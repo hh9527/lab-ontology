@@ -41,6 +41,42 @@ def int_number_kinds: Array(edsl.FilterInputKind) = ['Int, 'Number];
 # 指标不需要额外必需实体
 def no_types: Array(Type) = [];
 
+# CommandHead：command 的第一个空白分隔片段（例如把
+# `./bin/telora -C query run main` 投影为 `./bin/telora`）。
+# 语义只是“首个空白分隔片段”，不是完整 shell lexer；不会归一化 `./` 前缀，
+# 因此 `./bin/telora` 与 `bin/telora` 保持为不同成员。用封闭原语
+# Instr/If/Sub/Substr 组合，全部常量保持为参数化 Bind。
+def head_builder: Fn(qb.Expr) -> qb.Expr = fn(command) {
+    let sep: qb.Expr = qb.bind_string(" ");
+    let pos: qb.Expr = qb.instr(command, sep);
+    let found: qb.Expr = qb.scalar('Gt, [pos, qb.bind_int(0)]);
+    let rest: qb.Expr = qb.sub(pos, qb.bind_int(1));
+    qb.scalar_if(found, qb.substr([command, qb.bind_int(1), rest]), command)
+};
+
+# CommandHead 的固有 scope：只覆盖 shell action 事件，调用者无需每次手工
+# 重复 EventType=action、Action=shell。field 索引是 TimelineEvent 的规范字段
+# 顺序（字段名排序，从 0 开始）：event_type = 11，action = 0。
+def command_head_scope: Array(edsl.ScopePredicate) = [
+    { field: 11, op: 'Eq, input: 'Text("action") },
+    { field: 0, op: 'Eq, input: 'Text("shell") },
+];
+
+# Host 等待集合：host_request_opened / host_request_resolved 各自动计数，
+# 净额用受限计算指标（'Sub）表达。field 索引是 TimelineEvent 的规范字段
+# 顺序（字段名排序，从 0 开始）：event_type = 11。
+def host_request_opened_pred: edsl.ScopePredicate = { field: 11, op: 'Eq, input: 'Text("host_request_opened") };
+def host_request_resolved_pred: edsl.ScopePredicate = { field: 11, op: 'Eq, input: 'Text("host_request_resolved") };
+
+# 任务轮数净额：task_started / task_completed 各自动计数，Outstanding =
+# Started - Completed（尚未配对完成的轮数）。两个 EventType 条件只进入各自
+# 聚合的 FILTER，不会展平成互斥的全局 AND。
+def task_started_pred: edsl.ScopePredicate = { field: 11, op: 'Eq, input: 'Text("task_started") };
+def task_completed_pred: edsl.ScopePredicate = { field: 11, op: 'Eq, input: 'Text("task_completed") };
+
+# 受限计算指标运算符（ComputedOp）
+def sub_op: qb.ComputedOp = 'Sub;
+
 # ---------------------------------------------------------------------------
 # 封闭值域：任务类别
 # ---------------------------------------------------------------------------
@@ -99,6 +135,12 @@ type TimelineEvent = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
     @edsl.measure("EventCount", count_agg, no_types)
+    @edsl.filtered_measure("HostRequestOpenedCount", count_agg, no_types, host_request_opened_pred)
+    @edsl.filtered_measure("HostRequestResolvedCount", count_agg, no_types, host_request_resolved_pred)
+    @edsl.computed_measure("HostRequestNet", sub_op, "HostRequestOpenedCount", "HostRequestResolvedCount")
+    @edsl.filtered_measure("TaskStartedCount", count_agg, no_types, task_started_pred)
+    @edsl.filtered_measure("TaskCompletedCount", count_agg, no_types, task_completed_pred)
+    @edsl.computed_measure("TaskOutstanding", sub_op, "TaskStartedCount", "TaskCompletedCount")
     id: String,
 
     @edsl.column("execution")
@@ -171,6 +213,11 @@ type TimelineEvent = struct {
     @edsl.dimension("Command", flag_true, flag_true, eq_ops, text_kinds)
     command: String,
 
+    @edsl.column("command")
+    @edsl.computed_dimension("CommandHead", flag_true, flag_true, eq_ops, text_kinds, head_builder)
+    @edsl.scope(command_head_scope)
+    command_head: String,
+
     @edsl.column("exit_code")
     @edsl.dimension("ExitCode", flag_true, flag_true, eq_ops, int_kinds)
     exit_code: Int,
@@ -205,7 +252,7 @@ type TimelineEvent = struct {
 # ---------------------------------------------------------------------------
 
 @edsl.entity_source("action_paths", "ap")
-@edsl.relation(TimelineEvent, safe_kind, 0, 13)
+@edsl.relation(TimelineEvent, safe_kind, 0, 14)
 type ActionPath = struct {
     @edsl.column("event_id")
     event_id: String,

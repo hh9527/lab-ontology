@@ -11,6 +11,37 @@ def check: Fn(Bool, String) -> Bool = fn(cond, label) {
     if cond { 'True } else { fail!("ontology contract check failed", label) }
 };
 
+def option_unwrap: for(A) Fn(Option(A)) -> A = fn(value) {
+    match value { 'Some(v) => v, 'None => fail!("expected a value") }
+};
+
+def get_index: for(A) Fn(Array(A), Int) -> A = fn(values, i) {
+    match array.get(values, i) {
+        'Some(v) => v,
+        'None => fail!("index out of range", i),
+    }
+};
+
+def is_head_expr: Fn(qb.Expr) -> Bool = fn(e) {
+    match e {
+        'Scalar(call) => call.function == 'If && array.length(call.args) == 3,
+        _ => 'False,
+    }
+};
+
+def is_eq_bind: Fn(qb.Expr, String, qb.Val) -> Bool = fn(e, column, value) {
+    match e {
+        'Scalar(call) => call.function == 'Eq
+            && array.length(call.args) == 2
+            && (match array.get(call.args, 0) |> option_unwrap {
+                'Column(ref) => ref.source == "t" && ref.column == column,
+                _ => 'False,
+            })
+            && (match array.get(call.args, 1) |> option_unwrap { 'Bind(v) => v == value, _ => 'False }),
+        _ => 'False,
+    }
+};
+
 def main_request: Fn() -> edsl.QueryRequest = fn() {
     let request: edsl.QueryRequest = {
         measures: [
@@ -25,6 +56,8 @@ def main_request: Fn() -> edsl.QueryRequest = fn() {
             { target: 'Dimension("OrderRegion"), direction: 'Asc },
         ],
         limit: 'Some(3),
+        offset: 'None,
+        partition: 'None,
     };
     request
 };
@@ -90,9 +123,9 @@ def root_explicit_entities_ok: Bool = do {
         'Some(m) => m.requires == [0],
         'None => 'False,
     };
-    check(array.length(p.entities) == 3, "root explicitly lists three entity types")
-        && check(array.length(p.measures) == 5, "five measures collected from properties")
-        && check(array.length(p.dimensions) == 6, "six dimensions collected from properties")
+    check(array.length(p.entities) == 5, "root explicitly lists five entity types")
+        && check(array.length(p.measures) == 15, "fifteen measures collected from properties")
+        && check(array.length(p.dimensions) == 11, "eleven dimensions collected from properties")
         && check(array.length(p.relations) == 3, "three relations collected from properties")
         && check(contact_known, "known-but-unauthorized dimension stays in the closed vocabulary")
         && check(item_requires_order, "measure required entities resolved to entity indexes")
@@ -107,6 +140,8 @@ def parameterized_query_ok: Bool = do {
         filters: [{ id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("west") }],
         ordering: [],
         limit: 'Some(2),
+        offset: 'None,
+        partition: 'None,
     };
     let plan: qb.Plan = edsl.lower(knowledge.payload, request);
     let query: qb.Query = qb.transform_sqlite(plan);
@@ -145,6 +180,8 @@ def enum_filter_ok: Bool = do {
         filters: [{ id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("gold") }],
         ordering: [{ target: 'Dimension("CustomerTier"), direction: 'Asc }],
         limit: 'Some(3),
+        offset: 'None,
+        partition: 'None,
     };
     let plan: qb.Plan = edsl.lower(knowledge.payload, request);
     let filter_ok = match plan.filter {
@@ -169,6 +206,195 @@ def dimension_domain_helper_ok: Bool = do {
         && check(array.length(region_values) == 0, "dimension_domain exposes the open domain as empty")
 };
 
+# Pagination lowers to the standard Plan.offset: a request with stable ordering
+# and a non-negative offset keeps limit, sets offset, and appends the offset as
+# the last ordered binding. Finite results are business semantics, not proof of
+# full coverage.
+def pagination_ok: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [{ target: 'Measure("OrderAmount"), direction: 'Desc }],
+        limit: 'Some(5),
+        offset: 'Some(20),
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let offset_ok = plan.offset == 'Some(20);
+    let last_ok = match array.get(query.bindings, array.length(query.bindings) - 1) {
+        'Some(v) => v == 'Int(20),
+        'None => 'False,
+    };
+    check(offset_ok, "pagination: offset lowers to Plan.offset")
+        && check(last_ok, "pagination: offset is the last ordered binding")
+};
+
+# Computed dimensions can safely use the closed query scalars ('If/'Instr) and
+# participate in projection and grouping with arity-validated expressions.
+def computed_dimension_ok: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "TraceCount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "TraceHead", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let proj_ok = array.any(plan.projection, fn(item) {
+        match item { 'Expr(e) => is_head_expr(e), 'Aggregate(_) => 'False, 'Computed(_) => 'False }
+    });
+    let group_ok = array.length(plan.grouping) == 1 && is_head_expr(array.get(plan.grouping, 0) |> option_unwrap);
+    check(proj_ok, "computed dimension: new-scalar expression in projection")
+        && check(group_ok, "computed dimension: same expression in grouping")
+};
+
+# Generic domain scope: a dimension member declares its inherent row range as
+# typed predicates; the prepared payload publishes them, and selecting the
+# member merges the scope before user filters, both parameterized.
+def scope_ok: Bool = do {
+    let p = knowledge.payload;
+    let head = match array.find(p.dimensions, fn(d) { d.id == "TraceHead" }) {
+        'Some(d) => d,
+        'None => fail!("TraceHead dimension missing"),
+    };
+    let declared_ok = array.length(head.scope) == 1
+        && get_index(head.scope, 0).field == 1
+        && get_index(head.scope, 0).op == 'Eq
+        && get_index(head.scope, 0).input == 'Text("run");
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "TraceCount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "TraceHead", subject: "analyst", input: 'None }],
+        filters: [{ id: "TraceOwner", subject: "analyst", op: 'Eq, input: 'Text("alice") }],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let merged_ok = match plan.filter {
+        'Some('Scalar(call)) => call.function == 'And
+            && array.length(call.args) == 2
+            && is_eq_bind(array.get(call.args, 0) |> option_unwrap, "kind", 'String("run"))
+            && is_eq_bind(array.get(call.args, 1) |> option_unwrap, "owner", 'String("alice")),
+        _ => 'False,
+    };
+    check(declared_ok, "scope: inherent scope predicate published on the member")
+        && check(merged_ok, "scope: scope merges before the user filter, both parameterized")
+};
+
+# Top Per Group lowers to the standard Plan.partition: per-partition top N with
+# a stable ordering; global limit/offset/ordering are not combined.
+def top_per_group_ok: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [
+            { id: "OrderRegion", subject: "analyst", input: 'None },
+            { id: "OrderWeek", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [
+            { target: 'Measure("OrderAmount"), direction: 'Desc },
+            { target: 'Dimension("OrderWeek"), direction: 'Asc },
+        ],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some({ by: ["OrderRegion"], take: 2 }),
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let part_ok = match plan.partition {
+        'Some(p) => p.take == 2
+            && array.length(p.partition_by) == 1
+            && array.length(p.order_by) == 2,
+        'None => 'False,
+    };
+    let no_global = array.length(plan.ordering) == 0 && plan.limit == 'None && plan.offset == 'None;
+    check(part_ok, "top per group: partition lowers to Plan.partition")
+        && check(no_global, "top per group: no global limit/offset/ordering combined")
+};
+
+# Filtered and computed measures are part of the prepared knowledge and lower
+# through the public Plan: filtered aggregates carry their inherent predicate,
+# computed measures combine declared dependencies.
+def filtered_computed_measures_ok: Bool = do {
+    let p = knowledge.payload;
+    let run = match array.find(p.measures, fn(m) { m.id == "TraceRunCount" }) {
+        'Some(m) => m.predicate,
+        'None => fail!("TraceRunCount missing"),
+    };
+    let delta = match array.find(p.measures, fn(m) { m.id == "TraceDelta" }) {
+        'Some(m) => m.computed,
+        'None => fail!("TraceDelta missing"),
+    };
+    let pred_ok = match run {
+        'Some(pred) => pred.field == 1 && pred.op == 'Eq && pred.input == 'Text("run"),
+        'None => 'False,
+    };
+    let total = match array.find(p.measures, fn(m) { m.id == "TraceTotal" }) {
+        'Some(m) => m.computed,
+        'None => fail!("TraceTotal missing"),
+    };
+    let computed_ok = match delta {
+        'Some(spec) => spec.op == 'Sub && spec.left == "TraceRunCount" && spec.right == "TraceSkipCount",
+        'None => 'False,
+    };
+    let total_ok = match total {
+        'Some(spec) => spec.op == 'Add && spec.left == "TraceRunCount" && spec.right == "TraceSkipCount",
+        'None => 'False,
+    };
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "TraceDelta", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "TraceOwner", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let deps_projected = array.any(plan.projection, fn(item) {
+        match item { 'Aggregate(agg) => agg.alias == "TraceRunCount" || agg.alias == "TraceSkipCount", _ => 'False }
+    });
+    let computed_projected = array.any(plan.projection, fn(item) {
+        match item { 'Computed(c) => c.alias == "TraceDelta" && c.op == 'Sub, _ => 'False }
+    });
+    check(pred_ok, "filtered measure: inherent predicate published on the measure entry")
+        && check(computed_ok && total_ok, "computed measure: 'Sub and 'Add dependency specs published")
+        && check(deps_projected && computed_projected, "computed measure: dependencies and computed item are projected")
+};
+
+# The non-Timeline Approval example declares mutually exclusive conditional
+# counts plus Add/Sub composition through the same public path.
+def approval_measures_ok: Bool = do {
+    let p = knowledge.payload;
+    let net = match array.find(p.measures, fn(m) { m.id == "ApprovalNet" }) {
+        'Some(m) => m.computed,
+        'None => fail!("ApprovalNet missing"),
+    };
+    let spec_ok = match net {
+        'Some(spec) => spec.op == 'Sub && spec.left == "ApprovalApprovedCount" && spec.right == "ApprovalRejectedCount",
+        'None => 'False,
+    };
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "ApprovalTotal", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "ApprovalStatus", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let total_ok = array.any(plan.projection, fn(item) {
+        match item { 'Computed(c) => c.alias == "ApprovalTotal" && c.op == 'Add, _ => 'False }
+    });
+    check(spec_ok, "approval: non-Timeline computed net spec published")
+        && check(total_ok, "approval: non-Timeline Add composition lowers")
+};
+
 export {
     plan_ownership_ok,
     request_vocabulary_ok,
@@ -179,4 +405,10 @@ export {
     enum_domain_ok,
     enum_filter_ok,
     dimension_domain_helper_ok,
+    pagination_ok,
+    computed_dimension_ok,
+    scope_ok,
+    top_per_group_ok,
+    filtered_computed_measures_ok,
+    approval_measures_ok,
 };

@@ -49,8 +49,10 @@ def get_string: Fn(Dict(Value), String) -> Option(String) = fn(obj, key) {
 # `subject` 不属于顶层合法 key：dynamic 入口固定使用 `analyst`，显式提交的
 # `subject` 会被当作未知 key 拒绝。
 def is_known_top_key: Fn(String) -> Bool = fn(key) {
-    key == "measures" || key == "dimensions" || key == "filters" || key == "ordering" || key == "limit"
+    key == "measures" || key == "dimensions" || key == "filters" || key == "ordering" || key == "limit" || key == "offset" || key == "partition"
 };
+
+def is_known_partition_key: Fn(String) -> Bool = fn(key) { key == "by" || key == "take" };
 
 def is_known_measure_key: Fn(String) -> Bool = fn(key) { key == "id" || key == "input" };
 
@@ -219,6 +221,35 @@ def decode_ordering_list: Fn(Value) -> Option(Array(edsl.OrderRequest)) = fn(raw
     }
 };
 
+# Top Per Group：`partition` 只接受 `{"by": [维度 id...], "take": 正整数}`；
+# 形状非法返回 'None，语义约束（已选择、稳定排序、take 上限、不与 limit/offset
+# 组合）由 lowering 原子拒绝。
+def decode_partition: Fn(Value) -> Option(edsl.PartitionRequest) = fn(raw) {
+    match raw {
+        'Object(obj) => {
+            let keys_ok = keys_allowed(obj, is_known_partition_key);
+            let by: Option(Array(String)) = match dict.get(obj, "by") {
+                'Some('Array(items)) => array.fold(items, 'Some([]), fn(acc, item) {
+                    match (acc, item) {
+                        ('Some(list), 'String(text)) => 'Some(array.push(list, text)),
+                        _ => 'None,
+                    }
+                }),
+                _ => 'None,
+            };
+            let take = match dict.get(obj, "take") {
+                'Some('Int(value)) => 'Some(value),
+                _ => 'None,
+            };
+            match (by, take, keys_ok) {
+                ('Some(by), 'Some(take), 'True) => 'Some({ by, take }),
+                _ => 'None,
+            }
+        },
+        _ => 'None,
+    }
+};
+
 # 纯解码：形状非法返回 'None，不产生诊断。调用者决定如何报告。
 def decode_request: Fn(Value) -> Option(edsl.QueryRequest) = fn(raw) {
     match raw {
@@ -269,7 +300,28 @@ def decode_request: Fn(Value) -> Option(edsl.QueryRequest) = fn(raw) {
                 'Some(value) => value,
                 'None => { return 'None; },
             };
-            'Some({ measures, dimensions, filters, ordering, limit })
+            let offset = match dict.get(obj, "offset") {
+                'None => 'Some('None),
+                'Some('None) => 'Some('None),
+                'Some('Int(value)) => 'Some('Some(value)),
+                _ => { return 'None; },
+            };
+            let offset = match offset {
+                'Some(value) => value,
+                'None => { return 'None; },
+            };
+            let partition = match dict.get(obj, "partition") {
+                'None => 'Some('None),
+                'Some(raw_partition) => match decode_partition(raw_partition) {
+                    'Some(entry) => 'Some('Some(entry)),
+                    'None => 'None,
+                },
+            };
+            let partition = match partition {
+                'Some(value) => value,
+                'None => { return 'None; },
+            };
+            'Some({ measures, dimensions, filters, ordering, limit, offset, partition })
         },
         _ => 'None,
     }

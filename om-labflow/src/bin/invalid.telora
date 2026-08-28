@@ -4,8 +4,10 @@
 #
 # 每个 case_* 都是独立的失败根：grain 冲突、未知词汇、封闭值域外枚举值、
 # 非法 limit、未授权 subject、未请求排序目标、动态 JSON 形状非法、显式
-# subject、非法 EventType。它们不发布部分 Query；命令以诊断失败、非零退出
-# 且不产生任何 Entry 输出。
+# subject、非法 EventType、offset 缺排序、负 offset、CommandHead 与用户
+# 筛选冲突、Top Per Group 非法组合（与 limit 组合、非正 take、partition
+# 维度未选择）。它们不发布部分 Query；命令以诊断失败、非零退出且不产生
+# 任何 Entry 输出。
 
 import "std/value" { Value };
 import "std/json" as json;
@@ -25,6 +27,8 @@ def case_grain_conflict = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -37,6 +41,8 @@ def case_fanout_dimension = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -49,6 +55,8 @@ def case_unknown_measure = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -61,6 +69,8 @@ def case_unknown_dimension = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -73,6 +83,8 @@ def case_unknown_enum_value = do {
         filters: [{ id: "TaskKind", subject: "analyst", op: 'Eq, input: 'Text("platinum") }],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -85,6 +97,8 @@ def case_illegal_event_type = do {
         filters: [{ id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("not_a_real_event") }],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -97,6 +111,8 @@ def case_non_positive_limit = do {
         filters: [],
         ordering: [],
         limit: 'Some(0),
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -109,6 +125,8 @@ def case_unauthorized_subject = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -121,6 +139,8 @@ def case_unrequested_order = do {
         filters: [],
         ordering: [{ target: 'Measure("EventCount"), direction: 'Desc }],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     edsl.lower(payload, request)
 };
@@ -143,6 +163,103 @@ def case_illegal_event_type_dynamic = do {
     facade.build_from_value(payload, raw)
 };
 
+# 12. offset 存在但请求没有稳定排序：结构校验原子拒绝
+def case_offset_without_ordering = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "CommandHead", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'Some(3),
+        offset: 'Some(3),
+        partition: 'None,
+    };
+    edsl.lower(payload, request)
+};
+
+# 13. 负 offset：结构校验原子拒绝
+def case_negative_offset = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "CommandHead", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [{ target: 'Measure("EventCount"), direction: 'Desc }],
+        limit: 'Some(3),
+        offset: 'Some(-1),
+        partition: 'None,
+    };
+    edsl.lower(payload, request)
+};
+
+# 14. CommandHead 固有 scope（EventType=action、Action=shell）与用户筛选冲突：
+#     用户显式筛选 EventType=thinking 与 scope 的 EventType=action 互斥，原子失败。
+def case_command_head_scope_conflict = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "CommandHead", subject: "analyst", input: 'None }],
+        filters: [{ id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("thinking") }],
+        ordering: [],
+        limit: 'Some(3),
+        offset: 'None,
+        partition: 'None,
+    };
+    edsl.lower(payload, request)
+};
+
+# 15. Top Per Group 与全局 limit 组合：v1 原子拒绝，不静默改变语义。
+def case_partition_with_limit = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+        dimensions: [
+            { id: "CommandHead", subject: "analyst", input: 'None },
+            { id: "Role", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [
+            { target: 'Measure("EventCount"), direction: 'Desc },
+            { target: 'Dimension("CommandHead"), direction: 'Asc },
+        ],
+        limit: 'Some(10),
+        offset: 'None,
+        partition: 'Some({ by: ["Role"], take: 3 }),
+    };
+    edsl.lower(payload, request)
+};
+
+# 16. Top Per Group 的 take 非正：原子拒绝。
+def case_partition_bad_take = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+        dimensions: [
+            { id: "CommandHead", subject: "analyst", input: 'None },
+            { id: "Role", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [
+            { target: 'Measure("EventCount"), direction: 'Desc },
+            { target: 'Dimension("CommandHead"), direction: 'Asc },
+        ],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some({ by: ["Role"], take: 0 }),
+    };
+    edsl.lower(payload, request)
+};
+
+# 17. Top Per Group 的 partition 维度未在请求中选择：原子拒绝。
+def case_partition_unselected_by = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "CommandHead", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [{ target: 'Measure("EventCount"), direction: 'Desc }],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some({ by: ["Role"], take: 3 }),
+    };
+    edsl.lower(payload, request)
+};
+
 export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     # 本入口只用于演示失败；正常路径请使用 run query 或 run verify。
     let ignored_grain = case_grain_conflict;
@@ -157,5 +274,11 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     let ignored_json = case_bad_dynamic_json;
     let ignored_explicit_subject = case_explicit_subject_dynamic;
     let ignored_illegal_event_type_dynamic = case_illegal_event_type_dynamic;
+    let ignored_offset_no_order = case_offset_without_ordering;
+    let ignored_negative_offset = case_negative_offset;
+    let ignored_scope_conflict = case_command_head_scope_conflict;
+    let ignored_partition_limit = case_partition_with_limit;
+    let ignored_partition_take = case_partition_bad_take;
+    let ignored_partition_by = case_partition_unselected_by;
     'String("invalid cases")
 };

@@ -4,9 +4,12 @@
 #
 # 覆盖：确定性、SQL 形状、绑定顺序、筛选/分组/Top N、join 的 grain 保持、
 # Distinct、codec round-trip 与 dynamic JSON 边界（固定 subject / EventType
-# 封闭值域）。任何一项失败都会使本入口以诊断失败（非零退出）。
+# 封闭值域）、CommandHead 首词分组与固有 scope、offset 分页、固定 cutoff
+# 的多步查询。任何一项失败都会使本入口以诊断失败（非零退出）。
 
 import "std/value" { Value };
+import "std/array" as array;
+import "std/string" as string;
 import "std/json" as json;
 import "std/codec" as codec;
 import "std/result" as result;
@@ -55,6 +58,8 @@ def rounds_request: edsl.QueryRequest = {
         { target: 'Dimension("Role"), direction: 'Asc },
     ],
     limit: 'Some(5),
+    offset: 'None,
+    partition: 'None,
 };
 
 def rounds_sql = "SELECT count(t.id) AS EventCount, t.role FROM timeline AS t WHERE t.type = ? GROUP BY t.role ORDER BY count(t.id) DESC, t.role ASC LIMIT ?";
@@ -76,6 +81,8 @@ def action_request: edsl.QueryRequest = {
     ],
     ordering: [{ target: 'Measure("DurationSum"), direction: 'Desc }],
     limit: 'Some(10),
+    offset: 'None,
+    partition: 'None,
 };
 
 def action_sql = "SELECT count(t.id) AS EventCount, sum(t.duration) AS DurationSum, t.command FROM timeline AS t WHERE ((t.type = ? AND t.action = ?) AND t.success = ?) GROUP BY t.command ORDER BY sum(t.duration) DESC LIMIT ?";
@@ -86,6 +93,8 @@ def paths_request: edsl.QueryRequest = {
     filters: [],
     ordering: [],
     limit: 'None,
+    offset: 'None,
+    partition: 'None,
 };
 
 def paths_sql = "SELECT count(ap.path) AS PathCount, t.role FROM action_paths AS ap INNER JOIN timeline AS t ON ap.event_id = t.id GROUP BY t.role";
@@ -96,6 +105,8 @@ def distinct_request: edsl.QueryRequest = {
     filters: [],
     ordering: [],
     limit: 'None,
+    offset: 'None,
+    partition: 'None,
 };
 
 def distinct_sql = "SELECT count(DISTINCT t.id) AS EventCount FROM timeline AS t";
@@ -106,6 +117,8 @@ def thinking_request: edsl.QueryRequest = {
     filters: [{ id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("thinking") }],
     ordering: [],
     limit: 'None,
+    offset: 'None,
+    partition: 'None,
 };
 
 def thinking_sql = "SELECT max(t.duration) AS DurationMax, t.role FROM timeline AS t WHERE t.type = ? GROUP BY t.role";
@@ -193,6 +206,232 @@ def verify_dynamic_path = do {
     let query = facade.build_from_value(payload, raw);
     let checked_sql = assert_eq_text.must_ok!(query.sql, rounds_sql);
     let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, rounds_bindings);
+    query
+};
+
+# ---------------------------------------------------------------------------
+# CommandHead / 分页 / 固定 cutoff
+# ---------------------------------------------------------------------------
+
+def cutoff_time: Int = 1750000000000;
+
+def command_head_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "CommandHead", subject: "analyst", input: 'None }],
+    filters: [
+        { id: "Success", subject: "analyst", op: 'Eq, input: 'Int(0) },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [
+        { target: 'Measure("EventCount"), direction: 'Desc },
+        { target: 'Dimension("CommandHead"), direction: 'Asc },
+    ],
+    limit: 'Some(3),
+    offset: 'None,
+    partition: 'None,
+};
+
+def command_head_sql = "SELECT count(t.id) AS EventCount, CASE WHEN instr(t.command, ?) > ? THEN substr(t.command, ?, (instr(t.command, ?) - ?)) ELSE t.command END FROM timeline AS t WHERE (((t.type = ? AND t.action = ?) AND t.success = ?) AND t.at <= ?) GROUP BY CASE WHEN instr(t.command, ?) > ? THEN substr(t.command, ?, (instr(t.command, ?) - ?)) ELSE t.command END ORDER BY count(t.id) DESC, CASE WHEN instr(t.command, ?) > ? THEN substr(t.command, ?, (instr(t.command, ?) - ?)) ELSE t.command END ASC LIMIT ?";
+def command_head_bindings: Array(qb.Val) = [
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String("action"), 'String("shell"), 'Int(0), 'Int(cutoff_time),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'Int(3),
+];
+
+def command_head_page2_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "CommandHead", subject: "analyst", input: 'None }],
+    filters: [
+        { id: "Success", subject: "analyst", op: 'Eq, input: 'Int(0) },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [
+        { target: 'Measure("EventCount"), direction: 'Desc },
+        { target: 'Dimension("CommandHead"), direction: 'Asc },
+    ],
+    limit: 'Some(3),
+    offset: 'Some(3),
+    partition: 'None,
+};
+
+def command_head_page2_bindings: Array(qb.Val) = [
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String("action"), 'String("shell"), 'Int(0), 'Int(cutoff_time),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'Int(3), 'Int(3),
+];
+
+def command_head_by_role_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "CommandHead", subject: "analyst", input: 'None },
+        { id: "Role", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "Success", subject: "analyst", op: 'Eq, input: 'Int(0) },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def verify_command_head = do {
+    let query = facade.build_from_request(payload, command_head_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, command_head_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, command_head_bindings);
+    query
+};
+
+def verify_command_head_pagination = do {
+    let page1 = facade.build_from_request(payload, command_head_request);
+    let page2 = facade.build_from_request(payload, command_head_page2_request);
+    let checked_p1_sql = assert_eq_text.must_ok!(page1.sql, command_head_sql);
+    let checked_offset_clause = if string.contains(page2.sql, "OFFSET ?") { 0 } else { fail!("page2 missing OFFSET") };
+    let checked_p2_bindings = assert_eq_bindings.must_ok!(page2.bindings, command_head_page2_bindings);
+    0
+};
+
+def verify_fixed_cutoff_multi_step = do {
+    let step1 = facade.build_from_request(payload, command_head_request);
+    let step2 = facade.build_from_request(payload, command_head_by_role_request);
+    let cutoff_binding: qb.Val = 'Int(cutoff_time);
+    let has_cutoff_1 = if array.any(step1.bindings, fn(b) { b == cutoff_binding }) { 0 } else { fail!("step1 missing cutoff") };
+    let has_cutoff_2 = if array.any(step2.bindings, fn(b) { b == cutoff_binding }) { 0 } else { fail!("step2 missing cutoff") };
+    let sql_ok_1 = if string.contains(step1.sql, "t.at <= ?") { 0 } else { fail!("step1 missing cutoff filter") };
+    let sql_ok_2 = if string.contains(step2.sql, "t.at <= ?") { 0 } else { fail!("step2 missing cutoff filter") };
+    0
+};
+
+# ---------------------------------------------------------------------------
+# Host 等待净额 / Top Per Group
+# ---------------------------------------------------------------------------
+
+def host_net_request: edsl.QueryRequest = {
+    measures: [
+        { id: "HostRequestOpenedCount", subject: "analyst", input: 'All },
+        { id: "HostRequestResolvedCount", subject: "analyst", input: 'All },
+        { id: "HostRequestNet", subject: "analyst", input: 'All },
+    ],
+    dimensions: [{ id: "Artifact", subject: "analyst", input: 'None }],
+    filters: [{ id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) }],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def host_net_sql = "SELECT count(t.id) FILTER (WHERE t.type = ?) AS HostRequestOpenedCount, count(t.id) FILTER (WHERE t.type = ?) AS HostRequestResolvedCount, (count(t.id) FILTER (WHERE t.type = ?) - count(t.id) FILTER (WHERE t.type = ?)) AS HostRequestNet, t.artifact FROM timeline AS t WHERE t.at <= ? GROUP BY t.artifact";
+def host_net_bindings: Array(qb.Val) = [
+    'String("host_request_opened"), 'String("host_request_resolved"),
+    'String("host_request_opened"), 'String("host_request_resolved"),
+    'Int(cutoff_time),
+];
+
+def partition_top_n_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "CommandHead", subject: "analyst", input: 'None },
+        { id: "Role", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "Success", subject: "analyst", op: 'Eq, input: 'Int(0) },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [
+        { target: 'Measure("EventCount"), direction: 'Desc },
+        { target: 'Dimension("CommandHead"), direction: 'Asc },
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({ by: ["Role"], take: 3 }),
+};
+
+def partition_top_n_sql = "SELECT EventCount, __q_1, __q_2 FROM (SELECT count(t.id) AS EventCount, CASE WHEN instr(t.command, ?) > ? THEN substr(t.command, ?, (instr(t.command, ?) - ?)) ELSE t.command END AS __q_1, t.role AS __q_2, row_number() OVER (PARTITION BY t.role ORDER BY count(t.id) DESC, CASE WHEN instr(t.command, ?) > ? THEN substr(t.command, ?, (instr(t.command, ?) - ?)) ELSE t.command END ASC) AS __q_rn FROM timeline AS t WHERE (((t.type = ? AND t.action = ?) AND t.success = ?) AND t.at <= ?) GROUP BY CASE WHEN instr(t.command, ?) > ? THEN substr(t.command, ?, (instr(t.command, ?) - ?)) ELSE t.command END, t.role) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_2 ASC, EventCount DESC, __q_1 ASC";
+def partition_top_n_bindings: Array(qb.Val) = [
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String("action"), 'String("shell"), 'Int(0), 'Int(cutoff_time),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'Int(3),
+];
+
+def verify_host_request_net = do {
+    let query = facade.build_from_request(payload, host_net_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, host_net_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, host_net_bindings);
+    query
+};
+
+def verify_partition_top_n = do {
+    let query = facade.build_from_request(payload, partition_top_n_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, partition_top_n_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, partition_top_n_bindings);
+    query
+};
+
+def task_outstanding_request: edsl.QueryRequest = {
+    measures: [
+        { id: "TaskStartedCount", subject: "analyst", input: 'All },
+        { id: "TaskCompletedCount", subject: "analyst", input: 'All },
+        { id: "TaskOutstanding", subject: "analyst", input: 'All },
+    ],
+    dimensions: [{ id: "Role", subject: "analyst", input: 'None }],
+    filters: [{ id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) }],
+    ordering: [{ target: 'Measure("TaskOutstanding"), direction: 'Desc }],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def task_outstanding_sql = "SELECT count(t.id) FILTER (WHERE t.type = ?) AS TaskStartedCount, count(t.id) FILTER (WHERE t.type = ?) AS TaskCompletedCount, (count(t.id) FILTER (WHERE t.type = ?) - count(t.id) FILTER (WHERE t.type = ?)) AS TaskOutstanding, t.role FROM timeline AS t WHERE t.at <= ? GROUP BY t.role ORDER BY (count(t.id) FILTER (WHERE t.type = ?) - count(t.id) FILTER (WHERE t.type = ?)) DESC";
+def task_outstanding_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'Int(cutoff_time),
+    'String("task_started"), 'String("task_completed"),
+];
+
+def task_outstanding_top_n_request: edsl.QueryRequest = {
+    measures: [{ id: "TaskOutstanding", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "Role", subject: "analyst", input: 'None },
+        { id: "TaskId", subject: "analyst", input: 'None },
+    ],
+    filters: [{ id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) }],
+    ordering: [
+        { target: 'Measure("TaskOutstanding"), direction: 'Desc },
+        { target: 'Dimension("TaskId"), direction: 'Asc },
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({ by: ["Role"], take: 5 }),
+};
+
+def task_outstanding_top_n_sql = "SELECT TaskStartedCount, TaskCompletedCount, TaskOutstanding, __q_3, __q_4 FROM (SELECT count(t.id) FILTER (WHERE t.type = ?) AS TaskStartedCount, count(t.id) FILTER (WHERE t.type = ?) AS TaskCompletedCount, (count(t.id) FILTER (WHERE t.type = ?) - count(t.id) FILTER (WHERE t.type = ?)) AS TaskOutstanding, t.role AS __q_3, t.task_id AS __q_4, row_number() OVER (PARTITION BY t.role ORDER BY (count(t.id) FILTER (WHERE t.type = ?) - count(t.id) FILTER (WHERE t.type = ?)) DESC, t.task_id ASC) AS __q_rn FROM timeline AS t WHERE t.at <= ? GROUP BY t.role, t.task_id) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_3 ASC, TaskOutstanding DESC, __q_4 ASC";
+def task_outstanding_top_n_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'Int(cutoff_time), 'Int(5),
+];
+
+def verify_task_outstanding = do {
+    let query = facade.build_from_request(payload, task_outstanding_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, task_outstanding_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, task_outstanding_bindings);
+    let checked_filters = if string.contains(query.sql, "FILTER (WHERE t.type = ?)") { 0 } else { fail!("missing FILTER") };
+    query
+};
+
+def verify_task_outstanding_partition = do {
+    let query = facade.build_from_request(payload, task_outstanding_top_n_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, task_outstanding_top_n_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, task_outstanding_top_n_bindings);
     query
 };
 

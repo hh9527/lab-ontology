@@ -12,7 +12,7 @@ EnterpriseKnowledge：把领域业务词汇确定性地降低为参数化 SQLite
 ## 结构
 
 ```text
-src/model.telora      私有物理模型（实体/指标/维度/关系）
+src/model.telora      私有物理模型（实体/指标/维度/关系/计算维度/scope）
 src/knowledge.telora  PreparedPayload（profile/authorize/路径矩阵）
 src/query.telora      公共 typed/dynamic query facade（规范实现）
 src/facade.telora     facade 兼容性 re-export
@@ -28,6 +28,11 @@ tests/query.telora    契约测试
 
 ```bash
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/rounds-per-role.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/failed-command-heads.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/command-heads-page-2.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/per-role-failed-command-heads.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-by-role.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
 ./bin/telora -C om-labflow run verify
 ./bin/telora -C om-labflow run invalid --best-effort
 ./bin/telora -C om-labflow check @test/query

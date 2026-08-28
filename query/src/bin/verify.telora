@@ -20,6 +20,7 @@ import "std/codec" as codec;
 import "std/dict" as dict;
 import "std/json" as json;
 import "std/result" as result;
+import "std/string" as string;
 import "std/value" { Value };
 import "@src/lib" as qb;
 
@@ -36,11 +37,11 @@ def full_profile: Fn() -> qb.PlanProfile = fn() {
     let profile: qb.PlanProfile = {
         allowed_operators: [
             'Source, 'Column, 'Bind, 'Scalar, 'Aggregate, 'Project,
-            'Filter, 'Join, 'Group, 'Order, 'Limit,
+            'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset, 'Partition,
         ],
         allowed_join_kinds: ['Inner, 'Left],
         allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
-        allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
         allow_distinct: 'True,
     };
     profile
@@ -89,6 +90,8 @@ def demo_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.asc(qb.column("o", "customer_id"))],
         limit: 'Some(10),
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -106,6 +109,8 @@ def simple_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [qb.asc(qb.column("orders", "id"))],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -125,6 +130,8 @@ def top_n_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.desc_aggregate("order_count"), qb.asc(qb.column("o", "customer_id"))],
         limit: 'Some(5),
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -136,6 +143,308 @@ def expected_top_n_sql = "SELECT o.customer_id, count(o.id) AS order_count FROM 
 def expected_bindings: Array(qb.Val) = ['Int(1), 'Int(3), 'Float(100.0), 'Int(10)];
 
 def expected_top_n_bindings: Array(qb.Val) = ['Int(5)];
+
+# ---------------------------------------------------------------------------
+# Closed computed expression: first whitespace-delimited segment of a command.
+#
+#   ./bin/telora -C query run main  ->  ./bin/telora
+#
+# Composed with the closed primitives Instr (find), If (conditional) and
+# Sub/Substr (truncate before the delimiter).  No delimiter -> the original
+# value; empty input -> empty value; NULL input -> NULL (SQL CASE WHEN treats
+# NULL as false and selects the ELSE branch, which is the original value).
+# ---------------------------------------------------------------------------
+
+def first_token_expr: Fn(qb.Expr) -> qb.Expr = fn(command) {
+    let sep: qb.Expr = qb.bind_string(" ");
+    let pos: qb.Expr = qb.instr(command, sep);
+    let found: qb.Expr = qb.scalar('Gt, [pos, qb.bind_int(0)]);
+    let rest: qb.Expr = qb.sub(pos, qb.bind_int(1));
+    let segment: qb.Expr = qb.scalar_if(
+        found,
+        qb.substr([command, qb.bind_int(1), rest]),
+        command,
+    );
+    segment
+};
+
+def first_token_plan: Fn() -> qb.Plan = fn() {
+    let segment = first_token_expr(qb.column("c", "command"));
+    let plan: qb.Plan = {
+        revision: "verify-first-token",
+        sources: [qb.source("c", "commands")],
+        projection: [
+            qb.expr_item(segment),
+            qb.aggregate('Count, qb.column("c", "id"), 'False, "uses"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [segment],
+        ordering: [qb.desc_aggregate("uses"), qb.asc(qb.column("c", "command"))],
+        limit: 'Some(100),
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_first_token_sql = "SELECT CASE WHEN instr(c.command, ?) > ? THEN substr(c.command, ?, (instr(c.command, ?) - ?)) ELSE c.command END, count(c.id) AS uses FROM commands AS c GROUP BY CASE WHEN instr(c.command, ?) > ? THEN substr(c.command, ?, (instr(c.command, ?) - ?)) ELSE c.command END ORDER BY count(c.id) DESC, c.command ASC LIMIT ?";
+
+def expected_first_token_bindings: Array(qb.Val) = [
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'Int(100),
+];
+
+# ---------------------------------------------------------------------------
+# Safe pagination: non-negative offset with mandatory stable ordering.
+# ---------------------------------------------------------------------------
+
+def paged_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-paged",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'Some(qb.scalar('Gt, [qb.column("o", "total"), qb.bind_float(50.0)])),
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'Some(10),
+        offset: 'Some(20),
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_paged_sql = "SELECT o.id FROM orders AS o WHERE o.total > ? ORDER BY o.id ASC LIMIT ? OFFSET ?";
+
+def expected_paged_bindings: Array(qb.Val) = ['Float(50.0), 'Int(10), 'Int(20)];
+
+# offset without an explicit limit renders `LIMIT -1 OFFSET ?`.
+def offset_only_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-offset-only",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'None,
+        offset: 'Some(5),
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_offset_only_sql = "SELECT o.id FROM orders AS o ORDER BY o.id ASC LIMIT -1 OFFSET ?";
+
+def offset_no_ordering_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-offset-no-order",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'Some(10),
+        offset: 'Some(5),
+        partition: 'None,
+    };
+    plan
+};
+
+def negative_offset_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-negative-offset",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'Some(10),
+        offset: 'Some(-1),
+        partition: 'None,
+    };
+    plan
+};
+
+# A profile that allows offset plans (full profile above includes 'Offset).
+
+# ---------------------------------------------------------------------------
+# Partitioned Top N: per-Role top 3 CommandHeads by EventCount desc.
+# ---------------------------------------------------------------------------
+
+def top_per_role_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-top-per-role",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(qb.column("e", "command_head")),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "event_count"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "status"), qb.bind_string("failed")])),
+        joins: [],
+        grouping: [qb.column("e", "role"), qb.column("e", "command_head")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("event_count"), qb.asc(qb.column("e", "command_head"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def expected_partition_sql = "SELECT __q_0, __q_1, event_count FROM (SELECT e.role AS __q_0, e.command_head AS __q_1, count(e.id) AS event_count, row_number() OVER (PARTITION BY e.role ORDER BY count(e.id) DESC, e.command_head ASC) AS __q_rn FROM events AS e WHERE e.status = ? GROUP BY e.role, e.command_head) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_0 ASC, event_count DESC, __q_1 ASC";
+
+def expected_partition_bindings: Array(qb.Val) = ['String("failed"), 'Int(3)];
+
+def partition_no_tie_break_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-partition-no-tiebreak",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(qb.column("e", "command_head")),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "event_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role"), qb.column("e", "command_head")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("event_count")],
+            3,
+        )),
+    };
+    plan
+};
+
+# ---------------------------------------------------------------------------
+# Filtered and computed aggregates.
+# ---------------------------------------------------------------------------
+
+def filtered_aggregate_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-filtered-agg",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_started")])),
+                "started_count"),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_completed")])),
+                "completed_count"),
+            qb.computed_item('Sub, "started_count", "completed_count", "outstanding"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "year"), qb.bind_int(2024)])),
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [qb.desc_aggregate("outstanding")],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_computed_sql = "SELECT e.role, count(e.id) FILTER (WHERE e.type = ?) AS started_count, count(e.id) FILTER (WHERE e.type = ?) AS completed_count, (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) AS outstanding FROM events AS e WHERE e.year = ? GROUP BY e.role ORDER BY (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) DESC";
+
+def expected_computed_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'Int(2024),
+    'String("task_started"), 'String("task_completed"),
+];
+
+def computed_partition_net_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-computed-partition-net",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(qb.column("e", "command_head")),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_started")])),
+                "started_count"),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_completed")])),
+                "completed_count"),
+            qb.computed_item('Sub, "started_count", "completed_count", "outstanding"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "year"), qb.bind_int(2024)])),
+        joins: [],
+        grouping: [qb.column("e", "role"), qb.column("e", "command_head")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("outstanding"), qb.asc(qb.column("e", "command_head"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def expected_computed_partition_sql = "SELECT __q_0, __q_1, started_count, completed_count, outstanding FROM (SELECT e.role AS __q_0, e.command_head AS __q_1, count(e.id) FILTER (WHERE e.type = ?) AS started_count, count(e.id) FILTER (WHERE e.type = ?) AS completed_count, (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) AS outstanding, row_number() OVER (PARTITION BY e.role ORDER BY (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) DESC, e.command_head ASC) AS __q_rn FROM events AS e WHERE e.year = ? GROUP BY e.role, e.command_head) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_0 ASC, outstanding DESC, __q_1 ASC";
+
+def expected_computed_partition_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'Int(2024),
+    'Int(3),
+];
+
+def computed_unknown_operand_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-computed-unknown",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.computed_item('Sub, "started_count", "missing_alias", "outstanding"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def computed_cycle_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-computed-cycle",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.computed_item('Sub, "b_count", "a_count", "c_count"),
+            qb.computed_item('Sub, "c_count", "a_count", "b_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
 
 # ---------------------------------------------------------------------------
 # JSON codec boundary helpers (Val <-> untagged scalar JSON).
@@ -224,6 +533,81 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     let top_n_bindings_ok = q3.bindings == expected_top_n_bindings;
     let top_n_operators_ok = qb.profile_accepts(top_n, full);
 
+    # Closed computed expression (first whitespace segment) checks.
+    let token_plan = first_token_plan();
+    let token = qb.validate(token_plan, full);
+    let q4 = qb.transform_sqlite(token);
+    let token_sql_ok = q4.sql == expected_first_token_sql;
+    let token_bindings_ok = q4.bindings == expected_first_token_bindings;
+    let token_profile_ok = qb.profile_accepts(token_plan, full);
+    let token_profile_reject_ok = !qb.profile_accepts(token_plan, restricted_profile());
+    # The conditional's ELSE branch is the original column: no delimiter,
+    # empty input and NULL input all fall back to the original value.
+    let token_else_ok = string.contains(q4.sql, "ELSE c.command");
+
+    # Safe pagination checks.
+    let paged = qb.validate(paged_plan(), full);
+    let q5 = qb.transform_sqlite(paged);
+    let paged_sql_ok = q5.sql == expected_paged_sql;
+    let paged_bindings_ok = q5.bindings == expected_paged_bindings;
+    let offset_only = qb.validate(offset_only_plan(), full);
+    let q6 = qb.transform_sqlite(offset_only);
+    let offset_only_sql_ok = q6.sql == expected_offset_only_sql;
+    let offset_requires_ordering_ok = !qb.structure_ok(offset_no_ordering_plan());
+    let negative_offset_rejected_ok = !qb.structure_ok(negative_offset_plan());
+    let offset_expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Filter,
+        'Order, 'Limit, 'Offset,
+    ];
+    let offset_operator_ok = qb.operators(paged_plan()) == offset_expected;
+    let paged_profile_ok = qb.profile_accepts(paged_plan(), full);
+
+    # Partitioned Top N checks.
+    let partition = qb.validate(top_per_role_plan(), full);
+    let q7 = qb.transform_sqlite(partition);
+    let partition_sql_ok = q7.sql == expected_partition_sql;
+    let partition_bindings_ok = q7.bindings == expected_partition_bindings;
+    let partition_profile_ok = qb.profile_accepts(top_per_role_plan(), full);
+    let partition_take_bound_ok = string.contains(q7.sql, "__q_rn <= ?");
+    let partition_tie_break_reject_ok = !qb.structure_ok(partition_no_tie_break_plan());
+    let partition_operators_expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+        'Filter, 'Group, 'Order, 'Partition,
+    ];
+    let partition_operators_ok = qb.operators(top_per_role_plan()) == partition_operators_expected;
+
+    # Filtered and computed aggregates checks.
+    let computed = qb.validate(filtered_aggregate_plan(), full);
+    let q8 = qb.transform_sqlite(computed);
+    let computed_sql_ok = q8.sql == expected_computed_sql;
+    let computed_bindings_ok = q8.bindings == expected_computed_bindings;
+    let computed_ordering_ok = string.contains(q8.sql, "ORDER BY (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) DESC");
+    let computed_profile_ok = qb.profile_accepts(filtered_aggregate_plan(), full);
+    let computed_partition = qb.validate(computed_partition_net_plan(), full);
+    let q9 = qb.transform_sqlite(computed_partition);
+    let computed_partition_sql_ok = q9.sql == expected_computed_partition_sql;
+    let computed_partition_bindings_ok = q9.bindings == expected_computed_partition_bindings;
+    let computed_unknown_reject_ok = !qb.structure_ok(computed_unknown_operand_plan());
+    let computed_cycle_reject_ok = !qb.structure_ok(computed_cycle_plan());
+    # Profile capability coverage: aggregate-local filter consumes `Filter`;
+    # computed aggregates consume `Scalar` plus the specific Add/Sub scalar.
+    let eq_but_no_filter: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate, 'Group],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq],
+        allow_distinct: 'True,
+    };
+    let filtered_consumes_filter_ok = !qb.profile_accepts(filtered_aggregate_plan(), eq_but_no_filter);
+    let no_scalar: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Aggregate, 'Filter, 'Group, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq, 'Add, 'Sub],
+        allow_distinct: 'True,
+    };
+    let computed_consumes_scalar_ok = !qb.profile_accepts(filtered_aggregate_plan(), no_scalar);
+
     # JSON codec boundary checks.
     let json_roundtrip_ok = val_roundtrip('Int(3))
         && val_roundtrip('Float(3.5))
@@ -241,6 +625,19 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     let all_ok = coverage_ok && reject_ok && simple_ok && operators_ok
         && determinism_ok && ordering_ok && bindings_ok
         && top_n_order_ok && top_n_bindings_ok && top_n_operators_ok
+        && token_sql_ok && token_bindings_ok && token_profile_ok
+        && token_profile_reject_ok && token_else_ok
+        && paged_sql_ok && paged_bindings_ok && offset_only_sql_ok
+        && offset_requires_ordering_ok && negative_offset_rejected_ok
+        && offset_operator_ok && paged_profile_ok
+        && partition_sql_ok && partition_bindings_ok && partition_profile_ok
+        && partition_take_bound_ok && partition_tie_break_reject_ok
+        && partition_operators_ok
+        && computed_sql_ok && computed_bindings_ok && computed_ordering_ok
+        && computed_profile_ok && computed_partition_sql_ok
+        && computed_partition_bindings_ok
+        && computed_unknown_reject_ok && computed_cycle_reject_ok
+        && filtered_consumes_filter_ok && computed_consumes_scalar_ok
         && json_roundtrip_ok && json_int_float_dispatch_ok
         && json_scalar_array_ok && json_encoded_bindings_ok;
 
@@ -255,6 +652,14 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
             ordering: if ordering_ok { 'True } else { 'False },
             bindings: if bindings_ok { 'True } else { 'False },
             top_n_aggregate_ordering: if top_n_order_ok && top_n_bindings_ok { 'True } else { 'False },
+            first_token_lowering: if token_sql_ok && token_bindings_ok { 'True } else { 'False },
+            first_token_profile: if token_profile_ok && token_profile_reject_ok { 'True } else { 'False },
+            pagination_lowering: if paged_sql_ok && paged_bindings_ok && offset_only_sql_ok { 'True } else { 'False },
+            pagination_safety: if offset_requires_ordering_ok && negative_offset_rejected_ok && offset_operator_ok { 'True } else { 'False },
+            partition_lowering: if partition_sql_ok && partition_bindings_ok && partition_take_bound_ok { 'True } else { 'False },
+            partition_safety: if partition_tie_break_reject_ok && partition_operators_ok { 'True } else { 'False },
+            filtered_computed_lowering: if computed_sql_ok && computed_bindings_ok && computed_ordering_ok { 'True } else { 'False },
+            filtered_computed_safety: if computed_profile_ok && computed_partition_sql_ok && computed_partition_bindings_ok && computed_unknown_reject_ok && computed_cycle_reject_ok && filtered_consumes_filter_ok && computed_consumes_scalar_ok { 'True } else { 'False },
             json_roundtrip: if json_roundtrip_ok { 'True } else { 'False },
             json_int_float_dispatch: if json_int_float_dispatch_ok { 'True } else { 'False },
             json_scalar_array: if json_scalar_array_ok { 'True } else { 'False },

@@ -79,11 +79,11 @@ def full_profile: Fn() -> qb.PlanProfile = fn() {
     let profile: qb.PlanProfile = {
         allowed_operators: [
             'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
-            'Filter, 'Join, 'Group, 'Order, 'Limit,
+            'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset,
         ],
         allowed_join_kinds: ['Inner, 'Left],
         allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
-        allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
         allow_distinct: 'True,
     };
     profile
@@ -143,6 +143,8 @@ def demo_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.asc(qb.column("o", "customer_id"))],
         limit: 'Some(10),
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -160,6 +162,8 @@ def simple_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [qb.asc(qb.column("orders", "id"))],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -174,6 +178,8 @@ def distinct_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -188,6 +194,8 @@ def bad_arity_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -202,6 +210,8 @@ def unknown_alias_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -216,6 +226,8 @@ def negative_limit_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [],
         limit: 'Some(-1),
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -230,6 +242,8 @@ def bad_identifier_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -251,6 +265,8 @@ def left_join_plan: Fn() -> qb.Plan = fn() {
         grouping: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -270,6 +286,8 @@ def top_n_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.desc_aggregate("order_count"), qb.asc(qb.column("o", "customer_id"))],
         limit: 'Some(5),
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -285,6 +303,8 @@ def unprojected_ordering_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.desc_aggregate("order_count")],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -303,6 +323,8 @@ def unknown_ordering_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.asc_aggregate("missing_measure")],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -321,6 +343,8 @@ def bad_ordering_alias_plan: Fn() -> qb.Plan = fn() {
         grouping: [qb.column("o", "customer_id")],
         ordering: [qb.desc_aggregate("order count")],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     plan
 };
@@ -467,9 +491,1087 @@ export def transform_empty_bindings_when_no_dynamic_values = do {
         grouping: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     let q = qb.transform_sqlite(plan);
     array.length(q.bindings) == 0 && q.sql == "SELECT o.id FROM orders AS o"
+};
+
+# ---------------------------------------------------------------------------
+# Closed computed expression: first whitespace-delimited segment.
+#
+# Contract (SQLite `instr` semantics, 1-based, 0 when absent):
+#   - no delimiter : `instr(text, sep) = 0`, the `> 0` guard fails and the
+#                    ELSE branch returns the original value;
+#   - empty string : same as no delimiter -> empty string;
+#   - NULL input   : `instr(NULL, sep)` is NULL, `CASE WHEN NULL` selects the
+#                    ELSE branch, so NULL propagates unchanged.
+# The segment before the first delimiter is `substr(text, 1, instr - 1)`.
+# ---------------------------------------------------------------------------
+
+def first_token_expr: Fn(qb.Expr) -> qb.Expr = fn(command) {
+    let sep: qb.Expr = qb.bind_string(" ");
+    let pos: qb.Expr = qb.instr(command, sep);
+    let found: qb.Expr = qb.scalar('Gt, [pos, qb.bind_int(0)]);
+    let rest: qb.Expr = qb.sub(pos, qb.bind_int(1));
+    let segment: qb.Expr = qb.scalar_if(
+        found,
+        qb.substr([command, qb.bind_int(1), rest]),
+        command,
+    );
+    segment
+};
+
+def first_token_plan: Fn() -> qb.Plan = fn() {
+    let segment = first_token_expr(qb.column("c", "command"));
+    let plan: qb.Plan = {
+        revision: "test-first-token",
+        sources: [qb.source("c", "commands")],
+        projection: [
+            qb.expr_item(segment),
+            qb.aggregate('Count, qb.column("c", "id"), 'False, "uses"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [segment],
+        ordering: [qb.desc_aggregate("uses"), qb.asc(qb.column("c", "command"))],
+        limit: 'Some(100),
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_first_token_sql = "SELECT CASE WHEN instr(c.command, ?) > ? THEN substr(c.command, ?, (instr(c.command, ?) - ?)) ELSE c.command END, count(c.id) AS uses FROM commands AS c GROUP BY CASE WHEN instr(c.command, ?) > ? THEN substr(c.command, ?, (instr(c.command, ?) - ?)) ELSE c.command END ORDER BY count(c.id) DESC, c.command ASC LIMIT ?";
+
+def expected_first_token_bindings: Array(qb.Val) = [
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'String(" "), 'Int(0), 'Int(1), 'String(" "), 'Int(1),
+    'Int(100),
+];
+
+def bad_instr_arity_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-bad-instr-arity",
+        sources: [qb.source("c", "commands")],
+        projection: [qb.expr_item(qb.scalar('Instr, [qb.column("c", "command")]))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def bad_if_arity_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-bad-if-arity",
+        sources: [qb.source("c", "commands")],
+        projection: [
+            qb.expr_item(qb.scalar('If, [qb.column("c", "command"), qb.column("c", "command")])),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def bad_sub_arity_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-bad-sub-arity",
+        sources: [qb.source("c", "commands")],
+        projection: [
+            qb.expr_item(qb.scalar('Sub, [qb.bind_int(1), qb.bind_int(2), qb.bind_int(3)])),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def first_token_ordering_plan: Fn() -> qb.Plan = fn() {
+    let segment = first_token_expr(qb.column("c", "command"));
+    let plan: qb.Plan = {
+        revision: "test-first-token-order",
+        sources: [qb.source("c", "commands")],
+        projection: [qb.expr_item(qb.column("c", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(segment)],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+export def first_token_lowerings_to_guarded_substr = do {
+    let q = qb.transform_sqlite(first_token_plan());
+    q.sql == expected_first_token_sql && q.bindings == expected_first_token_bindings
+};
+
+export def first_token_dynamic_values_stay_in_bindings = do {
+    # The separator, guard and offsets are all `?` placeholders: no literal
+    # space, 0 or 1 is embedded in the SQL text.
+    let q = qb.transform_sqlite(first_token_plan());
+    !string.contains(q.sql, "' '")
+        && !string.contains(q.sql, " 1")
+        && !string.contains(q.sql, " 0")
+};
+
+export def first_token_else_returns_original_value = do {
+    # No delimiter, empty input and NULL input all select the ELSE branch,
+    # which returns the original column value.
+    let q = qb.transform_sqlite(first_token_plan());
+    string.contains(q.sql, "ELSE c.command")
+};
+
+export def first_token_segment_excludes_delimiter = do {
+    let q = qb.transform_sqlite(first_token_plan());
+    string.contains(q.sql, "substr(c.command, ?, (instr(c.command, ?) - ?))")
+};
+
+export def first_token_guards_with_instr_gt_zero = do {
+    let q = qb.transform_sqlite(first_token_plan());
+    string.contains(q.sql, "instr(c.command, ?) > ?")
+};
+
+export def first_token_usable_in_projection_grouping_ordering = do {
+    let projected = qb.transform_sqlite(first_token_plan());
+    let ordered = qb.transform_sqlite(first_token_ordering_plan());
+    string.contains(projected.sql, "CASE WHEN instr(c.command, ?)")
+        && string.contains(projected.sql, "GROUP BY CASE WHEN")
+        && string.contains(ordered.sql, "ORDER BY CASE WHEN instr(c.command, ?)")
+};
+
+export def first_token_placeholders_match_bindings = do {
+    let q = qb.transform_sqlite(first_token_plan());
+    (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def first_token_profile_accepts = do {
+    qb.profile_accepts(first_token_plan(), full_profile())
+};
+
+export def first_token_profile_rejects_without_scalars = do {
+    # `restricted_profile` allows only `Substr`, so Instr/If/Sub/Gt are rejected.
+    !qb.profile_accepts(first_token_plan(), restricted_profile())
+};
+
+export def first_token_rejects_bad_instr_arity = do {
+    !qb.structure_ok(bad_instr_arity_plan())
+};
+
+export def first_token_rejects_bad_if_arity = do {
+    !qb.structure_ok(bad_if_arity_plan())
+};
+
+export def first_token_rejects_bad_sub_arity = do {
+    !qb.structure_ok(bad_sub_arity_plan())
+};
+
+# ---------------------------------------------------------------------------
+# Safe pagination: non-negative offset with mandatory stable ordering.
+# ---------------------------------------------------------------------------
+
+def paged_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-paged",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'Some(qb.scalar('Gt, [qb.column("o", "total"), qb.bind_float(50.0)])),
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'Some(10),
+        offset: 'Some(20),
+        partition: 'None,
+    };
+    plan
+};
+
+def offset_only_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-offset-only",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'None,
+        offset: 'Some(5),
+        partition: 'None,
+    };
+    plan
+};
+
+def offset_zero_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-offset-zero",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'Some(10),
+        offset: 'Some(0),
+        partition: 'None,
+    };
+    plan
+};
+
+def offset_no_ordering_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-offset-no-order",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'Some(10),
+        offset: 'Some(5),
+        partition: 'None,
+    };
+    plan
+};
+
+def negative_offset_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-negative-offset",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("o", "id"))],
+        limit: 'Some(10),
+        offset: 'Some(-1),
+        partition: 'None,
+    };
+    plan
+};
+
+def no_offset_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Filter, 'Order, 'Limit],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr, 'Gt],
+        allow_distinct: 'True,
+    };
+    profile
+};
+
+export def pagination_lowerings_to_limit_offset = do {
+    let q = qb.transform_sqlite(paged_plan());
+    let expected: Array(qb.Val) = ['Float(50.0), 'Int(10), 'Int(20)];
+    q.sql == "SELECT o.id FROM orders AS o WHERE o.total > ? ORDER BY o.id ASC LIMIT ? OFFSET ?"
+        && q.bindings == expected
+};
+
+export def pagination_offset_without_limit_lowerings_to_limit_minus_one = do {
+    let q = qb.transform_sqlite(offset_only_plan());
+    let expected: Array(qb.Val) = ['Int(5)];
+    q.sql == "SELECT o.id FROM orders AS o ORDER BY o.id ASC LIMIT -1 OFFSET ?"
+        && q.bindings == expected
+};
+
+export def pagination_offset_zero_is_accepted_and_lowered = do {
+    let q = qb.transform_sqlite(offset_zero_plan());
+    let expected: Array(qb.Val) = ['Int(10), 'Int(0)];
+    q.sql == "SELECT o.id FROM orders AS o ORDER BY o.id ASC LIMIT ? OFFSET ?"
+        && q.bindings == expected
+};
+
+export def pagination_bindings_follow_placeholder_order = do {
+    let q = qb.transform_sqlite(paged_plan());
+    let q2 = qb.transform_sqlite(offset_zero_plan());
+    (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+        && (array.length(string.split(q2.sql, "?")) - 1) == array.length(q2.bindings)
+};
+
+export def pagination_requires_stable_ordering = do {
+    !qb.structure_ok(offset_no_ordering_plan())
+};
+
+export def pagination_rejects_negative_offset = do {
+    !qb.structure_ok(negative_offset_plan())
+};
+
+export def pagination_accepts_non_negative_offset = do {
+    qb.structure_ok(paged_plan()) && qb.structure_ok(offset_zero_plan())
+};
+
+export def pagination_operator_in_canonical_order = do {
+    let expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Filter,
+        'Order, 'Limit, 'Offset,
+    ];
+    qb.operators(paged_plan()) == expected
+};
+
+export def pagination_profile_rejects_without_offset_operator = do {
+    !qb.profile_accepts(paged_plan(), no_offset_profile())
+};
+
+export def pagination_profile_accepts_with_offset_operator = do {
+    qb.profile_accepts(paged_plan(), full_profile())
+};
+
+export def pagination_deterministic = do {
+    let q1 = qb.transform_sqlite(paged_plan());
+    let q2 = qb.transform_sqlite(paged_plan());
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+};
+
+# ---------------------------------------------------------------------------
+# Partitioned Top N.
+#
+# Success: partition by Role, keep the top 3 CommandHeads per Role by
+# EventCount desc, CommandHead asc.  `take` enters SQL as a bound `?`.
+# ---------------------------------------------------------------------------
+
+def top_per_role_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-top-per-role",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(qb.column("e", "command_head")),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "event_count"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "status"), qb.bind_string("failed")])),
+        joins: [],
+        grouping: [qb.column("e", "role"), qb.column("e", "command_head")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("event_count"), qb.asc(qb.column("e", "command_head"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def expected_top_per_role_sql = "SELECT __q_0, __q_1, event_count FROM (SELECT e.role AS __q_0, e.command_head AS __q_1, count(e.id) AS event_count, row_number() OVER (PARTITION BY e.role ORDER BY count(e.id) DESC, e.command_head ASC) AS __q_rn FROM events AS e WHERE e.status = ? GROUP BY e.role, e.command_head) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_0 ASC, event_count DESC, __q_1 ASC";
+
+def expected_top_per_role_bindings: Array(qb.Val) = ['String("failed"), 'Int(3)];
+
+def partition_bad_key_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-bad-key",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "status")],
+            [qb.asc(qb.column("e", "role"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def partition_bad_order_target_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-bad-order",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("missing_measure")],
+            3,
+        )),
+    };
+    plan
+};
+
+def partition_no_order_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-no-order",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [],
+            3,
+        )),
+    };
+    plan
+};
+
+def partition_no_tie_break_plan: Fn() -> qb.Plan = fn() {
+    # Non-partition grouping expression `command_head` is not covered by the
+    # partition ordering, so the tie-breaker is missing.
+    let plan: qb.Plan = {
+        revision: "test-partition-no-tiebreak",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(qb.column("e", "command_head")),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "event_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role"), qb.column("e", "command_head")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("event_count")],
+            3,
+        )),
+    };
+    plan
+};
+
+def partition_zero_take_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-zero-take",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.asc(qb.column("e", "role"))],
+            0,
+        )),
+    };
+    plan
+};
+
+def partition_over_cap_take_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-over-cap",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.asc(qb.column("e", "role"))],
+            qb.max_partition_take + 1,
+        )),
+    };
+    plan
+};
+
+def partition_negative_take_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-negative-take",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.asc(qb.column("e", "role"))],
+            -1,
+        )),
+    };
+    plan
+};
+
+def partition_with_limit_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-with-limit",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'Some(10),
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.asc(qb.column("e", "role"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def partition_with_offset_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-with-offset",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'Some(5),
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.asc(qb.column("e", "role"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def partition_with_global_order_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-partition-with-order",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [qb.asc(qb.column("e", "role"))],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.asc(qb.column("e", "role"))],
+            3,
+        )),
+    };
+    plan
+};
+
+# Partition by role with the computed first-token grouping expression used in
+# the partition-internal ordering; bindings stay deterministic.
+def computed_partition_plan: Fn() -> qb.Plan = fn() {
+    let token = first_token_expr(qb.column("c", "command"));
+    let plan: qb.Plan = {
+        revision: "test-computed-partition",
+        sources: [qb.source("c", "commands")],
+        projection: [
+            qb.expr_item(qb.column("c", "role")),
+            qb.expr_item(token),
+            qb.aggregate('Count, qb.column("c", "id"), 'False, "uses"),
+        ],
+        filter: 'Some(qb.scalar('Gt, [qb.column("c", "level"), qb.bind_int(5)])),
+        joins: [],
+        grouping: [qb.column("c", "role"), token],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("c", "role")],
+            [qb.desc_aggregate("uses"), qb.asc(token)],
+            2,
+        )),
+    };
+    plan
+};
+
+export def partition_lowers_to_row_number_subquery = do {
+    let q = qb.transform_sqlite(top_per_role_plan());
+    q.sql == expected_top_per_role_sql && q.bindings == expected_top_per_role_bindings
+};
+
+export def partition_keeps_fewer_than_take_rows = do {
+    # `__q_rn <= ?` keeps every partition with fewer than N rows; `take` is a
+    # bound value, never an inline literal.
+    let q = qb.transform_sqlite(top_per_role_plan());
+    string.contains(q.sql, "WHERE __q_rn <= ?")
+        && q.bindings[1] == 'Int(3)
+};
+
+export def partition_tie_breaker_in_ordering = do {
+    let q = qb.transform_sqlite(top_per_role_plan());
+    # measure DESC then the non-partition grouping expression ASC
+    string.contains(q.sql, "ORDER BY count(e.id) DESC, e.command_head ASC")
+        && string.contains(q.sql, "ORDER BY __q_0 ASC, event_count DESC, __q_1 ASC")
+};
+
+export def partition_operators_in_canonical_order = do {
+    let expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+        'Filter, 'Group, 'Order, 'Partition,
+    ];
+    qb.operators(top_per_role_plan()) == expected
+};
+
+export def partition_profile_accepts = do {
+    qb.profile_accepts(top_per_role_plan(), full_profile())
+};
+
+export def partition_profile_rejects_without_partition_operator = do {
+    let no_partition: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+            'Filter, 'Group, 'Order, 'Limit,
+        ],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr, 'Eq],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(top_per_role_plan(), no_partition)
+};
+
+export def partition_rejects_non_grouping_key = do {
+    !qb.structure_ok(partition_bad_key_plan())
+};
+
+export def partition_rejects_unselected_order_target = do {
+    !qb.structure_ok(partition_bad_order_target_plan())
+};
+
+export def partition_rejects_missing_ordering = do {
+    !qb.structure_ok(partition_no_order_plan())
+};
+
+export def partition_rejects_missing_tie_breaker = do {
+    !qb.structure_ok(partition_no_tie_break_plan())
+};
+
+export def partition_rejects_zero_take = do {
+    !qb.structure_ok(partition_zero_take_plan())
+};
+
+export def partition_rejects_over_cap_take = do {
+    !qb.structure_ok(partition_over_cap_take_plan())
+};
+
+export def partition_rejects_negative_take = do {
+    !qb.structure_ok(partition_negative_take_plan())
+};
+
+export def partition_rejects_global_limit_combination = do {
+    !qb.structure_ok(partition_with_limit_plan())
+};
+
+export def partition_rejects_global_offset_combination = do {
+    !qb.structure_ok(partition_with_offset_plan())
+};
+
+export def partition_rejects_global_ordering_combination = do {
+    !qb.structure_ok(partition_with_global_order_plan())
+};
+
+export def partition_accepts_valid_plan = do {
+    qb.structure_ok(top_per_role_plan()) && qb.structure_ok(computed_partition_plan())
+};
+
+export def partition_computed_ordering_bindings_deterministic = do {
+    let q = qb.transform_sqlite(computed_partition_plan());
+    let q2 = qb.transform_sqlite(computed_partition_plan());
+    q.sql == q2.sql && q.bindings == q2.bindings
+        && (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def partition_computed_ordering_uses_bindings_not_literals = do {
+    let q = qb.transform_sqlite(computed_partition_plan());
+    !string.contains(q.sql, "' '") && !string.contains(q.sql, " 0")
+};
+
+export def partition_computed_ordering_profile = do {
+    qb.profile_accepts(computed_partition_plan(), full_profile())
+};
+
+export def partition_deterministic = do {
+    let q1 = qb.transform_sqlite(top_per_role_plan());
+    let q2 = qb.transform_sqlite(top_per_role_plan());
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+};
+
+# ---------------------------------------------------------------------------
+# Filtered and computed aggregates.
+#
+# Filtered aggregates carry their own row-level predicate
+# (`count(id) FILTER (WHERE type = ?)`); the global WHERE limits the whole fact
+# set and is never merged into the per-aggregate predicates.
+# Computed aggregates combine declared aggregate aliases with Add/Sub; operands
+# must resolve to declared aggregate/computed items in the same projection and
+# the dependency graph must be acyclic.
+# ---------------------------------------------------------------------------
+
+def filtered_aggregate_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-filtered-agg",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_started")])),
+                "started_count"),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_completed")])),
+                "completed_count"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "year"), qb.bind_int(2024)])),
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def computed_aggregate_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-computed-agg",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_started")])),
+                "started_count"),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_completed")])),
+                "completed_count"),
+            qb.computed_item('Sub, "started_count", "completed_count", "outstanding"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "year"), qb.bind_int(2024)])),
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [qb.desc_aggregate("outstanding")],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_filtered_sql = "SELECT e.role, count(e.id) FILTER (WHERE e.type = ?) AS started_count, count(e.id) FILTER (WHERE e.type = ?) AS completed_count FROM events AS e WHERE e.year = ? GROUP BY e.role";
+
+def expected_computed_sql = "SELECT e.role, count(e.id) FILTER (WHERE e.type = ?) AS started_count, count(e.id) FILTER (WHERE e.type = ?) AS completed_count, (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) AS outstanding FROM events AS e WHERE e.year = ? GROUP BY e.role ORDER BY (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) DESC";
+
+def expected_filtered_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"), 'Int(2024),
+];
+
+def expected_computed_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'Int(2024),
+    'String("task_started"), 'String("task_completed"),
+];
+
+def computed_partition_net_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-computed-partition-net",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(qb.column("e", "command_head")),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_started")])),
+                "started_count"),
+            qb.aggregate_filtered('Count, qb.column("e", "id"), 'False,
+                'Some(qb.scalar('Eq, [qb.column("e", "type"), qb.bind_string("task_completed")])),
+                "completed_count"),
+            qb.computed_item('Sub, "started_count", "completed_count", "outstanding"),
+        ],
+        filter: 'Some(qb.scalar('Eq, [qb.column("e", "year"), qb.bind_int(2024)])),
+        joins: [],
+        grouping: [qb.column("e", "role"), qb.column("e", "command_head")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("outstanding"), qb.asc(qb.column("e", "command_head"))],
+            3,
+        )),
+    };
+    plan
+};
+
+def expected_computed_partition_sql = "SELECT __q_0, __q_1, started_count, completed_count, outstanding FROM (SELECT e.role AS __q_0, e.command_head AS __q_1, count(e.id) FILTER (WHERE e.type = ?) AS started_count, count(e.id) FILTER (WHERE e.type = ?) AS completed_count, (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) AS outstanding, row_number() OVER (PARTITION BY e.role ORDER BY (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) DESC, e.command_head ASC) AS __q_rn FROM events AS e WHERE e.year = ? GROUP BY e.role, e.command_head) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_0 ASC, outstanding DESC, __q_1 ASC";
+
+# Manually derived from the SQL text's placeholder order (see
+# partition_bindings_match_sql_placeholder_order):
+#   started_count FILTER, completed_count FILTER,
+#   computed left, computed right,
+#   window-order computed left, window-order computed right,
+#   global WHERE year, outer take
+def expected_computed_partition_bindings: Array(qb.Val) = [
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'String("task_started"), 'String("task_completed"),
+    'Int(2024),
+    'Int(3),
+];
+
+def computed_unknown_operand_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-computed-unknown",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.computed_item('Sub, "started_count", "missing_alias", "outstanding"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def computed_cycle_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-computed-cycle",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.computed_item('Sub, "b_count", "a_count", "c_count"),
+            qb.computed_item('Sub, "c_count", "a_count", "b_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def computed_alias_conflict_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-computed-alias-conflict",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "started_count"),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "started_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+export def filtered_aggregates_lower_with_filters = do {
+    let q = qb.transform_sqlite(filtered_aggregate_plan());
+    q.sql == expected_filtered_sql && q.bindings == expected_filtered_bindings
+};
+
+export def filtered_aggregates_not_merged_into_global_and = do {
+    # The global WHERE limits the whole fact set; each aggregate keeps its own
+    # FILTER predicate.  They are never merged into a single AND.
+    let q = qb.transform_sqlite(filtered_aggregate_plan());
+    string.contains(q.sql, "FILTER (WHERE e.type = ?)")
+        && string.contains(q.sql, "WHERE e.year = ?")
+        && !string.contains(q.sql, "AND e.type")
+};
+
+export def filtered_aggregates_binding_order = do {
+    # Bindings follow placeholder order: each FILTER's `?` then the global WHERE.
+    let q = qb.transform_sqlite(filtered_aggregate_plan());
+    (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+        && q.bindings[0] == 'String("task_started")
+        && q.bindings[2] == 'Int(2024)
+};
+
+export def computed_aggregate_lowers_with_arithmetic = do {
+    let q = qb.transform_sqlite(computed_aggregate_plan());
+    q.sql == expected_computed_sql && q.bindings == expected_computed_bindings
+};
+
+export def computed_aggregate_usable_in_ordering = do {
+    let q = qb.transform_sqlite(computed_aggregate_plan());
+    string.contains(q.sql, "ORDER BY (count(e.id) FILTER (WHERE e.type = ?) - count(e.id) FILTER (WHERE e.type = ?)) DESC")
+};
+
+export def computed_aggregate_placeholders_match_bindings = do {
+    let q = qb.transform_sqlite(computed_aggregate_plan());
+    (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def computed_aggregate_deterministic = do {
+    let q1 = qb.transform_sqlite(computed_aggregate_plan());
+    let q2 = qb.transform_sqlite(computed_aggregate_plan());
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+};
+
+export def computed_aggregate_with_partition_lowers = do {
+    let q = qb.transform_sqlite(computed_partition_net_plan());
+    q.sql == expected_computed_partition_sql
+        && q.bindings == expected_computed_partition_bindings
+};
+
+export def computed_aggregate_with_partition_profile = do {
+    qb.profile_accepts(computed_partition_net_plan(), full_profile())
+};
+
+export def partition_bindings_match_sql_placeholder_order = do {
+    # Independent regression assertion: the expected bindings are derived by
+    # reading the SQL text's `?` placeholders left-to-right, NOT from the
+    # implementation's group assembly.  The inner SQL text is
+    #   SELECT <projection>, <hidden>, row_number() OVER (PARTITION BY ...
+    #          ORDER BY window-order ...) FROM ... JOIN ... WHERE ... GROUP BY ...
+    # so the placeholder order is: projection, hidden, window partition/order,
+    # join, global filter, grouping, then the outer take.
+    let q = qb.transform_sqlite(computed_partition_net_plan());
+    let expected: Array(qb.Val) = [
+        'String("task_started"), 'String("task_completed"),
+        'String("task_started"), 'String("task_completed"),
+        'String("task_started"), 'String("task_completed"),
+        'Int(2024), 'Int(3),
+    ];
+    q.bindings == expected
+        && (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def computed_rejects_unknown_operand = do {
+    !qb.structure_ok(computed_unknown_operand_plan())
+};
+
+export def computed_rejects_dependency_cycle = do {
+    !qb.structure_ok(computed_cycle_plan())
+};
+
+export def computed_rejects_alias_conflict = do {
+    !qb.structure_ok(computed_alias_conflict_plan())
+};
+
+export def filtered_predicate_profile_reject = do {
+    # Allows Eq but not the scalar itself... this profile forbids the scalar.
+    let no_eq: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Aggregate, 'Filter, 'Group],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(filtered_aggregate_plan(), no_eq)
+};
+
+export def filtered_aggregate_consumes_filter_capability = do {
+    # A profile that allows the scalar `Eq` but forbids the `Filter` operator
+    # must still reject a filtered aggregate: the aggregate-local predicate is
+    # a Filter capability.
+    let eq_but_no_filter: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate, 'Group],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(filtered_aggregate_plan(), eq_but_no_filter)
+};
+
+export def computed_aggregates_profile_accepts = do {
+    qb.profile_accepts(computed_aggregate_plan(), full_profile())
+};
+
+def computed_add_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-computed-add",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "started_count"),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "completed_count"),
+            qb.computed_item('Add, "started_count", "completed_count", "total_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+export def computed_aggregate_rejects_missing_add_scalar = do {
+    # A `ComputedOp.Add` aggregate consumes `ScalarFunction.Add`; a profile
+    # without `Add` must reject it even though it allows `Scalar`.
+    let no_add: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate, 'Group],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq, 'Sub],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(computed_add_plan(), no_add)
+};
+
+export def computed_aggregate_rejects_missing_sub_scalar = do {
+    # A `ComputedOp.Sub` aggregate consumes `ScalarFunction.Sub`; a profile
+    # without `Sub` must reject it.
+    let no_sub: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate, 'Filter, 'Group, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq, 'Add],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(computed_aggregate_plan(), no_sub)
+};
+
+export def computed_aggregate_rejects_missing_scalar_operator = do {
+    let no_scalar: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Aggregate, 'Filter, 'Group, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq, 'Add, 'Sub],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(computed_aggregate_plan(), no_scalar)
 };
 
 # ---------------------------------------------------------------------------

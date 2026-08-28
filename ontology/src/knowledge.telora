@@ -12,6 +12,8 @@ import "@src/edsl" as edsl;
 
 def sum_agg: qb.AggregateFunction = 'Sum;
 def count_agg: qb.AggregateFunction = 'Count;
+def add_op: qb.ComputedOp = 'Add;
+def sub_op: qb.ComputedOp = 'Sub;
 def flag_true: Bool = 'True;
 def flag_false: Bool = 'False;
 def eq_ops: Array(edsl.FilterOp) = ['Eq];
@@ -22,10 +24,38 @@ def no_kinds: Array(edsl.FilterInputKind) = [];
 def safe_kind: edsl.RelationKind = 'Safe;
 def fanout_kind: edsl.RelationKind = 'FanOut;
 
+# Inherent scope of TraceHead: only rows whose kind is the stable value "run".
+# The explicit Array(ScopePredicate) contract gives the record literal its
+# nominal ScopePredicate identity at its construction point.
+def head_scope: Array(edsl.ScopePredicate) = [{field: 1, op: 'Eq, input: 'Text("run")}];
+
+# Inherent predicates of the filtered measures: mutually exclusive conditions
+# over the closed TraceKind domain (kind = "run" / kind = "skip").
+def run_predicate: edsl.ScopePredicate = {field: 1, op: 'Eq, input: 'Text("run")};
+def skip_predicate: edsl.ScopePredicate = {field: 1, op: 'Eq, input: 'Text("skip")};
+
+# Non-Timeline conditional-count predicates over the closed ApprovalStatus
+# domain (approval status), proving the capability is not keyed to
+# Trace/EventType names or data shapes.
+def approved_predicate: edsl.ScopePredicate = {field: 1, op: 'Eq, input: 'Text("approved")};
+def rejected_predicate: edsl.ScopePredicate = {field: 1, op: 'Eq, input: 'Text("rejected")};
+
 # Canonical computed dimension: Substr(created_at, 1, 7). The literals are
 # lowered to bound values at plan-build time; no pre-rendered SQL is stored.
 def week_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
     qb.substr([col, qb.bind_int(1), qb.bind_int(7)])
+};
+
+# Computed dimension built from the closed query scalars 'Instr, 'If, 'Gt,
+# 'Sub and 'Substr: the first whitespace-delimited segment of a text column.
+# All constants stay parameterized binds; the same expression is stable across
+# projection, grouping and ordering.
+def head_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
+    let sep: qb.Expr = qb.bind_string(" ");
+    let pos: qb.Expr = qb.instr(col, sep);
+    let found: qb.Expr = qb.scalar('Gt, [pos, qb.bind_int(0)]);
+    let rest: qb.Expr = qb.sub(pos, qb.bind_int(1));
+    qb.scalar_if(found, qb.substr([col, qb.bind_int(1), rest]), col)
 };
 
 # --- Entity declarations -----------------------------------------------------
@@ -111,6 +141,72 @@ type Item = struct {
     order_id: Int,
 };
 
+# Traces are a standalone grain demonstrating the closed computed-expression
+# and scope mechanisms: TraceHead is a computed dimension over `label` whose
+# inherent scope restricts rows to kind=run. Callers selecting TraceHead get
+# the scope for free; a contradictory user filter fails atomically.
+# Canonical (alphabetical) field order: 0: id (key), 1: kind (enum dimension),
+# 2: label (computed dimension base), 3: owner (dimension).
+type TraceKind = enum {
+    @edsl.enum_value("run", "Run event")
+    'Run,
+    @edsl.enum_value("skip", "Skip event")
+    'Skip,
+};
+
+@edsl.entity_source("traces", "t")
+type Trace = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("TraceCount", count_agg, requires_none)
+    @edsl.filtered_measure("TraceRunCount", count_agg, requires_none, run_predicate)
+    @edsl.filtered_measure("TraceSkipCount", count_agg, requires_none, skip_predicate)
+    @edsl.computed_measure("TraceTotal", add_op, "TraceRunCount", "TraceSkipCount")
+    @edsl.computed_measure("TraceDelta", sub_op, "TraceRunCount", "TraceSkipCount")
+    id: Int,
+    @edsl.column("kind")
+    @edsl.dimension("TraceKind", flag_true, flag_true, eq_ops, text_kinds)
+    kind: TraceKind,
+    @edsl.column("label")
+    @edsl.computed_dimension("TraceHead", flag_true, flag_true, eq_ops, text_kinds, head_builder)
+    @edsl.scope(head_scope)
+    label: String,
+    @edsl.column("owner")
+    @edsl.dimension("TraceOwner", flag_true, flag_true, eq_ops, text_kinds)
+    owner: String,
+};
+
+# Approvals demonstrate the conditional-count / computed-net capability in a
+# non-Timeline domain (approval status), proving it is not hardcoded to
+# Trace/EventType names or shapes. Both 'Add and 'Sub go through the public
+# filtered/computed lowering path.
+# Canonical (alphabetical) field order: 0: id (key), 1: status (enum
+# dimension), 2: subject (dimension).
+type ApprovalStatus = enum {
+    @edsl.enum_value("approved", "Approved")
+    'Approved,
+    @edsl.enum_value("rejected", "Rejected")
+    'Rejected,
+};
+
+@edsl.entity_source("approvals", "a")
+type Approval = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("ApprovalCount", count_agg, requires_none)
+    @edsl.filtered_measure("ApprovalApprovedCount", count_agg, requires_none, approved_predicate)
+    @edsl.filtered_measure("ApprovalRejectedCount", count_agg, requires_none, rejected_predicate)
+    @edsl.computed_measure("ApprovalNet", sub_op, "ApprovalApprovedCount", "ApprovalRejectedCount")
+    @edsl.computed_measure("ApprovalTotal", add_op, "ApprovalApprovedCount", "ApprovalRejectedCount")
+    id: Int,
+    @edsl.column("status")
+    @edsl.dimension("ApprovalStatus", flag_true, flag_true, eq_ops, text_kinds)
+    status: ApprovalStatus,
+    @edsl.column("subject")
+    @edsl.dimension("ApprovalSubject", flag_true, flag_true, eq_ops, text_kinds)
+    subject: String,
+};
+
 # --- PlanProfile accepted by this knowledge ----------------------------------
 
 def requires_none: Array(Type) = [];
@@ -120,11 +216,14 @@ def requires_order_customer: Array(Type) = [Order, Customer];
 def profile: qb.PlanProfile = {
     allowed_operators: [
         'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
-        'Filter, 'Join, 'Group, 'Order, 'Limit,
+        'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset, 'Partition,
     ],
     allowed_join_kinds: ['Inner, 'Left],
     allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
-    allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+    allowed_scalars: [
+        'Substr, 'Instr, 'If, 'Add, 'Sub,
+        'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
+    ],
     allow_distinct: 'True,
 };
 
@@ -137,7 +236,7 @@ def authorize: Fn(String) -> Bool = fn(subject) {
 # --- Prepared payload (computed once at module load) -------------------------
 
 def payload: edsl.PreparedPayload = do {
-    let entity_types: Array(Type) = [Order, Customer, Item];
+    let entity_types: Array(Type) = [Order, Customer, Item, Trace, Approval];
     let result: edsl.PreparedPayload = edsl.build_root(
         "fictional-v2",
         entity_types,
@@ -152,6 +251,10 @@ export {
     Customer,
     CustomerTier,
     Item,
+    Trace,
+    TraceKind,
+    Approval,
+    ApprovalStatus,
     profile,
     payload,
 };

@@ -101,13 +101,14 @@ def aggregate_alias_count: Fn(Array(qb.SelectItem), String) -> Int = fn(items, a
         match item {
             'Aggregate(agg) => agg.alias == alias,
             'Expr(_) => 'False,
+            'Computed(_) => 'False,
         }
     }))
 };
 
 def expr_item_count: Fn(Array(qb.SelectItem)) -> Int = fn(items) {
     array.length(array.filter(items, fn(item) {
-        match item { 'Expr(_) => 'True, 'Aggregate(_) => 'False }
+        match item { 'Expr(_) => 'True, 'Aggregate(_) => 'False, 'Computed(_) => 'False }
     }))
 };
 
@@ -184,6 +185,8 @@ def main_request: edsl.QueryRequest = {
         { target: 'Dimension("OrderRegion"), direction: 'Asc },
     ],
     limit: 'Some(5),
+    offset: 'None,
+    partition: 'None,
 };
 
 def unprojected_filter_request: edsl.QueryRequest = {
@@ -198,6 +201,8 @@ def unprojected_filter_request: edsl.QueryRequest = {
     ],
     ordering: [],
     limit: 'None,
+    offset: 'None,
+    partition: 'None,
 };
 
 # Closed-enum dimension request: filters CustomerTier by a legal stable value.
@@ -213,6 +218,8 @@ def enum_request: edsl.QueryRequest = {
     ],
     ordering: [],
     limit: 'Some(2),
+    offset: 'None,
+    partition: 'None,
 };
 
 # Open String dimension request (compatibility with the existing open
@@ -229,6 +236,8 @@ def open_string_request: edsl.QueryRequest = {
     ],
     ordering: [],
     limit: 'None,
+    offset: 'None,
+    partition: 'None,
 };
 
 # ---------------------------------------------------------------------------
@@ -261,16 +270,28 @@ def check_knowledge_entries: Bool = do {
     let has_cust = array.any(measure_ids, fn(id) { id == "CustomerCount" });
     let has_item = array.any(measure_ids, fn(id) { id == "ItemAmount" });
     let has_item_qty = array.any(measure_ids, fn(id) { id == "ItemQty" });
+    let has_trace = array.any(measure_ids, fn(id) { id == "TraceCount" });
+    let has_run = array.any(measure_ids, fn(id) { id == "TraceRunCount" });
+    let has_skip = array.any(measure_ids, fn(id) { id == "TraceSkipCount" });
+    let has_total = array.any(measure_ids, fn(id) { id == "TraceTotal" });
+    let has_delta = array.any(measure_ids, fn(id) { id == "TraceDelta" });
+    let has_approval = array.any(measure_ids, fn(id) { id == "ApprovalCount" })
+        && array.any(measure_ids, fn(id) { id == "ApprovalApprovedCount" })
+        && array.any(measure_ids, fn(id) { id == "ApprovalRejectedCount" })
+        && array.any(measure_ids, fn(id) { id == "ApprovalNet" })
+        && array.any(measure_ids, fn(id) { id == "ApprovalTotal" });
     let dim_ids = array.map(p.dimensions, fn(d) { d.id });
     let dims_ok = array.all([
-        "OrderId", "OrderRegion", "OrderWeek", "CustomerName", "CustomerTier", "CustomerContact",
+        "OrderId", "OrderRegion", "OrderWeek", "CustomerName", "CustomerTier",
+        "CustomerContact", "TraceKind", "TraceHead", "TraceOwner",
+        "ApprovalStatus", "ApprovalSubject",
     ], fn(id) { array.any(dim_ids, fn(d) { d == id }) });
     let contact = array.find(p.dimensions, fn(d) { d.id == "CustomerContact" });
     let contact_unauthorized = match contact {
         'Some(d) => !d.authorized,
         'None => 'False,
     };
-    check(has_amount && has_count && has_cust && has_item && has_item_qty, "knowledge measures collected")
+    check(has_amount && has_count && has_cust && has_item && has_item_qty && has_trace && has_run && has_skip && has_total && has_delta && has_approval, "knowledge measures collected")
         && check(dims_ok, "knowledge dimensions collected")
         && check(contact_unauthorized, "known dimension CustomerContact exists but is not authorized")
 };
@@ -360,6 +381,8 @@ def check_measure_required_joins: Bool = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     let p1: qb.Plan = edsl.lower(knowledge.payload, item_only);
     # ItemQty (item grain) requires Order and Customer: two safe joins.
@@ -369,6 +392,8 @@ def check_measure_required_joins: Bool = do {
         filters: [],
         ordering: [],
         limit: 'None,
+        offset: 'None,
+        partition: 'None,
     };
     let p2: qb.Plan = edsl.lower(knowledge.payload, item_qty);
     let join1_ok = array.length(p1.joins) == 1;
@@ -392,7 +417,7 @@ def check_cross_module_prepared: Bool = do {
         'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
         _ => 'False,
     };
-    let entities_ok = array.length(p.entities) == 3;
+    let entities_ok = array.length(p.entities) == 5;
     check(auth_ok, "cross-module: published authorization closure works")
         && check(computed_ok, "cross-module: published computed-dimension closure works")
         && check(entities_ok, "cross-module: published entity index available")
@@ -461,6 +486,359 @@ def check_enum_determinism: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Requests and checks for the closed computed-expression, pagination and
+# scope capabilities.
+# ---------------------------------------------------------------------------
+
+# TraceHead is a computed dimension over t.label (first whitespace-delimited
+# segment via 'Instr/'If/'Sub/'Substr) with an inherent scope on t.kind.
+def trace_head_request: edsl.QueryRequest = {
+    measures: [{ id: "TraceCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "TraceHead", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Dimension("TraceHead"), direction: 'Asc }],
+    limit: 'Some(3),
+    offset: 'None,
+    partition: 'None,
+};
+
+# Pagination: stable deterministic ordering is required so pages repeat.
+def paginated_request: edsl.QueryRequest = {
+    measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Measure("OrderAmount"), direction: 'Desc }],
+    limit: 'Some(5),
+    offset: 'Some(10),
+    partition: 'None,
+};
+
+# Scope + user filter: the inherent scope predicate must merge before the
+# user filter, deterministically, with both values parameterized.
+def scope_request: edsl.QueryRequest = {
+    measures: [{ id: "TraceCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "TraceHead", subject: "analyst", input: 'None }],
+    filters: [{ id: "TraceOwner", subject: "analyst", op: 'Eq, input: 'Text("alice") }],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def is_head_expr: Fn(qb.Expr) -> Bool = fn(e) {
+    match e {
+        'Scalar(call) => call.function == 'If && array.length(call.args) == 3,
+        _ => 'False,
+    }
+};
+
+# Matches Eq(column(source "t", column), Bind(value)).
+def is_eq_bind: Fn(qb.Expr, String, qb.Val) -> Bool = fn(e, column, value) {
+    match e {
+        'Scalar(call) => call.function == 'Eq
+            && array.length(call.args) == 2
+            && (match get_expr(call.args, 0) {
+                'Column(ref) => ref.source == "t" && ref.column == column,
+                _ => 'False,
+            })
+            && (match get_expr(call.args, 1) { 'Bind(v) => v == value, _ => 'False }),
+        _ => 'False,
+    }
+};
+
+def check_computed_dimension: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, trace_head_request);
+    let proj_ok = array.any(plan.projection, fn(item) {
+        match item { 'Expr(e) => is_head_expr(e), 'Aggregate(_) => 'False, 'Computed(_) => 'False }
+    });
+    let group_ok = array.length(plan.grouping) == 1 && is_head_expr(get_expr(plan.grouping, 0));
+    let order_ok = array.length(plan.ordering) == 1 && (match get_index(plan.ordering, 0).key {
+        'Expr(e) => is_head_expr(e),
+        'AggregateRef(_) => 'False,
+    });
+    let scope_ok = match plan.filter {
+        'Some(f) => is_eq_bind(f, "kind", 'String("run")),
+        'None => 'False,
+    };
+    check(proj_ok, "computed dimension: new-scalar expression in projection")
+        && check(group_ok, "computed dimension: same expression in grouping")
+        && check(order_ok, "computed dimension: same expression in ordering")
+        && check(scope_ok, "computed dimension: inherent scope lowers to Eq on t.kind with bind")
+};
+
+def check_pagination: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, paginated_request);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let plan2: qb.Plan = edsl.lower(knowledge.payload, paginated_request);
+    let q2: qb.Query = qb.transform_sqlite(plan2);
+    let offset_ok = plan.offset == 'Some(10);
+    let last_ok = match array.get(query.bindings, array.length(query.bindings) - 1) {
+        'Some(v) => v == 'Int(10),
+        'None => 'False,
+    };
+    let det_ok = plan == plan2 && query.sql == q2.sql && query.bindings == q2.bindings;
+    check(offset_ok, "pagination: offset lowers to Plan.offset")
+        && check(last_ok, "pagination: offset is the last ordered binding")
+        && check(det_ok, "pagination: repeated lowering is byte-identical")
+};
+
+def check_scope_declared: Bool = do {
+    let p = knowledge.payload;
+    let head = match array.find(p.dimensions, fn(d) { d.id == "TraceHead" }) {
+        'Some(d) => d,
+        'None => fail!("TraceHead dimension missing"),
+    };
+    let scope_ok = array.length(head.scope) == 1
+        && get_index(head.scope, 0).field == 1
+        && get_index(head.scope, 0).op == 'Eq
+        && get_index(head.scope, 0).input == 'Text("run");
+    check(scope_ok, "scope: TraceHead publishes its inherent scope predicate")
+};
+
+def check_scope_merge: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, scope_request);
+    let merge_ok = match plan.filter {
+        'Some('Scalar(call)) => call.function == 'And
+            && array.length(call.args) == 2
+            && is_eq_bind(get_expr(call.args, 0), "kind", 'String("run"))
+            && is_eq_bind(get_expr(call.args, 1), "owner", 'String("alice")),
+        _ => 'False,
+    };
+    check(merge_ok, "scope: scope predicate merges before the user filter, both parameterized")
+};
+
+# ---------------------------------------------------------------------------
+# Requests and checks for Top Per Group and filtered/computed measures.
+# ---------------------------------------------------------------------------
+
+# Per-region Top 2 by amount, tie-broken by the computed week dimension.
+def top_per_region_request: edsl.QueryRequest = {
+    measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+        { id: "OrderWeek", subject: "analyst", input: 'None },
+    ],
+    filters: [],
+    ordering: [
+        { target: 'Measure("OrderAmount"), direction: 'Desc },
+        { target: 'Dimension("OrderWeek"), direction: 'Asc },
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({ by: ["OrderRegion"], take: 2 }),
+};
+
+# Filtered measures: mutually exclusive counts over the closed TraceKind domain.
+def filtered_measure_request: edsl.QueryRequest = {
+    measures: [
+        { id: "TraceRunCount", subject: "analyst", input: 'All },
+        { id: "TraceSkipCount", subject: "analyst", input: 'All },
+    ],
+    dimensions: [{ id: "TraceOwner", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+# Global filter + measure inherent predicate: the global filter stays in the
+# global WHERE and the inherent predicate stays in the aggregate FILTER; they
+# must not be flattened into a conflicting global AND (wrong empty set).
+def filtered_with_global_request: edsl.QueryRequest = {
+    measures: [{ id: "TraceRunCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "TraceOwner", subject: "analyst", input: 'None }],
+    filters: [{ id: "TraceOwner", subject: "analyst", op: 'Eq, input: 'Text("alice") }],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+# Computed measures (both 'Add and 'Sub) with ordinary ordering.
+def computed_measure_request: edsl.QueryRequest = {
+    measures: [
+        { id: "TraceTotal", subject: "analyst", input: 'All },
+        { id: "TraceDelta", subject: "analyst", input: 'All },
+    ],
+    dimensions: [{ id: "TraceOwner", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Measure("TraceDelta"), direction: 'Desc }],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+# Top Per Group ordered by a computed measure.
+def top_per_group_computed_request: edsl.QueryRequest = {
+    measures: [{ id: "TraceDelta", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "TraceOwner", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Measure("TraceDelta"), direction: 'Desc }],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({ by: ["TraceOwner"], take: 2 }),
+};
+
+def is_week_expr: Fn(qb.Expr) -> Bool = fn(e) {
+    match e {
+        'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
+        _ => 'False,
+    }
+};
+
+def aggregate_alias: Fn(qb.SelectItem, String) -> Bool = fn(item, alias) {
+    match item { 'Aggregate(agg) => agg.alias == alias, _ => 'False }
+};
+
+def is_filtered_aggregate: Fn(qb.SelectItem, String) -> Bool = fn(item, alias) {
+    match item {
+        'Aggregate(agg) => agg.alias == alias && (match agg.filter {
+            'Some('Scalar(call)) => call.function == 'Eq
+                && array.length(call.args) == 2
+                && is_column(get_expr(call.args, 0), "t", "kind")
+                && is_bind(get_expr(call.args, 1)),
+            _ => 'False,
+        }),
+        _ => 'False,
+    }
+};
+
+def check_top_per_group: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, top_per_region_request);
+    let part_ok = match plan.partition {
+        'Some(p) => array.length(p.partition_by) == 1
+            && is_column(get_expr(p.partition_by, 0), "o", "region")
+            && array.length(p.order_by) == 2
+            && (match get_index(p.order_by, 0).key {
+                'AggregateRef(ref) => ref.alias == "OrderAmount",
+                _ => 'False,
+            })
+            && (match get_index(p.order_by, 0).direction { 'Desc => 'True, 'Asc => 'False })
+            && (match get_index(p.order_by, 1).key {
+                'Expr(e) => is_week_expr(e),
+                _ => 'False,
+            })
+            && p.take == 2,
+        'None => 'False,
+    };
+    let global_ok = array.length(plan.ordering) == 0 && plan.limit == 'None && plan.offset == 'None;
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(part_ok, "top per group: per-region top 2 lowers to Plan.partition with stable order_by")
+        && check(global_ok, "top per group: no global ordering/limit/offset is combined")
+};
+
+def check_filtered_measure: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, filtered_measure_request);
+    let has_run = array.any(plan.projection, fn(item) { is_filtered_aggregate(item, "TraceRunCount") });
+    let has_skip = array.any(plan.projection, fn(item) { is_filtered_aggregate(item, "TraceSkipCount") });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(has_run && has_skip, "filtered measure: inherent predicate lowers to FILTER on each aggregate")
+};
+
+def check_filtered_global_separation: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, filtered_with_global_request);
+    let global_ok = match plan.filter {
+        'Some(f) => is_eq_bind(f, "owner", 'String("alice")),
+        'None => 'False,
+    };
+    let filtered_ok = array.any(plan.projection, fn(item) { is_filtered_aggregate(item, "TraceRunCount") });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(global_ok, "filtered measure: global filter stays a single global Eq on the user filter")
+        && check(filtered_ok, "filtered measure: inherent predicate stays in the aggregate FILTER, not merged")
+};
+
+# Non-Timeline domain proof: approval-status conditional counts and their
+# Add/Sub composition go through the same public filtered/computed lowering path
+# (the capability is not keyed to Trace/EventType names or data shapes).
+def approval_request: edsl.QueryRequest = {
+    measures: [
+        { id: "ApprovalApprovedCount", subject: "analyst", input: 'All },
+        { id: "ApprovalRejectedCount", subject: "analyst", input: 'All },
+        { id: "ApprovalNet", subject: "analyst", input: 'All },
+        { id: "ApprovalTotal", subject: "analyst", input: 'All },
+    ],
+    dimensions: [{ id: "ApprovalStatus", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Measure("ApprovalNet"), direction: 'Desc }],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_non_timeline_measures: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, approval_request);
+    let approved_ok = array.any(plan.projection, fn(item) {
+        match item {
+            'Aggregate(agg) => agg.alias == "ApprovalApprovedCount" && (match agg.filter {
+                'Some('Scalar(call)) => call.function == 'Eq
+                    && array.length(call.args) == 2
+                    && is_column(get_expr(call.args, 0), "a", "status")
+                    && (match get_expr(call.args, 1) { 'Bind('String("approved")) => 'True, _ => 'False }),
+                _ => 'False,
+            }),
+            _ => 'False,
+        }
+    });
+    let net_ok = array.any(plan.projection, fn(item) {
+        match item { 'Computed(c) => c.alias == "ApprovalNet" && c.op == 'Sub && c.left == "ApprovalApprovedCount" && c.right == "ApprovalRejectedCount", _ => 'False }
+    });
+    let total_ok = array.any(plan.projection, fn(item) {
+        match item { 'Computed(c) => c.alias == "ApprovalTotal" && c.op == 'Add && c.left == "ApprovalApprovedCount" && c.right == "ApprovalRejectedCount", _ => 'False }
+    });
+    let order_ok = array.length(plan.ordering) == 1 && (match get_index(plan.ordering, 0).key {
+        'AggregateRef(ref) => ref.alias == "ApprovalNet",
+        _ => 'False,
+    });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(approved_ok, "non-timeline: approval approved count lowers with its inherent FILTER")
+        && check(net_ok && total_ok, "non-timeline: approval net (Sub) and total (Add) lower through the public path")
+        && check(order_ok, "non-timeline: approval computed measure participates in ordering")
+};
+
+def check_computed_measure: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, computed_measure_request);
+    let deps_projected = array.any(plan.projection, fn(item) { aggregate_alias(item, "TraceRunCount") })
+        && array.any(plan.projection, fn(item) { aggregate_alias(item, "TraceSkipCount") });
+    let add_ok = array.any(plan.projection, fn(item) {
+        match item {
+            'Computed(c) => c.op == 'Add && c.left == "TraceRunCount" && c.right == "TraceSkipCount" && c.alias == "TraceTotal",
+            _ => 'False,
+        }
+    });
+    let sub_ok = array.any(plan.projection, fn(item) {
+        match item {
+            'Computed(c) => c.op == 'Sub && c.left == "TraceRunCount" && c.right == "TraceSkipCount" && c.alias == "TraceDelta",
+            _ => 'False,
+        }
+    });
+    let order_ok = array.length(plan.ordering) == 1 && (match get_index(plan.ordering, 0).key {
+        'AggregateRef(ref) => ref.alias == "TraceDelta",
+        _ => 'False,
+    });
+    check(deps_projected, "computed measure: dependencies are projected")
+        && check(add_ok && sub_ok, "computed measure: both 'Add and 'Sub lower over the dependency aliases")
+        && check(order_ok, "computed measure: computed measure participates in ordinary ordering")
+};
+
+def check_top_per_group_computed: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, top_per_group_computed_request);
+    let computed_projected = array.any(plan.projection, fn(item) {
+        match item { 'Computed(c) => c.alias == "TraceDelta", _ => 'False }
+    });
+    let part_ok = match plan.partition {
+        'Some(p) => array.length(p.order_by) == 1
+            && (match get_index(p.order_by, 0).key {
+                'AggregateRef(ref) => ref.alias == "TraceDelta",
+                _ => 'False,
+            })
+            && p.take == 2,
+        'None => 'False,
+    };
+    check(computed_projected && part_ok, "top per group: computed measure is a stable partition ordering target")
+};
+
+# ---------------------------------------------------------------------------
 # Entry.
 # ---------------------------------------------------------------------------
 
@@ -482,5 +860,15 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     let c15 = check_enum_filter;
     let c16 = check_open_string_dimension;
     let c17 = check_enum_determinism;
+    let c18 = check_computed_dimension;
+    let c19 = check_pagination;
+    let c20 = check_scope_declared;
+    let c21 = check_scope_merge;
+    let c22 = check_top_per_group;
+    let c23 = check_filtered_measure;
+    let c24 = check_computed_measure;
+    let c25 = check_top_per_group_computed;
+    let c26 = check_filtered_global_separation;
+    let c27 = check_non_timeline_measures;
     'String("verify ok")
 };

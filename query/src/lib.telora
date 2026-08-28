@@ -50,12 +50,21 @@ type ColumnRef = struct {
     column: String,
 };
 
-# ScalarFunction is the closed scalar vocabulary for this round.  `Substr` is
-# the required SQLite scalar (`substr(value, start[, length])`); the remaining
-# variants are operator-style scalar predicates/logic rendered with SQLite
-# operator syntax.  Semantics never change with the profile or the caller.
+# ScalarFunction is the closed scalar vocabulary.  `Substr` is the required
+# SQLite scalar (`substr(value, start[, length])`); `Instr` finds the first
+# occurrence of a needle (`instr(haystack, needle)`, 1-based, 0 when absent);
+# `If` is the conditional (`CASE WHEN cond THEN t ELSE e END`); `Add`/`Sub`
+# are the necessary integer arithmetic primitives.  The remaining variants are
+# operator-style scalar predicates/logic rendered with SQLite operator syntax.
+# The AST is closed: no raw SQL fragment, no arbitrary function name/operator
+# and no identifier can escape through this vocabulary.  Semantics never
+# change with the profile or the caller.
 type ScalarFunction = enum {
     'Substr,
+    'Instr,
+    'If,
+    'Add,
+    'Sub,
     'Eq,
     'Ne,
     'Lt,
@@ -86,16 +95,37 @@ type AggregateFunction = enum {
     'Max,
 };
 
+# `filter` is the aggregate-local row predicate (SQLite
+# `FILTER (WHERE ...)`).  It only narrows this aggregate's input rows and is
+# never merged into the global WHERE.  The predicate reuses the closed Expr,
+# profile, arity, identifier and binding boundaries.
 type AggregateCall = struct {
     function: AggregateFunction,
     arg: Expr,
     distinct: Bool,
+    filter: Option(Expr),
+    alias: String,
+};
+
+# v1 computed aggregate: a restricted arithmetic combination of declared
+# aggregates, referenced by their output alias.  Leaves must resolve to
+# aggregate/computed items in the same projection; dependencies must be acyclic.
+type ComputedOp = enum {
+    'Add,
+    'Sub,
+};
+
+type ComputedAggregate = struct {
+    op: ComputedOp,
+    left: String,
+    right: String,
     alias: String,
 };
 
 type SelectItem = enum {
     'Expr(Expr),
     'Aggregate(AggregateCall),
+    'Computed(ComputedAggregate),
 };
 
 # ---------------------------------------------------------------------------
@@ -155,6 +185,20 @@ type Plan = struct {
     grouping: Array(Expr),
     ordering: Array(OrderBy),
     limit: Option(Int),
+    offset: Option(Int),
+    partition: Option(PartitionedTopN),
+};
+
+# Restricted partitioned Top N stage.  It runs after filter, join, group and
+# aggregate: within each partition (a subset of the selected grouping
+# expressions) the stable ordering keeps the top `take` rows.  The public AST
+# stays closed: no arbitrary window function, frame, raw SQL or identifier
+# escape; the SQLite lowering uses a single `row_number() over (partition by ...)`
+# subquery internally.
+type PartitionedTopN = struct {
+    partition_by: Array(Expr),
+    order_by: Array(OrderBy),
+    take: Int,
 };
 
 # ---------------------------------------------------------------------------
@@ -173,7 +217,13 @@ type Operator = enum {
     'Group,
     'Order,
     'Limit,
+    'Offset,
+    'Partition,
 };
+
+# Upper bound for `PartitionedTopN.take`.  `take` must be a positive integer
+# within this cap and always enters the SQL through a `?` binding.
+def max_partition_take = 1000;
 
 type PlanProfile = struct {
     allowed_operators: Array(Operator),
@@ -228,10 +278,27 @@ def exprs_operators: Fn(Array(Expr)) -> Array(Operator) = fn(exprs) {
     array.fold(exprs, empty, fn(acc, expr) { ops_union(acc, expr_operators(expr)) })
 };
 
+def aggregate_operators: Fn(AggregateCall) -> Array(Operator) = fn(call) {
+    # An aggregate-local predicate is a Filter capability: it narrows that
+    # aggregate's input rows, so a profile that forbids Filter must reject it.
+    let base = ops_union(expr_operators(call.arg), ['Aggregate]);
+    match call.filter {
+        'Some(expr) => ops_union(ops_union(base, expr_operators(expr)), ['Filter]),
+        'None => base,
+    }
+};
+
 def select_item_operators: Fn(SelectItem) -> Array(Operator) = fn(item) {
     match item {
         'Expr(expr) => expr_operators(expr),
-        'Aggregate(call) => ops_union(expr_operators(call.arg), ['Aggregate]),
+        'Aggregate(call) => aggregate_operators(call),
+        # A computed aggregate consumes the Scalar capability (the restricted
+        # Add/Sub arithmetic over aggregates); the operand aggregate items are
+        # counted separately and must be projection items.
+        'Computed(_) => {
+            let empty: Array(Operator) = [];
+            ops_union(empty, ['Scalar])
+        },
     }
 };
 
@@ -254,6 +321,12 @@ def joins_operators: Fn(Array(Join)) -> Array(Operator) = fn(joins) {
     })
 };
 
+# The canonical operator vocabulary order documented for this crate.
+def canonical_operators: Array(Operator) = [
+    'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+    'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset, 'Partition,
+];
+
 # Returns the set of standard operators used by a plan, in canonical vocabulary
 # order.  `operators(plan) <= profile.allowed_operators` is the subset check.
 def operators: Fn(Plan) -> Array(Operator) = fn(plan) {
@@ -267,25 +340,40 @@ def operators: Fn(Plan) -> Array(Operator) = fn(plan) {
         ops_union(acc, select_item_operators(item))
     });
     let with_filter = match plan.filter {
-        'Some(expr) => ops_union(ops_union(with_items, ['Filter]), expr_operators(expr)),
+        'Some(expr) => ops_union(ops_union(with_items, expr_operators(expr)), ['Filter]),
         'None => with_items,
     };
     let with_joins = ops_union(with_filter, joins_operators(plan.joins));
     let with_group = if array.length(plan.grouping) > 0 {
-        ops_union(ops_union(with_joins, ['Group]), exprs_operators(plan.grouping))
+        ops_union(ops_union(with_joins, exprs_operators(plan.grouping)), ['Group])
     } else {
         with_joins
     };
     let with_order = if array.length(plan.ordering) > 0 {
-        ops_union(ops_union(with_group, ['Order]), ordering_operators(plan.ordering))
+        ops_union(ops_union(with_group, ordering_operators(plan.ordering)), ['Order])
     } else {
         with_group
     };
-    if plan.limit != 'None {
+    let with_limit = if plan.limit != 'None {
         ops_union(with_order, ['Limit])
     } else {
         with_order
-    }
+    };
+    let with_offset = if plan.offset != 'None {
+        ops_union(with_limit, ['Offset])
+    } else {
+        with_limit
+    };
+    let used = match plan.partition {
+        'Some(pt) => {
+            let with_window_order = ops_union(with_offset, ordering_operators(pt.order_by));
+            let with_partition_order = ops_union(with_window_order, ['Order]);
+            ops_union(with_partition_order, ['Partition])
+        },
+        'None => with_offset,
+    };
+    # Emit only the used operators, always in canonical vocabulary order.
+    array.filter(canonical_operators, fn(op) { ops_member(used, op) })
 };
 
 # ---------------------------------------------------------------------------
@@ -296,6 +384,10 @@ def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args
     let len = array.length(args);
     match function {
         'Substr => len == 2 || len == 3,
+        'Instr => len == 2,
+        'If => len == 3,
+        'Add => len == 2,
+        'Sub => len == 2,
         'Eq => len == 2,
         'Ne => len == 2,
         'Lt => len == 2,
@@ -326,7 +418,14 @@ def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
 def select_item_valid: Fn(SelectItem, Array(String)) -> Bool = fn(item, aliases) {
     match item {
         'Expr(expr) => expr_valid(expr, aliases),
-        'Aggregate(call) => is_sql_identifier(call.alias) && expr_valid(call.arg, aliases),
+        'Aggregate(call) => is_sql_identifier(call.alias) && expr_valid(call.arg, aliases)
+            && (match call.filter {
+                'Some(expr) => expr_valid(expr, aliases),
+                'None => 'True,
+            }),
+        # Computed aggregates need the full plan for operand resolution; that
+        # check runs in `computed_items_ok`.
+        'Computed(_) => 'True,
     }
 };
 
@@ -350,28 +449,147 @@ def aliases_of: Fn(Plan) -> Array(String) = fn(plan) {
     })
 };
 
-# Aliases of the aggregates projected by the plan, in projection order.
-def projected_aggregate_aliases: Fn(Plan) -> Array(String) = fn(plan) {
+# Aliases of the measures (aggregates and computed aggregates) projected by the
+# plan, in projection order.  Ordering and partition ordering may reference any
+# of these aliases.
+def projected_measure_aliases: Fn(Plan) -> Array(String) = fn(plan) {
     let empty: Array(String) = [];
     array.fold(plan.projection, empty, fn(acc, item) {
         match item {
             'Expr(_) => acc,
             'Aggregate(call) => array.push(acc, call.alias),
+            'Computed(ca) => array.push(acc, ca.alias),
         }
     })
 };
 
 # An ordering key is valid when a plain expression is a valid Expr, or when an
-# AggregateRef names a valid SQL identifier that is projected by the plan.
-def order_key_valid: Fn(OrderKey, Array(String), Array(String)) -> Bool = fn(key, source_aliases, aggregate_aliases) {
+# AggregateRef names a valid SQL identifier that is a projected measure alias.
+def order_key_valid: Fn(OrderKey, Array(String), Array(String)) -> Bool = fn(key, source_aliases, measure_aliases) {
     match key {
         'Expr(expr) => expr_valid(expr, source_aliases),
-        'AggregateRef(ref) => is_sql_identifier(ref.alias) && known_alias(aggregate_aliases, ref.alias),
+        'AggregateRef(ref) => is_sql_identifier(ref.alias) && known_alias(measure_aliases, ref.alias),
     }
 };
 
+# Structural equality of expressions (closed nominal enum: `==` is structural).
+def expr_member: Fn(Array(Expr), Expr) -> Bool = fn(exprs, target) {
+    array.any(exprs, fn(candidate) { candidate == target })
+};
+
+def exprs_subset: Fn(Array(Expr), Array(Expr)) -> Bool = fn(needles, haystack) {
+    array.all(needles, fn(needle) { expr_member(haystack, needle) })
+};
+
+# The projection item whose aggregate/computed alias equals `alias`.
+def find_item_by_alias: Fn(Plan, String) -> Option(SelectItem) = fn(plan, alias) {
+    array.find(plan.projection, fn(item) {
+        match item {
+            'Expr(_) => 'False,
+            'Aggregate(call) => call.alias == alias,
+            'Computed(ca) => ca.alias == alias,
+        }
+    })
+};
+
+def count_in: Fn(Array(String), String) -> Int = fn(items, target) {
+    array.length(array.filter(items, fn(item) { item == target }))
+};
+
+# Aggregate/computed aliases must be distinct so references are unambiguous and
+# reusing a filtered aggregate always means the same declaration.
+def measure_aliases_distinct: Fn(Plan) -> Bool = fn(plan) {
+    let aliases = projected_measure_aliases(plan);
+    array.all(array.enumerate(aliases), fn(pair) { count_in(aliases, pair.1) == 1 })
+};
+
+# True when expanding `alias` (a computed aggregate) reaches `alias` again,
+# i.e. the computed-aggregate dependency graph has a cycle.
+def computed_cycle_from: Fn(Plan, String, Array(String)) -> Bool = fn(plan, alias, path) {
+    if array.any(path, fn(p) { p == alias }) {
+        'True
+    } else {
+        match find_item_by_alias(plan, alias) {
+            'Some('Computed(ca)) => {
+                let next_path = array.push(path, alias);
+                computed_cycle_from(plan, ca.left, next_path)
+                    || computed_cycle_from(plan, ca.right, next_path)
+            },
+            _ => 'False,
+        }
+    }
+};
+
+# A computed aggregate is well-formed when its alias is a valid SQL identifier,
+# both operands resolve to declared aggregate/computed items in the same
+# projection, and the dependency graph is acyclic.  Query only guarantees this
+# structural resolution (alias, dependency order, SQL structure); business
+# grain/relation-path compatibility is the Ontology's responsibility and is NOT
+# asserted here.
+def computed_ok: Fn(Plan, ComputedAggregate) -> Bool = fn(plan, ca) {
+    let alias_ok = is_sql_identifier(ca.alias) && !computed_cycle_from(plan, ca.alias, []);
+    let left_ok = match find_item_by_alias(plan, ca.left) {
+        'Some('Aggregate(_)) => 'True,
+        'Some('Computed(_)) => 'True,
+        _ => 'False,
+    };
+    let right_ok = match find_item_by_alias(plan, ca.right) {
+        'Some('Aggregate(_)) => 'True,
+        'Some('Computed(_)) => 'True,
+        _ => 'False,
+    };
+    alias_ok && left_ok && right_ok
+};
+
+def computed_items_ok: Fn(Plan) -> Bool = fn(plan) {
+    array.all(plan.projection, fn(item) {
+        match item {
+            'Computed(ca) => computed_ok(plan, ca),
+            _ => 'True,
+        }
+    })
+};
+
+# The partitioned Top N stage is well-formed when:
+#   - `take` is a positive integer within `max_partition_take`;
+#   - every partition key is one of the selected grouping expressions;
+#   - `order_by` is non-empty and every target is a selected grouping
+#     expression or a projected aggregate alias;
+#   - every non-partition grouping expression is covered by an `Expr` order key
+#     (deterministic tie-breaker);
+#   - v1 does not combine partitioned Top N with global limit/offset/ordering.
+def partition_structure_ok: Fn(Plan, PartitionedTopN) -> Bool = fn(plan, pt) {
+    let take_ok = pt.take > 0 && pt.take <= max_partition_take;
+    let keys_ok = array.length(pt.partition_by) > 0
+        && exprs_subset(pt.partition_by, plan.grouping);
+    let order_ok = array.length(pt.order_by) > 0
+        && array.all(pt.order_by, fn(ob) {
+            match ob.key {
+                'Expr(expr) => expr_member(plan.grouping, expr),
+                'AggregateRef(ref) => is_sql_identifier(ref.alias)
+                    && known_alias(projected_measure_aliases(plan), ref.alias),
+            }
+        });
+    let tie_break_ok = array.all(plan.grouping, fn(group_expr) {
+        if expr_member(pt.partition_by, group_expr) {
+            'True
+        } else {
+            array.any(pt.order_by, fn(ob) {
+                match ob.key {
+                    'Expr(expr) => expr == group_expr,
+                    'AggregateRef(_) => 'False,
+                }
+            })
+        }
+    });
+    let no_combo_ok = plan.limit == 'None && plan.offset == 'None
+        && array.length(plan.ordering) == 0;
+    take_ok && keys_ok && order_ok && tie_break_ok && no_combo_ok
+};
+
 # Pure structural predicate: true when the plan is a well-formed Plan whose
-# identifiers, scalar arities, source references and limit are legal.
+# identifiers, scalar arities, source references, limit/offset and partitioned
+# Top N stage are legal.
 def structure_ok: Fn(Plan) -> Bool = fn(plan) {
     let sources_nonempty = array.length(plan.sources) > 0;
     let projection_nonempty = array.length(plan.projection) > 0;
@@ -387,15 +605,29 @@ def structure_ok: Fn(Plan) -> Bool = fn(plan) {
         'None => 'True,
     };
     let grouping_ok = array.all(plan.grouping, fn(expr) { expr_valid(expr, aliases) });
-    let aggregate_aliases = projected_aggregate_aliases(plan);
-    let ordering_ok = array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases, aggregate_aliases) });
+    let measure_aliases = projected_measure_aliases(plan);
+    let ordering_ok = array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases, measure_aliases) });
     let limit_ok = match plan.limit {
         'Some(value) => value >= 0,
         'None => 'True,
     };
+    let offset_ok = match plan.offset {
+        'Some(value) => value >= 0,
+        'None => 'True,
+    };
+    let offset_ordering_ok = match plan.offset {
+        'Some(_) => array.length(plan.ordering) > 0,
+        'None => 'True,
+    };
+    let partition_ok = match plan.partition {
+        'Some(pt) => partition_structure_ok(plan, pt),
+        'None => 'True,
+    };
+    let measures_ok = measure_aliases_distinct(plan) && computed_items_ok(plan);
     sources_nonempty && projection_nonempty && source_ids_ok && join_ids_ok
         && join_conds_ok && projection_ok && filter_ok && grouping_ok
-        && ordering_ok && limit_ok
+        && ordering_ok && limit_ok && offset_ok && offset_ordering_ok
+        && partition_ok && measures_ok
 };
 
 # Failing structural validation: rejects illegal structure, invalid
@@ -421,13 +653,72 @@ def validate_structure: Fn(Plan) -> Plan = fn(plan) {
         fail!("plan filter contains an invalid expression", plan)
     } else if !array.all(plan.grouping, fn(expr) { expr_valid(expr, aliases_of(plan)) }) {
         fail!("plan grouping contains an invalid expression", plan)
-    } else if !array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases_of(plan), projected_aggregate_aliases(plan)) }) {
+    } else if !array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases_of(plan), projected_measure_aliases(plan)) }) {
         fail!("plan ordering contains an invalid or unprojected ordering target", plan)
     } else if !match plan.limit {
         'Some(value) => value >= 0,
         'None => 'True,
     } {
         fail!("plan limit must be non-negative", plan)
+    } else if !match plan.offset {
+        'Some(value) => value >= 0,
+        'None => 'True,
+    } {
+        fail!("plan offset must be non-negative", plan)
+    } else if !match plan.offset {
+        'Some(_) => array.length(plan.ordering) > 0,
+        'None => 'True,
+    } {
+        fail!("plan offset requires a stable ordering", plan)
+    } else if !match plan.partition {
+        'Some(pt) => pt.take > 0 && pt.take <= max_partition_take,
+        'None => 'True,
+    } {
+        fail!("partition take must be a positive integer within the cap", plan)
+    } else if !match plan.partition {
+        'Some(pt) => array.length(pt.partition_by) > 0
+            && exprs_subset(pt.partition_by, plan.grouping),
+        'None => 'True,
+    } {
+        fail!("partition key must be a selected grouping expression", plan)
+    } else if !match plan.partition {
+        'Some(pt) => array.length(pt.order_by) > 0
+            && array.all(pt.order_by, fn(ob) {
+                match ob.key {
+                    'Expr(expr) => expr_member(plan.grouping, expr),
+                    'AggregateRef(ref) => is_sql_identifier(ref.alias)
+                        && known_alias(projected_measure_aliases(plan), ref.alias),
+                }
+            }),
+        'None => 'True,
+    } {
+        fail!("partition ordering must be non-empty with selected targets", plan)
+    } else if !match plan.partition {
+        'Some(pt) => array.all(plan.grouping, fn(group_expr) {
+            if expr_member(pt.partition_by, group_expr) {
+                'True
+            } else {
+                array.any(pt.order_by, fn(ob) {
+                    match ob.key {
+                        'Expr(expr) => expr == group_expr,
+                        'AggregateRef(_) => 'False,
+                    }
+                })
+            }
+        }),
+        'None => 'True,
+    } {
+        fail!("partition ordering must cover non-partition grouping expressions", plan)
+    } else if !match plan.partition {
+        'Some(_) => plan.limit == 'None && plan.offset == 'None
+            && array.length(plan.ordering) == 0,
+        'None => 'True,
+    } {
+        fail!("partitioned top N cannot be combined with global limit, offset or ordering", plan)
+    } else if !measure_aliases_distinct(plan) {
+        fail!("projected aggregate and computed aggregate aliases must be distinct", plan)
+    } else if !computed_items_ok(plan) {
+        fail!("computed aggregate has an unknown operand, an unresolved alias or a dependency cycle", plan)
     } else {
         plan
     }
@@ -455,12 +746,27 @@ def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed)
 def select_scalars_ok: Fn(SelectItem, Array(ScalarFunction)) -> Bool = fn(item, allowed) {
     match item {
         'Expr(expr) => expr_scalars_ok(expr, allowed),
-        'Aggregate(call) => expr_scalars_ok(call.arg, allowed),
+        'Aggregate(call) => expr_scalars_ok(call.arg, allowed)
+            && (match call.filter {
+                'Some(expr) => expr_scalars_ok(expr, allowed),
+                'None => 'True,
+            }),
+        # A computed aggregate consumes the scalar capability corresponding to
+        # its operator: `ComputedOp.Add` requires `ScalarFunction.Add` in the
+        # allowed scalars, `ComputedOp.Sub` requires `ScalarFunction.Sub`.
+        'Computed(ca) => {
+            let op_allowed = match ca.op {
+                'Add => array.any(allowed, fn(candidate) { candidate == 'Add }),
+                'Sub => array.any(allowed, fn(candidate) { candidate == 'Sub }),
+            };
+            op_allowed
+        },
     }
 };
 
 # An AggregateRef ordering key adds no new scalar usage: the referenced
-# aggregate already appears in the projection and is checked there.
+# aggregate or computed aggregate already appears in the projection and is
+# checked there.
 def order_key_scalars_ok: Fn(OrderKey, Array(ScalarFunction)) -> Bool = fn(key, allowed) {
     match key {
         'Expr(expr) => expr_scalars_ok(expr, allowed),
@@ -472,6 +778,7 @@ def select_aggregate_ok: Fn(SelectItem, Array(AggregateFunction)) -> Bool = fn(i
     match item {
         'Expr(_) => 'True,
         'Aggregate(call) => array.any(allowed, fn(candidate) { candidate == call.function }),
+        'Computed(_) => 'True,
     }
 };
 
@@ -499,10 +806,19 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
             match item {
                 'Expr(_) => 'True,
                 'Aggregate(call) => call.distinct == 'False,
+                'Computed(_) => 'True,
             }
         })
     };
+    # `'Partition` itself is covered by ops_ok via `operators(plan)`; here we
+    # check the scalars used by the partition keys and partition ordering.
+    let partition_ok = match plan.partition {
+        'Some(pt) => array.all(pt.partition_by, fn(expr) { expr_scalars_ok(expr, profile.allowed_scalars) })
+            && array.all(pt.order_by, fn(ob) { order_key_scalars_ok(ob.key, profile.allowed_scalars) }),
+        'None => 'True,
+    };
     ops_ok && joins_ok && aggregates_ok && scalars_ok && distinct_ok
+        && partition_ok
 };
 
 # Failing profile validation: structural problems are rejected first, then any
@@ -524,6 +840,10 @@ def validate: Fn(Plan, PlanProfile) -> Plan = fn(plan, profile) {
 def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
     match function {
         'Substr => "substr",
+        'Instr => "instr",
+        'If => "if",
+        'Add => "+",
+        'Sub => "-",
         'Eq => "=",
         'Ne => "!=",
         'Lt => "<",
@@ -563,6 +883,10 @@ def direction_sql: Fn(Ordering) -> String = fn(direction) {
 def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function, parts) {
     match function {
         'Substr => `\{scalar_name(function)}(\{string.join(parts, ", ")})`,
+        'Instr => `instr(\{parts[0]}, \{parts[1]})`,
+        'If => `CASE WHEN \{parts[0]} THEN \{parts[1]} ELSE \{parts[2]} END`,
+        'Add => `(\{parts[0]} + \{parts[1]})`,
+        'Sub => `(\{parts[0]} - \{parts[1]})`,
         'Eq => `\{parts[0]} = \{parts[1]}`,
         'Ne => `\{parts[0]} != \{parts[1]}`,
         'Lt => `\{parts[0]} < \{parts[1]}`,
@@ -597,16 +921,52 @@ def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
 def render_aggregate_call: Fn(AggregateCall) -> Tuple([String, Array(Val)]) = fn(call) {
     let rendered = render_expr(call.arg);
     let distinct_sql = if call.distinct { "DISTINCT " } else { "" };
-    let sql = `\{aggregate_name(call.function)}(\{distinct_sql}\{rendered.0})`;
-    (sql, rendered.1)
+    let filter_part = match call.filter {
+        'Some(expr) => {
+            let filtered = render_expr(expr);
+            (` FILTER (WHERE \{filtered.0})`, filtered.1)
+        },
+        'None => {
+            let empty: Array(Val) = [];
+            ("", empty)
+        },
+    };
+    let sql = `\{aggregate_name(call.function)}(\{distinct_sql}\{rendered.0})\{filter_part.0}`;
+    (sql, array.concat([rendered.1, filter_part.1]))
 };
 
-def render_select_item: Fn(SelectItem) -> Tuple([String, Array(Val)]) = fn(item) {
+# Renders the full expression of a measure alias (aggregate or computed) by
+# re-expanding its declaration.  A computed aggregate may reference another
+# computed aggregate; acyclicity is enforced by structural validation.
+def render_computed_aggregate: Fn(Plan, ComputedAggregate) -> Tuple([String, Array(Val)]) = fn(plan, ca) {
+    let left = render_measure_ref(plan, ca.left);
+    let right = render_measure_ref(plan, ca.right);
+    let op = match ca.op {
+        'Add => "+",
+        'Sub => "-",
+    };
+    (`(\{left.0} \{op} \{right.0})`, array.concat([left.1, right.1]))
+};
+
+def render_measure_ref: Fn(Plan, String) -> Tuple([String, Array(Val)]) = fn(plan, alias) {
+    match find_item_by_alias(plan, alias) {
+        'Some('Aggregate(call)) => render_aggregate_call(call),
+        'Some('Computed(ca)) => render_computed_aggregate(plan, ca),
+        _ => fail!("measure reference is not a declared aggregate or computed aggregate", plan, alias),
+    }
+};
+
+def render_select_item: Fn(SelectItem, Plan) -> Tuple([String, Array(Val)]) = fn(item, plan) {
     match item {
         'Expr(expr) => render_expr(expr),
         'Aggregate(call) => {
             let rendered = render_aggregate_call(call);
             let sql = `\{rendered.0} AS \{call.alias}`;
+            (sql, rendered.1)
+        },
+        'Computed(ca) => {
+            let rendered = render_computed_aggregate(plan, ca);
+            let sql = `\{rendered.0} AS \{ca.alias}`;
             (sql, rendered.1)
         },
     }
@@ -620,41 +980,24 @@ def render_join: Fn(Join) -> Tuple([String, Array(Val)]) = fn(join) {
     (sql, empty)
 };
 
-# Finds the projected aggregate with the given output alias.
-def find_aggregate: Fn(Plan, String) -> Option(AggregateCall) = fn(plan, alias) {
-    let found = array.find(plan.projection, fn(item) {
-        match item {
-            'Expr(_) => 'False,
-            'Aggregate(call) => call.alias == alias,
-        }
-    });
-    match found {
-        'Some(item) => match item {
-            'Aggregate(call) => 'Some(call),
-            'Expr(_) => 'None,
-        },
-        'None => 'None,
-    }
-};
-
-# Renders an ordering key.  An AggregateRef renders the full aggregate
-# expression of the projected measure (never a source-qualified alias), so the
-# generated SQL is executable and unambiguous.
+# Renders an ordering key.  An AggregateRef renders the full aggregate or
+# computed aggregate expression of the projected measure (never a
+# source-qualified alias), so the generated SQL is executable and unambiguous.
 def render_order_key: Fn(OrderKey, Plan) -> Tuple([String, Array(Val)]) = fn(key, plan) {
     match key {
         'Expr(expr) => render_expr(expr),
         'AggregateRef(ref) => {
-            let found = find_aggregate(plan, ref.alias);
-            match found {
-                'Some(call) => render_aggregate_call(call),
-                'None => fail!("ordering references an unprojected aggregate", plan, ref),
+            match find_item_by_alias(plan, ref.alias) {
+                'Some('Aggregate(call)) => render_aggregate_call(call),
+                'Some('Computed(ca)) => render_computed_aggregate(plan, ca),
+                _ => fail!("ordering references an unprojected measure", plan, ref),
             }
         },
     }
 };
 
-def render_plan: Fn(Plan) -> Query = fn(plan) {
-    let rendered_items = array.map(plan.projection, render_select_item);
+def render_unpartitioned: Fn(Plan) -> Query = fn(plan) {
+    let rendered_items = array.map(plan.projection, fn(item) { render_select_item(item, plan) });
     let select_sql = string.join(array.map(rendered_items, fn(pair) { pair.0 }), ", ");
     let select_bindings = array.concat(array.map(rendered_items, fn(pair) { pair.1 }));
 
@@ -704,10 +1047,28 @@ def render_plan: Fn(Plan) -> Query = fn(plan) {
         ("", empty)
     };
 
+    # `limit` and `offset` are both part of the query semantics.  An offset
+    # without an explicit limit renders as `LIMIT -1 OFFSET ?` (SQLite: -1
+    # means no row cap), so pagination never needs an inline literal beyond
+    # the bound value.
     let limit_part = match plan.limit {
         'Some(value) => {
             let values: Array(Val) = ['Int(value)];
             (" LIMIT ?", values)
+        },
+        'None => if plan.offset != 'None {
+            let empty: Array(Val) = [];
+            (" LIMIT -1", empty)
+        } else {
+            let empty: Array(Val) = [];
+            ("", empty)
+        },
+    };
+
+    let offset_part = match plan.offset {
+        'Some(value) => {
+            let values: Array(Val) = ['Int(value)];
+            (" OFFSET ?", values)
         },
         'None => {
             let empty: Array(Val) = [];
@@ -722,13 +1083,217 @@ def render_plan: Fn(Plan) -> Query = fn(plan) {
         group_part.1,
         order_part.1,
         limit_part.1,
+        offset_part.1,
     ];
     let all_bindings = array.concat(binding_groups);
 
-    let sql = `SELECT \{select_sql} FROM \{from_sql}\{join_text}\{filter_part.0}\{group_part.0}\{order_part.0}\{limit_part.0}`;
+    let sql = `SELECT \{select_sql} FROM \{from_sql}\{join_text}\{filter_part.0}\{group_part.0}\{order_part.0}\{limit_part.0}\{offset_part.0}`;
 
     let result: Query = {sql: sql, bindings: all_bindings};
     result
+};
+
+# If the expression is a projection expression item, return its stable outer
+# column reference (`__q_<index>`); otherwise `None`.
+def expr_projection_ref: Fn(Expr, Array(SelectItem)) -> Option(String) = fn(expr, projection) {
+    let found = array.find(array.enumerate(projection), fn(pair) {
+        match pair.1 {
+            'Expr(item_expr) => item_expr == expr,
+            'Aggregate(_) => 'False,
+            'Computed(_) => 'False,
+        }
+    });
+    match found {
+        'Some(pair) => 'Some(`__q_\{pair.0}`),
+        'None => 'None,
+    }
+};
+
+# Renders a projection item for the inner subquery: (inner_sql, outer_ref,
+# bindings).  Expression items get a stable `__q_<index>` alias; aggregate and
+# computed aggregates keep their public alias.  Everything is referenced by
+# name from the outer query.
+def render_partition_item: Fn(SelectItem, Int, Plan) -> Tuple([String, String, Array(Val)]) = fn(item, index, plan) {
+    match item {
+        'Expr(expr) => {
+            let rendered = render_expr(expr);
+            (`\{rendered.0} AS __q_\{index}`, `__q_\{index}`, rendered.1)
+        },
+        'Aggregate(call) => {
+            let rendered = render_aggregate_call(call);
+            (`\{rendered.0} AS \{call.alias}`, call.alias, rendered.1)
+        },
+        'Computed(ca) => {
+            let rendered = render_computed_aggregate(plan, ca);
+            (`\{rendered.0} AS \{ca.alias}`, ca.alias, rendered.1)
+        },
+    }
+};
+
+# Partitioned Top N lowering.  The inner subquery is the grouped query plus a
+# `row_number() over (partition by ...)`, aliased as `__q_rn`; the outer query
+# selects the projected columns by name, filters `__q_rn <= ?` (the take
+# binding) and orders deterministically by the partition keys then the partition
+# ordering.  Partition keys and ordering expression keys that are not already
+# projected are exposed as hidden `__q_pk_<i>` / `__q_ok_<j>` columns so the
+# outer ORDER BY is always stable.  The inner SQL text places the window
+# expression inside the SELECT list, so bindings follow the real placeholder
+# order: projection, hidden columns, window partition, window ordering, join,
+# global filter, grouping, then the outer take value.
+def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
+    let item_parts = array.map(array.enumerate(plan.projection), fn(pair) {
+        render_partition_item(pair.1, pair.0, plan)
+    });
+    let inner_select_parts = array.map(item_parts, fn(part) { part.0 });
+    let outer_refs = array.map(item_parts, fn(part) { part.1 });
+    let select_bindings = array.concat(array.map(item_parts, fn(part) { part.2 }));
+
+    let pk_entries = array.enumerate(pt.partition_by);
+    let ok_entries = array.enumerate(pt.order_by);
+
+    # Partition keys: outer ref and hidden column when not projected.
+    let pk_outer_parts = array.map(pk_entries, fn(pair) {
+        match expr_projection_ref(pair.1, plan.projection) {
+            'Some(ref) => `\{ref} ASC`,
+            'None => `__q_pk_\{pair.0} ASC`,
+        }
+    });
+    let pk_hidden_parts = array.filter(pk_entries, fn(pair) {
+        match expr_projection_ref(pair.1, plan.projection) {
+            'Some(_) => 'False,
+            'None => 'True,
+        }
+    });
+    let pk_hidden = array.map(pk_hidden_parts, fn(pair) {
+        let rendered = render_expr(pair.1);
+        (`\{rendered.0} AS __q_pk_\{pair.0}`, rendered.1)
+    });
+
+    # Partition ordering keys: outer ref (projection alias, hidden `__q_ok_<j>`
+    # or projected aggregate alias) with direction.
+    let ok_outer_parts = array.map(ok_entries, fn(pair) {
+        let ref = match pair.1.key {
+            'Expr(expr) => match expr_projection_ref(expr, plan.projection) {
+                'Some(r) => r,
+                'None => `__q_ok_\{pair.0}`,
+            },
+            'AggregateRef(r) => r.alias,
+        };
+        let empty: Array(Val) = [];
+        (`\{ref} \{direction_sql(pair.1.direction)}`, empty)
+    });
+    let ok_hidden_parts = array.filter(ok_entries, fn(pair) {
+        match pair.1.key {
+            'Expr(expr) => match expr_projection_ref(expr, plan.projection) {
+                'Some(_) => 'False,
+                'None => 'True,
+            },
+            'AggregateRef(_) => 'False,
+        }
+    });
+    let ok_hidden = array.map(ok_hidden_parts, fn(pair) {
+        match pair.1.key {
+            'Expr(expr) => {
+                let rendered = render_expr(expr);
+                (`\{rendered.0} AS __q_ok_\{pair.0}`, rendered.1)
+            },
+            'AggregateRef(_) => {
+                let empty: Array(Val) = [];
+                ("", empty)
+            },
+        }
+    });
+
+    # Window clause: PARTITION BY the partition keys, ORDER BY the partition
+    # ordering (aggregate keys render the full aggregate expression).
+    let partition_parts = array.map(pt.partition_by, render_expr);
+    let partition_sql = string.join(array.map(partition_parts, fn(p) { p.0 }), ", ");
+    let partition_bindings = array.concat(array.map(partition_parts, fn(p) { p.1 }));
+    let window_order_parts = array.map(pt.order_by, fn(ob) {
+        let rendered = render_order_key(ob.key, plan);
+        (`\{rendered.0} \{direction_sql(ob.direction)}`, rendered.1)
+    });
+    let window_order_sql = string.join(array.map(window_order_parts, fn(p) { p.0 }), ", ");
+    let window_order_bindings = array.concat(array.map(window_order_parts, fn(p) { p.1 }));
+
+    # FROM / JOIN / WHERE / GROUP BY (identical to the plain path).
+    let primary = plan.sources[0];
+    let from_sql = `\{primary.table} AS \{primary.alias}`;
+    let rendered_joins = array.map(plan.joins, render_join);
+    let joins_text = string.join(array.map(rendered_joins, fn(pair) { pair.0 }), " ");
+    let joins_bindings = array.concat(array.map(rendered_joins, fn(pair) { pair.1 }));
+    let join_text = if array.length(plan.joins) > 0 {
+        ` \{joins_text}`
+    } else {
+        ""
+    };
+    let filter_part = match plan.filter {
+        'Some(expr) => {
+            let rendered = render_expr(expr);
+            (` WHERE \{rendered.0}`, rendered.1)
+        },
+        'None => {
+            let empty: Array(Val) = [];
+            ("", empty)
+        },
+    };
+    let group_part = if array.length(plan.grouping) > 0 {
+        let rendered_group = array.map(plan.grouping, render_expr);
+        let group_sql = string.join(array.map(rendered_group, fn(pair) { pair.0 }), ", ");
+        let group_bindings = array.concat(array.map(rendered_group, fn(pair) { pair.1 }));
+        (` GROUP BY \{group_sql}`, group_bindings)
+    } else {
+        let empty: Array(Val) = [];
+        ("", empty)
+    };
+
+    let hidden_sqls = array.concat([
+        array.map(pk_hidden, fn(p) { p.0 }),
+        array.map(ok_hidden, fn(p) { p.0 }),
+    ]);
+    let hidden_bindings = array.concat([
+        array.concat(array.map(pk_hidden, fn(p) { p.1 })),
+        array.concat(array.map(ok_hidden, fn(p) { p.1 })),
+    ]);
+
+    let rn_column = `row_number() OVER (PARTITION BY \{partition_sql} ORDER BY \{window_order_sql}) AS __q_rn`;
+    let inner_columns = array.concat([inner_select_parts, hidden_sqls, [rn_column]]);
+    let inner_select_sql = string.join(inner_columns, ", ");
+    let inner_sql = `SELECT \{inner_select_sql} FROM \{from_sql}\{join_text}\{filter_part.0}\{group_part.0}`;
+
+    # The inner SQL text is
+    #   SELECT <projection>, <hidden>, row_number() OVER (PARTITION BY ...
+    #          ORDER BY window-order ...) FROM ... JOIN ... WHERE ... GROUP BY ...
+    # so placeholders appear in this exact order: projection, hidden, window
+    # partition, window ordering, join, global filter, grouping.
+    let inner_bindings = array.concat([
+        select_bindings,
+        hidden_bindings,
+        partition_bindings,
+        window_order_bindings,
+        joins_bindings,
+        filter_part.1,
+        group_part.1,
+    ]);
+
+    let outer_order_sql = string.join(array.concat([
+        pk_outer_parts,
+        array.map(ok_outer_parts, fn(p) { p.0 }),
+    ]), ", ");
+    let outer_select_sql = string.join(outer_refs, ", ");
+    let take_values: Array(Val) = ['Int(pt.take)];
+    let sql = `SELECT \{outer_select_sql} FROM (\{inner_sql}) AS __partitioned WHERE __q_rn <= ? ORDER BY \{outer_order_sql}`;
+    let all_bindings = array.concat([inner_bindings, take_values]);
+
+    let result: Query = {sql: sql, bindings: all_bindings};
+    result
+};
+
+def render_plan: Fn(Plan) -> Query = fn(plan) {
+    match plan.partition {
+        'Some(pt) => render_partitioned(plan, pt),
+        'None => render_unpartitioned(plan),
+    }
 };
 
 # Pure, deterministic concretization of a legal Plan into a parameterized
@@ -774,11 +1339,51 @@ def substr: Fn(Array(Expr)) -> Expr = fn(args) {
     'Scalar(call)
 };
 
+# 1-based position of the first occurrence of `needle` within `haystack`;
+# 0 when the needle is absent (SQLite `instr`).
+def instr: Fn(Expr, Expr) -> Expr = fn(haystack, needle) {
+    let call: ScalarCall = {function: 'Instr, args: [haystack, needle]};
+    'Scalar(call)
+};
+
+# Conditional: `CASE WHEN cond THEN then_expr ELSE else_expr END`.
+def scalar_if: Fn(Expr, Expr, Expr) -> Expr = fn(cond, then_expr, else_expr) {
+    let call: ScalarCall = {function: 'If, args: [cond, then_expr, else_expr]};
+    'Scalar(call)
+};
+
+def add: Fn(Expr, Expr) -> Expr = fn(left, right) {
+    let call: ScalarCall = {function: 'Add, args: [left, right]};
+    'Scalar(call)
+};
+
+def sub: Fn(Expr, Expr) -> Expr = fn(left, right) {
+    let call: ScalarCall = {function: 'Sub, args: [left, right]};
+    'Scalar(call)
+};
+
 def expr_item: Fn(Expr) -> SelectItem = fn(expr) { 'Expr(expr) };
 
 def aggregate: Fn(AggregateFunction, Expr, Bool, String) -> SelectItem = fn(function, arg, distinct, alias) {
-    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, alias: alias};
+    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: 'None, alias: alias};
     'Aggregate(call)
+};
+
+# Filtered aggregate: the row-level predicate only narrows this aggregate's
+# input rows (`FILTER (WHERE ...)`); it is never merged into the global WHERE.
+def aggregate_filtered: Fn(AggregateFunction, Expr, Bool, Option(Expr), String) -> SelectItem = fn(function, arg, distinct, filter, alias) {
+    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: filter, alias: alias};
+    'Aggregate(call)
+};
+
+# Computed aggregate: restricted Add/Sub over declared aggregate aliases.
+def computed_aggregate: Fn(ComputedOp, String, String, String) -> ComputedAggregate = fn(op, left, right, alias) {
+    let item: ComputedAggregate = {op: op, left: left, right: right, alias: alias};
+    item
+};
+
+def computed_item: Fn(ComputedOp, String, String, String) -> SelectItem = fn(op, left, right, alias) {
+    'Computed(computed_aggregate(op, left, right, alias))
 };
 
 def source: Fn(String, String) -> Source = fn(alias, table) {
@@ -819,6 +1424,11 @@ def order_by: Fn(OrderKey, Ordering) -> OrderBy = fn(key, direction) {
     item
 };
 
+def partitioned_top_n: Fn(Array(Expr), Array(OrderBy), Int) -> PartitionedTopN = fn(partition_by, order_by, take) {
+    let item: PartitionedTopN = {partition_by: partition_by, order_by: order_by, take: take};
+    item
+};
+
 # ---------------------------------------------------------------------------
 # Public surface.
 # ---------------------------------------------------------------------------
@@ -832,6 +1442,8 @@ export {
     Expr,
     AggregateFunction,
     AggregateCall,
+    ComputedOp,
+    ComputedAggregate,
     SelectItem,
     Source,
     JoinKind,
@@ -842,9 +1454,11 @@ export {
     OrderKey,
     OrderBy,
     Plan,
+    PartitionedTopN,
     Operator,
     PlanProfile,
     is_sql_identifier,
+    max_partition_take,
     operators,
     structure_ok,
     validate_structure,
@@ -864,8 +1478,15 @@ export {
     bind_bool,
     scalar,
     substr,
+    instr,
+    scalar_if,
+    add,
+    sub,
     expr_item,
     aggregate,
+    aggregate_filtered,
+    computed_aggregate,
+    computed_item,
     source,
     join,
     asc,
@@ -873,4 +1494,5 @@ export {
     asc_aggregate,
     desc_aggregate,
     order_by,
+    partitioned_top_n,
 };

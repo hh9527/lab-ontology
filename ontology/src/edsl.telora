@@ -40,6 +40,37 @@ type MeasureDef = struct {
     requires: Array(Type),
 };
 
+# Member-level: filtered measure declaration. Adds a domain-declared inherent
+# predicate to the aggregate: only rows matching the predicate count into this
+# measure. The predicate references a declared, authorized, filterable dimension
+# of the same entity (reusing enum value, operation, input kind and scope
+# validation). The inherent predicate and user global filters keep separate
+# semantics and are never flattened into one global AND. Multiple annotations
+# fold by appending (composable).
+@property('Field)
+type FilteredMeasureDef = struct { measures: Array(FilteredMeasureSpec) };
+
+type FilteredMeasureSpec = struct {
+    id: String,
+    aggregate: qb.AggregateFunction,
+    requires: Array(Type),
+    predicate: ScopePredicate,
+};
+
+# Member-level: computed measure declaration. Combines two already-declared
+# measures (plain, filtered, or computed) with a restricted 'Add/'Sub. The
+# dependencies must exist and share the declaring entity's grain; the dependency
+# graph must be acyclic. Multiple annotations fold by appending.
+@property('Field)
+type ComputedMeasureDef = struct { measures: Array(ComputedMeasureSpec) };
+
+type ComputedMeasureSpec = struct {
+    id: String,
+    op: qb.ComputedOp,
+    left: String,
+    right: String,
+};
+
 # Member-level: plain dimension declaration over a field. `authorized` is the
 # query/projection authorization status: an unauthorized dimension still
 # belongs to the closed vocabulary (typed requests may reference it) but any
@@ -57,7 +88,8 @@ type DimensionDef = struct {
 # Member-level: computed dimension declaration. The builder receives the base
 # field's column expression and returns the canonical computed expression
 # (e.g. Substr(column, 1, 7)); literals are lowered to bound values at build
-# time, never pre-rendered SQL.
+# time, never pre-rendered SQL. Builders may use any closed query scalar
+# (including 'Instr, 'If, 'Add, 'Sub) and are validated by arity checks.
 @property('Field)
 type ComputedDimensionDef = struct {
     id: String,
@@ -67,6 +99,13 @@ type ComputedDimensionDef = struct {
     input_kinds: Array(FilterInputKind),
     build: Fn(qb.Expr) -> qb.Expr,
 };
+
+# Member-level: inherent row-range scope of a dimension member. Predicates
+# reference canonical field indexes of the member's own entity; the scope is
+# merged with user filters in deterministic order at lowering time. Dynamic
+# values stay parameterized; contradictory scope/filter constraints fail.
+@property('Field)
+type ScopeDef = struct { predicates: Array(ScopePredicate) };
 
 # Type-level: entity base data source.
 @property('Type)
@@ -108,6 +147,15 @@ type FilterInput = enum {
     'Int(Int),
 };
 
+# A member's inherent row-range scope predicate: a constraint on one field of
+# the member's own entity (canonical field index, filter op, literal value).
+# Scope predicates always lower to parameterized bindings.
+type ScopePredicate = struct {
+    field: Int,
+    op: FilterOp,
+    input: FilterInput,
+};
+
 type OrderDirection = enum { 'Asc, 'Desc };
 
 type OrderTarget = enum {
@@ -143,12 +191,22 @@ type OrderRequest = struct {
     direction: OrderDirection,
 };
 
+# Restricted Top Per Group request: partition the aggregated result by a set of
+# selected dimensions and keep the top `take` rows per partition under a stable
+# ordering. v1 does not combine with a global limit or offset.
+type PartitionRequest = struct {
+    by: Array(String),   # dimension ids defining the partitions
+    take: Int,           # positive integer with an upper bound (max_partition_take)
+};
+
 type QueryRequest = struct {
     measures: Array(MeasureRequest),
     dimensions: Array(DimensionRequest),
     filters: Array(FilterRequest),
     ordering: Array(OrderRequest),
     limit: Option(Int),
+    offset: Option(Int),
+    partition: Option(PartitionRequest),
 };
 
 # ---------------------------------------------------------------------------
@@ -181,6 +239,14 @@ type EntityEntry = struct {
     fields: Array(FieldEntry),
 };
 
+# Prepared dependency spec of a computed measure: operands are business measure
+# ids resolved at lowering time against the prepared measures.
+type ComputedMeasureEntry = struct {
+    op: qb.ComputedOp,
+    left: String,
+    right: String,
+};
+
 type MeasureEntry = struct {
     id: String,
     entity: Int,
@@ -188,6 +254,8 @@ type MeasureEntry = struct {
     aggregate: qb.AggregateFunction,
     alias: String,
     requires: Array(Int),
+    predicate: Option(ScopePredicate),
+    computed: Option(ComputedMeasureEntry),
 };
 
 type DimensionEntry = struct {
@@ -201,6 +269,7 @@ type DimensionEntry = struct {
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
     values: Array(EnumValueEntry),
+    scope: Array(ScopePredicate),
 };
 
 type RelationEntry = struct {
@@ -254,6 +323,30 @@ def measure: Fn(String, qb.AggregateFunction, Array(Type)) -> Fn(property.FieldP
     }
 };
 
+def filtered_measure: Fn(String, qb.AggregateFunction, Array(Type), ScopePredicate) -> Fn(property.FieldPropertyCtx, Option(FilteredMeasureDef)) -> FilteredMeasureDef = fn(id, aggregate, requires, predicate) {
+    fn(ctx, previous) {
+        let spec: FilteredMeasureSpec = { id, aggregate, requires, predicate };
+        let all = match previous {
+            'Some(p) => array.push(p.measures, spec),
+            'None => [spec],
+        };
+        let result: FilteredMeasureDef = { measures: all };
+        result
+    }
+};
+
+def computed_measure: Fn(String, qb.ComputedOp, String, String) -> Fn(property.FieldPropertyCtx, Option(ComputedMeasureDef)) -> ComputedMeasureDef = fn(id, op, left, right) {
+    fn(ctx, previous) {
+        let spec: ComputedMeasureSpec = { id, op, left, right };
+        let all = match previous {
+            'Some(p) => array.push(p.measures, spec),
+            'None => [spec],
+        };
+        let result: ComputedMeasureDef = { measures: all };
+        result
+    }
+};
+
 def dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind)) -> Fn(property.FieldPropertyCtx, Option(DimensionDef)) -> DimensionDef = fn(id, authorized, filterable, ops, input_kinds) {
     fn(ctx, previous) {
         let result: DimensionDef = { id, authorized, filterable, ops, input_kinds };
@@ -290,6 +383,17 @@ def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td.TypeDesc, Option(Relatio
 def enum_value: Fn(String, String) -> Fn(property.VariantPropertyCtx, Option(EnumValueDef)) -> EnumValueDef = fn(value, label) {
     fn(ctx, previous) {
         let result: EnumValueDef = { value, label };
+        result
+    }
+};
+
+def scope: Fn(Array(ScopePredicate)) -> Fn(property.FieldPropertyCtx, Option(ScopeDef)) -> ScopeDef = fn(predicates) {
+    fn(ctx, previous) {
+        let all = match previous {
+            'Some(p) => array.concat([p.predicates, predicates]),
+            'None => predicates,
+        };
+        let result: ScopeDef = { predicates: all };
         result
     }
 };
@@ -355,8 +459,7 @@ def resolve_required: Fn(Array(EntityEntry), Array(Type)) -> Array(Int) = fn(ent
 def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(MeasureEntry) = fn(entities, entity) {
     let fields = entity.fields;
     array.flat_map(fields, fn(f) {
-        let m = property.get_field_prop(entity.entity_type, f.index, MeasureDef);
-        match m {
+        let plain = match property.get_field_prop(entity.entity_type, f.index, MeasureDef) {
             'Some(d) => do {
                 let result: MeasureEntry = {
                     id: d.id,
@@ -365,12 +468,107 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     aggregate: d.aggregate,
                     alias: d.id,
                     requires: resolve_required(entities, d.requires),
+                    predicate: 'None,
+                    computed: 'None,
                 };
                 [result]
             },
             'None => [],
-        }
+        };
+        let filtered = match property.get_field_prop(entity.entity_type, f.index, FilteredMeasureDef) {
+            'Some(d) => array.map(d.measures, fn(spec) {
+                let result: MeasureEntry = {
+                    id: spec.id,
+                    entity: entity.index,
+                    field: f.index,
+                    aggregate: spec.aggregate,
+                    alias: spec.id,
+                    requires: resolve_required(entities, spec.requires),
+                    predicate: 'Some(spec.predicate),
+                    computed: 'None,
+                };
+                result
+            }),
+            'None => [],
+        };
+        let computed = match property.get_field_prop(entity.entity_type, f.index, ComputedMeasureDef) {
+            'Some(d) => array.map(d.measures, fn(spec) {
+                let result: MeasureEntry = {
+                    id: spec.id,
+                    entity: entity.index,
+                    field: f.index,
+                    aggregate: 'Count,
+                    alias: spec.id,
+                    requires: [],
+                    predicate: 'None,
+                    computed: 'Some({ op: spec.op, left: spec.left, right: spec.right }),
+                };
+                result
+            }),
+            'None => [],
+        };
+        array.concat([plain, filtered, computed])
     })
+};
+
+def measure_by_id: Fn(Array(MeasureEntry), String) -> MeasureEntry = fn(measures, id) {
+    match array.find(measures, fn(m) { m.id == id }) {
+        'Some(m) => m,
+        'None => fail!("computed measure depends on an unknown measure", id),
+    }
+};
+
+# Follow the computed-measure dependency graph; a revisit means a cycle.
+def has_dep_cycle: Fn(Array(MeasureEntry), String, Array(String)) -> Bool = fn(measures, id, visited) {
+    if array.any(visited, fn(v) { v == id }) {
+        'True
+    } else {
+        let direct = match array.find(measures, fn(m) { m.id == id }) {
+            'Some(m) => match m.computed {
+                'Some(spec) => [spec.left, spec.right],
+                'None => [],
+            },
+            'None => [],
+        };
+        let new_visited = array.push(visited, id);
+        array.any(direct, fn(dep) { has_dep_cycle(measures, dep, new_visited) })
+    }
+};
+
+# Prepare-time measure contract: unique measure ids; computed measure operands
+# must exist and share the declaring entity's grain; the dependency graph must be
+# acyclic. Failures surface as prepare-time diagnostics.
+def check_measure_contract: Fn(Array(MeasureEntry)) -> Array(MeasureEntry) = fn(measures) {
+    let dup = array.find(measures, fn(m) {
+        array.length(array.filter(measures, fn(o) { o.id == m.id })) > 1
+    });
+    let ids_ok = match dup {
+        'Some(m) => fail!("duplicate measure id", m.id),
+        'None => 'True,
+    };
+    let validated = array.map(measures, fn(entry) {
+        match entry.computed {
+            'None => entry,
+            'Some(spec) => do {
+                let left = measure_by_id(measures, spec.left);
+                let right = measure_by_id(measures, spec.right);
+                let entity_ok: Bool = if left.entity == entry.entity && right.entity == entry.entity {
+                    'True
+                } else {
+                    fail!("computed measure dependencies must share the declaring entity's grain", entry.id)
+                };
+                let cycle_ok: Bool = if has_dep_cycle(measures, entry.id, []) {
+                    fail!("computed measure dependency cycle", entry.id)
+                } else {
+                    'True
+                };
+                let result: MeasureEntry = if entity_ok && cycle_ok { entry } else { entry };
+                result
+            },
+        }
+    });
+    let result: Array(MeasureEntry) = if ids_ok { validated } else { validated };
+    result
 };
 
 def identity_expr: Fn(qb.Expr) -> qb.Expr = fn(e) { e };
@@ -423,27 +621,34 @@ def value_domain: Fn(Type) -> Array(EnumValueEntry) = fn(field_ty) {
     }
 };
 
+def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
+    match property.get_field_prop(owner, index, ScopeDef) {
+        'Some(s) => s.predicates,
+        'None => [],
+    }
+};
+
 def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(entity) {
     let fields = entity.fields;
     let plain = array.flat_map(fields, fn(f) {
         let d = property.get_field_prop(entity.entity_type, f.index, DimensionDef);
         match d {
-            'Some(dd) => [dimension_entry(entity.index, f.index, dd.id, 'False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, value_domain(f.ty))],
+            'Some(dd) => [dimension_entry(entity.index, f.index, dd.id, 'False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, value_domain(f.ty), field_scope(entity.entity_type, f.index))],
             'None => [],
         }
     });
     let computed = array.flat_map(fields, fn(f) {
         let d = property.get_field_prop(entity.entity_type, f.index, ComputedDimensionDef);
         match d {
-            'Some(dd) => [dimension_entry(entity.index, f.index, dd.id, 'True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [])],
+            'Some(dd) => [dimension_entry(entity.index, f.index, dd.id, 'True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], field_scope(entity.entity_type, f.index))],
             'None => [],
         }
     });
     array.concat([plain, computed])
 };
 
-def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb.Expr) -> qb.Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values) {
-    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values };
+def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb.Expr) -> qb.Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, scope) {
+    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values, scope };
     result
 };
 
@@ -633,7 +838,8 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
     let entities = array.map(int_range(n), fn(i) {
         build_entity(get_index(entity_types, i), i)
     });
-    let measures = array.flat_map(entities, fn(e) { collect_entity_measures(entities, e) });
+    let measures_raw = array.flat_map(entities, fn(e) { collect_entity_measures(entities, e) });
+    let measures = check_measure_contract(measures_raw);
     let dimensions = array.flat_map(entities, fn(e) { collect_entity_dimensions(e) });
     let relations = collect_relations(entities);
     let paths = build_paths(n, relations);
@@ -666,6 +872,9 @@ type ResolvedDimension = struct {
 type FilterResolution = struct {
     expr: qb.Expr,
     entity: Int,
+    field: Int,
+    op: FilterOp,
+    input: FilterInput,
 };
 
 def to_bind: Fn(FilterInput) -> qb.Expr = fn(input) {
@@ -676,21 +885,82 @@ def to_bind: Fn(FilterInput) -> qb.Expr = fn(input) {
     }
 };
 
-def resolve_measures: Fn(PreparedPayload, Array(MeasureRequest)) -> Array(ResolvedMeasure) = fn(payload, requests) {
-    array.map(requests, fn(req) {
-        if !payload.authorize(req.subject) {
-            fail!("subject is not authorized for measure", req.subject, req.id)
-        } else {
-            match array.find(payload.measures, fn(m) { m.id == req.id }) {
-                'Some(entry) => do {
-                    let distinct = match req.input { 'Distinct => 'True, 'All => 'False };
-                    let result: ResolvedMeasure = { entry, distinct };
-                    result
-                },
-                'None => fail!("unknown measure", req.subject, req.id),
-            }
+def resolve_measure_entry: Fn(PreparedPayload, MeasureRequest) -> ResolvedMeasure = fn(payload, req) {
+    if !payload.authorize(req.subject) {
+        fail!("subject is not authorized for measure", req.subject, req.id)
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == req.id }) {
+            'Some(entry) => do {
+                let distinct = match req.input { 'Distinct => 'True, 'All => 'False };
+                let result: ResolvedMeasure = { entry, distinct };
+                result
+            },
+            'None => fail!("unknown measure", req.subject, req.id),
         }
-    })
+    }
+};
+
+def resolve_measure_by_id: Fn(PreparedPayload, String, String) -> ResolvedMeasure = fn(payload, id, subject) {
+    if !payload.authorize(subject) {
+        fail!("subject is not authorized for measure", subject, id)
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == id }) {
+            'Some(entry) => do {
+                let result: ResolvedMeasure = { entry, distinct: 'False };
+                result
+            },
+            'None => fail!("unknown measure dependency", subject, id),
+        }
+    }
+};
+
+# Transitive computed-measure dependencies, dependencies before dependents.
+def transitive_deps: Fn(Array(MeasureEntry), String) -> Array(String) = fn(measures, id) {
+    match array.find(measures, fn(m) { m.id == id }) {
+        'Some(m) => match m.computed {
+            'Some(spec) => array.concat([
+                transitive_deps(measures, spec.left),
+                [spec.left],
+                transitive_deps(measures, spec.right),
+                [spec.right],
+            ]),
+            'None => [],
+        },
+        'None => [],
+    }
+};
+
+type MeasureExpandState = struct {
+    included: Array(String),
+    resolved: Array(ResolvedMeasure),
+};
+
+def expand_measure: Fn(PreparedPayload, MeasureExpandState, MeasureRequest) -> MeasureExpandState = fn(payload, state, req) {
+    let entry = resolve_measure_entry(payload, req);
+    let deps = transitive_deps(payload.measures, entry.entry.id);
+    let missing = array.fold(deps, [], fn(acc, id) {
+        if array.any(acc, fn(a) { a == id }) || array.any(state.included, fn(a) { a == id }) {
+            acc
+        } else {
+            array.push(acc, id)
+        }
+    });
+    let new_resolved = array.fold(missing, state.resolved, fn(acc, id) {
+        array.push(acc, resolve_measure_by_id(payload, id, req.subject))
+    });
+    let included2 = array.fold(missing, state.included, fn(acc, id) {
+        if array.any(acc, fn(a) { a == id }) { acc } else { array.push(acc, id) }
+    });
+    let included3 = if array.any(included2, fn(a) { a == entry.entry.id }) { included2 } else { array.push(included2, entry.entry.id) };
+    let resolved2 = array.push(new_resolved, entry);
+    let result: MeasureExpandState = { included: included3, resolved: resolved2 };
+    result
+};
+
+def resolve_measures: Fn(PreparedPayload, Array(MeasureRequest)) -> Array(ResolvedMeasure) = fn(payload, requests) {
+    let init: MeasureExpandState = { included: [], resolved: [] };
+    let final_state = array.fold(requests, init, fn(state, req) { expand_measure(payload, state, req) });
+    final_state.resolved
 };
 
 def resolve_dimensions: Fn(PreparedPayload, Array(DimensionRequest)) -> Array(ResolvedDimension) = fn(payload, requests) {
@@ -748,7 +1018,7 @@ def resolve_enum_filter: Fn(PreparedPayload, DimensionEntry, FilterRequest) -> F
         'Eq => match req.input {
             'Text(s) => if array.any(entry.values, fn(v) { v.value == s }) {
                 let expr = qb.scalar('Eq, [base, qb.bind_string(s)]);
-                let result: FilterResolution = { expr, entity: entry.entity };
+                let result: FilterResolution = { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input };
                 result
             } else {
                 fail!("unknown enum value for dimension", req.subject, req.id, s)
@@ -786,7 +1056,7 @@ def resolve_filters: Fn(PreparedPayload, Array(FilterRequest)) -> Array(FilterRe
                             'Ge => qb.scalar('Ge, [base, bound]),
                             'Le => qb.scalar('Le, [base, bound]),
                         };
-                        let result: FilterResolution = { expr, entity: entry.entity };
+                        let result: FilterResolution = { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input };
                         result
                     }
                 },
@@ -805,6 +1075,185 @@ def combine_filters: Fn(Array(qb.Expr)) -> Option(qb.Expr) = fn(exprs) {
     }) {
         'Some(expr) => 'Some(expr),
         'None => 'None,
+    }
+};
+
+# Enum closed-domain scope resolution (mirrors resolve_enum_filter). A scope
+# value must be a member of the referenced dimension's stable value domain.
+def resolve_enum_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> FilterResolution = fn(payload, entry, predicate) {
+    let base = dimension_expr(payload, entry);
+    match predicate.op {
+        'Eq => match predicate.input {
+            'Text(s) => if array.any(entry.values, fn(v) { v.value == s }) {
+                let expr = qb.scalar('Eq, [base, qb.bind_string(s)]);
+                let result: FilterResolution = { expr, entity: entry.entity, field: entry.field, op: predicate.op, input: predicate.input };
+                result
+            } else {
+                fail!("scope references an unknown enum value for dimension", entry.id, s)
+            },
+            _ => fail!("scope uses an invalid enum value for dimension", entry.id, predicate.input),
+        },
+        'Ge => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'Le => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+    }
+};
+
+# Resolve one inherent scope predicate of a selected dimension member. The
+# predicate must reference a declared, authorized, filterable dimension of the
+# member's own entity; unsupported ops or input kinds fail atomically.
+def resolve_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> FilterResolution = fn(payload, owner, predicate) {
+    let entity = get_index(payload.entities, owner.entity);
+    let field = match array.get(entity.fields, predicate.field) {
+        'Some(f) => f,
+        'None => fail!("scope references an unknown field", owner.id, predicate.field),
+    };
+    match array.find(payload.dimensions, fn(d) { d.entity == owner.entity && d.field == field.index }) {
+        'None => fail!("scope references a field with no dimension declaration", owner.id, field.name),
+        'Some(d) => do {
+            if !d.authorized {
+                fail!("scope references a dimension that is not authorized", d.id)
+            } else if !d.filterable {
+                fail!("scope references a dimension with no filter capability", d.id)
+            } else if !array.any(d.ops, fn(op) { op == predicate.op }) {
+                fail!("scope uses an operation not supported by the dimension", d.id, predicate.op)
+            } else if array.length(d.values) > 0 {
+                resolve_enum_scope(payload, d, predicate)
+            } else if !filter_input_allowed(d.input_kinds, predicate.input) {
+                fail!("scope uses an invalid value for the dimension", d.id, predicate.input)
+            } else {
+                let base = dimension_expr(payload, d);
+                let bound = to_bind(predicate.input);
+                let expr = match predicate.op {
+                    'Eq => qb.scalar('Eq, [base, bound]),
+                    'Ge => qb.scalar('Ge, [base, bound]),
+                    'Le => qb.scalar('Le, [base, bound]),
+                };
+                let result: FilterResolution = { expr, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input };
+                result
+            }
+        },
+    }
+};
+
+# Two constraints on the same entity+field contradict each other only when both
+# are equality constraints with different literal values.
+def eq_conflict: Fn(FilterResolution, FilterResolution) -> Bool = fn(a, b) {
+    a.entity == b.entity && a.field == b.field && a.op == 'Eq && b.op == 'Eq && a.input != b.input
+};
+
+def find_internal_conflict: Fn(Array(FilterResolution)) -> Option(FilterResolution) = fn(list) {
+    let n = array.length(list);
+    let init: Option(FilterResolution) = 'None;
+    array.fold(int_range(n), init, fn(acc, i) {
+        match acc {
+            'Some(_) => acc,
+            'None => do {
+                let a = get_index(list, i);
+                let inner_init: Option(FilterResolution) = 'None;
+                array.fold(int_range(n), inner_init, fn(inner_acc, j) {
+                    match inner_acc {
+                        'Some(_) => inner_acc,
+                        'None => if j > i {
+                            let b = get_index(list, j);
+                            if eq_conflict(a, b) { 'Some(b) } else { 'None }
+                        } else {
+                            'None
+                        },
+                    }
+                })
+            },
+        }
+    })
+};
+
+def find_cross_conflict: Fn(Array(FilterResolution), Array(FilterResolution)) -> Option(FilterResolution) = fn(scopes, users) {
+    let init: Option(FilterResolution) = 'None;
+    array.fold(scopes, init, fn(acc, s) {
+        match acc {
+            'Some(_) => acc,
+            'None => do {
+                let found: Option(FilterResolution) = array.fold(users, 'None, fn(inner_acc, u) {
+                    match inner_acc {
+                        'Some(_) => inner_acc,
+                        'None => if eq_conflict(s, u) { 'Some(u) } else { 'None },
+                    }
+                });
+                found
+            },
+        }
+    })
+};
+
+def scope_conflict: Fn(Array(FilterResolution), Array(FilterResolution)) -> Option(FilterResolution) = fn(scopes, users) {
+    match find_internal_conflict(scopes) {
+        'Some(c) => 'Some(c),
+        'None => find_cross_conflict(scopes, users),
+    }
+};
+
+# Merge member scopes (in request order, then declaration order) with user
+# filters (in request order) into one deterministic left-assoc And expression.
+# Mutually contradictory scope/filter constraints fail atomically.
+def combined_filter: Fn(Array(FilterResolution), Array(FilterResolution)) -> Option(qb.Expr) = fn(scopes, users) {
+    let conflict = scope_conflict(scopes, users);
+    let exprs = array.concat([array.map(scopes, fn(s) { s.expr }), array.map(users, fn(u) { u.expr })]);
+    let filtered = match conflict {
+        'Some(c) => fail!("conflicting scope/filter constraints", c.entity, c.field, c.input),
+        'None => exprs,
+    };
+    combine_filters(filtered)
+};
+
+# Resolve a filtered measure's inherent predicate to a parameterized expression.
+# The predicate must reference a declared, authorized, filterable dimension of
+# the measure's own entity; enum value, operation, input kind and scope rules
+# are reused. The predicate only scopes that measure's rows (FILTER), never the
+# global fact set.
+def resolve_measure_predicate: Fn(PreparedPayload, MeasureEntry) -> qb.Expr = fn(payload, entry) {
+    match entry.predicate {
+        'None => fail!("measure has no inherent predicate", entry.id),
+        'Some(pred) => do {
+            let entity = get_index(payload.entities, entry.entity);
+            let field = match array.get(entity.fields, pred.field) {
+                'Some(f) => f,
+                'None => fail!("measure predicate references an unknown field", entry.id, pred.field),
+            };
+            match array.find(payload.dimensions, fn(d) { d.entity == entry.entity && d.field == field.index }) {
+                'None => fail!("measure predicate references a field with no dimension declaration", entry.id, field.name),
+                'Some(d) => do {
+                    if !d.authorized {
+                        fail!("measure predicate references a dimension that is not authorized", d.id)
+                    } else if !d.filterable {
+                        fail!("measure predicate references a dimension with no filter capability", d.id)
+                    } else if !array.any(d.ops, fn(op) { op == pred.op }) {
+                        fail!("measure predicate uses an operation not supported by the dimension", d.id, pred.op)
+                    } else if array.length(d.values) > 0 {
+                        match pred.op {
+                            'Eq => match pred.input {
+                                'Text(s) => if array.any(d.values, fn(v) { v.value == s }) {
+                                    qb.scalar('Eq, [dimension_expr(payload, d), qb.bind_string(s)])
+                                } else {
+                                    fail!("measure predicate references an unknown enum value for dimension", d.id, s)
+                                },
+                                _ => fail!("measure predicate uses an invalid enum value for dimension", d.id, pred.input),
+                            },
+                            'Ge => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'Le => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                        }
+                    } else if !filter_input_allowed(d.input_kinds, pred.input) {
+                        fail!("measure predicate uses an invalid value for the dimension", d.id, pred.input)
+                    } else {
+                        let base = dimension_expr(payload, d);
+                        let bound = to_bind(pred.input);
+                        match pred.op {
+                            'Eq => qb.scalar('Eq, [base, bound]),
+                            'Ge => qb.scalar('Ge, [base, bound]),
+                            'Le => qb.scalar('Le, [base, bound]),
+                        }
+                    }
+                },
+            }
+        },
     }
 };
 
@@ -862,6 +1311,76 @@ def check_limit: Fn(Option(Int)) -> Option(Int) = fn(limit) {
     }
 };
 
+# Offset must be non-negative and, when present, requires a stable deterministic
+# ordering so pages repeat deterministically.
+def check_offset: Fn(Option(Int), Int) -> Option(Int) = fn(offset, ordering_len) {
+    match offset {
+        'None => 'None,
+        'Some(n) => if n < 0 {
+            fail!("offset must be a non-negative integer", n)
+        } else if ordering_len == 0 {
+            fail!("offset requires a stable, deterministic ordering", n)
+        } else {
+            'Some(n)
+        }
+    }
+};
+
+# Validate and lower a Top Per Group request. Partition dimensions must be
+# selected, authorized and grain-compatible; the ordering must be stable (it
+# must cover every non-partition selected dimension); `take` must be a positive
+# integer within the query upper bound; global limit/offset are not combined.
+# The resolved ordering is reused as the partition-internal ordering.
+def check_partition: Fn(PreparedPayload, QueryRequest, Array(ResolvedDimension), Array(qb.OrderBy)) -> Option(qb.PartitionedTopN) = fn(payload, request, dimensions, ordering) {
+    match request.partition {
+        'None => 'None,
+        'Some(part) => do {
+            let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
+            if array.length(part.by) == 0 {
+                fail!("partition must name at least one dimension")
+            } else if part.take <= 0 || part.take > qb.max_partition_take {
+                fail!("partition take must be a positive integer within the upper bound", part.take)
+            } else if request.limit != 'None || request.offset != 'None {
+                fail!("top per group does not combine with a global limit or offset")
+            } else if array.length(request.ordering) == 0 {
+                fail!("top per group requires a stable, deterministic ordering")
+            } else {
+                let partition_dims = array.map(part.by, fn(id) {
+                    if !array.any(requested_dimension_ids, fn(d) { d == id }) {
+                        fail!("partition dimension is not selected in this request", id)
+                    } else {
+                        match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                            'Some(d) => if !d.authorized {
+                                fail!("partition dimension is not authorized", id)
+                            } else {
+                                d
+                            },
+                            'None => fail!("partition references an unknown dimension", id),
+                        }
+                    }
+                });
+                let non_partition_dims = array.filter(dimensions, fn(d) {
+                    !array.any(part.by, fn(id) { id == d.entry.id })
+                });
+                let stable_ok = array.all(non_partition_dims, fn(d) {
+                    array.any(request.ordering, fn(o) {
+                        match o.target {
+                            'Dimension(id) => id == d.entry.id,
+                            'Measure(_) => 'False,
+                        }
+                    })
+                });
+                if !stable_ok {
+                    fail!("partition ordering is not stable: it must cover every non-partition dimension")
+                } else {
+                    let partition_exprs = array.map(partition_dims, fn(d) { dimension_expr(payload, d) });
+                    'Some(qb.partitioned_top_n(partition_exprs, ordering, part.take))
+                }
+            }
+        },
+    }
+};
+
 def merge_edges: Fn(Array(Int), Array(Int)) -> Array(Int) = fn(acc, seq) {
     array.fold(seq, acc, fn(edges, r) {
         if array.any(edges, fn(e) { e == r }) {
@@ -914,16 +1433,22 @@ def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
             fail!("requested measures are not grain-compatible")
         } else {
             let dimensions = resolve_dimensions(payload, request.dimensions);
+            let scope_resolutions = array.flat_map(dimensions, fn(d) {
+                array.map(d.entry.scope, fn(p) { resolve_scope(payload, d.entry, p) })
+            });
             let filter_resolutions = resolve_filters(payload, request.filters);
-            let filter_expr = combine_filters(array.map(filter_resolutions, fn(f) { f.expr }));
+            let filter_expr = combined_filter(scope_resolutions, filter_resolutions);
             let requested_measure_ids = array.map(request.measures, fn(m) { m.id });
             let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
             let ordering = resolve_ordering(payload, request.ordering, requested_measure_ids, requested_dimension_ids);
+            let partition = check_partition(payload, request, dimensions, ordering);
             let limit = check_limit(request.limit);
+            let offset = check_offset(request.offset, array.length(request.ordering));
             let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
+            let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
             let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
             let measure_targets = array.concat(array.map(measures, fn(m) { m.entry.requires }));
-            let targets = array.concat([measure_targets, dim_entities, filter_entities]);
+            let targets = array.concat([measure_targets, dim_entities, scope_entities, filter_entities]);
             let joins = select_joins(payload, base_entity, targets);
             let base_source = get_index(payload.entities, base_entity);
             let join_sources = array.map(joins, fn(j) { j.source });
@@ -931,13 +1456,20 @@ def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
             let measure_items = array.map(measures, fn(m) {
                 let entity = get_index(payload.entities, m.entry.entity);
                 let field = get_index(entity.fields, m.entry.field);
-                qb.aggregate(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, m.entry.alias)
+                match m.entry.computed {
+                    'Some(spec) => qb.computed_item(spec.op, spec.left, spec.right, m.entry.alias),
+                    'None => match m.entry.predicate {
+                        'Some(_) => qb.aggregate_filtered(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, 'Some(resolve_measure_predicate(payload, m.entry)), m.entry.alias),
+                        'None => qb.aggregate(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, m.entry.alias),
+                    },
+                }
             });
             let dimension_items = array.map(dimensions, fn(d) {
                 qb.expr_item(dimension_expr(payload, d.entry))
             });
             let projection = array.concat([measure_items, dimension_items]);
             let grouping = array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) });
+            let no_partition_ordering: Array(qb.OrderBy) = [];
             let plan: qb.Plan = {
                 revision: payload.revision,
                 sources,
@@ -945,8 +1477,10 @@ def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
                 filter: filter_expr,
                 joins,
                 grouping,
-                ordering,
-                limit,
+                ordering: if partition == 'None { ordering } else { no_partition_ordering },
+                limit: if partition == 'None { limit } else { 'None },
+                offset: if partition == 'None { offset } else { 'None },
+                partition,
             };
             qb.validate(plan, payload.profile)
         }
@@ -961,6 +1495,8 @@ export {
     ColumnMap,
     KeyFlag,
     MeasureDef,
+    FilteredMeasureDef,
+    ComputedMeasureDef,
     DimensionDef,
     ComputedDimensionDef,
     EntitySource,
@@ -971,6 +1507,7 @@ export {
     FilterOp,
     FilterInputKind,
     FilterInput,
+    ScopePredicate,
     OrderDirection,
     OrderTarget,
     MeasureInput,
@@ -979,6 +1516,7 @@ export {
     DimensionRequest,
     FilterRequest,
     OrderRequest,
+    PartitionRequest,
     QueryRequest,
     FieldEntry,
     EnumValueEntry,
@@ -991,11 +1529,14 @@ export {
     column,
     key,
     measure,
+    filtered_measure,
+    computed_measure,
     dimension,
     computed_dimension,
     entity_source,
     relation,
     enum_value,
+    scope,
     build_root,
     lower,
     dimension_expr,
@@ -1003,6 +1544,8 @@ export {
     to_bind,
     combine_filters,
     check_limit,
+    check_offset,
+    check_partition,
     get_index,
     int_range,
 };
