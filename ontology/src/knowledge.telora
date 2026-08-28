@@ -1,0 +1,157 @@
+# Fictional EnterpriseKnowledge used by the example binaries.
+#
+# This module is deliberately small and domain-neutral (no logistics facts).
+# It demonstrates how an enterprise author declares nominal entity types and
+# typed properties, then publishes a prepared payload that the eDSL hot path
+# consumes. All business ids are the stable exchange vocabulary declared here.
+
+import "query/lib" as qb;
+import "@src/edsl" as edsl;
+
+# --- Pre-bound decorator arguments (decorator calls do not re-type literals). --
+
+def sum_agg: qb.AggregateFunction = 'Sum;
+def count_agg: qb.AggregateFunction = 'Count;
+def flag_true: Bool = 'True;
+def flag_false: Bool = 'False;
+def eq_ops: Array(edsl.FilterOp) = ['Eq];
+def ge_le_ops: Array(edsl.FilterOp) = ['Ge, 'Le];
+def text_kinds: Array(edsl.FilterInputKind) = ['Text];
+def no_ops: Array(edsl.FilterOp) = [];
+def no_kinds: Array(edsl.FilterInputKind) = [];
+def safe_kind: edsl.RelationKind = 'Safe;
+def fanout_kind: edsl.RelationKind = 'FanOut;
+
+# Canonical computed dimension: Substr(created_at, 1, 7). The literals are
+# lowered to bound values at plan-build time; no pre-rendered SQL is stored.
+def week_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
+    qb.substr([col, qb.bind_int(1), qb.bind_int(7)])
+};
+
+# --- Entity declarations -----------------------------------------------------
+
+# Orders are the base grain for the order measures.
+# Canonical (alphabetical) field order: 0: amount (measure),
+# 1: created_at (computed dimension base), 2: customer_id (relation FK),
+# 3: order_id (key), 4: region (dimension).
+@edsl.entity_source("orders", "o")
+@edsl.relation(Customer, safe_kind, 2, 1)
+type Order = struct {
+    @edsl.column("order_id")
+    @edsl.key(flag_true)
+    @edsl.measure("OrderCount", count_agg, requires_none)
+    @edsl.dimension("OrderId", flag_true, flag_false, no_ops, no_kinds)
+    order_id: Int,
+    @edsl.column("customer_id")
+    customer_id: Int,
+    @edsl.column("amount")
+    @edsl.measure("OrderAmount", sum_agg, requires_none)
+    amount: Float,
+    @edsl.column("region")
+    @edsl.dimension("OrderRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+    @edsl.column("created_at")
+    @edsl.computed_dimension("OrderWeek", flag_true, flag_true, ge_le_ops, text_kinds, week_builder)
+    created_at: String,
+};
+
+# Customers hold the tier/name/contact dimensions reachable from orders.
+# Canonical (alphabetical) field order: 0: contact (known, not authorized),
+# 1: id (key), 2: name (dimension, groupable only), 3: tier (closed enum
+# dimension). CustomerCount is a measure on the customer grain that requires
+# Order; the Customer->Order path is fan-out-only, so requesting it fails
+# atomically.
+#
+# CustomerTier is a closed enum value domain: its variants declare stable
+# physical values and display labels; the physical "tier" column stores the
+# stable values. Filters on the CustomerTier dimension accept only members of
+# this domain (Eq) and unknown values fail atomically.
+type CustomerTier = enum {
+    @edsl.enum_value("gold", "Gold customer")
+    'Gold,
+    @edsl.enum_value("silver", "Silver customer")
+    'Silver,
+    @edsl.enum_value("bronze", "Bronze customer")
+    'Bronze,
+};
+
+@edsl.entity_source("customers", "c")
+@edsl.relation(Order, fanout_kind, 1, 2)
+type Customer = struct {
+    @edsl.column("contact")
+    @edsl.dimension("CustomerContact", flag_false, flag_false, no_ops, no_kinds)
+    contact: String,
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("CustomerCount", count_agg, requires_order)
+    id: Int,
+    @edsl.column("name")
+    @edsl.dimension("CustomerName", flag_true, flag_false, no_ops, no_kinds)
+    name: String,
+    @edsl.column("tier")
+    @edsl.dimension("CustomerTier", flag_true, flag_true, eq_ops, text_kinds)
+    tier: CustomerTier,
+};
+
+# Items are an item-grain entity whose measures carry Order (and Customer)
+# as required entities, forcing grain-safe joins even without dimensions.
+# Canonical (alphabetical) field order: 0: amount (measure), 1: id (key),
+# 2: order_id (relation FK).
+@edsl.entity_source("items", "i")
+@edsl.relation(Order, safe_kind, 2, 3)
+type Item = struct {
+    @edsl.column("amount")
+    @edsl.measure("ItemAmount", sum_agg, requires_order)
+    amount: Float,
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("ItemQty", count_agg, requires_order_customer)
+    id: Int,
+    @edsl.column("order_id")
+    order_id: Int,
+};
+
+# --- PlanProfile accepted by this knowledge ----------------------------------
+
+def requires_none: Array(Type) = [];
+def requires_order: Array(Type) = [Order];
+def requires_order_customer: Array(Type) = [Order, Customer];
+
+def profile: qb.PlanProfile = {
+    allowed_operators: [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+        'Filter, 'Join, 'Group, 'Order, 'Limit,
+    ],
+    allowed_join_kinds: ['Inner, 'Left],
+    allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
+    allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+    allow_distinct: 'True,
+};
+
+# --- Authorization (fictional) -----------------------------------------------
+
+def authorize: Fn(String) -> Bool = fn(subject) {
+    subject == "analyst"
+};
+
+# --- Prepared payload (computed once at module load) -------------------------
+
+def payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [Order, Customer, Item];
+    let result: edsl.PreparedPayload = edsl.build_root(
+        "fictional-v2",
+        entity_types,
+        profile,
+        authorize,
+    );
+    result
+};
+
+export {
+    Order,
+    Customer,
+    CustomerTier,
+    Item,
+    profile,
+    payload,
+};

@@ -1,0 +1,72 @@
+# ent-1/src/bin/query-surface.telora
+#
+# Public query surface self-verification entry (no run-ctx source required).
+#
+# Constructs a generic typed Request (not targeted at any hidden intent) and
+# exercises both public paths:
+#   - typed:  query.lower(request)                 -> Query
+#   - dynamic: query.lower_value(encoded request)  -> ValueQuery
+# and proves deterministic lowering, typed/dynamic equality, and that the
+# normalized intent round-trips to the same Request.
+#
+# The real file-source provenance path (invalid JSON diagnosed at its
+# @run-ctx/request source location) is provided by the fixed query-1 entry
+# (the A4 consumer), which wraps this facade and supplies the request through
+# run-ctx sources; `lower_value` preserves the input provenance through
+# fail! subjects.  This entry keeps the exact no-source GOAL command working:
+#
+#   ./bin/telora run query-surface -C ent-1
+import "query/lib" as qb;
+import "std/codec" as codec;
+import "std/json" as json;
+import "std/result" as result;
+import "std/value" { Value };
+import "@src/query" as query;
+
+# Generic request over the public vocabulary: one measure, one dimension, one
+# authorized filter, ordering on requested projections, positive Top N.
+def generic_request: query.Request = {
+    measures: ["OrdersCreated"],
+    dimensions: ["OrderMonth"],
+    filters: [
+        { dimension: "CustomerTier", op: 'Eq, value: 'String("Gold") },
+    ],
+    ordering: [
+        { target: 'Measure("OrdersCreated"), direction: 'Desc },
+        { target: 'Dimension("OrderMonth"), direction: 'Asc },
+    ],
+    limit: 'Some(5),
+};
+
+export def main: Fn(Dict(Value)) -> Value = fn(sources) {
+    # Typed path: deterministic lowering.
+    let q1 = query.lower(generic_request);
+    let q2 = query.lower(generic_request);
+    let deterministic = q1.sql == q2.sql && q1.bindings == q2.bindings;
+
+    # Dynamic path: encode the generic request to the fixed Value shape and
+    # lower through lower_value.
+    let encoded: Value = codec.encode(Value, generic_request) |> result.unwrap;
+    let vq = query.lower_value(encoded);
+    let query_value = vq.query;
+
+    # Typed and dynamic paths must produce the same Query for the same intent.
+    let typed_query_value: Value = codec.encode(Value, q1) |> result.unwrap;
+    let same_query = typed_query_value == query_value;
+
+    # The normalized intent must decode back to the same typed Request.
+    let decoded_back: query.Request = codec.decode(query.Request, vq.intent) |> result.unwrap;
+    let roundtrip = decoded_back == generic_request;
+
+    # Both outputs must be encodable as JSON text.
+    let intent_json = json.stringify(vq.intent);
+    let query_json = json.stringify(vq.query);
+
+    'Object({
+        deterministic: if deterministic { 'True } else { 'False },
+        same_query: if same_query { 'True } else { 'False },
+        roundtrip: if roundtrip { 'True } else { 'False },
+        intent_json: 'String(intent_json),
+        query_json: 'String(query_json),
+    })
+};

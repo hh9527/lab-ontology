@@ -1,0 +1,176 @@
+# ent-1/src/query.telora
+#
+# Public query facade for the logistics EnterpriseKnowledge.
+#
+# The facade captures the prepared lowering from the same private ontology
+# root (`@src/model` payload): it derives the closed business vocabulary from
+# the published payload and delegates lowering to the eDSL hot path plus the
+# public QueryBuilder.  It does not maintain a second copy of domain
+# knowledge, does not reimplement lowering/Plan/SQL logic, and exposes no
+# physical table/column/alias/join facts.
+#
+# Public surface:
+#   - business vocabulary (measures, dimensions)
+#   - typed Request decodable from the fixed JSON shape in
+#     query-1/QUERY-DOC.md
+#   - lower: Fn(Request) -> qb.Query
+#   - lower_value: Fn(Value) -> ValueQuery (dynamic boundary)
+#
+# The public boundary uses only precise nominal types; no Any/Dyn erasure.
+
+import "query/lib" as qb;
+import "std/array" as array;
+import "std/codec" as codec;
+import "std/json" as json;
+import "std/value" { Value };
+import "ontology/edsl" as edsl;
+import "@src/model" as model;
+
+# ---------------------------------------------------------------------------
+# Public typed request vocabulary (mirrors the fixed JSON shape).
+# ---------------------------------------------------------------------------
+
+# Filter value as it appears in JSON: a native scalar.  Telora internally
+# keeps a closed nominal enum and explicit branch/type checks; across the JSON
+# codec boundary it uses the untagged representation (mirroring query's
+# `Val`): 'String(s) <-> "s", 'Number(f) <-> f, 'Int(i) <-> i.
+@json.untagged
+type FilterValue = enum {
+    'String(String),
+    'Number(Float),
+    'Int(Int),
+};
+
+type Filter = struct {
+    dimension: String,
+    op: edsl.FilterOp,
+    value: FilterValue,
+};
+
+# Ordering entries reuse the eDSL public ordering types (same JSON shape:
+# {"target": {"Measure": "..."} | {"Dimension": "..."}, "direction": "Asc"|"Desc"}).
+type Order = edsl.OrderRequest;
+
+type Request = struct {
+    measures: Array(String),
+    dimensions: Array(String),
+    filters: Array(Filter),
+    ordering: Array(Order),
+    limit: Option(Int),
+};
+
+type ValueQuery = struct {
+    intent: Value,
+    query: Value,
+};
+
+# ---------------------------------------------------------------------------
+# Closed business vocabulary captured from the prepared ontology root.
+# ---------------------------------------------------------------------------
+
+# Measures: all payload measures are queryable.
+def measures: Array(String) = array.map(model.payload.measures, fn(m) { m.id });
+
+# Dimensions: only authorized dimensions are queryable; the unauthorized
+# dimension (no granted capability) is intentionally excluded here and
+# documented in the public contract as a known-but-unqueryable concept.
+def dimensions: Array(String) = array.map(
+    array.filter(model.payload.dimensions, fn(d) { d.authorized }),
+    fn(d) { d.id },
+);
+
+# Closed value catalog for the CustomerTier closed enum value domain, captured
+# from the same prepared ontology root (no second hand-maintained copy). Lets a
+# query designer discover legal filter values without reading the private model.
+def customer_tier_domain: Array(edsl.EnumValueEntry) =
+    edsl.dimension_domain(model.payload, "CustomerTier");
+
+# ---------------------------------------------------------------------------
+# Adaptation to the private typed request.  The public request carries no
+# subject (the inquirer is not part of the request contract); the facade
+# fills the fixed subject here and delegates all lowering to the eDSL.
+# ---------------------------------------------------------------------------
+
+def to_filter_input: Fn(FilterValue) -> edsl.FilterInput = fn(value) {
+    match value {
+        'String(s) => 'Text(s),
+        'Number(f) => 'Number(f),
+        'Int(i) => 'Int(i),
+    }
+};
+
+def to_edsl_request: Fn(Request) -> edsl.QueryRequest = fn(request) {
+    let result: edsl.QueryRequest = {
+        measures: array.map(request.measures, fn(id) {
+            let item: edsl.MeasureRequest = { id, subject: "analyst", input: 'All };
+            item
+        }),
+        dimensions: array.map(request.dimensions, fn(id) {
+            let item: edsl.DimensionRequest = { id, subject: "analyst", input: 'None };
+            item
+        }),
+        filters: array.map(request.filters, fn(f) {
+            let item: edsl.FilterRequest = {
+                id: f.dimension,
+                subject: "analyst",
+                op: f.op,
+                input: to_filter_input(f.value),
+            };
+            item
+        }),
+        ordering: request.ordering,
+        limit: request.limit,
+    };
+    result
+};
+
+# ---------------------------------------------------------------------------
+# Lowering.
+# ---------------------------------------------------------------------------
+
+# Typed public entry: Request -> parameterized Query.
+def lower: Fn(Request) -> qb.Query = fn(request) {
+    let plan: qb.Plan = edsl.lower(model.payload, to_edsl_request(request));
+    qb.transform_sqlite(plan)
+};
+
+# Dynamic public entry: decodes the fixed JSON shape, converts to the typed
+# Request, calls the same lower, and encodes the normalized Request and the
+# Query into a ValueQuery.  Any decode/vocabulary/filter/ordering/limit
+# problem fails out-of-band with the input provenance; a partial ValueQuery
+# is never returned.
+def lower_value: Fn(Value) -> ValueQuery = fn(input) {
+    let decoded = codec.decode(Request, input);
+    let request = match decoded {
+        'Ok(req) => req,
+        'Err(err) => fail!("invalid query request", err.message, err.data, input),
+    };
+    let query = lower(request);
+    let intent = match codec.encode(Value, request) {
+        'Ok(v) => v,
+        'Err(err) => fail!("cannot encode normalized request", err.message, err.data),
+    };
+    let query_value = match codec.encode(Value, query) {
+        'Ok(v) => v,
+        'Err(err) => fail!("cannot encode query", err.message, err.data),
+    };
+    let result: ValueQuery = { intent, query: query_value };
+    result
+};
+
+# ---------------------------------------------------------------------------
+# Public surface.
+# ---------------------------------------------------------------------------
+
+export {
+    FilterValue,
+    Filter,
+    Order,
+    Request,
+    ValueQuery,
+    measures,
+    dimensions,
+    customer_tier_domain,
+    lower,
+    lower_value,
+};

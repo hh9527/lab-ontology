@@ -1,0 +1,876 @@
+# query/src/lib.telora
+#
+# QueryBuilder: a domain-neutral Plan vocabulary with deterministic SQLite
+# concretization.  This package knows nothing about ontologies, enterprises,
+# metrics, dimensions or question phrasing.  The public entry module is
+# `query/lib.telora` for external dependents; package-internal code
+# (bins, tests) may use `@src/lib`.
+
+import "std/array" as array;
+import "std/string" as string;
+import "std/regex" as regex;
+import "std/json" as json;
+
+# ---------------------------------------------------------------------------
+# Public value type: dynamic values flowing into bindings.
+#
+# `Val` remains a closed nominal enum on the Telora side; its JSON codec
+# representation is deliberately untagged so that runtime values cross the
+# JSON boundary as native scalar JSON: 'Int(3) <-> 3, 'Float(3.5) <-> 3.5,
+# 'String("abc") <-> "abc", 'Bool(true) <-> true.  Query.bindings therefore
+# encodes as a native JSON scalar array (e.g. [3, "abc"]) with no variant
+# wrapper such as {"Int": 3} or {"String": "abc"}.  This property only
+# affects the codec boundary; inside Telora `Val` variants are unchanged and
+# SQL placeholder/binding-order/lowering semantics are unaffected.
+# ---------------------------------------------------------------------------
+
+@json.untagged
+type Val = enum {
+    'String(String),
+    'Int(Int),
+    'Float(Float),
+    'Bool(Bool),
+};
+
+# ---------------------------------------------------------------------------
+# Public Query: parameterized SQLite query shape.
+# ---------------------------------------------------------------------------
+
+type Query = struct {
+    sql: String,
+    bindings: Array(Val),
+};
+
+# ---------------------------------------------------------------------------
+# Expressions.
+# ---------------------------------------------------------------------------
+
+type ColumnRef = struct {
+    source: String,
+    column: String,
+};
+
+# ScalarFunction is the closed scalar vocabulary for this round.  `Substr` is
+# the required SQLite scalar (`substr(value, start[, length])`); the remaining
+# variants are operator-style scalar predicates/logic rendered with SQLite
+# operator syntax.  Semantics never change with the profile or the caller.
+type ScalarFunction = enum {
+    'Substr,
+    'Eq,
+    'Ne,
+    'Lt,
+    'Le,
+    'Gt,
+    'Ge,
+    'And,
+    'Or,
+    'Not,
+};
+
+type ScalarCall = struct {
+    function: ScalarFunction,
+    args: Array(Expr),
+};
+
+type Expr = enum {
+    'Column(ColumnRef),
+    'Bind(Val),
+    'Scalar(ScalarCall),
+};
+
+type AggregateFunction = enum {
+    'Count,
+    'Sum,
+    'Avg,
+    'Min,
+    'Max,
+};
+
+type AggregateCall = struct {
+    function: AggregateFunction,
+    arg: Expr,
+    distinct: Bool,
+    alias: String,
+};
+
+type SelectItem = enum {
+    'Expr(Expr),
+    'Aggregate(AggregateCall),
+};
+
+# ---------------------------------------------------------------------------
+# Relations and plan structure.
+# ---------------------------------------------------------------------------
+
+type Source = struct {
+    alias: String,
+    table: String,
+};
+
+type JoinKind = enum {
+    'Inner,
+    'Left,
+};
+
+type JoinCondition = struct {
+    left: ColumnRef,
+    right: ColumnRef,
+};
+
+type Join = struct {
+    kind: JoinKind,
+    source: Source,
+    condition: JoinCondition,
+};
+
+type Ordering = enum {
+    'Asc,
+    'Desc,
+};
+
+# A reference to a projected aggregate, addressed by its output alias.
+type AggregateRef = struct {
+    alias: String,
+};
+
+# Ordering key: either a plain expression or a reference to a projected
+# aggregate measure.  AggregateRef is only valid when the alias matches an
+# AggregateCall in `Plan.projection`.
+type OrderKey = enum {
+    'Expr(Expr),
+    'AggregateRef(AggregateRef),
+};
+
+type OrderBy = struct {
+    key: OrderKey,
+    direction: Ordering,
+};
+
+type Plan = struct {
+    revision: String,
+    sources: Array(Source),
+    projection: Array(SelectItem),
+    filter: Option(Expr),
+    joins: Array(Join),
+    grouping: Array(Expr),
+    ordering: Array(OrderBy),
+    limit: Option(Int),
+};
+
+# ---------------------------------------------------------------------------
+# Operator vocabulary and profile.
+# ---------------------------------------------------------------------------
+
+type Operator = enum {
+    'Source,
+    'Project,
+    'Column,
+    'Bind,
+    'Scalar,
+    'Aggregate,
+    'Filter,
+    'Join,
+    'Group,
+    'Order,
+    'Limit,
+};
+
+type PlanProfile = struct {
+    allowed_operators: Array(Operator),
+    allowed_join_kinds: Array(JoinKind),
+    allowed_aggregates: Array(AggregateFunction),
+    allowed_scalars: Array(ScalarFunction),
+    allow_distinct: Bool,
+};
+
+# ---------------------------------------------------------------------------
+# Identifier checks.
+# ---------------------------------------------------------------------------
+
+def sql_identifier_pattern = regex.compile(r"^[A-Za-z_][A-Za-z0-9_]*$");
+
+def is_sql_identifier: Fn(String) -> Bool = fn(text) {
+    regex.is_match(sql_identifier_pattern, text)
+};
+
+# ---------------------------------------------------------------------------
+# Operator set computation.
+# ---------------------------------------------------------------------------
+
+def ops_member: Fn(Array(Operator), Operator) -> Bool = fn(items, op) {
+    array.any(items, fn(item) { item == op })
+};
+
+def push_unique_operator: Fn(Array(Operator), Operator) -> Array(Operator) = fn(items, op) {
+    if ops_member(items, op) { items } else { array.push(items, op) }
+};
+
+def ops_union: Fn(Array(Operator), Array(Operator)) -> Array(Operator) = fn(left, right) {
+    array.fold(right, left, push_unique_operator)
+};
+
+def expr_operators: Fn(Expr) -> Array(Operator) = fn(expr) {
+    match expr {
+        'Column(_) => ['Column],
+        'Bind(_) => ['Bind],
+        'Scalar(call) => {
+            let empty: Array(Operator) = [];
+            let child = array.fold(call.args, empty, fn(acc, arg) {
+                ops_union(acc, expr_operators(arg))
+            });
+            ops_union(child, ['Scalar])
+        },
+    }
+};
+
+def exprs_operators: Fn(Array(Expr)) -> Array(Operator) = fn(exprs) {
+    let empty: Array(Operator) = [];
+    array.fold(exprs, empty, fn(acc, expr) { ops_union(acc, expr_operators(expr)) })
+};
+
+def select_item_operators: Fn(SelectItem) -> Array(Operator) = fn(item) {
+    match item {
+        'Expr(expr) => expr_operators(expr),
+        'Aggregate(call) => ops_union(expr_operators(call.arg), ['Aggregate]),
+    }
+};
+
+def order_key_operators: Fn(OrderKey) -> Array(Operator) = fn(key) {
+    match key {
+        'Expr(expr) => expr_operators(expr),
+        'AggregateRef(_) => ['Aggregate],
+    }
+};
+
+def ordering_operators: Fn(Array(OrderBy)) -> Array(Operator) = fn(ordering) {
+    let empty: Array(Operator) = [];
+    array.fold(ordering, empty, fn(acc, ob) { ops_union(acc, order_key_operators(ob.key)) })
+};
+
+def joins_operators: Fn(Array(Join)) -> Array(Operator) = fn(joins) {
+    let empty: Array(Operator) = [];
+    array.fold(joins, empty, fn(acc, join) {
+        ops_union(ops_union(acc, ['Join]), ['Column])
+    })
+};
+
+# Returns the set of standard operators used by a plan, in canonical vocabulary
+# order.  `operators(plan) <= profile.allowed_operators` is the subset check.
+def operators: Fn(Plan) -> Array(Operator) = fn(plan) {
+    let base: Array(Operator) = ['Source];
+    let with_projection = if array.length(plan.projection) > 0 {
+        ops_union(base, ['Project])
+    } else {
+        base
+    };
+    let with_items = array.fold(plan.projection, with_projection, fn(acc, item) {
+        ops_union(acc, select_item_operators(item))
+    });
+    let with_filter = match plan.filter {
+        'Some(expr) => ops_union(ops_union(with_items, ['Filter]), expr_operators(expr)),
+        'None => with_items,
+    };
+    let with_joins = ops_union(with_filter, joins_operators(plan.joins));
+    let with_group = if array.length(plan.grouping) > 0 {
+        ops_union(ops_union(with_joins, ['Group]), exprs_operators(plan.grouping))
+    } else {
+        with_joins
+    };
+    let with_order = if array.length(plan.ordering) > 0 {
+        ops_union(ops_union(with_group, ['Order]), ordering_operators(plan.ordering))
+    } else {
+        with_group
+    };
+    if plan.limit != 'None {
+        ops_union(with_order, ['Limit])
+    } else {
+        with_order
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Structural validation.
+# ---------------------------------------------------------------------------
+
+def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args) {
+    let len = array.length(args);
+    match function {
+        'Substr => len == 2 || len == 3,
+        'Eq => len == 2,
+        'Ne => len == 2,
+        'Lt => len == 2,
+        'Le => len == 2,
+        'Gt => len == 2,
+        'Ge => len == 2,
+        'And => len == 2,
+        'Or => len == 2,
+        'Not => len == 1,
+    }
+};
+
+def known_alias: Fn(Array(String), String) -> Bool = fn(aliases, alias) {
+    array.any(aliases, fn(candidate) { candidate == alias })
+};
+
+def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
+    match expr {
+        'Column(ref) => is_sql_identifier(ref.column) && known_alias(aliases, ref.source),
+        'Bind(_) => 'True,
+        'Scalar(call) => {
+            scalar_arity_ok(call.function, call.args)
+            && array.all(call.args, fn(arg) { expr_valid(arg, aliases) })
+        },
+    }
+};
+
+def select_item_valid: Fn(SelectItem, Array(String)) -> Bool = fn(item, aliases) {
+    match item {
+        'Expr(expr) => expr_valid(expr, aliases),
+        'Aggregate(call) => is_sql_identifier(call.alias) && expr_valid(call.arg, aliases),
+    }
+};
+
+def join_identifiers_valid: Fn(Join) -> Bool = fn(join) {
+    is_sql_identifier(join.source.alias)
+    && is_sql_identifier(join.source.table)
+    && is_sql_identifier(join.condition.left.source)
+    && is_sql_identifier(join.condition.left.column)
+    && is_sql_identifier(join.condition.right.source)
+    && is_sql_identifier(join.condition.right.column)
+};
+
+def join_condition_valid: Fn(Join, Array(String)) -> Bool = fn(join, aliases) {
+    known_alias(aliases, join.condition.left.source)
+    && known_alias(aliases, join.condition.right.source)
+};
+
+def aliases_of: Fn(Plan) -> Array(String) = fn(plan) {
+    array.fold(plan.joins, array.map(plan.sources, fn(source) { source.alias }), fn(acc, join) {
+        array.push(acc, join.source.alias)
+    })
+};
+
+# Aliases of the aggregates projected by the plan, in projection order.
+def projected_aggregate_aliases: Fn(Plan) -> Array(String) = fn(plan) {
+    let empty: Array(String) = [];
+    array.fold(plan.projection, empty, fn(acc, item) {
+        match item {
+            'Expr(_) => acc,
+            'Aggregate(call) => array.push(acc, call.alias),
+        }
+    })
+};
+
+# An ordering key is valid when a plain expression is a valid Expr, or when an
+# AggregateRef names a valid SQL identifier that is projected by the plan.
+def order_key_valid: Fn(OrderKey, Array(String), Array(String)) -> Bool = fn(key, source_aliases, aggregate_aliases) {
+    match key {
+        'Expr(expr) => expr_valid(expr, source_aliases),
+        'AggregateRef(ref) => is_sql_identifier(ref.alias) && known_alias(aggregate_aliases, ref.alias),
+    }
+};
+
+# Pure structural predicate: true when the plan is a well-formed Plan whose
+# identifiers, scalar arities, source references and limit are legal.
+def structure_ok: Fn(Plan) -> Bool = fn(plan) {
+    let sources_nonempty = array.length(plan.sources) > 0;
+    let projection_nonempty = array.length(plan.projection) > 0;
+    let source_ids_ok = array.all(plan.sources, fn(source) {
+        is_sql_identifier(source.alias) && is_sql_identifier(source.table)
+    });
+    let join_ids_ok = array.all(plan.joins, join_identifiers_valid);
+    let aliases = aliases_of(plan);
+    let join_conds_ok = array.all(plan.joins, fn(join) { join_condition_valid(join, aliases) });
+    let projection_ok = array.all(plan.projection, fn(item) { select_item_valid(item, aliases) });
+    let filter_ok = match plan.filter {
+        'Some(expr) => expr_valid(expr, aliases),
+        'None => 'True,
+    };
+    let grouping_ok = array.all(plan.grouping, fn(expr) { expr_valid(expr, aliases) });
+    let aggregate_aliases = projected_aggregate_aliases(plan);
+    let ordering_ok = array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases, aggregate_aliases) });
+    let limit_ok = match plan.limit {
+        'Some(value) => value >= 0,
+        'None => 'True,
+    };
+    sources_nonempty && projection_nonempty && source_ids_ok && join_ids_ok
+        && join_conds_ok && projection_ok && filter_ok && grouping_ok
+        && ordering_ok && limit_ok
+};
+
+# Failing structural validation: rejects illegal structure, invalid
+# identifiers, unknown source references, bad scalar arities and negative
+# limits with a Host diagnostic.  Never publishes a partial Query.
+def validate_structure: Fn(Plan) -> Plan = fn(plan) {
+    if array.length(plan.sources) == 0 {
+        fail!("plan must declare at least one source", plan)
+    } else if array.length(plan.projection) == 0 {
+        fail!("plan must declare a non-empty projection", plan)
+    } else if !array.all(plan.sources, fn(source) { is_sql_identifier(source.alias) && is_sql_identifier(source.table) }) {
+        fail!("plan declares an invalid source identifier", plan)
+    } else if !array.all(plan.joins, join_identifiers_valid) {
+        fail!("plan declares an invalid join identifier", plan)
+    } else if !array.all(plan.joins, fn(join) { join_condition_valid(join, aliases_of(plan)) }) {
+        fail!("plan join condition references an unknown source", plan)
+    } else if !array.all(plan.projection, fn(item) { select_item_valid(item, aliases_of(plan)) }) {
+        fail!("plan projection contains an invalid expression", plan)
+    } else if !match plan.filter {
+        'Some(expr) => expr_valid(expr, aliases_of(plan)),
+        'None => 'True,
+    } {
+        fail!("plan filter contains an invalid expression", plan)
+    } else if !array.all(plan.grouping, fn(expr) { expr_valid(expr, aliases_of(plan)) }) {
+        fail!("plan grouping contains an invalid expression", plan)
+    } else if !array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases_of(plan), projected_aggregate_aliases(plan)) }) {
+        fail!("plan ordering contains an invalid or unprojected ordering target", plan)
+    } else if !match plan.limit {
+        'Some(value) => value >= 0,
+        'None => 'True,
+    } {
+        fail!("plan limit must be non-negative", plan)
+    } else {
+        plan
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Profile validation.
+# ---------------------------------------------------------------------------
+
+def operator_allowed: Fn(Operator, Array(Operator)) -> Bool = fn(op, allowed) {
+    array.any(allowed, fn(candidate) { candidate == op })
+};
+
+def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed) {
+    match expr {
+        'Column(_) => 'True,
+        'Bind(_) => 'True,
+        'Scalar(call) => {
+            let self_ok = array.any(allowed, fn(candidate) { candidate == call.function });
+            self_ok && array.all(call.args, fn(arg) { expr_scalars_ok(arg, allowed) })
+        },
+    }
+};
+
+def select_scalars_ok: Fn(SelectItem, Array(ScalarFunction)) -> Bool = fn(item, allowed) {
+    match item {
+        'Expr(expr) => expr_scalars_ok(expr, allowed),
+        'Aggregate(call) => expr_scalars_ok(call.arg, allowed),
+    }
+};
+
+# An AggregateRef ordering key adds no new scalar usage: the referenced
+# aggregate already appears in the projection and is checked there.
+def order_key_scalars_ok: Fn(OrderKey, Array(ScalarFunction)) -> Bool = fn(key, allowed) {
+    match key {
+        'Expr(expr) => expr_scalars_ok(expr, allowed),
+        'AggregateRef(_) => 'True,
+    }
+};
+
+def select_aggregate_ok: Fn(SelectItem, Array(AggregateFunction)) -> Bool = fn(item, allowed) {
+    match item {
+        'Expr(_) => 'True,
+        'Aggregate(call) => array.any(allowed, fn(candidate) { candidate == call.function }),
+    }
+};
+
+# Pure capability check: true exactly when every operator and refined
+# capability used by the plan is accepted by the profile.  The profile is a
+# capability declaration; it never changes operator semantics.
+def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
+    let used = operators(plan);
+    let ops_ok = array.all(used, fn(op) { operator_allowed(op, profile.allowed_operators) });
+    let joins_ok = array.all(plan.joins, fn(join) {
+        array.any(profile.allowed_join_kinds, fn(kind) { kind == join.kind })
+    });
+    let aggregates_ok = array.all(plan.projection, fn(item) { select_aggregate_ok(item, profile.allowed_aggregates) });
+    let scalars_ok = array.all(plan.projection, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
+        && (match plan.filter {
+            'Some(expr) => expr_scalars_ok(expr, profile.allowed_scalars),
+            'None => 'True,
+        })
+        && array.all(plan.grouping, fn(expr) { expr_scalars_ok(expr, profile.allowed_scalars) })
+        && array.all(plan.ordering, fn(ob) { order_key_scalars_ok(ob.key, profile.allowed_scalars) });
+    let distinct_ok = if profile.allow_distinct {
+        'True
+    } else {
+        array.all(plan.projection, fn(item) {
+            match item {
+                'Expr(_) => 'True,
+                'Aggregate(call) => call.distinct == 'False,
+            }
+        })
+    };
+    ops_ok && joins_ok && aggregates_ok && scalars_ok && distinct_ok
+};
+
+# Failing profile validation: structural problems are rejected first, then any
+# operator or refined capability outside the profile (including a distinct
+# aggregate when `allow_distinct` is false) fails with a Host diagnostic.
+def validate: Fn(Plan, PlanProfile) -> Plan = fn(plan, profile) {
+    let structured = validate_structure(plan);
+    if profile_accepts(structured, profile) {
+        structured
+    } else {
+        fail!("plan uses capabilities not allowed by the profile", plan, profile)
+    }
+};
+
+# ---------------------------------------------------------------------------
+# SQLite lowering.
+# ---------------------------------------------------------------------------
+
+def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
+    match function {
+        'Substr => "substr",
+        'Eq => "=",
+        'Ne => "!=",
+        'Lt => "<",
+        'Le => "<=",
+        'Gt => ">",
+        'Ge => ">=",
+        'And => "AND",
+        'Or => "OR",
+        'Not => "NOT",
+    }
+};
+
+def aggregate_name: Fn(AggregateFunction) -> String = fn(function) {
+    match function {
+        'Count => "count",
+        'Sum => "sum",
+        'Avg => "avg",
+        'Min => "min",
+        'Max => "max",
+    }
+};
+
+def join_kind_sql: Fn(JoinKind) -> String = fn(kind) {
+    match kind {
+        'Inner => "INNER JOIN",
+        'Left => "LEFT JOIN",
+    }
+};
+
+def direction_sql: Fn(Ordering) -> String = fn(direction) {
+    match direction {
+        'Asc => "ASC",
+        'Desc => "DESC",
+    }
+};
+
+def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function, parts) {
+    match function {
+        'Substr => `\{scalar_name(function)}(\{string.join(parts, ", ")})`,
+        'Eq => `\{parts[0]} = \{parts[1]}`,
+        'Ne => `\{parts[0]} != \{parts[1]}`,
+        'Lt => `\{parts[0]} < \{parts[1]}`,
+        'Le => `\{parts[0]} <= \{parts[1]}`,
+        'Gt => `\{parts[0]} > \{parts[1]}`,
+        'Ge => `\{parts[0]} >= \{parts[1]}`,
+        'And => `(\{parts[0]} AND \{parts[1]})`,
+        'Or => `(\{parts[0]} OR \{parts[1]})`,
+        'Not => `NOT (\{parts[0]})`,
+    }
+};
+
+# Renders an expression to (sql_fragment, bindings).  Dynamic values always
+# become `?` placeholders and are collected into bindings in placeholder order.
+def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
+    match expr {
+        'Column(ref) => {
+            let empty: Array(Val) = [];
+            (`\{ref.source}.\{ref.column}`, empty)
+        },
+        'Bind(val) => ("?", [val]),
+        'Scalar(call) => {
+            let rendered_args = array.map(call.args, render_expr);
+            let sql_parts = array.map(rendered_args, fn(pair) { pair.0 });
+            let bind_parts = array.map(rendered_args, fn(pair) { pair.1 });
+            let bindings = array.concat(bind_parts);
+            (render_scalar_sql(call.function, sql_parts), bindings)
+        },
+    }
+};
+
+def render_aggregate_call: Fn(AggregateCall) -> Tuple([String, Array(Val)]) = fn(call) {
+    let rendered = render_expr(call.arg);
+    let distinct_sql = if call.distinct { "DISTINCT " } else { "" };
+    let sql = `\{aggregate_name(call.function)}(\{distinct_sql}\{rendered.0})`;
+    (sql, rendered.1)
+};
+
+def render_select_item: Fn(SelectItem) -> Tuple([String, Array(Val)]) = fn(item) {
+    match item {
+        'Expr(expr) => render_expr(expr),
+        'Aggregate(call) => {
+            let rendered = render_aggregate_call(call);
+            let sql = `\{rendered.0} AS \{call.alias}`;
+            (sql, rendered.1)
+        },
+    }
+};
+
+def render_join: Fn(Join) -> Tuple([String, Array(Val)]) = fn(join) {
+    let left_col = `\{join.condition.left.source}.\{join.condition.left.column}`;
+    let right_col = `\{join.condition.right.source}.\{join.condition.right.column}`;
+    let sql = `\{join_kind_sql(join.kind)} \{join.source.table} AS \{join.source.alias} ON \{left_col} = \{right_col}`;
+    let empty: Array(Val) = [];
+    (sql, empty)
+};
+
+# Finds the projected aggregate with the given output alias.
+def find_aggregate: Fn(Plan, String) -> Option(AggregateCall) = fn(plan, alias) {
+    let found = array.find(plan.projection, fn(item) {
+        match item {
+            'Expr(_) => 'False,
+            'Aggregate(call) => call.alias == alias,
+        }
+    });
+    match found {
+        'Some(item) => match item {
+            'Aggregate(call) => 'Some(call),
+            'Expr(_) => 'None,
+        },
+        'None => 'None,
+    }
+};
+
+# Renders an ordering key.  An AggregateRef renders the full aggregate
+# expression of the projected measure (never a source-qualified alias), so the
+# generated SQL is executable and unambiguous.
+def render_order_key: Fn(OrderKey, Plan) -> Tuple([String, Array(Val)]) = fn(key, plan) {
+    match key {
+        'Expr(expr) => render_expr(expr),
+        'AggregateRef(ref) => {
+            let found = find_aggregate(plan, ref.alias);
+            match found {
+                'Some(call) => render_aggregate_call(call),
+                'None => fail!("ordering references an unprojected aggregate", plan, ref),
+            }
+        },
+    }
+};
+
+def render_plan: Fn(Plan) -> Query = fn(plan) {
+    let rendered_items = array.map(plan.projection, render_select_item);
+    let select_sql = string.join(array.map(rendered_items, fn(pair) { pair.0 }), ", ");
+    let select_bindings = array.concat(array.map(rendered_items, fn(pair) { pair.1 }));
+
+    let primary = plan.sources[0];
+    let from_sql = `\{primary.table} AS \{primary.alias}`;
+
+    let rendered_joins = array.map(plan.joins, render_join);
+    let joins_text = string.join(array.map(rendered_joins, fn(pair) { pair.0 }), " ");
+    let joins_bindings = array.concat(array.map(rendered_joins, fn(pair) { pair.1 }));
+    let join_text = if array.length(plan.joins) > 0 {
+        ` \{joins_text}`
+    } else {
+        ""
+    };
+
+    let filter_part = match plan.filter {
+        'Some(expr) => {
+            let rendered = render_expr(expr);
+            (` WHERE \{rendered.0}`, rendered.1)
+        },
+        'None => {
+            let empty: Array(Val) = [];
+            ("", empty)
+        },
+    };
+
+    let group_part = if array.length(plan.grouping) > 0 {
+        let rendered_group = array.map(plan.grouping, render_expr);
+        let group_sql = string.join(array.map(rendered_group, fn(pair) { pair.0 }), ", ");
+        let group_bindings = array.concat(array.map(rendered_group, fn(pair) { pair.1 }));
+        (` GROUP BY \{group_sql}`, group_bindings)
+    } else {
+        let empty: Array(Val) = [];
+        ("", empty)
+    };
+
+    let order_part = if array.length(plan.ordering) > 0 {
+        let rendered_order = array.map(plan.ordering, fn(ob) {
+            let rendered = render_order_key(ob.key, plan);
+            (`\{rendered.0} \{direction_sql(ob.direction)}`, rendered.1)
+        });
+        let order_sql = string.join(array.map(rendered_order, fn(pair) { pair.0 }), ", ");
+        let order_bindings = array.concat(array.map(rendered_order, fn(pair) { pair.1 }));
+        (` ORDER BY \{order_sql}`, order_bindings)
+    } else {
+        let empty: Array(Val) = [];
+        ("", empty)
+    };
+
+    let limit_part = match plan.limit {
+        'Some(value) => {
+            let values: Array(Val) = ['Int(value)];
+            (" LIMIT ?", values)
+        },
+        'None => {
+            let empty: Array(Val) = [];
+            ("", empty)
+        },
+    };
+
+    let binding_groups: Array(Array(Val)) = [
+        select_bindings,
+        joins_bindings,
+        filter_part.1,
+        group_part.1,
+        order_part.1,
+        limit_part.1,
+    ];
+    let all_bindings = array.concat(binding_groups);
+
+    let sql = `SELECT \{select_sql} FROM \{from_sql}\{join_text}\{filter_part.0}\{group_part.0}\{order_part.0}\{limit_part.0}`;
+
+    let result: Query = {sql: sql, bindings: all_bindings};
+    result
+};
+
+# Pure, deterministic concretization of a legal Plan into a parameterized
+# SQLite Query.  The same legal Plan always produces byte-identical SQL and
+# same-order bindings.  Structurally illegal or SQLite-unrealizable plans fail
+# with a Host diagnostic and never publish a partial Query.
+def transform_sqlite: Fn(Plan) -> Query = fn(plan) {
+    let structured = validate_structure(plan);
+    render_plan(structured)
+};
+
+# ---------------------------------------------------------------------------
+# Constructor helpers.
+# ---------------------------------------------------------------------------
+
+def column: Fn(String, String) -> Expr = fn(source, column_name) {
+    let ref: ColumnRef = {source: source, column: column_name};
+    'Column(ref)
+};
+
+def column_ref: Fn(String, String) -> ColumnRef = fn(source, column_name) {
+    let ref: ColumnRef = {source: source, column: column_name};
+    ref
+};
+
+def bind_val: Fn(Val) -> Expr = fn(val) { 'Bind(val) };
+
+def bind_string: Fn(String) -> Expr = fn(value) { 'Bind('String(value)) };
+
+def bind_int: Fn(Int) -> Expr = fn(value) { 'Bind('Int(value)) };
+
+def bind_float: Fn(Float) -> Expr = fn(value) { 'Bind('Float(value)) };
+
+def bind_bool: Fn(Bool) -> Expr = fn(value) { 'Bind('Bool(value)) };
+
+def scalar: Fn(ScalarFunction, Array(Expr)) -> Expr = fn(function, args) {
+    let call: ScalarCall = {function: function, args: args};
+    'Scalar(call)
+};
+
+def substr: Fn(Array(Expr)) -> Expr = fn(args) {
+    let call: ScalarCall = {function: 'Substr, args: args};
+    'Scalar(call)
+};
+
+def expr_item: Fn(Expr) -> SelectItem = fn(expr) { 'Expr(expr) };
+
+def aggregate: Fn(AggregateFunction, Expr, Bool, String) -> SelectItem = fn(function, arg, distinct, alias) {
+    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, alias: alias};
+    'Aggregate(call)
+};
+
+def source: Fn(String, String) -> Source = fn(alias, table) {
+    let item: Source = {alias: alias, table: table};
+    item
+};
+
+def join: Fn(JoinKind, Source, ColumnRef, ColumnRef) -> Join = fn(kind, source_item, left, right) {
+    let condition: JoinCondition = {left: left, right: right};
+    let item: Join = {kind: kind, source: source_item, condition: condition};
+    item
+};
+
+def asc: Fn(Expr) -> OrderBy = fn(expr) {
+    let item: OrderBy = {key: 'Expr(expr), direction: 'Asc};
+    item
+};
+
+def desc: Fn(Expr) -> OrderBy = fn(expr) {
+    let item: OrderBy = {key: 'Expr(expr), direction: 'Desc};
+    item
+};
+
+def asc_aggregate: Fn(String) -> OrderBy = fn(alias) {
+    let ref: AggregateRef = {alias: alias};
+    let item: OrderBy = {key: 'AggregateRef(ref), direction: 'Asc};
+    item
+};
+
+def desc_aggregate: Fn(String) -> OrderBy = fn(alias) {
+    let ref: AggregateRef = {alias: alias};
+    let item: OrderBy = {key: 'AggregateRef(ref), direction: 'Desc};
+    item
+};
+
+def order_by: Fn(OrderKey, Ordering) -> OrderBy = fn(key, direction) {
+    let item: OrderBy = {key: key, direction: direction};
+    item
+};
+
+# ---------------------------------------------------------------------------
+# Public surface.
+# ---------------------------------------------------------------------------
+
+export {
+    Val,
+    Query,
+    ColumnRef,
+    ScalarFunction,
+    ScalarCall,
+    Expr,
+    AggregateFunction,
+    AggregateCall,
+    SelectItem,
+    Source,
+    JoinKind,
+    JoinCondition,
+    Join,
+    Ordering,
+    AggregateRef,
+    OrderKey,
+    OrderBy,
+    Plan,
+    Operator,
+    PlanProfile,
+    is_sql_identifier,
+    operators,
+    structure_ok,
+    validate_structure,
+    profile_accepts,
+    validate,
+    transform_sqlite,
+    scalar_name,
+    aggregate_name,
+    join_kind_sql,
+    direction_sql,
+    column,
+    column_ref,
+    bind_val,
+    bind_string,
+    bind_int,
+    bind_float,
+    bind_bool,
+    scalar,
+    substr,
+    expr_item,
+    aggregate,
+    source,
+    join,
+    asc,
+    desc,
+    asc_aggregate,
+    desc_aggregate,
+    order_by,
+};

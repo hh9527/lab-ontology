@@ -1,0 +1,486 @@
+# Verification entry for the EnterpriseKnowledge eDSL.
+#
+# Runs assertions over:
+#   property fold, request coverage, relation selection, equality/range filters,
+#   unprojected filter dimensions, measure-desc/dimension-asc ordering, Top N,
+#   binding order, profile coverage, repeated-lowering determinism, and
+#   cross-module prepared behavior.
+#
+# Any failed assertion fails loudly (fail!) so `run verify` is strict.
+
+import "query/lib" as qb;
+import "std/value" { Value };
+import "std/array" as array;
+import "std/type-property" as property;
+import "std/type-desc" as td;
+import "@src/edsl" as edsl;
+import "@src/knowledge" as knowledge;
+
+# ---------------------------------------------------------------------------
+# Assertion helper.
+# ---------------------------------------------------------------------------
+
+def check: Fn(Bool, String) -> Bool = fn(cond, label) {
+    if cond { 'True } else { fail!("verify check failed", label) }
+};
+
+# ---------------------------------------------------------------------------
+# Structural inspection helpers.
+# ---------------------------------------------------------------------------
+
+def get_index: for(A) Fn(Array(A), Int) -> A = fn(values, i) {
+    match array.get(values, i) {
+        'Some(v) => v,
+        'None => fail!("index out of range", i),
+    }
+};
+
+def get_expr: Fn(Array(qb.Expr), Int) -> qb.Expr = fn(xs, i) {
+    get_index(xs, i)
+};
+
+def is_column: Fn(qb.Expr, String, String) -> Bool = fn(e, source, column) {
+    match e {
+        'Column(ref) => ref.source == source && ref.column == column,
+        _ => 'False,
+    }
+};
+
+def is_bind: Fn(qb.Expr) -> Bool = fn(e) {
+    match e { 'Bind(_) => 'True, _ => 'False }
+};
+
+def is_eq_region: Fn(qb.Expr) -> Bool = fn(e) {
+    match e {
+        'Scalar(call) => call.function == 'Eq
+            && array.length(call.args) == 2
+            && is_column(get_expr(call.args, 0), "o", "region")
+            && is_bind(get_expr(call.args, 1)),
+        _ => 'False,
+    }
+};
+
+def is_ge_week: Fn(qb.Expr) -> Bool = fn(e) {
+    match e {
+        'Scalar(call) => do {
+            if call.function != 'Ge || array.length(call.args) != 2 {
+                'False
+            } else {
+                let pred = get_expr(call.args, 0);
+                let bound = get_expr(call.args, 1);
+                match pred {
+                    'Scalar(sub) => sub.function == 'Substr
+                        && array.length(sub.args) == 3
+                        && is_column(get_expr(sub.args, 0), "o", "created_at")
+                        && is_bind(get_expr(sub.args, 1))
+                        && is_bind(get_expr(sub.args, 2))
+                        && is_bind(bound),
+                    _ => 'False,
+                }
+            }
+        },
+        _ => 'False,
+    }
+};
+
+def filter_and_eq_ge: Fn(Option(qb.Expr)) -> Bool = fn(f) {
+    match f {
+        'Some('Scalar(call)) => do {
+            if call.function != 'And || array.length(call.args) != 2 {
+                'False
+            } else {
+                is_eq_region(get_expr(call.args, 0)) && is_ge_week(get_expr(call.args, 1))
+            }
+        },
+        _ => 'False,
+    }
+};
+
+def aggregate_alias_count: Fn(Array(qb.SelectItem), String) -> Int = fn(items, alias) {
+    array.length(array.filter(items, fn(item) {
+        match item {
+            'Aggregate(agg) => agg.alias == alias,
+            'Expr(_) => 'False,
+        }
+    }))
+};
+
+def expr_item_count: Fn(Array(qb.SelectItem)) -> Int = fn(items) {
+    array.length(array.filter(items, fn(item) {
+        match item { 'Expr(_) => 'True, 'Aggregate(_) => 'False }
+    }))
+};
+
+def ordering_shape_ok: Fn(Array(qb.OrderBy)) -> Bool = fn(ordering) {
+    if array.length(ordering) != 2 {
+        'False
+    } else {
+        let first = get_index(ordering, 0);
+        let second = get_index(ordering, 1);
+        let first_key_ok = match first.key {
+            'AggregateRef(ref) => ref.alias == "OrderAmount",
+            _ => 'False,
+        };
+        let first_dir_ok = match first.direction { 'Desc => 'True, 'Asc => 'False };
+        let second_key_ok = match second.key {
+            'Expr(e) => is_column(e, "o", "region"),
+            _ => 'False,
+        };
+        let second_dir_ok = match second.direction { 'Asc => 'True, 'Desc => 'False };
+        first_key_ok && first_dir_ok && second_key_ok && second_dir_ok
+    }
+};
+
+def join_ok: Fn(Array(qb.Join)) -> Bool = fn(joins) {
+    if array.length(joins) != 1 {
+        'False
+    } else {
+        let j = get_index(joins, 0);
+        let kind_ok = match j.kind { 'Inner => 'True, 'Left => 'False };
+        let source_ok = j.source.alias == "c" && j.source.table == "customers";
+        let cond_ok = j.condition.left.source == "o" && j.condition.left.column == "customer_id"
+            && j.condition.right.source == "c" && j.condition.right.column == "id";
+        kind_ok && source_ok && cond_ok
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Property fold probe (declared in this module).
+# ---------------------------------------------------------------------------
+
+def safe_kind: edsl.RelationKind = 'Safe;
+def fanout_kind: edsl.RelationKind = 'FanOut;
+def flag_true: Bool = 'True;
+
+@edsl.relation(FoldProbe, safe_kind, 0, 0)
+@edsl.relation(FoldProbe, fanout_kind, 0, 0)
+type FoldProbe = struct {
+    @edsl.column("first")
+    @edsl.column("second")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+# ---------------------------------------------------------------------------
+# Requests used by the checks.
+# ---------------------------------------------------------------------------
+
+def main_request: edsl.QueryRequest = {
+    measures: [
+        { id: "OrderAmount", subject: "analyst", input: 'All },
+        { id: "OrderCount", subject: "analyst", input: 'All },
+    ],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+        { id: "OrderWeek", subject: "analyst", input: 'None },
+        { id: "CustomerTier", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("east") },
+        { id: "OrderWeek", subject: "analyst", op: 'Ge, input: 'Text("2024-01") },
+    ],
+    ordering: [
+        { target: 'Measure("OrderAmount"), direction: 'Desc },
+        { target: 'Dimension("OrderRegion"), direction: 'Asc },
+    ],
+    limit: 'Some(5),
+};
+
+def unprojected_filter_request: edsl.QueryRequest = {
+    measures: [
+        { id: "OrderAmount", subject: "analyst", input: 'All },
+    ],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("gold") },
+    ],
+    ordering: [],
+    limit: 'None,
+};
+
+# Closed-enum dimension request: filters CustomerTier by a legal stable value.
+def enum_request: edsl.QueryRequest = {
+    measures: [
+        { id: "OrderAmount", subject: "analyst", input: 'All },
+    ],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("gold") },
+    ],
+    ordering: [],
+    limit: 'Some(2),
+};
+
+# Open String dimension request (compatibility with the existing open
+# dimensions; the value is not constrained by any closed domain).
+def open_string_request: edsl.QueryRequest = {
+    measures: [
+        { id: "OrderAmount", subject: "analyst", input: 'All },
+    ],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("west") },
+    ],
+    ordering: [],
+    limit: 'None,
+};
+
+# ---------------------------------------------------------------------------
+# Individual checks.
+# ---------------------------------------------------------------------------
+
+def check_property_fold: Bool = do {
+    let col_ok = match property.get_field_prop(FoldProbe, 0, edsl.ColumnMap) {
+        'Some(c) => c.column == "second",
+        'None => 'False,
+    };
+    let rel_ok = match property.get_type_prop(FoldProbe, edsl.RelationDef) {
+        'Some(d) => array.length(d.relations) == 2,
+        'None => 'False,
+    };
+    let key_ok = match property.get_field_prop(FoldProbe, 0, edsl.KeyFlag) {
+        'Some(k) => k.value,
+        'None => 'False,
+    };
+    check(col_ok, "property fold: multiple column annotations collapse to last")
+        && check(rel_ok, "property fold: relation annotations append")
+        && check(key_ok, "property fold: key annotation present")
+};
+
+def check_knowledge_entries: Bool = do {
+    let p = knowledge.payload;
+    let measure_ids = array.map(p.measures, fn(m) { m.id });
+    let has_amount = array.any(measure_ids, fn(id) { id == "OrderAmount" });
+    let has_count = array.any(measure_ids, fn(id) { id == "OrderCount" });
+    let has_cust = array.any(measure_ids, fn(id) { id == "CustomerCount" });
+    let has_item = array.any(measure_ids, fn(id) { id == "ItemAmount" });
+    let has_item_qty = array.any(measure_ids, fn(id) { id == "ItemQty" });
+    let dim_ids = array.map(p.dimensions, fn(d) { d.id });
+    let dims_ok = array.all([
+        "OrderId", "OrderRegion", "OrderWeek", "CustomerName", "CustomerTier", "CustomerContact",
+    ], fn(id) { array.any(dim_ids, fn(d) { d == id }) });
+    let contact = array.find(p.dimensions, fn(d) { d.id == "CustomerContact" });
+    let contact_unauthorized = match contact {
+        'Some(d) => !d.authorized,
+        'None => 'False,
+    };
+    check(has_amount && has_count && has_cust && has_item && has_item_qty, "knowledge measures collected")
+        && check(dims_ok, "knowledge dimensions collected")
+        && check(contact_unauthorized, "known dimension CustomerContact exists but is not authorized")
+};
+
+def check_request_coverage: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    check(array.length(plan.projection) == 5, "request coverage: one projection per requested measure/dimension")
+        && check(aggregate_alias_count(plan.projection, "OrderAmount") == 1, "request coverage: OrderAmount exactly once")
+        && check(aggregate_alias_count(plan.projection, "OrderCount") == 1, "request coverage: OrderCount exactly once")
+        && check(expr_item_count(plan.projection) == 3, "request coverage: three dimension expr items")
+};
+
+def check_relation_selection: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    check(join_ok(plan.joins), "relation selection: safe path Order->Customer becomes one inner join")
+};
+
+def check_filters: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    check(filter_and_eq_ge(plan.filter), "filters: equality on region and range (Ge) on computed week")
+};
+
+def check_unprojected_filter_dimension: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, unprojected_filter_request);
+    let filter_mentions_tier = match plan.filter {
+        'Some('Scalar(call)) => array.any(call.args, fn(a) { is_column(a, "c", "tier") }),
+        _ => 'False,
+    };
+    let tier_not_projected = aggregate_alias_count(plan.projection, "tier") == 0
+        && array.length(array.filter(plan.projection, fn(item) {
+            match item { 'Expr(e) => is_column(e, "c", "tier"), _ => 'False }
+        })) == 0;
+    check(filter_mentions_tier, "unprojected filter dimension: filter path covers tier")
+        && check(tier_not_projected, "unprojected filter dimension: tier not projected")
+        && check(array.length(plan.joins) == 1, "unprojected filter dimension: join path provided")
+};
+
+def check_ordering_and_limit: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    check(ordering_shape_ok(plan.ordering), "ordering: measure desc then dimension asc")
+        && check(plan.limit == 'Some(5), "top n: limit is Some(5)")
+};
+
+def check_bindings_order: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = [
+        'Int(1), 'Int(7), 'String("east"), 'Int(1), 'Int(7), 'String("2024-01"),
+        'Int(1), 'Int(7), 'Int(5),
+    ];
+    check(query.bindings == expected, "bindings order: projection, filter, grouping, limit")
+};
+
+def check_profile_coverage: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    let accepted = qb.profile_accepts(plan, knowledge.profile);
+    let narrow: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+            'Filter, 'Group, 'Order, 'Limit,
+        ],
+        allowed_join_kinds: ['Inner, 'Left],
+        allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
+        allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allow_distinct: 'True,
+    };
+    let rejected = !qb.profile_accepts(plan, narrow);
+    check(accepted, "profile coverage: plan accepted by knowledge profile")
+        && check(rejected, "profile coverage: plan rejected when Join capability is removed")
+};
+
+def check_determinism: Bool = do {
+    let plan1: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    let plan2: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    let q1: qb.Query = qb.transform_sqlite(plan1);
+    let q2: qb.Query = qb.transform_sqlite(plan2);
+    check(plan1 == plan2, "determinism: repeated lowering yields identical plan")
+        && check(q1.sql == q2.sql && q1.bindings == q2.bindings, "determinism: identical sql and bindings")
+};
+
+def check_measure_required_joins: Bool = do {
+    # ItemAmount (item grain) requires Order: requesting it without any
+    # dimensions must still produce the Item->Order safe join.
+    let item_only: edsl.QueryRequest = {
+        measures: [{ id: "ItemAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    };
+    let p1: qb.Plan = edsl.lower(knowledge.payload, item_only);
+    # ItemQty (item grain) requires Order and Customer: two safe joins.
+    let item_qty: edsl.QueryRequest = {
+        measures: [{ id: "ItemQty", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    };
+    let p2: qb.Plan = edsl.lower(knowledge.payload, item_qty);
+    let join1_ok = array.length(p1.joins) == 1;
+    let join2_ok = array.length(p2.joins) == 2;
+    check(join1_ok, "measure required entity: ItemAmount plan has the Item->Order join")
+        && check(join2_ok, "measure required entities: ItemQty plan has Item->Order and Order->Customer joins")
+};
+
+def check_cross_module_prepared: Bool = do {
+    # This module consumes the payload published by @src/knowledge (a different
+    # module). The published closures (computed dimension builder and the
+    # authorization predicate) must work here with their original identity.
+    let p = knowledge.payload;
+    let auth_ok = p.authorize("analyst") && !p.authorize("outsider");
+    let week_entry = match array.find(p.dimensions, fn(d) { d.id == "OrderWeek" }) {
+        'Some(d) => d,
+        'None => fail!("OrderWeek dimension missing"),
+    };
+    let week_expr = edsl.dimension_expr(p, week_entry);
+    let computed_ok = match week_expr {
+        'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
+        _ => 'False,
+    };
+    let entities_ok = array.length(p.entities) == 3;
+    check(auth_ok, "cross-module: published authorization closure works")
+        && check(computed_ok, "cross-module: published computed-dimension closure works")
+        && check(entities_ok, "cross-module: published entity index available")
+};
+
+def check_enum_domain: Bool = do {
+    # The CustomerTier dimension carries a closed value domain published at
+    # prepare time (stable values and labels), discoverable from the payload
+    # without reading the model source.
+    let p = knowledge.payload;
+    let tier = match array.find(p.dimensions, fn(d) { d.id == "CustomerTier" }) {
+        'Some(d) => d,
+        'None => fail!("CustomerTier dimension missing"),
+    };
+    let values = tier.values;
+    let domain_ok = array.length(values) == 3
+        && array.any(values, fn(v) { v.variant == "Gold" && v.value == "gold" && v.label == "Gold customer" })
+        && array.any(values, fn(v) { v.variant == "Silver" && v.value == "silver" && v.label == "Silver customer" })
+        && array.any(values, fn(v) { v.variant == "Bronze" && v.value == "bronze" && v.label == "Bronze customer" });
+    let region = match array.find(p.dimensions, fn(d) { d.id == "OrderRegion" }) {
+        'Some(d) => d,
+        'None => fail!("OrderRegion dimension missing"),
+    };
+    check(domain_ok, "enum domain: closed catalog published with stable values and labels")
+        && check(array.length(region.values) == 0, "enum domain: open string dimension has empty value domain")
+};
+
+def check_dimension_domain_helper: Bool = do {
+    let values = edsl.dimension_domain(knowledge.payload, "CustomerTier");
+    let region_values = edsl.dimension_domain(knowledge.payload, "OrderRegion");
+    check(array.length(values) == 3, "dimension_domain: enum dimension exposes its closed domain")
+        && check(array.length(region_values) == 0, "dimension_domain: open dimension exposes empty domain")
+};
+
+def check_enum_filter: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, enum_request);
+    let filter_ok = match plan.filter {
+        'Some('Scalar(call)) => call.function == 'Eq
+            && array.length(call.args) == 2
+            && is_column(get_expr(call.args, 0), "c", "tier")
+            && is_bind(get_expr(call.args, 1)),
+        _ => 'False,
+    };
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("gold"), 'Int(2)];
+    check(filter_ok, "enum filter: legal stable value becomes Eq on c.tier with a bind")
+        && check(query.bindings == expected, "enum filter: bindings are the stable value and the limit")
+};
+
+def check_open_string_dimension: Bool = do {
+    # OrderRegion remains an open String dimension: it has no closed value
+    # domain and its filter value is still a parameterized binding.
+    let plan: qb.Plan = edsl.lower(knowledge.payload, open_string_request);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("west")];
+    check(query.bindings == expected, "open string dimension: filter binding stays parameterized")
+};
+
+def check_enum_determinism: Bool = do {
+    let plan1: qb.Plan = edsl.lower(knowledge.payload, enum_request);
+    let plan2: qb.Plan = edsl.lower(knowledge.payload, enum_request);
+    let q1: qb.Query = qb.transform_sqlite(plan1);
+    let q2: qb.Query = qb.transform_sqlite(plan2);
+    check(plan1 == plan2, "enum determinism: repeated lowering yields identical plan")
+        && check(q1.sql == q2.sql && q1.bindings == q2.bindings, "enum determinism: identical sql and bindings")
+};
+
+# ---------------------------------------------------------------------------
+# Entry.
+# ---------------------------------------------------------------------------
+
+export def main: Fn(Dict(Value)) -> Value = fn(sources) {
+    let c1 = check_property_fold;
+    let c2 = check_knowledge_entries;
+    let c3 = check_request_coverage;
+    let c4 = check_relation_selection;
+    let c5 = check_filters;
+    let c6 = check_unprojected_filter_dimension;
+    let c7 = check_ordering_and_limit;
+    let c8 = check_bindings_order;
+    let c9 = check_profile_coverage;
+    let c10 = check_determinism;
+    let c11 = check_measure_required_joins;
+    let c12 = check_cross_module_prepared;
+    let c13 = check_enum_domain;
+    let c14 = check_dimension_domain_helper;
+    let c15 = check_enum_filter;
+    let c16 = check_open_string_dimension;
+    let c17 = check_enum_determinism;
+    'String("verify ok")
+};

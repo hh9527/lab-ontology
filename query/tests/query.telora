@@ -1,0 +1,575 @@
+# query/tests/query.telora
+#
+# Public contract checks for the QueryBuilder package: closed operator
+# vocabulary, profile coverage, structural validity, deterministic SQLite
+# lowering, binding order, and the untagged-scalar JSON codec boundary of
+# `Val`/`Query`.  `check @test/query` evaluates every exported def;
+# any failure makes the check exit non-zero.
+
+import "std/array" as array;
+import "std/string" as string;
+import "std/codec" as codec;
+import "std/dict" as dict;
+import "std/json" as json;
+import "std/result" as result;
+import "std/value" { Value };
+import "@src/lib" as qb;
+
+# ---------------------------------------------------------------------------
+# JSON codec boundary helpers (Val <-> untagged scalar JSON).
+# ---------------------------------------------------------------------------
+
+def encode_val: Fn(qb.Val) -> Value = fn(val) {
+    codec.encode(Value, val) |> result.unwrap
+};
+
+def decode_val: Fn(Value) -> qb.Val = fn(value) {
+    codec.decode(qb.Val, value) |> result.unwrap
+};
+
+def val_roundtrip: Fn(qb.Val) -> Bool = fn(val) {
+    decode_val(encode_val(val)) == val
+};
+
+# Parse a JSON scalar text and decode it back to a Val (dispatch check).
+def json_to_val: Fn(String) -> qb.Val = fn(text) {
+    let parsed = json.parse(text) |> result.unwrap;
+    decode_val(parsed)
+};
+
+# A scalar JSON value: String/Int/Float/True/False.  Any Array/Object or
+# wrapper object (e.g. {"Int": 3}) is not a native scalar.
+def is_scalar_value: Fn(Value) -> Bool = fn(value) {
+    match value {
+        'String(_) => 'True,
+        'Int(_) => 'True,
+        'Float(_) => 'True,
+        'True => 'True,
+        'False => 'True,
+        _ => 'False,
+    }
+};
+
+# Encode a Query across the codec boundary and check that `bindings` is a
+# native scalar array with no variant wrappers.
+def query_bindings_are_scalar_array: Fn(qb.Query) -> Bool = fn(query) {
+    let encoded = codec.encode(Value, query) |> result.unwrap;
+    match encoded {
+        'Object(fields) => match dict.get(fields, "bindings") {
+            'Some('Array(items)) => array.all(items, is_scalar_value),
+            _ => 'False,
+        },
+        _ => 'False,
+    }
+};
+
+def query_encoded_bindings_match: Fn(qb.Query, Array(qb.Val)) -> Bool = fn(query, expected) {
+    let encoded = codec.encode(Value, query) |> result.unwrap;
+    match encoded {
+        'Object(fields) => match dict.get(fields, "bindings") {
+            'Some('Array(items)) => array.map(items, decode_val) == expected,
+            _ => 'False,
+        },
+        _ => 'False,
+    }
+};
+
+
+def full_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+            'Filter, 'Join, 'Group, 'Order, 'Limit,
+        ],
+        allowed_join_kinds: ['Inner, 'Left],
+        allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
+        allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allow_distinct: 'True,
+    };
+    profile
+};
+
+def simple_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'True,
+    };
+    profile
+};
+
+def no_distinct_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Aggregate],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'False,
+    };
+    profile
+};
+
+def restricted_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'True,
+    };
+    profile
+};
+
+def demo_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-demo",
+        sources: [qb.source("o", "orders")],
+        projection: [
+            qb.expr_item(qb.column("o", "customer_id")),
+            qb.expr_item(qb.substr([qb.column("o", "name"), qb.bind_int(1), qb.bind_int(3)])),
+            qb.aggregate('Sum, qb.column("o", "total"), 'False, "total_sum"),
+        ],
+        filter: 'Some(qb.scalar('Gt, [qb.column("o", "total"), qb.bind_float(100.0)])),
+        joins: [
+            qb.join(
+                'Inner,
+                qb.source("c", "customers"),
+                qb.column_ref("o", "customer_id"),
+                qb.column_ref("c", "id"),
+            ),
+        ],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.asc(qb.column("o", "customer_id"))],
+        limit: 'Some(10),
+    };
+    plan
+};
+
+def simple_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-simple",
+        sources: [qb.source("orders", "orders")],
+        projection: [
+            qb.expr_item(qb.column("orders", "id")),
+            qb.expr_item(qb.bind_string("x")),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("orders", "id"))],
+        limit: 'None,
+    };
+    plan
+};
+
+def distinct_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-distinct",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.aggregate('Count, qb.column("o", "customer_id"), 'True, "customers")],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+    };
+    plan
+};
+
+def bad_arity_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-bad-arity",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.substr([qb.column("o", "name")]))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+    };
+    plan
+};
+
+def unknown_alias_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-unknown-alias",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("missing", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+    };
+    plan
+};
+
+def negative_limit_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-negative-limit",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'Some(-1),
+    };
+    plan
+};
+
+def bad_identifier_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-bad-identifier",
+        sources: [qb.source("o", "order items")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+    };
+    plan
+};
+
+def left_join_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-left-join",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [
+            qb.join(
+                'Left,
+                qb.source("c", "customers"),
+                qb.column_ref("o", "customer_id"),
+                qb.column_ref("c", "id"),
+            ),
+        ],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+    };
+    plan
+};
+
+# Positive case required by Host feedback: aggregate measure DESC + dimension
+# ASC + limit (count(o.id) DESC, o.customer_id ASC, LIMIT 5).
+def top_n_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-top-n",
+        sources: [qb.source("o", "orders")],
+        projection: [
+            qb.expr_item(qb.column("o", "customer_id")),
+            qb.aggregate('Count, qb.column("o", "id"), 'False, "order_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.desc_aggregate("order_count"), qb.asc(qb.column("o", "customer_id"))],
+        limit: 'Some(5),
+    };
+    plan
+};
+
+# Negative: ordering references an aggregate alias that is not projected.
+def unprojected_ordering_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-unprojected-ordering",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "customer_id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.desc_aggregate("order_count")],
+        limit: 'None,
+    };
+    plan
+};
+
+# Negative: ordering references an aggregate alias that does not exist at all.
+def unknown_ordering_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-unknown-ordering",
+        sources: [qb.source("o", "orders")],
+        projection: [
+            qb.expr_item(qb.column("o", "customer_id")),
+            qb.aggregate('Count, qb.column("o", "id"), 'False, "order_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.asc_aggregate("missing_measure")],
+        limit: 'None,
+    };
+    plan
+};
+
+# Negative: ordering aggregate reference uses an invalid SQL identifier.
+def bad_ordering_alias_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-bad-ordering-alias",
+        sources: [qb.source("o", "orders")],
+        projection: [
+            qb.expr_item(qb.column("o", "customer_id")),
+            qb.aggregate('Count, qb.column("o", "id"), 'False, "order_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.desc_aggregate("order count")],
+        limit: 'None,
+    };
+    plan
+};
+
+export def vocabulary_is_closed = do {
+    let expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+        'Filter, 'Join, 'Group, 'Order, 'Limit,
+    ];
+    qb.operators(demo_plan()) == expected
+};
+
+export def profile_accepts_legal_plan = do {
+    qb.profile_accepts(demo_plan(), full_profile())
+};
+
+export def profile_rejects_restricted_plan = do {
+    !qb.profile_accepts(demo_plan(), restricted_profile())
+};
+
+export def profile_rejects_left_join = do {
+    let only_inner: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Join],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(left_join_plan(), only_inner)
+};
+
+export def distinct_rejected_without_allow = do {
+    !qb.profile_accepts(distinct_plan(), no_distinct_profile())
+};
+
+export def distinct_accepted_with_allow = do {
+    qb.profile_accepts(distinct_plan(), full_profile())
+};
+
+export def simple_plan_accepted = do {
+    qb.profile_accepts(simple_plan(), simple_profile())
+};
+
+export def structure_rejects_bad_arity = do {
+    !qb.structure_ok(bad_arity_plan())
+};
+
+export def structure_rejects_unknown_alias = do {
+    !qb.structure_ok(unknown_alias_plan())
+};
+
+export def structure_rejects_negative_limit = do {
+    !qb.structure_ok(negative_limit_plan())
+};
+
+export def structure_rejects_bad_identifier = do {
+    !qb.structure_ok(bad_identifier_plan())
+};
+
+export def structure_accepts_valid_plan = do {
+    qb.structure_ok(simple_plan())
+};
+
+export def validate_returns_plan = do {
+    let plan = simple_plan();
+    qb.validate(plan, simple_profile()) == plan
+};
+
+export def transform_is_deterministic = do {
+    let q1 = qb.transform_sqlite(simple_plan());
+    let q2 = qb.transform_sqlite(simple_plan());
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+};
+
+export def transform_preserves_clause_order = do {
+    let q = qb.transform_sqlite(demo_plan());
+    let expected = "SELECT o.customer_id, substr(o.name, ?, ?), sum(o.total) AS total_sum FROM orders AS o INNER JOIN customers AS c ON o.customer_id = c.id WHERE o.total > ? GROUP BY o.customer_id ORDER BY o.customer_id ASC LIMIT ?";
+    q.sql == expected
+};
+
+export def transform_bindings_in_placeholder_order = do {
+    let q = qb.transform_sqlite(demo_plan());
+    let expected: Array(qb.Val) = ['Int(1), 'Int(3), 'Float(100.0), 'Int(10)];
+    q.bindings == expected
+};
+
+export def transform_uses_placeholders_not_escaped_values = do {
+    let q = qb.transform_sqlite(simple_plan());
+    let contains_literal = string.contains(q.sql, "\"x\"") || string.contains(q.sql, "'x'");
+    !contains_literal && string.contains(q.sql, "?")
+};
+
+export def transform_left_join_sql = do {
+    let q = qb.transform_sqlite(left_join_plan());
+    q.sql == "SELECT o.id FROM orders AS o LEFT JOIN customers AS c ON o.customer_id = c.id"
+};
+
+export def aggregate_ordering_top_n_sql = do {
+    let q = qb.transform_sqlite(top_n_plan());
+    q.sql == "SELECT o.customer_id, count(o.id) AS order_count FROM orders AS o GROUP BY o.customer_id ORDER BY count(o.id) DESC, o.customer_id ASC LIMIT ?"
+};
+
+export def aggregate_ordering_top_n_bindings = do {
+    let q = qb.transform_sqlite(top_n_plan());
+    let expected: Array(qb.Val) = ['Int(5)];
+    q.bindings == expected
+};
+
+export def aggregate_ordering_does_not_emit_source_qualified_alias = do {
+    let q = qb.transform_sqlite(top_n_plan());
+    !string.contains(q.sql, "o.order_count")
+};
+
+export def aggregate_ordering_accepted_by_profile = do {
+    qb.profile_accepts(top_n_plan(), full_profile())
+};
+
+export def ordering_rejects_unprojected_aggregate = do {
+    !qb.structure_ok(unprojected_ordering_plan())
+};
+
+export def ordering_rejects_unknown_aggregate = do {
+    !qb.structure_ok(unknown_ordering_plan())
+};
+
+export def ordering_rejects_bad_alias_identifier = do {
+    !qb.structure_ok(bad_ordering_alias_plan())
+};
+
+export def ordering_unprojected_aggregate_has_no_query = do {
+    # The same structural rejection is what makes transform_sqlite fail; no
+    # partial Query is ever published (verified live by `run invalid`).
+    let unprojected = unprojected_ordering_plan();
+    !qb.structure_ok(unprojected)
+};
+
+export def transform_empty_bindings_when_no_dynamic_values = do {
+    let plan: qb.Plan = {
+        revision: "test-no-bindings",
+        sources: [qb.source("o", "orders")],
+        projection: [qb.expr_item(qb.column("o", "id"))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+    };
+    let q = qb.transform_sqlite(plan);
+    array.length(q.bindings) == 0 && q.sql == "SELECT o.id FROM orders AS o"
+};
+
+# ---------------------------------------------------------------------------
+# JSON codec boundary (Val <-> untagged scalar JSON).
+# ---------------------------------------------------------------------------
+
+export def json_val_int_roundtrip = do {
+    val_roundtrip('Int(3))
+};
+
+export def json_val_float_roundtrip = do {
+    val_roundtrip('Float(3.5))
+};
+
+export def json_val_string_roundtrip = do {
+    val_roundtrip('String("abc"))
+};
+
+export def json_val_bool_roundtrip = do {
+    val_roundtrip('Bool('True))
+};
+
+export def json_val_int_encodes_as_scalar_number = do {
+    encode_val('Int(3)) == 'Int(3)
+};
+
+export def json_val_float_encodes_as_scalar_number = do {
+    encode_val('Float(3.5)) == 'Float(3.5)
+};
+
+export def json_val_string_encodes_as_scalar_string = do {
+    encode_val('String("abc")) == 'String("abc")
+};
+
+export def json_val_bool_encodes_as_scalar_bool = do {
+    encode_val('Bool('True)) == 'True
+};
+
+export def json_val_no_variant_wrapper = do {
+    let encoded = json.stringify(encode_val('Int(3)));
+    encoded == "3"
+        && json.stringify(encode_val('Float(3.5))) == "3.5"
+        && json.stringify(encode_val('String("abc"))) == "\"abc\""
+        && json.stringify(encode_val('Bool('True))) == "true"
+};
+
+export def json_int_float_dispatch = do {
+    json_to_val("3") == 'Int(3)
+        && json_to_val("3.5") == 'Float(3.5)
+        && json_to_val("\"abc\"") == 'String("abc")
+        && json_to_val("true") == 'Bool('True)
+};
+
+export def json_float_whole_number_dispatch_boundary = do {
+    # JSON text cannot preserve a whole-number Float: "3.0" parses to a Float
+    # but the compact text "3" parses to an Int.  The Int/Float dispatch follows
+    # the JSON parser: "3.0" stays Float, "3" is Int.  This is a documented
+    # JSON codec boundary, not a QueryBuilder lowering change.
+    json_to_val("3.0") == 'Float(3.0)
+};
+
+export def json_query_bindings_are_scalar_array = do {
+    query_bindings_are_scalar_array(qb.transform_sqlite(demo_plan()))
+};
+
+export def json_query_encoded_bindings_match = do {
+    let expected: Array(qb.Val) = ['Int(1), 'Int(3), 'Float(100.0), 'Int(10)];
+    query_encoded_bindings_match(qb.transform_sqlite(demo_plan()), expected)
+};
+
+export def json_query_roundtrip = do {
+    let q = qb.transform_sqlite(demo_plan());
+    let encoded = codec.encode(Value, q) |> result.unwrap;
+    let decoded: qb.Query = codec.decode(qb.Query, encoded) |> result.unwrap;
+    decoded == q
+};
+
+export def json_query_bindings_no_wrapper_objects = do {
+    let encoded = codec.encode(Value, qb.transform_sqlite(demo_plan())) |> result.unwrap;
+    let has_wrapper = match encoded {
+        'Object(fields) => match dict.get(fields, "bindings") {
+            'Some('Array(items)) => array.any(items, fn(item) {
+                match item {
+                    'Object(_) => 'True,
+                    'Array(_) => 'True,
+                    _ => 'False,
+                }
+            }),
+            _ => 'True,
+        },
+        _ => 'True,
+    };
+    !has_wrapper
+};
+
+export def json_codec_does_not_change_lowering = do {
+    # The untagged codec property only affects the codec boundary; Query
+    # generation and determinism are unchanged.
+    let q1 = qb.transform_sqlite(demo_plan());
+    let q2 = qb.transform_sqlite(demo_plan());
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+        && q1.sql == "SELECT o.customer_id, substr(o.name, ?, ?), sum(o.total) AS total_sum FROM orders AS o INNER JOIN customers AS c ON o.customer_id = c.id WHERE o.total > ? GROUP BY o.customer_id ORDER BY o.customer_id ASC LIMIT ?"
+};

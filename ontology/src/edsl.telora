@@ -1,0 +1,1008 @@
+# EnterpriseKnowledge eDSL core (domain-independent).
+#
+# Provides:
+#   - typed-property carriers for declaring enterprise knowledge on nominal
+#     entity structs (physical columns, keys, measures, dimensions, computed
+#     dimensions, entity sources, relations);
+#   - one-time root preparation (build_root) that collects the property facts,
+#     validates them, precomputes safe paths, and publishes a PreparedPayload;
+#   - a hot-path lowering (lower) that turns a typed QueryRequest into a
+#     query Plan and validates it against the knowledge's PlanProfile.
+#
+# All Plan/PlanProfile/Query types come from the query public contract.
+
+import "query/lib" as qb;
+import "std/array" as array;
+import "std/type-desc" as td;
+import "std/type-property" as property;
+
+# ---------------------------------------------------------------------------
+# Property carriers (declared on entity structs and their fields).
+# ---------------------------------------------------------------------------
+
+# Member-level: physical column mapping for a field.
+@property('Field)
+type ColumnMap = struct { column: String };
+
+# Member-level: marks a field as the entity key.
+@property('Field)
+type KeyFlag = struct { value: Bool };
+
+# Member-level: measure declaration (aggregate over a field at the entity's
+# natural grain). The id is the stable business vocabulary id (exchange
+# protocol); the aggregate output alias is derived from it at prepare time.
+# `requires` lists additional entities the measure semantics need (beyond its
+# own grain), reached only through grain-safe paths.
+@property('Field)
+type MeasureDef = struct {
+    id: String,
+    aggregate: qb.AggregateFunction,
+    requires: Array(Type),
+};
+
+# Member-level: plain dimension declaration over a field. `authorized` is the
+# query/projection authorization status: an unauthorized dimension still
+# belongs to the closed vocabulary (typed requests may reference it) but any
+# grouping/sorting/filtering use fails atomically. `filterable` independently
+# controls whether a filter capability exists for an authorized dimension.
+@property('Field)
+type DimensionDef = struct {
+    id: String,
+    authorized: Bool,
+    filterable: Bool,
+    ops: Array(FilterOp),
+    input_kinds: Array(FilterInputKind),
+};
+
+# Member-level: computed dimension declaration. The builder receives the base
+# field's column expression and returns the canonical computed expression
+# (e.g. Substr(column, 1, 7)); literals are lowered to bound values at build
+# time, never pre-rendered SQL.
+@property('Field)
+type ComputedDimensionDef = struct {
+    id: String,
+    authorized: Bool,
+    filterable: Bool,
+    ops: Array(FilterOp),
+    input_kinds: Array(FilterInputKind),
+    build: Fn(qb.Expr) -> qb.Expr,
+};
+
+# Type-level: entity base data source.
+@property('Type)
+type EntitySource = struct { table: String, alias: String };
+
+# Type-level: relation declarations from this entity to target entities.
+@property('Type)
+type RelationDef = struct { relations: Array(RelationDecl) };
+
+type RelationDecl = struct {
+    target: Type,
+    kind: RelationKind,
+    from_field: Int,
+    to_field: Int,
+};
+
+# Variant-level: stable external/physical value and display label for a
+# payload-free enum variant. When a plain dimension field is typed with a
+# named enum, its variants (with or without this annotation) form the closed
+# value domain: the stable value is used for filtering bindings and the label
+# for discovery. Variants without the annotation use the variant name as both
+# stable value and label.
+@property('Variant)
+type EnumValueDef = struct { value: String, label: String };
+
+# ---------------------------------------------------------------------------
+# Public request vocabulary.
+# ---------------------------------------------------------------------------
+
+type RelationKind = enum { 'Safe, 'FanOut };
+
+type FilterOp = enum { 'Eq, 'Ge, 'Le };
+
+type FilterInputKind = enum { 'Text, 'Number, 'Int };
+
+type FilterInput = enum {
+    'Text(String),
+    'Number(Float),
+    'Int(Int),
+};
+
+type OrderDirection = enum { 'Asc, 'Desc };
+
+type OrderTarget = enum {
+    'Measure(String),
+    'Dimension(String),
+};
+
+type MeasureInput = enum { 'All, 'Distinct };
+
+type DimensionInput = enum { 'None };
+
+type MeasureRequest = struct {
+    id: String,
+    subject: String,
+    input: MeasureInput,
+};
+
+type DimensionRequest = struct {
+    id: String,
+    subject: String,
+    input: DimensionInput,
+};
+
+type FilterRequest = struct {
+    id: String,
+    subject: String,
+    op: FilterOp,
+    input: FilterInput,
+};
+
+type OrderRequest = struct {
+    target: OrderTarget,
+    direction: OrderDirection,
+};
+
+type QueryRequest = struct {
+    measures: Array(MeasureRequest),
+    dimensions: Array(DimensionRequest),
+    filters: Array(FilterRequest),
+    ordering: Array(OrderRequest),
+    limit: Option(Int),
+};
+
+# ---------------------------------------------------------------------------
+# Prepared payload types.
+# ---------------------------------------------------------------------------
+
+type FieldEntry = struct {
+    index: Int,
+    name: String,
+    column: String,
+    is_key: Bool,
+    ty: Type,
+};
+
+# One member of a closed enum value domain. `value` is the stable
+# external/physical value used for filter bindings; `label` is the display
+# label; `variant` is the canonical enum variant name.
+type EnumValueEntry = struct {
+    variant: String,
+    value: String,
+    label: String,
+};
+
+type EntityEntry = struct {
+    index: Int,
+    entity_type: Type,
+    table: String,
+    alias: String,
+    key_field: Int,
+    fields: Array(FieldEntry),
+};
+
+type MeasureEntry = struct {
+    id: String,
+    entity: Int,
+    field: Int,
+    aggregate: qb.AggregateFunction,
+    alias: String,
+    requires: Array(Int),
+};
+
+type DimensionEntry = struct {
+    id: String,
+    entity: Int,
+    field: Int,
+    computed: Bool,
+    build: Fn(qb.Expr) -> qb.Expr,
+    authorized: Bool,
+    filterable: Bool,
+    ops: Array(FilterOp),
+    input_kinds: Array(FilterInputKind),
+    values: Array(EnumValueEntry),
+};
+
+type RelationEntry = struct {
+    from: Int,
+    to: Int,
+    kind: RelationKind,
+    from_field: Int,
+    to_field: Int,
+};
+
+type PathResult = enum {
+    'Safe(Array(Int)),
+    'FanOut(Array(Int)),
+    'Missing,
+    'Truncated,
+};
+
+type PreparedPayload = struct {
+    revision: String,
+    entities: Array(EntityEntry),
+    measures: Array(MeasureEntry),
+    dimensions: Array(DimensionEntry),
+    relations: Array(RelationEntry),
+    paths: Array(Array(PathResult)),
+    profile: qb.PlanProfile,
+    authorize: Fn(String) -> Bool,
+};
+
+# ---------------------------------------------------------------------------
+# Provider factories (used as decorators by the knowledge author).
+# ---------------------------------------------------------------------------
+
+def column: Fn(String) -> Fn(property.FieldPropertyCtx, Option(ColumnMap)) -> ColumnMap = fn(column) {
+    fn(ctx, previous) {
+        let result: ColumnMap = { column };
+        result
+    }
+};
+
+def key: Fn(Bool) -> Fn(property.FieldPropertyCtx, Option(KeyFlag)) -> KeyFlag = fn(value) {
+    fn(ctx, previous) {
+        let result: KeyFlag = { value };
+        result
+    }
+};
+
+def measure: Fn(String, qb.AggregateFunction, Array(Type)) -> Fn(property.FieldPropertyCtx, Option(MeasureDef)) -> MeasureDef = fn(id, aggregate, requires) {
+    fn(ctx, previous) {
+        let result: MeasureDef = { id, aggregate, requires };
+        result
+    }
+};
+
+def dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind)) -> Fn(property.FieldPropertyCtx, Option(DimensionDef)) -> DimensionDef = fn(id, authorized, filterable, ops, input_kinds) {
+    fn(ctx, previous) {
+        let result: DimensionDef = { id, authorized, filterable, ops, input_kinds };
+        result
+    }
+};
+
+def computed_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Fn(qb.Expr) -> qb.Expr) -> Fn(property.FieldPropertyCtx, Option(ComputedDimensionDef)) -> ComputedDimensionDef = fn(id, authorized, filterable, ops, input_kinds, build) {
+    fn(ctx, previous) {
+        let result: ComputedDimensionDef = { id, authorized, filterable, ops, input_kinds, build };
+        result
+    }
+};
+
+def entity_source: Fn(String, String) -> Fn(td.TypeDesc, Option(EntitySource)) -> EntitySource = fn(table, alias) {
+    fn(ctx, previous) {
+        let result: EntitySource = { table, alias };
+        result
+    }
+};
+
+def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td.TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, from_field, to_field) {
+    fn(ctx, previous) {
+        let entry: RelationDecl = { target, kind, from_field, to_field };
+        let relations = match previous {
+            'Some(p) => array.push(p.relations, entry),
+            'None => [entry],
+        };
+        let result: RelationDef = { relations };
+        result
+    }
+};
+
+def enum_value: Fn(String, String) -> Fn(property.VariantPropertyCtx, Option(EnumValueDef)) -> EnumValueDef = fn(value, label) {
+    fn(ctx, previous) {
+        let result: EnumValueDef = { value, label };
+        result
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Prepare-time helpers.
+# ---------------------------------------------------------------------------
+
+def get_index: for(A) Fn(Array(A), Int) -> A = fn(values, i) {
+    match array.get(values, i) {
+        'Some(v) => v,
+        'None => fail!("index out of range", i),
+    }
+};
+
+def int_range: Fn(Int) -> Array(Int) = fn(n) {
+    if n <= 0 { [] } else { array.push(int_range(n - 1), n - 1) }
+};
+
+def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, name, field_ty) {
+    let col = property.get_field_prop(owner, index, ColumnMap);
+    let column = match col {
+        'Some(c) => c.column,
+        'None => "",
+    };
+    let key = property.get_field_prop(owner, index, KeyFlag);
+    let is_key = match key {
+        'Some(k) => k.value,
+        'None => 'False,
+    };
+    let result: FieldEntry = { index, name, column, is_key, ty: field_ty };
+    result
+};
+
+def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
+    let src = property.get_type_prop(ty, EntitySource);
+    let source = match src {
+        'Some(s) => s,
+        'None => fail!("entity has no source mapping", ty),
+    };
+    let field_descs = td.fields(ty);
+    let enumerated = array.enumerate(field_descs);
+    let fields = array.map(enumerated, fn(pair) {
+        build_field(ty, pair.1.index, pair.1.name, pair.1.ty)
+    });
+    let key_field = match array.find(fields, fn(f) { f.is_key }) {
+        'Some(f) => f.index,
+        'None => -1,
+    };
+    let result: EntityEntry = { index, entity_type: ty, table: source.table, alias: source.alias, key_field, fields };
+    result
+};
+
+def resolve_required: Fn(Array(EntityEntry), Array(Type)) -> Array(Int) = fn(entities, types) {
+    array.map(types, fn(ty) {
+        match array.find(entities, fn(e) { e.entity_type == ty }) {
+            'Some(e) => e.index,
+            'None => fail!("measure requires an entity that is not part of this knowledge", ty),
+        }
+    })
+};
+
+def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(MeasureEntry) = fn(entities, entity) {
+    let fields = entity.fields;
+    array.flat_map(fields, fn(f) {
+        let m = property.get_field_prop(entity.entity_type, f.index, MeasureDef);
+        match m {
+            'Some(d) => do {
+                let result: MeasureEntry = {
+                    id: d.id,
+                    entity: entity.index,
+                    field: f.index,
+                    aggregate: d.aggregate,
+                    alias: d.id,
+                    requires: resolve_required(entities, d.requires),
+                };
+                [result]
+            },
+            'None => [],
+        }
+    })
+};
+
+def identity_expr: Fn(qb.Expr) -> qb.Expr = fn(e) { e };
+
+def enum_value_entry: Fn(String, String, String) -> EnumValueEntry = fn(variant, value, label) {
+    let result: EnumValueEntry = { variant, value, label };
+    result
+};
+
+def has_payload: Fn(Option(Type)) -> Bool = fn(payload) {
+    match payload { 'Some(_) => 'True, 'None => 'False }
+};
+
+def duplicate_value: Fn(Array(EnumValueEntry)) -> Option(String) = fn(entries) {
+    let values = array.map(entries, fn(e) { e.value });
+    array.find(values, fn(v) {
+        array.length(array.filter(values, fn(w) { w == v })) > 1
+    })
+};
+
+# Build the closed value domain for a plain dimension field whose type is a
+# payload-free named enum. Non-enum field types yield the empty (open) domain;
+# payload-bearing enum shapes produce an explicit prepare-time diagnostic.
+def value_domain: Fn(Type) -> Array(EnumValueEntry) = fn(field_ty) {
+    let ref_ty = td.strip_attributes(field_ty);
+    let resolved = match td.resolve(ref_ty) {
+        'Ok(t) => td.strip_attributes(t),
+        'Err(_) => ref_ty,
+    };
+    match td.kind(resolved) {
+        'Enum => do {
+            let vs = td.variants(ref_ty);
+            if array.any(vs, fn(v) { has_payload(v.payload) }) {
+                fail!("dimension field uses an enum with payload variants; only payload-free variants are supported", field_ty)
+            } else {
+                let entries = array.map(vs, fn(v) {
+                    let prop = property.get_variant_prop(ref_ty, v.index, EnumValueDef);
+                    match prop {
+                        'Some(spec) => enum_value_entry(v.name, spec.value, spec.label),
+                        'None => enum_value_entry(v.name, v.name, v.name),
+                    }
+                });
+                match duplicate_value(entries) {
+                    'Some(value) => fail!("enum value domain contains duplicate stable values", field_ty, value),
+                    'None => entries,
+                }
+            }
+        },
+        _ => [],
+    }
+};
+
+def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(entity) {
+    let fields = entity.fields;
+    let plain = array.flat_map(fields, fn(f) {
+        let d = property.get_field_prop(entity.entity_type, f.index, DimensionDef);
+        match d {
+            'Some(dd) => [dimension_entry(entity.index, f.index, dd.id, 'False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, value_domain(f.ty))],
+            'None => [],
+        }
+    });
+    let computed = array.flat_map(fields, fn(f) {
+        let d = property.get_field_prop(entity.entity_type, f.index, ComputedDimensionDef);
+        match d {
+            'Some(dd) => [dimension_entry(entity.index, f.index, dd.id, 'True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [])],
+            'None => [],
+        }
+    });
+    array.concat([plain, computed])
+};
+
+def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb.Expr) -> qb.Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values) {
+    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values };
+    result
+};
+
+def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entities) {
+    array.flat_map(entities, fn(entity) {
+        let rd = property.get_type_prop(entity.entity_type, RelationDef);
+        let decls = match rd {
+            'Some(d) => d.relations,
+            'None => [],
+        };
+        array.map(decls, fn(rel) {
+            let to_index = match array.find(entities, fn(e) { e.entity_type == rel.target }) {
+                'Some(e) => e.index,
+                'None => fail!("relation target is not part of this knowledge", rel.target),
+            };
+            let result: RelationEntry = {
+                from: entity.index,
+                to: to_index,
+                kind: rel.kind,
+                from_field: rel.from_field,
+                to_field: rel.to_field,
+            };
+            result
+        })
+    })
+};
+
+# ---------------------------------------------------------------------------
+# BFS path precomputation (prepare-time only).
+# ---------------------------------------------------------------------------
+
+type BfsState = struct { node: Int, path: Array(Int) };
+
+type SearchResult = enum {
+    'Found(Array(Int)),
+    'Truncated,
+    'Missing,
+};
+
+type ExpandContinue = struct { visited: Array(Bool), states: Array(BfsState) };
+
+type ExpandResult = enum {
+    'Found(Array(Int)),
+    'Continue(ExpandContinue),
+};
+
+def visited_at: Fn(Array(Bool), Int) -> Bool = fn(visited, i) {
+    match array.get(visited, i) {
+        'Some(v) => v,
+        'None => 'False,
+    }
+};
+
+def set_at: Fn(Array(Bool), Int, Bool) -> Array(Bool) = fn(values, index, value) {
+    let enumerated = array.enumerate(values);
+    array.map(enumerated, fn(pair) { if pair.0 == index { value } else { pair.1 } })
+};
+
+def outgoing_indexes: Fn(Int, Array(RelationEntry), Bool) -> Array(Int) = fn(node, relations, safe_only) {
+    let enumerated = array.enumerate(relations);
+    array.flat_map(enumerated, fn(pair) {
+        let r = pair.1;
+        if r.from == node && (safe_only == 'False || r.kind == 'Safe) {
+            [pair.0]
+        } else {
+            []
+        }
+    })
+};
+
+def has_unvisited_successor: Fn(Array(Bool), Array(BfsState), Array(RelationEntry), Bool) -> Bool = fn(visited, frontier, relations, safe_only) {
+    array.any(frontier, fn(state) {
+        let outs = outgoing_indexes(state.node, relations, safe_only);
+        array.any(outs, fn(r_idx) {
+            let r = get_index(relations, r_idx);
+            !visited_at(visited, r.to)
+        })
+    })
+};
+
+def expand_state: Fn(Int, Array(Bool), BfsState, Array(RelationEntry), Bool) -> ExpandResult = fn(to, visited, state, relations, safe_only) {
+    let outs = outgoing_indexes(state.node, relations, safe_only);
+    let init_cont: ExpandContinue = { visited: visited, states: [] };
+    let init: ExpandResult = 'Continue(init_cont);
+    array.fold(outs, init, fn(acc, r_idx) {
+        match acc {
+            'Found(_) => acc,
+            'Continue(cont) => do {
+                let r = get_index(relations, r_idx);
+                if !visited_at(cont.visited, r.to) {
+                    let new_visited = set_at(cont.visited, r.to, 'True);
+                    let new_path = array.push(state.path, r_idx);
+                    if r.to == to {
+                        let found: ExpandResult = 'Found(new_path);
+                        found
+                    } else {
+                        let next_state: BfsState = { node: r.to, path: new_path };
+                        let new_cont: ExpandContinue = { visited: new_visited, states: array.push(cont.states, next_state) };
+                        let result: ExpandResult = 'Continue(new_cont);
+                        result
+                    }
+                } else {
+                    acc
+                }
+            },
+        }
+    })
+};
+
+def expand_frontier: Fn(Int, Array(Bool), Array(BfsState), Array(RelationEntry), Bool) -> ExpandResult = fn(to, visited, frontier, relations, safe_only) {
+    let init_cont: ExpandContinue = { visited: visited, states: [] };
+    let init: ExpandResult = 'Continue(init_cont);
+    array.fold(frontier, init, fn(acc, state) {
+        match acc {
+            'Found(_) => acc,
+            'Continue(cont) => do {
+                let expanded = expand_state(to, cont.visited, state, relations, safe_only);
+                match expanded {
+                    'Found(path) => 'Found(path),
+                    'Continue(new_cont) => do {
+                        let merged: ExpandContinue = {
+                            visited: new_cont.visited,
+                            states: array.concat([cont.states, new_cont.states]),
+                        };
+                        let result: ExpandResult = 'Continue(merged);
+                        result
+                    },
+                }
+            },
+        }
+    })
+};
+
+def search_loop: Fn(Int, Array(Bool), Array(BfsState), Array(RelationEntry), Bool, Int) -> SearchResult = fn(to, visited, frontier, relations, safe_only, depth) {
+    if depth >= 8 {
+        if has_unvisited_successor(visited, frontier, relations, safe_only) { 'Truncated } else { 'Missing }
+    } else {
+        let expanded = expand_frontier(to, visited, frontier, relations, safe_only);
+        match expanded {
+            'Found(path) => 'Found(path),
+            'Continue(cont) => do {
+                if array.length(cont.states) == 0 {
+                    'Missing
+                } else {
+                    search_loop(to, cont.visited, cont.states, relations, safe_only, depth + 1)
+                }
+            },
+        }
+    }
+};
+
+def search: Fn(Int, Int, Int, Array(RelationEntry), Bool) -> SearchResult = fn(from, to, n, relations, safe_only) {
+    let visited: Array(Bool) = array.map(int_range(n), fn(i) { i == from });
+    let start: BfsState = { node: from, path: [] };
+    search_loop(to, visited, [start], relations, safe_only, 0)
+};
+
+def classify_path: Fn(Int, Int, Int, Array(RelationEntry)) -> PathResult = fn(from, to, n, relations) {
+    if from == to {
+        'Safe([])
+    } else {
+        match search(from, to, n, relations, 'True) {
+            'Found(path) => 'Safe(path),
+            _ => match search(from, to, n, relations, 'False) {
+                'Found(path) => 'FanOut(path),
+                'Truncated => 'Truncated,
+                'Missing => 'Missing,
+            },
+        }
+    }
+};
+
+def build_paths: Fn(Int, Array(RelationEntry)) -> Array(Array(PathResult)) = fn(n, relations) {
+    array.map(int_range(n), fn(from) {
+        array.map(int_range(n), fn(to) {
+            classify_path(from, to, n, relations)
+        })
+    })
+};
+
+# ---------------------------------------------------------------------------
+# Root preparation.
+# ---------------------------------------------------------------------------
+
+def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> PreparedPayload = fn(revision, entity_types, profile, authorize) {
+    let n = array.length(entity_types);
+    let entities = array.map(int_range(n), fn(i) {
+        build_entity(get_index(entity_types, i), i)
+    });
+    let measures = array.flat_map(entities, fn(e) { collect_entity_measures(entities, e) });
+    let dimensions = array.flat_map(entities, fn(e) { collect_entity_dimensions(e) });
+    let relations = collect_relations(entities);
+    let paths = build_paths(n, relations);
+    let payload: PreparedPayload = {
+        revision,
+        entities,
+        measures,
+        dimensions,
+        relations,
+        paths,
+        profile,
+        authorize,
+    };
+    payload
+};
+
+# ---------------------------------------------------------------------------
+# Hot-path lowering.
+# ---------------------------------------------------------------------------
+
+type ResolvedMeasure = struct {
+    entry: MeasureEntry,
+    distinct: Bool,
+};
+
+type ResolvedDimension = struct {
+    entry: DimensionEntry,
+};
+
+type FilterResolution = struct {
+    expr: qb.Expr,
+    entity: Int,
+};
+
+def to_bind: Fn(FilterInput) -> qb.Expr = fn(input) {
+    match input {
+        'Text(s) => qb.bind_string(s),
+        'Number(f) => qb.bind_float(f),
+        'Int(i) => qb.bind_int(i),
+    }
+};
+
+def resolve_measures: Fn(PreparedPayload, Array(MeasureRequest)) -> Array(ResolvedMeasure) = fn(payload, requests) {
+    array.map(requests, fn(req) {
+        if !payload.authorize(req.subject) {
+            fail!("subject is not authorized for measure", req.subject, req.id)
+        } else {
+            match array.find(payload.measures, fn(m) { m.id == req.id }) {
+                'Some(entry) => do {
+                    let distinct = match req.input { 'Distinct => 'True, 'All => 'False };
+                    let result: ResolvedMeasure = { entry, distinct };
+                    result
+                },
+                'None => fail!("unknown measure", req.subject, req.id),
+            }
+        }
+    })
+};
+
+def resolve_dimensions: Fn(PreparedPayload, Array(DimensionRequest)) -> Array(ResolvedDimension) = fn(payload, requests) {
+    array.map(requests, fn(req) {
+        if !payload.authorize(req.subject) {
+            fail!("subject is not authorized for dimension", req.subject, req.id)
+        } else {
+            match array.find(payload.dimensions, fn(d) { d.id == req.id }) {
+                'Some(entry) => do {
+                    if !entry.authorized {
+                        fail!("dimension is not authorized", req.subject, req.id)
+                    } else {
+                        let result: ResolvedDimension = { entry };
+                        result
+                    }
+                },
+                'None => fail!("unknown dimension", req.subject, req.id),
+            }
+        }
+    })
+};
+
+def dimension_expr: Fn(PreparedPayload, DimensionEntry) -> qb.Expr = fn(payload, entry) {
+    let entity = get_index(payload.entities, entry.entity);
+    let field = get_index(entity.fields, entry.field);
+    let base = qb.column(entity.alias, field.column);
+    entry.build(base)
+};
+
+# Public discovery: the closed value domain (stable values and labels) of a
+# dimension, or the empty array for an open (String/Int/Float) dimension.
+# Unknown dimension ids fail atomically (closed vocabulary).
+def dimension_domain: Fn(PreparedPayload, String) -> Array(EnumValueEntry) = fn(payload, id) {
+    match array.find(payload.dimensions, fn(d) { d.id == id }) {
+        'Some(entry) => entry.values,
+        'None => fail!("unknown dimension", id),
+    }
+};
+
+def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(kinds, input) {
+    let kind: FilterInputKind = match input {
+        'Text(_) => 'Text,
+        'Number(_) => 'Number,
+        'Int(_) => 'Int,
+    };
+    array.any(kinds, fn(k) { k == kind })
+};
+
+# Enum closed-domain filter resolution. A legal stable value keeps producing a
+# parameterized binding; unknown values fail atomically with the subject, the
+# dimension id and the dynamic JSON input value as evidence.
+def resolve_enum_filter: Fn(PreparedPayload, DimensionEntry, FilterRequest) -> FilterResolution = fn(payload, entry, req) {
+    let base = dimension_expr(payload, entry);
+    match req.op {
+        'Eq => match req.input {
+            'Text(s) => if array.any(entry.values, fn(v) { v.value == s }) {
+                let expr = qb.scalar('Eq, [base, qb.bind_string(s)]);
+                let result: FilterResolution = { expr, entity: entry.entity };
+                result
+            } else {
+                fail!("unknown enum value for dimension", req.subject, req.id, s)
+            },
+            _ => fail!("invalid enum filter value for dimension", req.subject, req.id, req.input),
+        },
+        'Ge => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'Le => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+    }
+};
+
+def resolve_filters: Fn(PreparedPayload, Array(FilterRequest)) -> Array(FilterResolution) = fn(payload, requests) {
+    array.map(requests, fn(req) {
+        if !payload.authorize(req.subject) {
+            fail!("subject is not authorized for filter", req.subject, req.id)
+        } else {
+            match array.find(payload.dimensions, fn(d) { d.id == req.id }) {
+                'None => fail!("unknown filter dimension", req.subject, req.id),
+                'Some(entry) => do {
+                    if !entry.authorized {
+                        fail!("dimension is not authorized", req.subject, req.id)
+                    } else if !entry.filterable {
+                        fail!("dimension has no filter capability", req.subject, req.id)
+                    } else if !array.any(entry.ops, fn(op) { op == req.op }) {
+                        fail!("filter operation not supported for dimension", req.subject, req.id)
+                    } else if array.length(entry.values) > 0 {
+                        resolve_enum_filter(payload, entry, req)
+                    } else if !filter_input_allowed(entry.input_kinds, req.input) {
+                        fail!("invalid filter value for dimension", req.subject, req.id)
+                    } else {
+                        let base = dimension_expr(payload, entry);
+                        let bound = to_bind(req.input);
+                        let expr = match req.op {
+                            'Eq => qb.scalar('Eq, [base, bound]),
+                            'Ge => qb.scalar('Ge, [base, bound]),
+                            'Le => qb.scalar('Le, [base, bound]),
+                        };
+                        let result: FilterResolution = { expr, entity: entry.entity };
+                        result
+                    }
+                },
+            }
+        }
+    })
+};
+
+def combine_filters: Fn(Array(qb.Expr)) -> Option(qb.Expr) = fn(exprs) {
+    let init_none: Option(qb.Expr) = 'None;
+    match array.fold(exprs, init_none, fn(acc, expr) {
+        match acc {
+            'None => 'Some(expr),
+            'Some(prev) => 'Some(qb.scalar('And, [prev, expr])),
+        }
+    }) {
+        'Some(expr) => 'Some(expr),
+        'None => 'None,
+    }
+};
+
+def resolve_ordering: Fn(PreparedPayload, Array(OrderRequest), Array(String), Array(String)) -> Array(qb.OrderBy) = fn(payload, requests, requested_measures, requested_dimensions) {
+    array.map(requests, fn(req) {
+        match req.target {
+            'Measure(id) => do {
+                if !array.any(requested_measures, fn(m) { m == id }) {
+                    fail!("ordering target is not a requested measure", id)
+                } else {
+                    match array.find(payload.measures, fn(m) { m.id == id }) {
+                        'Some(entry) => match req.direction {
+                            'Asc => qb.asc_aggregate(entry.alias),
+                            'Desc => qb.desc_aggregate(entry.alias),
+                        },
+                        'None => fail!("ordering references an unknown measure", id),
+                    }
+                }
+            },
+            'Dimension(id) => do {
+                if !array.any(requested_dimensions, fn(d) { d == id }) {
+                    match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                        'Some(entry) => if !entry.authorized {
+                            fail!("dimension is not authorized", id)
+                        } else {
+                            fail!("ordering target is not a requested dimension", id)
+                        },
+                        'None => fail!("ordering target is not a requested dimension", id),
+                    }
+                } else {
+                    match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                        'Some(entry) => do {
+                            if !entry.authorized {
+                                fail!("dimension is not authorized", id)
+                            } else {
+                                let expr = dimension_expr(payload, entry);
+                                match req.direction {
+                                    'Asc => qb.asc(expr),
+                                    'Desc => qb.desc(expr),
+                                }
+                            }
+                        },
+                        'None => fail!("ordering references an unknown dimension", id),
+                    }
+                }
+            },
+        }
+    })
+};
+
+def check_limit: Fn(Option(Int)) -> Option(Int) = fn(limit) {
+    match limit {
+        'None => 'None,
+        'Some(n) => if n > 0 { 'Some(n) } else { fail!("limit must be a positive integer", n) },
+    }
+};
+
+def merge_edges: Fn(Array(Int), Array(Int)) -> Array(Int) = fn(acc, seq) {
+    array.fold(seq, acc, fn(edges, r) {
+        if array.any(edges, fn(e) { e == r }) {
+            edges
+        } else {
+            array.push(edges, r)
+        }
+    })
+};
+
+def select_joins: Fn(PreparedPayload, Int, Array(Int)) -> Array(qb.Join) = fn(payload, base, targets) {
+    let edges = array.fold(targets, [], fn(acc, target) {
+        if target == base {
+            acc
+        } else {
+            let row = get_index(payload.paths, base);
+            let pr = get_index(row, target);
+            match pr {
+                'Safe(seq) => merge_edges(acc, seq),
+                'FanOut(_) => fail!("path to requested entity requires a fan-out relation", target),
+                'Missing => fail!("no safe path to requested entity", target),
+                'Truncated => fail!("path search was truncated", target),
+            }
+        }
+    });
+    array.map(edges, fn(r_index) {
+        let r = get_index(payload.relations, r_index);
+        let from_entity = get_index(payload.entities, r.from);
+        let to_entity = get_index(payload.entities, r.to);
+        let from_field = get_index(from_entity.fields, r.from_field);
+        let to_field = get_index(to_entity.fields, r.to_field);
+        let kind: qb.JoinKind = match r.kind { 'Safe => 'Inner, 'FanOut => 'Left };
+        qb.join(
+            kind,
+            qb.source(to_entity.alias, to_entity.table),
+            qb.column_ref(from_entity.alias, from_field.column),
+            qb.column_ref(to_entity.alias, to_field.column),
+        )
+    })
+};
+
+def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
+    if array.length(request.measures) == 0 {
+        fail!("request must select at least one measure")
+    } else {
+        let measures = resolve_measures(payload, request.measures);
+        let base_entity = get_index(measures, 0).entry.entity;
+        let grain_ok = array.all(measures, fn(m) { m.entry.entity == base_entity });
+        if !grain_ok {
+            fail!("requested measures are not grain-compatible")
+        } else {
+            let dimensions = resolve_dimensions(payload, request.dimensions);
+            let filter_resolutions = resolve_filters(payload, request.filters);
+            let filter_expr = combine_filters(array.map(filter_resolutions, fn(f) { f.expr }));
+            let requested_measure_ids = array.map(request.measures, fn(m) { m.id });
+            let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
+            let ordering = resolve_ordering(payload, request.ordering, requested_measure_ids, requested_dimension_ids);
+            let limit = check_limit(request.limit);
+            let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
+            let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
+            let measure_targets = array.concat(array.map(measures, fn(m) { m.entry.requires }));
+            let targets = array.concat([measure_targets, dim_entities, filter_entities]);
+            let joins = select_joins(payload, base_entity, targets);
+            let base_source = get_index(payload.entities, base_entity);
+            let join_sources = array.map(joins, fn(j) { j.source });
+            let sources = array.concat([[qb.source(base_source.alias, base_source.table)], join_sources]);
+            let measure_items = array.map(measures, fn(m) {
+                let entity = get_index(payload.entities, m.entry.entity);
+                let field = get_index(entity.fields, m.entry.field);
+                qb.aggregate(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, m.entry.alias)
+            });
+            let dimension_items = array.map(dimensions, fn(d) {
+                qb.expr_item(dimension_expr(payload, d.entry))
+            });
+            let projection = array.concat([measure_items, dimension_items]);
+            let grouping = array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) });
+            let plan: qb.Plan = {
+                revision: payload.revision,
+                sources,
+                projection,
+                filter: filter_expr,
+                joins,
+                grouping,
+                ordering,
+                limit,
+            };
+            qb.validate(plan, payload.profile)
+        }
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Public exports.
+# ---------------------------------------------------------------------------
+
+export {
+    ColumnMap,
+    KeyFlag,
+    MeasureDef,
+    DimensionDef,
+    ComputedDimensionDef,
+    EntitySource,
+    RelationDef,
+    RelationDecl,
+    EnumValueDef,
+    RelationKind,
+    FilterOp,
+    FilterInputKind,
+    FilterInput,
+    OrderDirection,
+    OrderTarget,
+    MeasureInput,
+    DimensionInput,
+    MeasureRequest,
+    DimensionRequest,
+    FilterRequest,
+    OrderRequest,
+    QueryRequest,
+    FieldEntry,
+    EnumValueEntry,
+    EntityEntry,
+    MeasureEntry,
+    DimensionEntry,
+    RelationEntry,
+    PathResult,
+    PreparedPayload,
+    column,
+    key,
+    measure,
+    dimension,
+    computed_dimension,
+    entity_source,
+    relation,
+    enum_value,
+    build_root,
+    lower,
+    dimension_expr,
+    dimension_domain,
+    to_bind,
+    combine_filters,
+    check_limit,
+    get_index,
+    int_range,
+};

@@ -1,0 +1,267 @@
+# query/src/bin/verify.telora
+#
+# Verifies the core guarantees of QueryBuilder:
+#   1. profile coverage  : operators(plan) <= profile and refined capability
+#                          checks accept legal plans and reject out-of-scope
+#                          plans;
+#   2. canonical order   : the generated SQL preserves projection, join,
+#                          grouping and ordering order (checked byte-for-byte
+#                          against the documented expected SQL);
+#   3. determinism       : transforming the same Plan twice yields
+#                          byte-identical SQL and same-order bindings;
+#   4. JSON codec        : `Val` crosses the JSON boundary as untagged scalar
+#                          JSON (round-trip for all four variants, correct
+#                          Int/Float dispatch, and Query.bindings encoded as a
+#                          native scalar array with no variant wrappers).
+# The run fails (Host diagnostics, no output) if any check fails.
+
+import "std/array" as array;
+import "std/codec" as codec;
+import "std/dict" as dict;
+import "std/json" as json;
+import "std/result" as result;
+import "std/value" { Value };
+import "@src/lib" as qb;
+
+def val_to_value: Fn(qb.Val) -> Value = fn(val) {
+    match val {
+        'String(text) => 'String(text),
+        'Int(number) => 'Int(number),
+        'Float(number) => 'Float(number),
+        'Bool(flag) => if flag { 'True } else { 'False },
+    }
+};
+
+def full_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Column, 'Bind, 'Scalar, 'Aggregate, 'Project,
+            'Filter, 'Join, 'Group, 'Order, 'Limit,
+        ],
+        allowed_join_kinds: ['Inner, 'Left],
+        allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
+        allowed_scalars: ['Substr, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allow_distinct: 'True,
+    };
+    profile
+};
+
+def restricted_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Column, 'Bind, 'Scalar, 'Project, 'Filter, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'False,
+    };
+    profile
+};
+
+def simple_profile: Fn() -> qb.PlanProfile = fn() {
+    let profile: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Column, 'Bind, 'Project, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr],
+        allow_distinct: 'True,
+    };
+    profile
+};
+
+def demo_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-1",
+        sources: [qb.source("o", "orders")],
+        projection: [
+            qb.expr_item(qb.column("o", "customer_id")),
+            qb.expr_item(qb.substr([qb.column("o", "name"), qb.bind_int(1), qb.bind_int(3)])),
+            qb.aggregate('Sum, qb.column("o", "total"), 'False, "total_sum"),
+        ],
+        filter: 'Some(qb.scalar('Gt, [qb.column("o", "total"), qb.bind_float(100.0)])),
+        joins: [
+            qb.join(
+                'Inner,
+                qb.source("c", "customers"),
+                qb.column_ref("o", "customer_id"),
+                qb.column_ref("c", "id"),
+            ),
+        ],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.asc(qb.column("o", "customer_id"))],
+        limit: 'Some(10),
+    };
+    plan
+};
+
+def simple_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-simple",
+        sources: [qb.source("orders", "orders")],
+        projection: [
+            qb.expr_item(qb.column("orders", "id")),
+            qb.expr_item(qb.bind_string("x")),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [qb.asc(qb.column("orders", "id"))],
+        limit: 'None,
+    };
+    plan
+};
+
+# Top-N by a projected aggregate measure, with a dimension tie-breaker:
+# count(o.id) DESC, o.customer_id ASC, LIMIT 5.
+def top_n_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-top-n",
+        sources: [qb.source("o", "orders")],
+        projection: [
+            qb.expr_item(qb.column("o", "customer_id")),
+            qb.aggregate('Count, qb.column("o", "id"), 'False, "order_count"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("o", "customer_id")],
+        ordering: [qb.desc_aggregate("order_count"), qb.asc(qb.column("o", "customer_id"))],
+        limit: 'Some(5),
+    };
+    plan
+};
+
+def expected_sql = "SELECT o.customer_id, substr(o.name, ?, ?), sum(o.total) AS total_sum FROM orders AS o INNER JOIN customers AS c ON o.customer_id = c.id WHERE o.total > ? GROUP BY o.customer_id ORDER BY o.customer_id ASC LIMIT ?";
+
+def expected_top_n_sql = "SELECT o.customer_id, count(o.id) AS order_count FROM orders AS o GROUP BY o.customer_id ORDER BY count(o.id) DESC, o.customer_id ASC LIMIT ?";
+
+def expected_bindings: Array(qb.Val) = ['Int(1), 'Int(3), 'Float(100.0), 'Int(10)];
+
+def expected_top_n_bindings: Array(qb.Val) = ['Int(5)];
+
+# ---------------------------------------------------------------------------
+# JSON codec boundary helpers (Val <-> untagged scalar JSON).
+# ---------------------------------------------------------------------------
+
+def encode_val: Fn(qb.Val) -> Value = fn(val) {
+    codec.encode(Value, val) |> result.unwrap
+};
+
+def decode_val: Fn(Value) -> qb.Val = fn(value) {
+    codec.decode(qb.Val, value) |> result.unwrap
+};
+
+def val_roundtrip: Fn(qb.Val) -> Bool = fn(val) {
+    decode_val(encode_val(val)) == val
+};
+
+# Parse a JSON scalar text and decode it back to a Val (dispatch check).
+def json_to_val: Fn(String) -> qb.Val = fn(text) {
+    let parsed = json.parse(text) |> result.unwrap;
+    decode_val(parsed)
+};
+
+# A scalar JSON value: String/Int/Float/True/False.  Any Array/Object or
+# wrapper object (e.g. {"Int": 3}) is not a native scalar.
+def is_scalar_value: Fn(Value) -> Bool = fn(value) {
+    match value {
+        'String(_) => 'True,
+        'Int(_) => 'True,
+        'Float(_) => 'True,
+        'True => 'True,
+        'False => 'True,
+        _ => 'False,
+    }
+};
+
+# Encode a Query across the codec boundary and check that `bindings` is a
+# native scalar array with no variant wrappers.
+def query_bindings_are_scalar_array: Fn(qb.Query) -> Bool = fn(query) {
+    let encoded = codec.encode(Value, query) |> result.unwrap;
+    match encoded {
+        'Object(fields) => match dict.get(fields, "bindings") {
+            'Some('Array(items)) => array.all(items, is_scalar_value),
+            _ => 'False,
+        },
+        _ => 'False,
+    }
+};
+
+def query_encoded_bindings_match: Fn(qb.Query, Array(qb.Val)) -> Bool = fn(query, expected) {
+    let encoded = codec.encode(Value, query) |> result.unwrap;
+    match encoded {
+        'Object(fields) => match dict.get(fields, "bindings") {
+            'Some('Array(items)) => array.map(items, decode_val) == expected,
+            _ => 'False,
+        },
+        _ => 'False,
+    }
+};
+
+export def main: Fn(Dict(Value)) -> Value = fn(sources) {
+    let plan = demo_plan();
+    let full = full_profile();
+    let restricted = restricted_profile();
+
+    let coverage_ok = qb.profile_accepts(plan, full);
+    let reject_ok = !qb.profile_accepts(plan, restricted);
+    let simple_ok = qb.profile_accepts(simple_plan(), simple_profile());
+
+    let operators_expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+        'Filter, 'Join, 'Group, 'Order, 'Limit,
+    ];
+    let operators_ok = qb.operators(plan) == operators_expected;
+
+    let validated = qb.validate(plan, full);
+    let q1 = qb.transform_sqlite(validated);
+    let q2 = qb.transform_sqlite(plan);
+    let determinism_ok = q1.sql == q2.sql && q1.bindings == q2.bindings;
+    let ordering_ok = q1.sql == expected_sql;
+    let bindings_ok = q1.bindings == expected_bindings;
+
+    let top_n = qb.validate(top_n_plan(), full);
+    let q3 = qb.transform_sqlite(top_n);
+    let top_n_order_ok = q3.sql == expected_top_n_sql;
+    let top_n_bindings_ok = q3.bindings == expected_top_n_bindings;
+    let top_n_operators_ok = qb.profile_accepts(top_n, full);
+
+    # JSON codec boundary checks.
+    let json_roundtrip_ok = val_roundtrip('Int(3))
+        && val_roundtrip('Float(3.5))
+        && val_roundtrip('String("abc"))
+        && val_roundtrip('Bool('True));
+    let json_int_float_dispatch_ok = json_to_val("3") == 'Int(3)
+        && json_to_val("3.5") == 'Float(3.5)
+        && json_to_val("\"abc\"") == 'String("abc")
+        && json_to_val("true") == 'Bool('True);
+    let json_scalar_array_ok = query_bindings_are_scalar_array(q1)
+        && query_bindings_are_scalar_array(q3);
+    let json_encoded_bindings_ok = query_encoded_bindings_match(q1, expected_bindings)
+        && query_encoded_bindings_match(q3, expected_top_n_bindings);
+
+    let all_ok = coverage_ok && reject_ok && simple_ok && operators_ok
+        && determinism_ok && ordering_ok && bindings_ok
+        && top_n_order_ok && top_n_bindings_ok && top_n_operators_ok
+        && json_roundtrip_ok && json_int_float_dispatch_ok
+        && json_scalar_array_ok && json_encoded_bindings_ok;
+
+    if !all_ok {
+        fail!("verify checks failed", plan)
+    } else {
+        let binding_values: Array(Value) = array.map(q1.bindings, val_to_value);
+        let result: Value = 'Object({
+            coverage: if coverage_ok { 'True } else { 'False },
+            operators: if operators_ok { 'True } else { 'False },
+            determinism: if determinism_ok { 'True } else { 'False },
+            ordering: if ordering_ok { 'True } else { 'False },
+            bindings: if bindings_ok { 'True } else { 'False },
+            top_n_aggregate_ordering: if top_n_order_ok && top_n_bindings_ok { 'True } else { 'False },
+            json_roundtrip: if json_roundtrip_ok { 'True } else { 'False },
+            json_int_float_dispatch: if json_int_float_dispatch_ok { 'True } else { 'False },
+            json_scalar_array: if json_scalar_array_ok { 'True } else { 'False },
+            json_encoded_bindings: if json_encoded_bindings_ok { 'True } else { 'False },
+            sql: 'String(q1.sql),
+            binding_values: 'Array(binding_values),
+        });
+        result
+    }
+};

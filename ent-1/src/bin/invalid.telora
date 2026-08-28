@@ -1,0 +1,232 @@
+# ent-1/src/bin/invalid.telora
+#
+# Invalid-request entry. Every case must fail atomically: no trusted Plan is
+# published and no Query is produced. `run invalid --best-effort` reports the
+# Host diagnostics and exits non-zero without output (fail! is not catchable,
+# so the first failing case terminates the evaluation).
+
+import "query/lib" as qb;
+import "std/array" as array;
+import "std/codec" as codec;
+import "std/json" as json;
+import "std/result" as result;
+import "std/value" { Value };
+import "ontology/edsl" as edsl;
+import "@src/model" as model;
+import "@src/query" as query;
+
+def invalid_cases: Array(edsl.QueryRequest) = [
+    # DOMAIN illegal scenario: OrdersCreated grouped by ProductCategory and
+    # DeliveryException. ProductCategory is only reachable from the Order
+    # grain via fan-out and DeliveryException has no granted capability.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [
+            { id: "ProductCategory", subject: "analyst", input: 'None },
+            { id: "DeliveryException", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # ProductCategory from the Order grain requires a fan-out path.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "ProductCategory", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # DeliveryException: closed vocabulary but no granted capability.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "DeliveryException", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # Filter on CarrierName: groupable but not filterable.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [{ id: "CarrierName", subject: "analyst", op: 'Eq, input: 'Text("SF") }],
+        ordering: [],
+        limit: 'None,
+    },
+    # Filter on ServiceName: groupable but not filterable.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [{ id: "ServiceName", subject: "analyst", op: 'Eq, input: 'Text("Standard") }],
+        ordering: [],
+        limit: 'None,
+    },
+    # Filter on DeliveryException: not authorized, no filter capability.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [{ id: "DeliveryException", subject: "analyst", op: 'Eq, input: 'Text("damaged") }],
+        ordering: [],
+        limit: 'None,
+    },
+    # Unknown enum value for the CustomerTier closed value domain: "Diamond" is
+    # not a member (DOMAIN enum verification scenario) and must fail atomically
+    # with the dynamic input value as evidence.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [{ id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("Diamond") }],
+        ordering: [],
+        limit: 'None,
+    },
+    # Range operation on the CustomerTier closed enum domain: only Eq is
+    # supported.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [{ id: "CustomerTier", subject: "analyst", op: 'Ge, input: 'Text("Gold") }],
+        ordering: [],
+        limit: 'None,
+    },
+    # Non-positive limit (Top N must be a positive integer).
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'Some(0),
+    },
+    # Negative limit.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'Some(-5),
+    },
+    # Unknown measure id.
+    {
+        measures: [{ id: "BogusMeasure", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # Unknown dimension id.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "BogusDim", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # Grain conflict: Order-grain and Package-grain measures cannot combine.
+    {
+        measures: [
+            { id: "OrdersCreated", subject: "analyst", input: 'All },
+            { id: "DeliveredPackages", subject: "analyst", input: 'All },
+        ],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # Ordering target that was not requested.
+    {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "OriginRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [{ target: 'Dimension("CarrierName"), direction: 'Asc }],
+        limit: 'None,
+    },
+    # Unauthorized subject.
+    {
+        measures: [{ id: "OrdersCreated", subject: "outsider", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+    # Empty measures: no base grain can be derived.
+    {
+        measures: [],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+    },
+];
+
+export def main: Fn(Dict(Value)) -> Value = fn(sources) {
+    let attempts = array.map(invalid_cases, fn(req) {
+        let plan: qb.Plan = edsl.lower(model.payload, req);
+        let _query: qb.Query = qb.transform_sqlite(plan);
+        'String("unexpected success")
+    });
+    let outcome: Value = 'String("unexpected success");
+    outcome
+};
+
+# ---------------------------------------------------------------------------
+# Best-effort failure probes (non-exported). They fail during best-effort
+# module evaluation (`run invalid --best-effort`), so their diagnostics
+# surface alongside the request-level failures without breaking the strict
+# MainType contract of the exported entry.
+# ---------------------------------------------------------------------------
+
+def flag_true_probe: Bool = 'True;
+
+# DOMAIN enum verification scenario: a dynamic JSON filter value "Diamond" is
+# not a member of the CustomerTier closed value domain; lowering must fail
+# atomically with no partial Query. (The exported entry stops at the first
+# failing request-level case; this probe surfaces the enum failure directly.)
+def unknown_enum_value_probe: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrdersCreated", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [{ id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("Diamond") }],
+        ordering: [],
+        limit: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(model.payload, request);
+    plan
+};
+
+# ---------------------------------------------------------------------------
+# Public-facade negative dynamic-boundary evidence (non-exported best-effort
+# probes).  These exercise the public dynamic entry `lower_value(Value)` with
+# the fixed JSON request shape, exactly as the A4 fixed query-1 entry supplies
+# it through a run-ctx source.  The probes fail out-of-band (no partial
+# ValueQuery); lower_value preserves the input Value as a fail! subject so the
+# diagnostics are attributable to the input JSON's filter value field.
+# They surface under `run invalid -C ent-1 --best-effort` alongside the
+# request-level failures; the strict GOAL entry (`run query-surface -C ent-1`)
+# stays a clean no-source success entry.
+# ---------------------------------------------------------------------------
+
+# CustomerTier = Diamond: not a member of the closed enum value domain.
+# Filter values use the untagged native JSON scalar shape ("Diamond"), per
+# query-1/QUERY-DOC.md.
+def facade_diamond_probe: Value = do {
+    let raw = json.parse("{\"measures\":[\"OrdersCreated\"],\"dimensions\":[],\"filters\":[{\"dimension\":\"CustomerTier\",\"op\":\"Eq\",\"value\":\"Diamond\"}],\"ordering\":[],\"limit\":5}");
+    let input = match raw {
+        'Ok(v) => v,
+        'Err(err) => fail!("probe: invalid fixture JSON", err.message),
+    };
+    let vq = query.lower_value(input);
+    let encoded: Value = codec.encode(Value, vq) |> result.unwrap;
+    encoded
+};
+
+# CustomerTier Ge Gold: range operations are not supported on the closed enum
+# value domain. Filter values use the untagged native JSON scalar shape.
+def facade_tier_ge_probe: Value = do {
+    let raw = json.parse("{\"measures\":[\"OrdersCreated\"],\"dimensions\":[],\"filters\":[{\"dimension\":\"CustomerTier\",\"op\":\"Ge\",\"value\":\"Gold\"}],\"ordering\":[],\"limit\":5}");
+    let input = match raw {
+        'Ok(v) => v,
+        'Err(err) => fail!("probe: invalid fixture JSON", err.message),
+    };
+    let vq = query.lower_value(input);
+    let encoded: Value = codec.encode(Value, vq) |> result.unwrap;
+    encoded
+};

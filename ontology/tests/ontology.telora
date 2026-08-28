@@ -1,0 +1,182 @@
+# Public type and module contract checks for the EnterpriseKnowledge eDSL.
+# Evaluated by `check @test/ontology`; any broken contract fails loudly.
+
+import "query/lib" as qb;
+import "std/array" as array;
+import "std/string" as string;
+import "@src/edsl" as edsl;
+import "@src/knowledge" as knowledge;
+
+def check: Fn(Bool, String) -> Bool = fn(cond, label) {
+    if cond { 'True } else { fail!("ontology contract check failed", label) }
+};
+
+def main_request: Fn() -> edsl.QueryRequest = fn() {
+    let request: edsl.QueryRequest = {
+        measures: [
+            { id: "OrderAmount", subject: "analyst", input: 'All },
+        ],
+        dimensions: [
+            { id: "OrderRegion", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [
+            { target: 'Measure("OrderAmount"), direction: 'Desc },
+            { target: 'Dimension("OrderRegion"), direction: 'Asc },
+        ],
+        limit: 'Some(3),
+    };
+    request
+};
+
+# Plan / PlanProfile / Query are owned by query: the eDSL does not
+# define alternatives and the knowledge profile is a qb.PlanProfile.
+def plan_ownership_ok: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request());
+    let validated: qb.Plan = qb.validate(plan, knowledge.profile);
+    check(array.length(validated.sources) >= 1, "plan is a query Plan and validates")
+};
+
+# The request vocabulary is closed and typed: ordering targets distinguish
+# Measure and Dimension variants; ids are the declared business vocabulary.
+def request_vocabulary_ok: Bool = do {
+    let target: edsl.OrderTarget = 'Measure("OrderAmount");
+    let target2: edsl.OrderTarget = 'Dimension("OrderRegion");
+    let ok1 = match target { 'Measure(id) => id == "OrderAmount", 'Dimension(_) => 'False };
+    let ok2 = match target2 { 'Dimension(id) => id == "OrderRegion", 'Measure(_) => 'False };
+    check(ok1 && ok2, "ordering targets distinguish closed Measure/Dimension variants")
+};
+
+# Business vocabulary ids in the prepared payload are valid SQL output
+# identifiers (aliases are derived from them at prepare time).
+def vocabulary_identifiers_ok: Bool = do {
+    let p = knowledge.payload;
+    let measure_ok = array.all(p.measures, fn(m) { qb.is_sql_identifier(m.alias) });
+    let dim_ok = array.all(p.dimensions, fn(d) { qb.is_sql_identifier(d.id) });
+    check(measure_ok, "measure aliases are valid SQL identifiers")
+        && check(dim_ok, "dimension ids are valid SQL identifiers")
+};
+
+# Prepared behavior is cross-module: the payload published by the knowledge
+# module is consumed here with its closures intact.
+def prepared_cross_module_ok: Bool = do {
+    let p = knowledge.payload;
+    let auth_ok = p.authorize("analyst") && !p.authorize("nobody");
+    let week = match array.find(p.dimensions, fn(d) { d.id == "OrderWeek" }) {
+        'Some(d) => d,
+        'None => fail!("OrderWeek missing from prepared dimensions"),
+    };
+    let expr = edsl.dimension_expr(p, week);
+    let computed_ok = match expr {
+        'Scalar(call) => call.function == 'Substr,
+        _ => 'False,
+    };
+    check(auth_ok, "published authorization closure works cross-module")
+        && check(computed_ok, "published computed-dimension closure works cross-module")
+};
+
+# The knowledge declares a closed set of entities explicitly on the root; the
+# payload contains exactly those entities and their facts, including the
+# vocabulary-vs-authorization separation and measure required entities.
+def root_explicit_entities_ok: Bool = do {
+    let p = knowledge.payload;
+    let contact = array.find(p.dimensions, fn(d) { d.id == "CustomerContact" });
+    let contact_known = match contact {
+        'Some(d) => !d.authorized && !d.filterable,
+        'None => 'False,
+    };
+    let item_amount = array.find(p.measures, fn(m) { m.id == "ItemAmount" });
+    let item_requires_order = match item_amount {
+        'Some(m) => m.requires == [0],
+        'None => 'False,
+    };
+    check(array.length(p.entities) == 3, "root explicitly lists three entity types")
+        && check(array.length(p.measures) == 5, "five measures collected from properties")
+        && check(array.length(p.dimensions) == 6, "six dimensions collected from properties")
+        && check(array.length(p.relations) == 3, "three relations collected from properties")
+        && check(contact_known, "known-but-unauthorized dimension stays in the closed vocabulary")
+        && check(item_requires_order, "measure required entities resolved to entity indexes")
+};
+
+# A lower request produces a Plan whose Query is deterministic and
+# parameterized (bindings non-empty when filters/limit present).
+def parameterized_query_ok: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [{ id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("west") }],
+        ordering: [],
+        limit: 'Some(2),
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(array.length(query.bindings) == 2, "filter value and limit are parameterized bindings")
+        && check(!qb.is_sql_identifier("1abc"), "identifier lexical rule still applies")
+};
+
+# Closed enum value domains: the CustomerTier dimension publishes a closed
+# catalog (stable values and labels) discoverable from the payload, while open
+# String dimensions keep an empty domain.
+def enum_domain_ok: Bool = do {
+    let p = knowledge.payload;
+    let tier = match array.find(p.dimensions, fn(d) { d.id == "CustomerTier" }) {
+        'Some(d) => d,
+        'None => fail!("CustomerTier dimension missing"),
+    };
+    let values = tier.values;
+    let domain_ok = array.length(values) == 3
+        && array.any(values, fn(v) { v.variant == "Gold" && v.value == "gold" && v.label == "Gold customer" })
+        && array.any(values, fn(v) { v.variant == "Silver" && v.value == "silver" && v.label == "Silver customer" })
+        && array.any(values, fn(v) { v.variant == "Bronze" && v.value == "bronze" && v.label == "Bronze customer" });
+    let region = match array.find(p.dimensions, fn(d) { d.id == "OrderRegion" }) {
+        'Some(d) => d,
+        'None => fail!("OrderRegion dimension missing"),
+    };
+    check(domain_ok, "CustomerTier dimension publishes its closed enum value domain")
+        && check(array.length(region.values) == 0, "open String dimension has an empty value domain")
+};
+
+# A legal enum stable value produces a parameterized binding; the closed
+# domain does not change projection/grouping of the underlying column.
+def enum_filter_ok: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "CustomerTier", subject: "analyst", input: 'None }],
+        filters: [{ id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("gold") }],
+        ordering: [{ target: 'Dimension("CustomerTier"), direction: 'Asc }],
+        limit: 'Some(3),
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let filter_ok = match plan.filter {
+        'Some('Scalar(call)) => call.function == 'Eq
+            && array.length(call.args) == 2
+            && (match call.args[0] { 'Column(ref) => ref.source == "c" && ref.column == "tier", _ => 'False })
+            && (match call.args[1] { 'Bind('String("gold")) => 'True, _ => 'False }),
+        _ => 'False,
+    };
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("gold"), 'Int(3)];
+    check(filter_ok, "legal enum value lowers to Eq on the tier column with a bind")
+        && check(query.bindings == expected, "enum filter binding is the stable value followed by the limit")
+};
+
+# Public discovery helper: dimension_domain exposes the closed catalog for an
+# enum dimension and the empty domain for an open dimension.
+def dimension_domain_helper_ok: Bool = do {
+    let values = edsl.dimension_domain(knowledge.payload, "CustomerTier");
+    let region_values = edsl.dimension_domain(knowledge.payload, "OrderRegion");
+    check(array.length(values) == 3, "dimension_domain exposes the enum closed catalog")
+        && check(array.length(region_values) == 0, "dimension_domain exposes the open domain as empty")
+};
+
+export {
+    plan_ownership_ok,
+    request_vocabulary_ok,
+    vocabulary_identifiers_ok,
+    prepared_cross_module_ok,
+    root_explicit_entities_ok,
+    parameterized_query_ok,
+    enum_domain_ok,
+    enum_filter_ok,
+    dimension_domain_helper_ok,
+};
