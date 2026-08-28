@@ -180,11 +180,13 @@ attempt id 索引的 history task。它们适合查询“当前状态”，而 `
 交付结构应与 `ent-1` 同等级，至少包括：
 
 - `om-labflow/telora-deps.json`；
-- 私有模型与公共 typed/dynamic query facade；
+- `om-labflow/src/model.telora`：私有模型；
+- `om-labflow/src/query.telora`：公共 typed/dynamic query facade（可以复用其他内部模块）；
 - `src/bin/query.telora`：实现上述 `input` Value source 到参数化 Query 的稳定入口；
 - 合法查询演示、严格验证以及关键非法场景；
 - 模型和公共查询面的契约测试；
-- 领域说明与查询设计指南。
+- `om-labflow/docs/DOMAIN.md`：领域说明与能力边界；
+- `om-labflow/docs/QUERY-DESIGN-GUIDE.md`：公共查询设计指南。
 
 所有成功路径必须产生确定性的参数化 SQLite Query；测试应覆盖 grain 安全、绑定顺序、
 筛选/排序/Top N、动态 JSON 边界和能力不足时的失败语义。完成时列出并运行实际可用的
