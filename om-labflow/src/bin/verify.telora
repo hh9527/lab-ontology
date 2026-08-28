@@ -1,0 +1,203 @@
+# om-labflow 严格验证
+#
+#   bin/telora -C om-labflow run verify
+#
+# 覆盖：确定性、SQL 形状、绑定顺序、筛选/分组/Top N、join 的 grain 保持、
+# Distinct、codec round-trip 与 dynamic JSON 边界（固定 subject / EventType
+# 封闭值域）。任何一项失败都会使本入口以诊断失败（非零退出）。
+
+import "std/value" { Value };
+import "std/json" as json;
+import "std/codec" as codec;
+import "std/result" as result;
+import "ontology/edsl" as edsl;
+import "query/lib" as qb;
+import "@src/knowledge" { payload };
+import "@src/query" as facade;
+
+# ---------------------------------------------------------------------------
+# 断言工具
+# ---------------------------------------------------------------------------
+
+def assert_eq_text: Fn(String, String) -> Result(String, String) = fn(actual, expected) {
+    if actual == expected { 'Ok(actual) } else { 'Err("SQL mismatch") }
+};
+
+def assert_eq_bindings: Fn(Array(qb.Val), Array(qb.Val)) -> Result(Array(qb.Val), String) = fn(actual, expected) {
+    if actual == expected { 'Ok(actual) } else { 'Err("bindings mismatch") }
+};
+
+# decode_request 应当拒绝给定 Value
+def assert_rejected: Fn(Value) -> Result(Value, String) = fn(raw) {
+    let decoded = facade.decode_request(raw);
+    if decoded == 'None { 'Ok(raw) } else { 'Err("request should be rejected") }
+};
+
+# decode_request 应当接受给定 Value
+def assert_accepted: Fn(Value) -> Result(edsl.QueryRequest, String) = fn(raw) {
+    let decoded = facade.decode_request(raw);
+    match decoded {
+        'Some(request) => 'Ok(request),
+        'None => 'Err("request should be accepted"),
+    }
+};
+
+# ---------------------------------------------------------------------------
+# 代表性子句
+# ---------------------------------------------------------------------------
+
+def rounds_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "Role", subject: "analyst", input: 'None }],
+    filters: [{ id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("task_started") }],
+    ordering: [
+        { target: 'Measure("EventCount"), direction: 'Desc },
+        { target: 'Dimension("Role"), direction: 'Asc },
+    ],
+    limit: 'Some(5),
+};
+
+def rounds_sql = "SELECT count(t.id) AS EventCount, t.role FROM timeline AS t WHERE t.type = ? GROUP BY t.role ORDER BY count(t.id) DESC, t.role ASC LIMIT ?";
+def rounds_bindings: Array(qb.Val) = ['String("task_started"), 'Int(5)];
+def action_bindings: Array(qb.Val) = ['String("action"), 'String("shell"), 'Int(1), 'Int(10)];
+def empty_bindings: Array(qb.Val) = [];
+def thinking_bindings: Array(qb.Val) = ['String("thinking")];
+
+def action_request: edsl.QueryRequest = {
+    measures: [
+        { id: "EventCount", subject: "analyst", input: 'All },
+        { id: "DurationSum", subject: "analyst", input: 'All },
+    ],
+    dimensions: [{ id: "Command", subject: "analyst", input: 'None }],
+    filters: [
+        { id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("action") },
+        { id: "Action", subject: "analyst", op: 'Eq, input: 'Text("shell") },
+        { id: "Success", subject: "analyst", op: 'Eq, input: 'Int(1) },
+    ],
+    ordering: [{ target: 'Measure("DurationSum"), direction: 'Desc }],
+    limit: 'Some(10),
+};
+
+def action_sql = "SELECT count(t.id) AS EventCount, sum(t.duration) AS DurationSum, t.command FROM timeline AS t WHERE ((t.type = ? AND t.action = ?) AND t.success = ?) GROUP BY t.command ORDER BY sum(t.duration) DESC LIMIT ?";
+
+def paths_request: edsl.QueryRequest = {
+    measures: [{ id: "PathCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "Role", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+};
+
+def paths_sql = "SELECT count(ap.path) AS PathCount, t.role FROM action_paths AS ap INNER JOIN timeline AS t ON ap.event_id = t.id GROUP BY t.role";
+
+def distinct_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'Distinct }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+};
+
+def distinct_sql = "SELECT count(DISTINCT t.id) AS EventCount FROM timeline AS t";
+
+def thinking_request: edsl.QueryRequest = {
+    measures: [{ id: "DurationMax", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "Role", subject: "analyst", input: 'None }],
+    filters: [{ id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("thinking") }],
+    ordering: [],
+    limit: 'None,
+};
+
+def thinking_sql = "SELECT max(t.duration) AS DurationMax, t.role FROM timeline AS t WHERE t.type = ? GROUP BY t.role";
+
+# ---------------------------------------------------------------------------
+# 验证项
+# ---------------------------------------------------------------------------
+
+def verify_rounds = do {
+    let query = facade.build_from_request(payload, rounds_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, rounds_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, rounds_bindings);
+    query
+};
+
+def verify_action = do {
+    let query = facade.build_from_request(payload, action_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, action_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, action_bindings);
+    query
+};
+
+def verify_paths_join = do {
+    let query = facade.build_from_request(payload, paths_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, paths_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, empty_bindings);
+    query
+};
+
+def verify_distinct = do {
+    let query = facade.build_from_request(payload, distinct_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, distinct_sql);
+    query
+};
+
+def verify_thinking = do {
+    let query = facade.build_from_request(payload, thinking_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, thinking_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, thinking_bindings);
+    query
+};
+
+def verify_determinism = do {
+    let first = facade.build_from_request(payload, rounds_request);
+    let second = facade.build_from_request(payload, rounds_request);
+    let checked_sql = assert_eq_text.must_ok!(second.sql, first.sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(second.bindings, first.bindings);
+    first
+};
+
+def verify_codec_roundtrip = do {
+    let query = facade.build_from_request(payload, rounds_request);
+    let encoded = facade.encode_query(query);
+    let decoded = codec.decode(qb.Query, encoded) |> result.unwrap;
+    let checked_sql = assert_eq_text.must_ok!(decoded.sql, query.sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(decoded.bindings, query.bindings);
+    decoded
+};
+
+def verify_json_boundary = do {
+    let non_object = json.parse("42") |> result.unwrap;
+    let rejected_non_object = assert_rejected.must_ok!(non_object);
+
+    # dynamic 入口固定 subject=analyst：缺少 subject 是合法请求。
+    let missing_subject = json.parse(r#"{"measures": [{"id": "EventCount"}]}"#) |> result.unwrap;
+    let accepted_missing_subject = assert_accepted.must_ok!(missing_subject);
+
+    # 显式 subject 属于未知顶层 key，整体拒绝。
+    let explicit_subject = json.parse(r#"{"subject": "analyst", "measures": [{"id": "EventCount"}]}"#) |> result.unwrap;
+    let rejected_explicit_subject = assert_rejected.must_ok!(explicit_subject);
+
+    let bad_op = json.parse(r#"{"filters": [{"id": "EventType", "op": "bogus", "value": "x"}]}"#) |> result.unwrap;
+    let rejected_bad_op = assert_rejected.must_ok!(bad_op);
+
+    let bool_value = json.parse(r#"{"filters": [{"id": "Success", "op": "eq", "value": true}]}"#) |> result.unwrap;
+    let rejected_bool_value = assert_rejected.must_ok!(bool_value);
+
+    let bad_limit = json.parse(r#"{"measures": [{"id": "EventCount"}], "limit": "5"}"#) |> result.unwrap;
+    let rejected_bad_limit = assert_rejected.must_ok!(bad_limit);
+    0
+};
+
+def verify_dynamic_path = do {
+    let raw = json.parse(r#"{"measures": [{"id": "EventCount"}], "dimensions": [{"id": "Role"}], "filters": [{"id": "EventType", "op": "eq", "value": "task_started"}], "ordering": [{"target": {"kind": "measure", "id": "EventCount"}, "direction": "desc"}, {"target": {"kind": "dimension", "id": "Role"}, "direction": "asc"}], "limit": 5}"#) |> result.unwrap;
+    let query = facade.build_from_value(payload, raw);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, rounds_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, rounds_bindings);
+    query
+};
+
+export def main: Fn(Dict(Value)) -> Value = fn(sources) {
+    # 汇总展示：输出最后一个验证查询的 Query JSON
+    let query = facade.build_from_request(payload, rounds_request);
+    facade.encode_query(query)
+};
