@@ -104,6 +104,8 @@ mapping 与公共查询面分离，且来自同一个 prepared knowledge root。
 | `ExitCode` | int | 开放 | eq |
 | `AtTime` | int | 开放 | ge, le（毫秒 epoch） |
 | `Duration` | int | 开放 | eq, ge, le |
+| `AttemptId` | text | 开放 | eq（JSON-backed：`payload_json` 的 `$.attempt_id`，task 事件适用） |
+| `TaskCompletionStatus` | text | 开放 | eq（JSON-backed：`payload_json` 的 `$.status`，task_completed 事件适用） |
 | `Path` | text | 开放 | eq（ActionPath 维度） |
 
 所有维度 v1 均 `authorized` 且 `filterable`。授权主体由 `authorize` 决定
@@ -150,6 +152,27 @@ mapping 与公共查询面分离，且来自同一个 prepared knowledge root。
   `EventType=thinking`）；与 scope 取值相同的筛选（如 `EventType=action`）不冲突。
 - 底层用封闭标量 `Instr`/`If`/`Sub`/`Substr` 组合实现，语义与 SQLite 一致：
   无分隔符、空字符串、NULL 输入都有确定行为。
+
+### JSON-backed 维度（AttemptId / TaskCompletionStatus）
+
+两个 JSON-backed 维度都从 `TimelineEvent.payload_json` 物理 JSON 列声明，复用同一
+可组合 `json_dimension` provider（同一 document 发布多个稳定 path，可组合 fold）：
+
+| 业务维度 | JSON path | 类型 | 适用事件 |
+| --- | --- | --- | --- |
+| `AttemptId` | `$.attempt_id` | text | `task_started`/`task_completed`（带 attempt 的任务事件） |
+| `TaskCompletionStatus` | `$.status` | text | `task_completed`（payload 含任务完成状态，如 submitted/stale） |
+
+- path 固定于领域声明：动态 `QueryRequest` 只能选择/筛选/排序业务 Dimension id，
+  不得携带 path、SQLite 函数名、raw JSON 表达式或 `payload_json` 物理列名；提交
+  这些都会作为未知 key / 未知业务 Dimension 原子失败。
+- path 通过 Query 的公共 `JsonExtract` 构造器成为 String binding（`?`），绝不进入
+  SQL 文本或成为 identifier；同一 path 在 projection/grouping/ordering 重复出现时
+  保持确定性与严格占位符顺序。
+- **SQL NULL 边界**：missing path 与 JSON null 都降低为 SQL NULL，不伪装成空串、
+  不自动 `coalesce`。不包含 attempt/status 的其他 Timeline 事件只有在请求业务
+  语义允许时才可能形成 NULL 分组；因此按这些维度分析时应显式过滤适用事件
+  （如 `EventType=task_completed`），避免把所有 Timeline 行混入可信零/NULL 结果。
 
 ### 关系
 
@@ -220,18 +243,21 @@ CommandHead”：
 虚假业务定义绕过；需要时应在 Labflow 侧显式建模或等待底层能力。
 
 1. **一轮任务的耗时区间**。一轮 = 配对 `task_started` 与同一 `attempt_id` 的
-   `task_completed`，耗时 = `task_completed.at - task_started.at`。当前
-   QueryBuilder 没有列间算术、没有 self-join + 类型筛选条件、也无法从
-   `payload_json` 提取 `attempt_id`，因此不能表达配对区间。可表达的是事件的
-   独立时长聚合（`DurationSum`/`DurationAvg`/`DurationMax`）。
-2. **逐 attempt 的完成状态 / 控制面状态**。`TaskOutstanding =
-   TaskStartedCount - TaskCompletedCount` 现在可以按维度给出轮数净额；但逐
-   `attempt_id` 的“当前是否完成”仍需要从 `payload_json` 提取 `attempt_id` 或
+   `task_completed`，耗时 = `task_completed.at - task_started.at`。`AttemptId`
+   现在可作业务维度（`payload_json` 的 `$.attempt_id`），按 AttemptId 分组统计
+   Started/Completed/Outstanding 净额也可表达；但一轮配对区间仍需要 self-join
+   （`task_started` 与 `task_completed` 按 attempt 配对）与两行间算术
+   （`completed.at - started.at`），QueryBuilder 不支持，因此不能表达配对区间。
+   可表达的是事件独立时长聚合（`DurationSum`/`DurationAvg`/`DurationMax`）。
+2. **逐 attempt 的完成状态 / 控制面状态**。按 AttemptId 分组的轮数净额
+   （`TaskStartedCount`/`TaskCompletedCount`/`TaskOutstanding`）现在可表达；但
    读取 `states.state` / `states.task_records`（状态库以 schema 名 `states`
-   ATTACH，QueryBuilder 的标识符不允许 `.`，无法引用 `states.*` 表），因此仍
-   不可表达。
-3. **JSON 字段**。`payload_json`（`attempt_id`、`status`、`backend_id` 等）不暴露
-   为维度；当前 QueryBuilder 无 JSON 函数。
+   ATTACH，QueryBuilder 的标识符不允许 `.`，无法引用 `states.*` 表）仍不可表达，
+   逐 attempt 的持久化状态快照（active/history、status 字段）仍不可读。
+3. **JSON 字段（部分）**。`payload_json` 的 `$.attempt_id` 与 `$.status` 已分别
+   通过 `AttemptId`/`TaskCompletionStatus` 维度暴露（同一 document 的多个稳定
+   path，可组合 fold）；`backend_id`、`optional` 等其他 payload 字段暂未暴露为
+   业务维度。
 4. **聚合算术边界**。领域声明的条件指标（`FILTER (WHERE ...)`）与受限计算指标
    （`'Add`/`'Sub` 组合已声明聚合）现在可用，例如 `HostRequestNet =
    HostRequestOpenedCount - HostRequestResolvedCount`、`input_tokens +
@@ -244,10 +270,11 @@ CommandHead”：
 
 ### 未来所需的底层能力
 
-`json_extract`/JSON 函数、schema 限定表名、日期时间函数与区间（self-join 或
-窗口）、聚合算术的进一步扩展（除法、任意表达式、NULL 自动 coalesce）。行级
-列间算术（`Add`/`Sub`）、首词计算维度（`Instr`/`If`/`Substr`）、条件指标
-（FILTER）与计算指标（`'Add`/`'Sub`）以及 Top Per Group 已在 v1 中可用。
+schema 限定表名、日期时间函数、一轮配对区间（self-join 或窗口）、聚合算术的
+进一步扩展（除法、任意表达式、NULL 自动 coalesce）。行级列间算术（`Add`/`Sub`）、
+首词计算维度（`Instr`/`If`/`Substr`）、SQLite JSON1 固定 path 维度
+（`json_extract`）、条件指标（FILTER）、计算指标（`'Add`/`'Sub`）以及
+Top Per Group 已在 v1 中可用。
 
 ## 安全与公共边界
 

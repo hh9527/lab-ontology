@@ -54,7 +54,9 @@ type ColumnRef = struct {
 # SQLite scalar (`substr(value, start[, length])`); `Instr` finds the first
 # occurrence of a needle (`instr(haystack, needle)`, 1-based, 0 when absent);
 # `If` is the conditional (`CASE WHEN cond THEN t ELSE e END`); `Add`/`Sub`
-# are the necessary integer arithmetic primitives.  The remaining variants are
+# are the necessary integer arithmetic primitives; `JsonExtract`/`JsonType`/
+# `JsonValid` are the closed SQLite JSON1 v1 vocabulary (the JSON path is
+# always a string `Bind`, never SQL text).  The remaining variants are
 # operator-style scalar predicates/logic rendered with SQLite operator syntax.
 # The AST is closed: no raw SQL fragment, no arbitrary function name/operator
 # and no identifier can escape through this vocabulary.  Semantics never
@@ -65,6 +67,9 @@ type ScalarFunction = enum {
     'If,
     'Add,
     'Sub,
+    'JsonExtract,
+    'JsonType,
+    'JsonValid,
     'Eq,
     'Ne,
     'Lt,
@@ -388,6 +393,9 @@ def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args
         'If => len == 3,
         'Add => len == 2,
         'Sub => len == 2,
+        'JsonExtract => len == 2,
+        'JsonType => len == 2,
+        'JsonValid => len == 1,
         'Eq => len == 2,
         'Ne => len == 2,
         'Lt => len == 2,
@@ -404,12 +412,33 @@ def known_alias: Fn(Array(String), String) -> Bool = fn(aliases, alias) {
     array.any(aliases, fn(candidate) { candidate == alias })
 };
 
+# JsonExtract/JsonType require their second argument to be a literal string
+# Bind (the JSON path).  Columns, computed expressions, Int/Float Binds or
+# missing arguments are rejected so a path can never enter the SQL text.
+def json_path_ok: Fn(Expr) -> Bool = fn(expr) {
+    match expr {
+        'Bind('String(_)) => 'True,
+        _ => 'False,
+    }
+};
+
+# Arity plus the JSON path-argument constraint for the JSON1 scalar vocabulary.
+def json_call_valid: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args) {
+    let arity_ok = scalar_arity_ok(function, args);
+    match function {
+        'JsonExtract => arity_ok && json_path_ok(args[1]),
+        'JsonType => arity_ok && json_path_ok(args[1]),
+        'JsonValid => arity_ok,
+        _ => arity_ok,
+    }
+};
+
 def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
     match expr {
         'Column(ref) => is_sql_identifier(ref.column) && known_alias(aliases, ref.source),
         'Bind(_) => 'True,
         'Scalar(call) => {
-            scalar_arity_ok(call.function, call.args)
+            json_call_valid(call.function, call.args)
             && array.all(call.args, fn(arg) { expr_valid(arg, aliases) })
         },
     }
@@ -844,6 +873,9 @@ def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
         'If => "if",
         'Add => "+",
         'Sub => "-",
+        'JsonExtract => "json_extract",
+        'JsonType => "json_type",
+        'JsonValid => "json_valid",
         'Eq => "=",
         'Ne => "!=",
         'Lt => "<",
@@ -887,6 +919,9 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
         'If => `CASE WHEN \{parts[0]} THEN \{parts[1]} ELSE \{parts[2]} END`,
         'Add => `(\{parts[0]} + \{parts[1]})`,
         'Sub => `(\{parts[0]} - \{parts[1]})`,
+        'JsonExtract => `json_extract(\{parts[0]}, \{parts[1]})`,
+        'JsonType => `json_type(\{parts[0]}, \{parts[1]})`,
+        'JsonValid => `json_valid(\{parts[0]})`,
         'Eq => `\{parts[0]} = \{parts[1]}`,
         'Ne => `\{parts[0]} != \{parts[1]}`,
         'Lt => `\{parts[0]} < \{parts[1]}`,
@@ -1362,6 +1397,23 @@ def sub: Fn(Expr, Expr) -> Expr = fn(left, right) {
     'Scalar(call)
 };
 
+# SQLite JSON1 v1: the JSON path is always converted to a string Bind, so it
+# enters `?`/bindings and never the SQL text.
+def json_extract: Fn(Expr, String) -> Expr = fn(document, path) {
+    let call: ScalarCall = {function: 'JsonExtract, args: [document, bind_string(path)]};
+    'Scalar(call)
+};
+
+def json_type: Fn(Expr, String) -> Expr = fn(document, path) {
+    let call: ScalarCall = {function: 'JsonType, args: [document, bind_string(path)]};
+    'Scalar(call)
+};
+
+def json_valid: Fn(Expr) -> Expr = fn(document) {
+    let call: ScalarCall = {function: 'JsonValid, args: [document]};
+    'Scalar(call)
+};
+
 def expr_item: Fn(Expr) -> SelectItem = fn(expr) { 'Expr(expr) };
 
 def aggregate: Fn(AggregateFunction, Expr, Bool, String) -> SelectItem = fn(function, arg, distinct, alias) {
@@ -1482,6 +1534,9 @@ export {
     scalar_if,
     add,
     sub,
+    json_extract,
+    json_type,
+    json_valid,
     expr_item,
     aggregate,
     aggregate_filtered,

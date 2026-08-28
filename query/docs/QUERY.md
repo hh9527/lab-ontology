@@ -39,6 +39,7 @@ type ColumnRef = struct { source: String, column: String };
 
 type ScalarFunction = enum {
     'Substr, 'Instr, 'If, 'Add, 'Sub,
+    'JsonExtract, 'JsonType, 'JsonValid,
     'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
 };
 type ScalarCall = struct { function: ScalarFunction, args: Array(Expr) };
@@ -88,6 +89,9 @@ alias 做 `'Add`/`'Sub` 算术组合。
 | `'Instr` | 2 | `instr(haystack, needle)`：needle 首次出现的 1-based 位置，缺失为 `0` |
 | `'If` | 3 | `CASE WHEN cond THEN then ELSE else END`；cond 非零为真，NULL 走 ELSE |
 | `'Add` / `'Sub` | 2 | 整数算术，渲染为 `(a + b)` / `(a - b)` |
+| `'JsonExtract` | 2 | `json_extract(document, path)`；path 必须是字符串 Bind |
+| `'JsonType` | 2 | `json_type(document, path)`；path 必须是字符串 Bind |
+| `'JsonValid` | 1 | `json_valid(document)` |
 | `'Eq/'Ne/'Lt/'Le/'Gt/'Ge` | 2 | 比较运算 |
 | `'And` / `'Or` | 2 | 逻辑运算 |
 | `'Not` | 1 | 逻辑非 |
@@ -95,6 +99,12 @@ alias 做 `'Add`/`'Sub` 算术组合。
 `'If`、`'Instr`、`'Add`、`'Sub` 属于 profile 的 `allowed_scalars`，并经过 arity
 校验（`'If` 恰为 3，`'Instr`/`'Add`/`'Sub` 恰为 2）。computed expression 可以稳定
 用于 projection、grouping 和 ordering。
+
+SQLite JSON1 v1 词汇（`'JsonExtract`/`'JsonType`/`'JsonValid`）同样属于
+`allowed_scalars` 并消耗 `Scalar` operator。`JsonExtract`/`JsonType` 的第二个参数
+（JSON path）在结构校验中必须确认为字符串 `Bind`：列、计算表达式、Int/Float Bind
+或缺失参数均原子失败；path 经 `?` 进入 bindings，绝不插入 SQL 文本。arity 固定
+（Extract/Type 为 2，Valid 为 1）。
 
 ### Plan
 
@@ -185,6 +195,8 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `aggregate_filtered` | `Fn(AggregateFunction, Expr, Bool, Option(Expr), String) -> SelectItem` |
 | `computed_aggregate` | `Fn(ComputedOp, String, String, String) -> ComputedAggregate` |
 | `computed_item` | `Fn(ComputedOp, String, String, String) -> SelectItem` |
+| `json_extract` / `json_type` | `Fn(Expr, String) -> Expr` |
+| `json_valid` | `Fn(Expr) -> Expr` |
 | `source` | `Fn(String, String) -> Source` |
 | `join` | `Fn(JoinKind, Source, ColumnRef, ColumnRef) -> Join` |
 | `asc` / `desc` | `Fn(Expr) -> OrderBy` |
@@ -484,6 +496,62 @@ bindings 严格按占位符出现顺序：两个 FILTER 的 `?`、全局 WHERE�
 - ordering、全局分页与分组内 Top N 可以引用最终 computed aggregate；与分组内
   Top N 组合时按分区内 ordering 稳定排序。
 
+## SQLite JSON v1
+
+从 `payload_json` 风格列提取字段，并用于 projection、filter、grouping 与
+ordering。JSON path 始终是字符串 `Bind`，进入 `?`/bindings，绝不进入 SQL 文本。
+
+```telora
+def attempts: qb.Plan = {
+    revision: "attempt-json-v1",
+    sources: [qb.source("e", "events")],
+    projection: [
+        qb.expr_item(qb.column("e", "id")),
+        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.attempt_id")),
+        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.status")),
+        qb.expr_item(qb.json_type(qb.column("e", "payload"), "$.amount")),
+        qb.expr_item(qb.json_valid(qb.column("e", "payload"))),
+    ],
+    filter: 'Some(qb.scalar('Eq, [
+        qb.json_extract(qb.column("e", "payload"), "$.status"),
+        qb.bind_string("ok"),
+    ])),
+    joins: [],
+    grouping: [qb.json_extract(qb.column("e", "payload"), "$.attempt_id")],
+    ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id"))],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+```
+
+lowering：
+
+```sql
+SELECT e.id, json_extract(e.payload, ?), json_extract(e.payload, ?),
+       json_type(e.payload, ?), json_valid(e.payload)
+FROM events AS e
+WHERE json_extract(e.payload, ?) = ?
+GROUP BY json_extract(e.payload, ?)
+ORDER BY json_extract(e.payload, ?) ASC
+```
+
+bindings：`['String("$.attempt_id"), 'String("$.status"), 'String("$.amount"),
+'String("$.status"), 'String("ok"), 'String("$.attempt_id"), 'String("$.attempt_id")]`
+——严格按占位符出现顺序。
+
+SQLite JSON1 标量语义（v1 精确采用，schema 保证被读文档是合法 JSON；v1 不在
+Query AST 内修复 malformed JSON）：
+
+- `json_extract(doc, path)`：path 缺失或对应 JSON null → SQL NULL；字符串/数值/
+  布尔 → 对应 SQL scalar；对象/数组 → JSON text；
+- `json_type(doc, path)`：返回 SQLite 类型文本（`null`/`true`/`false`/
+  `integer`/`real`/`text`/`array`/`object`）或 path 缺失时 NULL；
+- `json_valid(doc)`：合法 JSON 返回 `1`，否则 `0`。
+
+path binding 在 projection、filter、grouping、ordering、computed dimension 与
+partition ordering 中保持严格占位符顺序与重复表达式确定性。
+
 ## 验证与转换保证
 
 结构校验覆盖：非空 sources/projection、合法标识符、source alias 引用、标量参数
@@ -555,7 +623,9 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 | 标量 arity 非法 | `validate_structure` 失败，或 `structure_ok == 'False` |
 | 分组 Top N：key 非 grouping / target 未选择 / 缺 tie-breaker / `take` 越界 / 与全局分页或 ordering 组合 | `validate_structure` 失败，或 `structure_ok == 'False` |
 | computed aggregate：未知操作数 / 循环依赖 / alias 冲突 | `validate_structure` 失败，或 `structure_ok == 'False` |
+| JSON：Extract/Type arity 非 2、Valid arity 非 1、path 非字符串 Bind（列/计算表达式/Int/Float Bind/缺失） | `validate_structure` 失败，或 `structure_ok == 'False` |
 | FILTER predicate 使用 profile 未允许的表达式 | `validate` 失败，或 `profile_accepts == 'False` |
+| Profile 缺 JsonExtract / JsonType / JsonValid | `validate` 失败，或 `profile_accepts == 'False` |
 | SQLite 转换失败 | `transform_sqlite` 失败 |
 
 失败通过 Telora Host 的带外诊断表达。QueryBuilder 不返回部分 Query，也不接受
@@ -578,10 +648,12 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 （SQL/bindings/offset 安全约束）、分组内 Top N（row_number 子查询、bindings、
 profile、tie-breaker 拒绝）、filtered/computed aggregates（FILTER lowering、计算
 聚合 arithmetic、computed 参与 ordering、computed 与分组 Top N 组合、未知操作数与
-循环依赖拒绝）、确定性和 JSON codec；`invalid` 验证未投影聚合
-排序等非法 Plan 只产生诊断。`tests/query.telora` 覆盖相同契约的逐项断言，包括
+循环依赖拒绝）、SQLite JSON1 v1（projection/filter/grouping/ordering 与 partition
+ordering 的 path binding 顺序、path 不进入 SQL 文本、profile 覆盖）、确定性和
+JSON codec；`invalid` 验证非字符串 JSON path 等非法 Plan 只产生诊断。
+`tests/query.telora` 覆盖相同契约的逐项断言，包括
 `'Instr`/`'If`/`'Add`/`'Sub` arity 拒绝、offset 缺 ordering 拒绝、负 offset 拒绝，
-分组 Top N 的成功与拒绝场景，以及 filtered/computed aggregates 的成功场景（互斥
-事件类型条件计数、全局 filter 与聚合 filter 并存、computed 参与 ordering、computed
-与分组 Top N 组合）与拒绝场景（未知操作数、循环依赖、alias 冲突、profile 拒绝
-FILTER predicate）。
+分组 Top N 的成功与拒绝场景，filtered/computed aggregates 的成功与拒绝场景，以及
+JSON 的成功场景（三种以上位置、partition ordering、占位符顺序、确定性）与拒绝
+场景（Extract/Type/Valid 错误 arity、非字符串 path 列/Int Bind/表达式 path、
+Profile 分别缺三个 JSON scalar）。

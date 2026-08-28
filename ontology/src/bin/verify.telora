@@ -280,18 +280,20 @@ def check_knowledge_entries: Bool = do {
         && array.any(measure_ids, fn(id) { id == "ApprovalRejectedCount" })
         && array.any(measure_ids, fn(id) { id == "ApprovalNet" })
         && array.any(measure_ids, fn(id) { id == "ApprovalTotal" });
+    let has_device = array.any(measure_ids, fn(id) { id == "DeviceCount" });
     let dim_ids = array.map(p.dimensions, fn(d) { d.id });
     let dims_ok = array.all([
         "OrderId", "OrderRegion", "OrderWeek", "CustomerName", "CustomerTier",
         "CustomerContact", "TraceKind", "TraceHead", "TraceOwner",
         "ApprovalStatus", "ApprovalSubject",
+        "DeviceChannel", "DeviceRetryCount", "DeviceOwner",
     ], fn(id) { array.any(dim_ids, fn(d) { d == id }) });
     let contact = array.find(p.dimensions, fn(d) { d.id == "CustomerContact" });
     let contact_unauthorized = match contact {
         'Some(d) => !d.authorized,
         'None => 'False,
     };
-    check(has_amount && has_count && has_cust && has_item && has_item_qty && has_trace && has_run && has_skip && has_total && has_delta && has_approval, "knowledge measures collected")
+    check(has_amount && has_count && has_cust && has_item && has_item_qty && has_trace && has_run && has_skip && has_total && has_delta && has_approval && has_device, "knowledge measures collected")
         && check(dims_ok, "knowledge dimensions collected")
         && check(contact_unauthorized, "known dimension CustomerContact exists but is not authorized")
 };
@@ -417,7 +419,7 @@ def check_cross_module_prepared: Bool = do {
         'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
         _ => 'False,
     };
-    let entities_ok = array.length(p.entities) == 5;
+    let entities_ok = array.length(p.entities) == 6;
     check(auth_ok, "cross-module: published authorization closure works")
         && check(computed_ok, "cross-module: published computed-dimension closure works")
         && check(entities_ok, "cross-module: published entity index available")
@@ -796,6 +798,105 @@ def check_non_timeline_measures: Bool = do {
         && check(order_ok, "non-timeline: approval computed measure participates in ordering")
 };
 
+# ---------------------------------------------------------------------------
+# Requests and checks for JSON-backed dimensions.
+# ---------------------------------------------------------------------------
+
+# DeviceChannel = $.channel (top-level) and DeviceRetryCount = $.retry.count
+# (nested). Requests only carry the business ids; the paths stay bindings.
+def json_request: edsl.QueryRequest = {
+    measures: [{ id: "DeviceCount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "DeviceChannel", subject: "analyst", input: 'None },
+        { id: "DeviceRetryCount", subject: "analyst", input: 'None },
+    ],
+    filters: [{ id: "DeviceChannel", subject: "analyst", op: 'Eq, input: 'Text("api") }],
+    ordering: [{ target: 'Dimension("DeviceRetryCount"), direction: 'Desc }],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+# JSON dimension as a stable partition ordering tie-breaker.
+def json_top_per_group_request: edsl.QueryRequest = {
+    measures: [{ id: "DeviceCount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "DeviceOwner", subject: "analyst", input: 'None },
+        { id: "DeviceChannel", subject: "analyst", input: 'None },
+    ],
+    filters: [],
+    ordering: [
+        { target: 'Measure("DeviceCount"), direction: 'Desc },
+        { target: 'Dimension("DeviceChannel"), direction: 'Asc },
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({ by: ["DeviceOwner"], take: 2 }),
+};
+
+def is_json_extract: Fn(qb.Expr, String) -> Bool = fn(e, path) {
+    match e {
+        'Scalar(call) => call.function == 'JsonExtract
+            && array.length(call.args) == 2
+            && (match get_expr(call.args, 0) {
+                'Column(ref) => ref.source == "d" && ref.column == "attributes_json",
+                _ => 'False,
+            })
+            && (match get_expr(call.args, 1) { 'Bind('String(p)) => p == path, _ => 'False }),
+        _ => 'False,
+    }
+};
+
+def check_json_dimension: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, json_request);
+    let proj_channel = array.any(plan.projection, fn(item) {
+        match item { 'Expr(e) => is_json_extract(e, "$.channel"), _ => 'False }
+    });
+    let proj_retry = array.any(plan.projection, fn(item) {
+        match item { 'Expr(e) => is_json_extract(e, "$.retry.count"), _ => 'False }
+    });
+    let group_ok = array.length(plan.grouping) == 2
+        && is_json_extract(get_expr(plan.grouping, 0), "$.channel")
+        && is_json_extract(get_expr(plan.grouping, 1), "$.retry.count");
+    let filter_ok = match plan.filter {
+        'Some('Scalar(call)) => call.function == 'Eq
+            && array.length(call.args) == 2
+            && is_json_extract(get_expr(call.args, 0), "$.channel")
+            && (match get_expr(call.args, 1) { 'Bind('String("api")) => 'True, _ => 'False }),
+        _ => 'False,
+    };
+    let order_ok = array.length(plan.ordering) == 1
+        && (match get_index(plan.ordering, 0).key {
+            'Expr(e) => is_json_extract(e, "$.retry.count"),
+            _ => 'False,
+        })
+        && (match get_index(plan.ordering, 0).direction { 'Desc => 'True, 'Asc => 'False });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(proj_channel && proj_retry, "json dimension: top-level and nested paths in projection")
+        && check(group_ok, "json dimension: paths in grouping")
+        && check(filter_ok, "json dimension: parameterized filter on a declared path")
+        && check(order_ok, "json dimension: stable ordering on a nested path")
+};
+
+def check_json_top_per_group: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, json_top_per_group_request);
+    let part_ok = match plan.partition {
+        'Some(p) => array.length(p.order_by) == 2
+            && (match get_index(p.order_by, 0).key {
+                'AggregateRef(ref) => ref.alias == "DeviceCount",
+                _ => 'False,
+            })
+            && (match get_index(p.order_by, 1).key {
+                'Expr(e) => is_json_extract(e, "$.channel"),
+                _ => 'False,
+            })
+            && p.take == 2,
+        'None => 'False,
+    };
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(part_ok, "json dimension: path as a stable partition ordering tie-breaker")
+};
+
 def check_computed_measure: Bool = do {
     let plan: qb.Plan = edsl.lower(knowledge.payload, computed_measure_request);
     let deps_projected = array.any(plan.projection, fn(item) { aggregate_alias(item, "TraceRunCount") })
@@ -870,5 +971,7 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     let c25 = check_top_per_group_computed;
     let c26 = check_filtered_global_separation;
     let c27 = check_non_timeline_measures;
+    let c28 = check_json_dimension;
+    let c29 = check_json_top_per_group;
     'String("verify ok")
 };

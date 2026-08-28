@@ -33,6 +33,9 @@ tests/query.telora    契约测试
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/per-role-failed-command-heads.json
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-by-role.json
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/attempt-rounds.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-status-by-role.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-by-attempt.json
 ./bin/telora -C om-labflow run verify
 ./bin/telora -C om-labflow run invalid --best-effort
 ./bin/telora -C om-labflow check @test/query

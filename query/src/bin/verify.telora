@@ -41,7 +41,7 @@ def full_profile: Fn() -> qb.PlanProfile = fn() {
         ],
         allowed_join_kinds: ['Inner, 'Left],
         allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
-        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'JsonExtract, 'JsonType, 'JsonValid, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
         allow_distinct: 'True,
     };
     profile
@@ -447,6 +447,75 @@ def computed_cycle_plan: Fn() -> qb.Plan = fn() {
 };
 
 # ---------------------------------------------------------------------------
+# SQLite JSON1 v1.
+# ---------------------------------------------------------------------------
+
+def json_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "verify-json",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "id")),
+            qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.attempt_id")),
+            qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.status")),
+            qb.expr_item(qb.json_type(qb.column("e", "payload"), "$.amount")),
+            qb.expr_item(qb.json_valid(qb.column("e", "payload"))),
+        ],
+        filter: 'Some(qb.scalar('Eq, [
+            qb.json_extract(qb.column("e", "payload"), "$.status"),
+            qb.bind_string("ok"),
+        ])),
+        joins: [],
+        grouping: [qb.json_extract(qb.column("e", "payload"), "$.attempt_id")],
+        ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id"))],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_json_sql = "SELECT e.id, json_extract(e.payload, ?), json_extract(e.payload, ?), json_type(e.payload, ?), json_valid(e.payload) FROM events AS e WHERE json_extract(e.payload, ?) = ? GROUP BY json_extract(e.payload, ?) ORDER BY json_extract(e.payload, ?) ASC";
+
+def expected_json_bindings: Array(qb.Val) = [
+    'String("$.attempt_id"), 'String("$.status"), 'String("$.amount"),
+    'String("$.status"), 'String("ok"),
+    'String("$.attempt_id"), 'String("$.attempt_id"),
+];
+
+def json_partition_plan: Fn() -> qb.Plan = fn() {
+    let attempt = qb.json_extract(qb.column("e", "payload"), "$.attempt_id");
+    let plan: qb.Plan = {
+        revision: "verify-json-partition",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(attempt),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "uses"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role"), attempt],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("uses"), qb.asc(attempt)],
+            3,
+        )),
+    };
+    plan
+};
+
+def expected_json_partition_sql = "SELECT __q_0, __q_1, uses FROM (SELECT e.role AS __q_0, json_extract(e.payload, ?) AS __q_1, count(e.id) AS uses, row_number() OVER (PARTITION BY e.role ORDER BY count(e.id) DESC, json_extract(e.payload, ?) ASC) AS __q_rn FROM events AS e GROUP BY e.role, json_extract(e.payload, ?)) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_0 ASC, uses DESC, __q_1 ASC";
+
+def expected_json_partition_bindings: Array(qb.Val) = [
+    'String("$.attempt_id"), 'String("$.attempt_id"),
+    'String("$.attempt_id"), 'Int(3),
+];
+
+# ---------------------------------------------------------------------------
 # JSON codec boundary helpers (Val <-> untagged scalar JSON).
 # ---------------------------------------------------------------------------
 
@@ -608,6 +677,35 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
     };
     let computed_consumes_scalar_ok = !qb.profile_accepts(filtered_aggregate_plan(), no_scalar);
 
+    # SQLite JSON1 v1 checks.
+    let json_validated = qb.validate(json_plan(), full);
+    let q10 = qb.transform_sqlite(json_validated);
+    let json_sql_ok = q10.sql == expected_json_sql;
+    let json_bindings_ok = q10.bindings == expected_json_bindings;
+    let json_path_bound_ok = !string.contains(q10.sql, "$.attempt_id")
+        && string.contains(q10.sql, "json_extract(e.payload, ?)");
+    let json_profile_ok = qb.profile_accepts(json_plan(), full);
+    let json_partition = qb.validate(json_partition_plan(), full);
+    let q11 = qb.transform_sqlite(json_partition);
+    let json_partition_sql_ok = q11.sql == expected_json_partition_sql;
+    let json_partition_bindings_ok = q11.bindings == expected_json_partition_bindings;
+    let json_bad_probe: qb.Plan = {
+        revision: "verify-json-bad-path",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.scalar('JsonExtract, [
+            qb.column("e", "payload"),
+            qb.column("e", "path"),
+        ]))],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let json_nonstring_path_reject_ok = !qb.structure_ok(json_bad_probe);
+
     # JSON codec boundary checks.
     let json_roundtrip_ok = val_roundtrip('Int(3))
         && val_roundtrip('Float(3.5))
@@ -638,6 +736,9 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
         && computed_partition_bindings_ok
         && computed_unknown_reject_ok && computed_cycle_reject_ok
         && filtered_consumes_filter_ok && computed_consumes_scalar_ok
+        && json_sql_ok && json_bindings_ok && json_path_bound_ok
+        && json_profile_ok && json_partition_sql_ok
+        && json_partition_bindings_ok && json_nonstring_path_reject_ok
         && json_roundtrip_ok && json_int_float_dispatch_ok
         && json_scalar_array_ok && json_encoded_bindings_ok;
 
@@ -660,6 +761,8 @@ export def main: Fn(Dict(Value)) -> Value = fn(sources) {
             partition_safety: if partition_tie_break_reject_ok && partition_operators_ok { 'True } else { 'False },
             filtered_computed_lowering: if computed_sql_ok && computed_bindings_ok && computed_ordering_ok { 'True } else { 'False },
             filtered_computed_safety: if computed_profile_ok && computed_partition_sql_ok && computed_partition_bindings_ok && computed_unknown_reject_ok && computed_cycle_reject_ok && filtered_consumes_filter_ok && computed_consumes_scalar_ok { 'True } else { 'False },
+            json_lowering: if json_sql_ok && json_bindings_ok && json_path_bound_ok && json_partition_sql_ok && json_partition_bindings_ok { 'True } else { 'False },
+            json_safety: if json_profile_ok && json_nonstring_path_reject_ok { 'True } else { 'False },
             json_roundtrip: if json_roundtrip_ok { 'True } else { 'False },
             json_int_float_dispatch: if json_int_float_dispatch_ok { 'True } else { 'False },
             json_scalar_array: if json_scalar_array_ok { 'True } else { 'False },

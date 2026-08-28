@@ -83,7 +83,7 @@ def full_profile: Fn() -> qb.PlanProfile = fn() {
         ],
         allowed_join_kinds: ['Inner, 'Left],
         allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
-        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'JsonExtract, 'JsonType, 'JsonValid, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
         allow_distinct: 'True,
     };
     profile
@@ -1572,6 +1572,204 @@ export def computed_aggregate_rejects_missing_scalar_operator = do {
         allow_distinct: 'True,
     };
     !qb.profile_accepts(computed_aggregate_plan(), no_scalar)
+};
+
+# ---------------------------------------------------------------------------
+# SQLite JSON1 v1 (JsonExtract / JsonType / JsonValid).
+#
+# The JSON path is always a literal string Bind, so it enters `?`/bindings and
+# never the SQL text.  Arity is fixed (Extract/Type = 2, Valid = 1); the second
+# argument of Extract/Type must be a string Bind in structural validation.
+# ---------------------------------------------------------------------------
+
+def json_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-json",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "id")),
+            qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.attempt_id")),
+            qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.status")),
+            qb.expr_item(qb.json_type(qb.column("e", "payload"), "$.amount")),
+            qb.expr_item(qb.json_valid(qb.column("e", "payload"))),
+        ],
+        filter: 'Some(qb.scalar('Eq, [
+            qb.json_extract(qb.column("e", "payload"), "$.status"),
+            qb.bind_string("ok"),
+        ])),
+        joins: [],
+        grouping: [qb.json_extract(qb.column("e", "payload"), "$.attempt_id")],
+        ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id"))],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_json_sql = "SELECT e.id, json_extract(e.payload, ?), json_extract(e.payload, ?), json_type(e.payload, ?), json_valid(e.payload) FROM events AS e WHERE json_extract(e.payload, ?) = ? GROUP BY json_extract(e.payload, ?) ORDER BY json_extract(e.payload, ?) ASC";
+
+def expected_json_bindings: Array(qb.Val) = [
+    'String("$.attempt_id"), 'String("$.status"), 'String("$.amount"),
+    'String("$.status"), 'String("ok"),
+    'String("$.attempt_id"), 'String("$.attempt_id"),
+];
+
+def json_partition_plan: Fn() -> qb.Plan = fn() {
+    let attempt = qb.json_extract(qb.column("e", "payload"), "$.attempt_id");
+    let plan: qb.Plan = {
+        revision: "test-json-partition",
+        sources: [qb.source("e", "events")],
+        projection: [
+            qb.expr_item(qb.column("e", "role")),
+            qb.expr_item(attempt),
+            qb.aggregate('Count, qb.column("e", "id"), 'False, "uses"),
+        ],
+        filter: 'None,
+        joins: [],
+        grouping: [qb.column("e", "role"), attempt],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some(qb.partitioned_top_n(
+            [qb.column("e", "role")],
+            [qb.desc_aggregate("uses"), qb.asc(attempt)],
+            3,
+        )),
+    };
+    plan
+};
+
+def expected_json_partition_sql = "SELECT __q_0, __q_1, uses FROM (SELECT e.role AS __q_0, json_extract(e.payload, ?) AS __q_1, count(e.id) AS uses, row_number() OVER (PARTITION BY e.role ORDER BY count(e.id) DESC, json_extract(e.payload, ?) ASC) AS __q_rn FROM events AS e GROUP BY e.role, json_extract(e.payload, ?)) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_0 ASC, uses DESC, __q_1 ASC";
+
+def expected_json_partition_bindings: Array(qb.Val) = [
+    'String("$.attempt_id"), 'String("$.attempt_id"),
+    'String("$.attempt_id"), 'Int(3),
+];
+
+# A minimal plan exposing a single expression, for structural rejection tests.
+def json_probe_plan: Fn(qb.Expr) -> qb.Plan = fn(probe) {
+    let plan: qb.Plan = {
+        revision: "test-json-probe",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(probe)],
+        filter: 'None,
+        joins: [],
+        grouping: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+export def json_lowers_across_projection_filter_grouping_ordering = do {
+    let q = qb.transform_sqlite(json_plan());
+    q.sql == expected_json_sql && q.bindings == expected_json_bindings
+};
+
+export def json_path_stays_in_bindings_not_sql = do {
+    let q = qb.transform_sqlite(json_plan());
+    !string.contains(q.sql, "$.attempt_id")
+        && !string.contains(q.sql, "$.status")
+        && string.contains(q.sql, "json_extract(e.payload, ?)")
+        && q.bindings[0] == 'String("$.attempt_id")
+};
+
+export def json_placeholders_match_bindings = do {
+    let q = qb.transform_sqlite(json_plan());
+    (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def json_partition_ordering_keeps_placeholder_order = do {
+    let q = qb.transform_sqlite(json_partition_plan());
+    q.sql == expected_json_partition_sql
+        && q.bindings == expected_json_partition_bindings
+        && (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def json_deterministic = do {
+    let q1 = qb.transform_sqlite(json_plan());
+    let q2 = qb.transform_sqlite(json_plan());
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+};
+
+export def json_profile_accepts = do {
+    qb.profile_accepts(json_plan(), full_profile())
+};
+
+export def json_rejects_missing_extract_scalar = do {
+    let no_extract: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Filter, 'Group, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['JsonType, 'JsonValid, 'Eq],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(json_plan(), no_extract)
+};
+
+export def json_rejects_missing_type_scalar = do {
+    let no_type: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Filter, 'Group, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['JsonExtract, 'JsonValid, 'Eq],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(json_plan(), no_type)
+};
+
+export def json_rejects_missing_valid_scalar = do {
+    let no_valid: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar, 'Filter, 'Group, 'Order],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['JsonExtract, 'JsonType, 'Eq],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(json_plan(), no_valid)
+};
+
+export def json_rejects_wrong_extract_arity = do {
+    !qb.structure_ok(json_probe_plan(qb.scalar('JsonExtract, [qb.column("e", "payload")])))
+};
+
+export def json_rejects_wrong_type_arity = do {
+    !qb.structure_ok(json_probe_plan(qb.scalar('JsonType, [
+        qb.column("e", "payload"),
+        qb.bind_string("$.a"),
+        qb.bind_string("$.b"),
+    ])))
+};
+
+export def json_rejects_wrong_valid_arity = do {
+    !qb.structure_ok(json_probe_plan(qb.scalar('JsonValid, [
+        qb.column("e", "payload"),
+        qb.bind_string("$.a"),
+    ])))
+};
+
+export def json_rejects_nonstring_path_column = do {
+    !qb.structure_ok(json_probe_plan(qb.scalar('JsonExtract, [
+        qb.column("e", "payload"),
+        qb.column("e", "path"),
+    ])))
+};
+
+export def json_rejects_nonstring_path_int_bind = do {
+    !qb.structure_ok(json_probe_plan(qb.scalar('JsonType, [
+        qb.column("e", "payload"),
+        qb.bind_int(1),
+    ])))
+};
+
+export def json_rejects_expression_path = do {
+    !qb.structure_ok(json_probe_plan(qb.scalar('JsonExtract, [
+        qb.column("e", "payload"),
+        qb.substr([qb.bind_string("$.attempt_id"), qb.bind_int(1), qb.bind_int(9)]),
+    ])))
 };
 
 # ---------------------------------------------------------------------------

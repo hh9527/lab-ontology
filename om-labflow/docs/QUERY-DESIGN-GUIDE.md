@@ -71,6 +71,7 @@
 | 最常关联的路径 Top N | measure `PathCount`，dimension `Path`，ordering `PathCount desc` |
 | 按角色统计关联路径数（join） | measure `PathCount`，dimension `Role`（经 Safe join 到 timeline） |
 | 一轮 reply token | measure `InputTokenSum`/`OutputTokenSum`/`ReasoningTokenSum`，filter `EventType=reply`；合计 = 三者之和 |
+| 每个 attempt 启动的轮数 Top N | measure `EventCount`，dimension `AttemptId`（JSON-backed：`payload_json` 的 `$.attempt_id`），filter `EventType=task_started` |
 | 按时间范围筛选 | dimension `AtTime`，filter `AtTime ge/le <毫秒 epoch>` |
 
 重复 lowering 逐字节稳定：同一个合法请求总是产生完全相同的 SQL 与 bindings。
@@ -143,6 +144,26 @@ TaskStartedCount - TaskCompletedCount` 是计算指标。全局 `AtTime <= cutof
 ordering 或 Top Per Group 分区内排序目标。样例见
 `tests/requests/task-outstanding-by-role.json` 与
 `tests/requests/task-outstanding-top5-by-role.json`。
+
+### JSON-backed 维度（AttemptId / TaskCompletionStatus）
+
+`AttemptId`（`payload_json` 的 `$.attempt_id`）与 `TaskCompletionStatus`
+（`payload_json` 的 `$.status`）是同一物理 JSON 列声明的两个业务维度。动态请求
+只能选择/筛选/排序业务词汇 id，不能提交 path、raw predicate、SQLite 函数名或
+`payload_json` 物理列名（提交这些会作为未知 key / 未知业务 Dimension 原子失败）；
+path 作为 String binding（`?`）进入，绝不进入 SQL 文本。missing path 或 JSON null
+降低为 SQL NULL，v1 不自动 `coalesce`，不伪装成空串。
+
+按这些维度分析时应显式过滤适用事件（例如 `EventType=task_completed`），避免把
+所有 Timeline 行混入可信零/NULL 结果。样例：
+
+- `attempt-rounds.json`：按 AttemptId 统计 task_started 轮数。
+- `task-completion-status-by-role.json`：`task_completed` 下按
+  `TaskCompletionStatus`+`Role` 分组 EventCount（`$.status` 在
+  projection/grouping/ordering 重复出现的绑定顺序精确）。
+- `task-completion-by-attempt.json`：`task_completed` 下同时选择
+  `AttemptId`+`TaskCompletionStatus`+`Role`，证明两个稳定 path 同时进入
+  projection/grouping/ordering bindings。
 
 ### 条件指标与计算指标
 
@@ -222,7 +243,10 @@ predicate，只通过 `FILTER (WHERE ...)` 收窄自身聚合，不与用户全�
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/host-request-net.json
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-by-role.json
 ./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
-./bin/telora -C om-labflow run query --source input=stdin+json:// < om-labflow/tests/requests/task-outstanding-by-role.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/attempt-rounds.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-status-by-role.json
+./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-by-attempt.json
+./bin/telora -C om-labflow run query --source input=stdin+json:// < om-labflow/tests/requests/task-completion-status-by-role.json
 ./bin/telora -C om-labflow run probe
 ./bin/telora -C om-labflow run verify
 ./bin/telora -C om-labflow run invalid --best-effort
@@ -237,12 +261,13 @@ predicate，只通过 `FILTER (WHERE ...)` 收窄自身聚合，不与用户全�
   grain 保持、codec round-trip、dynamic JSON 边界（固定 subject / EventType
   封闭值域）、CommandHead 首词分组与固有 scope、offset 分页、固定 cutoff 的
   多步查询、Host/Task 净额（filtered + computed measures）、Top Per Group
-  （row_number 子查询与绑定顺序）以及 Outstanding 参与分区内排序，并含动态
-  路径端到端。
+  （row_number 子查询与绑定顺序）、Outstanding 参与分区内排序、JSON-backed
+  `AttemptId` 维度（path 只作 binding），并含动态路径端到端。
 - `invalid --best-effort` 演示上述失败语义（非零退出、无 output），包括
   `EventType=not_a_real_event`、显式 `subject`、负 offset、offset 缺排序、
   `CommandHead` scope 冲突、Top Per Group 非法组合（与 limit 组合、非正 take、
-  partition 维度未选择）。
+  partition 维度未选择）、JSON 词汇泄露（物理列名 `payload_json`、raw 函数名、
+  dimension 对象内的 `path` key）。
 - `check @test/query` 是契约测试：成功路径的确定性断言，含 EventType 全部合法
   值、shell action 绑定顺序、缺少 subject 成功与显式 subject 拒绝、CommandHead
   TOP N、分页完整性（`LIMIT ? OFFSET ?` 与绑定收尾）、固定 cutoff 多步查询、

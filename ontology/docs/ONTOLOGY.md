@@ -72,6 +72,7 @@ type QueryRequest = struct {
 | `computed_measure(id, op, left, right)` | 字段 | 以已声明指标为依赖的受限计算指标（`'Add`/`'Sub`） |
 | `dimension(id, authorized, filterable, ops, input_kinds)` | 字段 | 普通维度及其能力 |
 | `computed_dimension(id, authorized, filterable, ops, input_kinds, build)` | 字段 | 从字段表达式构造的计算维度 |
+| `json_dimension(id, authorized, filterable, ops, input_kinds, path)` | 字段 | 把被标注字段的物理 JSON 列按固定 path 声明为业务维度（可组合 fold） |
 | `scope(predicates)` | 字段 | 维度成员的固有行范围（`Array(ScopePredicate)`，可组合 fold） |
 | `entity_source(table, alias)` | 类型 | 实体的数据源和别名 |
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的关系 |
@@ -142,6 +143,35 @@ def head_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
     qb.scalar_if(found, qb.substr([col, qb.bind_int(1), rest]), col)
 };
 ```
+
+### JSON-backed Dimension
+
+`json_dimension` 把被标注字段的物理 JSON 列按固定 `path` 声明为业务 Dimension。
+领域作者在 knowledge 声明时固定 path；动态 `QueryRequest` 只能选择/筛选/排序业务
+Dimension id，不得携带 path、raw predicate、SQLite 函数名或 JSON 表达式。
+
+```telora
+@edsl.entity_source("devices", "d")
+type Device = struct {
+    @edsl.column("attributes_json")
+    @edsl.json_dimension("DeviceChannel", flag_true, flag_true, eq_ops, text_kinds, "$.channel")
+    @edsl.json_dimension("DeviceRetryCount", flag_true, flag_true, eq_ops, int_kinds, "$.retry.count")
+    attributes_json: String,
+    # ...
+};
+```
+
+- path 通过 Query 的公共 `JsonExtract` 构造器成为 String binding（`?`），绝不成为
+  SQL literal 或 identifier；JSON Dimension 复用现有 authorization、filterable、
+  ops、input kinds、enum domain、scope、grain、relation path、grouping、ordering
+  与 Top Per Group 检查。
+- knowledge Profile 必须显式允许所使用的 JSON scalar：缺 `'JsonExtract` 的 Profile
+  在 lowering 时原子失败。
+- 同一 JSON Dimension 在 projection/grouping/filter/order 中重复 lowering 时保持
+  确定性与正确 binding 顺序（顶层 `$.channel` 与嵌套 `$.retry.count` 均可用于授权
+  选择、参数化筛选、分组、稳定排序，并可作为 Top Per Group 的 ordering/tie-breaker）。
+- **SQL NULL 边界**：missing path 与 JSON null 都可能降低为 NULL；v1 不把它们伪装成
+  空字符串，也不承诺自动 `coalesce`。
 
 ### 领域成员的固有 scope
 
@@ -372,11 +402,13 @@ QueryBuilder 的 `Val` 使用 untagged JSON codec，因此 Query 编码后的 bi
 以下情况原子失败：未知 id、授权失败、缺失筛选能力、非法筛选输入、未知枚举值、
 非正 limit、负 offset、缺稳定排序的 offset、互斥的 scope/filter 约束、scope 引用
 非法字段或缺失能力、未请求的排序目标、grain 冲突、不安全或缺失路径、profile
-越界，以及 Top Per Group 与条件/计算指标相关的非法组合：未选择的 partition 维度、
-未请求的 partition 排序目标、非稳定 partition 排序、非正或超上限的 `take`、
-partition 与全局 limit/offset 组合、条件指标 predicate 引用未授权/不可筛选/未知
-枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术。诊断由 Host 机制承载；
-公共 API 不返回 Rejection 或诊断数组。
+越界，以及 Top Per Group、条件/计算指标与 JSON-backed Dimension 相关的非法组合：
+未选择的 partition 维度、未请求的 partition 排序目标、非稳定 partition 排序、
+非正或超上限的 `take`、partition 与全局 limit/offset 组合、条件指标 predicate
+引用未授权/不可筛选/未知枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术、
+Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimension、
+非法 JSON 筛选输入、按未请求 JSON Dimension 排序。诊断由 Host 机制承载；公共 API
+不返回 Rejection 或诊断数组。
 
 公共 Request、Plan、Query 和业务词汇均保持精确具名类型，不使用 `Any`、`Dyn` 或
 进程内 TypeId 作为交换协议。eDSL 只负责知识到 Plan；`transform_sqlite` 是端到端
@@ -398,10 +430,13 @@ partition 与全局 limit/offset 组合、条件指标 predicate 引用未授权
 lowering 确定性、封闭枚举值域、封闭计算表达式（`'If`/`'Instr` 参与
 projection/grouping/ordering）、分页（offset 降低与绑定顺序、确定性）、领域
 scope（声明、合并顺序、参数化）、Top Per Group（每分区 Top 2、computed 维度
-tie-breaker、与全局 limit/offset 不组合）及条件/计算指标（FILTER lowering、
+tie-breaker、与全局 limit/offset 不组合）、条件/计算指标（FILTER lowering、
 依赖投影、计算指标参与普通与分区排序、全局 filter 与固有 predicate 分离、
-非 Timeline 的 Approval 条件计数与 Add/Sub 组合）；`invalid` 展示非法请求不
-发布可信结果的诊断，包括负 offset、缺排序 offset、scope/filter 冲突、partition
-非法组合、计算指标契约破坏（未知依赖、依赖环、跨 grain）与 filtered Measure
-非法 predicate（引用未授权/不可筛选维度、不允许的 operation/input kind、enum
-未知稳定值）。
+非 Timeline 的 Approval 条件计数与 Add/Sub 组合）及 JSON-backed Dimension（顶层
+与嵌套 path 的 projection/grouping/filter/order、path 参与 Top Per Group
+tie-breaker、binding 顺序确定性）；`invalid` 展示非法请求不发布可信结果的诊断，
+包括负 offset、缺排序 offset、scope/filter 冲突、partition 非法组合、计算指标
+契约破坏（未知依赖、依赖环、跨 grain）、filtered Measure 非法 predicate（引用
+未授权/不可筛选维度、不允许的 operation/input kind、enum 未知稳定值）与 JSON
+Dimension 拒绝（Profile 缺 JsonExtract、未授权 JSON Dimension、非法筛选输入、
+未请求排序目标）。

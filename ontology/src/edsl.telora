@@ -100,6 +100,23 @@ type ComputedDimensionDef = struct {
     build: Fn(qb.Expr) -> qb.Expr,
 };
 
+# Member-level: JSON-backed dimension declaration. The annotated field's physical
+# column is the JSON document; the fixed `path` (declared by the domain model
+# author) becomes a String binding through query's JsonExtract. Dynamic requests
+# only see the business Dimension id and never carry the path. Multiple
+# annotations fold by appending.
+@property('Field)
+type JsonDimensionDef = struct { dimensions: Array(JsonDimensionSpec) };
+
+type JsonDimensionSpec = struct {
+    id: String,
+    authorized: Bool,
+    filterable: Bool,
+    ops: Array(FilterOp),
+    input_kinds: Array(FilterInputKind),
+    path: String,
+};
+
 # Member-level: inherent row-range scope of a dimension member. Predicates
 # reference canonical field indexes of the member's own entity; the scope is
 # merged with user filters in deterministic order at lowering time. Dynamic
@@ -359,6 +376,25 @@ def computed_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInpu
         let result: ComputedDimensionDef = { id, authorized, filterable, ops, input_kinds, build };
         result
     }
+};
+
+def json_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind), String) -> Fn(property.FieldPropertyCtx, Option(JsonDimensionDef)) -> JsonDimensionDef = fn(id, authorized, filterable, ops, input_kinds, path) {
+    fn(ctx, previous) {
+        let spec: JsonDimensionSpec = { id, authorized, filterable, ops, input_kinds, path };
+        let all = match previous {
+            'Some(p) => array.push(p.dimensions, spec),
+            'None => [spec],
+        };
+        let result: JsonDimensionDef = { dimensions: all };
+        result
+    }
+};
+
+# Prepared build closure for a JSON dimension: json_extract(column, fixed path).
+# The path is a String capture that query lowers to a `?` binding, never into SQL
+# text or an identifier.
+def json_builder: Fn(String) -> Fn(qb.Expr) -> qb.Expr = fn(path) {
+    fn(col) { qb.json_extract(col, path) }
 };
 
 def entity_source: Fn(String, String) -> Fn(td.TypeDesc, Option(EntitySource)) -> EntitySource = fn(table, alias) {
@@ -644,7 +680,16 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
             'None => [],
         }
     });
-    array.concat([plain, computed])
+    let json = array.flat_map(fields, fn(f) {
+        let d = property.get_field_prop(entity.entity_type, f.index, JsonDimensionDef);
+        match d {
+            'Some(dd) => array.map(dd.dimensions, fn(spec) {
+                dimension_entry(entity.index, f.index, spec.id, 'True, json_builder(spec.path), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], field_scope(entity.entity_type, f.index))
+            }),
+            'None => [],
+        }
+    });
+    array.concat([plain, computed, json])
 };
 
 def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb.Expr) -> qb.Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, scope) {
@@ -1499,6 +1544,7 @@ export {
     ComputedMeasureDef,
     DimensionDef,
     ComputedDimensionDef,
+    JsonDimensionDef,
     EntitySource,
     RelationDef,
     RelationDecl,
@@ -1533,6 +1579,8 @@ export {
     computed_measure,
     dimension,
     computed_dimension,
+    json_dimension,
+    json_builder,
     entity_source,
     relation,
     enum_value,

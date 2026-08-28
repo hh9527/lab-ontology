@@ -332,6 +332,84 @@ def task_outstanding_top_n_bindings: Array(qb.Val) = [
     'Int(cutoff_time), 'Int(5),
 ];
 
+# JSON-backed Dimension：AttemptId 从 payload_json 的固定 path `$.attempt_id`
+# 提取，path 作为 String binding（?）进入，绝不进入 SQL 文本。
+def attempt_rounds_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "AttemptId", subject: "analyst", input: 'None }],
+    filters: [
+        { id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("task_started") },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [{ target: 'Measure("EventCount"), direction: 'Desc }],
+    limit: 'Some(10),
+    offset: 'None,
+    partition: 'None,
+};
+
+def attempt_rounds_sql = "SELECT count(t.id) AS EventCount, json_extract(t.payload_json, ?) FROM timeline AS t WHERE (t.type = ? AND t.at <= ?) GROUP BY json_extract(t.payload_json, ?) ORDER BY count(t.id) DESC LIMIT ?";
+def attempt_rounds_bindings: Array(qb.Val) = [
+    'String("$.attempt_id"), 'String("task_started"), 'Int(cutoff_time),
+    'String("$.attempt_id"), 'Int(10),
+];
+
+# task_completed 下按 TaskCompletionStatus + Role 分组；`$.status` 在
+# projection/grouping/ordering 重复出现，bindings 按占位符真实顺序。
+def completion_status_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "TaskCompletionStatus", subject: "analyst", input: 'None },
+        { id: "Role", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("task_completed") },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [
+        { target: 'Measure("EventCount"), direction: 'Desc },
+        { target: 'Dimension("TaskCompletionStatus"), direction: 'Asc },
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def completion_status_sql = "SELECT count(t.id) AS EventCount, json_extract(t.payload_json, ?), t.role FROM timeline AS t WHERE (t.type = ? AND t.at <= ?) GROUP BY json_extract(t.payload_json, ?), t.role ORDER BY count(t.id) DESC, json_extract(t.payload_json, ?) ASC";
+def completion_status_bindings: Array(qb.Val) = [
+    'String("$.status"), 'String("task_completed"), 'Int(cutoff_time),
+    'String("$.status"), 'String("$.status"),
+];
+
+# task_completed 下同时选择 AttemptId + TaskCompletionStatus + Role：同一
+# document 的两个稳定 path 同时进入 projection/grouping/ordering bindings。
+def completion_by_attempt_request: edsl.QueryRequest = {
+    measures: [{ id: "EventCount", subject: "analyst", input: 'All }],
+    dimensions: [
+        { id: "AttemptId", subject: "analyst", input: 'None },
+        { id: "TaskCompletionStatus", subject: "analyst", input: 'None },
+        { id: "Role", subject: "analyst", input: 'None },
+    ],
+    filters: [
+        { id: "EventType", subject: "analyst", op: 'Eq, input: 'Text("task_completed") },
+        { id: "AtTime", subject: "analyst", op: 'Le, input: 'Int(cutoff_time) },
+    ],
+    ordering: [
+        { target: 'Dimension("TaskCompletionStatus"), direction: 'Asc },
+        { target: 'Dimension("AttemptId"), direction: 'Asc },
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def completion_by_attempt_sql = "SELECT count(t.id) AS EventCount, json_extract(t.payload_json, ?), json_extract(t.payload_json, ?), t.role FROM timeline AS t WHERE (t.type = ? AND t.at <= ?) GROUP BY json_extract(t.payload_json, ?), json_extract(t.payload_json, ?), t.role ORDER BY json_extract(t.payload_json, ?) ASC, json_extract(t.payload_json, ?) ASC";
+def completion_by_attempt_bindings: Array(qb.Val) = [
+    'String("$.attempt_id"), 'String("$.status"),
+    'String("task_completed"), 'Int(cutoff_time),
+    'String("$.attempt_id"), 'String("$.status"),
+    'String("$.status"), 'String("$.attempt_id"),
+];
+
 # ---------------------------------------------------------------------------
 # 测试项
 # ---------------------------------------------------------------------------
@@ -481,6 +559,33 @@ export def test_task_outstanding_partition = do {
     let checked_sql = assert_eq_text.must_ok!(query.sql, task_outstanding_top_n_sql);
     let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, task_outstanding_top_n_bindings);
     let checked_window = assert_sql_contains.must_ok!(query.sql, "row_number() OVER (PARTITION BY");
+    query
+};
+
+# JSON-backed Dimension：AttemptId 作为业务词汇投影/分组/筛选/排序，
+# `$.attempt_id` path 只作为 binding 进入，SQL 文本不含 JSON 表达式。
+export def test_attempt_id_json_dimension = do {
+    let query = facade.build_from_request(payload, attempt_rounds_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, attempt_rounds_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, attempt_rounds_bindings);
+    query
+};
+
+# task_completed 下按 TaskCompletionStatus + Role 分组：`$.status` path 在
+# projection/grouping/ordering 重复出现，bindings 顺序精确锁定。
+export def test_completion_status_by_role = do {
+    let query = facade.build_from_request(payload, completion_status_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, completion_status_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, completion_status_bindings);
+    query
+};
+
+# 同一 document 的两个稳定 path（attempt_id / status）同时进入
+# projection/grouping/ordering bindings，重复表达式保持确定性。
+export def test_completion_by_attempt = do {
+    let query = facade.build_from_request(payload, completion_by_attempt_request);
+    let checked_sql = assert_eq_text.must_ok!(query.sql, completion_by_attempt_sql);
+    let checked_bindings = assert_eq_bindings.must_ok!(query.bindings, completion_by_attempt_bindings);
     query
 };
 
