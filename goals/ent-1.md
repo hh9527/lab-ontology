@@ -75,11 +75,11 @@ Count、Substr、Eq、Ge、Le、And，以及完成筛选、分组、排序和 li
 以下命令通过；`invalid` 按预期产生带来源诊断且不输出部分 Query：
 
 ```bash
-./bin/telora run main -C ent-1
-./bin/telora run verify -C ent-1
-./bin/telora run query-surface -C ent-1
-./bin/telora run invalid -C ent-1 --best-effort
-./bin/telora check @test/logistics -C ent-1
-./bin/telora check @test/query-surface -C ent-1
-./bin/telora query exports @bin/main -C ent-1
+./bin/telora -C ent-1 run main
+./bin/telora -C ent-1 run verify
+./bin/telora -C ent-1 run query-surface
+./bin/telora -C ent-1 run invalid --best-effort
+./bin/telora -C ent-1 check @test/logistics
+./bin/telora -C ent-1 check @test/query-surface
+./bin/telora -C ent-1 query exports @bin/main
 ```

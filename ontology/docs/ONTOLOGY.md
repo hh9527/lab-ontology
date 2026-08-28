@@ -224,11 +224,11 @@ QueryBuilder 的 `Val` 使用 untagged JSON codec，因此 Query 编码后的 bi
 在资产根目录运行：
 
 ```bash
-./bin/telora run main -C ontology
-./bin/telora run verify -C ontology
-./bin/telora run invalid -C ontology --best-effort
-./bin/telora check @test/ontology -C ontology
-./bin/telora query exports @bin/main -C ontology
+./bin/telora -C ontology run main
+./bin/telora -C ontology run verify
+./bin/telora -C ontology run invalid --best-effort
+./bin/telora -C ontology check @test/ontology
+./bin/telora -C ontology query exports @bin/main
 ```
 
 `verify` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复

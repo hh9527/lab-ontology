@@ -937,10 +937,10 @@ Host 从当前目录向上查找最近的 `telora-deps.json`，因此可以在 c
 ambient binding。完整示例：
 
 ```text
-telora run main -C examples/my-crate
-telora serve main -C examples/my-crate --bind stdio://
-telora run-with @src/entry/tool main -C examples/my-crate -- argument
-telora check @test/compiler -C examples/my-crate
+telora -C examples/my-crate run main
+telora -C examples/my-crate serve main --bind stdio://
+telora -C examples/my-crate run-with @src/entry/tool main -- argument
+telora -C examples/my-crate check @test/compiler
 ```
 
 `serve --bind stdio://` 的每行响应包含 `ok`、`error` 和 `diagnostics`。handler 成功或

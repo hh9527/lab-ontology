@@ -40,9 +40,9 @@ Profile、结构验证，以及确定性的 SQLite `Plan -> Query` 转换。Onto
 以下命令通过；`invalid` 按预期以诊断结束且不输出 Query：
 
 ```bash
-./bin/telora run main -C query
-./bin/telora run verify -C query
-./bin/telora run invalid -C query --best-effort
-./bin/telora check @test/query -C query
-./bin/telora query exports @bin/main -C query
+./bin/telora -C query run main
+./bin/telora -C query run verify
+./bin/telora -C query run invalid --best-effort
+./bin/telora -C query check @test/query
+./bin/telora -C query query exports @bin/main
 ```

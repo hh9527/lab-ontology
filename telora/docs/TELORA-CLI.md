@@ -9,21 +9,21 @@ Telora 从当前目录向上查找最近的 `telora-deps.json`，因此命令可
 命令参数使用稳定逻辑模块 ID，不使用物理文件名：
 
 ```text
-telora run main -C examples/my-crate
-telora run main -C examples/my-crate --source request=stdin+json://
-telora serve main -C examples/my-crate --bind stdio://
-telora run verify -C examples/my-crate
-telora check @test/compiler -C examples/my-crate
-telora query modules -C examples/my-crate
-telora query at @bin/main -C examples/my-crate
-telora query at @src/compiler -C examples/my-crate -k type,let,def,import
-telora query exports @src/compiler -C examples/my-crate
-telora query at @src/compiler:12:3 -C examples/my-crate
-telora query exports std/string -C examples/my-crate
-telora query at std/array -C examples/my-crate -p flat_map
+telora -C examples/my-crate run main
+telora -C examples/my-crate run main --source request=stdin+json://
+telora -C examples/my-crate serve main --bind stdio://
+telora -C examples/my-crate run verify
+telora -C examples/my-crate check @test/compiler
+telora -C examples/my-crate query modules
+telora -C examples/my-crate query at @bin/main
+telora -C examples/my-crate query at @src/compiler -k type,let,def,import
+telora -C examples/my-crate query exports @src/compiler
+telora -C examples/my-crate query at @src/compiler:12:3
+telora -C examples/my-crate query exports std/string
+telora -C examples/my-crate query at std/array -p flat_map
 telora run -S path/to/file.telora
-telora run-with @src/entry/tool main -C examples/my-crate -- argument
-telora run invalid -C examples/my-crate --best-effort
+telora -C examples/my-crate run-with @src/entry/tool main -- argument
+telora -C examples/my-crate run invalid --best-effort
 ```
 
 `check` 的输入仍是完整 Module，不是任意表达式 scratch。模块顶层使用 `def` 声明

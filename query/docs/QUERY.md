@@ -258,11 +258,11 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 在资产根目录运行：
 
 ```bash
-./bin/telora run main -C query
-./bin/telora run verify -C query
-./bin/telora run invalid -C query --best-effort
-./bin/telora check @test/query -C query
-./bin/telora query exports @bin/main -C query
+./bin/telora -C query run main
+./bin/telora -C query run verify
+./bin/telora -C query run invalid --best-effort
+./bin/telora -C query check @test/query
+./bin/telora -C query query exports @bin/main
 ```
 
 `verify` 覆盖 profile、结构、规范顺序、Top N、确定性、绑定顺序和 JSON codec；

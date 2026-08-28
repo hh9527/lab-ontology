@@ -42,9 +42,9 @@ Plan、PlanProfile、Query 和标准算子由 `query` crate 提供。Ontology �
 以下命令通过；`invalid` 按预期产生诊断且不发布可信结果：
 
 ```bash
-./bin/telora run main -C ontology
-./bin/telora run verify -C ontology
-./bin/telora run invalid -C ontology --best-effort
-./bin/telora check @test/ontology -C ontology
-./bin/telora query exports @bin/main -C ontology
+./bin/telora -C ontology run main
+./bin/telora -C ontology run verify
+./bin/telora -C ontology run invalid --best-effort
+./bin/telora -C ontology check @test/ontology
+./bin/telora -C ontology query exports @bin/main
 ```
