@@ -190,4 +190,12 @@ attempt id 索引的 history task。它们适合查询“当前状态”，而 `
 
 所有成功路径必须产生确定性的参数化 SQLite Query；测试应覆盖 grain 安全、绑定顺序、
 筛选/排序/Top N、动态 JSON 边界和能力不足时的失败语义。完成时列出并运行实际可用的
-`bin/telora -C om-labflow ...` 验证命令。
+验证命令，至少包括：
+
+```bash
+bin/telora -C om-labflow check @test/query
+bin/telora -C om-labflow eval @src/bin/main:main
+bin/telora -C om-labflow eval @src/bin/verify:main
+bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/failed-command-heads.json
+bin/telora -C om-labflow check @src/bin/invalid  # 应按预期非零并输出诊断
+```
