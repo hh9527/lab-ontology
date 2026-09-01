@@ -12,8 +12,8 @@ labflow query-om -            # 从 stdin 读取 JSON
 Labflow 在内部调用：
 
 ```bash
-"$TELORA_BIN" -C "$OM_LABFLOW_PATH" run query --source input=file.json
-"$TELORA_BIN" -C "$OM_LABFLOW_PATH" run query --source input=stdin+json://
+"$TELORA_BIN" -C "$OM_LABFLOW_PATH" eval-with @src/bin/query:main --source input=file.json
+"$TELORA_BIN" -C "$OM_LABFLOW_PATH" eval-with @src/bin/query:main --source input=stdin+json://
 ```
 
 本资产只负责 `om-labflow` 领域资产；它不读取、修改或管理 Labflow 数据库，也
@@ -40,7 +40,7 @@ mapping 与公共查询面分离，且来自同一个 prepared knowledge root。
 
 ## 业务词汇（v1）
 
-以下 id 是调用者可以使用的封闭词汇。`run probe` 会输出机器可读目录。
+以下 id 是调用者可以使用的封闭词汇。`eval @src/bin/probe:main` 会输出机器可读目录。
 
 ### 实体
 
@@ -109,7 +109,7 @@ mapping 与公共查询面分离，且来自同一个 prepared knowledge root。
 | `Path` | text | 开放 | eq（ActionPath 维度） |
 
 所有维度 v1 均 `authorized` 且 `filterable`。授权主体由 `authorize` 决定
-（v1 固定接受 `analyst`）。dynamic 入口（`run query`）在内部固定 subject 为
+（v1 固定接受 `analyst`）。dynamic 入口（`eval-with @src/bin/query:main`）在内部固定 subject 为
 `analyst`，公共 JSON 不接受也不要求 `subject` key，显式提交的 `subject` 会被
 当作未知 key 拒绝；typed 入口保留 `QueryRequest.subject` 并经过同一 authorize
 检查。
@@ -139,7 +139,7 @@ mapping 与公共查询面分离，且来自同一个 prepared knowledge root。
 ### 计算维度：CommandHead（command 首词）
 
 `CommandHead` 是 `command` 的第一个空白分隔片段（例如把
-`./bin/telora -C query run main` 投影为 `./bin/telora`）。语义只是“首个空白
+`./bin/telora -C query eval @src/bin/main:main` 投影为 `./bin/telora`）。语义只是“首个空白
 分隔片段”，**不是完整 shell lexer**；不做任何归一化，因此 `./bin/telora` 与
 `bin/telora` 保持为不同成员，不会被静默合并。
 

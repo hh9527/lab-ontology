@@ -27,16 +27,16 @@ tests/query.telora    契约测试
 ## 快速开始
 
 ```bash
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/rounds-per-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/failed-command-heads.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/command-heads-page-2.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/per-role-failed-command-heads.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-by-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/attempt-rounds.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-status-by-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-by-attempt.json
-./bin/telora -C om-labflow run verify
-./bin/telora -C om-labflow run invalid --best-effort
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/rounds-per-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/failed-command-heads.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/command-heads-page-2.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/per-role-failed-command-heads.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-outstanding-by-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/attempt-rounds.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-completion-status-by-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-completion-by-attempt.json
+./bin/telora -C om-labflow eval @src/bin/verify:main
+./bin/telora -C om-labflow check @src/bin/invalid
 ./bin/telora -C om-labflow check @test/query
 ```

@@ -6,7 +6,7 @@
 
 ## 动态请求 JSON 契约
 
-`run query` 的 `input` source 是完整 JSON 对象。业务词汇位于 `id` 字段；调用者
+`eval-with @src/bin/query:main` 的 `input` source 是完整 JSON 对象。业务词汇位于 `id` 字段；调用者
 不得提交表名、列名、alias、join、SQL 片段或任意表达式。
 
 ```json
@@ -225,36 +225,36 @@ predicate，只通过 `FILTER (WHERE ...)` 收窄自身聚合，不与用户全�
 - 未授权 subject（仅 typed 入口可触发：dynamic 入口固定为 `analyst`）；
 - 排序目标未在请求中选择。
 
-演示：`bin/telora -C om-labflow run invalid --best-effort`。
+演示：`bin/telora -C om-labflow check @src/bin/invalid`。
 
 ## 验证命令
 
 在仓库根目录运行（或任意子目录，`-C om-labflow` 指定 crate）：
 
 ```bash
-./bin/telora -C om-labflow run main
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/rounds-per-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/action-duration-by-command.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/host-latest-resolved.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/top-paths.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/failed-command-heads.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/command-heads-page-2.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/per-role-failed-command-heads.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/host-request-net.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-by-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/attempt-rounds.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-status-by-role.json
-./bin/telora -C om-labflow run query --source input=om-labflow/tests/requests/task-completion-by-attempt.json
-./bin/telora -C om-labflow run query --source input=stdin+json:// < om-labflow/tests/requests/task-completion-status-by-role.json
-./bin/telora -C om-labflow run probe
-./bin/telora -C om-labflow run verify
-./bin/telora -C om-labflow run invalid --best-effort
+./bin/telora -C om-labflow eval @src/bin/main:main
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/rounds-per-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/action-duration-by-command.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/host-latest-resolved.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/top-paths.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/failed-command-heads.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/command-heads-page-2.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/per-role-failed-command-heads.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/host-request-net.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-outstanding-by-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-outstanding-top5-by-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/attempt-rounds.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-completion-status-by-role.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=om-labflow/tests/requests/task-completion-by-attempt.json
+./bin/telora -C om-labflow eval-with @src/bin/query:main --source input=stdin+json:// < om-labflow/tests/requests/task-completion-status-by-role.json
+./bin/telora -C om-labflow eval @src/bin/probe:main
+./bin/telora -C om-labflow eval @src/bin/verify:main
+./bin/telora -C om-labflow check @src/bin/invalid
 ./bin/telora -C om-labflow check @test/query
 ./bin/telora -C om-labflow check @src/model
 ./bin/telora -C om-labflow check @src/knowledge
 ./bin/telora -C om-labflow check @src/query
-./bin/telora -C om-labflow query exports @bin/query
+./bin/telora -C om-labflow query exports @src/bin/query
 ```
 
 - `verify` 覆盖确定性、SQL 形状、绑定顺序、筛选/分组/Top N、Distinct、join

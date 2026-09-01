@@ -68,18 +68,18 @@ Count、Substr、Eq、Ge、Le、And，以及完成筛选、分组、排序和 li
 - `src/bin/query-surface.telora`：公共查询面的端到端入口。
 - `tests/logistics.telora`、`tests/query-surface.telora`：模型与公共 facade 契约检查。
 - `docs/DOMAIN.md`、`docs/QUERY-DESIGN-GUIDE.md`：业务知识与查询设计指南。
-- `telora-deps.json`：声明对 `ontology` 和 `query` 的依赖。
+- `telora-crate.json`：声明 crate 模块及对 `ontology`、`query` 的依赖。
 
 ## 完成条件
 
 以下命令通过；`invalid` 按预期产生带来源诊断且不输出部分 Query：
 
 ```bash
-./bin/telora -C ent-1 run main
-./bin/telora -C ent-1 run verify
-./bin/telora -C ent-1 run query-surface
-./bin/telora -C ent-1 run invalid --best-effort
+./bin/telora -C ent-1 eval @src/bin/main:main
+./bin/telora -C ent-1 eval @src/bin/verify:main
+./bin/telora -C ent-1 eval @src/bin/query-surface:main
+./bin/telora -C ent-1 check @src/bin/invalid
 ./bin/telora -C ent-1 check @test/logistics
 ./bin/telora -C ent-1 check @test/query-surface
-./bin/telora -C ent-1 query exports @bin/main
+./bin/telora -C ent-1 query exports @src/bin/main
 ```

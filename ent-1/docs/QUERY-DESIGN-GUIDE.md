@@ -173,9 +173,9 @@ N 写入 `limit`。
 当前目录中的可执行验证：
 
 ```bash
-./bin/telora -C ent-1 run query-surface
+./bin/telora -C ent-1 eval @src/bin/query-surface:main
 ./bin/telora -C ent-1 check @test/query-surface
-./bin/telora -C ent-1 run invalid --best-effort
+./bin/telora -C ent-1 check @src/bin/invalid
 ```
 
 `query-surface` 验证 typed/dynamic lowering 等价、确定性、JSON round-trip 和原生标量

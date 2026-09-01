@@ -15,13 +15,7 @@ crate 名，不依赖 `@src` 私有路径。
 ### 值与 Query
 
 ```telora
-@json.untagged
-type Val = enum {
-    'String(String),
-    'Int(Int),
-    'Float(Float),
-    'Bool(Bool),
-};
+import "std/value" { ScalarValue as Val };
 
 type Query = struct {
     sql: String,
@@ -29,7 +23,8 @@ type Query = struct {
 };
 ```
 
-`Val` 是动态绑定值的唯一载体。`Query.sql` 只含合法标识符、算子和 `?`；动态值
+`Val` 是标准 `ScalarValue` 的公开别名，也是动态绑定值的唯一载体；包含 null、string、
+integer、number 和 boolean。`Query.sql` 只含合法标识符、算子和 `?`；动态值
 只进入 `bindings`，并与占位符按出现顺序一一对应。
 
 ### 表达式与聚合
@@ -184,7 +179,7 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | --- | --- |
 | `column` | `Fn(String, String) -> Expr` |
 | `column_ref` | `Fn(String, String) -> ColumnRef` |
-| `bind_val` / `bind_string` / `bind_int` / `bind_float` / `bind_bool` | `Fn(...) -> Expr` |
+| `bind_val` / `bind_string` / `bind_int` / `bind_float` / `bind_bool` / `bind_null` | `Fn(...) -> Expr` |
 | `scalar` | `Fn(ScalarFunction, Array(Expr)) -> Expr` |
 | `substr` | `Fn(Array(Expr)) -> Expr` |
 | `instr` | `Fn(Expr, Expr) -> Expr` |
@@ -585,7 +580,7 @@ Source, Project, Column, Bind, Scalar, Aggregate, Filter, Join, Group, Order, Li
 
 ## JSON codec 边界
 
-`@json.untagged` 只改变 `Val` 的 JSON 表示，Telora 内部仍使用封闭 variant：
+`Val` 直接使用标准库 `ScalarValue` 的 JSON 表示，Telora 内部仍使用封闭 variant：
 
 | Telora `Val` | JSON |
 | --- | --- |
@@ -593,6 +588,7 @@ Source, Project, Column, Bind, Scalar, Aggregate, Filter, Join, Group, Order, Li
 | `'Int(3)` | `3` |
 | `'Float(3.5)` | `3.5` |
 | `'Bool(true)` | `true` |
+| `'None` | `null` |
 
 ```telora
 import "std/codec" as codec;
@@ -637,11 +633,11 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 在资产根目录运行：
 
 ```bash
-./bin/telora -C query run main
-./bin/telora -C query run verify
-./bin/telora -C query run invalid --best-effort
+./bin/telora -C query eval @src/bin/main:main
+./bin/telora -C query eval @src/bin/verify:main
+./bin/telora -C query check @src/bin/invalid
 ./bin/telora -C query check @test/query
-./bin/telora -C query query exports @bin/main
+./bin/telora -C query query exports @src/bin/main
 ```
 
 `verify` 覆盖 profile、结构、规范顺序、Top N、首词分组 lowering、分页

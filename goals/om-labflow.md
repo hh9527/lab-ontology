@@ -18,8 +18,8 @@ labflow query-om -  # 从 stdin 读取 JSON
 Labflow 将在内部调用：
 
 ```bash
-"$TELORA_BIN" -C "$OM_LABFLOW_PATH" run query --source input=file.json
-"$TELORA_BIN" -C "$OM_LABFLOW_PATH" run query --source input=stdin+json://
+"$TELORA_BIN" -C "$OM_LABFLOW_PATH" eval-with @src/bin/query:main --source input=file.json
+"$TELORA_BIN" -C "$OM_LABFLOW_PATH" eval-with @src/bin/query:main --source input=stdin+json://
 ```
 
 这是一个显式可选能力：`TELORA_BIN` 指向 Telora 可执行文件，`OM_LABFLOW_PATH` 指向
@@ -179,7 +179,7 @@ attempt id 索引的 history task。它们适合查询“当前状态”，而 `
 
 交付结构应与 `ent-1` 同等级，至少包括：
 
-- `om-labflow/telora-deps.json`；
+- `om-labflow/telora-crate.json`；
 - `om-labflow/src/model.telora`：私有模型；
 - `om-labflow/src/query.telora`：公共 typed/dynamic query facade（可以复用其他内部模块）；
 - `src/bin/query.telora`：实现上述 `input` Value source 到参数化 Query 的稳定入口；

@@ -16,8 +16,8 @@ Profile、结构验证，以及确定性的 SQLite `Plan -> Query` 转换。Onto
 - `transform_sqlite` 对同一个合法 Plan 生成逐字节相同的 SQL 和相同顺序的 bindings。
 - 所有动态值通过 `Bind(Val)` 进入 `?` 占位符；SQL 文本只承载结构和合法标识符。
 - bindings 顺序与 SQL 中占位符的出现顺序严格一致。
-- `Val` 在 Telora 内保持封闭名义 enum，在 JSON codec 边界编码为原生 string、integer、
-  number 和 boolean。
+- `Val` re-export `std/value.ScalarValue`，在 JSON codec 边界编码为原生 null、string、
+  integer、number 和 boolean。
 - 非法 Plan、Profile 越界和无法具体化的 Plan 通过带外诊断失败，不发布部分 Query。
 
 ## 范围
@@ -33,16 +33,16 @@ Profile、结构验证，以及确定性的 SQLite `Plan -> Query` 转换。Onto
 - `src/bin/invalid.telora`：非法 Plan 的带外诊断演示。
 - `tests/query.telora`：公共契约检查。
 - `docs/QUERY.md`：可独立使用的公共契约与指南。
-- `telora-deps.json`：canonical crate name 为 `query`。
+- `telora-crate.json`：声明 canonical crate name、模块清单和依赖。
 
 ## 完成条件
 
 以下命令通过；`invalid` 按预期以诊断结束且不输出 Query：
 
 ```bash
-./bin/telora -C query run main
-./bin/telora -C query run verify
-./bin/telora -C query run invalid --best-effort
+./bin/telora -C query eval @src/bin/main:main
+./bin/telora -C query eval @src/bin/verify:main
+./bin/telora -C query check @src/bin/invalid
 ./bin/telora -C query check @test/query
-./bin/telora -C query query exports @bin/main
+./bin/telora -C query query exports @src/bin/main
 ```

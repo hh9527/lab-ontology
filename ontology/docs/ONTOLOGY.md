@@ -419,11 +419,11 @@ Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimen
 在资产根目录运行：
 
 ```bash
-./bin/telora -C ontology run main
-./bin/telora -C ontology run verify
-./bin/telora -C ontology run invalid --best-effort
+./bin/telora -C ontology eval @src/bin/main:main
+./bin/telora -C ontology eval @src/bin/verify:main
+./bin/telora -C ontology check @src/bin/invalid
 ./bin/telora -C ontology check @test/ontology
-./bin/telora -C ontology query exports @bin/main
+./bin/telora -C ontology query exports @src/bin/main
 ```
 
 `verify` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复

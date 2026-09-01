@@ -35,16 +35,16 @@ Plan、PlanProfile、Query 和标准算子由 `query` crate 提供。Ontology �
 - `src/bin/invalid.telora`：非法知识或请求的带外诊断演示。
 - `tests/ontology.telora`：公共契约检查。
 - `docs/ONTOLOGY.md`：企业知识作者可独立使用的公共契约与指南。
-- `telora-deps.json`：声明对 `query` 的依赖。
+- `telora-crate.json`：声明 crate 模块及对 `query` 的依赖。
 
 ## 完成条件
 
 以下命令通过；`invalid` 按预期产生诊断且不发布可信结果：
 
 ```bash
-./bin/telora -C ontology run main
-./bin/telora -C ontology run verify
-./bin/telora -C ontology run invalid --best-effort
+./bin/telora -C ontology eval @src/bin/main:main
+./bin/telora -C ontology eval @src/bin/verify:main
+./bin/telora -C ontology check @src/bin/invalid
 ./bin/telora -C ontology check @test/ontology
-./bin/telora -C ontology query exports @bin/main
+./bin/telora -C ontology query exports @src/bin/main
 ```
