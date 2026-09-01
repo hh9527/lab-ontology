@@ -4,37 +4,57 @@
 公开语言表面。完整语义以 [`../docs/design/LANGUAGE.md`](../docs/design/LANGUAGE.md)
 为准；本文没有说明的行为不能据此推断为存在。
 
+本文把嵌入 Telora、准备外部输入、执行 Entry 效果并呈现诊断的 CLI 或运行时适配器
+称为运行时宿主（Host）。
+
 Telora 是一门确定、纯、面向表达式的语言，用于把意图编译为不可变计划。
 值不可变，模块显式声明，TypeMetadata 是普通数据，并由执行程序代码的同一个
 VM 求值。
 
-最小 crate 由 `telora-deps.json` 和入口模块组成：
+最小 workspace 由 workspace 配置、crate manifest、lock 和入口模块组成：
 
 ```text
 hello/
-  telora-deps.json
-  src/bin/main.telora
+  telora-config.json
+  telora-crate.json
+  telora-lock.json
+  src/app.telora
 ```
 
 ```json
-{"name":"hello","dependencies":{}}
+{"version":1,"members":["."]}
+```
+
+```json
+{"name":"hello","modules":["@src/app"],"dependencies":[]}
 ```
 
 ```telora
-# src/bin/main.telora；# 引入行注释
-import "std/value" {Value};
+# src/app.telora；# 引入行注释
+import "std/actor" as actor;
+import "std/ees" as ees;
+import "std/entry" as entry;
 
-export def main: Fn(Dict(Value)) -> Value = fn(sources) {
-    'String("hello, telora")
-};
+type State = struct {};
+def config: entry.ContextConfig = {sources: [], envs: [], args: 'False};
+export def run = entry.run(config, ees.none, fn(ctx) {
+    let reduce: Fn(State, actor.Event) -> actor.Transition(State) = fn(state, event) {
+        match event {
+            'Request(request) => (state, [actor.reply(request.id, 'String("hello, telora"))]),
+            'EesReply(_) => fail!("unexpected EES reply"),
+        }
+    };
+    ({}, reduce)
+});
 ```
 
 在 crate 目录运行：
 
 ```bash
-telora check @bin/main
-telora run main
-telora query exports @bin/main
+telora lock
+telora check @src/app
+telora run @src/app:run
+telora query exports @src/app
 ```
 
 `check` 检查并求值模块导出，`run` 通过 Entry 调度入口，`query` 以 JSONL 查询
@@ -365,6 +385,9 @@ type Value = enum {
 };
 ```
 
+`std/value.ScalarValue` 是带 untagged codec 的标量子集，包含 null、Bool、Int、Float 和
+String。参数化查询用它表达 bindings，codec 会直接产生对应的 JSON scalar。
+
 `std/json` 负责 JSON 文本和 schema，`std/codec` 在 Value 与有类型值之间转换：
 
 ```telora
@@ -512,8 +535,8 @@ Property payload 是普通有类型值，也可以包含普通 closure。closure
 完整捕获图。适合把 TypeDesc/member property 的一次性解释结果准备为运行期 closure；
 不要在每次业务调用中重新枚举 metadata 或 property registry。
 
-JSON/TOML/YAML 文件也可以作为静态数据模块 import。它们在封闭模块图建立时由
-Host 加载，不是运行时文件 IO，并且只导出 `data: Value`：
+JSON/TOML/YAML 文件也可以作为静态数据模块 import。它们在封闭模块图建立时加载，
+不是程序执行期间的文件 IO，并且只导出 `data: Value`：
 
 ```telora
 import "./request.json" { data as request };
@@ -549,7 +572,7 @@ contextual intrinsic 糖：`value.dbg!("message")` 等价于
 
 ## 当前实现限制与缓解方法
 
-本节描述当前实现中已经通过测试和实验确认的边界。遇到这些边界时，应使用给出的
+本节描述当前实现中已经由源码和测试确认的边界。遇到这些边界时，应使用给出的
 有类型写法，不要用 `Any`、`Dyn` 或 String 标识绕过。
 
 ### 多元素能力目录的类型推断
@@ -786,7 +809,7 @@ payload 在复制前预扣，最终输出在分配前按共享节点 memoize 测
 fragment 仍按每次展开的长度核算，但拒绝路径不会实际展开指数大小的结果。这套机制
 是静态 dictionary elaboration，不会把模板转换成 Telora 源码。
 
-`dbg!` 的 `repr` 是 Host-only、有界且 cycle-safe 的观察文本，不进入 Telora String；
+`dbg!` 的 `repr` 是运行时专用、有界且 cycle-safe 的观察文本，不进入 Telora String；
 codec/JSON 是数据交换协议，也不是展示 API。Float 的 debug repr 会保留 `3.0` 和
 `-0.0`，有意不同于插值及 `fmt.render` 的 `3` 和 `-0`。
 
@@ -855,7 +878,7 @@ def make_plan: Fn(Model, Request) -> Plan = fn(model, request) {
 ```
 
 普通 Telora 调用者不接收或处理诊断对象。它只表达值依赖、成功结果和失败位置；
-求值器与 Host 依据这些依赖保留来源、跳过失败值的依赖计算，并尽力继续彼此独立的
+求值器与运行时适配器依据这些依赖保留来源、跳过失败值的依赖计算，并尽力继续彼此独立的
 工作。最终结果仍然原子发布：不能产生完整 `T` 时，不发布部分 `T`。
 
 best-effort 求值在复合值内部也按数据依赖推进。`array.map` 会保留失败槽位、跳过它
@@ -869,9 +892,9 @@ Array/Tuple/Dict/tagged 构造、`map`、`enumerate`、`push` 和 `zip` 等保�
 失败子节点，以便继续健康成员。`any` 的健康 True 和 `all` 的健康 False 可以确定性短路；
 `find` 若在候选成员之前已有失败 predicate，则成员身份不确定并传播 Fail。
 这些失败槽位不是语言值或额外 variant，源码不能匹配或恢复。可达性只决定还可继续
-哪些诊断计算；只要出现任何 error，本轮命令的最终 Host 结果就整体失去意义，即使干净的
-最终根仍可算出，codec、最终返回值和 SystemEffect 也不会越过 Host 边界。Module 在
-WorkWorld/MainWorld 间的内部固化不是 Host 发布，可以保留 Fail。需要业务恢复时仍显式使用
+哪些诊断计算；只要出现任何 error，本轮命令就不会发布结果，即使干净的最终根仍可算出，
+codec、最终返回值和 SystemEffect 也不会越过运行时发布边界。Module 在
+WorkWorld/MainWorld 间的内部固化不是对外发布，可以保留 Fail。需要业务恢复时仍显式使用
 `Option`、`Result` 或领域 enum。
 
 依赖库失败时仍是普通 Module。Module 的 `Available/Unavailable` 只表达源码是否存在；
@@ -879,7 +902,7 @@ WorkWorld/MainWorld 间的内部固化不是 Host 发布，可以保留 Fail。�
 健康 export 和含 Fail 的 export：下游读取健康项可继续工作，读取失败项则传播同一个 Fail。
 没有 `PartialModule`/`UntrustedModule` 语言实体，也不会把原始 error 降级。
 
-不要仅仅为了向 Host 报告诊断，就把 `Fn(Input) -> Output` 改成公开的
+不要仅仅为了让运行时报告诊断，就把 `Fn(Input) -> Output` 改成公开的
 `Fn(Input) -> Outcome(Output, Rejection)`，也不要在 eDSL 中复制一套
 `BlameError`、诊断数组或发布状态机。只有 Telora 调用者本身确实需要恢复、分支或
 组合失败时，才把失败建模为 `Option`、`Result` 或领域 enum。`panic!` 仍只表示实现
@@ -900,7 +923,7 @@ export def compile: Fn(Input) -> Output = fn(input) { ... };
 export { Entity, Requirement, compile };
 ```
 
-import 是静态的。模块顶层是声明空间，只接受 option、import、type、decl、def、
+import 是静态的。模块顶层是声明空间，只接受 import、type、trait、impl、decl、def、
 native 和 export；普通模块值也使用 `def`。`let` 只用于函数或 `do` 等普通 block
 中的顺序计算和局部 shadow。顶层 `let`、`export let`、裸表达式和 final expression
 都不合法。模块只暴露显式 export。库必须导出向调用者承诺的每个类型和函数。
@@ -910,11 +933,11 @@ fallback。`validate` 等 prelude 名不是保留字，本地 binding 可以正�
 仍需访问内建项时使用显式别名，例如
 `import "std/prelude" { validate as builtin_validate };`。
 
-`src/bin/` 下的入口由 Host 以 `@bin/...` 选择；
-`tests/` 下的入口以 `@test/...` 选择。从这些入口导入可复用代码时，应使用显式源码根路径：
+`src/` 下的文件由 crate module 清单发布；`tests/` 下的入口由 Host 以 `@test/...`
+选择。模块既可以使用显式源码根路径，也可以使用相对路径：
 
 ```telora
-# src/bin/main.telora
+# src/app.telora
 import "@src/compiler" { compile };
 ```
 
@@ -922,55 +945,51 @@ import "@src/compiler" { compile };
 
 ```text
 @src/model       -> <crate>/src/model.telora
-@bin/main        -> <crate>/src/bin/main.telora
 @test/compiler   -> <crate>/tests/compiler.telora
 plan-lib/types     -> <plan-lib>/src/types.telora
 ```
 
-Host 从当前目录向上查找最近的 `telora-deps.json`，因此可以在 crate 根目录或其任意
-子目录运行命令。`run main` 选择 `@bin/main`；binary name 是不含路径分隔符和
-`.telora` 后缀的单个 stem。`@main` 不是模块 ID。`run main` 完全等价于
-`run-with std/entry/default main`；默认 Entry 调用 Main 的
-`main: Fn(Dict(Value)) -> Value`，并把结果编码为 JSON。自定义 Entry 位于
-`src/entry/<name>.telora`，并通过 `run-with @src/entry/<name>` 显式选择；普通模块不能
-导入它。环境与输入由 Entry 显式传给 Main，不形成
-ambient binding。完整示例：
+CLI 从当前目录向上查找最近的 `telora-config.json`，因此可以在 workspace 内运行
+命令。`run @src/app:run` 选择普通模块的 `run` export；该值必须是
+`entry.Run(State)`。工具解开 wrapper、初始化具体 State、投递一个 Request，并把 Reply
+中的 Value 编码为 JSON。环境与输入由 `entry.ContextConfig` 显式声明，不形成 ambient
+binding。
+
+普通 module 的纯结果使用 `telora eval module:name`；带显式 source、环境变量
+白名单和字符串参数的纯函数使用 `eval-with`。两者都要求返回 `Value`，并且不创建 Entry
+或 effect loop。完整示例：
 
 ```text
-telora -C examples/my-crate run main
-telora -C examples/my-crate serve main --bind stdio://
-telora -C examples/my-crate run-with @src/entry/tool main -- argument
+telora -C examples/my-crate run @src/app:run
+telora -C examples/my-crate serve @src/app:serve --bind stdio://
+telora -C examples/my-crate eval @src/model:answer
 telora -C examples/my-crate check @test/compiler
 ```
 
-`serve --bind stdio://` 的每行响应包含 `ok`、`error` 和 `diagnostics`。handler 成功或
+`serve --bind stdio://` 的每行响应包含 `ok`、`error` 和 `diagnostics`。请求成功或
 产生可恢复诊断后服务均继续运行；当前响应中的诊断项稳定公开 `message`。初始化失败、
-协议失败和资源类 terminal failure 仍由 Host 带外报告。
+协议失败和资源类 terminal failure 仍由运行时适配器带外报告。
 
 `check` 用统一 Module 管线的 best-effort 策略求值所选模块；任何 error 都会非零退出，
 但内部图仍可保留以查询健康事实。它不进行 Entry 调度，也不会调用已经
-导出的函数，因此不等价于应用行为验收。成功路径必须由普通 `run` 严格执行；遇到
-失败时可以用 `run --best-effort` 扩大诊断覆盖，并检查非零退出、Host 诊断和无
+导出的函数，因此不等价于行为验收。纯导出由 `eval` / `eval-with` 验收，应用 service
+由普通 `run` 严格执行；遇到
+失败时可以用 `run --best-effort` 扩大诊断覆盖，并检查非零退出、CLI 诊断和无
 output。不能仅以 `check` 成功作为行为证据。
 
-在 binary/test 入口中，`./compiler` 以及其他 `./` 或 `../` import 非法。
-在 `src/` 下的模块中，相对 import 仍然合法，并从导入模块的逻辑目录解析。
-`@src/` 始终从导入模块所属 crate 的源码根解析。`plan-lib/types`
-等 package 路径选择由 crate manifest 固定的依赖；`std/...` 选择 Telora 内置模块。
-resolver 在模块图发现前按 crate 粒度建立 first-win 清单：builtin crates 在先，当前
-crate 和 manifest dependencies 随后；已登记的 crate name 及 source 指向不再改变。
+在 test 入口中，`./compiler` 以及其他 `./` 或 `../` import 非法。
+在 `src/` 下的模块中，相对 import 合法，并从导入模块的逻辑目录解析。
+`@src/` 始终从导入模块所属 crate 的源码根解析。`plan-lib/types` 等 package 路径只能
+选择当前 crate manifest 声明的直接依赖；`std/...` 选择 Telora 内置模块。CLI 在模块图
+发现前依据 config 与 lock 准备完整的 crate-name 到物理 root 映射；resolver 随后按
+crate 粒度建立清单，builtin crates 在先，当前 crate 和直接 dependencies 随后。已登记的
+crate name 及 source 指向不再改变。
 依赖只公开自身的普通 `src/` 模块。
-
-单文件探索使用 `telora run -S path/to/file.telora`。该模式不查找
-`telora-deps.json`，即使文件祖先目录中存在 manifest。canonical owner 默认为
-`standalone`；根文件可用 `option "crate.name" "..."` 显式覆盖，并可声明相对根文件
-所在目录解析的 `crate.dependency`。普通 crate 模块不能声明这些 resolver options，
-被 standalone 根导入的模块也不能再次声明它们。
 
 ## 递归与有界工作
 
 Telora 支持带显式契约的递归函数。调用和 back-edge 消耗 fuel；分配也受配额
-限制。算法必须暴露其契约要求的任何语义深度界限，而不能依赖 Host fuel
+限制。算法必须暴露其契约要求的任何语义深度界限，而不能依赖运行时 fuel
 最终耗尽来终止。
 
 ## 编程建议
@@ -978,6 +997,7 @@ Telora 支持带显式契约的递归函数。调用和 back-edge 消耗 fuel；
 - 通过 selector 和回调保留精确的泛型类型。
 - 嵌套回调约束不足时，优先使用带显式契约的小型具名辅助函数。
 - 应用事实和物理映射留在可复用方法库之外。
-- 不得添加 Host 函数、native 声明、`Any` 或 `Dyn` 来绕过困难的泛型关系。
+- 不得添加外部函数、native 声明、`Any` 或 `Dyn` 来绕过困难的泛型关系。
 - 优先让类型表达静态约束；动态失败使用 `fail!` 并携带原始证据。
-- 以严格 `run` 作为最终验收；失败排查时再使用 `--best-effort` 扩大诊断覆盖。
+- 纯导出使用 `eval` / `eval-with` 验收，应用 service 使用严格 `run` 验收；失败排查时
+  再使用 `--best-effort` 扩大诊断覆盖。
