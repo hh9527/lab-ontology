@@ -6,11 +6,11 @@
 
 ```telora
 import "@src/edsl" as edsl;
-import "query/lib" as qb;
+import "@src/query" as qb;
 ```
 
-外部 crate 通过其 manifest 中的依赖名导入 `query/lib`。`@src/edsl` 是
-ontology crate 对领域模型作者提供的源码模块；示例知识位于 `@src/knowledge`。
+外部 crate 通过 `ontology/edsl` 和 `ontology/query` 导入公共模块。`@src/edsl`
+是 ontology crate 内部使用的路径；示例知识位于 `@src/knowledge`。
 
 ## 公共请求类型
 
@@ -655,14 +655,10 @@ Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimen
 在资产根目录运行：
 
 ```bash
-./bin/telora -C ontology eval @src/bin/main:main
-./bin/telora -C ontology eval @src/bin/verify:main
-./bin/telora -C ontology check @src/bin/invalid
 ./bin/telora -C ontology check @test/ontology
-./bin/telora -C ontology query exports @src/bin/main
 ```
 
-`verify` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复
+`tests/ontology.telora` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复
 lowering 确定性、封闭枚举值域、封闭计算表达式（`'If`/`'Instr` 参与
 projection/grouping/ordering）、分页（offset 降低与绑定顺序、确定性）、领域
 scope（声明、合并顺序、参数化）、Top Per Group（每分区 Top 2、computed 维度
@@ -670,12 +666,12 @@ tie-breaker、与全局 limit/offset 不组合）、条件/计算指标（FILTER
 依赖投影、计算指标参与普通与分区排序、全局 filter 与固有 predicate 分离、
 非 Timeline 的 Approval 条件计数与 Add/Sub 组合）及 JSON-backed Dimension（顶层
 与嵌套 path 的 projection/grouping/filter/order、path 参与 Top Per Group
-tie-breaker、binding 顺序确定性）；`invalid` 展示非法请求不发布可信结果的诊断，
+tie-breaker、binding 顺序确定性），并验证非法请求不发布可信结果，
 包括负 offset、缺排序 offset、scope/filter 冲突、partition 非法组合、计算指标
 契约破坏（未知依赖、依赖环、跨 grain）、filtered Measure 非法 predicate（引用
 未授权/不可筛选维度、不允许的 operation/input kind、enum 未知稳定值）与 JSON
 Dimension 拒绝（Profile 缺 JsonExtract、未授权 JSON Dimension、非法筛选输入、
-未请求排序目标）。`verify` 与 `tests/ontology` 还覆盖下一轮能力：measureless
+未请求排序目标）。测试还覆盖下一轮能力：measureless
 行级投影（无虚构 COUNT、无 grouping、跨安全 join 列表、contains 参数化绑定）、
 文本筛选算子（starts-with/contains/not-contains/ends-with 的封闭 lowering 与
 binding 顺序）、HAVING（阈值绑定、需已选 measure）、EXISTS（fan-out 必需实体改为

@@ -1,8 +1,10 @@
 # Query 目标
 
-`query` 是领域无关的结构化查询基础 crate。它定义稳定的 Plan vocabulary、能力
-Profile、结构验证，以及确定性的 SQLite `Plan -> Query` 转换。Ontology 和具体企业
-模型只通过 `query/src/lib.telora` 的公共类型与函数使用本 crate。
+`ontology/src/query.telora` 是统一 `ontology` crate 中领域无关的结构化查询基础模块。
+它定义稳定的 Plan vocabulary、能力 Profile、结构验证，以及确定性的 SQLite
+`Plan -> Query` 转换。Ontology eDSL 和具体企业模型只通过该公共模块使用 Query 能力。
+crate 内部通过 `@src/query` 导入，外部依赖者通过 `ontology/query` 导入；不保留旧的
+`query/lib` 包名或兼容入口。
 
 ## 功能要求
 
@@ -22,27 +24,20 @@ Profile、结构验证，以及确定性的 SQLite `Plan -> Query` 转换。Onto
 
 ## 范围
 
-本 crate 只包含通用查询结构和 SQLite 具体化，不包含 ontology、企业实体、指标、
+本阶段只实现通用查询结构和 SQLite 具体化，不包含 ontology、企业实体、指标、
 维度、业务题面或领域 lowering。当前后端范围是 SQLite；公共边界保持精确类型。
 
 ## 交付物
 
-- `src/lib.telora`：公共类型、构造函数、验证和 SQLite 转换。
-- `src/bin/main.telora`：合法 Plan 到参数化 Query 的最小演示。
-- `src/bin/verify.telora`：能力覆盖、规范顺序、Top N、确定性和 JSON codec 验证。
-- `src/bin/invalid.telora`：非法 Plan 的带外诊断演示。
-- `tests/query.telora`：公共契约检查。
-- `docs/QUERY.md`：可独立使用的公共契约与指南。
-- `telora-crate.json`：声明 canonical crate name、模块清单和依赖。
+- `ontology/src/query.telora`：公共类型、构造函数、验证和 SQLite 转换。
+- `ontology/docs/QUERY.md`：可独立使用的公共契约与指南。
+- `ontology/tests/query.telora`：结构、能力、SQL、bindings、确定性和 codec 契约测试。
 
 ## 完成条件
 
-以下命令通过；`invalid` 按预期以诊断结束且不输出 Query：
+以下命令通过：
 
 ```bash
-./bin/telora -C query eval @src/bin/main:main
-./bin/telora -C query eval @src/bin/verify:main
-./bin/telora -C query check @src/bin/invalid
-./bin/telora -C query check @test/query
-./bin/telora -C query query exports @src/bin/main
+./bin/telora -C ontology check @src/query
+./bin/telora -C ontology check @test/query
 ```

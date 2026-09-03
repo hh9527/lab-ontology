@@ -2,7 +2,7 @@
 
 `ontology` 是领域无关的 EnterpriseKnowledge eDSL。它让企业作者通过 nominal entity
 types 和 type/member/variant properties 声明知识，一次性准备知识图，并把有类型
-`QueryRequest` 确定性地 lowering 为 `query` crate 的标准 Plan。
+`QueryRequest` 确定性地 lowering 为同一 crate 中 `query` 模块的标准 Plan。
 
 ## 功能要求
 
@@ -22,29 +22,24 @@ types 和 type/member/variant properties 声明知识，一次性准备知识图
 
 ## 边界
 
-Plan、PlanProfile、Query 和标准算子由 `query` crate 提供。Ontology 保持领域无关，
+Plan、PlanProfile、Query 和标准算子由同一 crate 的 `query` 模块提供。Ontology 保持领域无关，
 不包含物流实体、企业表列、具体指标或业务题面，也不把 SQLite 细节写入 Plan 语义。
 公共 API 使用精确具名类型，业务 vocabulary 使用稳定 String id 作为交换身份。
+crate 内部使用 `@src/query`，外部依赖者使用 `ontology/query`；所有旧 `query/lib`
+引用都应迁移，不提供兼容包。
 
 ## 交付物
 
 - `src/edsl.telora`：property providers、prepared knowledge 和 Request lowering。
 - `src/knowledge.telora`：小型、领域中性的完整建模示例。
-- `src/bin/main.telora`：包含筛选、排序和 Top N 的端到端演示。
-- `src/bin/verify.telora`：property、关系、筛选、排序、Top N、枚举值域和确定性验证。
-- `src/bin/invalid.telora`：非法知识或请求的带外诊断演示。
-- `tests/ontology.telora`：公共契约检查。
+- `tests/ontology.telora`：property、关系、筛选、排序、Top N、枚举值域、失败路径和确定性契约测试。
 - `docs/ONTOLOGY.md`：企业知识作者可独立使用的公共契约与指南。
-- `telora-crate.json`：声明 crate 模块及对 `query` 的依赖。
+- `telora-crate.json`：声明统一 crate 的 Query 与 Ontology 模块。
 
 ## 完成条件
 
-以下命令通过；`invalid` 按预期产生诊断且不发布可信结果：
+以下命令通过：
 
 ```bash
-./bin/telora -C ontology eval @src/bin/main:main
-./bin/telora -C ontology eval @src/bin/verify:main
-./bin/telora -C ontology check @src/bin/invalid
 ./bin/telora -C ontology check @test/ontology
-./bin/telora -C ontology query exports @src/bin/main
 ```

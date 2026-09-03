@@ -1,10 +1,10 @@
 # QueryBuilder
 
-本文档是 `query` crate 的使用指南与公共契约。QueryBuilder 接收结构化、
+本文档是 `ontology/query` 模块的使用指南与公共契约。QueryBuilder 接收结构化、
 后端无关的 `Plan`，验证其结构和能力范围，并确定性地生成参数化 SQLite `Query`。
 
 ```telora
-import "query/lib" as qb;
+import "ontology/query" as qb;
 ```
 
 crate 内部可使用 `import "@src/lib" as qb;`。外部依赖者只使用 manifest 中的
@@ -1109,14 +1109,11 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 在资产根目录运行：
 
 ```bash
-./bin/telora -C query eval @src/bin/main:main
-./bin/telora -C query eval @src/bin/verify:main
-./bin/telora -C query check @src/bin/invalid
-./bin/telora -C query check @test/query
-./bin/telora -C query query exports @src/bin/main
+./bin/telora -C ontology check @src/query
+./bin/telora -C ontology check @test/query
 ```
 
-`verify` 覆盖 profile、结构、规范顺序、Top N、首词分组 lowering、分页
+`tests/query.telora` 覆盖 profile、结构、规范顺序、Top N、首词分组 lowering、分页
 （SQL/bindings/offset 安全约束）、分组内 Top N（row_number 子查询、bindings、
 profile、tie-breaker 拒绝）、filtered/computed aggregates（FILTER lowering、计算
 聚合 arithmetic、computed 参与 ordering、computed 与分组 Top N 组合、未知操作数与
@@ -1127,10 +1124,10 @@ ordering 的 path binding 顺序、path 不进入 SQL 文本、profile 覆盖）
 HAVING 的组计数、相关聚合 EXISTS 的 group/having 与 base-grain 保持）、派生
 UNION ALL 关系（多来源合并为具名 source，外层分组/聚合/分区 Top 1 完整 SQL 形状、
 参数分支与 HAVING/过滤的固定 binding 顺序与确定性、profile 递归与非法结构拒绝）、
-多关系组合的确定性 SQL/bindings 顺序、JSON codec；`invalid` 验证 JSON path、HAVING
+多关系组合的确定性 SQL/bindings 顺序、JSON codec，并验证 JSON path、HAVING
 measure、EXISTS 相关引用、空 Join 条件、count_groups 内层未知列、相关聚合 EXISTS
 内层未知 grouping、派生 UNION 列集不一致/外层引用未投影列等非法 Plan 只产生诊断。
-`tests/query.telora` 覆盖相同契约的逐项断言，包括
+测试还包含相同契约的逐项断言，包括
 `'Instr`/`'If`/`'Add`/`'Sub`/`'Lower`/`'Length` arity 拒绝、offset 缺 ordering
 拒绝、负 offset 拒绝、分组 Top N 的成功与拒绝场景、filtered/computed aggregates
 的成功与拒绝场景、HAVING 的成功与拒绝（未投影 measure）场景、EXISTS 的成功与各类
