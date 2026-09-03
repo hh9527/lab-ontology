@@ -7,7 +7,7 @@
 import "ontology/query" as qb;
 ```
 
-crate 内部可使用 `import "@src/lib" as qb;`。外部依赖者只使用 manifest 中的
+crate 内部可使用 `import "@src/query" as qb;`。外部依赖者只使用 manifest 中的
 crate 名，不依赖 `@src` 私有路径。
 
 ## 公共类型

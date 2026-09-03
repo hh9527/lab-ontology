@@ -104,10 +104,125 @@ def select_payload: Fn(Intent) -> edsl.PreparedPayload = fn(intent) {
     }
 };
 
+# ---------------------------------------------------------------------------
+# Alarm-anchored requests and site/tenant governance dimensions.
+#
+# The alarm table references devices of several domains through one MEDN key.
+# Routing an alarm-anchored request to the governance (site/tenant) object
+# would have to map every alarm to exactly one device domain; the knowledge
+# layer resolves the join deterministically to a single device table, which
+# silently narrows the object domain and misanswers alarms of other domains.
+#
+# Policy (deterministic, no silent narrowing):
+#   - when the base object is the alarm entity and the request references a
+#     governance dimension (SiteName/SiteId/TenantName/TenantId/TenantIndustry),
+#     the request must carry an explicit device anchor whose dimensions belong
+#     to exactly one device domain that the governance route may use; v1 allows
+#     the network-device domain only (the deterministic route).  Requests with
+#     no anchor, or with anchors from other/multiple device domains, are
+#     rejected with a deterministic diagnostic.  These queries should be
+#     expressed device-side (device measure/dimension + exists(alarm)) after
+#     domain clarification.
+#   - all other alarm-anchored requests (alarm filters/lists/counts using the
+#     alarm's own dimensions, or per-device-domain filters) keep working.
+# ---------------------------------------------------------------------------
+
+def governance_dim_ids: Array(String) = ["SiteName", "SiteId", "TenantName", "TenantId", "TenantIndustry"];
+
+def is_governance_dim: Fn(String) -> Bool = fn(id) {
+    array.any(governance_dim_ids, fn(g) { g == id })
+};
+
+def entity_index_by_id: Fn(Array(edsl.EntityEntry), String) -> Option(Int) = fn(entities, id) {
+    match array.find(entities, fn(e) { e.id == id }) {
+        'Some(e) => 'Some(e.index),
+        'None => 'None,
+    }
+};
+
+def dimension_entity_of: Fn(Array(edsl.DimensionEntry), String) -> Option(Int) = fn(dims, id) {
+    match array.find(dims, fn(d) { d.id == id }) {
+        'Some(d) => 'Some(d.entity),
+        'None => 'None,
+    }
+};
+
+def referenced_dimension_ids: Fn(Intent) -> Array(String) = fn(intent) {
+    let from_dims = array.map(intent.dimensions, fn(d) { d.id });
+    let from_filters = array.map(intent.filters, fn(f) { f.id });
+    let from_any = array.map(intent.any_of, fn(a) { a.id });
+    let from_ordering = array.flat_map(intent.ordering, fn(o) {
+        match o.target {
+            'Dimension(id) => [id],
+            'Measure(_) => [],
+        }
+    });
+    array.concat([from_dims, from_filters, from_any, from_ordering])
+};
+
+def guard_alarm_site_tenant: Fn(Intent, edsl.PreparedPayload) -> Bool = fn(intent, payload) {
+    let first_measure = array.get(intent.measures, 0);
+    let first_dim = array.get(intent.dimensions, 0);
+    let base_entity = match first_measure {
+        'Some(m) => match array.find(payload.measures, fn(me) { me.id == m.id }) {
+            'Some(me) => 'Some(me.entity),
+            'None => 'None,
+        },
+        'None => match first_dim {
+            'Some(d) => dimension_entity_of(payload.dimensions, d.id),
+            'None => 'None,
+        },
+    };
+    let alarm_entity = entity_index_by_id(payload.entities, "alarm");
+    match (base_entity, alarm_entity) {
+        ('Some(b), 'Some(a)) => if b != a {
+            'True
+        } else {
+            let referenced = referenced_dimension_ids(intent);
+            if !array.any(referenced, is_governance_dim) {
+                'True
+            } else {
+                let net_entity = entity_index_by_id(payload.entities, "net_device");
+                let non_gov_entities = array.flat_map(referenced, fn(id) {
+                    if is_governance_dim(id) {
+                        []
+                    } else {
+                        match dimension_entity_of(payload.dimensions, id) {
+                            'Some(e) => if e == a { [] } else { [e] },
+                            'None => [],
+                        }
+                    }
+                });
+                let anchors = array.fold(non_gov_entities, [], fn(acc, e) {
+                    if array.any(acc, fn(x) { x == e }) { acc } else { array.push(acc, e) }
+                });
+                match net_entity {
+                    'Some(n) => if array.length(anchors) == 0 {
+                        fail!(
+                            "alarm-anchored site/tenant query requires an explicit device-domain anchor",
+                            intent,
+                        )
+                    } else if array.all(anchors, fn(e) { e == n }) {
+                        'True
+                    } else {
+                        fail!(
+                            "alarm-anchored site/tenant query is ambiguous across device domains; anchor a single device domain (network supported in v1) or query device-side",
+                            intent,
+                        )
+                    },
+                    'None => fail!("alarm-anchored site/tenant query requires an explicit device-domain anchor", intent),
+                }
+            }
+        },
+        _ => 'True,
+    }
+};
+
 # Lower a plain QueryRequest (measure-less or aggregated) to a Query.
 def make_query: Fn(edsl.QueryRequest) -> qb.Query = fn(request) {
     let intent: Intent = intent_from_request(request);
     let payload: edsl.PreparedPayload = select_payload(intent);
+    let _guarded: Bool = guard_alarm_site_tenant(intent, payload);
     let plan: qb.Plan = edsl.lower(payload, request);
     qb.transform_sqlite(plan)
 };
@@ -119,6 +234,7 @@ def make_query: Fn(edsl.QueryRequest) -> qb.Query = fn(request) {
 #     optional min_matches/any_of + having) then transform.
 def make_intent_query: Fn(Intent) -> qb.Query = fn(intent) {
     let payload: edsl.PreparedPayload = select_payload(intent);
+    let _guarded: Bool = guard_alarm_site_tenant(intent, payload);
     match intent.group_count {
         'Some('CountGroups) => edsl.lower_group_count(
             payload,

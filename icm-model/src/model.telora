@@ -9,15 +9,23 @@
 #   - measure-less row projection / listing / attribute requests;
 #   - filters: equality, ordering comparisons and text pattern ops
 #     (contains / starts-with / ends-with / not-contains);
-#   - group predicates (HAVING) on selected measures;
-#   - Top Per Group and filtered/computed measures where declared.
+#   - correlated existence (EXISTS, incl. reverse derivation and
+#     min_matches grouped existence) over device->alarm;
+#   - group predicates (HAVING) and nested "count of groups passing HAVING";
+#   - OR-group value filters (AnyOf) on subject and inside EXISTS;
+#   - count(DISTINCT ...) measures (distinct affected-device reference count);
+#   - Top Per Group (partitioned top N) and deterministic ordering/pagination;
+#   - unified five-domain device counting over a derived UNION ALL source.
 #
-# Not modelled (deterministic diagnostics from the ontology/query layers):
-#   nested group counting / "count of groups after HAVING", correlated
-#   existence over device->alarm (the relation graph keeps the single
-#   alarm->device safe direction), relative time windows evaluated by the SQL
-#   engine, COUNT(DISTINCT related attribute), arbitrary row-level DISTINCT,
-#   dual-key OR joins to the site view, and multi-hop role joins.
+# Intentional boundaries (deterministic diagnostics from the ontology/query
+# layers, no raw SQL escape):
+#   - measure hosts stay on a single entity grain; KPI aggregates are declared
+#     on the sample table and reach the device by a safe N:1 join (per-device
+#     aggregates over samples are expressed by grouping on a device dimension);
+#   - time windows are closed/open text bounds supplied as bindings (relative
+#     windows are computed by the caller, never by the SQL engine);
+#   - row-level DISTINCT, dual-key OR joins to the site view, multi-hop role
+#     joins and metric tables reached through a fan-out path are not modelled.
 #   Field decorator ordering is irrelevant to the codec; relation field indices
 #   follow the canonical (alphabetically sorted) field order of each struct.
 
@@ -100,6 +108,61 @@ def net_classify: Fn(qb.Expr) -> qb.Expr = fn(col) {
     )
 };
 
+# PON device classification normalisation.  The physical column may store the
+# abstract values 'olt'/'onu', their capitalised forms, or the dotted
+# vendor/display forms ('ne.category.olt', 'ne.category.onu',
+# 'ne.category.pon.onu', 'ne.category.pon.spl' for GPON).  The computed
+# dimension maps every known form to one canonical business value ('olt' /
+# 'onu' / 'gpon') so an Eq filter on the canonical value is correct for every
+# stored form.  Rows that match no known alias pass through unchanged.
+def pon_classify: Fn(qb.Expr) -> qb.Expr = fn(col) {
+    let is_olt: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("olt")]);
+    let is_OLT: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("OLT")]);
+    let is_ne_olt: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("ne.category.olt")]);
+    let is_onu: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("onu")]);
+    let is_ONU: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("ONU")]);
+    let is_ne_onu: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("ne.category.onu")]);
+    let is_ne_pon_onu: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("ne.category.pon.onu")]);
+    let is_spl: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("spl")]);
+    let is_SPL: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("SPL")]);
+    let is_gpon: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("GPON")]);
+    let is_ne_pon_spl: qb.Expr = qb.scalar('Eq, [col, qb.bind_string("ne.category.pon.spl")]);
+    let olt: qb.Expr = qb.bind_string("olt");
+    let onu: qb.Expr = qb.bind_string("onu");
+    let gpon: qb.Expr = qb.bind_string("gpon");
+    qb.scalar_if(
+        is_olt, olt,
+        qb.scalar_if(
+            is_OLT, olt,
+            qb.scalar_if(
+                is_ne_olt, olt,
+                qb.scalar_if(
+                    is_onu, onu,
+                    qb.scalar_if(
+                        is_ONU, onu,
+                        qb.scalar_if(
+                            is_ne_onu, onu,
+                            qb.scalar_if(
+                                is_ne_pon_onu, onu,
+                                qb.scalar_if(
+                                    is_spl, gpon,
+                                    qb.scalar_if(
+                                        is_SPL, gpon,
+                                        qb.scalar_if(
+                                            is_gpon, gpon,
+                                            qb.scalar_if(is_ne_pon_spl, gpon, col),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+};
+
 # ---------------------------------------------------------------------------
 # Governance views
 # ---------------------------------------------------------------------------
@@ -115,6 +178,7 @@ type Tenant = struct {
     @edsl.column("TENANT_ID")
     @edsl.key(flag_true)
     @edsl.measure("TenantCount", count_agg, no_types)
+    @edsl.dimension("TenantId", flag_true, flag_true, text_eq_ops, text_kinds)
     tenant_id: String,
 
     @edsl.column("TENANT_NAME")
@@ -130,6 +194,7 @@ type Site = struct {
     @edsl.column("SITE_ID")
     @edsl.key(flag_true)
     @edsl.measure("SiteCount", count_agg, no_types)
+    @edsl.dimension("SiteId", flag_true, flag_true, text_eq_ops, text_kinds)
     site_id: String,
 
     @edsl.column("SITE_NAME")
@@ -303,7 +368,7 @@ type NetDevice = struct {
 @edsl.relation(Site, safe_kind, 10, 0)
 type PonDevice = struct {
     @edsl.column("classification")
-    @edsl.dimension("PonDeviceClassification", flag_true, flag_true, text_eq_ops, text_kinds)
+    @edsl.computed_dimension("PonDeviceClassification", flag_true, flag_true, text_eq_ops, text_kinds, pon_classify)
     classification: String,
 
     @edsl.column("commuState")
@@ -543,6 +608,7 @@ type StorageDevice = struct {
 @edsl.relation(Site, safe_kind, 8, 0)
 type TerminalDevice = struct {
     @edsl.column("accessDeviceId")
+    @edsl.dimension("TerminalAccessDeviceId", flag_true, flag_true, text_eq_ops, text_kinds)
     access_id: String,
 
     @edsl.column("classification")
@@ -642,6 +708,17 @@ type CollabDevice = struct {
 # these five sources.  The logical fields are stable identifiers (device id,
 # site id, tenant id); the outer plan never joins governance views, so only
 # these stable ids are published as dimensions (not SiteName/TenantName).
+#
+# Capability boundary (public contract in docs/DOMAIN.md section 4.1): the
+# unified device source is a plain cross-domain object count over stable ids.
+# It does NOT carry alarm/KPI/sub-part relations and does NOT support related
+# existence filters (e.g. "unified devices that have a matching alarm"), so
+# requests mixing DeviceCount with alarm existence/HAVING, or with
+# SiteName/TenantName display dimensions, are deterministically rejected by the
+# ontology layer.  Such generic-device questions must first be narrowed to a
+# concrete domain (after user clarification) or answered with the
+# alarm-anchored AlarmDeviceRefCount (Distinct) measure; the model never
+# silently substitutes a single domain.
 
 def device_net_cols: Array(edsl.UnionColumnDecl) = [
     {field: 0, column: "id"},
@@ -796,6 +873,7 @@ type ApRadioKpi = struct {
 # mem_usage_avg=3, mem_usage_max=4, res_id=5, ts=6
 @edsl.entity_source("ServerDeviceKPI", "k")
 @edsl.relation(ServerDevice, safe_kind, 5, 6)
+@edsl.relation(Alarm, fanout_kind, 5, 6)
 type ServerKpi = struct {
     @edsl.column("cpuUsage")
     @edsl.measure("ServerCpuUsageAvg", avg_agg, no_types)
@@ -1088,7 +1166,10 @@ type StoragePsu = struct {
 };
 
 # ---------------------------------------------------------------------------
-# Server sub-parts (parentResId / neResId -> PhysicalServer.oriResId)
+# Server sub-parts.  Mount keys follow the physical schema / entity-set links:
+#   - most parts (disk/fan/memory/processor/nic/port): part.parentResId ->
+#     PhysicalServer.id;
+#   - PSU (parentResId) and optical module (neResId): -> PhysicalServer.oriResId.
 # ---------------------------------------------------------------------------
 
 # canonical indices: id=0, name=1, parent_id=2, status=3
@@ -1136,7 +1217,7 @@ type ServerOptical = struct {
 
 # canonical indices: disk_type=0, id=1, name=2, parent_id=3, status=4
 @edsl.entity_source("PhysicalServerDisk", "p")
-@edsl.relation(ServerDevice, safe_kind, 3, 13)
+@edsl.relation(ServerDevice, safe_kind, 3, 6)
 type ServerDisk = struct {
     @edsl.column("diskType")
     @edsl.dimension("ServerDiskType", flag_true, flag_true, text_eq_ops, text_kinds)
@@ -1160,7 +1241,7 @@ type ServerDisk = struct {
 
 # canonical indices: id=0, name=1, parent_id=2, speed=3, status=4
 @edsl.entity_source("PhysicalServerFan", "p")
-@edsl.relation(ServerDevice, safe_kind, 2, 13)
+@edsl.relation(ServerDevice, safe_kind, 2, 6)
 type ServerFan = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1183,7 +1264,7 @@ type ServerFan = struct {
 
 # canonical indices: capacity=0, id=1, name=2, parent_id=3, speed=4
 @edsl.entity_source("PhysicalServerMemory", "p")
-@edsl.relation(ServerDevice, safe_kind, 3, 13)
+@edsl.relation(ServerDevice, safe_kind, 3, 6)
 type ServerMemory = struct {
     @edsl.column("capacity")
     capacity: String,
@@ -1205,7 +1286,7 @@ type ServerMemory = struct {
 
 # canonical indices: core_count=0, frequency=1, id=2, name=3, parent_id=4
 @edsl.entity_source("PhysicalServerProcessor", "p")
-@edsl.relation(ServerDevice, safe_kind, 4, 13)
+@edsl.relation(ServerDevice, safe_kind, 4, 6)
 type ServerProcessor = struct {
     @edsl.column("coreCount")
     core_count: String,
@@ -1227,7 +1308,7 @@ type ServerProcessor = struct {
 
 # canonical indices: id=0, mac=1, name=2, parent_id=3, speed=4
 @edsl.entity_source("PhysicalServerNIC", "p")
-@edsl.relation(ServerDevice, safe_kind, 3, 13)
+@edsl.relation(ServerDevice, safe_kind, 3, 6)
 type ServerNic = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1250,7 +1331,7 @@ type ServerNic = struct {
 
 # canonical indices: id=0, name=1, parent_id=2, port_type=3, speed=4
 @edsl.entity_source("PhysicalServerPort", "p")
-@edsl.relation(ServerDevice, safe_kind, 2, 13)
+@edsl.relation(ServerDevice, safe_kind, 2, 6)
 type ServerPort = struct {
     @edsl.column("id")
     @edsl.key(flag_true)

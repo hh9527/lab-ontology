@@ -1,16 +1,22 @@
 # ICM 业务领域
 
+本文是 ICM EnterpriseKnowledge 的公开背景知识包，面向 Resolver（构造查询输入的调用方）。
+它只表达业务对象、领域词汇、概念关系、分类、状态、值域、单位、时间语义和统计口径，
+并发布可公开引用的 measure / dimension / 稳定对象 ID。**本文件不包含任何物理 schema、
+表列、Join 路径、SQL、bindings 或实现细节。** 输入 JSON 的结构化契约见
+[`INTENT.md`](INTENT.md)。
+
 ## 1. 业务对象
 
 - **租户**：多租户隔离与归属的根对象；设备、站点、告警、KPI 等资源按租户归属。
 - **站点**：设备与告警所在的物理/组织位置；每个站点属于一个租户。
 - **设备**：分域管理的物理设备。
-  - 网络（network）：交换机、路由器、AC、AP、防火墙及其机框/单板/端口/光模块。
+  - 网络（network）：交换机、路由器、AC、AP、防火墙及其端口/光模块。
   - PON：OLT、ONU。
   - 服务器（server）：机架/昆仑/异构/天工机框/智能小站/机柜服务器及其硬盘/内存/
     处理器/风扇/电源/网卡/端口/光模块。
-  - 存储（storage）：华为 SMIS/VSP/HP/分布式/闪存存储设备、FC 交换机及其控制器/
-    机箱/硬盘/风扇/电源/端口/后备电源。
+  - 存储（storage）：华为 SMIS/VSP/HP/分布式/闪存存储设备及其控制器/机箱/硬盘/
+    风扇/电源/端口/后备电源。
   - 终端（terminal）：打印机、UPS、负载均衡等接入终端。
   - 协作（collaboration）：视频会议终端等协作设备。
 - **子部件**：设备内部可独立管理的部件（见各域列举）。
@@ -20,77 +26,259 @@
 
 ## 2. 设备分类（稳定值）
 
-| 域 | 分类值 |
-| --- | --- |
-| 网络 | `ne.category.switch`（交换机）、`ne.category.ac`（AC/WAC）、`ne.category.router`（路由器/AR）、`ne.category.fatap`（AP）、`ne.category.firewall`（防火墙） |
-| PON | `olt`、`onu` |
-| 服务器 | `ne.category.server.rack`（机架）、`ne.category.server.kunlun`（昆仑）、`ne.category.server.heterogeneous`（异构）、`ne.category.server.subrack`（天工机框）、`ne.category.server.edge`（智能小站）、`ne.category.server.enclosure`（机柜） |
-| 存储（子类） | `HuaweiSmisStorageDevice`（华为SMIS）、`VSPStorageDevice`（VSP）、`HPEStorageDevice`（HP）、`FusionStorageDevice`（分布式）、`EnterpriseStorage`（闪存） |
-| 终端 | `ne.category.terminal.*` |
-| 协作 | `COLLABORATION` |
+| 域 | 分类维度 | 稳定值（可在 Eq / AnyOf 中使用） |
+| --- | --- | --- |
+| 网络 | `NetworkDeviceType` | `ne.category.switch`（交换机）、`ne.category.ac`（AC）、`ne.category.router`（路由器）、`ne.category.fatap`（AP）、`ne.category.firewall`（防火墙） |
+| PON | `PonDeviceClassification` | `olt`（OLT/光线路终端）、`onu`（ONU/光网络单元）、`gpon`（GPON/分光类） |
+| 服务器 | `ServerClassification` | `ne.category.server.rack`（机架）、`ne.category.server.kunlun`（昆仑）、`ne.category.server.heterogeneous`（异构）、`ne.category.server.subrack`（天工机框）、`ne.category.server.edge`（智能小站）、`ne.category.server.enclosure`（机柜） |
+| 存储（子类） | `StorageSubClass` | `HuaweiSmisStorageDevice`、`VSPStorageDevice`、`HPEStorageDevice`、`FusionStorageDevice`、`EnterpriseStorage` |
+| 终端 | `TerminalClassification` | `ne.category.terminal.*`（开放） |
+| 协作 | `CollabClassification` | `COLLABORATION` |
 
-## 3. 状态与值域
+> 分类维度使用**归一化后的稳定值**，调用方筛选时使用稳定值即可：
+> - 网络 `NetworkDeviceType`：`LSW`/`AC`/`WAC`/`AR`/`AP` 等别名归一为
+>   `ne.category.switch`/`ne.category.ac`/`ne.category.router`/`ne.category.fatap` 等；
+> - PON `PonDeviceClassification`：`olt`/`OLT`/`ne.category.olt` 归一为 `olt`，
+>   `onu`/`ONU`/`ne.category.onu`/`ne.category.pon.onu` 归一为 `onu`，
+>   `spl`/`GPON`/`ne.category.pon.spl` 归一为 `gpon`；
+> - 厂商维度（`NetworkDeviceManufacturer` 等）同样归一：`huawei` 覆盖 `Huawei`/
+>   `huawei technologies co., ltd`/`2011` 等库内拼写。
+> 未列出别名不能保证命中，仍以稳定值为准。
 
-- 通信状态：`0`=在线、`1`=离线。
-- 告警级别：`1`=紧急、`2`=重要、`3`=次要、`4`=提示。
-- 告警确认：`0`=未确认、`1`=已确认；告警清除：`0`=未清除、`1`=已清除。
-- 存储运行/健康状态：`1`=正常。
-- 子部件状态：如 `异常` 等业务状态。
-- 链路方向：`bidirectional`=双向、`unidirectional`=单向。
+## 3. 状态与值域（筛选值 = 底层存储编码）
+
+> 状态/枚举类维度对外筛选时使用**底层存储编码**，不使用中文标签；中文标签只作业务
+> 含义说明。模型按维度类型把输入作为参数化绑定传给查询，因此文本编码维度必须传
+> `{"Text": "<code>"}`、整数维度传 `{"Int": <code>}`。传中文标签（如把 `"0"` 写成
+> `"在线"`）不会命中底层数据，属于值域错误。
+
+| 维度（字段） | 类型 | 稳定值（筛选输入） | 业务含义 |
+| --- | --- | --- | --- |
+| 各域设备通信状态 `*CommuState`（commuState） | text | `"0"` | 在线 |
+| 同上 | text | `"1"` | 离线 |
+| `AlarmSeverity`（SEVERITY） | int | `1` | 紧急 |
+| 同上 | int | `2` | 重要 |
+| 同上 | int | `3` | 次要 |
+| 同上 | int | `4` | 提示 |
+| `AlarmAcked`（ACKED） | int | `0` / `1` | 未确认 / 已确认 |
+| `AlarmCleared`（CLEARED） | int | `0` / `1` | 未清除 / 已清除 |
+| `StorageRunningStatus`（runningStatus） | text | `"1"` | 正常（其余库内值按原样筛选） |
+| `StorageHealthStatus`（healthStatus） | text | `"1"` | 正常（其余库内值按原样筛选） |
+| 子部件状态 `ServerPsuStatus`/`ServerDiskStatus`/`ServerFanStatus`/`StorageBackupPowerStatus`/`StorageFanStatus`/`StoragePsuStatus` | text | 库内业务文本，如 `"正常"`/`"异常"` | 开放文本；筛选值须等于存储文本 |
+
+- 网络设备的分类归一（`LSW`/`AC`/`WAC`/`AR`/`AP` → `ne.category.*`）与厂商拼写归一见
+  §2；这些维度筛选时使用**归一后的稳定值**。
+- 链路/接口口径不在本模型范围内。
 
 ## 4. 业务关系与归属
 
 - 设备属于某租户；设备位于某站点（站点属于租户）。
-- 设备产生告警，告警关联产生它的设备/资源；子部件告警也归属到对应设备资源。
+- 设备产生告警，告警关联产生它的设备/资源。
 - 设备包含子部件；子部件属于某设备。
 - 设备/子部件有对应的时间序列 KPI。
 - 网络、PON、服务器、存储、终端五类设备都具有“设备—站点—租户”的归属链。
-  **统一设备统计**指对具备站点归属的上述五类设备做联合计数（`DeviceCount`）。
-  协作设备（视频会议终端等）没有站点归属，不属于任何站点，因此被排除在统一设备
-  统计之外；租户归属不能替代站点归属，统一设备统计也不会把某一单域设备计数当作
-  跨域设备数。
+- **告警与治理对象的组合边界**：告警表的资源引用（MEDN）可指向多个设备域的主键，把
+  “告警”对象直接按站点/租户治理维度分组/筛选需要把每条告警映射到唯一设备域。模型
+  只在请求带**明确的单一设备域锚点**（v1 支持网络设备域，例如同时使用
+  `NetworkDevice*` 维度/过滤）时允许告警对象使用 `SiteName`/`SiteId`/
+  `TenantName`/`TenantId` 等治理维度；没有锚点或锚点横跨多域的请求确定性拒绝，要求先
+  用设备侧路径（设备指标/维度 + `exists(alarm)`）或澄清设备域（见 §4.1 对象域纪律）。
+  告警自身的 `AlarmTenant` 等告警侧文本维度不受此限制。
 
-## 5. 指标（Measure）业务含义
+### 4.1 统一设备统计与对象域纪律
 
-计数类（结果无量纲，表示对象或事件的个数）：
+- **统一设备统计**指对具备站点归属的上述五类设备（网络/PON/服务器/存储/终端）做联合
+  计数（`DeviceCount`）。协作设备（视频会议终端等）没有站点归属，不属于任何站点，
+  因此被排除在统一设备统计之外；租户归属不能替代站点归属。`DeviceCount` 只统计设备
+  对象，不引入告警、KPI 或子部件条件，也不会把某一单域设备计数当作跨域设备数。
+- 统一设备源只发布**稳定归属标识**维度（`DeviceTenantId`/`DeviceSiteId`），可用于
+  跨域计数、按租户/站点标识筛选/分组，以及对稳定标识的排序和分组内 Top N。它**不
+  携带**站点/租户的展示名称（`SiteName`/`TenantName`）、告警关系、KPI 关系或子部件
+  关系。
+- **对象域纪律（必须遵守）**：当用户使用上位概念“设备”而未指明具体设备域时，调用方
+  **不得为了得到成功查询而静默把对象域缩窄成某一个设备子域**，也不得把统一设备统计
+  悄悄替换成单域计数或忽略附加条件。下列形状**不是**单条可表达的查询；必须先与用户
+  澄清对象域（网络 / PON / 服务器 / 存储 / 终端 / 协作），澄清后使用相应单域指标，
+  或改用语义匹配的跨域指标：
+  1. 需要对统一设备按站点/租户的**展示名称**（`SiteName`/`TenantName`）筛选、分组或
+     排序；
+  2. 需要“统一设备 + 告警相关条件”的计数或 Top N（如“存在某告警的设备数”）；
+  3. 需要统一设备与 KPI、子部件等其他对象同请求组合。
+  澄清到单一域后，可用该域的计数指标与站点/租户名称维度、`exists(alarm)`、KPI 等
+  组合（如 `NetworkDeviceCount` + `SiteName`/`TenantName` + `exists`）。若问题的真实
+  意图是“告警关联的受影响设备/资源**去重**数”（跨域、告警锚定），使用
+  `AlarmDeviceRefCount` 的 `Distinct` 口径；它与五域统一对象计数是不同口径，不可互换。
+- 若“设备”的对象域本身不明确（例如是否包含无站点归属的协作设备、是否指全部六域、
+  还是仅指具备站点归属的五域），`DeviceCount` 不能替用户定义一个未声明的对象域；
+  先澄清对象域与口径，再选择 `DeviceCount`（五域、仅计数）或分域计数（如
+  `NetworkDeviceCount` + `CollabDeviceCount` 分别表达）。协作设备数量使用
+  `CollabDeviceCount`。
+- 上述不可表达组合若未经澄清直接提交，模型会**确定性拒绝**并给出可归因诊断：不发布
+  部分结果，不退回单域，也不忽略告警/名称条件（见 `INTENT.md` §8）。
 
-- `DeviceCount`：五域统一设备对象数（网络、PON、服务器、存储、终端联合统计，
-  见第 4 节归属口径；协作设备除外）。
-- `NetworkDeviceCount` / `PonDeviceCount` / `ServerDeviceCount` /
-  `StorageDeviceCount` / `TerminalDeviceCount` / `CollabDeviceCount`：各设备域的
-  对象数；单域计数只代表该域设备，不能代表跨域设备数量。
-- `AlarmCount`：当前告警事件的条数。
-- `AlarmDeviceRefCount`：告警关联的受影响设备/资源数。采用去重口径时，计的是
-  去重后的受影响设备/资源数；采用非去重口径时，计的是告警关联的引用行数，
-  不等于去重后的设备数。
-- `SiteCount`、`TenantCount`：站点数、租户数。
-- 子部件计数：存储的 控制器/机箱/备电/硬盘/风扇/端口/电源 数量、服务器的 电源/光模块/
-  硬盘/风扇/内存条/处理器/网卡/端口 数量、网络的 端口/光模块 数量。
+## 5. 指标（Measure）业务含义与统计口径
 
-KPI 类（名称带设备域与聚合含义，含义是相应业务量在该统计周期内的聚合值）：
+- **计数类**：结果无量纲，表示对象或事件个数。
+- **KPI 类**：结果是有量纲的聚合值，表示相应业务量在选定统计周期/分组内的聚合值；
+  KPI 的时间筛选通过其所属 KPI 实体的时间维度完成，统计区间采用 `[start, end)`
+  半开区间（见 §7）。
+- **去重口径**：`AlarmDeviceRefCount` 使用 `Distinct` 输入表示“去重后的受影响
+  设备/资源数”，使用 `All` 输入表示“告警关联的引用行数”。其它计数指标默认
+  `All`；`Distinct` 只在指标列自身有意义时才被接受。
 
-- 网络设备：CPU 使用率、内存使用率（单位 %，平均/最大）；端口利用率（平均，%）、
-  端口总数/已用端口数（总和）；在线率（平均/最大）；AP 射频：信道利用率（平均，%）、
-  丢包率、信号接收强度（平均，dBm）、在线用户数（总和）。
-- PON/ONU：OLT CPU/内存使用率（%）；ONU 内存使用率（%）、在线率、光功率、
-  光模块温度（最大）；PON 端口入/出流量速率（bps）、光功率、光端口发送带宽利用率。
-- 服务器：CPU、内存使用率（平均/最大，%）、硬盘使用率（平均，%）。
-- 存储：CPU、内存使用率、每秒 IO 次数、吞吐量（平均）。
+指标目录（`id` 为公开标识）：
+
+| id | 业务含义 | 单位/口径 |
+| --- | --- | --- |
+| `DeviceCount` | 五域（网络/PON/服务器/存储/终端）统一设备对象数；只统计具备站点归属的设备对象，不携带告警/KPI/子部件条件（见 §4.1） | 个 |
+| `NetworkDeviceCount` | 网络设备对象数 | 个 |
+| `PonDeviceCount` | PON 设备（OLT/ONU）对象数 | 个 |
+| `ServerDeviceCount` | 服务器对象数 | 个 |
+| `StorageDeviceCount` | 存储设备对象数 | 个 |
+| `TerminalDeviceCount` | 终端设备对象数 | 个 |
+| `CollabDeviceCount` | 协作设备对象数 | 个 |
+| `AlarmCount` | 当前告警事件条数 | 条 |
+| `AlarmDeviceRefCount` | 告警关联的受影响设备/资源引用计数；`Distinct`=按资源标识去重后的跨域对象数（告警锚定的“有此类告警的设备/资源去重数量”），`All`=告警关联的引用行数。该口径与五域 `DeviceCount` 的对象域不同（含协作等告警资源），不可互换 | 个/行 |
+| `SiteCount` | 站点数 | 个 |
+| `TenantCount` | 租户数 | 个 |
+| `StorageControllerCount`/`StorageChassisCount`/`StorageBackupPowerCount`/`StorageDiskCount`/`StorageFanCount`/`StoragePortCount`/`StoragePsuCount` | 存储设备对应子部件数（控制器/机箱/备电/硬盘/风扇/端口/电源） | 个 |
+| `ServerPsuCount`/`ServerOpticalCount`/`ServerDiskCount`/`ServerFanCount`/`ServerMemoryCount`/`ServerProcessorCount`/`ServerNicCount`/`ServerPortCount` | 服务器对应子部件数（电源/光模块/硬盘/风扇/内存条/处理器/网卡/端口） | 个 |
+| `NetPortCount`/`NetOpticalCount` | 网络设备对应子部件数（端口/光模块） | 个 |
+| `NetworkCpuUsageAvg` / `NetworkCpuUsageMax` | 网络设备 CPU 使用率平均 / 最大 | % |
+| `NetworkMemUsageAvg` / `NetworkMemUsageMax` | 网络设备内存使用率平均 / 最大 | % |
+| `NetworkIfUtilizationAvg` | 网络设备端口利用率平均 | % |
+| `NetworkPortCountSum` / `NetworkPortUsedCountSum` | 网络设备端口总数 / 已用端口数 | 个 |
+| `NetworkOnlineRateAvg` / `NetworkOnlineRateMax` | 网络设备在线率平均 / 最大 | — |
+| `ApChannelUtilizationAvg` | AP 射频信道利用率平均 | % |
+| `ApPacketLossSum` | AP 射频丢包率总和 | — |
+| `ApRssiAvg` | AP 射频信号接收强度平均 | dBm |
+| `ApUserCountSum` | AP 射频在线用户数总和 | 个 |
+| `ServerCpuUsageAvg` / `ServerCpuUsageMax` | 服务器 CPU 使用率平均 / 最大 | % |
+| `ServerMemUsageAvg` / `ServerMemUsageMax` | 服务器内存使用率平均 / 最大 | % |
+| `ServerDiskUsageAvg` | 服务器硬盘使用率平均 | % |
+| `PonCpuUsageAvg` | OLT CPU 使用率平均 | % |
+| `PonMemUsageAvg` / `PonMemUsageMax` | OLT 内存使用率平均 / 最大 | % |
+| `OnuMemUsageAvg` / `OnuMemUsageMax` | ONU 内存使用率平均 / 最大 | % |
+| `OnuOnlineRateAvg` | ONU 在线率平均 | — |
+| `OnuOpticalPowerAvg` | ONU 光功率平均 | — |
+| `OnuOpticsTemperatureAvg` / `OnuOpticsTemperatureMax` | ONU 光模块温度平均 / 最大 | — |
+| `PonPortIfOutBandRateAvg` | PON 端口光发送带宽利用率平均 | — |
+| `PonPortInTrafficAvg` / `PonPortOutTrafficAvg` | PON 端口入/出流量速率平均 | bps |
+| `PonPortOpticalPowerAvg` | PON 端口光功率平均 | — |
+| `StorageCpuUsageAvg` / `StorageMemUsageAvg` | 存储设备 CPU/内存使用率平均 | — |
+| `StorageIopsAvg` | 存储设备每秒 IO 次数平均 | 次/秒 |
+| `StorageThroughputAvg` | 存储设备吞吐量平均 | — |
 
 ## 6. 维度（Dimension）业务含义
 
-- 设备属性：设备名称、设备 id、类型/分类、别名、通信状态、IP、MAC、型号、厂商、
-  序列号、位置、版本类、资产编号、服务时长、容量/使用率等，按设备域区分。
-- 治理：`TenantName`（租户名称）、`SiteName`（站点名称）、`TenantIndustry`（租户行业）。
-  名称是用于展示的业务名称，可重复或变化。
-- 统一设备的稳定标识：`DeviceTenantId`（租户 id）、`DeviceSiteId`（站点 id）。它们
-  是稳定标识，标识设备归属的租户/站点；名称不是标识，不能代替稳定 id。
-- 时间：各 KPI 的采样时间。
+维度用于选择/筛选/分组/排序。每个维度属于某个业务对象（设备域、子部件、告警、
+KPI 采样、治理视图或统一设备）。
+
+- 维度值是业务展示值或稳定值，筛选输入必须与维度类型匹配。
+- `TenantName`/`SiteName` 是展示用业务名称，可重复或变化；`TenantId`/`SiteId`/
+  `DeviceTenantId`/`DeviceSiteId` 是稳定归属标识（`TenantId`/`SiteId` 在治理对象上，
+  `DeviceTenantId`/`DeviceSiteId` 在统一设备上表示同一套标识）。名称不是标识，不能
+  互相代替；按名称查询用 `*Name` 维度，按标识查询用 `*Id` 维度。
+
+维度目录（`id` 为公开标识；类型 = 该维度接受的值类型）：
+
+| 归属 | id（按对象分组完整列出本模型公开的维度 id） | 类型 |
+| --- | --- | --- |
+| 治理 | `TenantName`、`TenantId`、`TenantIndustry`；`SiteName`、`SiteId` | text |
+| 统一设备 | `DeviceTenantId`、`DeviceSiteId` | text |
+| 告警 | `AlarmName`、`AlarmType`、`AlarmSource`、`AlarmProbableCause`、`AlarmResName`、`AlarmTenant` | text |
+| 告警 | `AlarmSeverity`、`AlarmAcked`、`AlarmCleared` | int |
+| 告警 | `AlarmTime` | time |
+| 网络设备 | `NetworkDeviceId`、`NetworkDeviceName`、`NetworkDeviceType`、`NetworkDeviceAlias`、`NetworkDeviceIp`、`NetworkDeviceMac`、`NetworkDeviceSn`、`NetworkDeviceLocation`、`NetworkDeviceManufacturer`、`NetworkDeviceModel`、`NetworkDeviceVersion`、`NetworkDeviceOsVersion`、`NetworkDevicePatchVersion`、`NetworkDeviceCommuState`、`NetworkDeviceLanguage` | text |
+| PON 设备 | `PonDeviceId`、`PonDeviceName`、`PonDeviceClassification`、`PonDeviceIp`、`PonDeviceSn`、`PonDeviceLocation`、`PonDeviceManufacturer`、`PonDeviceOsVersion`、`PonDeviceParentOlt`、`PonDeviceCommuState` | text |
+| 服务器 | `ServerDeviceId`、`ServerName`、`ServerClassification`、`ServerIp`、`ServerSn`、`ServerMac`、`ServerLocation`、`ServerManufacturer`、`ServerModel`、`ServerVersion`、`ServerBiosVersion`、`ServerFirmwareVersion`、`ServerBmcHostname`、`ServerAssetNumber`、`ServerCommuState` | text |
+| 服务器 | `ServerServiceDuration` | int |
+| 存储设备 | `StorageDeviceId`、`StorageName`、`StorageSubClass`、`StorageIp`、`StorageSn`、`StorageLocation`、`StorageManufacturer`、`StorageModel`、`StorageCommuState`、`StorageRunningStatus`、`StorageHealthStatus`、`StorageHotPatchVersion` | text |
+| 存储设备 | `StorageUsedCapacityRate`、`StorageTotalCapacity` | float |
+| 终端设备 | `TerminalDeviceId`、`TerminalName`、`TerminalClassification`、`TerminalIp`、`TerminalMac`、`TerminalModel`、`TerminalSn`、`TerminalAccessDeviceId`、`TerminalCommuState` | text |
+| 协作设备 | `CollabDeviceId`、`CollabName`、`CollabClassification`、`CollabIp`、`CollabCommuState` | text |
+| KPI 采样 | `NetworkKpiTime`、`NetOnlineKpiTime`、`ApRadioKpiTime`、`ServerKpiTime`、`PonKpiTime`、`OnuKpiTime`、`PonPortKpiTime`、`StorageKpiTime` | time |
+| 存储子部件 | `StorageControllerName`、`StorageChassisName`、`StorageBackupPowerName`、`StorageBackupPowerStatus`、`StorageDiskType`、`StorageFanStatus`、`StoragePortType`、`StoragePsuStatus` | text |
+| 服务器子部件 | `ServerPsuName`、`ServerPsuStatus`、`ServerDiskType`、`ServerDiskStatus`、`ServerFanStatus`、`ServerNicMac`、`ServerPortType` | text |
+| 网络子部件 | `NetPortType` | text |
+
+### 6.1 版本/固件类维度的语义边界
+
+版本类维度名称相近但语义不同，筛选/投影前必须按下列边界选择；模型按各维度映射到
+对应的数据列，不存在一个维度覆盖“全部版本”：
+
+| 维度 id | 语义边界 | 数据样例 |
+| --- | --- | --- |
+| `NetworkDeviceVersion` | 网络设备的**设备版本**（产品版本） | `V200R001C00` |
+| `NetworkDeviceOsVersion` | 网络设备的**软件（OS）版本** | `V200R019C10`、`V200R019C00SPC500` |
+| `NetworkDevicePatchVersion` | 网络设备的**补丁版本** | `V200R001SPH002` |
+| `PonDeviceOsVersion` | PON 设备（OLT/ONU）的**软件版本** | `V200R019C10` 等 |
+| `ServerVersion` | 服务器的**固件/BMC 版本**（`version` 字段） | `BMC3.19.00.07` |
+| `ServerBiosVersion` | 服务器的 **BIOS 版本** | `5.11.02` |
+| `ServerFirmwareVersion` | 服务器的**固件版本**（`firmwareVersion` 字段，与 `ServerVersion` 并存的另一口径） | 库内固件文本 |
+| `StorageHotPatchVersion` | 存储设备的**热补丁版本** | `V100R001SPH001` |
+| `ServerBmcHostname` | BMC 主机名（标识，不是版本） | 库内主机名 |
+
+注意：`ServerVersion`（固件/BMC 版本，值形如 `BMC3.19.00.07`）与
+`ServerFirmwareVersion`（`firmwareVersion` 字段）在业务上都是“固件版本”的近似表述，
+但落在两个不同字段/列，公共契约以两个独立维度发布；检索“固件版本为 BMC3.19.00.07
+的服务器”使用 `ServerVersion`，检索 `firmwareVersion` 列请使用 `ServerFirmwareVersion`，
+两者不能互换。网络域的“设备版本”与“软件版本”同理（`NetworkDeviceVersion` 与
+`NetworkDeviceOsVersion`）。
 
 ## 7. 时间含义与统计口径
 
 - KPI 与告警的数据时间使用统一格式的文本时间戳；告警发生时间表示告警产生的时刻。
-- “近 N 天/近 N 月”等相对业务周期以业务基准时刻向前推算，统计区间采用半开区间
-  `[start, end)`：包含区间起点，不包含区间终点。
-- “近一个月”可指最近一个自然月，也可指自基准时刻回推的固定天数（如 30 天），两种
-  口径的区间边界不同，按相应业务统计约定确定采用哪一种。
+- **模型支持的表示**：时间筛选/排序只接受**绝对文本时间戳边界**，格式与库内数据一致
+  （`YYYY-MM-DD HH:MM:SS`）。KPI 采样时间维度用 `Ge`/`Lt` 表达半开区间
+  `[start, end)`（包含起点、不包含终点）；告警时间 `AlarmTime` 额外支持
+  `Eq`/`Gt`/`Le`。时间边界是调用方提供的业务值；模型与 SQL 引擎都不会推算“当前
+  时间”，也不会把相对时间词换算成边界。
+- **相对时间词的换算责任与口径区分**：把“近 7 天/最近 30 天/近一个月/昨天/今天”等
+  自然语言时间词换算成绝对边界时，调用方必须区分两种口径：
+  - **固定时长窗口**：自报告参考时刻 R 回推固定小时/天数，例如“近 7 天”=
+    `[R − 7×24h, R)`；“最近 30 天”=`[R − 30×24h, R)`。
+  - **自然日历周期**：按日历边界计算，例如“本月”= 该自然月 `[月初, 下月初)`。
+  - “近一个月/最近一个月”**同时存在**固定 30 天窗口与自然月两种合理口径，边界不同；
+    输入未指明采用哪一种时，调用方**必须先澄清**，不得自行选定固定天数并把该假设
+    当作最终口径。
+  - “昨天/今天”也按上述原则处理：须明确是自然日边界（如 `[昨日 00:00:00, 今日
+    00:00:00)`）还是自 R 回推 24 小时的固定窗口，未指明时先澄清。
+- 换算得到的绝对边界必须与库内时间戳文本格式一致并保持半开区间；边界值作为参数化
+  绑定进入查询，不进入 SQL 文本。
+
+## 8. 稳定对象标识（`exists.target` / 对象归属）
+
+下列稳定对象标识可在存在性过滤的 `target` 字段中使用（对象间是否允许相关由模型
+声明决定，不支持的组合会给出确定性诊断）：
+
+`tenant`、`site`、`alarm`、`net_device`、`pon_device`、`server_device`、
+`storage_device`、`terminal_device`、`collab_device`。
+
+> 注意：**统一设备源不是存在性过滤的关系端点**。`exists.target` 不接受 `device`；
+> “跨域设备 + 告警存在性”的单条统一计数无法表达，必须先澄清对象域（用该域设备计数 +
+> `exists(alarm)`）或改用告警锚定的 `AlarmDeviceRefCount`（`Distinct`）口径
+> （见 §4.1）。各单域设备（`net_device` 等）与 `alarm` 之间的相关存在性按其声明方向
+> 支持。
+
+## 9. 授权主体
+
+`subject` 字段填写授权主体标识。当前模型接受的主体标识为 `analyst` 与 `resolver`；
+未授权主体会确定性失败。
+
+## 10. 维度能力边界
+
+- **文本维度**（含设备/告警/子部件/治理/统一设备的文本属性）：支持 `Eq`、`Ne`、
+  `Contains`、`NotContains`、`StartsWith`、`EndsWith`；输入类型为 text。
+  `Contains`/`StartsWith`/`EndsWith` 大小写不敏感，`Eq`/`Ne`/`NotContains`
+  大小写敏感。
+- 枚举/状态类文本维度使用 §2（分类归一）与 §3（状态编码）给出的**稳定值**；中文标签
+  与未归一别名不是可筛选值（例如通信状态筛选用 `"0"`/`"1"`，不是 `"在线"`/`"离线"`）。
+- **整数维度**（如 `AlarmSeverity`、`ServerServiceDuration`）：支持 `Eq`、`Ne`、
+  `Gt`、`Ge`、`Lt`、`Le`；输入类型为 int。
+- **浮点维度**（如 `StorageUsedCapacityRate`、`StorageTotalCapacity`）：支持
+  `Eq`、`Ne`、`Gt`、`Ge`、`Lt`、`Le`；输入类型为 number。
+- **时间维度**：KPI 采样时间维度支持 `Gt`、`Ge`、`Lt`、`Le`（text）；告警时间
+  `AlarmTime` 额外支持 `Eq`。
+- 使用维度不支持的算子或输入类型、以及任何未知词汇都会确定性失败，不会返回部分
+  结果（见 `INTENT.md` 的失败语义）。

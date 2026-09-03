@@ -12,8 +12,13 @@ EnterpriseKnowledge。组织方式可参考旧 `ent-1`，但实体、关系、�
   `suite-1.jsonl` 和当前重点改进集合 `suite-1-b1.jsonl`。Benchmark 记录由 Labflow 管理在
   `.labflow/benchmarks/icm-eval.sqlite`，不属于模型 artifact。
 - `icm-model/docs/DOMAIN.md` 表达业务对象、领域词汇、概念关系、分类、状态、值域、单位、
-  时间语义和统计口径。可公开 measure/dimension ID 及其业务含义，但不写 Intent/Query
-  教程、CLI/SQL/bindings、物理 schema、Join 路径或实现细节。
+  时间语义和统计口径。可公开 measure/dimension ID 及其业务含义，但不写 CLI/SQL/bindings、
+  物理 schema、Join 路径或实现细节。
+- `icm-model/docs/INTENT.md` 是 Resolver 使用的完整公共输入契约。它必须准确说明 intent JSON
+  的顶层结构、必填与可选字段、dimension/filter/measure/ordering 的结构、所有公开枚举的 JSON
+  表示、值类型、操作符、分页与 Top N 语义，并提供与评测题无关的通用示例。Resolver 只依据
+  `DOMAIN.md` 和 `INTENT.md` 就应能构造合法输入，不得依赖源码、测试或通过诊断猜测类型。
+  `INTENT.md` 不得暴露物理 schema、Join 路径、SQL、bindings、隐藏知识或标准答案。
 - 公共资料不得包含评测题、选择列表、隐藏知识 K、trap、标准答案或按题编号编写的提示。
 - icm-modeler 不读取 Benchmark SQLite 报告。Host 负责汇总测评结论，并通过
   `feedbacks/icm-model.md` 提供改进重点；icm-modeler 不把具体题目或答案硬编码进模型。
@@ -42,8 +47,8 @@ icm-modeler 负责实现适配器固定调用的 `@src/bin/make-query:main` Telo
 
 ## 交付与验证
 
-至少交付模型、动态查询 facade、`src/bin/make-query.telora`、契约测试和自包含的
-`docs/DOMAIN.md`。不交付独立查询设计指南或 README，也不向 `icm/eval/public/` 复制文档；
+至少交付模型、动态查询 facade、`src/bin/make-query.telora`、契约测试，以及自包含且相互一致的
+`docs/DOMAIN.md` 和 `docs/INTENT.md`。不交付 README，也不向 `icm/eval/public/` 复制文档；
 私有模型源码只留在 `icm-model/`。
 
 完成前运行实际可用的检查，并至少覆盖：合法 intent、未知词汇、非法枚举、类型错误、grain
