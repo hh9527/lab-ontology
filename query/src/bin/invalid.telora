@@ -1,10 +1,10 @@
 # query/src/bin/invalid.telora
 #
-# Demonstrates that an illegal Plan produces Host diagnostics and no Query.
-# `JsonExtract` is given a column as its second argument instead of a literal
-# string Bind path, so structural validation inside transform_sqlite rejects
-# the plan.  Running with --best-effort reports the diagnostics, exits non-zero
-# and publishes no output (no partial Query is ever produced).
+# Demonstrates that illegal Plans produce Host diagnostics and no Query.
+# Each exported def is structurally illegal in a different P0 capability
+# (JSON path, HAVING measure, EXISTS correlation and empty join condition).
+# `check` reports the diagnostics and exits non-zero; no partial Query is ever
+# published.
 
 import "std/value" { Value };
 import "@src/lib" as qb;
@@ -26,6 +26,9 @@ def invalid_plan: Fn() -> qb.Plan = fn() {
         ordering: [],
         limit: 'None,
         offset: 'None,
+        exists: [],
+        having: [],
+        derived: 'None,
         partition: 'None,
     };
     plan
@@ -33,6 +36,229 @@ def invalid_plan: Fn() -> qb.Plan = fn() {
 
 export def main: Value = do {
     let plan = invalid_plan();
+    let query = qb.transform_sqlite(plan);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# HAVING references a measure alias that is neither an aggregate nor a
+# computed aggregate in the projection -> structural rejection.
+export def invalid_having_unknown_measure: Value = do {
+    let plan: qb.Plan = {
+        revision: "invalid-having-unknown",
+        sources: [qb.source("e", "events")],
+        projection: [qb.expr_item(qb.column("e", "role"))],
+        filter: 'None,
+        exists: [],
+        joins: [],
+        grouping: [qb.column("e", "role")],
+        having: [qb.having('Gt, "missing_measure", 'Int(1))],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    let query = qb.transform_sqlite(plan);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# EXISTS correlates an outer column of an alias unknown to the plan ->
+# structural rejection.
+export def invalid_exists_bad_outer: Value = do {
+    let plan: qb.Plan = {
+        revision: "invalid-exists-bad-outer",
+        sources: [qb.source("d", "devices")],
+        projection: [qb.expr_item(qb.column("d", "id"))],
+        filter: 'None,
+        exists: [qb.exists(
+            qb.source("a", "alerts"),
+            [qb.column_eq(qb.column_ref("q", "id"), qb.column_ref("a", "device_id"))],
+            'None,
+        )],
+        joins: [],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    let query = qb.transform_sqlite(plan);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# A join ON-clause that combines nothing with `And` is structurally invalid.
+export def invalid_join_empty_and: Value = do {
+    let plan: qb.Plan = {
+        revision: "invalid-join-empty-and",
+        sources: [qb.source("t", "transfers")],
+        projection: [qb.expr_item(qb.column("t", "id"))],
+        filter: 'None,
+        exists: [],
+        joins: [qb.join_on('Inner, qb.source("a", "accounts"), qb.on_and([]))],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    let query = qb.transform_sqlite(plan);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# Nested group count: the inner HAVING measure references a column of an
+# unknown alias -> structural rejection, no partial Query.
+def invalid_nested_having_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "invalid-nested-having",
+        sources: [qb.source("c", "children")],
+        projection: [qb.expr_item(qb.column("c", "parent_id"))],
+        filter: 'None,
+        exists: [],
+        joins: [],
+        grouping: [qb.column("c", "parent_id")],
+        having: [qb.having_call('Gt, 'Count, qb.column("q", "id"), 'False, 'Int(3))],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+export def invalid_nested_count_unknown_column: Value = do {
+    let plan = invalid_nested_having_plan();
+    let profile: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+            'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order, 'Limit,
+            'Offset, 'Partition,
+        ],
+        allowed_join_kinds: ['Inner, 'Left],
+        allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
+        allowed_scalars: ['Eq],
+        allow_distinct: 'True,
+    };
+    let query = qb.count_groups(plan, profile);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# Correlated aggregate EXISTS: the inner grouping references an alias that is
+# not visible to the inner body -> structural rejection, no partial Query.
+export def invalid_grouped_exists_unknown_group: Value = do {
+    let plan: qb.Plan = {
+        revision: "invalid-grouped-exists-group",
+        sources: [qb.source("s", "subjects")],
+        projection: [qb.expr_item(qb.column("s", "id"))],
+        filter: 'None,
+        exists: [qb.exists_grouped(
+            qb.source("e", "events"),
+            [qb.column_eq(qb.column_ref("s", "id"), qb.column_ref("e", "subject_id"))],
+            'None,
+            [qb.column("q", "subject_id")],
+            [qb.having_call('Ge, 'Count, qb.column("e", "id"), 'False, 'Int(3))],
+        )],
+        joins: [],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    let query = qb.transform_sqlite(plan);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# Derived UNION ALL: branch output column sets are inconsistent -> structural
+# rejection, no partial Query.
+export def invalid_union_mismatched_columns: Value = do {
+    let plan: qb.Plan = {
+        revision: "invalid-union-mismatch",
+        sources: [],
+        derived: 'Some(qb.derived_source("u", [
+            qb.union_branch(qb.source("a", "items_a"), [
+                qb.union_column("owner_id", qb.column("a", "owner_id")),
+                qb.union_column("group_id", qb.column("a", "group_id")),
+                qb.union_column("item_id", qb.column("a", "item_id")),
+            ], 'None),
+            qb.union_branch(qb.source("b", "items_b"), [
+                qb.union_column("owner_id", qb.column("b", "owner_id")),
+                qb.union_column("item_id", qb.column("b", "item_id")),
+            ], 'None),
+        ])),
+        projection: [qb.expr_item(qb.column("u", "owner_id"))],
+        filter: 'None,
+        exists: [],
+        joins: [],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let query = qb.transform_sqlite(plan);
+    let result: Value = 'Object({
+        unreachable: 'False,
+        sql: 'String(query.sql),
+    });
+    result
+};
+
+# Derived UNION ALL: outer references a column the derived relation does not
+# project -> structural rejection, no partial Query.
+export def invalid_union_unprojected_column: Value = do {
+    let plan: qb.Plan = {
+        revision: "invalid-union-unprojected",
+        sources: [],
+        derived: 'Some(qb.derived_source("u", [
+            qb.union_branch(qb.source("a", "items_a"), [
+                qb.union_column("owner_id", qb.column("a", "owner_id")),
+                qb.union_column("group_id", qb.column("a", "group_id")),
+                qb.union_column("item_id", qb.column("a", "item_id")),
+            ], 'None),
+        ])),
+        projection: [qb.expr_item(qb.column("u", "owner_id"))],
+        filter: 'Some(qb.scalar('Eq, [qb.column("u", "missing"), qb.bind_string("x")])),
+        exists: [],
+        joins: [],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
     let query = qb.transform_sqlite(plan);
     let result: Value = 'Object({
         unreachable: 'False,

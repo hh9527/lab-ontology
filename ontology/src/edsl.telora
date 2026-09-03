@@ -128,15 +128,57 @@ type ScopeDef = struct { predicates: Array(ScopePredicate) };
 @property('Type)
 type EntitySource = struct { table: String, alias: String };
 
+# Type-level: stable business id of an entity (used by existence filters and
+# row-level targets). Falls back to the source alias when absent.
+@property('Type)
+type EntityId = struct { id: String };
+
+# Union (multi-source) entity declaration. An entity declared only with
+# `union_source` (and no `entity_source`) is a logical entity whose rows are the
+# UNION ALL of an ordered list of physical branches. Every branch maps each
+# canonical logical field (by index) to that branch's physical column; all
+# branches must map the full logical field set with a consistent order. Optional
+# `filter` is a fixed, closed row filter over one logical field (Eq). No raw
+# SQL/Expr/fragment is accepted.
+type UnionColumnDecl = struct {
+    field: Int,
+    column: String,
+};
+
+type UnionBranchDecl = struct {
+    table: String,
+    alias: String,
+    columns: Array(UnionColumnDecl),
+    filter: Option(ScopePredicate),
+};
+
+@property('Type)
+type UnionSourceDef = struct {
+    alias: String,
+    branches: Array(UnionBranchDecl),
+};
+
 # Type-level: relation declarations from this entity to target entities.
 @property('Type)
 type RelationDef = struct { relations: Array(RelationDecl) };
 
+# A single column-equality key between two entities: `from`/`to` are canonical
+# field indexes of the declaring (from) entity and the target (to) entity.
+type RelationPair = struct { from: Int, to: Int };
+
+# Relation key: a closed conjunction/disjunction tree over column-equality
+# pairs. `'And`/`'Or` arrays must be non-empty. It lowers to the query public
+# JoinCondition tree via `join_on`/`on_eq`/`on_and`/`on_or`; no raw SQL.
+type RelationKey = enum {
+    'Eq(RelationPair),
+    'And(Array(RelationKey)),
+    'Or(Array(RelationKey)),
+};
+
 type RelationDecl = struct {
     target: Type,
     kind: RelationKind,
-    from_field: Int,
-    to_field: Int,
+    key: RelationKey,
 };
 
 # Variant-level: stable external/physical value and display label for a
@@ -154,7 +196,14 @@ type EnumValueDef = struct { value: String, label: String };
 
 type RelationKind = enum { 'Safe, 'FanOut };
 
-type FilterOp = enum { 'Eq, 'Ge, 'Le };
+# Filter operations. Comparison ops map to the closed query scalars
+# ('Eq/'Ne/'Gt/'Ge/'Lt/'Le); text ops ('Contains/'NotContains/'StartsWith/
+# 'EndsWith) lower through the closed 'Instr/'Lower/'Length/'Substr/'Add/'Sub
+# vocabulary and always keep the runtime value in a parameterized Bind.
+type FilterOp = enum {
+    'Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le,
+    'Contains, 'NotContains, 'StartsWith, 'EndsWith,
+};
 
 type FilterInputKind = enum { 'Text, 'Number, 'Int };
 
@@ -203,6 +252,16 @@ type FilterRequest = struct {
     input: FilterInput,
 };
 
+# A closed OR-group over a single dimension: a base row matches when its value
+# equals any of the listed values (lowered to the query `Or(Eq(...), ...)`).
+# Values keep request order and become parameterized bindings; there is no raw
+# Expr/SQL/column/alias escape.
+type AnyOfRequest = struct {
+    id: String,
+    subject: String,
+    values: Array(FilterInput),
+};
+
 type OrderRequest = struct {
     target: OrderTarget,
     direction: OrderDirection,
@@ -226,6 +285,31 @@ type QueryRequest = struct {
     partition: Option(PartitionRequest),
 };
 
+# Existence filter request: keeps the base grain while restricting to base rows
+# that have at least one related row in the target entity (or, when
+# `min_matches` is set, at least `min_matches` related rows). The target is a
+# stable entity id related to the base entity; the relation may be declared in
+# either direction (a reverse existence is derived without duplicating edges)
+# and fan-out relations are allowed (existence never amplifies the subject
+# grain). `filters` constrain the related rows and are parameterized bindings.
+type ExistsRequest = struct {
+    target: String,
+    subject: String,
+    filters: Array(FilterRequest),
+    any_of: Array(AnyOfRequest),
+    min_matches: Option(Int),
+};
+
+# Aggregate-result (HAVING) predicate over a requested measure alias.
+type HavingOp = enum { 'Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le };
+
+type HavingRequest = struct {
+    measure: String,
+    subject: String,
+    op: HavingOp,
+    threshold: FilterInput,
+};
+
 # ---------------------------------------------------------------------------
 # Prepared payload types.
 # ---------------------------------------------------------------------------
@@ -247,13 +331,31 @@ type EnumValueEntry = struct {
     label: String,
 };
 
+# Prepared union (derived) branch: physical source, ordered per-field physical
+# column names (aligned to the canonical logical field order), and an optional
+# fixed row filter over one logical field.
+type UnionBranchEntry = struct {
+    table: String,
+    alias: String,
+    columns: Array(String),
+    filter: Option(ScopePredicate),
+};
+
+# Prepared union (derived) source: the logical alias and ordered branches.
+type UnionEntry = struct {
+    alias: String,
+    branches: Array(UnionBranchEntry),
+};
+
 type EntityEntry = struct {
     index: Int,
+    id: String,
     entity_type: Type,
     table: String,
     alias: String,
     key_field: Int,
     fields: Array(FieldEntry),
+    union: Option(UnionEntry),
 };
 
 # Prepared dependency spec of a computed measure: operands are business measure
@@ -293,8 +395,7 @@ type RelationEntry = struct {
     from: Int,
     to: Int,
     kind: RelationKind,
-    from_field: Int,
-    to_field: Int,
+    key: RelationKey,
 };
 
 type PathResult = enum {
@@ -404,9 +505,44 @@ def entity_source: Fn(String, String) -> Fn(td.TypeDesc, Option(EntitySource)) -
     }
 };
 
+def entity_id: Fn(String) -> Fn(td.TypeDesc, Option(EntityId)) -> EntityId = fn(id) {
+    fn(ctx, previous) {
+        let result: EntityId = { id };
+        result
+    }
+};
+
+# Union (multi-source) entity provider: marks the annotated type as a logical
+# entity backed by an ordered UNION ALL of physical branches. Mutually exclusive
+# with `entity_source`; branch aliases must not collide with the union alias.
+def union_source: Fn(String, Array(UnionBranchDecl)) -> Fn(td.TypeDesc, Option(UnionSourceDef)) -> UnionSourceDef = fn(u_alias, branches) {
+    fn(ctx, previous) {
+        let result: UnionSourceDef = { alias: u_alias, branches };
+        result
+    }
+};
+
+# Single-column-equality relation sugar: `from_field` is a canonical field
+# index on the declaring entity, `to_field` on the target entity.
 def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td.TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, from_field, to_field) {
     fn(ctx, previous) {
-        let entry: RelationDecl = { target, kind, from_field, to_field };
+        let pair: RelationPair = { from: from_field, to: to_field };
+        let entry: RelationDecl = { target, kind, key: 'Eq(pair) };
+        let relations = match previous {
+            'Some(p) => array.push(p.relations, entry),
+            'None => [entry],
+        };
+        let result: RelationDef = { relations };
+        result
+    }
+};
+
+# Relation with a structured key: `'Eq(pair)`, `'And(...)` or `'Or(...)` over
+# column-equality pairs (conjunctive/disjunctive keys). Multiple annotations
+# fold by appending.
+def relation_key: Fn(Type, RelationKind, RelationKey) -> Fn(td.TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, key) {
+    fn(ctx, previous) {
+        let entry: RelationDecl = { target, kind, key };
         let relations = match previous {
             'Some(p) => array.push(p.relations, entry),
             'None => [entry],
@@ -464,12 +600,99 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
     result
 };
 
+# Prepare one union (multi-source) entity. Logical fields are the type's
+# canonical fields; each field must declare a non-empty, distinct logical column
+# (the stable output name). Every branch maps the full canonical field set to
+# its own physical columns with a consistent (ascending field-index) order;
+# physical columns, tables and aliases must be legal identifiers. Branch aliases
+# are unique and distinct from the union alias; optional fixed branch filters
+# must be Eq over a valid logical field.
+def branch_mapping_ok: Fn(Array(FieldEntry), UnionBranchDecl) -> Array(String) = fn(fields, branch) {
+    if array.length(branch.columns) != array.length(fields) {
+        fail!("union branch must map every logical field exactly once")
+    } else {
+        let bad_order = array.find(branch.columns, fn(c) {
+            c.field < 0 || c.field >= array.length(fields)
+        });
+        let mapped = array.enumerate(branch.columns);
+        let bad_duplicate = array.find(mapped, fn(pair) {
+            array.length(array.filter(branch.columns, fn(o) { o.field == pair.1.field })) > 1
+        });
+        if bad_order != 'None {
+            fail!("union branch column mapping is out of range")
+        } else if bad_duplicate != 'None {
+            fail!("union branch maps the same logical field more than once")
+        } else {
+            # deterministic, consistent order: canonical field i must appear at
+            # position i (an ascending, exactly-once mapping)
+            let order_bad = array.any(mapped, fn(pair) { pair.1.field != pair.0 });
+            let bad_col = array.find(branch.columns, fn(c) { !qb.is_sql_identifier(c.column) });
+            if order_bad {
+                fail!("union branch column mapping must use a consistent ascending field order")
+            } else if bad_col != 'None {
+                fail!("union branch physical column is not a legal identifier")
+            } else {
+                array.map(branch.columns, fn(c) { c.column })
+            }
+        }
+    }
+};
+
+def build_union_entry: Fn(Type, Array(FieldEntry), UnionSourceDef) -> UnionEntry = fn(ty, fields, spec) {
+    if array.length(spec.branches) == 0 {
+        fail!("union entity must declare at least one branch", ty)
+    } else if array.length(fields) == 0 {
+        fail!("union entity must declare at least one logical field", ty)
+    } else {
+        let empty_col = array.find(fields, fn(f) { f.column == "" });
+        let dup_col = array.find(fields, fn(f) {
+            array.length(array.filter(fields, fn(o) { o.column == f.column })) > 1
+        });
+        let union_bad_id = !qb.is_sql_identifier(spec.alias);
+        let alias_dup = array.find(spec.branches, fn(b) {
+            array.length(array.filter(spec.branches, fn(o) { o.alias == b.alias })) > 1
+        });
+        let alias_clash = array.find(spec.branches, fn(b) { b.alias == spec.alias });
+        let bad_table = array.find(spec.branches, fn(b) { !qb.is_sql_identifier(b.table) });
+        let bad_branch_alias = array.find(spec.branches, fn(b) { !qb.is_sql_identifier(b.alias) });
+        let bad_filter = array.find(spec.branches, fn(b) {
+            match b.filter {
+                'None => 'False,
+                'Some(p) => p.op != 'Eq || p.field < 0 || p.field >= array.length(fields),
+            }
+        });
+        if empty_col != 'None {
+            fail!("union entity fields must declare physical columns", ty)
+        } else if dup_col != 'None {
+            fail!("union entity fields must map to distinct output columns", ty)
+        } else if union_bad_id {
+            fail!("union alias is not a legal identifier", ty)
+        } else if alias_dup != 'None {
+            fail!("union branches must use distinct aliases", ty)
+        } else if alias_clash != 'None {
+            fail!("union branch alias must not equal the union alias", ty)
+        } else if bad_table != 'None {
+            fail!("union branch table is not a legal identifier", ty)
+        } else if bad_branch_alias != 'None {
+            fail!("union branch alias is not a legal identifier", ty)
+        } else if bad_filter != 'None {
+            fail!("union branch filter must be Eq over a valid logical field", ty)
+        } else {
+            let prepared_branches = array.map(spec.branches, fn(b) {
+                let columns = branch_mapping_ok(fields, b);
+                let result: UnionBranchEntry = { table: b.table, alias: b.alias, columns, filter: b.filter };
+                result
+            });
+            let result: UnionEntry = { alias: spec.alias, branches: prepared_branches };
+            result
+        }
+    }
+};
+
 def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     let src = property.get_type_prop(ty, EntitySource);
-    let source = match src {
-        'Some(s) => s,
-        'None => fail!("entity has no source mapping", ty),
-    };
+    let union_prop = property.get_type_prop(ty, UnionSourceDef);
+    let declared_id = property.get_type_prop(ty, EntityId);
     let field_descs = td.fields(ty);
     let enumerated = array.enumerate(field_descs);
     let fields = array.map(enumerated, fn(pair) {
@@ -479,8 +702,26 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
         'Some(f) => f.index,
         'None => -1,
     };
-    let result: EntityEntry = { index, entity_type: ty, table: source.table, alias: source.alias, key_field, fields };
-    result
+    match (src, union_prop) {
+        ('Some(source), 'None) => do {
+            let id = match declared_id {
+                'Some(e) => e.id,
+                'None => source.alias,
+            };
+            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, key_field, fields, union: 'None };
+            result
+        },
+        ('None, 'Some(union_def)) => do {
+            let union = build_union_entry(ty, fields, union_def);
+            let id = match declared_id {
+                'Some(e) => e.id,
+                'None => union.alias,
+            };
+            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, key_field, fields, union: 'Some(union) };
+            result
+        },
+        _ => fail!("entity must declare exactly one of entity_source or union_source", ty),
+    }
 };
 
 def resolve_required: Fn(Array(EntityEntry), Array(Type)) -> Array(Int) = fn(entities, types) {
@@ -713,8 +954,7 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
                 from: entity.index,
                 to: to_index,
                 kind: rel.kind,
-                from_field: rel.from_field,
-                to_field: rel.to_field,
+                key: rel.key,
             };
             result
         })
@@ -1054,6 +1294,61 @@ def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(k
     array.any(kinds, fn(k) { k == kind })
 };
 
+# True for the text-search operations (starts-with/contains/ends-with families).
+def is_text_op: Fn(FilterOp) -> Bool = fn(op) {
+    match op {
+        'Contains => 'True,
+        'NotContains => 'True,
+        'StartsWith => 'True,
+        'EndsWith => 'True,
+        'Eq => 'False,
+        'Ne => 'False,
+        'Gt => 'False,
+        'Ge => 'False,
+        'Lt => 'False,
+        'Le => 'False,
+    }
+};
+
+# Build the closed query expression for an open (non-enum) dimension filter.
+# The caller has already validated operation support and the input kind/value.
+# Comparison ops map to the closed query scalars; text ops lower through the
+# closed 'Instr/'Lower/'Length/'Substr/'Add/'Sub vocabulary. All runtime values
+# remain parameterized binds.
+def open_condition_expr: Fn(qb.Expr, FilterOp, qb.Expr) -> qb.Expr = fn(base, op, bound) {
+    match op {
+        'Eq => qb.scalar('Eq, [base, bound]),
+        'Ne => qb.scalar('Ne, [base, bound]),
+        'Gt => qb.scalar('Gt, [base, bound]),
+        'Ge => qb.scalar('Ge, [base, bound]),
+        'Lt => qb.scalar('Lt, [base, bound]),
+        'Le => qb.scalar('Le, [base, bound]),
+        # case-insensitive containment
+        'Contains => qb.scalar('Gt, [qb.instr(qb.lower(base), qb.lower(bound)), qb.bind_int(0)]),
+        # case-sensitive negation (query public contract)
+        'NotContains => qb.scalar('Eq, [qb.instr(base, bound), qb.bind_int(0)]),
+        # case-insensitive prefix
+        'StartsWith => qb.scalar('Eq, [qb.instr(qb.lower(base), qb.lower(bound)), qb.bind_int(1)]),
+        # case-insensitive suffix
+        'EndsWith => do {
+            let lower_base = qb.lower(base);
+            let lower_bound = qb.lower(bound);
+            let start = qb.add(qb.sub(qb.length(lower_base), qb.length(lower_bound)), qb.bind_int(1));
+            qb.scalar('Eq, [qb.substr([lower_base, start]), lower_bound])
+        },
+    }
+};
+
+# Convert a runtime filter value into the query ScalarValue used at codec
+# boundaries and by HAVING thresholds.
+def to_val: Fn(FilterInput) -> qb.Val = fn(input) {
+    match input {
+        'Text(s) => 'String(s),
+        'Number(f) => 'Float(f),
+        'Int(i) => 'Int(i),
+    }
+};
+
 # Enum closed-domain filter resolution. A legal stable value keeps producing a
 # parameterized binding; unknown values fail atomically with the subject, the
 # dimension id and the dynamic JSON input value as evidence.
@@ -1070,8 +1365,15 @@ def resolve_enum_filter: Fn(PreparedPayload, DimensionEntry, FilterRequest) -> F
             },
             _ => fail!("invalid enum filter value for dimension", req.subject, req.id, req.input),
         },
+        'Ne => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'Gt => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
         'Ge => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'Lt => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
         'Le => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'Contains => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'NotContains => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'StartsWith => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+        'EndsWith => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
     }
 };
 
@@ -1091,16 +1393,25 @@ def resolve_filters: Fn(PreparedPayload, Array(FilterRequest)) -> Array(FilterRe
                         fail!("filter operation not supported for dimension", req.subject, req.id)
                     } else if array.length(entry.values) > 0 {
                         resolve_enum_filter(payload, entry, req)
+                    } else if is_text_op(req.op) {
+                        match req.input {
+                            'Text(_) => if !filter_input_allowed(entry.input_kinds, req.input) {
+                                fail!("invalid filter value for dimension", req.subject, req.id)
+                            } else {
+                                let base = dimension_expr(payload, entry);
+                                let bound = to_bind(req.input);
+                                let expr = open_condition_expr(base, req.op, bound);
+                                let result: FilterResolution = { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input };
+                                result
+                            },
+                            _ => fail!("text filter operation requires a text input value", req.subject, req.id),
+                        }
                     } else if !filter_input_allowed(entry.input_kinds, req.input) {
                         fail!("invalid filter value for dimension", req.subject, req.id)
                     } else {
                         let base = dimension_expr(payload, entry);
                         let bound = to_bind(req.input);
-                        let expr = match req.op {
-                            'Eq => qb.scalar('Eq, [base, bound]),
-                            'Ge => qb.scalar('Ge, [base, bound]),
-                            'Le => qb.scalar('Le, [base, bound]),
-                        };
+                        let expr = open_condition_expr(base, req.op, bound);
                         let result: FilterResolution = { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input };
                         result
                     }
@@ -1123,6 +1434,114 @@ def combine_filters: Fn(Array(qb.Expr)) -> Option(qb.Expr) = fn(exprs) {
     }
 };
 
+# ---------------------------------------------------------------------------
+# Closed OR-group (AnyOf) over one dimension.
+# ---------------------------------------------------------------------------
+
+# Left-associative Or over Eq(base, bind(value)) in request order.
+def or_eq_terms: Fn(qb.Expr, Array(FilterInput)) -> qb.Expr = fn(base, values) {
+    let init: Option(qb.Expr) = 'None;
+    let folded = array.fold(values, init, fn(acc, value) {
+        let term = qb.scalar('Eq, [base, to_bind(value)]);
+        match acc {
+            'None => 'Some(term),
+            'Some(prev) => 'Some(qb.scalar('Or, [prev, term])),
+        }
+    });
+    match folded {
+        'Some(expr) => expr,
+        'None => fail!("any-of group must contain at least one value"),
+    }
+};
+
+# Value-level check for one AnyOf member against a resolved dimension entry:
+# closed enum domains require a Text stable value; open dimensions require an
+# allowed input kind.
+def any_of_value_ok: Fn(DimensionEntry, FilterInput) -> Bool = fn(entry, value) {
+    if array.length(entry.values) > 0 {
+        match value {
+            'Text(s) => array.any(entry.values, fn(e) { e.value == s }),
+            _ => 'False,
+        }
+    } else {
+        filter_input_allowed(entry.input_kinds, value)
+    }
+};
+
+# Build the OR-group expression for an already-resolved, authorized dimension.
+# The dimension must support Eq and the group must be non-empty; every member is
+# validated before the group is built (atomic failure, no dropped branches).
+def build_any_of: Fn(PreparedPayload, DimensionEntry, AnyOfRequest) -> qb.Expr = fn(payload, entry, spec) {
+    if array.length(spec.values) == 0 {
+        fail!("any-of group must contain at least one value", spec.id)
+    } else if !array.any(entry.ops, fn(op) { op == 'Eq }) {
+        fail!("any-of requires the Eq filter operation for dimension", spec.id)
+    } else {
+        let values_ok = array.all(spec.values, fn(v) { any_of_value_ok(entry, v) });
+        if !values_ok {
+            fail!("any-of contains an unknown or invalid value for dimension", spec.id)
+        } else {
+            let base = dimension_expr(payload, entry);
+            or_eq_terms(base, spec.values)
+        }
+    }
+};
+
+# Ordinary (subject-query) OR-group: authorization and vocabulary checks, then
+# the closed OR-group expression.
+def any_of_expr: Fn(PreparedPayload, AnyOfRequest) -> qb.Expr = fn(payload, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for any-of filter", spec.subject, spec.id)
+    } else {
+        match array.find(payload.dimensions, fn(d) { d.id == spec.id }) {
+            'None => fail!("unknown any-of dimension", spec.subject, spec.id),
+            'Some(entry) => do {
+                if !entry.authorized {
+                    fail!("dimension is not authorized", spec.subject, spec.id)
+                } else if !entry.filterable {
+                    fail!("dimension has no filter capability", spec.subject, spec.id)
+                } else {
+                    build_any_of(payload, entry, spec)
+                }
+            },
+        }
+    }
+};
+
+# Existence inner OR-group: the dimension must belong to the related (target)
+# entity so the OR-group only constrains the EXISTS inner rows.
+def any_of_on_target: Fn(PreparedPayload, Int, AnyOfRequest) -> qb.Expr = fn(payload, target, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for any-of filter", spec.subject, spec.id)
+    } else {
+        match array.find(payload.dimensions, fn(d) { d.id == spec.id }) {
+            'None => fail!("unknown any-of dimension", spec.subject, spec.id),
+            'Some(entry) => if entry.entity == target {
+                if !entry.authorized {
+                    fail!("dimension is not authorized", spec.subject, spec.id)
+                } else if !entry.filterable {
+                    fail!("dimension has no filter capability", spec.subject, spec.id)
+                } else {
+                    build_any_of(payload, entry, spec)
+                }
+            } else {
+                fail!("any-of inner filter must reference the target entity", spec.id)
+            },
+        }
+    }
+};
+
+# Append extra expressions as trailing AND terms (used for OR-group terms after
+# the scopes+user filter conjunction).
+def append_filter_terms: Fn(Option(qb.Expr), Array(qb.Expr)) -> Option(qb.Expr) = fn(base, extra) {
+    array.fold(extra, base, fn(acc, expr) {
+        match acc {
+            'None => 'Some(expr),
+            'Some(prev) => 'Some(qb.scalar('And, [prev, expr])),
+        }
+    })
+};
+
 # Enum closed-domain scope resolution (mirrors resolve_enum_filter). A scope
 # value must be a member of the referenced dimension's stable value domain.
 def resolve_enum_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> FilterResolution = fn(payload, entry, predicate) {
@@ -1138,8 +1557,15 @@ def resolve_enum_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> F
             },
             _ => fail!("scope uses an invalid enum value for dimension", entry.id, predicate.input),
         },
+        'Ne => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'Gt => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
         'Ge => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'Lt => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
         'Le => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'Contains => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'NotContains => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'StartsWith => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
+        'EndsWith => fail!("scope on enum dimension supports only Eq", entry.id, predicate.op),
     }
 };
 
@@ -1163,16 +1589,25 @@ def resolve_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> Filter
                 fail!("scope uses an operation not supported by the dimension", d.id, predicate.op)
             } else if array.length(d.values) > 0 {
                 resolve_enum_scope(payload, d, predicate)
+            } else if is_text_op(predicate.op) {
+                match predicate.input {
+                    'Text(_) => if !filter_input_allowed(d.input_kinds, predicate.input) {
+                        fail!("scope uses an invalid value for the dimension", d.id, predicate.input)
+                    } else {
+                        let base = dimension_expr(payload, d);
+                        let bound = to_bind(predicate.input);
+                        let expr = open_condition_expr(base, predicate.op, bound);
+                        let result: FilterResolution = { expr, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input };
+                        result
+                    },
+                    _ => fail!("scope text operation requires a text input value", d.id),
+                }
             } else if !filter_input_allowed(d.input_kinds, predicate.input) {
                 fail!("scope uses an invalid value for the dimension", d.id, predicate.input)
             } else {
                 let base = dimension_expr(payload, d);
                 let bound = to_bind(predicate.input);
-                let expr = match predicate.op {
-                    'Eq => qb.scalar('Eq, [base, bound]),
-                    'Ge => qb.scalar('Ge, [base, bound]),
-                    'Le => qb.scalar('Le, [base, bound]),
-                };
+                let expr = open_condition_expr(base, predicate.op, bound);
                 let result: FilterResolution = { expr, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input };
                 result
             }
@@ -1282,19 +1717,33 @@ def resolve_measure_predicate: Fn(PreparedPayload, MeasureEntry) -> qb.Expr = fn
                                 },
                                 _ => fail!("measure predicate uses an invalid enum value for dimension", d.id, pred.input),
                             },
+                            'Ne => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'Gt => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
                             'Ge => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'Lt => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
                             'Le => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'Contains => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'NotContains => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'StartsWith => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                            'EndsWith => fail!("measure predicate on enum dimension supports only Eq", d.id, pred.op),
+                        }
+                    } else if is_text_op(pred.op) {
+                        match pred.input {
+                            'Text(_) => if !filter_input_allowed(d.input_kinds, pred.input) {
+                                fail!("measure predicate uses an invalid value for the dimension", d.id, pred.input)
+                            } else {
+                                let base = dimension_expr(payload, d);
+                                let bound = to_bind(pred.input);
+                                open_condition_expr(base, pred.op, bound)
+                            },
+                            _ => fail!("measure predicate text operation requires a text input value", d.id),
                         }
                     } else if !filter_input_allowed(d.input_kinds, pred.input) {
                         fail!("measure predicate uses an invalid value for the dimension", d.id, pred.input)
                     } else {
                         let base = dimension_expr(payload, d);
                         let bound = to_bind(pred.input);
-                        match pred.op {
-                            'Eq => qb.scalar('Eq, [base, bound]),
-                            'Ge => qb.scalar('Ge, [base, bound]),
-                            'Le => qb.scalar('Le, [base, bound]),
-                        }
+                        open_condition_expr(base, pred.op, bound)
                     }
                 },
             }
@@ -1436,6 +1885,27 @@ def merge_edges: Fn(Array(Int), Array(Int)) -> Array(Int) = fn(acc, seq) {
     })
 };
 
+# One relation column pair becomes an equality ON atom over the two entities'
+# canonical field columns (aliases come from the entity source declarations).
+def pair_to_condition: Fn(PreparedPayload, Int, Int, RelationPair) -> qb.JoinCondition = fn(payload, from_entity, to_entity, pair) {
+    let from_entry = get_index(payload.entities, from_entity);
+    let to_entry = get_index(payload.entities, to_entity);
+    let from_field = get_index(from_entry.fields, pair.from);
+    let to_field = get_index(to_entry.fields, pair.to);
+    qb.on_eq(qb.column_ref(from_entry.alias, from_field.column), qb.column_ref(to_entry.alias, to_field.column))
+};
+
+# A relation key lowers to the query public JoinCondition tree. `'And`/`'Or`
+# nodes map to `on_and`/`on_or`; every column reference resolves to a visible
+# source/join alias, so the result is a closed structured ON predicate.
+def key_to_condition: Fn(PreparedPayload, Int, Int, RelationKey) -> qb.JoinCondition = fn(payload, from_entity, to_entity, key) {
+    match key {
+        'Eq(pair) => pair_to_condition(payload, from_entity, to_entity, pair),
+        'And(keys) => qb.on_and(array.map(keys, fn(k) { key_to_condition(payload, from_entity, to_entity, k) })),
+        'Or(keys) => qb.on_or(array.map(keys, fn(k) { key_to_condition(payload, from_entity, to_entity, k) })),
+    }
+};
+
 def select_joins: Fn(PreparedPayload, Int, Array(Int)) -> Array(qb.Join) = fn(payload, base, targets) {
     let edges = array.fold(targets, [], fn(acc, target) {
         if target == base {
@@ -1445,7 +1915,7 @@ def select_joins: Fn(PreparedPayload, Int, Array(Int)) -> Array(qb.Join) = fn(pa
             let pr = get_index(row, target);
             match pr {
                 'Safe(seq) => merge_edges(acc, seq),
-                'FanOut(_) => fail!("path to requested entity requires a fan-out relation", target),
+                'FanOut(_) => fail!("path to requested entity requires a fan-out relation; use an existence filter", target),
                 'Missing => fail!("no safe path to requested entity", target),
                 'Truncated => fail!("path search was truncated", target),
             }
@@ -1453,82 +1923,351 @@ def select_joins: Fn(PreparedPayload, Int, Array(Int)) -> Array(qb.Join) = fn(pa
     });
     array.map(edges, fn(r_index) {
         let r = get_index(payload.relations, r_index);
-        let from_entity = get_index(payload.entities, r.from);
         let to_entity = get_index(payload.entities, r.to);
-        let from_field = get_index(from_entity.fields, r.from_field);
-        let to_field = get_index(to_entity.fields, r.to_field);
         let kind: qb.JoinKind = match r.kind { 'Safe => 'Inner, 'FanOut => 'Left };
-        qb.join(
+        qb.join_on(
             kind,
             qb.source(to_entity.alias, to_entity.table),
-            qb.column_ref(from_entity.alias, from_field.column),
-            qb.column_ref(to_entity.alias, to_field.column),
+            key_to_condition(payload, r.from, r.to, r.key),
         )
     })
 };
 
-def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
-    if array.length(request.measures) == 0 {
-        fail!("request must select at least one measure")
+def entity_by_id: Fn(PreparedPayload, String) -> Int = fn(payload, id) {
+    match array.find(payload.entities, fn(e) { e.id == id }) {
+        'Some(e) => e.index,
+        'None => fail!("exists target entity is unknown", id),
+    }
+};
+
+# Direction-explicit relation lookup for existence filters. Prefers a forward
+# edge (base -> target); when absent, a reverse edge (target -> base) is used to
+# derive the correlated existence without requiring the model to duplicate graph
+# edges. Reverse lookups feed only the existence predicate, never the ordinary
+# join path closure.
+type RelationLookup = struct { index: Int, reversed: Bool };
+
+def lookup_existence_relation: Fn(PreparedPayload, Int, Int) -> RelationLookup = fn(payload, base_entity, target) {
+    let enumerated = array.enumerate(payload.relations);
+    let forward = array.find(enumerated, fn(pair) { pair.1.from == base_entity && pair.1.to == target });
+    match forward {
+        'Some(pair) => do {
+            let result: RelationLookup = { index: pair.0, reversed: 'False };
+            result
+        },
+        'None => match array.find(enumerated, fn(pair) { pair.1.from == target && pair.1.to == base_entity }) {
+            'Some(pair) => do {
+                let result: RelationLookup = { index: pair.0, reversed: 'True };
+                result
+            },
+            'None => fail!("exists target is not directly related to the base entity"),
+        },
+    }
+};
+
+# Correlation equality for an existence relation key pair. For a forward edge
+# `pair.from`/`pair.to` are on the base/target entities; for a reverse edge the
+# roles swap, keeping the outer (base) column on the left of the ColumnEq.
+def exists_col_eq: Fn(EntityEntry, EntityEntry, RelationPair, Bool) -> qb.ColumnEq = fn(base_entry, target_entry, pair, reversed) {
+    if reversed {
+        let target_field = get_index(target_entry.fields, pair.from);
+        let base_field = get_index(base_entry.fields, pair.to);
+        qb.column_eq(qb.column_ref(base_entry.alias, base_field.column), qb.column_ref(target_entry.alias, target_field.column))
     } else {
-        let measures = resolve_measures(payload, request.measures);
-        let base_entity = get_index(measures, 0).entry.entity;
-        let grain_ok = array.all(measures, fn(m) { m.entry.entity == base_entity });
-        if !grain_ok {
-            fail!("requested measures are not grain-compatible")
+        let base_field = get_index(base_entry.fields, pair.from);
+        let target_field = get_index(target_entry.fields, pair.to);
+        qb.column_eq(qb.column_ref(base_entry.alias, base_field.column), qb.column_ref(target_entry.alias, target_field.column))
+    }
+};
+
+# The correlated EXISTS shape requires a conjunction of column equalities on the
+# inner source; disjunctive relation keys cannot be expressed by EXISTS and fail
+# with a deterministic diagnostic instead of guessing.
+def exists_pairs: Fn(RelationKey) -> Array(RelationPair) = fn(key) {
+    match key {
+        'Eq(pair) => [pair],
+        'And(keys) => array.flat_map(keys, fn(k) {
+            match k {
+                'Eq(pair) => [pair],
+                _ => fail!("exists relation key must be a conjunction of column equalities"),
+            }
+        }),
+        'Or(_) => fail!("exists relation key must be a conjunction of column equalities"),
+    }
+};
+
+# Lower one correlated existence request. Rows of the base entity that have at
+# least one (or, with `min_matches`, at least N) related row in the target
+# entity are kept; the relation may be declared in either direction and fan-out
+# relations are allowed because existence never amplifies the subject grain.
+# Inner filters constrain the related rows and are parameterized bindings.
+def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> qb.Exists = fn(payload, base_entity, spec) {
+    let target = entity_by_id(payload, spec.target);
+    if target == base_entity {
+        fail!("exists target must differ from the base entity", spec.target)
+    } else {
+        let lookup = lookup_existence_relation(payload, base_entity, target);
+        let rel = get_index(payload.relations, lookup.index);
+        let pairs = exists_pairs(rel.key);
+        let base_entry = get_index(payload.entities, base_entity);
+        let target_entry = get_index(payload.entities, target);
+        let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
+        let inner_filters = resolve_filters(payload, spec.filters);
+        let target_ok = array.all(inner_filters, fn(f) { f.entity == target });
+        if !target_ok {
+            fail!("exists inner filter must reference the target entity", spec.target)
         } else {
-            let dimensions = resolve_dimensions(payload, request.dimensions);
-            let scope_resolutions = array.flat_map(dimensions, fn(d) {
-                array.map(d.entry.scope, fn(p) { resolve_scope(payload, d.entry, p) })
-            });
-            let filter_resolutions = resolve_filters(payload, request.filters);
-            let filter_expr = combined_filter(scope_resolutions, filter_resolutions);
-            let requested_measure_ids = array.map(request.measures, fn(m) { m.id });
-            let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
-            let ordering = resolve_ordering(payload, request.ordering, requested_measure_ids, requested_dimension_ids);
-            let partition = check_partition(payload, request, dimensions, ordering);
-            let limit = check_limit(request.limit);
-            let offset = check_offset(request.offset, array.length(request.ordering));
-            let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
-            let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
-            let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
-            let measure_targets = array.concat(array.map(measures, fn(m) { m.entry.requires }));
-            let targets = array.concat([measure_targets, dim_entities, scope_entities, filter_entities]);
-            let joins = select_joins(payload, base_entity, targets);
-            let base_source = get_index(payload.entities, base_entity);
-            let join_sources = array.map(joins, fn(j) { j.source });
-            let sources = array.concat([[qb.source(base_source.alias, base_source.table)], join_sources]);
-            let measure_items = array.map(measures, fn(m) {
-                let entity = get_index(payload.entities, m.entry.entity);
-                let field = get_index(entity.fields, m.entry.field);
-                match m.entry.computed {
-                    'Some(spec) => qb.computed_item(spec.op, spec.left, spec.right, m.entry.alias),
-                    'None => match m.entry.predicate {
-                        'Some(_) => qb.aggregate_filtered(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, 'Some(resolve_measure_predicate(payload, m.entry)), m.entry.alias),
-                        'None => qb.aggregate(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, m.entry.alias),
-                    },
-                }
-            });
-            let dimension_items = array.map(dimensions, fn(d) {
-                qb.expr_item(dimension_expr(payload, d.entry))
-            });
-            let projection = array.concat([measure_items, dimension_items]);
-            let grouping = array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) });
-            let no_partition_ordering: Array(qb.OrderBy) = [];
-            let plan: qb.Plan = {
-                revision: payload.revision,
-                sources,
-                projection,
-                filter: filter_expr,
-                joins,
-                grouping,
-                ordering: if partition == 'None { ordering } else { no_partition_ordering },
-                limit: if partition == 'None { limit } else { 'None },
-                offset: if partition == 'None { offset } else { 'None },
-                partition,
-            };
-            qb.validate(plan, payload.profile)
+            let inner_any = array.map(spec.any_of, fn(a) { any_of_on_target(payload, target, a) });
+            let inner = append_filter_terms(combine_filters(array.map(inner_filters, fn(f) { f.expr })), inner_any);
+            let source = qb.source(target_entry.alias, target_entry.table);
+            match spec.min_matches {
+                'None => qb.exists(source, col_eqs, inner),
+                'Some(n) => do {
+                    if n <= 0 {
+                        fail!("exists minimum matches must be a positive integer", spec.target, n)
+                    } else if array.length(col_eqs) != 1 {
+                        fail!("grouped existence requires a single-pair relation key", spec.target)
+                    } else {
+                        # the inner correlation column identifies the related subject's group
+                        let corr = get_index(col_eqs, 0);
+                        let grouping: Array(qb.Expr) = [qb.column(corr.right.source, corr.right.column)];
+                        let count_column = if target_entry.key_field >= 0 {
+                            get_index(target_entry.fields, target_entry.key_field).column
+                        } else {
+                            corr.right.column
+                        };
+                        let count_expr: qb.Expr = qb.column(corr.right.source, count_column);
+                        let threshold_v: qb.Val = 'Int(n);
+                        let having_list: Array(qb.Having) = [qb.having_call('Ge, 'Count, count_expr, 'False, threshold_v)];
+                        qb.exists_grouped(source, col_eqs, inner, grouping, having_list)
+                    }
+                },
+            }
         }
+    }
+};
+
+# Lower one aggregate-result (HAVING) predicate over a requested measure.
+# Threshold values always become the trailing `?` binding via the query public
+# `having` constructor.
+def resolve_having: Fn(PreparedPayload, Array(MeasureRequest), HavingRequest) -> qb.Having = fn(payload, measure_requests, spec) {
+    if !array.any(measure_requests, fn(m) { m.id == spec.measure }) {
+        fail!("having references a measure that is not requested", spec.measure)
+    } else if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for having measure", spec.subject, spec.measure)
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == spec.measure }) {
+            'Some(entry) => do {
+                let op_q: qb.HavingOp = match spec.op {
+                    'Eq => 'Eq,
+                    'Ne => 'Ne,
+                    'Gt => 'Gt,
+                    'Ge => 'Ge,
+                    'Lt => 'Lt,
+                    'Le => 'Le,
+                };
+                let val_q: qb.Val = to_val(spec.threshold);
+                qb.having(op_q, entry.alias, val_q)
+            },
+            'None => fail!("having references an unknown measure", spec.measure),
+        }
+    }
+};
+
+# Union (derived) branch filter: a fixed Eq over one logical field mapped to the
+# branch's physical column.
+def union_branch_filter: Fn(EntityEntry, UnionBranchEntry) -> Option(qb.Expr) = fn(entity, branch) {
+    match branch.filter {
+        'None => 'None,
+        'Some(pred) => do {
+            let physical = get_index(branch.columns, pred.field);
+            let expr = qb.scalar('Eq, [qb.column(branch.alias, physical), to_bind(pred.input)]);
+            'Some(expr)
+        },
+    }
+};
+
+# Build the query DerivedSource for a union entity: each ordered branch projects
+# every logical field from its own mapped physical column under the logical
+# field's stable column name (the branch output alias). All validated at prepare.
+def build_union_derived: Fn(EntityEntry, UnionEntry) -> qb.DerivedSource = fn(entity, union) {
+    let branches = array.map(union.branches, fn(branch) {
+        let outputs = array.map(entity.fields, fn(f) {
+            let physical = get_index(branch.columns, f.index);
+            qb.union_column(f.column, qb.column(branch.alias, physical))
+        });
+        qb.union_branch(qb.source(branch.alias, branch.table), outputs, union_branch_filter(entity, branch))
+    });
+    qb.derived_source(union.alias, branches)
+};
+
+# Resolved physical sources for one lowering: either a normal base source plus
+# joins, or (for a union entity) an empty physical source set plus one derived
+# UNION ALL source. `exists` plans apply only to the single-source case.
+type LoweredSources = struct {
+    sources: Array(qb.Source),
+    derived: Option(qb.DerivedSource),
+    joins: Array(qb.Join),
+    exists: Array(qb.Exists),
+};
+
+# Shared lowering pipeline. Measures may be empty: the request then projects
+# row-level dimension attributes (no grouping, no aggregate items) and derives
+# the base entity from the first requested dimension. Existence filters keep the
+# base grain; having predicates constrain aggregated results.
+def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs) {
+    let measures = resolve_measures(payload, request.measures);
+    let dimensions = resolve_dimensions(payload, request.dimensions);
+    let measure_count = array.length(measures);
+    let dimension_count = array.length(dimensions);
+    if measure_count == 0 && dimension_count == 0 {
+        fail!("request must select at least one measure or one dimension")
+    } else if measure_count == 0 && request.partition != 'None {
+        fail!("top per group requires an aggregated measure")
+    } else if measure_count == 0 && array.length(having_specs) > 0 {
+        fail!("having requires an aggregated measure")
+    } else {
+        let base_entity = if measure_count > 0 {
+            let first = get_index(measures, 0).entry.entity;
+            let grain_ok = array.all(measures, fn(m) { m.entry.entity == first });
+            if grain_ok { first } else { fail!("requested measures are not grain-compatible") }
+        } else {
+            get_index(dimensions, 0).entry.entity
+        };
+        let scope_resolutions = array.flat_map(dimensions, fn(d) {
+            array.map(d.entry.scope, fn(p) { resolve_scope(payload, d.entry, p) })
+        });
+        let filter_resolutions = resolve_filters(payload, request.filters);
+        let any_exprs = array.map(any_of_specs, fn(a) { any_of_expr(payload, a) });
+        let filter_expr = append_filter_terms(combined_filter(scope_resolutions, filter_resolutions), any_exprs);
+        let any_entities = array.map(any_of_specs, fn(a) {
+            match array.find(payload.dimensions, fn(d) { d.id == a.id }) {
+                'Some(entry) => entry.entity,
+                'None => fail!("unknown any-of dimension", a.id),
+            }
+        });
+        let requested_measure_ids = array.map(request.measures, fn(m) { m.id });
+        let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
+        let ordering = resolve_ordering(payload, request.ordering, requested_measure_ids, requested_dimension_ids);
+        let partition = check_partition(payload, request, dimensions, ordering);
+        let limit = check_limit(request.limit);
+        let offset = check_offset(request.offset, array.length(request.ordering));
+        let base_entry = get_index(payload.entities, base_entity);
+        let source_plan = match base_entry.union {
+            'None => do {
+                let exists_plans = array.map(exists_specs, fn(spec) { resolve_exists(payload, base_entity, spec) });
+                let exists_targets = array.map(exists_specs, fn(spec) { entity_by_id(payload, spec.target) });
+                # A measure-required entity that is also an existence target is
+                # satisfied by the correlated existence predicate instead of a
+                # fan-out join, so the subject measure is not amplified.
+                let measure_targets = array.concat(array.map(measures, fn(m) { m.entry.requires }));
+                let filtered_measure_targets = array.filter(measure_targets, fn(t) {
+                    !array.any(exists_targets, fn(e) { e == t })
+                });
+                let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
+                let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
+                let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
+                let targets = array.concat([filtered_measure_targets, dim_entities, scope_entities, filter_entities, any_entities]);
+                let joins = select_joins(payload, base_entity, targets);
+                let join_sources = array.map(joins, fn(j) { j.source });
+                let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
+                let result: LoweredSources = { sources, derived: 'None, joins, exists: exists_plans };
+                result
+            },
+            'Some(union) => do {
+                if array.length(exists_specs) > 0 {
+                    fail!("union entity request does not support existence filters")
+                } else {
+                    let measure_targets = array.concat(array.map(measures, fn(m) { m.entry.requires }));
+                    let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
+                    let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
+                    let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
+                    let refs = array.concat([measure_targets, dim_entities, scope_entities, filter_entities, any_entities]);
+                    let refs_ok = array.all(refs, fn(t) { t == base_entity });
+                    if !refs_ok {
+                        fail!("union entity request cannot join or filter another entity")
+                    } else {
+                        let none_sources: Array(qb.Source) = [];
+                        let none_joins: Array(qb.Join) = [];
+                        let none_exists: Array(qb.Exists) = [];
+                        let result: LoweredSources = { sources: none_sources, derived: 'Some(build_union_derived(base_entry, union)), joins: none_joins, exists: none_exists };
+                        result
+                    }
+                }
+            },
+        };
+        let measure_items = array.map(measures, fn(m) {
+            let entity = get_index(payload.entities, m.entry.entity);
+            let field = get_index(entity.fields, m.entry.field);
+            match m.entry.computed {
+                'Some(spec) => qb.computed_item(spec.op, spec.left, spec.right, m.entry.alias),
+                'None => match m.entry.predicate {
+                    'Some(_) => qb.aggregate_filtered(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, 'Some(resolve_measure_predicate(payload, m.entry)), m.entry.alias),
+                    'None => qb.aggregate(m.entry.aggregate, qb.column(entity.alias, field.column), m.distinct, m.entry.alias),
+                },
+            }
+        });
+        let dimension_items = array.map(dimensions, fn(d) {
+            qb.expr_item(dimension_expr(payload, d.entry))
+        });
+        let projection = array.concat([measure_items, dimension_items]);
+        let none_grouping: Array(qb.Expr) = [];
+        let grouping = if measure_count > 0 {
+            array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) })
+        } else {
+            none_grouping
+        };
+        let having_plans = array.map(having_specs, fn(spec) { resolve_having(payload, request.measures, spec) });
+        let no_partition_ordering: Array(qb.OrderBy) = [];
+        let plan: qb.Plan = {
+            revision: payload.revision,
+            sources: source_plan.sources,
+            derived: source_plan.derived,
+            projection,
+            filter: filter_expr,
+            exists: source_plan.exists,
+            joins: source_plan.joins,
+            grouping,
+            having: having_plans,
+            ordering: if partition == 'None { ordering } else { no_partition_ordering },
+            limit: if partition == 'None { limit } else { 'None },
+            offset: if partition == 'None { offset } else { 'None },
+            partition,
+        };
+        qb.validate(plan, payload.profile)
+    }
+};
+
+def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
+    lower_core(payload, request, [], [], [])
+};
+
+# Additive entry: the base QueryRequest plus typed existence filters and
+# aggregate-result (HAVING) predicates.
+def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, exists_specs, having_specs) {
+    lower_core(payload, request, [], exists_specs, having_specs)
+};
+
+# Additive entry with closed OR-groups on the subject filters (AnyOf), combined
+# with existence filters and HAVING predicates in a deterministic order.
+def lower_any: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs) {
+    lower_core(payload, request, any_of_specs, exists_specs, having_specs)
+};
+
+# Count the number of groups of a grouped request that satisfy the given
+# aggregate-result predicates (nested shape 1: count of groups over a
+# `SELECT ... GROUP BY ... HAVING ...` inner query). Ordering/limit/offset/
+# partition do not change a group count and are rejected deterministically.
+def lower_group_count: Fn(PreparedPayload, QueryRequest, Array(HavingRequest)) -> qb.Query = fn(payload, request, having_specs) {
+    if array.length(request.ordering) > 0 {
+        fail!("group count request must not specify an ordering")
+    } else if request.limit != 'None || request.offset != 'None || request.partition != 'None {
+        fail!("group count request must not specify limit, offset or partition")
+    } else if array.length(request.measures) == 0 || array.length(request.dimensions) == 0 {
+        fail!("group count request must select measures and grouping dimensions")
+    } else {
+        let inner = lower_core(payload, request, [], [], having_specs);
+        qb.count_groups(inner, payload.profile)
     }
 };
 
@@ -1546,8 +2285,14 @@ export {
     ComputedDimensionDef,
     JsonDimensionDef,
     EntitySource,
+    EntityId,
+    UnionSourceDef,
+    UnionBranchDecl,
+    UnionColumnDecl,
     RelationDef,
     RelationDecl,
+    RelationPair,
+    RelationKey,
     EnumValueDef,
     RelationKind,
     FilterOp,
@@ -1564,6 +2309,10 @@ export {
     OrderRequest,
     PartitionRequest,
     QueryRequest,
+    ExistsRequest,
+    AnyOfRequest,
+    HavingOp,
+    HavingRequest,
     FieldEntry,
     EnumValueEntry,
     EntityEntry,
@@ -1582,11 +2331,17 @@ export {
     json_dimension,
     json_builder,
     entity_source,
+    entity_id,
+    union_source,
     relation,
+    relation_key,
     enum_value,
     scope,
     build_root,
     lower,
+    lower_full,
+    lower_any,
+    lower_group_count,
     dimension_expr,
     dimension_domain,
     to_bind,

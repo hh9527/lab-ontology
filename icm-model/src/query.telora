@@ -1,0 +1,141 @@
+# ICM dynamic query facade (icm-model.a3)
+#
+# The facade turns a typed ontology request into a parameterized QueryBuilder
+# Query through the model knowledge payload.  It is the single dynamic-query
+# entry consumed by bin/make-query and by contract tests.
+#
+# `Intent` is the wire format used by bin/make-query: it mirrors the ontology
+# QueryRequest fields and additionally carries:
+#   - any_of: OR-group value filters (ontology lower_any);
+#   - exists: correlated existence predicates (optional min_matches / any_of);
+#   - having: group predicates;
+#   - group_count: optional mode switching lowering to the nested
+#     "count of groups passing HAVING" shape (ontology lower_group_count).
+# A request whose `measures` is empty is a measure-less row projection /
+# listing request.
+
+import "@src/model" as model;
+import "ontology/edsl" as edsl;
+import "query/lib" as qb;
+import "std/array" as array;
+
+# Marker for the nested "count of groups passing HAVING" lowering.
+type GroupCountMode = enum { 'CountGroups };
+
+type Intent = struct {
+    measures: Array(edsl.MeasureRequest),
+    dimensions: Array(edsl.DimensionRequest),
+    filters: Array(edsl.FilterRequest),
+    any_of: Array(edsl.AnyOfRequest),
+    ordering: Array(edsl.OrderRequest),
+    limit: Option(Int),
+    offset: Option(Int),
+    partition: Option(edsl.PartitionRequest),
+    exists: Array(edsl.ExistsRequest),
+    having: Array(edsl.HavingRequest),
+    group_count: Option(GroupCountMode),
+};
+
+def intent_to_request: Fn(Intent) -> edsl.QueryRequest = fn(intent) {
+    let request: edsl.QueryRequest = {
+        measures: intent.measures,
+        dimensions: intent.dimensions,
+        filters: intent.filters,
+        ordering: intent.ordering,
+        limit: intent.limit,
+        offset: intent.offset,
+        partition: intent.partition,
+    };
+    request
+};
+
+def intent_from_request: Fn(edsl.QueryRequest) -> Intent = fn(request) {
+    let intent: Intent = {
+        measures: request.measures,
+        dimensions: request.dimensions,
+        filters: request.filters,
+        any_of: [],
+        ordering: request.ordering,
+        limit: request.limit,
+        offset: request.offset,
+        partition: request.partition,
+        exists: [],
+        having: [],
+        group_count: 'None,
+    };
+    intent
+};
+
+# --- unified-device vocabulary routing ------------------------------------
+# Requests that reference the unified five-domain device entity are lowered
+# against `device_payload`; everything else uses the main `payload`.
+
+def request_uses_device_measure: Fn(edsl.MeasureRequest) -> Bool = fn(m) {
+    m.id == "DeviceCount"
+};
+def request_uses_device_dimension: Fn(edsl.DimensionRequest) -> Bool = fn(d) {
+    d.id == "DeviceTenantId" || d.id == "DeviceSiteId"
+};
+def request_uses_device_filter: Fn(edsl.FilterRequest) -> Bool = fn(f) {
+    f.id == "DeviceTenantId" || f.id == "DeviceSiteId"
+};
+def request_uses_device_order: Fn(edsl.OrderRequest) -> Bool = fn(o) {
+    match o.target {
+        'Dimension(name) => name == "DeviceTenantId" || name == "DeviceSiteId",
+        'Measure(_) => 'False,
+    }
+};
+def request_uses_device_having: Fn(edsl.HavingRequest) -> Bool = fn(h) {
+    h.measure == "DeviceCount"
+};
+def intent_uses_device: Fn(Intent) -> Bool = fn(intent) {
+    array.any(intent.measures, request_uses_device_measure)
+        || array.any(intent.dimensions, request_uses_device_dimension)
+        || array.any(intent.filters, request_uses_device_filter)
+        || array.any(intent.ordering, request_uses_device_order)
+        || array.any(intent.having, request_uses_device_having)
+};
+
+def select_payload: Fn(Intent) -> edsl.PreparedPayload = fn(intent) {
+    if intent_uses_device(intent) {
+        model.device_payload
+    } else {
+        model.payload
+    }
+};
+
+# Lower a plain QueryRequest (measure-less or aggregated) to a Query.
+def make_query: Fn(edsl.QueryRequest) -> qb.Query = fn(request) {
+    let intent: Intent = intent_from_request(request);
+    let payload: edsl.PreparedPayload = select_payload(intent);
+    let plan: qb.Plan = edsl.lower(payload, request);
+    qb.transform_sqlite(plan)
+};
+
+# Lower a full Intent:
+#   - group_count = 'Some('CountGroups) -> nested "count of groups passing
+#     HAVING" (returns Query directly through ontology lower_group_count);
+#   - otherwise -> ontology lower_any (request + any_of OR-groups + exists with
+#     optional min_matches/any_of + having) then transform.
+def make_intent_query: Fn(Intent) -> qb.Query = fn(intent) {
+    let payload: edsl.PreparedPayload = select_payload(intent);
+    match intent.group_count {
+        'Some('CountGroups) => edsl.lower_group_count(
+            payload,
+            intent_to_request(intent),
+            intent.having,
+        ),
+        _ => {
+            let plan: qb.Plan = edsl.lower_any(
+                payload,
+                intent_to_request(intent),
+                intent.any_of,
+                intent.exists,
+                intent.having,
+            );
+            qb.transform_sqlite(plan)
+        }
+    }
+};
+
+export { Intent, GroupCountMode, intent_to_request, intent_from_request, make_query, make_intent_query };

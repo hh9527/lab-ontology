@@ -18,6 +18,7 @@ def flag_true: Bool = 'True;
 def flag_false: Bool = 'False;
 def eq_ops: Array(edsl.FilterOp) = ['Eq];
 def ge_le_ops: Array(edsl.FilterOp) = ['Ge, 'Le];
+def text_search_ops: Array(edsl.FilterOp) = ['Eq, 'Ne, 'Contains, 'NotContains, 'StartsWith, 'EndsWith];
 def text_kinds: Array(edsl.FilterInputKind) = ['Text];
 def int_kinds: Array(edsl.FilterInputKind) = ['Int];
 def no_ops: Array(edsl.FilterOp) = [];
@@ -65,6 +66,7 @@ def head_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
 # Canonical (alphabetical) field order: 0: amount (measure),
 # 1: created_at (computed dimension base), 2: customer_id (relation FK),
 # 3: order_id (key), 4: region (dimension).
+@edsl.entity_id("orders")
 @edsl.entity_source("orders", "o")
 @edsl.relation(Customer, safe_kind, 2, 1)
 type Order = struct {
@@ -79,7 +81,7 @@ type Order = struct {
     @edsl.measure("OrderAmount", sum_agg, requires_none)
     amount: Float,
     @edsl.column("region")
-    @edsl.dimension("OrderRegion", flag_true, flag_true, eq_ops, text_kinds)
+    @edsl.dimension("OrderRegion", flag_true, flag_true, text_search_ops, text_kinds)
     region: String,
     @edsl.column("created_at")
     @edsl.computed_dimension("OrderWeek", flag_true, flag_true, ge_le_ops, text_kinds, week_builder)
@@ -106,6 +108,7 @@ type CustomerTier = enum {
     'Bronze,
 };
 
+@edsl.entity_id("customers")
 @edsl.entity_source("customers", "c")
 @edsl.relation(Order, fanout_kind, 1, 2)
 type Customer = struct {
@@ -128,6 +131,7 @@ type Customer = struct {
 # as required entities, forcing grain-safe joins even without dimensions.
 # Canonical (alphabetical) field order: 0: amount (measure), 1: id (key),
 # 2: order_id (relation FK).
+@edsl.entity_id("items")
 @edsl.entity_source("items", "i")
 @edsl.relation(Order, safe_kind, 2, 3)
 type Item = struct {
@@ -155,6 +159,7 @@ type TraceKind = enum {
     'Skip,
 };
 
+@edsl.entity_id("traces")
 @edsl.entity_source("traces", "t")
 type Trace = struct {
     @edsl.column("id")
@@ -190,6 +195,7 @@ type ApprovalStatus = enum {
     'Rejected,
 };
 
+@edsl.entity_id("approvals")
 @edsl.entity_source("approvals", "a")
 type Approval = struct {
     @edsl.column("id")
@@ -214,6 +220,7 @@ type Approval = struct {
 # path stays a parameterized String binding, never SQL text.
 # Canonical (alphabetical) field order: 0: attributes_json (JSON document),
 # 1: id (key), 2: owner (dimension).
+@edsl.entity_id("devices")
 @edsl.entity_source("devices", "d")
 type Device = struct {
     @edsl.column("attributes_json")
@@ -229,6 +236,84 @@ type Device = struct {
     owner: String,
 };
 
+# Domain-neutral one-to-many Parent -> Child pair. Both directions of the same
+# foreign key are declared (Parent -> Child fan-out and Child -> Parent safe) to
+# prove build_root is cycle-safe; existence filters never join the fan-out edge,
+# so subject counts are not amplified by child rows.
+# Canonical (alphabetical) field order: 0: id (key/measure).
+@edsl.entity_id("parents")
+@edsl.entity_source("parents", "p")
+@edsl.relation(Child, fanout_kind, 0, 2)
+type Parent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("ParentCount", count_agg, requires_none)
+    id: Int,
+};
+
+# Canonical (alphabetical) field order: 0: id (key/measure), 1: name
+# (dimension), 2: parent_id (FK to Parent).
+@edsl.entity_id("children")
+@edsl.entity_source("children", "k")
+@edsl.relation(Parent, safe_kind, 2, 0)
+type Child = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("ChildCount", count_agg, requires_none)
+    id: Int,
+    @edsl.column("name")
+    @edsl.dimension("ChildName", flag_true, flag_true, text_search_ops, text_kinds)
+    name: String,
+    @edsl.column("parent_id")
+    parent_id: Int,
+};
+
+# Domain-neutral union (multi-source) entity: two item tables with the same
+# logical fields but genuinely different physical column names are merged under
+# one logical alias. Branch A exposes the logical names directly; branch B maps
+# group_id/item_id/owner_id to category_key/resource_key/account_key and is
+# restricted to kind = retail rows by a fixed branch filter. The outer query
+# treats MergedItem as one logical entity (no physical source, no join, no
+# EXISTS).
+# Canonical (alphabetical) field order: 0: group_id (dimension), 1: item_id
+# (key/measure), 2: kind (dimension), 3: owner_id (dimension).
+def merged_item_branch_a_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "group_id" },
+    { field: 1, column: "item_id" },
+    { field: 2, column: "kind" },
+    { field: 3, column: "owner_id" },
+];
+
+def merged_item_branch_b_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "category_key" },
+    { field: 1, column: "resource_key" },
+    { field: 2, column: "kind" },
+    { field: 3, column: "account_key" },
+];
+
+def merged_item_branches: Array(edsl.UnionBranchDecl) = [
+    { table: "items_a", alias: "a", columns: merged_item_branch_a_cols, filter: 'None },
+    { table: "items_b", alias: "b", columns: merged_item_branch_b_cols, filter: 'Some({ field: 2, op: 'Eq, input: 'Text("retail") }) },
+];
+
+@edsl.entity_id("merged_items")
+@edsl.union_source("u", merged_item_branches)
+type MergedItem = struct {
+    @edsl.column("group_id")
+    @edsl.dimension("ItemGroup", flag_true, flag_true, eq_ops, int_kinds)
+    group_id: Int,
+    @edsl.column("item_id")
+    @edsl.key(flag_true)
+    @edsl.measure("ItemCount", count_agg, requires_none)
+    item_id: Int,
+    @edsl.column("kind")
+    @edsl.dimension("ItemKind", flag_true, flag_true, eq_ops, text_kinds)
+    kind: String,
+    @edsl.column("owner_id")
+    @edsl.dimension("ItemOwner", flag_true, flag_true, eq_ops, int_kinds)
+    owner_id: Int,
+};
+
 # --- PlanProfile accepted by this knowledge ----------------------------------
 
 def requires_none: Array(Type) = [];
@@ -238,12 +323,13 @@ def requires_order_customer: Array(Type) = [Order, Customer];
 def profile: qb.PlanProfile = {
     allowed_operators: [
         'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
-        'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset, 'Partition,
+        'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order,
+        'Limit, 'Offset, 'Partition,
     ],
     allowed_join_kinds: ['Inner, 'Left],
     allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
     allowed_scalars: [
-        'Substr, 'Instr, 'If, 'Add, 'Sub,
+        'Substr, 'Instr, 'If, 'Add, 'Sub, 'Lower, 'Length,
         'JsonExtract, 'JsonType, 'JsonValid,
         'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
     ],
@@ -259,7 +345,7 @@ def authorize: Fn(String) -> Bool = fn(subject) {
 # --- Prepared payload (computed once at module load) -------------------------
 
 def payload: edsl.PreparedPayload = do {
-    let entity_types: Array(Type) = [Order, Customer, Item, Trace, Approval, Device];
+    let entity_types: Array(Type) = [Order, Customer, Item, Trace, Approval, Device, Parent, Child, MergedItem];
     let result: edsl.PreparedPayload = edsl.build_root(
         "fictional-v2",
         entity_types,
@@ -279,6 +365,9 @@ export {
     Approval,
     ApprovalStatus,
     Device,
+    Parent,
+    Child,
+    MergedItem,
     profile,
     payload,
 };

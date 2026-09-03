@@ -33,7 +33,7 @@ integer、number 和 boolean。`Query.sql` 只含合法标识符、算子和 `?`
 type ColumnRef = struct { source: String, column: String };
 
 type ScalarFunction = enum {
-    'Substr, 'Instr, 'If, 'Add, 'Sub,
+    'Substr, 'Instr, 'If, 'Add, 'Sub, 'Lower, 'Length,
     'JsonExtract, 'JsonType, 'JsonValid,
     'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
 };
@@ -76,6 +76,25 @@ alias 做 `'Add`/`'Sub` 算术组合。
 > 构造器均为公共契约的一部分。下游对 `SelectItem` 做穷尽 match 时必须处理
 > `'Computed`，否则会因 non-exhaustive match 无法编译。
 
+> **公共破坏性契约（新一轮）**：`JoinCondition` 从单一等值 struct 变为封闭的
+> `'Eq`/`'And`/`'Or` 树；`Join.condition` 使用该树类型。`Plan` 新增 `exists` 与
+> `having` 字段，`Operator` 新增 `'Exists`/`'Having`，`ScalarFunction` 新增
+> `'Lower`/`'Length`。构建 Plan/Join 的下游应使用 `qb.join`/`qb.join_on`、
+> `qb.exists`、`qb.having` 等构造器，并为记录字面量补上新字段；对 `Operator` 或
+> `ScalarFunction` 做穷尽 match 的下游必须处理新 variant。
+
+> **公共破坏性契约（嵌套聚合轮）**：`Having.measure` 改为 `HavingMeasure`
+> （`'Ref`/`'Call`）；`Exists` 新增 `grouping` 与 `having` 字段。新增构造器
+> `qb.having_call`、`qb.exists_grouped` 与转换 `qb.count_groups`。新建 Exists 的
+> 下游应继续使用 `qb.exists`/`qb.exists_grouped`，不要直接写 Exists 记录字面量；
+> 对 `Having.measure` 做穷尽 match 的下游必须处理 `'Call`。
+
+> **公共破坏性契约（派生 UNION ALL 轮）**：`Plan` 新增 `derived` 字段
+> （`Option(DerivedSource)`）；新增 `UnionColumn`/`UnionBranch`/`DerivedSource`
+> 类型与 `qb.union_column`/`qb.union_branch`/`qb.derived_source` 构造器。所有 Plan
+> 记录字面量必须补 `derived: 'None`（使用派生源时置 `'Some(qb.derived_source(...))`
+> 并把 `sources` 留空）；对 Plan 做穷尽构造的下游必须处理新字段。
+
 标量语义（与 SQLite 行为一致）：
 
 | 函数 | 参数 | 语义 |
@@ -84,6 +103,8 @@ alias 做 `'Add`/`'Sub` 算术组合。
 | `'Instr` | 2 | `instr(haystack, needle)`：needle 首次出现的 1-based 位置，缺失为 `0` |
 | `'If` | 3 | `CASE WHEN cond THEN then ELSE else END`；cond 非零为真，NULL 走 ELSE |
 | `'Add` / `'Sub` | 2 | 整数算术，渲染为 `(a + b)` / `(a - b)` |
+| `'Lower` | 1 | `lower(value)`：大小写归一；默认 SQLite build 只折叠 ASCII A-Z |
+| `'Length` | 1 | `length(value)`：文本按字符计数的长度 |
 | `'JsonExtract` | 2 | `json_extract(document, path)`；path 必须是字符串 Bind |
 | `'JsonType` | 2 | `json_type(document, path)`；path 必须是字符串 Bind |
 | `'JsonValid` | 1 | `json_valid(document)` |
@@ -106,20 +127,62 @@ SQLite JSON1 v1 词汇（`'JsonExtract`/`'JsonType`/`'JsonValid`）同样属于
 ```telora
 type Source = struct { alias: String, table: String };
 type JoinKind = enum { 'Inner, 'Left };
-type JoinCondition = struct { left: ColumnRef, right: ColumnRef };
+type ColumnEq = struct { left: ColumnRef, right: ColumnRef };
+type JoinCondition = enum {
+    'Eq(ColumnEq),
+    'And(Array(JoinCondition)),
+    'Or(Array(JoinCondition)),
+};
 type Join = struct { kind: JoinKind, source: Source, condition: JoinCondition };
 type Ordering = enum { 'Asc, 'Desc };
 type AggregateRef = struct { alias: String };
 type OrderKey = enum { 'Expr(Expr), 'AggregateRef(AggregateRef) };
 type OrderBy = struct { key: OrderKey, direction: Ordering };
 
+# Correlated EXISTS (semi-join) filter; `grouping`/`having` make it a
+# correlated aggregate EXISTS.  See "存在性过滤 (EXISTS)" and "嵌套聚合".
+type Exists = struct {
+    source: Source,
+    pairs: Array(ColumnEq),
+    filter: Option(Expr),
+    grouping: Array(Expr),
+    having: Array(Having),
+};
+
+# Aggregate-result predicate; see "HAVING" and "嵌套聚合".
+type HavingOp = enum { 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge };
+type HavingMeasure = enum {
+    'Ref(AggregateRef),
+    'Call(AggregateCall),
+};
+type Having = struct {
+    op: HavingOp,
+    measure: HavingMeasure,
+    threshold: Val,
+};
+
+# Derived UNION ALL source; see "派生 UNION ALL 关系（derived source）".
+type UnionColumn = struct { name: String, expr: Expr };
+type UnionBranch = struct {
+    source: Source,
+    outputs: Array(UnionColumn),
+    filter: Option(Expr),
+};
+type DerivedSource = struct {
+    alias: String,
+    branches: Array(UnionBranch),
+};
+
 type Plan = struct {
     revision: String,
     sources: Array(Source),
+    derived: Option(DerivedSource),
     projection: Array(SelectItem),
     filter: Option(Expr),
+    exists: Array(Exists),
     joins: Array(Join),
     grouping: Array(Expr),
+    having: Array(Having),
     ordering: Array(OrderBy),
     limit: Option(Int),
     offset: Option(Int),
@@ -140,6 +203,8 @@ type PartitionedTopN = struct {
 若干行；二者都不等于“已覆盖全量”。有限结果不能作为已遍历全部数据的证明，上层
 必须显式分页。
 
+`exists` 是保持 base grain 的相关存在性过滤（见下文“存在性过滤 (EXISTS)”）。
+`having` 是聚合结果谓词（见下文“HAVING”），其阈值永远作为 `?` 绑定。
 `partition` 是受限的分组内 Top N 阶段（见下文“分组内 Top N”）。
 
 ### 能力 Profile
@@ -147,7 +212,8 @@ type PartitionedTopN = struct {
 ```telora
 type Operator = enum {
     'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
-    'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset, 'Partition,
+    'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order,
+    'Limit, 'Offset, 'Partition,
 };
 
 type PlanProfile = struct {
@@ -171,6 +237,7 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `validate_structure` | `Fn(Plan) -> Plan` | 结构非法时 `fail!`，成功时返回原 Plan |
 | `validate` | `Fn(Plan, PlanProfile) -> Plan` | 结构或能力非法时 `fail!`，成功时返回原 Plan |
 | `transform_sqlite` | `Fn(Plan) -> Query` | 合法 Plan 确定性转换为 SQLite Query |
+| `count_groups` | `Fn(Plan, PlanProfile) -> Query` | 结构/profile 校验内层后，统计通过 HAVING 的组数（嵌套聚合形状 1） |
 | `is_sql_identifier` | `Fn(String) -> Bool` | 检查 `^[A-Za-z_][A-Za-z0-9_]*$` |
 
 常用纯构造函数：
@@ -185,6 +252,8 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `instr` | `Fn(Expr, Expr) -> Expr` |
 | `scalar_if` | `Fn(Expr, Expr, Expr) -> Expr` |
 | `add` / `sub` | `Fn(Expr, Expr) -> Expr` |
+| `lower` | `Fn(Expr) -> Expr` |
+| `length` | `Fn(Expr) -> Expr` |
 | `expr_item` | `Fn(Expr) -> SelectItem` |
 | `aggregate` | `Fn(AggregateFunction, Expr, Bool, String) -> SelectItem` |
 | `aggregate_filtered` | `Fn(AggregateFunction, Expr, Bool, Option(Expr), String) -> SelectItem` |
@@ -193,7 +262,18 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `json_extract` / `json_type` | `Fn(Expr, String) -> Expr` |
 | `json_valid` | `Fn(Expr) -> Expr` |
 | `source` | `Fn(String, String) -> Source` |
+| `column_eq` | `Fn(ColumnRef, ColumnRef) -> ColumnEq` |
+| `on_eq` | `Fn(ColumnRef, ColumnRef) -> JoinCondition` |
+| `on_and` / `on_or` | `Fn(Array(JoinCondition)) -> JoinCondition` |
 | `join` | `Fn(JoinKind, Source, ColumnRef, ColumnRef) -> Join` |
+| `join_on` | `Fn(JoinKind, Source, JoinCondition) -> Join` |
+| `exists` | `Fn(Source, Array(ColumnEq), Option(Expr)) -> Exists` |
+| `exists_grouped` | `Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array(Having)) -> Exists` |
+| `having` | `Fn(HavingOp, String, Val) -> Having` |
+| `having_call` | `Fn(HavingOp, AggregateFunction, Expr, Bool, Val) -> Having` |
+| `union_column` | `Fn(String, Expr) -> UnionColumn` |
+| `union_branch` | `Fn(Source, Array(UnionColumn), Option(Expr)) -> UnionBranch` |
+| `derived_source` | `Fn(String, Array(UnionBranch)) -> DerivedSource` |
 | `asc` / `desc` | `Fn(Expr) -> OrderBy` |
 | `asc_aggregate` / `desc_aggregate` | `Fn(String) -> OrderBy` |
 | `order_by` | `Fn(OrderKey, Ordering) -> OrderBy` |
@@ -224,7 +304,10 @@ def plan: qb.Plan = {
     ],
     limit: 'Some(5),
     offset: 'None,
+    exists: [],
+    having: [],
     partition: 'None,
+    derived: 'None,
 };
 
 def profile: qb.PlanProfile = {
@@ -289,7 +372,10 @@ def plan: qb.Plan = {
     ordering: [qb.desc_aggregate("uses")],
     limit: 'Some(100),
     offset: 'None,
+    exists: [],
+    having: [],
     partition: 'None,
+    derived: 'None,
 };
 ```
 
@@ -340,7 +426,10 @@ def page: qb.Plan = {
     ordering: [qb.desc_aggregate("uses"), qb.asc(qb.column("c", "command"))],
     limit: 'Some(100),
     offset: 'Some(100),
+    exists: [],
+    having: [],
     partition: 'None,
+    derived: 'None,
 };
 ```
 
@@ -379,6 +468,9 @@ def per_role: qb.Plan = {
     ordering: [],
     limit: 'None,
     offset: 'None,
+    exists: [],
+    having: [],
+    derived: 'None,
     partition: 'Some(qb.partitioned_top_n(
         [qb.column("e", "role")],
         [qb.desc_aggregate("event_count"), qb.asc(qb.column("e", "command_head"))],
@@ -449,7 +541,10 @@ def per_role_net: qb.Plan = {
     ordering: [qb.desc_aggregate("outstanding")],
     limit: 'None,
     offset: 'None,
+    exists: [],
+    having: [],
     partition: 'None,
+    derived: 'None,
 };
 ```
 
@@ -516,7 +611,10 @@ def attempts: qb.Plan = {
     ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id"))],
     limit: 'None,
     offset: 'None,
+    exists: [],
+    having: [],
     partition: 'None,
+    derived: 'None,
 };
 ```
 
@@ -547,35 +645,405 @@ Query AST 内修复 malformed JSON）：
 path binding 在 projection、filter、grouping、ordering、computed dimension 与
 partition ordering 中保持严格占位符顺序与重复表达式确定性。
 
+## 大小写归一与子串语义（Lower / Length / Instr / Substr）
+
+`'Lower`（`lower(value)`）是唯一的大小写归一标量。默认 SQLite build 只折叠
+ASCII A-Z；非 ASCII 保持不变。`'Instr` 与 `'Substr` 是大小写敏感的
+（SQLite 默认），`'Substr`/`'Instr`/`'Length` 都按字符而不是字节计算。上层可以用
+同一组封闭标量稳定实现四种子串关系：
+
+| 关系 | 大小写敏感 | 表达式 |
+| --- | --- | --- |
+| contains | 敏感 | `instr(col, ?) > 0` |
+| contains | 不敏感 | `instr(lower(col), lower(?)) > 0` |
+| starts-with | 不敏感 | `instr(lower(col), lower(?)) = 1` |
+| not-contains | 敏感 | `instr(col, ?) = 0` |
+| ends-with | 不敏感 | `substr(lower(col), length(lower(col)) - length(lower(?)) + 1) = lower(?)` |
+
+动态值（如 `lower(?)` 内的文本）永远通过 `?` 进入 bindings；SQL 文本不嵌入用户
+字面量。`lower(col) = lower(?)` 是参数化比较前统一口径的标准写法。示例：
+
+```telora
+let ci_contains: qb.Expr = qb.scalar('Gt, [
+    qb.instr(qb.lower(qb.column("c", "command")), qb.lower(qb.bind_string("run"))),
+    qb.bind_int(0),
+]);
+```
+
+## HAVING
+
+`Plan.having` 是聚合结果谓词数组（空数组表示没有 HAVING），各条之间为 AND。
+每条 `Having {op, measure, threshold}` 表示 `<measure> <op> <threshold>`：
+
+- `measure` 是 `HavingMeasure`：
+  - `'Ref(AggregateRef)` 命名投影中已声明的 aggregate/computed aggregate alias
+    （构造器 `qb.having(op, alias, threshold)`）；
+  - `'Call(AggregateCall)` 是直接聚合表达式，如 `count(child.id)`，不要求先投影
+    （构造器 `qb.having_call(op, function, arg, distinct, threshold)`），用于嵌套
+    聚合体（count_groups 内层、correlated aggregate EXISTS）；
+- `threshold` 是动态标量，永远成为该条件末尾的 `?` 绑定；
+- measure 按声明重新展开完整聚合表达式，因此带 FILTER 的 measure 会在 HAVING 中
+  按其占位符顺序重复绑定；
+- HAVING 消耗 `'Having` operator，`'Call` measure 额外消耗其 AggregateCall 的
+  operator/aggregate/scalar 用法，并递归进入 profile 检查；
+- HAVING 必须出现在 profile 的 `allowed_operators` 中。
+
+```telora
+def roles_over_n: qb.Plan = {
+    revision: "roles-over-n-v1",
+    sources: [qb.source("e", "events")],
+    projection: [
+        qb.expr_item(qb.column("e", "role")),
+        qb.aggregate('Count, qb.column("e", "id"), 'False, "event_count"),
+    ],
+    filter: 'None,
+    exists: [],
+    joins: [],
+    grouping: [qb.column("e", "role")],
+    having: [qb.having('Gt, "event_count", 'Int(5))],
+    ordering: [qb.desc_aggregate("event_count")],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    derived: 'None,
+};
+```
+
+```sql
+SELECT e.role, count(e.id) AS event_count
+FROM events AS e
+GROUP BY e.role
+HAVING count(e.id) > ?
+ORDER BY count(e.id) DESC
+```
+
+HAVING 与全局 `limit`/`offset`/`ordering` 以及分组内 Top N 可以组合；与分组内
+Top N 组合时，HAVING 进入内层分组查询（在 `GROUP BY` 之后），`take` 绑定仍在外层。
+HAVING 引用未投影或未知的 measure、非聚合/计算 alias 都会在结构校验中原子拒绝。
+
+## 嵌套聚合
+
+单层 `SELECT ... GROUP BY ... HAVING ...` 之上的两种通用形状由封闭的嵌套聚合
+原语表达，全部复用同一套 Plan/Expr/Aggregate/Having 类型，不引入 raw SQL、
+开放函数名或业务专用节点。Profile 递归收窄嵌套体内部使用的 operator、aggregate
+与 scalar，任何内层结构/profile/引用错误都原子失败、不发布部分 Query。
+
+### 形状 1：对满足 HAVING 的组计数（`count_groups`）
+
+`qb.count_groups(inner_plan, profile)` 先对 `inner_plan` 做结构校验与 profile
+校验，再渲染为
+
+```text
+SELECT count(1) FROM (<inner_plan 查询>) AS __q_count
+```
+
+`parents/children` fixture：按 parent 分组统计 child，保留 `count(child.id) > ?`
+的组，外层返回满足条件的 parent 组数。
+
+```telora
+def inner: qb.Plan = {
+    revision: "parents-over-n-v1",
+    sources: [qb.source("c", "children")],
+    projection: [qb.expr_item(qb.column("c", "parent_id"))],
+    filter: 'None,
+    exists: [],
+    joins: [],
+    grouping: [qb.column("c", "parent_id")],
+    having: [qb.having_call('Gt, 'Count, qb.column("c", "id"), 'False, 'Int(3))],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    derived: 'None,
+};
+
+let nested: qb.Query = qb.count_groups(inner, profile);
+```
+
+```sql
+SELECT count(1) FROM (SELECT c.parent_id FROM children AS c
+                      GROUP BY c.parent_id HAVING count(c.id) > ?) AS __q_count
+```
+
+同一 inner Plan + profile 两次输出逐字节相同；bindings 严格是内层占位符顺序
+（此例为阈值 `3`）。内层 HAVING 引用未知列/别名会被结构校验拒绝；profile 缺少
+Aggregate/Group/Having operator 或 `Count` 聚合会拒绝内层，子查询无法绕过 profile。
+
+### 形状 2：相关聚合 EXISTS（`exists_grouped`）
+
+`qb.exists_grouped(source, pairs, filter, grouping, having)` 构造带内层
+`GROUP BY` 与 `HAVING` 的相关 EXISTS。匹配 inner source 的行先按 `grouping`
+分组，只有 `having` 成立的组让 EXISTS 为真。EXISTS 仍是纯谓词：不产生 JOIN，
+外层 COUNT/SUM 保持 base grain。
+
+`subjects/events` fixture：外层保持 subject grain，只保留具有至少 N 条匹配
+event 的 subject。
+
+```telora
+def subjects_min: qb.Plan = {
+    revision: "subjects-min-events-v1",
+    sources: [qb.source("s", "subjects")],
+    projection: [qb.aggregate('Count, qb.column("s", "id"), 'False, "subject_count")],
+    filter: 'None,
+    exists: [qb.exists_grouped(
+        qb.source("e", "events"),
+        [qb.column_eq(qb.column_ref("s", "id"), qb.column_ref("e", "subject_id"))],
+        'Some(qb.scalar('Eq, [qb.column("e", "kind"), qb.bind_string("measuring")])),
+        [qb.column("e", "subject_id")],
+        [qb.having_call('Ge, 'Count, qb.column("e", "id"), 'False, 'Int(3))],
+    )],
+    joins: [],
+    grouping: [],
+    having: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    derived: 'None,
+};
+```
+
+```sql
+SELECT count(s.id) AS subject_count
+FROM subjects AS s
+WHERE EXISTS (SELECT 1 FROM events AS e
+              WHERE s.id = e.subject_id AND e.kind = ?
+              GROUP BY e.subject_id HAVING count(e.id) >= ?)
+```
+
+相关引用规则与普通 EXISTS 相同：`pairs` 的 left 是当前可见 outer alias 列、
+right 是 inner alias 列；inner 的 filter/grouping/HAVING 表达式只能引用 outer
+主 alias 与 inner alias。inner alias 遮蔽主 alias、空 pairs、未知 inner 列、
+未知 outer 引用都被结构校验原子拒绝。EXISTS 内层没有投影 measure，因此其
+HAVING 只接受直接 `'Call` 聚合表达式（`'Ref` 会被拒绝）。profile 递归收窄内层
+`'Exists`/`'Group`/`'Having`/`'Aggregate` operator、`allowed_aggregates` 与
+`allowed_scalars`。
+
+## 派生 UNION ALL 关系（derived source）
+
+把多个同 grain 的物理来源规范为一个逻辑关系，再在外层分组/聚合/分区，由
+`Plan.derived: Option(DerivedSource)` 表达：
+
+```telora
+type UnionColumn = struct { name: String, expr: Expr };
+type UnionBranch = struct { source: Source, outputs: Array(UnionColumn), filter: Option(Expr) };
+type DerivedSource = struct { alias: String, branches: Array(UnionBranch) };
+```
+
+- `branches` 是有序的非空分支列表，用 `UNION ALL` 合并；每个分支把 `source`
+  投影到相同的非空具名 `outputs`（顺序与 `name` 全部分支一致）；
+- 合并结果不是终结 Query，而是外层 Plan 的具名 source `alias`：外层可以对派生
+  列做 projection、filter、aggregate、grouping、HAVING、ordering 与现有
+  PartitionRequest；
+- 分支与外层只使用封闭 Plan/Expr/Aggregate/Order 体系；无 raw SQL、开放函数名、
+  任意表/列 fragment 或 schema 推断。UNION 去重、递归 CTE 与任意嵌套 SQL 不在
+  范围内。
+
+两个同 grain item 表合并后按 owner/group 计数，再用分区 Top 1 对每个 owner 取
+item 最多的 group：
+
+```telora
+def u: qb.DerivedSource = qb.derived_source("u", [
+    qb.union_branch(qb.source("a", "items_a"), [
+        qb.union_column("owner_id", qb.column("a", "owner_id")),
+        qb.union_column("group_id", qb.column("a", "group_id")),
+        qb.union_column("item_id", qb.column("a", "item_id")),
+    ], 'Some(qb.scalar('Eq, [qb.column("a", "kind"), qb.bind_string("x")]))),
+    qb.union_branch(qb.source("b", "items_b"), [
+        qb.union_column("owner_id", qb.column("b", "owner_id")),
+        qb.union_column("group_id", qb.column("b", "group_id")),
+        qb.union_column("item_id", qb.column("b", "item_id")),
+    ], 'None),
+]);
+
+def per_owner_top_group: qb.Plan = {
+    revision: "per-owner-top-group-v1",
+    sources: [],
+    derived: 'Some(u),
+    projection: [
+        qb.expr_item(qb.column("u", "owner_id")),
+        qb.expr_item(qb.column("u", "group_id")),
+        qb.aggregate('Count, qb.column("u", "item_id"), 'False, "item_count"),
+    ],
+    filter: 'None,
+    exists: [],
+    joins: [],
+    grouping: [qb.column("u", "owner_id"), qb.column("u", "group_id")],
+    having: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some(qb.partitioned_top_n(
+        [qb.column("u", "owner_id")],
+        [qb.desc_aggregate("item_count"), qb.asc(qb.column("u", "group_id"))],
+        1,
+    )),
+};
+```
+
+生成的 SQL 形状（bindings 恒按分支声明顺序后接外层表达式顺序）：
+
+```sql
+SELECT __q_0, __q_1, item_count
+FROM (SELECT u.owner_id AS __q_0, u.group_id AS __q_1, count(u.item_id) AS item_count,
+             row_number() OVER (PARTITION BY u.owner_id
+                                ORDER BY count(u.item_id) DESC, u.group_id ASC) AS __q_rn
+      FROM (SELECT a.owner_id AS owner_id, a.group_id AS group_id, a.item_id AS item_id
+            FROM items_a AS a WHERE a.kind = ?
+            UNION ALL
+            SELECT b.owner_id AS owner_id, b.group_id AS group_id, b.item_id AS item_id
+            FROM items_b AS b) AS u
+      GROUP BY u.owner_id, u.group_id) AS __partitioned
+WHERE __q_rn <= ?
+ORDER BY __q_0 ASC, item_count DESC, __q_1 ASC
+```
+
+结构校验（原子失败）：
+- `derived` 出现时 `sources`/`joins`/`exists` 必须为空；
+- 空分支、输出列为空、输出列名非法/重复、各分支列数或别名顺序不一致；
+- 派生 alias 与分支 source alias 必须隔离（遮蔽被拒绝）；分支内部只能引用自己
+  的 source alias；外层只能引用 `alias` 上已投影的输出列（未投影列被拒绝）；
+- 分支或外层的表达式继续受 identifier/arity/参数化约束。
+
+profile 递归：`operators`/`profile_accepts` 递归计入每个分支的
+source/operator/scalar（通过 `derived_operators` 与 `derived_branches_scalars_ok`），
+外层另计自身 operator/aggregate/scalar；因此派生来源不能绕过 source
+allow-list、分页或参数化约束。任一分支失败不发布部分 Query；同一结构重复转换
+逐字节一致。
+
+## 存在性过滤（EXISTS）
+
+`Plan.exists` 是相关子查询形式的半连接过滤（semi-join）：每条
+`Exists {source, pairs, filter, grouping, having}` 渲染为
+
+```text
+EXISTS (SELECT 1 FROM <table> AS <alias>
+        WHERE <left.col = alias.col> [AND ...] [AND <filter>]
+              [GROUP BY ...] [HAVING ...])
+```
+
+- `pairs` 非空，且每条 `ColumnEq` 的 `left` 是外层主 alias 的列，`right` 是
+  `source.alias` 的列；`source.alias` 不得与外层主 alias 重名；
+- `filter` 可选，是内层附加行谓词，其列只能引用外层主 alias 与 `source.alias`；
+- `grouping`/`having` 非空时是相关聚合 EXISTS（见“嵌套聚合”形状 2）；
+- 渲染为纯谓词，不产生 JOIN，因此外层 COUNT/SUM 不会被相关行的 fan-out 放大——
+  回答“存在相关告警的设备”一类问题；
+- 消耗 `'Exists` operator，必须出现在 `allowed_operators` 中。
+
+```telora
+def devices_with_alerts: qb.Plan = {
+    revision: "devices-with-alerts-v1",
+    sources: [qb.source("d", "devices")],
+    projection: [qb.aggregate('Count, qb.column("d", "id"), 'False, "device_count")],
+    filter: 'None,
+    exists: [qb.exists(
+        qb.source("a", "alerts"),
+        [qb.column_eq(qb.column_ref("d", "id"), qb.column_ref("a", "device_id"))],
+        'None,
+    )],
+    joins: [],
+    grouping: [],
+    having: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    derived: 'None,
+};
+```
+
+```sql
+SELECT count(d.id) AS device_count
+FROM devices AS d
+WHERE EXISTS (SELECT 1 FROM alerts AS a WHERE d.id = a.device_id)
+```
+
+非法引用（空 pairs、inner 列不是本 source、outer 列不是主 alias、内层 filter
+引用未知 alias、inner alias 与主 alias 重名）都会在结构校验中原子拒绝。
+
+## 角色化 Join 与结构化 ON 条件
+
+`JoinCondition` 是封闭的 ON 谓词树：`'Eq(ColumnEq)` 原子由
+`'And`/`'Or`（非空数组）组合。同一物理目标可以用多个别名作为角色（a/z 端、站点
+双口径等）：每个角色是 `plan.sources`/`plan.joins` 中一个独立 alias，ON 谓词在
+这些 alias 之间比较列。仍无 raw SQL、开放函数名或 identifier 逃逸。
+
+```telora
+def site_dual: qb.Plan = {
+    revision: "site-dual-v1",
+    sources: [qb.source("m", "movements")],
+    projection: [
+        qb.expr_item(qb.column("m", "id")),
+        qb.expr_item(qb.column("a", "name")),
+        qb.expr_item(qb.column("z", "name")),
+    ],
+    filter: 'None,
+    exists: [],
+    joins: [
+        # a 端与 z 端是同一张 endpoints 表的两个角色。
+        qb.join('Inner, qb.source("a", "endpoints"),
+            qb.column_ref("m", "a_id"), qb.column_ref("a", "id")),
+        qb.join_on('Inner, qb.source("z", "endpoints"),
+            qb.on_or([
+                qb.on_eq(qb.column_ref("m", "z_id"), qb.column_ref("z", "id")),
+                qb.on_eq(qb.column_ref("a", "parent_id"), qb.column_ref("z", "id")),
+            ])),
+    ],
+    grouping: [],
+    having: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    derived: 'None,
+};
+```
+
+```sql
+SELECT m.id, a.name, z.name
+FROM movements AS m
+INNER JOIN endpoints AS a ON m.a_id = a.id
+INNER JOIN endpoints AS z ON (m.z_id = z.id OR a.parent_id = z.id)
+```
+
+ON 条件中的每个列引用都必须解析到该 plan 可见的 source/join alias，否则结构校验
+原子拒绝。`'And`/`'Or` 为空同样拒绝。Join 的 `'Join` operator 与 `allowed_join_kinds`
+继续由 profile 收窄。
+
 ## 验证与转换保证
 
 结构校验覆盖：非空 sources/projection、合法标识符、source alias 引用、标量参数
 个数、非负 Plan limit、非负 Plan offset、offset 存在时必须带非空 ordering、排序
 聚合引用确实存在并已投影、分组内 Top N 的全部安全约束（partition key 是所选
 grouping、ordering target 已选择、稳定 tie-breaker、`take` 在正上限内、不与全局
-limit/offset/ordering 组合），以及 filtered/computed aggregate 约束（FILTER
-predicate 合法、操作数解析到已声明 aggregate/computed、依赖无环、alias 唯一）。
+limit/offset/ordering 组合）、filtered/computed aggregate 约束（FILTER
+predicate 合法、操作数解析到已声明 aggregate/computed、依赖无环、alias 唯一）、
+HAVING 引用解析到已投影 aggregate/computed、EXISTS 的相关引用形状合法（pairs
+非空、inner 列属于 exists source、outer 列属于主 alias、inner alias 不遮蔽主
+alias、内层 filter 引用可见 alias），以及 Join ON 条件树形状与 alias 引用。
 `validate` 在此基础上检查所有算子、join kind、aggregate、scalar 和 distinct 是否
 被 profile 接受。
 
 `transform_sqlite` 使用固定子句顺序：
 
 ```text
-SELECT ... FROM ... [JOIN ...] [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ?] [OFFSET ?]
+SELECT ... FROM ... [JOIN ...] [WHERE <filter> [AND EXISTS (...)] ...]
+       [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ?] [OFFSET ?]
 ```
 
 没有显式 limit 的 offset 渲染为 `LIMIT -1 OFFSET ?`。bindings 严格遵循 SQL 中
-`?` 的出现顺序：projection、join、filter、grouping、ordering、limit、offset。
+`?` 的出现顺序：projection、join、row filter、每个 EXISTS 子查询自己的绑定、
+grouping、having、ordering、limit、offset。
 分组内 Top N 把 window 表达式放在内层 SELECT 列表，因此绑定顺序为 projection、
-隐藏列、window partition、window ordering、join、global filter、grouping、`take`
-（与外层 `__q_rn <= ?` 对应）。
+隐藏列、window partition、window ordering、join、row/exists filter、grouping、
+having、`take`（与外层 `__q_rn <= ?` 对应）。
 同一个合法 Plan 总是生成逐字节相同的 SQL 和 binding 顺序。
 任何失败都不发布部分 Query。
 
 算子集合的规范顺序为：
 
 ```text
-Source, Project, Column, Bind, Scalar, Aggregate, Filter, Join, Group, Order, Limit, Offset, Partition
+Source, Project, Column, Bind, Scalar, Aggregate, Filter, Exists, Join, Group, Having, Order, Limit, Offset, Partition
 ```
 
 ## JSON codec 边界
@@ -616,17 +1084,25 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 | Profile 越界 | `validate` 失败，或 `profile_accepts == 'False` |
 | Plan 结构非法 | `validate_structure` 失败，或 `structure_ok == 'False` |
 | 负 offset / offset 缺 ordering | `validate_structure` 失败，或 `structure_ok == 'False` |
-| 标量 arity 非法 | `validate_structure` 失败，或 `structure_ok == 'False` |
+| 标量 arity 非法（含 Lower/Length 非 1） | `validate_structure` 失败，或 `structure_ok == 'False` |
 | 分组 Top N：key 非 grouping / target 未选择 / 缺 tie-breaker / `take` 越界 / 与全局分页或 ordering 组合 | `validate_structure` 失败，或 `structure_ok == 'False` |
 | computed aggregate：未知操作数 / 循环依赖 / alias 冲突 | `validate_structure` 失败，或 `structure_ok == 'False` |
+| HAVING：`'Ref` 非已投影 aggregate/computed、未知 alias；`'Call` 的 arg/filter 引用未知 alias | `validate_structure` 失败，或 `structure_ok == 'False` |
+| 相关聚合 EXISTS：pairs 为空 / inner 列非本 source / outer 列非主 alias / inner alias 遮蔽主 alias / 内层 grouping/HAVING 引用未知列 / HAVING 使用 `'Ref` measure | `validate_structure` 失败，或 `structure_ok == 'False` |
+| count_groups：内层 HAVING 引用未知列/别名 | `count_groups` 失败（`validate` 前），或 `structure_ok == 'False` |
+| 派生 UNION ALL：derived 与物理 sources/joins/EXISTS 并存、空分支、列数为空/不一致、别名顺序不一致、重复/非法输出别名、派生 alias 遮蔽分支、外层引用未投影列 | `validate_structure` 失败，或 `structure_ok == 'False` |
+| Join ON：条件引用未知 alias、`'And`/`'Or` 为空 | `validate_structure` 失败，或 `structure_ok == 'False` |
 | JSON：Extract/Type arity 非 2、Valid arity 非 1、path 非字符串 Bind（列/计算表达式/Int/Float Bind/缺失） | `validate_structure` 失败，或 `structure_ok == 'False` |
 | FILTER predicate 使用 profile 未允许的表达式 | `validate` 失败，或 `profile_accepts == 'False` |
-| Profile 缺 JsonExtract / JsonType / JsonValid | `validate` 失败，或 `profile_accepts == 'False` |
+| Profile 缺 JsonExtract / JsonType / JsonValid / Lower / Length | `validate` 失败，或 `profile_accepts == 'False` |
+| Profile 缺 `'Exists` / `'Having` | `validate` 失败，或 `profile_accepts == 'False` |
+| Profile 递归收窄嵌套体（count_groups 内层、相关聚合 EXISTS 内层、派生 UNION ALL 每个分支）：缺 Aggregate/Group/Having/Exists/Filter operator、缺 `allowed_aggregates` 中函数或缺内层 scalar | `count_groups`/`validate` 失败，或 `profile_accepts == 'False` |
 | SQLite 转换失败 | `transform_sqlite` 失败 |
 
 失败通过 Telora Host 的带外诊断表达。QueryBuilder 不返回部分 Query，也不接受
-预渲染 SELECT/JOIN/GROUP BY 片段。本实现只具体化 SQLite；不提供子查询、CTE、
-多后端插件协议或 `Bytes` binding。join 条件是结构化的单对列等值关系。
+预渲染 SELECT/JOIN/GROUP BY/HAVING/EXISTS 片段。本实现只具体化 SQLite；不提供
+任意子查询、CTE、多后端插件协议或 `Bytes` binding。join 条件是结构化的
+列等值/`And`/`Or` 组合；EXISTS 只用于结构化的相关存在性过滤。
 
 ## 验证
 
@@ -645,11 +1121,20 @@ JSON 文本不能保留整数值 Float 的身份：`'Float(3.0)` 紧凑编码可
 profile、tie-breaker 拒绝）、filtered/computed aggregates（FILTER lowering、计算
 聚合 arithmetic、computed 参与 ordering、computed 与分组 Top N 组合、未知操作数与
 循环依赖拒绝）、SQLite JSON1 v1（projection/filter/grouping/ordering 与 partition
-ordering 的 path binding 顺序、path 不进入 SQL 文本、profile 覆盖）、确定性和
-JSON codec；`invalid` 验证非字符串 JSON path 等非法 Plan 只产生诊断。
+ordering 的 path binding 顺序、path 不进入 SQL 文本、profile 覆盖）、P0 新能力
+（HAVING lowering/profile、Lower/Length 大小写归一与动态值不内联、EXISTS 半连接
+无 JOIN fan-out 与 profile、角色化/复合 ON Join）、嵌套聚合（count_groups 对满足
+HAVING 的组计数、相关聚合 EXISTS 的 group/having 与 base-grain 保持）、派生
+UNION ALL 关系（多来源合并为具名 source，外层分组/聚合/分区 Top 1 完整 SQL 形状、
+参数分支与 HAVING/过滤的固定 binding 顺序与确定性、profile 递归与非法结构拒绝）、
+多关系组合的确定性 SQL/bindings 顺序、JSON codec；`invalid` 验证 JSON path、HAVING
+measure、EXISTS 相关引用、空 Join 条件、count_groups 内层未知列、相关聚合 EXISTS
+内层未知 grouping、派生 UNION 列集不一致/外层引用未投影列等非法 Plan 只产生诊断。
 `tests/query.telora` 覆盖相同契约的逐项断言，包括
-`'Instr`/`'If`/`'Add`/`'Sub` arity 拒绝、offset 缺 ordering 拒绝、负 offset 拒绝，
-分组 Top N 的成功与拒绝场景，filtered/computed aggregates 的成功与拒绝场景，以及
-JSON 的成功场景（三种以上位置、partition ordering、占位符顺序、确定性）与拒绝
-场景（Extract/Type/Valid 错误 arity、非字符串 path 列/Int Bind/表达式 path、
-Profile 分别缺三个 JSON scalar）。
+`'Instr`/`'If`/`'Add`/`'Sub`/`'Lower`/`'Length` arity 拒绝、offset 缺 ordering
+拒绝、负 offset 拒绝、分组 Top N 的成功与拒绝场景、filtered/computed aggregates
+的成功与拒绝场景、HAVING 的成功与拒绝（未投影 measure）场景、EXISTS 的成功与各类
+非法引用拒绝场景、角色化 Join/复合 ON 的成功与非法 alias 拒绝场景、大小写归一的
+contains/starts-with/ends-with/not-contains 确定性 lowering，以及 JSON 的成功场景
+与拒绝场景（Extract/Type/Valid 错误 arity、非字符串 path、Profile 缺 scalar）。
+新增能力都以领域无关 fixture 覆盖，不写入任何 ICM/企业业务名。

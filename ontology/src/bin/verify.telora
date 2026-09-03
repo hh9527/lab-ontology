@@ -11,6 +11,7 @@
 import "query/lib" as qb;
 import "std/value" { Value };
 import "std/array" as array;
+import "std/string" as string;
 import "std/type-property" as property;
 import "std/type-desc" as td;
 import "@src/edsl" as edsl;
@@ -139,8 +140,11 @@ def join_ok: Fn(Array(qb.Join)) -> Bool = fn(joins) {
         let j = get_index(joins, 0);
         let kind_ok = match j.kind { 'Inner => 'True, 'Left => 'False };
         let source_ok = j.source.alias == "c" && j.source.table == "customers";
-        let cond_ok = j.condition.left.source == "o" && j.condition.left.column == "customer_id"
-            && j.condition.right.source == "c" && j.condition.right.column == "id";
+        let cond_ok = match j.condition {
+            'Eq(eq) => eq.left.source == "o" && eq.left.column == "customer_id"
+                && eq.right.source == "c" && eq.right.column == "id",
+            _ => 'False,
+        };
         kind_ok && source_ok && cond_ok
     }
 };
@@ -419,7 +423,7 @@ def check_cross_module_prepared: Bool = do {
         'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
         _ => 'False,
     };
-    let entities_ok = array.length(p.entities) == 6;
+    let entities_ok = array.length(p.entities) == 9;
     check(auth_ok, "cross-module: published authorization closure works")
         && check(computed_ok, "cross-module: published computed-dimension closure works")
         && check(entities_ok, "cross-module: published entity index available")
@@ -940,6 +944,197 @@ def check_top_per_group_computed: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Next-round capabilities: measureless row lists, text search ops, HAVING and
+# grain-preserving existence filters.
+# ---------------------------------------------------------------------------
+
+def is_expr_item: Fn(qb.SelectItem) -> Bool = fn(item) {
+    match item { 'Expr(_) => 'True, 'Aggregate(_) => 'False, 'Computed(_) => 'False }
+};
+
+# Measureless row-level projection: a list request over dimensions (no fictional
+# COUNT measure), lowerable to an ungrouped Plan with a parameterized filter.
+def check_row_level_list: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [
+            { id: "OrderRegion", subject: "analyst", input: 'None },
+            { id: "CustomerTier", subject: "analyst", input: 'None },
+        ],
+        filters: [
+            { id: "OrderRegion", subject: "analyst", op: 'Contains, input: 'Text("EAST") },
+        ],
+        ordering: [
+            { target: 'Dimension("OrderRegion"), direction: 'Asc },
+        ],
+        limit: 'Some(25),
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    let no_group = array.length(plan.grouping) == 0;
+    let has_join = array.length(plan.joins) == 1;
+    let only_exprs = array.all(plan.projection, fn(i) { is_expr_item(i) });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("EAST"), 'Int(0), 'Int(25)];
+    check(no_group && has_join && only_exprs, "measureless row list: ungrouped projection over a safe join")
+        && check(query.bindings == expected, "measureless row list: contains keeps parameterized bindings and limit")
+};
+
+# Closed text search operations lower through the query 'Instr/'Lower/'Length/
+# 'Substr vocabulary; runtime values never enter SQL text.
+def text_op_query: Fn(edsl.FilterOp, String) -> qb.Query = fn(op, text) {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [{ id: "OrderRegion", subject: "analyst", op: op, input: 'Text(text) }],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    qb.transform_sqlite(plan)
+};
+
+def check_text_search_ops: Bool = do {
+    let starts = text_op_query('StartsWith, "nor");
+    let contains = text_op_query('Contains, "east");
+    let notc = text_op_query('NotContains, "zzz");
+    let ends = text_op_query('EndsWith, "th");
+    let shapes_ok = string.contains(starts.sql, "instr(lower(o.region), lower(?)) = ?")
+        && string.contains(contains.sql, "instr(lower(o.region), lower(?)) > ?")
+        && string.contains(notc.sql, "instr(o.region, ?) = ?")
+        && string.contains(ends.sql, "substr(lower(o.region)");
+    let starts_b: Array(qb.Val) = ['String("nor"), 'Int(1)];
+    let contains_b: Array(qb.Val) = ['String("east"), 'Int(0)];
+    let notc_b: Array(qb.Val) = ['String("zzz"), 'Int(0)];
+    let ends_b: Array(qb.Val) = ['String("th"), 'Int(1), 'String("th")];
+    check(shapes_ok, "text search ops: starts-with/contains/not-contains/ends-with lower to closed expressions")
+        && check(starts.bindings == starts_b, "text search ops: starts-with binds value then position")
+        && check(contains.bindings == contains_b, "text search ops: contains binds value then zero")
+        && check(notc.bindings == notc_b, "text search ops: not-contains binds value then zero")
+        && check(ends.bindings == ends_b, "text search ops: ends-with binds the value twice and the computed start")
+};
+
+# Typed HAVING over a selected measure lowers to the query aggregate predicate;
+# the threshold stays a parameterized binding.
+def check_having: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let having: edsl.HavingRequest = {
+        measure: "OrderAmount",
+        subject: "analyst",
+        op: 'Ge,
+        threshold: 'Number(100.0),
+    };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [], [having]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_h: Array(qb.Val) = ['Float(100.0)];
+    check(array.length(plan.having) == 1, "having: aggregate-result predicate is lowered")
+        && check(query.bindings == expected_h, "having: threshold enters ordered bindings")
+};
+
+# Grain-preserving existence filter: a fan-out-only required entity is satisfied
+# by the correlated EXISTS predicate instead of a fan-out join, so the subject
+# measure is not amplified.
+def check_exists: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "CustomerCount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let exists: edsl.ExistsRequest = { target: "orders", subject: "analyst", filters: [], any_of: [], min_matches: 'None };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(array.length(plan.exists) == 1 && array.length(plan.joins) == 0,
+        "exists: fan-out requirement becomes a correlated EXISTS without a fan-out join")
+        && check(string.contains(query.sql, "EXISTS (SELECT 1 FROM orders AS o WHERE c.id = o.customer_id)"),
+            "exists: correlated existence predicate keeps the customer grain")
+};
+
+# Parent -> Child: ParentCount plus a minimum-match existence never joins the
+# fan-out child edge, so the parent count is not amplified by child rows.
+def check_parent_grain: Bool = do {
+    let base: edsl.QueryRequest = {
+        measures: [{ id: "ParentCount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plain: qb.Plan = edsl.lower(knowledge.payload, base);
+    let exists: edsl.ExistsRequest = { target: "children", subject: "analyst", filters: [], any_of: [], min_matches: 'Some(2) };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, base, [exists], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(2)];
+    check(array.length(plain.joins) == 0 && array.length(plan.joins) == 0,
+        "parent grain: ParentCount never joins the fan-out child edge")
+        && check(string.contains(query.sql, "GROUP BY k.parent_id HAVING count(k.id) >= ?")
+            && array.length(plan.grouping) == 0,
+            "parent grain: correlated aggregate existence keeps an ungrouped parent count")
+        && check(query.bindings == expected, "parent grain: minimum match threshold is parameterized")
+};
+
+# Nested shape 1: count of groups satisfying HAVING.
+def check_group_count: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let having: edsl.HavingRequest = {
+        measure: "OrderAmount",
+        subject: "analyst",
+        op: 'Ge,
+        threshold: 'Number(100.0),
+    };
+    let query: qb.Query = edsl.lower_group_count(knowledge.payload, request, [having]);
+    let expected: Array(qb.Val) = ['Float(100.0)];
+    check(string.contains(query.sql, "count(1) FROM (SELECT"), "group count: lowers to count(1) over the inner query")
+        && check(query.bindings == expected, "group count: HAVING threshold is the only binding")
+};
+
+# Closed OR-group on the subject filter lowers to one inner Or; the dimension's
+# entity is joined safely (Order -> Customer) and the values keep request order.
+def check_any_of: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let any: edsl.AnyOfRequest = { id: "CustomerTier", subject: "analyst", values: ['Text("gold"), 'Text("silver")] };
+    let plan: qb.Plan = edsl.lower_any(knowledge.payload, request, [any], [], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("gold"), 'String("silver")];
+    check(array.length(plan.joins) == 1 && query.bindings == expected,
+        "any-of: OR-group joins its dimension entity safely and binds values in order")
+        && check(string.contains(query.sql, "(c.tier = ? OR c.tier = ?)"),
+            "any-of: one dimension OR-group lowers to a single Or over equalities")
+};
+
+# ---------------------------------------------------------------------------
 # Entry.
 # ---------------------------------------------------------------------------
 
@@ -973,5 +1168,12 @@ export def main: Value = do {
     let c27 = check_non_timeline_measures;
     let c28 = check_json_dimension;
     let c29 = check_json_top_per_group;
+    let c30 = check_row_level_list;
+    let c31 = check_text_search_ops;
+    let c32 = check_having;
+    let c33 = check_exists;
+    let c34 = check_parent_grain;
+    let c35 = check_group_count;
+    let c36 = check_any_of;
     'String("verify ok")
 };

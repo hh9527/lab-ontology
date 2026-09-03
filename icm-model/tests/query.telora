@@ -1,0 +1,735 @@
+# ICM model contract tests (icm-model.a3)
+#
+# These tests drive the dynamic query facade with typed ontology QueryRequests
+# and assert the exact lowerings (SQL text + binding order) and determinism.
+# Failure behaviour (unknown vocabulary, illegal enums, type errors, grain
+# amplification, unsupported target attributes) is covered by the invalid
+# intent fixtures under icm-model/testdata/err-*.json and is exercised through
+# `bin/make-query check` (see icm/eval/public/QUERY-DESIGN-GUIDE.md).
+
+import "@src/model" as model;
+import "@src/query" as facade;
+import "ontology/edsl" as edsl;
+import "query/lib" as qb;
+import "std/value" {ScalarValue};
+
+def subject: String = "analyst";
+
+# ---------------------------------------------------------------------------
+# Request builder helpers
+# ---------------------------------------------------------------------------
+
+def request_measure: Fn(String) -> edsl.MeasureRequest = fn(id) {
+    {id: id, subject: subject, input: 'All}
+};
+
+def request_dimension: Fn(String) -> edsl.DimensionRequest = fn(id) {
+    {id: id, subject: subject, input: 'None}
+};
+
+def filter_eq_text: Fn(String, String) -> edsl.FilterRequest = fn(id, value) {
+    {id: id, subject: subject, op: 'Eq, input: 'Text(value)}
+};
+
+def filter_eq_int: Fn(String, Int) -> edsl.FilterRequest = fn(id, value) {
+    {id: id, subject: subject, op: 'Eq, input: 'Int(value)}
+};
+
+# ---------------------------------------------------------------------------
+# Assertion helpers (fail the module on mismatch so `check` reports an error)
+# ---------------------------------------------------------------------------
+
+def assert_query: Fn(edsl.QueryRequest, String, Array(ScalarValue)) -> Bool = fn(
+    request, expected_sql, expected_bindings
+) {
+    let query: qb.Query = facade.make_query(request);
+    if query.sql != expected_sql {
+        fail!("query.sql mismatch", query.sql, expected_sql)
+    } else if query.bindings != expected_bindings {
+        fail!("query.bindings mismatch", query.bindings, expected_bindings)
+    } else {
+        'True
+    }
+};
+
+def assert_deterministic: Fn(edsl.QueryRequest) -> Bool = fn(request) {
+    let first: qb.Query = facade.make_query(request);
+    let second: qb.Query = facade.make_query(request);
+    if first == second { 'True } else {
+        fail!("query is not deterministic")
+    }
+};
+
+# ---------------------------------------------------------------------------
+# 1. Legal intent: alarm count restricted by device and alarm attributes
+# ---------------------------------------------------------------------------
+
+def alarm_count_request: edsl.QueryRequest = {
+    measures: [request_measure("AlarmCount")],
+    dimensions: [],
+    filters: [
+        filter_eq_int("AlarmSeverity", 4),
+        filter_eq_text("NetworkDeviceName", "core-01"),
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_alarm_count = assert_query(
+    alarm_count_request,
+    "SELECT count(a.CSN) AS AlarmCount FROM T_CURRENT_ALARM AS a INNER JOIN EntNetworkElement AS d ON a.MEDN = d.id WHERE (a.SEVERITY = ? AND d.name = ?)",
+    ['Int(4), 'String("core-01")],
+);
+
+export def test_alarm_count_deterministic = assert_deterministic(alarm_count_request);
+
+# ---------------------------------------------------------------------------
+# 2. Legal intent: grouped sub-part count (storage controller by device name)
+# ---------------------------------------------------------------------------
+
+def controller_request: edsl.QueryRequest = {
+    measures: [request_measure("StorageControllerCount")],
+    dimensions: [request_dimension("StorageName")],
+    filters: [
+        filter_eq_text("StorageSubClass", "HuaweiSmisStorageDevice"),
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_grouped_subpart_count = assert_query(
+    controller_request,
+    "SELECT count(p.id) AS StorageControllerCount, d.name FROM SYS_Controller AS p INNER JOIN HuaweiStorageDevice AS d ON p.parentResId = d.id WHERE d.subClassName = ? GROUP BY d.name",
+    ['String("HuaweiSmisStorageDevice")],
+);
+
+# ---------------------------------------------------------------------------
+# 3. Legal intent: KPI aggregate joined to the device table
+# ---------------------------------------------------------------------------
+
+def server_cpu_request: edsl.QueryRequest = {
+    measures: [request_measure("ServerCpuUsageAvg")],
+    dimensions: [],
+    filters: [
+        filter_eq_text("ServerName", "server-01"),
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_kpi_aggregate = assert_query(
+    server_cpu_request,
+    "SELECT avg(k.cpuUsage) AS ServerCpuUsageAvg FROM ServerDeviceKPI AS k INNER JOIN PhysicalServer AS d ON k.resId = d.id WHERE d.name = ?",
+    ['String("server-01")],
+);
+
+# ---------------------------------------------------------------------------
+# 4. Legal intent: ordering + pagination (binding order limit after filter)
+# ---------------------------------------------------------------------------
+
+def paged_server_request: edsl.QueryRequest = {
+    measures: [request_measure("ServerDeviceCount")],
+    dimensions: [request_dimension("ServerName")],
+    filters: [
+        filter_eq_text("ServerClassification", "ne.category.server.rack"),
+    ],
+    ordering: [
+        {target: 'Dimension("ServerName"), direction: 'Asc},
+    ],
+    limit: 'Some(10),
+    offset: 'Some(5),
+    partition: 'None,
+};
+
+export def test_ordering_and_pagination = assert_query(
+    paged_server_request,
+    "SELECT count(d.id) AS ServerDeviceCount, d.name FROM PhysicalServer AS d WHERE d.classification = ? GROUP BY d.name ORDER BY d.name ASC LIMIT ? OFFSET ?",
+    ['String("ne.category.server.rack"), 'Int(10), 'Int(5)],
+);
+
+# ---------------------------------------------------------------------------
+# 5. Legal intent: trend shape (per timestamp rows ordered by time)
+# ---------------------------------------------------------------------------
+
+def pon_trend_request: edsl.QueryRequest = {
+    measures: [request_measure("PonPortIfOutBandRateAvg")],
+    dimensions: [
+        request_dimension("PonDeviceName"),
+        request_dimension("PonPortKpiTime"),
+    ],
+    filters: [
+        filter_eq_text("PonDeviceIp", "10.4.153.218"),
+    ],
+    ordering: [
+        {target: 'Dimension("PonPortKpiTime"), direction: 'Asc},
+    ],
+    limit: 'Some(1000),
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_trend_lowering = assert_query(
+    pon_trend_request,
+    "SELECT avg(k.ifOutBandRate) AS PonPortIfOutBandRateAvg, d.name, k.ts FROM PonDevicePonPortKPI AS k INNER JOIN EntPonElement AS d ON k.parentId = d.id WHERE d.ipAddress = ? GROUP BY d.name, k.ts ORDER BY k.ts ASC LIMIT ?",
+    ['String("10.4.153.218"), 'Int(1000)],
+);
+
+# ---------------------------------------------------------------------------
+# 6. Legal intent: Top Per Group (partition) with stable ordering
+# ---------------------------------------------------------------------------
+
+def server_cpu_top_request: edsl.QueryRequest = {
+    measures: [request_measure("ServerCpuUsageAvg")],
+    dimensions: [
+        request_dimension("ServerName"),
+        request_dimension("ServerKpiTime"),
+    ],
+    filters: [],
+    ordering: [
+        {target: 'Measure("ServerCpuUsageAvg"), direction: 'Desc},
+        {target: 'Dimension("ServerKpiTime"), direction: 'Asc},
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({by: ["ServerName"], take: 3}),
+};
+
+export def test_top_per_group = assert_query(
+    server_cpu_top_request,
+    "SELECT ServerCpuUsageAvg, __q_1, __q_2 FROM (SELECT avg(k.cpuUsage) AS ServerCpuUsageAvg, d.name AS __q_1, k.ts AS __q_2, row_number() OVER (PARTITION BY d.name ORDER BY avg(k.cpuUsage) DESC, k.ts ASC) AS __q_rn FROM ServerDeviceKPI AS k INNER JOIN PhysicalServer AS d ON k.resId = d.id GROUP BY d.name, k.ts) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_1 ASC, ServerCpuUsageAvg DESC, __q_2 ASC",
+    ['Int(3)],
+);
+
+# ---------------------------------------------------------------------------
+# 7. Determinism across repeated lowering (representative multi-join request)
+# ---------------------------------------------------------------------------
+
+export def test_grouped_deterministic = assert_deterministic(controller_request);
+export def test_paged_deterministic = assert_deterministic(paged_server_request);
+
+# ---------------------------------------------------------------------------
+# 8. Measure-less row projection (listing / attribute request)
+# ---------------------------------------------------------------------------
+
+def server_list_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [
+        request_dimension("ServerName"),
+        request_dimension("ServerModel"),
+    ],
+    filters: [
+        filter_eq_text("ServerClassification", "ne.category.server.rack"),
+    ],
+    ordering: [
+        {target: 'Dimension("ServerName"), direction: 'Asc},
+    ],
+    limit: 'Some(10),
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_measureless_listing = assert_query(
+    server_list_request,
+    "SELECT d.name, d.productName FROM PhysicalServer AS d WHERE d.classification = ? ORDER BY d.name ASC LIMIT ?",
+    ['String("ne.category.server.rack"), 'Int(10)],
+);
+
+export def test_measureless_deterministic = assert_deterministic(server_list_request);
+
+# ---------------------------------------------------------------------------
+# 9. Text pattern filter (contains, case-insensitive, parameterised)
+# ---------------------------------------------------------------------------
+
+def server_contains_request: edsl.QueryRequest = {
+    measures: [request_measure("ServerDeviceCount")],
+    dimensions: [],
+    filters: [
+        {id: "ServerName", subject: subject, op: 'Contains, input: 'Text("core")},
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_text_pattern_filter = assert_query(
+    server_contains_request,
+    "SELECT count(d.id) AS ServerDeviceCount FROM PhysicalServer AS d WHERE instr(lower(d.name), lower(?)) > ?",
+    ['String("core"), 'Int(0)],
+);
+
+# ---------------------------------------------------------------------------
+# 10. Group predicate (HAVING) via the full intent path
+# ---------------------------------------------------------------------------
+
+def assert_intent_query: Fn(facade.Intent, String, Array(ScalarValue)) -> Bool = fn(
+    intent, expected_sql, expected_bindings
+) {
+    let query: qb.Query = facade.make_intent_query(intent);
+    if query.sql != expected_sql {
+        fail!("intent query.sql mismatch", query.sql, expected_sql)
+    } else if query.bindings != expected_bindings {
+        fail!("intent query.bindings mismatch", query.bindings, expected_bindings)
+    } else {
+        'True
+    }
+};
+
+def alarm_having_intent: facade.Intent = {
+    measures: [request_measure("AlarmCount")],
+    dimensions: [request_dimension("AlarmType")],
+    filters: [],
+    any_of: [],
+    ordering: [
+        {target: 'Dimension("AlarmType"), direction: 'Asc},
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [],
+    having: [
+        {measure: "AlarmCount", subject: subject, op: 'Gt, threshold: 'Int(2)},
+    ],
+    group_count: 'None,
+};
+
+export def test_having = assert_intent_query(
+    alarm_having_intent,
+    "SELECT count(a.CSN) AS AlarmCount, a.ALARMTYPE FROM T_CURRENT_ALARM AS a GROUP BY a.ALARMTYPE HAVING count(a.CSN) > ? ORDER BY a.ALARMTYPE ASC",
+    ['Int(2)],
+);
+
+# ---------------------------------------------------------------------------
+# 11. Manufacturer value normalisation (known Huawei spellings -> "huawei")
+# ---------------------------------------------------------------------------
+
+def server_huawei_request: edsl.QueryRequest = {
+    measures: [request_measure("ServerDeviceCount")],
+    dimensions: [],
+    filters: [
+        {id: "ServerManufacturer", subject: subject, op: 'Eq, input: 'Text("huawei")},
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_manufacturer_normalization = assert_query(
+    server_huawei_request,
+    "SELECT count(d.id) AS ServerDeviceCount FROM PhysicalServer AS d WHERE CASE WHEN lower(d.manufacturer) = ? THEN ? ELSE CASE WHEN lower(d.manufacturer) = ? THEN ? ELSE CASE WHEN lower(d.manufacturer) = ? THEN ? ELSE d.manufacturer END END END = ?",
+    ['String("huawei"), 'String("huawei"), 'String("huawei technologies co., ltd"), 'String("huawei"), 'String("2011"), 'String("huawei"), 'String("huawei")],
+);
+
+export def test_manufacturer_deterministic = assert_deterministic(server_huawei_request);
+
+# ---------------------------------------------------------------------------
+# 12. Half-open time window (Ge lower bound, Lt upper bound)
+# ---------------------------------------------------------------------------
+
+def server_window_request: edsl.QueryRequest = {
+    measures: [request_measure("ServerCpuUsageAvg")],
+    dimensions: [request_dimension("ServerName")],
+    filters: [
+        {id: "ServerKpiTime", subject: subject, op: 'Ge, input: 'Text("2026-08-01 00:00:00")},
+        {id: "ServerKpiTime", subject: subject, op: 'Lt, input: 'Text("2026-08-08 00:00:00")},
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+export def test_half_open_time_window = assert_query(
+    server_window_request,
+    "SELECT avg(k.cpuUsage) AS ServerCpuUsageAvg, d.name FROM ServerDeviceKPI AS k INNER JOIN PhysicalServer AS d ON k.resId = d.id WHERE (k.ts >= ? AND k.ts < ?) GROUP BY d.name",
+    ['String("2026-08-01 00:00:00"), 'String("2026-08-08 00:00:00")],
+);
+
+# ---------------------------------------------------------------------------
+# 13. Correlated existence (EXISTS) via reverse-relation derivation
+# ---------------------------------------------------------------------------
+
+def net_exists_intent: facade.Intent = {
+    measures: [request_measure("NetworkDeviceCount")],
+    dimensions: [],
+    filters: [],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [
+        {
+            target: "alarm",
+            subject: subject,
+            filters: [filter_eq_int("AlarmSeverity", 4)],
+            any_of: [],
+            min_matches: 'None,
+        },
+    ],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_exists_reverse = assert_intent_query(
+    net_exists_intent,
+    "SELECT count(d.id) AS NetworkDeviceCount FROM EntNetworkElement AS d WHERE EXISTS (SELECT 1 FROM T_CURRENT_ALARM AS a WHERE d.id = a.MEDN AND a.SEVERITY = ?)",
+    ['Int(4)],
+);
+
+# ---------------------------------------------------------------------------
+# 14. Correlated aggregate EXISTS (min_matches = at least N related rows)
+# ---------------------------------------------------------------------------
+
+def net_exists_min2_intent: facade.Intent = {
+    measures: [request_measure("NetworkDeviceCount")],
+    dimensions: [],
+    filters: [],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [
+        {
+            target: "alarm",
+            subject: subject,
+            filters: [filter_eq_int("AlarmSeverity", 4)],
+            any_of: [],
+            min_matches: 'Some(2),
+        },
+    ],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_exists_min_matches = assert_intent_query(
+    net_exists_min2_intent,
+    "SELECT count(d.id) AS NetworkDeviceCount FROM EntNetworkElement AS d WHERE EXISTS (SELECT 1 FROM T_CURRENT_ALARM AS a WHERE d.id = a.MEDN AND a.SEVERITY = ? GROUP BY a.MEDN HAVING count(a.CSN) >= ?)",
+    ['Int(4), 'Int(2)],
+);
+
+# ---------------------------------------------------------------------------
+# 15. Nested count of groups passing HAVING (lower_group_count)
+# ---------------------------------------------------------------------------
+
+def alarm_group_count_intent: facade.Intent = {
+    measures: [request_measure("AlarmCount")],
+    dimensions: [request_dimension("AlarmType")],
+    filters: [],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [],
+    having: [
+        {measure: "AlarmCount", subject: subject, op: 'Gt, threshold: 'Int(2)},
+    ],
+    group_count: 'Some('CountGroups),
+};
+
+export def test_count_groups = assert_intent_query(
+    alarm_group_count_intent,
+    "SELECT count(1) FROM (SELECT count(a.CSN) AS AlarmCount, a.ALARMTYPE FROM T_CURRENT_ALARM AS a GROUP BY a.ALARMTYPE HAVING count(a.CSN) > ?) AS __q_count",
+    ['Int(2)],
+);
+
+# Deterministic assertion over the intent path.
+def assert_deterministic_intent: Fn(facade.Intent) -> Bool = fn(intent) {
+    let first: qb.Query = facade.make_intent_query(intent);
+    let second: qb.Query = facade.make_intent_query(intent);
+    if first == second { 'True } else {
+        fail!("intent query is not deterministic")
+    }
+};
+
+export def test_exists_deterministic = assert_deterministic_intent(net_exists_min2_intent);
+
+# ---------------------------------------------------------------------------
+# 16. OR-group value filter (any_of / lower_any)
+# ---------------------------------------------------------------------------
+
+def server_any_intent: facade.Intent = {
+    measures: [request_measure("ServerDeviceCount")],
+    dimensions: [],
+    filters: [],
+    any_of: [
+        {
+            id: "ServerClassification",
+            subject: subject,
+            values: [
+                'Text("ne.category.server.rack"),
+                'Text("ne.category.server.kunlun"),
+            ],
+        },
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_any_of = assert_intent_query(
+    server_any_intent,
+    "SELECT count(d.id) AS ServerDeviceCount FROM PhysicalServer AS d WHERE (d.classification = ? OR d.classification = ?)",
+    ['String("ne.category.server.rack"), 'String("ne.category.server.kunlun")],
+);
+
+export def test_any_of_deterministic = assert_deterministic_intent(server_any_intent);
+
+# ---------------------------------------------------------------------------
+# 23. Unified five-domain device entity - per-tenant Top 1 site device count
+# ---------------------------------------------------------------------------
+
+def device_top_site_intent: facade.Intent = {
+    measures: [request_measure("DeviceCount")],
+    dimensions: [
+        request_dimension("DeviceTenantId"),
+        request_dimension("DeviceSiteId"),
+    ],
+    filters: [],
+    any_of: [],
+    ordering: [
+        {target: 'Measure("DeviceCount"), direction: 'Desc},
+        {target: 'Dimension("DeviceSiteId"), direction: 'Asc},
+    ],
+    limit: 'None,
+    offset: 'None,
+    partition: 'Some({by: ["DeviceTenantId"], take: 1}),
+    exists: [],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_unified_device_top_site_per_tenant = assert_intent_query(
+    device_top_site_intent,
+    "SELECT DeviceCount, __q_1, __q_2 FROM (SELECT count(u.device_id) AS DeviceCount, u.tenant_id AS __q_1, u.site_id AS __q_2, row_number() OVER (PARTITION BY u.tenant_id ORDER BY count(u.device_id) DESC, u.site_id ASC) AS __q_rn FROM (SELECT n.id AS device_id, n.refParentSubnet AS site_id, n.tenantId AS tenant_id FROM EntNetworkElement AS n UNION ALL SELECT p.id AS device_id, p.refParentSubnet AS site_id, p.tenantId AS tenant_id FROM EntPonElement AS p UNION ALL SELECT s.id AS device_id, s.refParentSubnet AS site_id, s.tenantId AS tenant_id FROM PhysicalServer AS s UNION ALL SELECT g.id AS device_id, g.refParentSubnet AS site_id, g.tenantId AS tenant_id FROM HuaweiStorageDevice AS g UNION ALL SELECT t.resId AS device_id, t.siteId AS site_id, t.tenantId AS tenant_id FROM EntTerminalElement AS t) AS u GROUP BY u.tenant_id, u.site_id) AS __partitioned WHERE __q_rn <= ? ORDER BY __q_1 ASC, DeviceCount DESC, __q_2 ASC",
+    ['Int(1)],
+);
+
+export def test_unified_device_top_site_deterministic = assert_deterministic_intent(device_top_site_intent);
+
+# ---------------------------------------------------------------------------
+# 17. Single-value alarm-name existence (reverse, no fan-out JOIN)
+# ---------------------------------------------------------------------------
+
+def net_exists_alarm_name_intent: facade.Intent = {
+    measures: [request_measure("NetworkDeviceCount")],
+    dimensions: [],
+    filters: [],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [
+        {
+            target: "alarm",
+            subject: subject,
+            filters: [
+                {id: "AlarmName", subject: subject, op: 'Eq, input: 'Text("Heartbeat")},
+            ],
+            any_of: [],
+            min_matches: 'None,
+        },
+    ],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_exists_alarm_name = assert_intent_query(
+    net_exists_alarm_name_intent,
+    "SELECT count(d.id) AS NetworkDeviceCount FROM EntNetworkElement AS d WHERE EXISTS (SELECT 1 FROM T_CURRENT_ALARM AS a WHERE d.id = a.MEDN AND a.ALARMNAME = ?)",
+    ['String("Heartbeat")],
+);
+
+# ---------------------------------------------------------------------------
+# 18. OR-group inside EXISTS (multiple alarm names -> inner Or(Eq...))
+# ---------------------------------------------------------------------------
+
+def net_exists_alarm_any_intent: facade.Intent = {
+    measures: [request_measure("NetworkDeviceCount")],
+    dimensions: [],
+    filters: [],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [
+        {
+            target: "alarm",
+            subject: subject,
+            filters: [],
+            any_of: [
+                {
+                    id: "AlarmName",
+                    subject: subject,
+                    values: [
+                        'Text("Heartbeat"),
+                        'Text("设备离线"),
+                    ],
+                },
+            ],
+            min_matches: 'None,
+        },
+    ],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_exists_alarm_any = assert_intent_query(
+    net_exists_alarm_any_intent,
+    "SELECT count(d.id) AS NetworkDeviceCount FROM EntNetworkElement AS d WHERE EXISTS (SELECT 1 FROM T_CURRENT_ALARM AS a WHERE d.id = a.MEDN AND (a.ALARMNAME = ? OR a.ALARMNAME = ?))",
+    ['String("Heartbeat"), 'String("设备离线")],
+);
+
+export def test_exists_alarm_any_deterministic = assert_deterministic_intent(net_exists_alarm_any_intent);
+
+# ---------------------------------------------------------------------------
+# 19. Distinct affected-device reference count over Alarm.MEDN (P0)
+# ---------------------------------------------------------------------------
+
+def request_measure_distinct: Fn(String) -> edsl.MeasureRequest = fn(id) {
+    {id: id, subject: subject, input: 'Distinct}
+};
+
+def alarm_ref_count_intent: facade.Intent = {
+    measures: [request_measure_distinct("AlarmDeviceRefCount")],
+    dimensions: [],
+    filters: [],
+    any_of: [
+        {
+            id: "AlarmName",
+            subject: subject,
+            values: ['Text("Heartbeat"), 'Text("设备离线")],
+        },
+    ],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_alarm_device_ref_count = assert_intent_query(
+    alarm_ref_count_intent,
+    "SELECT count(DISTINCT a.MEDN) AS AlarmDeviceRefCount FROM T_CURRENT_ALARM AS a WHERE (a.ALARMNAME = ? OR a.ALARMNAME = ?)",
+    ['String("Heartbeat"), 'String("设备离线")],
+);
+
+export def test_alarm_device_ref_count_deterministic = assert_deterministic_intent(alarm_ref_count_intent);
+
+# ---------------------------------------------------------------------------
+# 20. Safe subject filter + EXISTS with three-value AnyOf (single EXISTS)
+# ---------------------------------------------------------------------------
+
+def server_count_exists_name3_intent: facade.Intent = {
+    measures: [request_measure("ServerDeviceCount")],
+    dimensions: [],
+    filters: [
+        filter_eq_text("ServerClassification", "ne.category.server.rack"),
+    ],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [
+        {
+            target: "alarm",
+            subject: subject,
+            filters: [],
+            any_of: [
+                {
+                    id: "AlarmName",
+                    subject: subject,
+                    values: [
+                        'Text("Heartbeat"),
+                        'Text("设备离线"),
+                        'Text("光模块收发异常"),
+                    ],
+                },
+            ],
+            min_matches: 'None,
+        },
+    ],
+    having: [],
+    group_count: 'None,
+};
+
+export def test_server_count_exists_name3 = assert_intent_query(
+    server_count_exists_name3_intent,
+    "SELECT count(d.id) AS ServerDeviceCount FROM PhysicalServer AS d WHERE d.classification = ? AND EXISTS (SELECT 1 FROM T_CURRENT_ALARM AS a WHERE d.id = a.MEDN AND ((a.ALARMNAME = ? OR a.ALARMNAME = ?) OR a.ALARMNAME = ?))",
+    ['String("ne.category.server.rack"), 'String("Heartbeat"), 'String("设备离线"), 'String("光模块收发异常")],
+);
+
+# ---------------------------------------------------------------------------
+# 21. Group count over an associated dimension (site) - count-of-groups
+# ---------------------------------------------------------------------------
+
+def group_count_by_site_intent: facade.Intent = {
+    measures: [request_measure("NetworkDeviceCount")],
+    dimensions: [request_dimension("SiteName")],
+    filters: [],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [],
+    having: [
+        {measure: "NetworkDeviceCount", subject: subject, op: 'Gt, threshold: 'Int(0)},
+    ],
+    group_count: 'Some('CountGroups),
+};
+
+export def test_group_count_by_site = assert_intent_query(
+    group_count_by_site_intent,
+    "SELECT count(1) FROM (SELECT count(d.id) AS NetworkDeviceCount, s.SITE_NAME FROM EntNetworkElement AS d INNER JOIN X_SITE_VIEW AS s ON d.refParentSubnet = s.SITE_ID GROUP BY s.SITE_NAME HAVING count(d.id) > ?) AS __q_count",
+    ['Int(0)],
+);
+
+# ---------------------------------------------------------------------------
+# 22. Group count of KPI devices passing HAVING (group by stable device id)
+# ---------------------------------------------------------------------------
+
+def group_count_kpi_having_intent: facade.Intent = {
+    measures: [request_measure("NetworkIfUtilizationAvg")],
+    dimensions: [request_dimension("NetworkDeviceId")],
+    filters: [
+        {id: "NetworkKpiTime", subject: subject, op: 'Ge, input: 'Text("2026-08-01 00:00:00")},
+        {id: "NetworkKpiTime", subject: subject, op: 'Lt, input: 'Text("2026-08-08 00:00:00")},
+    ],
+    any_of: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+    exists: [],
+    having: [
+        {measure: "NetworkIfUtilizationAvg", subject: subject, op: 'Ge, threshold: 'Number(70.0)},
+    ],
+    group_count: 'Some('CountGroups),
+};
+
+export def test_group_count_kpi_having = assert_intent_query(
+    group_count_kpi_having_intent,
+    "SELECT count(1) FROM (SELECT avg(k.ifUtilizationRate) AS NetworkIfUtilizationAvg, d.id FROM NetworkDeviceKPI AS k INNER JOIN EntNetworkElement AS d ON k.resId = d.id WHERE (k.ts >= ? AND k.ts < ?) GROUP BY d.id HAVING avg(k.ifUtilizationRate) >= ?) AS __q_count",
+    ['String("2026-08-01 00:00:00"), 'String("2026-08-08 00:00:00"), 'Float(70.0)],
+);
+
+export def test_group_count_kpi_deterministic = assert_deterministic_intent(group_count_kpi_having_intent);

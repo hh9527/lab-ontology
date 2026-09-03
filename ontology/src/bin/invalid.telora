@@ -295,21 +295,6 @@ def invalid_cases: Array(edsl.QueryRequest) = [
     },
 ];
 
-export def main: Value = do {
-    # Every case must fail atomically: a healthy result would make this entry
-    # an invalid "unexpected success". main consumes the attempt results so any
-    # successful case (a contract regression) fails loudly instead of
-    # publishing a trusted result.
-    let attempts = array.map(invalid_cases, fn(req) {
-        let plan: qb.Plan = edsl.lower(knowledge.payload, req);
-        let _query: qb.Query = qb.transform_sqlite(plan);
-        "unexpected success"
-    });
-    let healthy: Bool = array.all(attempts, fn(s) { s == "unexpected success" });
-    let outcome: Value = if healthy { 'String("unexpected success") } else { 'String("unexpected success") };
-    outcome
-};
-
 # ---------------------------------------------------------------------------
 # Prepare-time failure scenarios (non-exported). They fail during best-effort
 # module evaluation (run --best-effort / check), so their diagnostics surface
@@ -755,4 +740,375 @@ def json_unrequested_ordering: qb.Plan = do {
     };
     let plan: qb.Plan = edsl.lower(knowledge.payload, request);
     plan
+};
+
+# ---------------------------------------------------------------------------
+# Next-round failure scenarios (non-exported; surfaced by best-effort checks).
+# Existence filters, HAVING, measureless row lists and text operations must fail
+# atomically with deterministic diagnostics, never publishing a partial Plan.
+# ---------------------------------------------------------------------------
+
+# Existence filter naming an entity outside the knowledge.
+def exists_unknown_entity: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let exists: edsl.ExistsRequest = { target: "bogus-entity", subject: "analyst", filters: [], any_of: [], min_matches: 'None };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
+    plan
+};
+
+# Existence filter whose target is not directly related to the base entity.
+def exists_indirect_target: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "ItemQty", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let exists: edsl.ExistsRequest = { target: "traces", subject: "analyst", filters: [], any_of: [], min_matches: 'None };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
+    plan
+};
+
+# HAVING referencing a measure that was not requested.
+def having_unrequested_measure: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let having: edsl.HavingRequest = {
+        measure: "TraceCount",
+        subject: "analyst",
+        op: 'Ge,
+        threshold: 'Number(1.0),
+    };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [], [having]);
+    plan
+};
+
+# Top Per Group requires an aggregated measure; measureless row lists reject it.
+def row_partition_invalid: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [{ target: 'Dimension("OrderRegion"), direction: 'Asc }],
+        limit: 'None,
+        offset: 'None,
+        partition: 'Some({ by: ["OrderRegion"], take: 2 }),
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    plan
+};
+
+# Measureless row projection may not dereference an attribute across a fan-out
+# relation (that would amplify base rows); an existence filter is the alternative.
+def row_fanout_attribute: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [
+            { id: "CustomerTier", subject: "analyst", input: 'None },
+            { id: "OrderRegion", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    plan
+};
+
+# Text-search operations require a text input value.
+def text_op_non_text_input: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+        filters: [{ id: "OrderRegion", subject: "analyst", op: 'Contains, input: 'Number(5.0) }],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    plan
+};
+
+# A minimum-match existence threshold must be a positive integer.
+def exists_zero_min: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "ParentCount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let exists: edsl.ExistsRequest = { target: "children", subject: "analyst", filters: [], any_of: [], min_matches: 'Some(0) };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
+    plan
+};
+
+# An OR-group must contain at least one value.
+def any_of_empty_group: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let any: edsl.AnyOfRequest = { id: "OrderRegion", subject: "analyst", values: [] };
+    let plan: qb.Plan = edsl.lower_any(knowledge.payload, request, [any], [], []);
+    plan
+};
+
+# OR-group members are validated against the closed vocabulary.
+def any_of_unknown_dimension: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let any: edsl.AnyOfRequest = { id: "BogusDim", subject: "analyst", values: ['Text("x")] };
+    let plan: qb.Plan = edsl.lower_any(knowledge.payload, request, [any], [], []);
+    plan
+};
+
+# OR-group values must match the dimension's allowed input kinds.
+def any_of_wrong_input: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let any: edsl.AnyOfRequest = { id: "OrderRegion", subject: "analyst", values: ['Int(1)] };
+    let plan: qb.Plan = edsl.lower_any(knowledge.payload, request, [any], [], []);
+    plan
+};
+
+# OR-group subject authorization is enforced like any filter.
+def any_of_unauthorized: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let any: edsl.AnyOfRequest = { id: "OrderRegion", subject: "nobody", values: ['Text("east")] };
+    let plan: qb.Plan = edsl.lower_any(knowledge.payload, request, [any], [], []);
+    plan
+};
+
+# A union entity cannot combine with an existence filter (derived outer cannot
+# carry EXISTS).
+def union_with_exists: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "ItemCount", subject: "analyst", input: 'All }],
+        dimensions: [],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let exists: edsl.ExistsRequest = { target: "children", subject: "analyst", filters: [], any_of: [], min_matches: 'None };
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
+    plan
+};
+
+# A union entity request cannot join or filter another entity (derived outer
+# cannot declare physical joins/sources).
+def union_join_other: qb.Plan = do {
+    let request: edsl.QueryRequest = {
+        measures: [{ id: "ItemCount", subject: "analyst", input: 'All }],
+        dimensions: [
+            { id: "ItemOwner", subject: "analyst", input: 'None },
+            { id: "CustomerTier", subject: "analyst", input: 'None },
+        ],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower(knowledge.payload, request);
+    plan
+};
+
+# A union entity must declare at least one branch (prepare-time failure).
+def empty_union_branches: Array(edsl.UnionBranchDecl) = [];
+
+@edsl.union_source("x", empty_union_branches)
+type EmptyUnion = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+def union_empty_branches_payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [EmptyUnion];
+    let result: edsl.PreparedPayload = edsl.build_root("empty-union", entity_types, knowledge.profile, invalid_authorize);
+    result
+};
+
+# Union mapping negative prepare fixtures: heterogeneous physical column maps
+# must be rejected atomically (missing, duplicate, out-of-range, wrong order or
+# illegal physical column).
+
+def union_missing_cols: Array(edsl.UnionColumnDecl) = [{ field: 0, column: "id" }];
+def union_missing_branches: Array(edsl.UnionBranchDecl) = [{ table: "t1", alias: "x", columns: union_missing_cols, filter: 'None }];
+@edsl.union_source("umiss", union_missing_branches)
+type UMissing = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("name")
+    name: String,
+};
+def union_missing_payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [UMissing];
+    edsl.build_root("u-missing", entity_types, knowledge.profile, invalid_authorize)
+};
+
+def union_dup_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "id" },
+    { field: 0, column: "id" },
+];
+def union_dup_branches: Array(edsl.UnionBranchDecl) = [{ table: "t2", alias: "x", columns: union_dup_cols, filter: 'None }];
+@edsl.union_source("udup", union_dup_branches)
+type UDup = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("name")
+    name: String,
+};
+def union_dup_payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [UDup];
+    edsl.build_root("u-dup", entity_types, knowledge.profile, invalid_authorize)
+};
+
+def union_range_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "id" },
+    { field: 5, column: "name" },
+];
+def union_range_branches: Array(edsl.UnionBranchDecl) = [{ table: "t3", alias: "x", columns: union_range_cols, filter: 'None }];
+@edsl.union_source("urange", union_range_branches)
+type URange = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("name")
+    name: String,
+};
+def union_range_payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [URange];
+    edsl.build_root("u-range", entity_types, knowledge.profile, invalid_authorize)
+};
+
+def union_order_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 1, column: "name" },
+    { field: 0, column: "id" },
+];
+def union_order_branches: Array(edsl.UnionBranchDecl) = [{ table: "t4", alias: "x", columns: union_order_cols, filter: 'None }];
+@edsl.union_source("uorder", union_order_branches)
+type UOrder = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("name")
+    name: String,
+};
+def union_order_payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [UOrder];
+    edsl.build_root("u-order", entity_types, knowledge.profile, invalid_authorize)
+};
+
+def union_bad_col_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "bad col" },
+    { field: 1, column: "name" },
+];
+def union_bad_col_branches: Array(edsl.UnionBranchDecl) = [{ table: "t5", alias: "x", columns: union_bad_col_cols, filter: 'None }];
+@edsl.union_source("ubadcol", union_bad_col_branches)
+type UBadCol = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("name")
+    name: String,
+};
+def union_bad_col_payload: edsl.PreparedPayload = do {
+    let entity_types: Array(Type) = [UBadCol];
+    edsl.build_root("u-badcol", entity_types, knowledge.profile, invalid_authorize)
+};
+
+# Attempts for the next-round failure scenarios (invoked from `main` so that
+# best-effort evaluation surfaces each deterministic diagnostic).
+def next_cases: Array(Fn() -> qb.Plan) = [
+    fn() { exists_unknown_entity },
+    fn() { exists_indirect_target },
+    fn() { having_unrequested_measure },
+    fn() { row_partition_invalid },
+    fn() { row_fanout_attribute },
+    fn() { text_op_non_text_input },
+    fn() { exists_zero_min },
+    fn() { any_of_empty_group },
+    fn() { any_of_unknown_dimension },
+    fn() { any_of_wrong_input },
+    fn() { any_of_unauthorized },
+    fn() { union_with_exists },
+    fn() { union_join_other },
+];
+
+export def main: Value = do {
+    # Every case must fail atomically: a healthy result would make this entry
+    # an invalid "unexpected success". main consumes the attempt results so any
+    # successful case (a contract regression) fails loudly instead of
+    # publishing a trusted result.
+    let attempts = array.map(invalid_cases, fn(req) {
+        let plan: qb.Plan = edsl.lower(knowledge.payload, req);
+        let _query: qb.Query = qb.transform_sqlite(plan);
+        "unexpected success"
+    });
+    let healthy: Bool = array.all(attempts, fn(s) { s == "unexpected success" });
+    let attempts2 = array.map(next_cases, fn(make) {
+        let plan: qb.Plan = make();
+        let _query: qb.Query = qb.transform_sqlite(plan);
+        "unexpected success"
+    });
+    let healthy2: Bool = array.all(attempts2, fn(s) { s == "unexpected success" });
+    let combined: Bool = healthy && healthy2;
+    let outcome: Value = if combined { 'String("unexpected success") } else { 'String("unexpected success") };
+    outcome
 };

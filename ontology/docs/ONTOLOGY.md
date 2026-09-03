@@ -18,7 +18,10 @@ ontology crate 对领域模型作者提供的源码模块；示例知识位于 `
 type MeasureInput = enum { 'All, 'Distinct };
 type DimensionInput = enum { 'None };
 type FilterInput = enum { 'Text(String), 'Number(Float), 'Int(Int) };
-type FilterOp = enum { 'Eq, 'Ge, 'Le };
+type FilterOp = enum {
+    'Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le,
+    'Contains, 'NotContains, 'StartsWith, 'EndsWith,
+};
 type OrderDirection = enum { 'Asc, 'Desc };
 type OrderTarget = enum { 'Measure(String), 'Dimension(String) };
 
@@ -41,7 +44,49 @@ type QueryRequest = struct {
     offset: Option(Int),
     partition: Option(PartitionRequest),
 };
+
+# 封闭 OR-group：维度值属于任一给定值即匹配（lowering 为 query 的 `Or(Eq(...))`）。
+# 经 `lower_any(payload, request, any_of, exists, having)` 与普通 AND 条件合并。
+type AnyOfRequest = struct {
+    id: String,
+    subject: String,
+    values: Array(FilterInput),
+};
 ```
+
+`AnyOfRequest` 复用普通 `FilterRequest` 的 AND 列表兼容性：它在降低后作为单个
+`Or(Eq(...))` 项追加到 scope/AND 条件之后，组内值按请求顺序进入 bindings；空组、
+未知/未授权维度、非法值类型或维度不支持 Eq 都原子失败，不发布部分 Plan。
+
+存在性过滤与分组谓词是独立的有类型请求参数，通过 `lower_full` 与基础
+`QueryRequest` 一起降低：
+
+```telora
+type ExistsRequest = struct {
+    target: String,        # 稳定实体 id（见 `entity_id`）
+    subject: String,
+    filters: Array(FilterRequest),   # 相关实体行上的附加条件（AND）
+    any_of: Array(AnyOfRequest),     # 相关实体行上的 OR-group（约束 EXISTS 内层）
+    min_matches: Option(Int),        # 'Some(n)：至少 n 条匹配相关行（相关聚合 EXISTS）
+};
+
+type HavingOp = enum { 'Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le };
+type HavingRequest = struct {
+    measure: String,       # 本请求已选择的指标 id
+    subject: String,
+    op: HavingOp,
+    threshold: FilterInput,
+};
+```
+
+`lower(payload, request)`、`lower_full(payload, request, exists, having)` 与
+`lower_any(payload, request, any_of, exists, having)` 都接受 `QueryRequest`；
+`lower_full` 额外降低存在性过滤与分组谓词，`lower_any` 再叠加 subject 的 OR-group。
+基础请求可以没有
+`measures`：此时它是行级投影/列表请求（见下文“行级投影”）。
+`lower_group_count(payload, request, having)` 返回“满足 HAVING 的分组个数”（嵌套形状
+1，`count(1)` 于内层分组查询之上），请求必须选择指标与分组维度且不得指定
+ordering/limit/offset/partition。
 
 `id` 来自知识模型声明的封闭业务词汇。筛选按请求顺序以 `And` 组合；筛选维度
 不必同时投影。排序目标必须是本请求已经选择的指标或维度。`limit` 存在时必须
@@ -59,6 +104,20 @@ type QueryRequest = struct {
 与每分区 `take` 是不同语义：`limit` 截断全局结果，`take` 是每个分区各自的前 N 行；
 不足 N 行的分区返回其全部行。
 
+`measures` 可以为空：当请求没有 `measures` 时，它是行级投影/列表请求（目标属性、
+信息、列表），只投影维度属性、不引入虚构 COUNT 指标。此时必须至少选择一个
+`dimensions`，base 实体取自第一个请求维度所属实体；其他被引用实体（投影维度、
+筛选、排序、scope）必须经 base 的安全（不扩 grain）路径到达，fan-out 路径原子失败。
+行级请求不允许 `partition`，排序目标只能是维度，`limit`/`offset` 与授权/稳定排序
+规则照常生效。
+
+筛选能力与 `FilterOp` 词表：比较算子 `'Eq`/`'Ne`/`'Gt`/`'Ge`/`'Lt`/`'Le` 降低到
+query 的封闭比较 scalar；文本算子 `'Contains`/`'StartsWith`/`'EndsWith`（大小写
+不敏感）与 `'NotContains`（大小写敏感）通过 query 的封闭 `'Instr`/`'Lower`/
+`'Length`/`'Substr`/`'Add`/`'Sub` 词表表达。所有运行期值始终作为参数化 Bind 进入
+bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允许的算子与输入类型；
+文本算子要求 `'Text` 输入。封闭 enum 值域仍只支持 `'Eq`。
+
 ## 知识声明 API
 
 领域作者用具名 struct 表达实体，用 property decorator 就近声明事实：
@@ -75,7 +134,10 @@ type QueryRequest = struct {
 | `json_dimension(id, authorized, filterable, ops, input_kinds, path)` | 字段 | 把被标注字段的物理 JSON 列按固定 path 声明为业务维度（可组合 fold） |
 | `scope(predicates)` | 字段 | 维度成员的固有行范围（`Array(ScopePredicate)`，可组合 fold） |
 | `entity_source(table, alias)` | 类型 | 实体的数据源和别名 |
-| `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的关系 |
+| `union_source(alias, branches)` | 类型 | 联合（多来源）实体：有序物理分支 UNION ALL（与 `entity_source` 互斥） |
+| `entity_id(id)` | 类型 | 实体的稳定业务 id（供存在性过滤/行级目标引用；缺省为 alias） |
+| `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
+| `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`'Eq(RelationPair)`/`'And`/`'Or` 列等值组合 |
 | `enum_value(value, label)` | enum variant | 封闭值域的稳定值和展示标签 |
 
 同一字段的同型 property 按 `Option(previous)` 顺序 fold：字段 property 取最后一项，
@@ -319,18 +381,192 @@ type Customer = struct {
 多个目标按请求顺序合并并复用已有边。只有全 Safe 路径能进入 Plan；fan-out-only、
 不可达或被深度截断的目标都使请求失败。
 
+关系键可以结构化：`relation(target, kind, from_field, to_field)` 是单列等值糖，
+`relation_key(target, kind, key)` 接受 `RelationKey`，其中
+`'Eq(RelationPair)` 为单列等值，`'And`/`'Or`（非空）组合列等值
+（`RelationPair.from` 是声明实体、`to` 是目标实体的规范字段索引）。复合/析取键降低
+为 query 的 `join_on`/`on_eq`/`on_and`/`on_or` 结构化 ON 树，不引入 raw SQL。
+同一物理表的角色（a/z 端、父子同表、双口径）以不同实体类型共享同一物理表建模：每个
+角色是一个独立实体类型与 alias，relation 指向对应角色类型；这保持领域无关，不新增
+ICM 专用关系类型。
+
+## 联合实体（multi-source union）
+
+`union_source(alias, branches)` 让一个逻辑实体由多个同 grain 物理来源组成；它与
+`entity_source` 互斥。联合实体仍是一个普通 struct：其字段是逻辑字段，每个字段的
+`@edsl.column` 给出该逻辑字段的稳定输出列名。每个分支通过
+`columns: Array(UnionColumnDecl { field, column })` 把全部规范逻辑字段映射到该分支的
+物理列（`field` 为规范字段索引，`column` 为该分支的物理列名；映射必须完整、不重复且
+按字段索引升序）。`filter: Option(ScopePredicate)` 是该分支固定的行级过滤（`'Eq`
+over 一个逻辑字段），会解析到该分支映射后的物理列；不接受 raw SQL/Expr。
+
+```telora
+def merged_item_branch_a_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "group_id" },
+    { field: 1, column: "item_id" },
+    { field: 2, column: "kind" },
+    { field: 3, column: "owner_id" },
+];
+def merged_item_branch_b_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "category_key" },
+    { field: 1, column: "resource_key" },
+    { field: 2, column: "kind" },
+    { field: 3, column: "account_key" },
+];
+def merged_item_branches: Array(edsl.UnionBranchDecl) = [
+    { table: "items_a", alias: "a", columns: merged_item_branch_a_cols, filter: 'None },
+    { table: "items_b", alias: "b", columns: merged_item_branch_b_cols, filter: 'Some({ field: 2, op: 'Eq, input: 'Text("retail") }) },
+];
+
+@edsl.entity_id("merged_items")
+@edsl.union_source("u", merged_item_branches)
+type MergedItem = struct {
+    @edsl.column("group_id")
+    @edsl.dimension("ItemGroup", flag_true, flag_true, eq_ops, int_kinds)
+    group_id: Int,
+    @edsl.column("item_id")
+    @edsl.key(flag_true)
+    @edsl.measure("ItemCount", count_agg, no_requires)
+    item_id: Int,
+    # ...
+};
+```
+
+`build_root`/prepare 校验联合实体：分支非空、逻辑字段列非空且不重复、每个分支映射完整
+规范字段集一次且按升序、物理列/表/分支 alias/联合 alias 均为合法标识符、分支 alias
+唯一且不与联合 alias 冲突、固定分支过滤为合法字段上的 `'Eq`；映射缺失/重复/越界/
+顺序错/非法物理列都原子失败。prepared 表示供热路径直接使用。请求 base 为联合实体时，
+lowering 使用 query 已发布的 `derived_source`/`union_branch`/`union_column`：输出名
+用联合逻辑列名，输入表达式用各分支映射后的物理列；Plan `sources` 为空、
+`derived: 'Some(...)`、无 join/EXISTS；projection/filter/aggregate/grouping/HAVING/
+ordering/partition 全部作用于联合逻辑 alias。动态值按“分支声明顺序后接外层表达式
+顺序”进入 bindings；重复 lowering 逐字节确定。
+
+边界：derived 外层不能携带物理 sources/joins/EXISTS。因此本轮联合实体只支持完全由
+各分支直接投影出的同 grain 字段；需要额外 join/多跳关系的联合实体请求给出确定诊断，
+不退化到任一单一分支。普通单 source 实体的 Plan/SQL/bindings 保持不变；profile 递归
+收窄分支的 Source/Column/Bind/Scalar/Filter 与外层 Aggregate/Group/Having/Order/
+Partition。
+
+## 行级投影、存在性过滤、分组谓词
+
+### 行级投影（列表/信息请求）
+
+`measures` 为空时请求为行级投影：SELECT 只含维度属性，不引入虚构 COUNT 指标。
+
+```telora
+let list_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+        { id: "CustomerTier", subject: "analyst", input: 'None },
+    ],
+    filters: [{ id: "OrderRegion", subject: "analyst", op: 'Contains, input: 'Text("east") }],
+    ordering: [{ target: 'Dimension("OrderRegion"), direction: 'Asc }],
+    limit: 'Some(25),
+    offset: 'None,
+    partition: 'None,
+};
+let plan: qb.Plan = edsl.lower(knowledge.payload, list_request);
+```
+
+规则：必须有维度；base 实体取第一个请求维度所属实体；被引用实体必须经 base 的
+安全路径（fan-out 会放大行、原子拒绝）；不允许 `partition`；排序目标只能是维度；
+`limit`/`offset` 照常；筛选与 scope 照常。文本筛选（`'Contains`/`'StartsWith`/
+`'EndsWith`/`'NotContains`）保持参数化并降低到封闭的
+`'Instr`/`'Lower`/`'Length`/`'Substr` 词表。
+
+### 存在性过滤（EXISTS）
+
+```telora
+let request: edsl.QueryRequest = {
+    measures: [{ id: "CustomerCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+let exists: edsl.ExistsRequest = { target: "orders", subject: "analyst", filters: [], min_matches: 'None };
+let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
+```
+
+- `target` 是稳定实体 id（`entity_id`，缺省为 alias）；subject 需经授权。
+- 目标与 base 之间只需一条已声明关系；方向由 `lookup` 推导：优先 base→target 正向，
+  缺失时使用 target→base 反向边（反向存在性）推导相关性，不要求模型复制反向图边。
+  反向边不参与普通 join 路径闭包；同一对实体声明双向边也不会令 `build_root` 耗尽燃料
+  （路径搜索按访问集去环，Parent→Child 双向 fixture 通过）。
+- fan-out 关系允许（存在性不放大主体 grain）。`min_matches: 'None` 时是普通相关
+  EXISTS；`min_matches: 'Some(n)`（正整数）时是相关聚合 EXISTS：内层按相关性分组并
+  `HAVING count(关联 id) >= n`，仍保持主体 grain（Parent 计数 + `exists child`/
+  `child count >= n` 不被 Child 行放大；普通 fan-out join 仍原子拒绝）。
+- 关系键必须是列等值合取（`'Eq` 或 `'And`）；析取键在 EXISTS 中原子拒绝；分组存在性
+  要求单列合取键（一个 ColumnEq）。
+- 内层 `filters` 只能引用目标实体维度，动态值进入 bindings。
+- 当 measure 的 `requires` 实体恰好是 exists 目标时，该必需实体由相关存在谓词满足，
+  不再生成 fan-out join；`Plan.joins` 不放大 subject measure。
+- 未知实体、非直接相关、内层引用非目标实体、非正整数 `min_matches` 都原子失败。
+
+### 分组计数（count of groups）
+
+`lower_group_count(payload, request, having)` 对聚合/分组请求的“满足 HAVING 的组数”
+计数（query 的嵌套形状 1）：
+
+```telora
+let group_request: edsl.QueryRequest = {
+    measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+let having: edsl.HavingRequest = {
+    measure: "OrderAmount", subject: "analyst", op: 'Ge, threshold: 'Number(100.0),
+};
+let query: qb.Query = edsl.lower_group_count(knowledge.payload, group_request, [having]);
+```
+
+返回 `count(1)` 于内层分组查询之上；阈值恒为参数化绑定。请求不得携带
+ordering/limit/offset/partition，且必须同时选择指标与分组维度。
+
+### 分组谓词（HAVING）
+
+```telora
+let having: edsl.HavingRequest = {
+    measure: "OrderAmount",
+    subject: "analyst",
+    op: 'Ge,
+    threshold: 'Number(100.0),
+};
+let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [], [having]);
+```
+
+- `measure` 必须已在本请求选择（投影聚合/计算聚合）；未请求引用原子失败。
+- `threshold` 是动态标量，恒为尾部 `?` 绑定。
+- 与全局 `limit`/`offset`/`ordering`、分组内 Top N、分页的组合边界由 query 统一
+  校验；HAVING 与分组 Top N 组合时 HAVING 进入内层分组查询。
+- 无 measure 的行级请求带 HAVING 原子失败（"having requires an aggregated measure"）。
+- 使用 HAVING/EXISTS/Lower/Length 时，profile 的 `allowed_operators` 需含
+  `'Having`/`'Exists`、`allowed_scalars` 需含所用 scalar（`'Lower`/`'Length` 等），
+  否则 `qb.validate` 原子拒绝。
+
 ## 准备知识
 
 ```telora
 def profile: qb.PlanProfile = {
     allowed_operators: [
         'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
-        'Filter, 'Join, 'Group, 'Order, 'Limit, 'Offset,
+        'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order,
+        'Limit, 'Offset, 'Partition,
     ],
     allowed_join_kinds: ['Inner, 'Left],
     allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
     allowed_scalars: [
-        'Substr, 'Instr, 'If, 'Add, 'Sub,
+        'Substr, 'Instr, 'If, 'Add, 'Sub, 'Lower, 'Length,
+        'JsonExtract, 'JsonType, 'JsonValid,
         'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
     ],
     allow_distinct: 'True,
@@ -439,4 +675,9 @@ tie-breaker、binding 顺序确定性）；`invalid` 展示非法请求不发布
 契约破坏（未知依赖、依赖环、跨 grain）、filtered Measure 非法 predicate（引用
 未授权/不可筛选维度、不允许的 operation/input kind、enum 未知稳定值）与 JSON
 Dimension 拒绝（Profile 缺 JsonExtract、未授权 JSON Dimension、非法筛选输入、
-未请求排序目标）。
+未请求排序目标）。`verify` 与 `tests/ontology` 还覆盖下一轮能力：measureless
+行级投影（无虚构 COUNT、无 grouping、跨安全 join 列表、contains 参数化绑定）、
+文本筛选算子（starts-with/contains/not-contains/ends-with 的封闭 lowering 与
+binding 顺序）、HAVING（阈值绑定、需已选 measure）、EXISTS（fan-out 必需实体改为
+相关存在谓词、不产生 fan-out join）与结构化复合关系键（`'And` 合取键降低为
+`join_on` 的 AND ON 条件）。
