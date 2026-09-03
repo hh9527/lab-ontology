@@ -17,8 +17,8 @@ EnterpriseKnowledge。组织方式可参考旧 `ent-1`，但实体、关系、�
 - `icm/ao/schema/`、物理表列、Join 路径和 mapping 属于模型实现，不进入 Resolver 公共资料。
 - `icm-model/docs/*` 是交付给 Resolver 的唯一公开背景知识包，必须自包含；交付后 Resolver
   不读取或依赖 `icm/**`。`icm/ao/` 仅是 A3 的私有建模输入；`icm/eval/` 只包含问题全集
-  `questions.jsonl` 和当前重点改进子集 `selected.jsonl`。Benchmark 报告是目录外独立的
-  `benchmarks/icm-eval.sqlite` artifact。
+  `questions.jsonl` 和当前重点改进子集 `selected.jsonl`。Benchmark 记录由 Labflow 管理在
+  `.labflow/benchmarks/icm-eval.sqlite`，不属于模型 artifact。
 - `icm-model/docs/DOMAIN.md` 表达业务对象、领域词汇、概念关系、分类、状态、值域、单位、
   时间语义和统计口径。可公开 measure/dimension ID 及其业务含义，但不写 Intent/Query
   教程、CLI/SQL/bindings、物理 schema、Join 路径或实现细节。

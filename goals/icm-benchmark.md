@@ -1,8 +1,8 @@
 # ICM Benchmark 目标
 
-使用 Labflow 内置 `/bench` 流程，以 `icm/eval/questions.jsonl` 为问题全集、
-`icm/eval/selected.jsonl` 为当前重点改进子集完成全部 selected Cases，并生成独立的
-`benchmarks/icm-eval.sqlite`。`icm/eval/` 不存放报告或其它运行资料。不要自行安排题目顺序、
+使用 Labflow 内置 Bench artifact，以 `icm/eval/questions.jsonl` 为问题全集、
+`icm/eval/selected.jsonl` 为本轮有序题集完成全部 selected Cases；评测记录由 Labflow
+管理在 `.labflow/benchmarks/icm-eval.sqlite`。`icm/eval/` 不存放报告或其它运行资料。不要自行安排题目顺序、
 维护外部进度文件或手工拼装报告。
 
 每个 Resolver Session 可连续测评默认 10 题。Resolver 只获得 `icm-model/docs/*` 的稳定、
