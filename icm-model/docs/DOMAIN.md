@@ -1,71 +1,96 @@
-# ICM 领域模型（Domain）
+# ICM 业务领域
 
-> 与 `icm/eval/public/DOMAIN.md` 同源（本镜像供开发参考）。Resolver 使用
-> `icm/eval/public/DOMAIN.md`。
+## 1. 业务对象
 
-## 概览
+- **租户**：多租户隔离与归属的根对象；设备、站点、告警、KPI 等资源按租户归属。
+- **站点**：设备与告警所在的物理/组织位置；每个站点属于一个租户。
+- **设备**：分域管理的物理设备。
+  - 网络（network）：交换机、路由器、AC、AP、防火墙及其机框/单板/端口/光模块。
+  - PON：OLT、ONU。
+  - 服务器（server）：机架/昆仑/异构/天工机框/智能小站/机柜服务器及其硬盘/内存/
+    处理器/风扇/电源/网卡/端口/光模块。
+  - 存储（storage）：华为 SMIS/VSP/HP/分布式/闪存存储设备、FC 交换机及其控制器/
+    机箱/硬盘/风扇/电源/端口/后备电源。
+  - 终端（terminal）：打印机、UPS、负载均衡等接入终端。
+  - 协作（collaboration）：视频会议终端等协作设备。
+- **子部件**：设备内部可独立管理的部件（见各域列举）。
+- **告警**：设备/子部件产生的当前告警事件，含名称、类型、级别、确认与清除状态、
+  发生时间、产生告警的资源。
+- **KPI**：设备/子部件的时间序列运行指标（CPU/内存/在线率/端口/光功率/温度/流量等）。
 
-`icm-model` 基于 Ontology eDSL 声明 ICM 业务知识：6 类设备、站点/租户、当前告警、
-KPI 时序事实与设备子部件。能力形式：
+## 2. 设备分类（稳定值）
 
-- 聚合查询：count/avg/max/min/sum + 分组/过滤/排序/分页/分组内 Top N/HAVING。
-- 行级投影（`measures: []`）：目标属性、信息、列表（只投影维度属性）。
-- 存在性：`exists`（相关 EXISTS，方向自动推导）+ `min_matches`（≥N 相关行）。
-- 分组计数：`group_count: "CountGroups"`（满足 having 的组数）。
-- 多值 OR 组：`any_of`（维度等于任一给定值，多组 AND）。
-- 过滤词表：`Eq/Ne/Gt/Ge/Lt/Le` 与文本 `Contains/StartsWith/EndsWith/NotContains`。
+| 域 | 分类值 |
+| --- | --- |
+| 网络 | `ne.category.switch`（交换机）、`ne.category.ac`（AC/WAC）、`ne.category.router`（路由器/AR）、`ne.category.fatap`（AP）、`ne.category.firewall`（防火墙） |
+| PON | `olt`、`onu` |
+| 服务器 | `ne.category.server.rack`（机架）、`ne.category.server.kunlun`（昆仑）、`ne.category.server.heterogeneous`（异构）、`ne.category.server.subrack`（天工机框）、`ne.category.server.edge`（智能小站）、`ne.category.server.enclosure`（机柜） |
+| 存储（子类） | `HuaweiSmisStorageDevice`（华为SMIS）、`VSPStorageDevice`（VSP）、`HPEStorageDevice`（HP）、`FusionStorageDevice`（分布式）、`EnterpriseStorage`（闪存） |
+| 终端 | `ne.category.terminal.*` |
+| 协作 | `COLLABORATION` |
 
-## 授权
+## 3. 状态与值域
 
-subject 支持 `analyst` / `resolver`。
+- 通信状态：`0`=在线、`1`=离线。
+- 告警级别：`1`=紧急、`2`=重要、`3`=次要、`4`=提示。
+- 告警确认：`0`=未确认、`1`=已确认；告警清除：`0`=未清除、`1`=已清除。
+- 存储运行/健康状态：`1`=正常。
+- 子部件状态：如 `异常` 等业务状态。
+- 链路方向：`bidirectional`=双向、`unidirectional`=单向。
 
-## 指标
+## 4. 业务关系与归属
 
-计数指标：`DeviceCount`（五域统一设备行数：网络/PON/服务器/存储/终端，协作无站点键
-被排除）、`NetworkDeviceCount`、`PonDeviceCount`、`ServerDeviceCount`、
-`StorageDeviceCount`、`TerminalDeviceCount`、`CollabDeviceCount`、`AlarmCount`、
-`AlarmDeviceRefCount`（告警资源引用计数，`Distinct`=count(DISTINCT 引用列)）、
-`SiteCount`、`TenantCount`，以及各子部件计数（`Storage*Count`/`Server*Count`/
-`NetPortCount`/`NetOpticalCount`）。
+- 设备属于某租户；设备位于某站点（站点属于租户）。
+- 设备产生告警，告警关联产生它的设备/资源；子部件告警也归属到对应设备资源。
+- 设备包含子部件；子部件属于某设备。
+- 设备/子部件有对应的时间序列 KPI。
+- 网络、PON、服务器、存储、终端五类设备都具有“设备—站点—租户”的归属链。
+  **统一设备统计**指对具备站点归属的上述五类设备做联合计数（`DeviceCount`）。
+  协作设备（视频会议终端等）没有站点归属，不属于任何站点，因此被排除在统一设备
+  统计之外；租户归属不能替代站点归属，统一设备统计也不会把某一单域设备计数当作
+  跨域设备数。
 
-KPI 指标（按 设备域×指标×聚合）：`Network*`、`Ap*`、`Pon*`/`Onu*`、
-`Server*`、`Storage*`。完整 id 清单见 `icm/eval/public/DOMAIN.md`。
+## 5. 指标（Measure）业务含义
 
-## 维度
+计数类（结果无量纲，表示对象或事件的个数）：
 
-- 设备属性维度：name/id/type/alias/commuState/ip/mac/model/manufacturer/sn/
-  location/版本类/资产/状态/容量等，前缀按设备域（`NetworkDevice*`、`Server*`…）。
-- 统一设备治理 id 维度：`DeviceTenantId`、`DeviceSiteId`（稳定 id，可分组/排序）。
-- 治理与告警维度：`TenantName`、`TenantIndustry`、`SiteName`、`AlarmName`、
-  `AlarmType`、`AlarmSeverity`、`AlarmAcked`、`AlarmCleared`、`AlarmTime`、
-  `AlarmTenant`、`AlarmSource`、`AlarmResName`、`AlarmProbableCause`。
-- KPI 时间维度：`NetworkKpiTime`、`NetOnlineKpiTime`、`ApRadioKpiTime`、
-  `ServerKpiTime`、`PonKpiTime`、`OnuKpiTime`、`PonPortKpiTime`、`StorageKpiTime`。
+- `DeviceCount`：五域统一设备对象数（网络、PON、服务器、存储、终端联合统计，
+  见第 4 节归属口径；协作设备除外）。
+- `NetworkDeviceCount` / `PonDeviceCount` / `ServerDeviceCount` /
+  `StorageDeviceCount` / `TerminalDeviceCount` / `CollabDeviceCount`：各设备域的
+  对象数；单域计数只代表该域设备，不能代表跨域设备数量。
+- `AlarmCount`：当前告警事件的条数。
+- `AlarmDeviceRefCount`：告警关联的受影响设备/资源数。采用去重口径时，计的是
+  去重后的受影响设备/资源数；采用非去重口径时，计的是告警关联的引用行数，
+  不等于去重后的设备数。
+- `SiteCount`、`TenantCount`：站点数、租户数。
+- 子部件计数：存储的 控制器/机箱/备电/硬盘/风扇/端口/电源 数量、服务器的 电源/光模块/
+  硬盘/风扇/内存条/处理器/网卡/端口 数量、网络的 端口/光模块 数量。
 
-`NetworkDeviceType` 为归一化计算维度（LSW/AC/WAC/AR/AP 别名→`ne.category.*`）；
-`*Manufacturer` 为归一化计算维度（华为写法 `huawei`/`Huawei`/`2011`/
-`huawei technologies co., ltd` → `huawei`）。
+KPI 类（名称带设备域与聚合含义，含义是相应业务量在该统计周期内的聚合值）：
 
-## 稳定值
+- 网络设备：CPU 使用率、内存使用率（单位 %，平均/最大）；端口利用率（平均，%）、
+  端口总数/已用端口数（总和）；在线率（平均/最大）；AP 射频：信道利用率（平均，%）、
+  丢包率、信号接收强度（平均，dBm）、在线用户数（总和）。
+- PON/ONU：OLT CPU/内存使用率（%）；ONU 内存使用率（%）、在线率、光功率、
+  光模块温度（最大）；PON 端口入/出流量速率（bps）、光功率、光端口发送带宽利用率。
+- 服务器：CPU、内存使用率（平均/最大，%）、硬盘使用率（平均，%）。
+- 存储：CPU、内存使用率、每秒 IO 次数、吞吐量（平均）。
 
-- 网络类型：`ne.category.switch/ac/router/fatap/firewall`。
-- PON：`olt`/`onu`；服务器：`ne.category.server.*`；存储：`HuaweiSmis/VSP/HPE/
-  FusionStorage/EnterpriseStorage`；协作：`COLLABORATION`。
-- 厂商规范值：`huawei`（别名 2011 / Huawei / huawei technologies co., ltd，
-  大小写不敏感）。
-- 状态：`*CommuState` `0/1`；`AlarmSeverity` `1..4`；`AlarmAcked/Cleared` `0/1`。
-- 时间窗用半开区间 `[start, end)`：下界 `Ge`、上界 `Lt`。
+## 6. 维度（Dimension）业务含义
 
-## 能力边界（确定诊断）
+- 设备属性：设备名称、设备 id、类型/分类、别名、通信状态、IP、MAC、型号、厂商、
+  序列号、位置、版本类、资产编号、服务时长、容量/使用率等，按设备域区分。
+- 治理：`TenantName`（租户名称）、`SiteName`（站点名称）、`TenantIndustry`（租户行业）。
+  名称是用于展示的业务名称，可重复或变化。
+- 统一设备的稳定标识：`DeviceTenantId`（租户 id）、`DeviceSiteId`（站点 id）。它们
+  是稳定标识，标识设备归属的租户/站点；名称不是标识，不能代替稳定 id。
+- 时间：各 KPI 的采样时间。
 
-支持：有告警的设备数量/信息（exists target=alarm）、有 ≥N 告警的设备（min_matches）、
-次数超过 N 的实体数量（having+group_count）、维度多值任一（any_of）、
-受影响设备去重引用数（AlarmDeviceRefCount + Distinct）、
-跨治理层级的泛指设备计数/Top 1（DeviceCount + DeviceTenantId/DeviceSiteId，五域联合，
-协作无站点键被排除）。
+## 7. 时间含义与统计口径
 
-仍不支持（确定诊断）：
-跨实体去重计数（每设备的所在站点/租户去重口径）、行级 DISTINCT、相对时间窗（需
-物化）、HAVING measure-vs-measure、多跳角色 join 与站点双口径 OR。
-
-详见 `icm/eval/public/DOMAIN.md` §7。
+- KPI 与告警的数据时间使用统一格式的文本时间戳；告警发生时间表示告警产生的时刻。
+- “近 N 天/近 N 月”等相对业务周期以业务基准时刻向前推算，统计区间采用半开区间
+  `[start, end)`：包含区间起点，不包含区间终点。
+- “近一个月”可指最近一个自然月，也可指自基准时刻回推的固定天数（如 30 天），两种
+  口径的区间边界不同，按相应业务统计约定确定采用哪一种。

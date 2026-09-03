@@ -1,5 +1,13 @@
 # ICM 领域模型目标
 
+## 当前轮唯一工作
+
+Host 已完成文件结构清理：`icm-model/docs/` 现在只有 `DOMAIN.md`，`icm/eval/` 现在只有
+`questions.jsonl` 和 `selected.jsonl`。不要执行或尝试任何删除；本轮只编辑
+`icm-model/docs/DOMAIN.md`，删除其中“使用前需澄清”“完整遍历需要分页”“请求不默认”
+“不猜测”等 Resolver 操作规则。时间部分只保留数据时间、业务周期和统计口径。完成后运行
+四项 icm-model check。
+
 使用 `icm/ao/` 的自包含知识，在 `icm-model/` 中建立一个基于 `ontology` eDSL 的 ICM
 EnterpriseKnowledge。组织方式可参考旧 `ent-1`，但实体、关系、指标、维度、粒度和能力边界
 必须从 ICM 材料独立建模。
@@ -7,10 +15,15 @@ EnterpriseKnowledge。组织方式可参考旧 `ent-1`，但实体、关系、�
 ## 私有模型与公共边界
 
 - `icm/ao/schema/`、物理表列、Join 路径和 mapping 属于模型实现，不进入 Resolver 公共资料。
-- `icm/eval/public/` 只发布 Resolver 解题所需的稳定业务词汇、指标、维度、筛选能力、粒度规则、
-  意图 JSON 契约和诊断语义。
+- `icm-model/docs/*` 是交付给 Resolver 的唯一公开背景知识包，必须自包含；交付后 Resolver
+  不读取或依赖 `icm/**`。`icm/ao/` 仅是 A3 的私有建模输入；`icm/eval/` 只包含问题全集
+  `questions.jsonl` 和当前重点改进子集 `selected.jsonl`。Benchmark 报告是目录外独立的
+  `benchmarks/icm-eval.sqlite` artifact。
+- `icm-model/docs/DOMAIN.md` 表达业务对象、领域词汇、概念关系、分类、状态、值域、单位、
+  时间语义和统计口径。可公开 measure/dimension ID 及其业务含义，但不写 Intent/Query
+  教程、CLI/SQL/bindings、物理 schema、Join 路径或实现细节。
 - 公共资料不得包含评测题、选择列表、隐藏知识 K、trap、标准答案或按题编号编写的提示。
-- `icm/eval/report.sqlite` 存在时，应按迭代和 Case 汇总失败类型，用它发现模型能力缺口；不要
+- `benchmarks/icm-eval.sqlite` 存在时，应按迭代和 Case 汇总失败类型，用它发现模型能力缺口；不要
   把具体题目或答案硬编码进模型。Host 可通过 `feedbacks/icm-model.md` 补充改进重点。
 
 ## make-query
@@ -34,8 +47,9 @@ a3 负责实现适配器固定调用的 `@src/bin/make-query:main` Telora entry�
 
 ## 交付与验证
 
-至少交付模型、动态查询 facade、`src/bin/make-query.telora`、契约测试、领域文档和查询设计
-指南。公共文档同步到 `icm/eval/public/`，但私有模型源码只留在 `icm-model/`。
+至少交付模型、动态查询 facade、`src/bin/make-query.telora`、契约测试和自包含的
+`docs/DOMAIN.md`。不交付独立查询设计指南或 README，也不向 `icm/eval/public/` 复制文档；
+私有模型源码只留在 `icm-model/`。
 
 完成前运行实际可用的检查，并至少覆盖：合法 intent、未知词汇、非法枚举、类型错误、grain
 放大、不支持的目标属性、排序/Top N、绑定顺序，以及同一输入的确定性。
