@@ -23,17 +23,20 @@ EnterpriseKnowledge。组织方式可参考旧 `ent-1`，但实体、关系、�
 Host 已提供 `bin/make-query` 适配器，接口固定为：
 
 ```bash
-bin/make-query check <intent.json|intent-json>
+bin/make-query check
 ```
 
-第二个参数可以是包含单个 intent JSON 的现有文件，也可以直接是一个 JSON object；Resolver
-不需要、也不应为了调用工具先创建文件。成功时 stdout 只输出一个参数化 Query 对象：
+适配器只读取固定输入 `icm-eval/input.json`。调用前 Resolver 将一个完整 intent JSON
+写入该文件；不得向命令传递路径或 JSON 参数。适配器将 Telora stdout 写入
+`icm-eval/ok.json`，将 stderr 写入 `icm-eval/diagnostic.jsonl`，并在终端显示
+`exit code: N`。成功时 `ok.json` 只包含一个参数化 Query 对象：
 
 ```json
 {"sql":"SELECT ... WHERE ... = ?","bindings":["value"]}
 ```
 
-失败时退出码非零，stderr 输出简短、确定且可归因的诊断，stdout 不得输出部分 Query。
+失败时退出码非零，`ok.json` 为空，`diagnostic.jsonl` 包含确定且可归因的诊断。
+成功时退出码为零；`diagnostic.jsonl` 保留 Telora 实际产生的诊断，没有诊断时为空。
 动态值只能进入 bindings；调用者不能提交表名、列名、alias、Join、SQL 或任意表达式。
 icm-modeler 负责实现适配器固定调用的 `@src/bin/make-query:main` Telora entry；不要修改适配器协议。
 
