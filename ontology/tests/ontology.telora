@@ -423,7 +423,7 @@ def check_cross_module_prepared: Bool = do {
         'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
         _ => 'False,
     };
-    let entities_ok = array.length(p.entities) == 9;
+    let entities_ok = array.length(p.entities) == 12;
     check(auth_ok, "cross-module: published authorization closure works")
         && check(computed_ok, "cross-module: published computed-dimension closure works")
         && check(entities_ok, "cross-module: published entity index available")
@@ -1135,6 +1135,441 @@ def check_any_of: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Bounded two-hop correlated existence (ontology foundation feedback).
+#
+# Component -> Site (unique grain-safe owner) -> Alarm is declared explicitly
+# with @edsl.exists_route(Site, Alarm). Lowering must add only the grain-safe
+# owner join and a correlated EXISTS over the target: no outer fan-out join
+# that would amplify the component grain.
+# ---------------------------------------------------------------------------
+
+def entity_id_index: Fn(Array(edsl.EntityEntry), String) -> Int = fn(entities, id) {
+    match array.find(entities, fn(e) { e.id == id }) {
+        'Some(e) => e.index,
+        'None => -1,
+    }
+};
+
+def component_base_request: edsl.QueryRequest = {
+    measures: [{ id: "ComponentCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def alarm_exists_spec: edsl.ExistsRequest = {
+    target: "alarms",
+    subject: "analyst",
+    filters: [],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def alarm_min_exists_spec: edsl.ExistsRequest = {
+    target: "alarms",
+    subject: "analyst",
+    filters: [],
+    any_of: [],
+    min_matches: 'Some(2),
+};
+
+def alarm_filtered_exists_spec: edsl.ExistsRequest = {
+    target: "alarms",
+    subject: "analyst",
+    filters: [{ id: "AlarmLevel", subject: "analyst", op: 'Eq, input: 'Int(3) }],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def check_knowledge_route_prepared: Bool = do {
+    let p = knowledge.payload;
+    let component = entity_id_index(p.entities, "components");
+    let alarms = entity_id_index(p.entities, "alarms");
+    let route_ok = array.any(p.routes, fn(r) { r.base == component && r.target == alarms });
+    check(route_ok, "two-hop: prepared payload stores the declared Component -> Site -> Alarm route")
+        && check(array.length(p.routes) == 1, "two-hop: exactly one correlated-existence route is declared")
+};
+
+def check_two_hop_forward_exists: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, component_base_request, [alarm_exists_spec], []);
+    let join_shape = if array.length(plan.joins) == 1 {
+        let join = get_index(plan.joins, 0);
+        let kind_ok = match join.kind { 'Inner => 'True, 'Left => 'False };
+        let source_ok = join.source.alias == "s" && join.source.table == "sites";
+        let cond_ok = match join.condition {
+            'Eq(eq) => eq.left.source == "m" && eq.left.column == "site_id"
+                && eq.right.source == "s" && eq.right.column == "id",
+            _ => 'False,
+        };
+        kind_ok && source_ok && cond_ok
+    } else {
+        'False
+    };
+    let exists_count = array.length(plan.exists) == 1;
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(m.id) AS ComponentCount FROM components AS m INNER JOIN sites AS s ON m.site_id = s.id WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id)";
+    check(join_shape && exists_count, "two-hop: base->site inner join plus one correlated EXISTS")
+        && check(query.sql == expected_sql, "two-hop: SQL keeps the base grain via owner join and EXISTS")
+        && check(array.length(query.bindings) == 0, "two-hop: no bindings when there are no dynamic values")
+};
+
+def check_two_hop_grain_not_amplified: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, component_base_request, [alarm_exists_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(string.contains(query.sql, "FROM components AS m INNER JOIN sites AS s ON m.site_id = s.id"),
+        "two-hop: only the grain-safe owner join is emitted")
+        && check(!string.contains(query.sql, "JOIN alarms"), "two-hop: the Site->Alarm fan-out edge is never joined")
+        && check(string.contains(query.sql, "WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id)"),
+            "two-hop: existence is a correlated predicate, not a row-multiplying join")
+};
+
+def check_two_hop_min_matches: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, component_base_request, [alarm_min_exists_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(2)];
+    check(string.contains(query.sql, "GROUP BY al.site_id HAVING count(al.id) >= ?"),
+        "two-hop min_matches: correlated aggregate EXISTS over the owner-correlated group")
+        && check(query.bindings == expected, "two-hop min_matches: threshold enters ordered bindings")
+};
+
+def check_two_hop_filter_bindings_and_determinism: Bool = do {
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_full(knowledge.payload, component_base_request, [alarm_filtered_exists_spec], []));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_full(knowledge.payload, component_base_request, [alarm_filtered_exists_spec], []));
+    let expected: Array(qb.Val) = ['Int(3)];
+    check(string.contains(q1.sql, "AND al.level = ?"), "two-hop inner filter: dynamic value stays a bind")
+        && check(q1.bindings == expected, "two-hop inner filter: binding order is deterministic")
+        && check(q1.sql == q2.sql && q1.bindings == q2.bindings, "two-hop: repeated lowering is byte-identical")
+};
+
+def check_correlation_feasible: Bool = do {
+    let p = knowledge.payload;
+    check(edsl.correlation_feasible(p, "components", "alarms"), "feasible: declared two-hop route")
+        && check(edsl.correlation_feasible(p, "components", "sites"), "feasible: one-hop owner target")
+        && check(!edsl.correlation_feasible(p, "components", "customers"), "infeasible: unrelated target")
+        && check(!edsl.correlation_feasible(p, "components", "components"), "infeasible: self target")
+        && check(!edsl.correlation_feasible(p, "ghost", "alarms"), "infeasible: unknown base")
+        && check(!edsl.correlation_feasible(p, "components", "ghost"), "infeasible: unknown target")
+};
+
+def check_exists_inner_filter_target: Bool = do {
+    let p = knowledge.payload;
+    let alarms = entity_id_index(p.entities, "alarms");
+    let on_target = edsl.filters_on_entity(p, alarms, [
+        { id: "AlarmLevel", subject: "analyst", op: 'Eq, input: 'Int(3) },
+    ]);
+    let off_target = edsl.filters_on_entity(p, alarms, [
+        { id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("east") },
+    ]);
+    check(on_target, "exists inner filter on the path end entity is accepted")
+        && check(!off_target, "exists inner filter reaching beyond the path end is rejected")
+};
+
+# ---------------------------------------------------------------------------
+# Route declaration fixtures (valid and invalid).
+# ---------------------------------------------------------------------------
+
+# Valid: GoodLeaf -> GoodOwner (safe) -> GoodTarget (fan-out, existence only).
+@edsl.entity_id("good_leaf")
+@edsl.entity_source("good_leaf", "gl")
+@edsl.relation(GoodOwner, safe_kind, 1, 0)
+@edsl.exists_route(GoodOwner, GoodTarget)
+type GoodLeaf = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+@edsl.entity_id("good_owner")
+@edsl.entity_source("good_owner", "go")
+@edsl.relation(GoodTarget, fanout_kind, 0, 2)
+type GoodOwner = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("good_target")
+@edsl.entity_source("good_target", "gt")
+type GoodTarget = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("level")
+    level: Int,
+    @edsl.column("site_id")
+    site_id: Int,
+};
+
+# Invalid: first owner hop is fan-out (not unique / not grain-safe).
+@edsl.entity_id("bad_fan_leaf")
+@edsl.entity_source("bad_fan_leaf", "bfl")
+@edsl.relation(BadFanOwner, fanout_kind, 1, 0)
+@edsl.exists_route(BadFanOwner, BadFanTarget)
+type BadFanLeaf = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+@edsl.entity_id("bad_fan_owner")
+@edsl.entity_source("bad_fan_owner", "bfo")
+@edsl.relation(BadFanTarget, fanout_kind, 0, 2)
+type BadFanOwner = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("bad_fan_target")
+@edsl.entity_source("bad_fan_target", "bft")
+type BadFanTarget = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("level")
+    level: Int,
+    @edsl.column("site_id")
+    site_id: Int,
+};
+
+# Invalid: the only leaf -> owner relation is declared in the reverse direction
+# (owner -> leaf), so the first hop cannot be a unique forward relation.
+@edsl.entity_id("bad_dir_leaf")
+@edsl.entity_source("bad_dir_leaf", "bdl")
+@edsl.exists_route(BadDirOwner, BadDirTarget)
+type BadDirLeaf = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+@edsl.entity_id("bad_dir_owner")
+@edsl.entity_source("bad_dir_owner", "bdo")
+@edsl.relation(BadDirLeaf, safe_kind, 1, 0)
+type BadDirOwner = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("bad_dir_target")
+@edsl.entity_source("bad_dir_target", "bdt")
+type BadDirTarget = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("level")
+    level: Int,
+    @edsl.column("site_id")
+    site_id: Int,
+};
+
+# Invalid: two declared routes from the same base reach the same target.
+@edsl.entity_id("amb_leaf")
+@edsl.entity_source("amb_leaf", "aml")
+@edsl.relation(AmbOwnerA, safe_kind, 1, 0)
+@edsl.relation(AmbOwnerB, safe_kind, 1, 0)
+@edsl.exists_route(AmbOwnerA, AmbTarget)
+@edsl.exists_route(AmbOwnerB, AmbTarget)
+type AmbLeaf = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+@edsl.entity_id("amb_owner_a")
+@edsl.entity_source("amb_owner_a", "ama")
+@edsl.relation(AmbTarget, fanout_kind, 0, 2)
+type AmbOwnerA = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("amb_owner_b")
+@edsl.entity_source("amb_owner_b", "amb")
+@edsl.relation(AmbTarget, fanout_kind, 0, 2)
+type AmbOwnerB = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("amb_target")
+@edsl.entity_source("amb_target", "amt")
+type AmbTarget = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("level")
+    level: Int,
+    @edsl.column("site_id")
+    site_id: Int,
+};
+
+# Invalid: two relations from the via entity connect it to the same target.
+@edsl.entity_id("double_leaf")
+@edsl.entity_source("double_leaf", "dl")
+@edsl.relation(DoubleOwner, safe_kind, 1, 0)
+@edsl.exists_route(DoubleOwner, DoubleTarget)
+type DoubleLeaf = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+@edsl.entity_id("double_owner")
+@edsl.entity_source("double_owner", "dlo")
+@edsl.relation(DoubleTarget, fanout_kind, 0, 2)
+@edsl.relation(DoubleTarget, safe_kind, 0, 2)
+type DoubleOwner = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("double_target")
+@edsl.entity_source("double_target", "dlt")
+type DoubleTarget = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("level")
+    level: Int,
+    @edsl.column("site_id")
+    site_id: Int,
+};
+
+def route_problem_count: Fn(Array(Type)) -> Int = fn(types) {
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.route_build(graph.0, graph.1);
+    array.length(build.problems)
+};
+
+def check_route_prepare_valid: Bool = do {
+    let types: Array(Type) = [GoodLeaf, GoodOwner, GoodTarget];
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.route_build(graph.0, graph.1);
+    check(array.length(build.problems) == 0 && array.length(build.routes) == 1,
+        "route prepare: valid two-hop declaration resolves exactly one route")
+};
+
+def check_route_rejects_nonunique_owner: Bool = do {
+    let types: Array(Type) = [BadFanLeaf, BadFanOwner, BadFanTarget];
+    check(route_problem_count(types) > 0, "route prepare: non-unique (fan-out) owner hop is rejected")
+};
+
+def check_route_rejects_direction_mismatch: Bool = do {
+    let types: Array(Type) = [BadDirLeaf, BadDirOwner, BadDirTarget];
+    check(route_problem_count(types) > 0, "route prepare: reverse-only owner hop (direction mismatch) is rejected")
+};
+
+def check_route_rejects_ambiguous_target: Bool = do {
+    let types: Array(Type) = [AmbLeaf, AmbOwnerA, AmbOwnerB, AmbTarget];
+    check(route_problem_count(types) > 0, "route prepare: multiple routes to the same target are rejected")
+};
+
+def check_route_rejects_ambiguous_second_hop: Bool = do {
+    let types: Array(Type) = [DoubleLeaf, DoubleOwner, DoubleTarget];
+    check(route_problem_count(types) > 0, "route prepare: ambiguous via->target relation set is rejected")
+};
+
+# ---------------------------------------------------------------------------
+# Denser-relation-graph fuel regression (hub + leaf fan-out/ring edges).
+# ---------------------------------------------------------------------------
+
+@edsl.entity_source("dense_hub", "dh")
+@edsl.relation(DenseL1, fanout_kind, 0, 0)
+@edsl.relation(DenseL2, fanout_kind, 0, 0)
+@edsl.relation(DenseL3, fanout_kind, 0, 0)
+@edsl.relation(DenseL4, fanout_kind, 0, 0)
+@edsl.relation(DenseL5, fanout_kind, 0, 0)
+@edsl.relation(DenseL6, fanout_kind, 0, 0)
+type DenseHub = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("dense_leaf_1", "l1")
+@edsl.relation(DenseHub, safe_kind, 0, 0)
+@edsl.relation(DenseL2, fanout_kind, 0, 0)
+type DenseL1 = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("dense_leaf_2", "l2")
+@edsl.relation(DenseHub, safe_kind, 0, 0)
+@edsl.relation(DenseL3, fanout_kind, 0, 0)
+type DenseL2 = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("dense_leaf_3", "l3")
+@edsl.relation(DenseHub, safe_kind, 0, 0)
+@edsl.relation(DenseL4, fanout_kind, 0, 0)
+type DenseL3 = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("dense_leaf_4", "l4")
+@edsl.relation(DenseHub, safe_kind, 0, 0)
+@edsl.relation(DenseL5, fanout_kind, 0, 0)
+type DenseL4 = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("dense_leaf_5", "l5")
+@edsl.relation(DenseHub, safe_kind, 0, 0)
+@edsl.relation(DenseL6, fanout_kind, 0, 0)
+type DenseL5 = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("dense_leaf_6", "l6")
+@edsl.relation(DenseHub, safe_kind, 0, 0)
+@edsl.relation(DenseL1, fanout_kind, 0, 0)
+type DenseL6 = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+def dense_entity_types: Array(Type) = [DenseHub, DenseL1, DenseL2, DenseL3, DenseL4, DenseL5, DenseL6];
+
+def dense_authorize: Fn(String) -> Bool = fn(subject) { 'True };
+
+def check_dense_relation_prepare_bounded: Bool = do {
+    let dense: edsl.PreparedPayload = edsl.build_root("dense-v1", dense_entity_types, knowledge.profile, dense_authorize);
+    check(array.length(dense.entities) == 7, "dense graph: hub/leaf entities prepare within the evaluation budget")
+        && check(array.length(dense.paths) == 7 && array.all(dense.paths, fn(row) { array.length(row) == 7 }),
+            "dense graph: per-source bounded path rows stay complete and deterministic")
+};
+
+# ---------------------------------------------------------------------------
 # Entry.
 # ---------------------------------------------------------------------------
 
@@ -1175,5 +1610,18 @@ export def test_ontology: Value = do {
     let c34 = check_parent_grain;
     let c35 = check_group_count;
     let c36 = check_any_of;
+    let c37 = check_knowledge_route_prepared;
+    let c38 = check_two_hop_forward_exists;
+    let c39 = check_two_hop_grain_not_amplified;
+    let c40 = check_two_hop_min_matches;
+    let c41 = check_two_hop_filter_bindings_and_determinism;
+    let c42 = check_correlation_feasible;
+    let c43 = check_exists_inner_filter_target;
+    let c44 = check_route_prepare_valid;
+    let c45 = check_route_rejects_nonunique_owner;
+    let c46 = check_route_rejects_direction_mismatch;
+    let c47 = check_route_rejects_ambiguous_target;
+    let c48 = check_route_rejects_ambiguous_second_hop;
+    let c49 = check_dense_relation_prepare_bounded;
     'String("ontology tests ok")
 };

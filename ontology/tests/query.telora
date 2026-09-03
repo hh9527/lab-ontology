@@ -3422,3 +3422,103 @@ export def union_all_profile_recurses_into_branches = do {
         && !qb.profile_accepts(union_filtered_outer_plan(), no_filter)
         && !qb.profile_accepts(union_filtered_outer_plan(), no_count)
 };
+
+# ---------------------------------------------------------------------------
+# Correlated EXISTS whose outer column references a JOINED main alias (the
+# Query-layer shape used by the Ontology for bounded two-hop existence).
+#
+# A correlated EXISTS is only a predicate; it never emits a join to the inner
+# source. Combining a grain-safe owner INNER JOIN with a correlated EXISTS on
+# the joined owner alias keeps the base grain: the inner (target) table appears
+# only inside the subquery, never in the outer FROM/JOIN list.
+# ---------------------------------------------------------------------------
+
+def assert_ok: Fn(Bool, String) -> Bool = fn(cond, label) {
+    if cond { 'True } else { fail!("query contract check failed", label) }
+};
+
+def two_hop_exists_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-two-hop-exists",
+        sources: [qb.source("b", "components")],
+        projection: [qb.aggregate('Count, qb.column("b", "id"), 'False, "component_count")],
+        filter: 'None,
+        joins: [
+            qb.join(
+                'Inner,
+                qb.source("s", "sites"),
+                qb.column_ref("b", "site_id"),
+                qb.column_ref("s", "id"),
+            ),
+        ],
+        exists: [qb.exists(
+            qb.source("a", "alarms"),
+            [qb.column_eq(qb.column_ref("s", "id"), qb.column_ref("a", "site_id"))],
+            'Some(qb.scalar('Eq, [qb.column("a", "level"), qb.bind_int(3)])),
+        )],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_two_hop_sql = "SELECT count(b.id) AS component_count FROM components AS b INNER JOIN sites AS s ON b.site_id = s.id WHERE EXISTS (SELECT 1 FROM alarms AS a WHERE s.id = a.site_id AND a.level = ?)";
+
+export def two_hop_exists_structure_accepts_joined_outer_alias = do {
+    let plan = two_hop_exists_plan();
+    let joins_ok = array.length(plan.joins) == 1 && array.length(plan.exists) == 1;
+    assert_ok(qb.structure_ok(plan) && joins_ok,
+        "two-hop: EXISTS outer column may reference a joined main alias")
+};
+
+export def two_hop_exists_lowers_with_owner_join_and_correlated_exists = do {
+    let q = qb.transform_sqlite(two_hop_exists_plan());
+    let expected: Array(qb.Val) = ['Int(3)];
+    assert_ok(q.sql == expected_two_hop_sql,
+        "two-hop: SQL shape is owner join + correlated EXISTS")
+        && assert_ok(q.bindings == expected, "two-hop: bindings stay in placeholder order")
+        && assert_ok(!string.contains(q.sql, "JOIN alarms"), "two-hop: the target is never outer-joined")
+};
+
+export def two_hop_exists_deterministic = do {
+    let q1 = qb.transform_sqlite(two_hop_exists_plan());
+    let q2 = qb.transform_sqlite(two_hop_exists_plan());
+    assert_ok(q1.sql == q2.sql && q1.bindings == q2.bindings,
+        "two-hop: repeated lowering is byte-identical")
+};
+
+export def two_hop_exists_profile_accepts = do {
+    assert_ok(qb.profile_accepts(two_hop_exists_plan(), full_profile()),
+        "two-hop: Join + Exists plan is accepted by the full profile")
+};
+
+export def two_hop_exists_rejects_unknown_outer_alias = do {
+    # A correlated EXISTS whose outer column names an alias that is neither a
+    # base source nor a joined alias must be rejected structurally.
+    let plan: qb.Plan = {
+        revision: "test-two-hop-bad-outer",
+        sources: [qb.source("b", "components")],
+        projection: [qb.expr_item(qb.column("b", "id"))],
+        filter: 'None,
+        joins: [],
+        exists: [qb.exists(
+            qb.source("a", "alarms"),
+            [qb.column_eq(qb.column_ref("ghost", "id"), qb.column_ref("a", "site_id"))],
+            'None,
+        )],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    assert_ok(!qb.structure_ok(plan),
+        "two-hop: an EXISTS outer column must resolve to a visible main alias")
+};

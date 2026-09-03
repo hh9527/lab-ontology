@@ -31,8 +31,9 @@ Host 已提供 `bin/make-query` 适配器，接口固定为：
 bin/make-query check
 ```
 
-适配器只读取固定输入 `icm-eval/input.json`。调用前 Resolver 将一个完整 intent JSON
-写入该文件；不得向命令传递路径或 JSON 参数。适配器将 Telora stdout 写入
+适配器读取 Resolver 写入的固定输入 `icm-eval/input.json`，并在内部读取 Labflow 为当前
+benchmark turn 提供的只读公开上下文；不得向命令传递路径或 JSON 参数。适配器仅从当前
+题目/澄清原文中派生请求级时间授权，Resolver 不能写入或选择该上下文。适配器将 Telora stdout 写入
 `icm-eval/ok.json`，将 stderr 写入 `icm-eval/diagnostic.jsonl`，并在终端显示
 `exit code: N`。成功时 `ok.json` 只包含一个参数化 Query 对象：
 

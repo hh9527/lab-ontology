@@ -190,6 +190,21 @@ type RelationDecl = struct {
 @property('Variant)
 type EnumValueDef = struct { value: String, label: String };
 
+# Type-level: explicitly declared correlated-existence route for this base
+# entity. Each route names the unique, grain-safe owner entity (`via`) and the
+# target entity whose related rows are tested by the existence filter. A route
+# is the author's explicit declaration of a bounded two-hop path: base -> via
+# (a unique, grain-safe forward relation) then via -> target (the declared
+# relation in either direction). Routes are validated once at prepare time and
+# saved on the payload; the hot path never scans metadata or runs BFS.
+@property('Type)
+type ExistsRouteDef = struct { routes: Array(ExistsRouteSpec) };
+
+type ExistsRouteSpec = struct {
+    via: Type,
+    target: Type,
+};
+
 # ---------------------------------------------------------------------------
 # Public request vocabulary.
 # ---------------------------------------------------------------------------
@@ -398,6 +413,21 @@ type RelationEntry = struct {
     key: RelationKey,
 };
 
+# A prepared, validated correlated-existence route. `base` is the entity that
+# declares the route; `via` is its unique grain-safe owner entity; `target` is
+# the existence end entity. `via_edge` is the relation index of the forward
+# base -> via edge (kind Safe); `target_edge` is the relation index connecting
+# via to target; `target_reversed` is True when that edge is declared
+# target -> via and must be derived backwards for the existence correlation.
+type RouteEntry = struct {
+    base: Int,
+    via: Int,
+    target: Int,
+    via_edge: Int,
+    target_edge: Int,
+    target_reversed: Bool,
+};
+
 type PathResult = enum {
     'Safe(Array(Int)),
     'FanOut(Array(Int)),
@@ -411,6 +441,7 @@ type PreparedPayload = struct {
     measures: Array(MeasureEntry),
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
+    routes: Array(RouteEntry),
     paths: Array(Array(PathResult)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
@@ -566,6 +597,21 @@ def scope: Fn(Array(ScopePredicate)) -> Fn(property.FieldPropertyCtx, Option(Sco
             'None => predicates,
         };
         let result: ScopeDef = { predicates: all };
+        result
+    }
+};
+
+# Correlated-existence route declaration on the base entity type:
+# base -> `via` (unique grain-safe owner) -> `target` (existence end). Multiple
+# annotations fold by appending.
+def exists_route: Fn(Type, Type) -> Fn(td.TypeDesc, Option(ExistsRouteDef)) -> ExistsRouteDef = fn(via, target) {
+    fn(ctx, previous) {
+        let spec: ExistsRouteSpec = { via, target };
+        let all = match previous {
+            'Some(p) => array.push(p.routes, spec),
+            'None => [spec],
+        };
+        let result: ExistsRouteDef = { routes: all };
         result
     }
 };
@@ -963,22 +1009,19 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
 
 # ---------------------------------------------------------------------------
 # BFS path precomputation (prepare-time only).
+#
+# For each source entity one bounded breadth-first traversal (depth capped at
+# `path_depth_cap`) records the first deterministic path (by relation
+# enumeration order) to every reachable entity. A safe-only pass runs first;
+# targets reached there keep a Safe path. Targets reached only when fan-out
+# edges are allowed keep a FanOut path. Targets never reached are Missing.
+# The work is bounded per source (not per ordered pair), so adding a few hub
+# relations keeps preparation cheap and does not exhaust evaluation fuel.
 # ---------------------------------------------------------------------------
 
+def path_depth_cap = 8;
+
 type BfsState = struct { node: Int, path: Array(Int) };
-
-type SearchResult = enum {
-    'Found(Array(Int)),
-    'Truncated,
-    'Missing,
-};
-
-type ExpandContinue = struct { visited: Array(Bool), states: Array(BfsState) };
-
-type ExpandResult = enum {
-    'Found(Array(Int)),
-    'Continue(ExpandContinue),
-};
 
 def visited_at: Fn(Array(Bool), Int) -> Bool = fn(visited, i) {
     match array.get(visited, i) {
@@ -992,126 +1035,211 @@ def set_at: Fn(Array(Bool), Int, Bool) -> Array(Bool) = fn(values, index, value)
     array.map(enumerated, fn(pair) { if pair.0 == index { value } else { pair.1 } })
 };
 
-def outgoing_indexes: Fn(Int, Array(RelationEntry), Bool) -> Array(Int) = fn(node, relations, safe_only) {
+def empty_path_row: Fn(Int) -> Array(Option(Array(Int))) = fn(n) {
+    let none: Option(Array(Int)) = 'None;
+    array.map(int_range(n), fn(i) { none })
+};
+
+def row_set: Fn(Array(Option(Array(Int))), Int, Array(Int)) -> Array(Option(Array(Int))) = fn(row, index, path) {
+    let enumerated = array.enumerate(row);
+    array.map(enumerated, fn(pair) {
+        if pair.0 == index { 'Some(path) } else { pair.1 }
+    })
+};
+
+type BfsLevel = struct {
+    visited: Array(Bool),
+    paths: Array(Option(Array(Int))),
+    next: Array(BfsState),
+};
+
+def expand_level_state: Fn(BfsLevel, BfsState, Array(RelationEntry), Bool) -> BfsLevel = fn(level, state, relations, safe_only) {
+    let init: BfsLevel = { visited: level.visited, paths: level.paths, next: level.next };
     let enumerated = array.enumerate(relations);
-    array.flat_map(enumerated, fn(pair) {
-        let r = pair.1;
-        if r.from == node && (safe_only == 'False || r.kind == 'Safe) {
-            [pair.0]
+    array.fold(enumerated, init, fn(acc, pair) {
+        let rel = pair.1;
+        if rel.from != state.node {
+            acc
+        } else if safe_only && rel.kind != 'Safe {
+            acc
+        } else if visited_at(acc.visited, rel.to) {
+            acc
         } else {
-            []
+            let new_path = array.push(state.path, pair.0);
+            let new_visited = set_at(acc.visited, rel.to, 'True);
+            let new_paths = row_set(acc.paths, rel.to, new_path);
+            let next_state: BfsState = { node: rel.to, path: new_path };
+            let result: BfsLevel = { visited: new_visited, paths: new_paths, next: array.push(acc.next, next_state) };
+            result
         }
     })
 };
 
-def has_unvisited_successor: Fn(Array(Bool), Array(BfsState), Array(RelationEntry), Bool) -> Bool = fn(visited, frontier, relations, safe_only) {
-    array.any(frontier, fn(state) {
-        let outs = outgoing_indexes(state.node, relations, safe_only);
-        array.any(outs, fn(r_idx) {
-            let r = get_index(relations, r_idx);
-            !visited_at(visited, r.to)
-        })
-    })
-};
-
-def expand_state: Fn(Int, Array(Bool), BfsState, Array(RelationEntry), Bool) -> ExpandResult = fn(to, visited, state, relations, safe_only) {
-    let outs = outgoing_indexes(state.node, relations, safe_only);
-    let init_cont: ExpandContinue = { visited: visited, states: [] };
-    let init: ExpandResult = 'Continue(init_cont);
-    array.fold(outs, init, fn(acc, r_idx) {
-        match acc {
-            'Found(_) => acc,
-            'Continue(cont) => do {
-                let r = get_index(relations, r_idx);
-                if !visited_at(cont.visited, r.to) {
-                    let new_visited = set_at(cont.visited, r.to, 'True);
-                    let new_path = array.push(state.path, r_idx);
-                    if r.to == to {
-                        let found: ExpandResult = 'Found(new_path);
-                        found
-                    } else {
-                        let next_state: BfsState = { node: r.to, path: new_path };
-                        let new_cont: ExpandContinue = { visited: new_visited, states: array.push(cont.states, next_state) };
-                        let result: ExpandResult = 'Continue(new_cont);
-                        result
-                    }
-                } else {
-                    acc
-                }
-            },
-        }
-    })
-};
-
-def expand_frontier: Fn(Int, Array(Bool), Array(BfsState), Array(RelationEntry), Bool) -> ExpandResult = fn(to, visited, frontier, relations, safe_only) {
-    let init_cont: ExpandContinue = { visited: visited, states: [] };
-    let init: ExpandResult = 'Continue(init_cont);
-    array.fold(frontier, init, fn(acc, state) {
-        match acc {
-            'Found(_) => acc,
-            'Continue(cont) => do {
-                let expanded = expand_state(to, cont.visited, state, relations, safe_only);
-                match expanded {
-                    'Found(path) => 'Found(path),
-                    'Continue(new_cont) => do {
-                        let merged: ExpandContinue = {
-                            visited: new_cont.visited,
-                            states: array.concat([cont.states, new_cont.states]),
-                        };
-                        let result: ExpandResult = 'Continue(merged);
-                        result
-                    },
-                }
-            },
-        }
-    })
-};
-
-def search_loop: Fn(Int, Array(Bool), Array(BfsState), Array(RelationEntry), Bool, Int) -> SearchResult = fn(to, visited, frontier, relations, safe_only, depth) {
-    if depth >= 8 {
-        if has_unvisited_successor(visited, frontier, relations, safe_only) { 'Truncated } else { 'Missing }
+def bfs_loop: Fn(Int, Array(Bool), Array(Option(Array(Int))), Array(BfsState), Array(RelationEntry), Bool, Int) -> Array(Option(Array(Int))) = fn(n, visited, paths, frontier, relations, safe_only, depth) {
+    if depth >= path_depth_cap {
+        paths
+    } else if array.length(frontier) == 0 {
+        paths
     } else {
-        let expanded = expand_frontier(to, visited, frontier, relations, safe_only);
-        match expanded {
-            'Found(path) => 'Found(path),
-            'Continue(cont) => do {
-                if array.length(cont.states) == 0 {
-                    'Missing
-                } else {
-                    search_loop(to, cont.visited, cont.states, relations, safe_only, depth + 1)
-                }
-            },
-        }
+        let empty_next: Array(BfsState) = [];
+        let init_level: BfsLevel = { visited: visited, paths: paths, next: empty_next };
+        let level = array.fold(frontier, init_level, fn(acc, state) {
+            expand_level_state(acc, state, relations, safe_only)
+        });
+        bfs_loop(n, level.visited, level.paths, level.next, relations, safe_only, depth + 1)
     }
 };
 
-def search: Fn(Int, Int, Int, Array(RelationEntry), Bool) -> SearchResult = fn(from, to, n, relations, safe_only) {
+# Per-source bounded BFS: paths[to] is 'Some(seq) when `to` was reached within
+# the depth cap; otherwise 'None. The source itself is never recorded (its own
+# row cell is produced as 'Safe([]) by `build_row`).
+def source_paths: Fn(Int, Int, Array(RelationEntry), Bool) -> Array(Option(Array(Int))) = fn(from, n, relations, safe_only) {
     let visited: Array(Bool) = array.map(int_range(n), fn(i) { i == from });
+    let init_paths = empty_path_row(n);
     let start: BfsState = { node: from, path: [] };
-    search_loop(to, visited, [start], relations, safe_only, 0)
+    bfs_loop(n, visited, init_paths, [start], relations, safe_only, 0)
 };
 
-def classify_path: Fn(Int, Int, Int, Array(RelationEntry)) -> PathResult = fn(from, to, n, relations) {
-    if from == to {
-        'Safe([])
-    } else {
-        match search(from, to, n, relations, 'True) {
-            'Found(path) => 'Safe(path),
-            _ => match search(from, to, n, relations, 'False) {
-                'Found(path) => 'FanOut(path),
-                'Truncated => 'Truncated,
-                'Missing => 'Missing,
+def row_result: Fn(Array(Option(Array(Int))), Array(Option(Array(Int))), Int) -> PathResult = fn(safe_row, any_row, to) {
+    match safe_row[to] {
+        'Some(path) => {
+            let result: PathResult = 'Safe(path);
+            result
+        },
+        'None => match any_row[to] {
+            'Some(path) => {
+                let result: PathResult = 'FanOut(path);
+                result
             },
-        }
+            'None => 'Missing,
+        },
     }
+};
+
+def build_row: Fn(Int, Int, Array(RelationEntry)) -> Array(PathResult) = fn(from, n, relations) {
+    let safe_row = source_paths(from, n, relations, 'True);
+    let any_row = source_paths(from, n, relations, 'False);
+    array.map(int_range(n), fn(to) {
+        if to == from {
+            let result: PathResult = 'Safe([]);
+            result
+        } else {
+            row_result(safe_row, any_row, to)
+        }
+    })
 };
 
 def build_paths: Fn(Int, Array(RelationEntry)) -> Array(Array(PathResult)) = fn(n, relations) {
-    array.map(int_range(n), fn(from) {
-        array.map(int_range(n), fn(to) {
-            classify_path(from, to, n, relations)
+    array.map(int_range(n), fn(from) { build_row(from, n, relations) })
+};
+
+# ---------------------------------------------------------------------------
+# Correlated-existence route preparation.
+#
+# A route is the author's explicit declaration of a bounded two-hop existence
+# path: base -> via (forward, grain-safe) and via -> target. Preparation
+# validates each declaration deterministically and stores the resolved route on
+# the payload; lowering never rescans metadata or runs BFS.
+# ---------------------------------------------------------------------------
+
+type RouteResult = enum {
+    'Ok(RouteEntry),
+    'Err(String),
+};
+
+def find_entity_index: Fn(Array(EntityEntry), Type) -> Option(Int) = fn(entities, ty) {
+    match array.find(entities, fn(e) { e.entity_type == ty }) {
+        'Some(e) => 'Some(e.index),
+        'None => 'None,
+    }
+};
+
+def resolve_route: Fn(Array(EntityEntry), Array(RelationEntry), Int, Type, Type) -> RouteResult = fn(entities, relations, base, via_type, target_type) {
+    let via_opt = find_entity_index(entities, via_type);
+    let target_opt = find_entity_index(entities, target_type);
+    match (via_opt, target_opt) {
+        ('None, _) => 'Err("exists route via entity is not part of this knowledge"),
+        (_, 'None) => 'Err("exists route target entity is not part of this knowledge"),
+        ('Some(via), 'Some(target)) =>
+            if via == base {
+                'Err("exists route via entity must differ from the base entity")
+            } else if target == via {
+                'Err("exists route target entity must differ from the via entity")
+            } else {
+                let via_edges = array.filter(array.enumerate(relations), fn(p) {
+                    p.1.from == base && p.1.to == via
+                });
+                if array.length(via_edges) == 0 {
+                    'Err("exists route first hop requires a declared forward relation from the base entity to the via entity")
+                } else if array.length(via_edges) > 1 {
+                    'Err("exists route first hop is ambiguous: the base declares multiple relations to the via entity")
+                } else {
+                    let first_via = get_index(via_edges, 0);
+                    if first_via.1.kind != 'Safe {
+                        'Err("exists route first hop must be a grain-safe (non fan-out) owner relation")
+                    } else {
+                        let both = array.filter(array.enumerate(relations), fn(p) {
+                            (p.1.from == via && p.1.to == target) || (p.1.from == target && p.1.to == via)
+                        });
+                        if array.length(both) == 0 {
+                            'Err("exists route has no declared relation between the via entity and the target entity")
+                        } else if array.length(both) > 1 {
+                            'Err("exists route second hop is ambiguous: multiple relations connect the via entity and the target entity")
+                        } else {
+                            let second = get_index(both, 0);
+                            let entry: RouteEntry = {
+                                base,
+                                via,
+                                target,
+                                via_edge: first_via.0,
+                                target_edge: second.0,
+                                target_reversed: second.1.from == target,
+                            };
+                            let ok: RouteResult = 'Ok(entry);
+                            ok
+                        }
+                    }
+                }
+            },
+    }
+};
+
+type RouteBuild = struct { routes: Array(RouteEntry), problems: Array(String) };
+
+# Pure, deterministic route collection: never fails, so tests can assert both
+# valid and invalid declarations. `build_root` fails on the first problem.
+def route_build: Fn(Array(EntityEntry), Array(RelationEntry)) -> RouteBuild = fn(entities, relations) {
+    let init: RouteBuild = { routes: [], problems: [] };
+    let collected = array.fold(entities, init, fn(acc, entity) {
+        let rd = property.get_type_prop(entity.entity_type, ExistsRouteDef);
+        let specs = match rd {
+            'Some(d) => d.routes,
+            'None => [],
+        };
+        array.fold(specs, acc, fn(inner_acc, spec) {
+            let resolved = resolve_route(entities, relations, entity.index, spec.via, spec.target);
+            match resolved {
+                'Err(message) => do {
+                    let result: RouteBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, message) };
+                    result
+                },
+                'Ok(entry) => do {
+                    let dup = array.find(inner_acc.routes, fn(r) { r.base == entry.base && r.target == entry.target });
+                    match dup {
+                        'Some(_) => do {
+                            let result: RouteBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, "exists route is ambiguous: multiple declared routes reach the same target from the same base") };
+                            result
+                        },
+                        'None => do {
+                            let result: RouteBuild = { routes: array.push(inner_acc.routes, entry), problems: inner_acc.problems };
+                            result
+                        },
+                    }
+                },
+            }
         })
-    })
+    });
+    collected
 };
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1255,12 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
     let measures = check_measure_contract(measures_raw);
     let dimensions = array.flat_map(entities, fn(e) { collect_entity_dimensions(e) });
     let relations = collect_relations(entities);
+    let routes_build = route_build(entities, relations);
+    let routes = if array.length(routes_build.problems) > 0 {
+        fail!("invalid correlated-existence route declaration", get_index(routes_build.problems, 0))
+    } else {
+        routes_build.routes
+    };
     let paths = build_paths(n, relations);
     let payload: PreparedPayload = {
         revision,
@@ -1134,11 +1268,61 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
         measures,
         dimensions,
         relations,
+        routes,
         paths,
         profile,
         authorize,
     };
     payload
+};
+
+# ---------------------------------------------------------------------------
+# Pure contract probes (used by tests; never fail).
+# ---------------------------------------------------------------------------
+
+# Prepare only the entity/relation graph of a candidate knowledge (no measures,
+# dimensions, routes, paths or profile processing). Used by tests to exercise
+# route preparation on local fixtures.
+def knowledge_graph: Fn(Array(Type)) -> Tuple([Array(EntityEntry), Array(RelationEntry)]) = fn(entity_types) {
+    let n = array.length(entity_types);
+    let entities = array.map(int_range(n), fn(i) {
+        build_entity(get_index(entity_types, i), i)
+    });
+    let relations = collect_relations(entities);
+    (entities, relations)
+};
+
+# Pure feasibility probe: True when a correlated existence between the two
+# stable entity ids is lowerable through an explicitly declared route or through
+# a declared one-hop relation in either direction. False for an unknown base or
+# target, a self-target, or an entity with no declared relation or route.
+def correlation_feasible: Fn(PreparedPayload, String, String) -> Bool = fn(payload, base_id, target_id) {
+    match array.find(payload.entities, fn(e) { e.id == base_id }) {
+        'None => 'False,
+        'Some(base) => match array.find(payload.entities, fn(e) { e.id == target_id }) {
+            'None => 'False,
+            'Some(t) => if base.index == t.index {
+                'False
+            } else {
+                match find_route(payload, base.index, t.index) {
+                    'Some(_) => 'True,
+                    'None => lookup_existence_relation_opt(payload, base.index, t.index) != 'None,
+                }
+            },
+        },
+    }
+};
+
+# Pure probe: every filter in a correlated-existence inner list references a
+# dimension declared on the target entity index (the path end). Used to assert
+# that inner filters cannot reach beyond the declared path.
+def filters_on_entity: Fn(PreparedPayload, Int, Array(FilterRequest)) -> Bool = fn(payload, target, filters) {
+    array.all(filters, fn(req) {
+        match array.find(payload.dimensions, fn(d) { d.id == req.id }) {
+            'Some(d) => d.entity == target,
+            'None => 'False,
+        }
+    })
 };
 
 # ---------------------------------------------------------------------------
@@ -1947,36 +2131,48 @@ def entity_by_id: Fn(PreparedPayload, String) -> Int = fn(payload, id) {
 # join path closure.
 type RelationLookup = struct { index: Int, reversed: Bool };
 
-def lookup_existence_relation: Fn(PreparedPayload, Int, Int) -> RelationLookup = fn(payload, base_entity, target) {
+# Pure one-hop lookup: 'Some when base and target share a declared relation in
+# either direction, otherwise 'None (a declared two-hop route may still exist).
+def lookup_existence_relation_opt: Fn(PreparedPayload, Int, Int) -> Option(RelationLookup) = fn(payload, base_entity, target) {
     let enumerated = array.enumerate(payload.relations);
-    let forward = array.find(enumerated, fn(pair) { pair.1.from == base_entity && pair.1.to == target });
-    match forward {
+    match array.find(enumerated, fn(pair) { pair.1.from == base_entity && pair.1.to == target }) {
         'Some(pair) => do {
             let result: RelationLookup = { index: pair.0, reversed: 'False };
-            result
+            let some: Option(RelationLookup) = 'Some(result);
+            some
         },
         'None => match array.find(enumerated, fn(pair) { pair.1.from == target && pair.1.to == base_entity }) {
             'Some(pair) => do {
                 let result: RelationLookup = { index: pair.0, reversed: 'True };
-                result
+                let some: Option(RelationLookup) = 'Some(result);
+                some
             },
-            'None => fail!("exists target is not directly related to the base entity"),
+            'None => {
+                let none: Option(RelationLookup) = 'None;
+                none
+            },
         },
     }
 };
 
+# Pure declared-route lookup for a (base, target) pair. Prepare-time validation
+# guarantees at most one route per pair, so the lookup is unambiguous.
+def find_route: Fn(PreparedPayload, Int, Int) -> Option(RouteEntry) = fn(payload, base, target) {
+    array.find(payload.routes, fn(r) { r.base == base && r.target == target })
+};
+
 # Correlation equality for an existence relation key pair. For a forward edge
-# `pair.from`/`pair.to` are on the base/target entities; for a reverse edge the
-# roles swap, keeping the outer (base) column on the left of the ColumnEq.
-def exists_col_eq: Fn(EntityEntry, EntityEntry, RelationPair, Bool) -> qb.ColumnEq = fn(base_entry, target_entry, pair, reversed) {
+# `pair.from`/`pair.to` are on the outer/target entities; for a reverse edge the
+# roles swap, keeping the outer (correlated main) column on the left.
+def exists_col_eq: Fn(EntityEntry, EntityEntry, RelationPair, Bool) -> qb.ColumnEq = fn(outer_entry, target_entry, pair, reversed) {
     if reversed {
         let target_field = get_index(target_entry.fields, pair.from);
-        let base_field = get_index(base_entry.fields, pair.to);
-        qb.column_eq(qb.column_ref(base_entry.alias, base_field.column), qb.column_ref(target_entry.alias, target_field.column))
+        let outer_field = get_index(outer_entry.fields, pair.to);
+        qb.column_eq(qb.column_ref(outer_entry.alias, outer_field.column), qb.column_ref(target_entry.alias, target_field.column))
     } else {
-        let base_field = get_index(base_entry.fields, pair.from);
+        let outer_field = get_index(outer_entry.fields, pair.from);
         let target_field = get_index(target_entry.fields, pair.to);
-        qb.column_eq(qb.column_ref(base_entry.alias, base_field.column), qb.column_ref(target_entry.alias, target_field.column))
+        qb.column_eq(qb.column_ref(outer_entry.alias, outer_field.column), qb.column_ref(target_entry.alias, target_field.column))
     }
 };
 
@@ -1996,53 +2192,89 @@ def exists_pairs: Fn(RelationKey) -> Array(RelationPair) = fn(key) {
     }
 };
 
+# Inner body of a correlated existence request. `target_entry` is the inner
+# (exists) entity; inner filters and OR-groups must only reference that entity.
+# `min_matches` keeps the correlated-aggregate shape (grouped by the inner
+# correlation column) so the outer grain is never amplified.
+def build_correlated_exists: Fn(PreparedPayload, EntityEntry, Array(qb.ColumnEq), ExistsRequest, Int) -> qb.Exists = fn(payload, target_entry, col_eqs, spec, target) {
+    let inner_filters = resolve_filters(payload, spec.filters);
+    let target_ok = array.all(inner_filters, fn(f) { f.entity == target });
+    if !target_ok {
+        fail!("exists inner filter must reference the target entity", spec.target)
+    } else {
+        let inner_any = array.map(spec.any_of, fn(a) { any_of_on_target(payload, target, a) });
+        let inner = append_filter_terms(combine_filters(array.map(inner_filters, fn(f) { f.expr })), inner_any);
+        let source = qb.source(target_entry.alias, target_entry.table);
+        match spec.min_matches {
+            'None => qb.exists(source, col_eqs, inner),
+            'Some(n) => do {
+                if n <= 0 {
+                    fail!("exists minimum matches must be a positive integer", spec.target, n)
+                } else if array.length(col_eqs) != 1 {
+                    fail!("grouped existence requires a single-pair relation key", spec.target)
+                } else {
+                    # the inner correlation column identifies the related subject's group
+                    let corr = get_index(col_eqs, 0);
+                    let grouping: Array(qb.Expr) = [qb.column(corr.right.source, corr.right.column)];
+                    let count_column = if target_entry.key_field >= 0 {
+                        get_index(target_entry.fields, target_entry.key_field).column
+                    } else {
+                        corr.right.column
+                    };
+                    let count_expr: qb.Expr = qb.column(corr.right.source, count_column);
+                    let threshold_v: qb.Val = 'Int(n);
+                    let having_list: Array(qb.Having) = [qb.having_call('Ge, 'Count, count_expr, 'False, threshold_v)];
+                    qb.exists_grouped(source, col_eqs, inner, grouping, having_list)
+                }
+            },
+        }
+    }
+};
+
+# A lowered correlated existence: the qb.Exists predicate plus the optional via
+# (owner) entity that must be added to the outer FROM through a grain-safe join.
+type ExistsResolution = struct {
+    exists: qb.Exists,
+    via: Option(Int),
+};
+
 # Lower one correlated existence request. Rows of the base entity that have at
 # least one (or, with `min_matches`, at least N) related row in the target
-# entity are kept; the relation may be declared in either direction and fan-out
-# relations are allowed because existence never amplifies the subject grain.
-# Inner filters constrain the related rows and are parameterized bindings.
-def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> qb.Exists = fn(payload, base_entity, spec) {
+# entity are kept. The request is resolved either through an explicitly declared
+# bounded route (base -> via -> target) or through a declared one-hop relation
+# in either direction. Existence never amplifies the subject grain.
+def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> ExistsResolution = fn(payload, base_entity, spec) {
     let target = entity_by_id(payload, spec.target);
     if target == base_entity {
         fail!("exists target must differ from the base entity", spec.target)
     } else {
-        let lookup = lookup_existence_relation(payload, base_entity, target);
-        let rel = get_index(payload.relations, lookup.index);
-        let pairs = exists_pairs(rel.key);
-        let base_entry = get_index(payload.entities, base_entity);
-        let target_entry = get_index(payload.entities, target);
-        let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
-        let inner_filters = resolve_filters(payload, spec.filters);
-        let target_ok = array.all(inner_filters, fn(f) { f.entity == target });
-        if !target_ok {
-            fail!("exists inner filter must reference the target entity", spec.target)
-        } else {
-            let inner_any = array.map(spec.any_of, fn(a) { any_of_on_target(payload, target, a) });
-            let inner = append_filter_terms(combine_filters(array.map(inner_filters, fn(f) { f.expr })), inner_any);
-            let source = qb.source(target_entry.alias, target_entry.table);
-            match spec.min_matches {
-                'None => qb.exists(source, col_eqs, inner),
-                'Some(n) => do {
-                    if n <= 0 {
-                        fail!("exists minimum matches must be a positive integer", spec.target, n)
-                    } else if array.length(col_eqs) != 1 {
-                        fail!("grouped existence requires a single-pair relation key", spec.target)
-                    } else {
-                        # the inner correlation column identifies the related subject's group
-                        let corr = get_index(col_eqs, 0);
-                        let grouping: Array(qb.Expr) = [qb.column(corr.right.source, corr.right.column)];
-                        let count_column = if target_entry.key_field >= 0 {
-                            get_index(target_entry.fields, target_entry.key_field).column
-                        } else {
-                            corr.right.column
-                        };
-                        let count_expr: qb.Expr = qb.column(corr.right.source, count_column);
-                        let threshold_v: qb.Val = 'Int(n);
-                        let having_list: Array(qb.Having) = [qb.having_call('Ge, 'Count, count_expr, 'False, threshold_v)];
-                        qb.exists_grouped(source, col_eqs, inner, grouping, having_list)
-                    }
+        let route_opt = find_route(payload, base_entity, target);
+        match route_opt {
+            'Some(route) => do {
+                # Declared two-hop route: base -> via (grain-safe join added by
+                # the caller through the payload route table) -> target.
+                let via_entry = get_index(payload.entities, route.via);
+                let target_entry = get_index(payload.entities, target);
+                let rel = get_index(payload.relations, route.target_edge);
+                let pairs = exists_pairs(rel.key);
+                let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(via_entry, target_entry, pair, route.target_reversed) });
+                let exists = build_correlated_exists(payload, target_entry, col_eqs, spec, target);
+                let result: ExistsResolution = { exists, via: 'Some(route.via) };
+                result
+            },
+            'None => match lookup_existence_relation_opt(payload, base_entity, target) {
+                'Some(lookup) => do {
+                    let rel = get_index(payload.relations, lookup.index);
+                    let pairs = exists_pairs(rel.key);
+                    let base_entry = get_index(payload.entities, base_entity);
+                    let target_entry = get_index(payload.entities, target);
+                    let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
+                    let exists = build_correlated_exists(payload, target_entry, col_eqs, spec, target);
+                    let result: ExistsResolution = { exists, via: 'None };
+                    result
                 },
-            }
+                'None => fail!("exists target has no declared relation or route from the base entity", spec.target),
+            },
         }
     }
 };
@@ -2155,7 +2387,17 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
         let base_entry = get_index(payload.entities, base_entity);
         let source_plan = match base_entry.union {
             'None => do {
-                let exists_plans = array.map(exists_specs, fn(spec) { resolve_exists(payload, base_entity, spec) });
+                let exists_resolutions = array.map(exists_specs, fn(spec) { resolve_exists(payload, base_entity, spec) });
+                let exists_plans = array.map(exists_resolutions, fn(r) { r.exists });
+                # The via (owner) of a declared two-hop route becomes an ordinary
+                # grain-safe join target; the correlated EXISTS then references
+                # the joined owner alias, never the fan-out target edge.
+                let via_entities = array.flat_map(exists_resolutions, fn(r) {
+                    match r.via {
+                        'Some(v) => [v],
+                        'None => [],
+                    }
+                });
                 let exists_targets = array.map(exists_specs, fn(spec) { entity_by_id(payload, spec.target) });
                 # A measure-required entity that is also an existence target is
                 # satisfied by the correlated existence predicate instead of a
@@ -2167,7 +2409,7 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
                 let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
                 let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
                 let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
-                let targets = array.concat([filtered_measure_targets, dim_entities, scope_entities, filter_entities, any_entities]);
+                let targets = array.concat([filtered_measure_targets, via_entities, dim_entities, scope_entities, filter_entities, any_entities]);
                 let joins = select_joins(payload, base_entity, targets);
                 let join_sources = array.map(joins, fn(j) { j.source });
                 let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
@@ -2294,6 +2536,11 @@ export {
     RelationPair,
     RelationKey,
     EnumValueDef,
+    ExistsRouteDef,
+    ExistsRouteSpec,
+    RouteEntry,
+    RouteResult,
+    RouteBuild,
     RelationKind,
     FilterOp,
     FilterInputKind,
@@ -2337,6 +2584,12 @@ export {
     relation_key,
     enum_value,
     scope,
+    exists_route,
+    route_build,
+    resolve_route,
+    knowledge_graph,
+    correlation_feasible,
+    filters_on_entity,
     build_root,
     lower,
     lower_full,

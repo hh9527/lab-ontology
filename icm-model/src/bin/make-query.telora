@@ -1,11 +1,21 @@
 # bin/make-query Telora entry (icm-model.a3)
 #
-# The Host adapter `bin/make-query` invokes this entry with eval-with and one
-# named source "input" holding an intent JSON file.  This module decodes the
-# intent (an `Intent` = ontology QueryRequest fields plus optional `any_of` /
-# `exists` / `having` / `group_count` envelope fields; `measures` may be empty
-# for row projection) and lowers it to a single parameterized Query encoded as
-# the sole stdout Value.
+# The Host adapter `bin/make-query` invokes this entry with eval-with and two
+# named sources:
+#   - "input":         the intent JSON file written by the Resolver (untrusted);
+#   - "time_context":  an independent request-scoped context derived by the
+#                      trusted Host adapter from Labflow's engine-owned public
+#                      benchmark transcript (outside Resolver write access).
+#
+# This module decodes the intent (an `Intent` = ontology QueryRequest fields
+# plus optional `any_of` / `exists` / `having` / `group_count` / `time_windows`
+# envelope fields; `measures` may be empty for row projection) and lowers it to
+# a single parameterized Query encoded as the sole stdout Value.
+#
+# The trusted report reference never comes from the Intent; it is read from the
+# Host-injected time_context. `direct_bounds` authorizes only absolute values
+# literally present in the current public request. `report_reference: null`
+# makes relative time windows fail deterministically (no partial output).
 #
 # The Host adapter captures this entry's stdout in `icm-eval/ok.json` and
 # stderr in `icm-eval/diagnostic.jsonl`, then reports the Telora exit code.
@@ -21,7 +31,16 @@ import "std/entry" as entry;
 import "std/result" as result;
 import "std/value" {Value};
 
-def config: entry.ContextConfig = {sources: ["input"], envs: [], args: 'False};
+type TimeContextFile = struct {
+    version: Int,
+    report_reference: Option(String),
+    # Per-request directly-provided absolute bounds (Host-declared,
+    # Resolver-unwritable).  Optional for backward files; when absent, any
+    # request that filters a time dimension fails deterministically.
+    direct_bounds: Option(Array(facade.DirectBoundSpec)),
+};
+
+def config: entry.ContextConfig = {sources: ["input", "time_context"], envs: [], args: 'False};
 
 # Number of Intent envelope-only keys present in the raw object.  A valid full
 # Intent envelope carries all of them (arrays may be empty; group_count may be
@@ -56,24 +75,44 @@ def evaluate: Fn(entry.Context) -> Value = fn(ctx) {
         'Some(value) => value,
         'None => fail!("make-query: missing input source"),
     };
-    let present: Int = envelope_key_count(raw);
-    let intent: facade.Intent = if present == 0 {
-        # Plain QueryRequest shorthand (no envelope fields present).
-        let request: edsl.QueryRequest = codec.decode(edsl.QueryRequest, raw)
-            |> result.unwrap;
-        facade.intent_from_request(request)
-    } else if present == 4 {
-        # Full Intent envelope.  Any structural/type mismatch is a deterministic
-        # failure; it is never silently downgraded to a QueryRequest.
-        match codec.decode(facade.Intent, raw) {
-            'Ok(value) => value,
-            'Err(_) => fail!("make-query: invalid intent envelope", raw),
-        }
-    } else {
-        fail!("make-query: partial intent envelope", raw)
+    # Trusted report reference comes from the Host-injected time_context source
+    # (always present, Resolver-unwritable).  report_reference: null means "no
+    # reference available": non-time queries and authorized direct bounds keep
+    # working; relative time windows fail deterministically.
+    let context_value: Value = match dict.get(ctx.sources, "time_context") {
+        'Some(value) => value,
+        'None => fail!("make-query: missing time_context source (Host contract)"),
     };
-    let query: qb.Query = facade.make_intent_query(intent);
-    codec.encode(Value, query) |> result.unwrap
+    let context: TimeContextFile = codec.decode(TimeContextFile, context_value)
+        |> result.unwrap;
+    if context.version != 1 && context.version != 2 {
+        fail!("make-query: unsupported time_context version", context.version)
+    } else {
+        let trusted: Option(String) = context.report_reference;
+        let present: Int = envelope_key_count(raw);
+        let intent: facade.Intent = if present == 0 {
+            # Plain QueryRequest shorthand (no envelope fields present).
+            let request: edsl.QueryRequest = codec.decode(edsl.QueryRequest, raw)
+                |> result.unwrap;
+            facade.intent_from_request(request)
+        } else if present == 4 {
+            # Full Intent envelope.  Any structural/type mismatch is a
+            # deterministic failure; never silently downgraded to QueryRequest.
+            match codec.decode(facade.Intent, raw) {
+                'Ok(value) => value,
+                'Err(_) => fail!("make-query: invalid intent envelope", raw),
+            }
+        } else {
+            fail!("make-query: partial intent envelope", raw)
+        };
+        let _authorized: Bool = facade.authorize_request_time(
+            intent,
+            trusted,
+            context.direct_bounds,
+        );
+        let query: qb.Query = facade.make_intent_query_context(intent, trusted);
+        codec.encode(Value, query) |> result.unwrap
+    }
 };
 
 export def main = entry.main(config, evaluate);

@@ -15,6 +15,7 @@ telora=$project_root/bin/telora
 model=$project_root/icm-model
 work_dir=$project_root/icm-eval
 input=$work_dir/input.json
+time_context=$work_dir/time-context.runtime.json
 ok=$work_dir/ok.json
 diagnostic=$work_dir/diagnostic.jsonl
 
@@ -39,9 +40,76 @@ fail() {
 }
 [ -f "$input" ] || fail 66 "make-query: input.json is unavailable"
 
+set -- "$project_root"/.labflow/benchmarks/*.context.json
+[ "$#" -eq 1 ] && [ -f "$1" ] || {
+    fail 66 "make-query: exactly one active benchmark context is required"
+}
+public_context=$1
+
+# This adapter, rather than the Resolver, derives authorization from the
+# engine-owned public transcript. Only literal ISO date/time values used by
+# the submitted intent are copied into the trusted context.
+set +e
+perl -MJSON::PP -e '
+    use strict;
+    use warnings;
+
+    sub read_json {
+        my ($path) = @_;
+        open my $fh, "<", $path or die "open $path: $!";
+        local $/;
+        return decode_json(<$fh>);
+    }
+
+    my ($public_path, $input_path, $output_path) = @ARGV;
+    my $public = read_json($public_path);
+    my $intent = read_json($input_path);
+    die "unsupported public context\n" unless ($public->{version} // 0) == 1;
+    my $transcript = join "\n", map { $_->{text} // "" } @{$public->{messages} // []};
+    my %time_dimension = map { $_ => 1 } qw(
+        NetworkKpiTime NetOnlineKpiTime ApRadioKpiTime ServerKpiTime
+        PonKpiTime OnuKpiTime PonPortKpiTime StorageKpiTime AlarmTime
+    );
+    my (@bounds, %seen);
+    my $authorize = sub {
+        my ($dimension, $value) = @_;
+        return unless $time_dimension{$dimension // ""};
+        return unless defined $value && $value =~ /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$/;
+        return unless index($transcript, $value) >= 0;
+        my $key = "$dimension\0$value";
+        push @bounds, {dimension => $dimension, value => $value} unless $seen{$key}++;
+    };
+    for my $filter (@{$intent->{filters} // []}) {
+        my $input = $filter->{input};
+        $authorize->($filter->{id}, ref($input) eq "HASH" ? $input->{Text} : undef);
+    }
+    for my $window (@{$intent->{time_windows} // []}) {
+        next unless ($window->{kind} // "") eq "Direct";
+        $authorize->($window->{dimension}, $window->{start});
+        $authorize->($window->{dimension}, $window->{end});
+    }
+    my $temporary = "$output_path.$$";
+    open my $out, ">", $temporary or die "open $temporary: $!";
+    print {$out} JSON::PP->new->canonical->encode({
+        version => 2,
+        report_reference => undef,
+        direct_bounds => \@bounds,
+    });
+    close $out or die "close $temporary: $!";
+    rename $temporary, $output_path or die "rename $temporary: $!";
+' "$public_context" "$input" "$time_context" 2> "$diagnostic"
+context_code=$?
+set -e
+[ "$context_code" -eq 0 ] || {
+    : > "$ok"
+    printf 'exit code: %s\n' "$context_code"
+    exit "$context_code"
+}
+
 set +e
 "$telora" -C "$model" eval-with @src/bin/make-query:main \
-    --source "input=$input" > "$ok" 2> "$diagnostic"
+    --source "input=$input" \
+    --source "time_context=$time_context" > "$ok" 2> "$diagnostic"
 code=$?
 set -e
 

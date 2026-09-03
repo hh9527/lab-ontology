@@ -11,6 +11,9 @@
 #     (contains / starts-with / ends-with / not-contains);
 #   - correlated existence (EXISTS, incl. reverse derivation and
 #     min_matches grouped existence) over device->alarm;
+#   - model-declared two-hop correlated existence (exists_route): KPI sample and
+#     device sub-part entities reach alarm through their unique owner device via
+#     a grain-safe owner join + correlated EXISTS (no fan-out amplification);
 #   - group predicates (HAVING) and nested "count of groups passing HAVING";
 #   - OR-group value filters (AnyOf) on subject and inside EXISTS;
 #   - count(DISTINCT ...) measures (distinct affected-device reference count);
@@ -52,6 +55,8 @@ def min_agg: qb.AggregateFunction = 'Min;
 def text_eq_ops: Array(edsl.FilterOp) = ['Eq, 'Ne, 'Contains, 'NotContains, 'StartsWith, 'EndsWith];
 def text_range_ops: Array(edsl.FilterOp) = ['Gt, 'Ge, 'Lt, 'Le];
 def text_time_ops: Array(edsl.FilterOp) = ['Eq, 'Gt, 'Ge, 'Lt, 'Le];
+# Closed enum / status dimensions support equality only (ontology contract).
+def eq_only_ops: Array(edsl.FilterOp) = ['Eq];
 # Numeric comparison operators.
 def int_eq_ops: Array(edsl.FilterOp) = ['Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le];
 def int_eq_range_ops: Array(edsl.FilterOp) = ['Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le];
@@ -164,6 +169,34 @@ def pon_classify: Fn(qb.Expr) -> qb.Expr = fn(col) {
 };
 
 # ---------------------------------------------------------------------------
+# Closed status value domains (business value -> storage value compilation).
+#
+# Communication / running / health statuses are stored as short codes ('0' /
+# '1').  These enum types declare the source-field storage values as the enum
+# stable values (used internally by lowering) and the business labels as the
+# enum labels.  The public contract (DOMAIN.md section 3) exposes only the
+# business labels; the model/query facade compiles each accepted business value
+# to its storage code before lowering, so the SQL binding is always the real
+# storage value.  Unknown business values are rejected deterministically and no
+# display label is ever bound against the coded column.
+# ---------------------------------------------------------------------------
+
+type CommuStateCode = enum {
+    @edsl.enum_value("0", "在线")
+    'Online,
+    @edsl.enum_value("1", "离线")
+    'Offline,
+};
+
+# Storage running / health status: only the complete mapping is published
+# ('1' = 正常).  Other stored codes have no complete public mapping, so this
+# dimension is narrowed to the documented value and unknown inputs are rejected.
+type StorageNormalState = enum {
+    @edsl.enum_value("1", "正常")
+    'Normal,
+};
+
+# ---------------------------------------------------------------------------
 # Governance views
 # ---------------------------------------------------------------------------
 
@@ -216,6 +249,23 @@ type Site = struct {
 @edsl.relation(StorageDevice, safe_kind, 6, 3)
 @edsl.relation(TerminalDevice, safe_kind, 6, 7)
 @edsl.relation(CollabDevice, safe_kind, 6, 5)
+@edsl.exists_route(NetDevice, NetPort)
+@edsl.exists_route(NetDevice, NetOptical)
+@edsl.exists_route(ServerDevice, ServerPsu)
+@edsl.exists_route(ServerDevice, ServerOptical)
+@edsl.exists_route(ServerDevice, ServerDisk)
+@edsl.exists_route(ServerDevice, ServerFan)
+@edsl.exists_route(ServerDevice, ServerMemory)
+@edsl.exists_route(ServerDevice, ServerProcessor)
+@edsl.exists_route(ServerDevice, ServerNic)
+@edsl.exists_route(ServerDevice, ServerPort)
+@edsl.exists_route(StorageDevice, StorageController)
+@edsl.exists_route(StorageDevice, StorageChassis)
+@edsl.exists_route(StorageDevice, StorageBackupPower)
+@edsl.exists_route(StorageDevice, StorageDisk)
+@edsl.exists_route(StorageDevice, StorageFan)
+@edsl.exists_route(StorageDevice, StoragePort)
+@edsl.exists_route(StorageDevice, StoragePsu)
 type Alarm = struct {
     @edsl.column("ACKED")
     @edsl.dimension("AlarmAcked", flag_true, flag_true, int_eq_ops, int_kinds)
@@ -292,8 +342,8 @@ type NetDevice = struct {
     classification: String,
 
     @edsl.column("commuState")
-    @edsl.dimension("NetworkDeviceCommuState", flag_true, flag_true, text_eq_ops, text_kinds)
-    commu_state: String,
+    @edsl.dimension("NetworkDeviceCommuState", flag_true, flag_true, eq_only_ops, text_kinds)
+    commu_state: CommuStateCode,
 
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -372,8 +422,8 @@ type PonDevice = struct {
     classification: String,
 
     @edsl.column("commuState")
-    @edsl.dimension("PonDeviceCommuState", flag_true, flag_true, text_eq_ops, text_kinds)
-    commu_state: String,
+    @edsl.dimension("PonDeviceCommuState", flag_true, flag_true, eq_only_ops, text_kinds)
+    commu_state: CommuStateCode,
 
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -450,8 +500,8 @@ type ServerDevice = struct {
     classification: String,
 
     @edsl.column("commuState")
-    @edsl.dimension("ServerCommuState", flag_true, flag_true, text_eq_ops, text_kinds)
-    commu_state: String,
+    @edsl.dimension("ServerCommuState", flag_true, flag_true, eq_only_ops, text_kinds)
+    commu_state: CommuStateCode,
 
     @edsl.column("firmwareVersion")
     @edsl.dimension("ServerFirmwareVersion", flag_true, flag_true, text_eq_ops, text_kinds)
@@ -526,12 +576,12 @@ type ServerDevice = struct {
 @edsl.relation(Site, safe_kind, 12, 0)
 type StorageDevice = struct {
     @edsl.column("commuState")
-    @edsl.dimension("StorageCommuState", flag_true, flag_true, text_eq_ops, text_kinds)
-    commu_state: String,
+    @edsl.dimension("StorageCommuState", flag_true, flag_true, eq_only_ops, text_kinds)
+    commu_state: CommuStateCode,
 
     @edsl.column("healthStatus")
-    @edsl.dimension("StorageHealthStatus", flag_true, flag_true, text_eq_ops, text_kinds)
-    health_status: String,
+    @edsl.dimension("StorageHealthStatus", flag_true, flag_true, eq_only_ops, text_kinds)
+    health_status: StorageNormalState,
 
     @edsl.column("hotPatchVersion")
     @edsl.dimension("StorageHotPatchVersion", flag_true, flag_true, text_eq_ops, text_kinds)
@@ -573,8 +623,8 @@ type StorageDevice = struct {
     ref_parent_subnet: String,
 
     @edsl.column("runningStatus")
-    @edsl.dimension("StorageRunningStatus", flag_true, flag_true, text_eq_ops, text_kinds)
-    running_status: String,
+    @edsl.dimension("StorageRunningStatus", flag_true, flag_true, eq_only_ops, text_kinds)
+    running_status: StorageNormalState,
 
     @edsl.column("sn")
     @edsl.dimension("StorageSn", flag_true, flag_true, text_eq_ops, text_kinds)
@@ -616,8 +666,8 @@ type TerminalDevice = struct {
     classification: String,
 
     @edsl.column("commuState")
-    @edsl.dimension("TerminalCommuState", flag_true, flag_true, text_eq_ops, text_kinds)
-    commu_state: String,
+    @edsl.dimension("TerminalCommuState", flag_true, flag_true, eq_only_ops, text_kinds)
+    commu_state: CommuStateCode,
 
     @edsl.column("ipAddress")
     @edsl.dimension("TerminalIp", flag_true, flag_true, text_eq_ops, text_kinds)
@@ -667,8 +717,8 @@ type CollabDevice = struct {
     classification: String,
 
     @edsl.column("commuState")
-    @edsl.dimension("CollabCommuState", flag_true, flag_true, text_eq_ops, text_kinds)
-    commu_state: String,
+    @edsl.dimension("CollabCommuState", flag_true, flag_true, eq_only_ops, text_kinds)
+    commu_state: CommuStateCode,
 
     @edsl.column("id")
     id: String,
@@ -780,6 +830,7 @@ type Device = struct {
 # port_used_count_sum=7, res_id=8, ts=9
 @edsl.entity_source("NetworkDeviceKPI", "k")
 @edsl.relation(NetDevice, safe_kind, 8, 3)
+@edsl.exists_route(NetDevice, Alarm)
 type NetKpi = struct {
     @edsl.column("cpuUsage")
     @edsl.measure("NetworkCpuUsageAvg", avg_agg, no_types)
@@ -823,6 +874,7 @@ type NetKpi = struct {
 # canonical indices: online_rate_avg=0, online_rate_max=1, res_id=2, ts=3
 @edsl.entity_source("NetworkDeviceOnlineKPI", "k")
 @edsl.relation(NetDevice, safe_kind, 2, 3)
+@edsl.exists_route(NetDevice, Alarm)
 type NetOnlineKpi = struct {
     @edsl.column("onlineRate")
     @edsl.measure("NetworkOnlineRateAvg", avg_agg, no_types)
@@ -844,6 +896,7 @@ type NetOnlineKpi = struct {
 # rssi_avg=3, ts=4, user_count_sum=5
 @edsl.entity_source("NetworkApRadioKPI", "k")
 @edsl.relation(NetDevice, safe_kind, 2, 3)
+@edsl.exists_route(NetDevice, Alarm)
 type ApRadioKpi = struct {
     @edsl.column("channelUtilization")
     @edsl.measure("ApChannelUtilizationAvg", avg_agg, no_types)
@@ -873,7 +926,7 @@ type ApRadioKpi = struct {
 # mem_usage_avg=3, mem_usage_max=4, res_id=5, ts=6
 @edsl.entity_source("ServerDeviceKPI", "k")
 @edsl.relation(ServerDevice, safe_kind, 5, 6)
-@edsl.relation(Alarm, fanout_kind, 5, 6)
+@edsl.exists_route(ServerDevice, Alarm)
 type ServerKpi = struct {
     @edsl.column("cpuUsage")
     @edsl.measure("ServerCpuUsageAvg", avg_agg, no_types)
@@ -906,6 +959,7 @@ type ServerKpi = struct {
 # canonical indices: cpu_usage_avg=0, mem_usage_avg=1, mem_usage_max=2, res_id=3, ts=4
 @edsl.entity_source("PonDeviceKPI", "k")
 @edsl.relation(PonDevice, safe_kind, 3, 2)
+@edsl.exists_route(PonDevice, Alarm)
 type PonKpi = struct {
     @edsl.column("cpuUsage")
     @edsl.measure("PonCpuUsageAvg", avg_agg, no_types)
@@ -932,6 +986,7 @@ type PonKpi = struct {
 # res_id=6, ts=7
 @edsl.entity_source("PonDeviceOnuKPI", "k")
 @edsl.relation(PonDevice, safe_kind, 6, 2)
+@edsl.exists_route(PonDevice, Alarm)
 type OnuKpi = struct {
     @edsl.column("memUsage")
     @edsl.measure("OnuMemUsageAvg", avg_agg, no_types)
@@ -969,6 +1024,7 @@ type OnuKpi = struct {
 # out_traffic_avg=3, parent_id=4, ts=5
 @edsl.entity_source("PonDevicePonPortKPI", "k")
 @edsl.relation(PonDevice, safe_kind, 4, 2)
+@edsl.exists_route(PonDevice, Alarm)
 type PonPortKpi = struct {
     @edsl.column("ifOutBandRate")
     @edsl.measure("PonPortIfOutBandRateAvg", avg_agg, no_types)
@@ -998,6 +1054,7 @@ type PonPortKpi = struct {
 # throughput_avg=4, ts=5
 @edsl.entity_source("StorageDeviceKPI", "k")
 @edsl.relation(StorageDevice, safe_kind, 3, 3)
+@edsl.exists_route(StorageDevice, Alarm)
 type StorageKpi = struct {
     @edsl.column("cpuUsage")
     @edsl.measure("StorageCpuUsageAvg", avg_agg, no_types)
@@ -1030,6 +1087,8 @@ type StorageKpi = struct {
 # canonical indices: id=0, name=1, parent_id=2
 @edsl.entity_source("SYS_Controller", "p")
 @edsl.relation(StorageDevice, safe_kind, 2, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_controller")
 type StorageController = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1047,6 +1106,8 @@ type StorageController = struct {
 # canonical indices: id=0, name=1, parent_id=2
 @edsl.entity_source("SYS_Chassis", "p")
 @edsl.relation(StorageDevice, safe_kind, 2, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_chassis")
 type StorageChassis = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1064,6 +1125,8 @@ type StorageChassis = struct {
 # canonical indices: id=0, name=1, parent_id=2, status=3
 @edsl.entity_source("SYS_BackupPower", "p")
 @edsl.relation(StorageDevice, safe_kind, 2, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_backup_power")
 type StorageBackupPower = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1085,6 +1148,8 @@ type StorageBackupPower = struct {
 # canonical indices: capacity=0, disk_type=1, id=2, name=3, parent_id=4
 @edsl.entity_source("SYS_Disk", "p")
 @edsl.relation(StorageDevice, safe_kind, 4, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_disk")
 type StorageDisk = struct {
     @edsl.column("capacity")
     capacity: String,
@@ -1108,6 +1173,8 @@ type StorageDisk = struct {
 # canonical indices: id=0, name=1, parent_id=2, status=3
 @edsl.entity_source("SYS_Fan", "p")
 @edsl.relation(StorageDevice, safe_kind, 2, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_fan")
 type StorageFan = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1128,6 +1195,8 @@ type StorageFan = struct {
 # canonical indices: id=0, name=1, parent_id=2, port_type=3
 @edsl.entity_source("SYS_Port", "p")
 @edsl.relation(StorageDevice, safe_kind, 2, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_port")
 type StoragePort = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1148,6 +1217,8 @@ type StoragePort = struct {
 # canonical indices: id=0, name=1, parent_id=2, status=3
 @edsl.entity_source("SYS_PSU", "p")
 @edsl.relation(StorageDevice, safe_kind, 2, 3)
+@edsl.exists_route(StorageDevice, Alarm)
+@edsl.entity_id("storage_psu")
 type StoragePsu = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1175,6 +1246,8 @@ type StoragePsu = struct {
 # canonical indices: id=0, name=1, parent_id=2, status=3
 @edsl.entity_source("PhysicalServerPSU", "p")
 @edsl.relation(ServerDevice, safe_kind, 2, 13)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_psu")
 type ServerPsu = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1196,6 +1269,8 @@ type ServerPsu = struct {
 # canonical indices: id=0, name=1, ne_res_id=2, vendor=3, wavelength=4
 @edsl.entity_source("PhysicalServerOpticalModule", "p")
 @edsl.relation(ServerDevice, safe_kind, 2, 13)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_optical")
 type ServerOptical = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1218,6 +1293,8 @@ type ServerOptical = struct {
 # canonical indices: disk_type=0, id=1, name=2, parent_id=3, status=4
 @edsl.entity_source("PhysicalServerDisk", "p")
 @edsl.relation(ServerDevice, safe_kind, 3, 6)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_disk")
 type ServerDisk = struct {
     @edsl.column("diskType")
     @edsl.dimension("ServerDiskType", flag_true, flag_true, text_eq_ops, text_kinds)
@@ -1242,6 +1319,8 @@ type ServerDisk = struct {
 # canonical indices: id=0, name=1, parent_id=2, speed=3, status=4
 @edsl.entity_source("PhysicalServerFan", "p")
 @edsl.relation(ServerDevice, safe_kind, 2, 6)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_fan")
 type ServerFan = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1265,6 +1344,8 @@ type ServerFan = struct {
 # canonical indices: capacity=0, id=1, name=2, parent_id=3, speed=4
 @edsl.entity_source("PhysicalServerMemory", "p")
 @edsl.relation(ServerDevice, safe_kind, 3, 6)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_memory")
 type ServerMemory = struct {
     @edsl.column("capacity")
     capacity: String,
@@ -1287,6 +1368,8 @@ type ServerMemory = struct {
 # canonical indices: core_count=0, frequency=1, id=2, name=3, parent_id=4
 @edsl.entity_source("PhysicalServerProcessor", "p")
 @edsl.relation(ServerDevice, safe_kind, 4, 6)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_processor")
 type ServerProcessor = struct {
     @edsl.column("coreCount")
     core_count: String,
@@ -1309,6 +1392,8 @@ type ServerProcessor = struct {
 # canonical indices: id=0, mac=1, name=2, parent_id=3, speed=4
 @edsl.entity_source("PhysicalServerNIC", "p")
 @edsl.relation(ServerDevice, safe_kind, 3, 6)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_nic")
 type ServerNic = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1332,6 +1417,8 @@ type ServerNic = struct {
 # canonical indices: id=0, name=1, parent_id=2, port_type=3, speed=4
 @edsl.entity_source("PhysicalServerPort", "p")
 @edsl.relation(ServerDevice, safe_kind, 2, 6)
+@edsl.exists_route(ServerDevice, Alarm)
+@edsl.entity_id("server_port")
 type ServerPort = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1359,6 +1446,8 @@ type ServerPort = struct {
 # canonical indices: id=0, name=1, parent_id=2, port_type=3
 @edsl.entity_source("EntNetworkPort", "p")
 @edsl.relation(NetDevice, safe_kind, 2, 3)
+@edsl.exists_route(NetDevice, Alarm)
+@edsl.entity_id("net_port")
 type NetPort = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -1379,6 +1468,8 @@ type NetPort = struct {
 # canonical indices: id=0, name=1, ne_res_id=2, vendor=3, wavelength=4
 @edsl.entity_source("EntNetworkOpticalModule", "p")
 @edsl.relation(NetDevice, safe_kind, 2, 3)
+@edsl.exists_route(NetDevice, Alarm)
+@edsl.entity_id("net_optical")
 type NetOptical = struct {
     @edsl.column("id")
     @edsl.key(flag_true)

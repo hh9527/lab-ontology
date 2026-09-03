@@ -930,6 +930,15 @@ EXISTS (SELECT 1 FROM <table> AS <alias>
   回答“存在相关告警的设备”一类问题；
 - 消耗 `'Exists` operator，必须出现在 `allowed_operators` 中。
 
+“外层主 alias”包括 `sources[0]` 与全部 `joins` 引入的 join alias。因此一个相关
+EXISTS 的外层列可以引用一个**已 join 的 owner alias**：把唯一、grain-safe 的 owner
+`INNER JOIN` 进外层 FROM，再用相关 EXISTS 从该 owner alias 关联目标表，就表达有界
+两跳存在（base → owner → target），而目标表只出现在子查询内部、绝不被外层 JOIN。
+结构校验保证 EXISTS 的 outer 列必须是可见主 alias（base 或 join alias）、inner 列
+必须属于 `source.alias`；`tests/query.telora` 以 owner-join + 相关 EXISTS 的 Plan
+覆盖该形状的 SQL、binding 顺序、确定性与非法 outer 引用拒绝。Query 层不引入嵌套
+EXISTS、任意子查询或 raw SQL；动态值仍只进入 bindings。
+
 ```telora
 def devices_with_alerts: qb.Plan = {
     revision: "devices-with-alerts-v1",

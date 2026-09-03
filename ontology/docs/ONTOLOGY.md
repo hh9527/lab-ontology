@@ -138,6 +138,7 @@ bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允�
 | `entity_id(id)` | 类型 | 实体的稳定业务 id（供存在性过滤/行级目标引用；缺省为 alias） |
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
 | `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`'Eq(RelationPair)`/`'And`/`'Or` 列等值组合 |
+| `exists_route(via, target)` | 类型 | 显式声明有界两跳相关存在路径：base → `via`（唯一、grain-safe owner）→ `target`（可组合 fold） |
 | `enum_value(value, label)` | enum variant | 封闭值域的稳定值和展示标签 |
 
 同一字段的同型 property 按 `Option(previous)` 顺序 fold：字段 property 取最后一项，
@@ -376,10 +377,12 @@ type Customer = struct {
 
 ### 关系与安全路径
 
-`'Safe` 关系不扩张当前 grain；`'FanOut` 会扩张 grain。准备阶段对实体图计算
-确定性安全路径：最短边数优先，同长度按关系目录索引序列选择，最大深度为 8。
-多个目标按请求顺序合并并复用已有边。只有全 Safe 路径能进入 Plan；fan-out-only、
-不可达或被深度截断的目标都使请求失败。
+`'Safe` 关系不扩张当前 grain；`'FanOut` 会扩张 grain。准备阶段对实体图按源实体运行
+有界广度优先遍历（单源一次遍历记录到所有可达实体的路径；深度上限 8，关系目录索引序
+确定性优先），只保存最短的确定性路径矩阵，不在热路径执行 BFS。多个目标按请求顺序
+合并并复用已有边。只有全 Safe 路径能进入 Plan；fan-out-only、不可达或被深度截断的
+目标都使请求失败。遍历成本按源实体受控：业务模型即使增加若干枢纽关系也不会使
+prepare 耗尽求值燃料（`tests/ontology.telora` 内含较密 hub/leaf 关系图的燃料回归）。
 
 关系键可以结构化：`relation(target, kind, from_field, to_field)` 是单列等值糖，
 `relation_key(target, kind, key)` 接受 `RelationKey`，其中
@@ -493,20 +496,70 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
 ```
 
 - `target` 是稳定实体 id（`entity_id`，缺省为 alias）；subject 需经授权。
-- 目标与 base 之间只需一条已声明关系；方向由 `lookup` 推导：优先 base→target 正向，
-  缺失时使用 target→base 反向边（反向存在性）推导相关性，不要求模型复制反向图边。
-  反向边不参与普通 join 路径闭包；同一对实体声明双向边也不会令 `build_root` 耗尽燃料
-  （路径搜索按访问集去环，Parent→Child 双向 fixture 通过）。
+- 一跳：目标与 base 之间只需一条已声明关系；方向由 `lookup` 推导：优先 base→target
+  正向，缺失时使用 target→base 反向边（反向存在性）推导相关性，不要求模型复制反向
+  图边。反向边不参与普通 join 路径闭包；同一对实体声明双向边也不会令 `build_root`
+  耗尽燃料（路径搜索按访问集去环，Parent→Child 双向 fixture 通过）。
+- 两跳（受控多跳）：当 base 与目标之间没有一跳关系时，lowering 使用作者在 base 上
+  显式声明的 `@edsl.exists_route(via, target)` 路线（见下文“两跳相关存在”）。路线在
+  prepare 时校验并存入 payload，热路径不做元数据扫描或 BFS；请求无需感知路线。
 - fan-out 关系允许（存在性不放大主体 grain）。`min_matches: 'None` 时是普通相关
   EXISTS；`min_matches: 'Some(n)`（正整数）时是相关聚合 EXISTS：内层按相关性分组并
   `HAVING count(关联 id) >= n`，仍保持主体 grain（Parent 计数 + `exists child`/
   `child count >= n` 不被 Child 行放大；普通 fan-out join 仍原子拒绝）。
 - 关系键必须是列等值合取（`'Eq` 或 `'And`）；析取键在 EXISTS 中原子拒绝；分组存在性
   要求单列合取键（一个 ColumnEq）。
-- 内层 `filters` 只能引用目标实体维度，动态值进入 bindings。
+- 内层 `filters` 只能引用目标实体维度，动态值进入 bindings；任何引用路径终点之外实体
+  的内层筛选都原子失败。
 - 当 measure 的 `requires` 实体恰好是 exists 目标时，该必需实体由相关存在谓词满足，
   不再生成 fan-out join；`Plan.joins` 不放大 subject measure。
-- 未知实体、非直接相关、内层引用非目标实体、非正整数 `min_matches` 都原子失败。
+- 未知实体、目标即 base、没有声明一跳关系或路线、内层引用非目标实体、非正整数
+  `min_matches` 都原子失败。
+
+### 两跳相关存在（declared bounded route）
+
+KPI 事实或子部件往往不直接关联告警等稳定对象，而是经唯一 owner 实体再关联。Ontology
+不猜测任意可达路径：作者在 base 实体类型上显式声明路线：
+
+```telora
+@edsl.entity_id("components")
+@edsl.entity_source("components", "m")
+@edsl.relation(Site, 'Safe, 1, 0)          # component.site_id -> site.id
+@edsl.exists_route(Site, Alarm)            # 显式：base -> Site -> Alarm
+type Component = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("ComponentCount", 'Count, no_types)
+    id: Int,
+    @edsl.column("site_id")
+    site_id: Int,
+};
+```
+
+`exists_route(via, target)` 是 base 实体上的 type-level property，可多次标注（按声明
+顺序 fold 追加）。prepare 时对每条路线做确定性校验并保存到 `PreparedPayload.routes`：
+
+- 第一跳 base → `via` 必须存在且**唯一**：base 上恰好一条声明到 `via` 的 forward 关系，
+  且 kind 为 `'Safe`（唯一、grain-safe）。关系缺失（反向-only 属于方向不匹配）、多条
+  候选、`'FanOut` owner 都原子拒绝。
+- 第二跳 `via` → `target` 使用已声明关系（任一方向，存在性语义允许 fan-out）；via 与
+  target 之间关系缺失或存在多条候选关系都原子拒绝。
+- 同一 base 声明多条到达同一 target 的路线（歧义路径）原子拒绝。
+
+Lowering 一个两跳存在请求时只加 **grain-safe owner join**（base `INNER JOIN` via，
+不复制 base 行），再用 **correlated EXISTS** 关联 owner 与 target 内层：
+
+```text
+SELECT count(m.id) AS ComponentCount
+FROM components AS m
+INNER JOIN sites AS s ON m.site_id = s.id
+WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id [AND al.level = ?])
+```
+
+- 永不为该 target 发射外层 fan-out join（`JOIN alarms`），因此 base 计数不被放大。
+- `min_matches`、内层 `any_of`、授权、profile 递归收窄与参数化绑定规则与一跳完全一致；
+  绑定顺序与重复 lowering 逐字节确定。
+- 一跳直接/反向直接行为完全保留：未声明路线时按原有一跳逻辑解析。
 
 ### 分组计数（count of groups）
 
@@ -583,9 +636,9 @@ def payload: edsl.PreparedPayload = edsl.build_root(
 ```
 
 `build_root(revision, entity_types, profile, authorize)` 显式收集所列实体的 property，
-建立索引，验证关系图，预计算路径并返回 `PreparedPayload`。payload 含实体、指标、
-维度、枚举目录、关系、路径矩阵、profile 和普通 closure。业务 lowering 只消费
-payload，不重新扫描 metadata 或执行 BFS。
+建立索引，验证关系图，校验相关存在路线，预计算有界路径并返回 `PreparedPayload`。
+payload 含实体、指标、维度、枚举目录、关系、已声明路线（`routes`）、路径矩阵、
+profile 和普通 closure。业务 lowering 只消费 payload，不重新扫描 metadata 或执行 BFS。
 
 ```telora
 type PreparedPayload = struct {
@@ -594,6 +647,7 @@ type PreparedPayload = struct {
     measures: Array(MeasureEntry),
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
+    routes: Array(RouteEntry),
     paths: Array(Array(PathResult)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
@@ -643,8 +697,11 @@ QueryBuilder 的 `Val` 使用 untagged JSON codec，因此 Query 编码后的 bi
 非正或超上限的 `take`、partition 与全局 limit/offset 组合、条件指标 predicate
 引用未授权/不可筛选/未知枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术、
 Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimension、
-非法 JSON 筛选输入、按未请求 JSON Dimension 排序。诊断由 Host 机制承载；公共 API
-不返回 Rejection 或诊断数组。
+非法 JSON 筛选输入、按未请求 JSON Dimension 排序。相关存在失败还包括：目标即 base、
+没有声明一跳关系或路线、两跳路线第一跳非唯一 forward `'Safe` owner 关系
+（方向不匹配或非唯一 owner）、`via`/`target` 之间缺失或多条候选关系、同一 base 对
+同一 target 声明多条路线、内层筛选引用路径终点之外的实体、EXISTS 键含析取。诊断由
+Host 机制承载；公共 API 不返回 Rejection 或诊断数组。
 
 公共 Request、Plan、Query 和业务词汇均保持精确具名类型，不使用 `Any`、`Dyn` 或
 进程内 TypeId 作为交换协议。eDSL 只负责知识到 Plan；`transform_sqlite` 是端到端
@@ -676,4 +733,10 @@ Dimension 拒绝（Profile 缺 JsonExtract、未授权 JSON Dimension、非法�
 文本筛选算子（starts-with/contains/not-contains/ends-with 的封闭 lowering 与
 binding 顺序）、HAVING（阈值绑定、需已选 measure）、EXISTS（fan-out 必需实体改为
 相关存在谓词、不产生 fan-out join）与结构化复合关系键（`'And` 合取键降低为
-`join_on` 的 AND ON 条件）。
+`join_on` 的 AND ON 条件）。本轮的受控两跳相关存在也纳入覆盖：知识 payload 保存
+Component → Site → Alarm 路线；两跳 lowering 只发 grain-safe owner join + 相关
+EXISTS（SQL 形状、外层 grain 不被 Site→Alarm fan-out 放大、`min_matches` 分组计数、
+内层筛选绑定顺序与重复 lowering 逐字节一致）；纯可行性/内层筛选探针对未知/自指/无关
+target 返回拒绝；路线 prepare 探针验证合法路线解析一次，并拒绝非唯一 owner、方向不匹配、
+同 base 同 target 多路线歧义与 `via`→target 关系歧义；较密的 hub/leaf 关系图在
+prepare 时保持有界不耗尽求值燃料。

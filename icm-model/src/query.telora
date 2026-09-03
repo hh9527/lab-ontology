@@ -22,6 +22,33 @@ import "std/array" as array;
 # Marker for the nested "count of groups passing HAVING" lowering.
 type GroupCountMode = enum { 'CountGroups };
 
+# Generic time-window provenance contract (applies to KPI sampling and alarm
+# time dimensions alike).
+#   - 'Direct:        the caller/user supplied the absolute [start, end) bounds
+#                     directly; no external reference moment is needed.
+#   - 'FixedWindow:   the bounds were converted from a fixed-duration relative
+#                     phrase ("近7天"/"最近30天").
+#   - 'Calendar:      the bounds were converted from a natural calendar period
+#                     ("本月"/"昨天"/"今天").
+# Trust boundary: the report reference moment is NOT taken from the Intent.  It
+# must be injected by the Host/caller as an external, Resolver-unwritable
+# context (`trusted` passed to make_intent_query_context / apply_time_windows).
+# The optional `reference` on a TimeWindowSpec is only an untrusted self-report;
+# a relative (FixedWindow/Calendar) window fails deterministically when no
+# trusted context is provided, even if it carries a self-reported reference, and
+# when a trusted context is present any self-report must equal it.  Direct
+# absolute bounds never need a context.
+type TimeWindowKind = enum { 'Direct, 'FixedWindow, 'Calendar };
+
+type TimeWindowSpec = struct {
+    dimension: String,
+    subject: String,
+    kind: TimeWindowKind,
+    start: String,
+    end: String,
+    reference: Option(String),
+};
+
 type Intent = struct {
     measures: Array(edsl.MeasureRequest),
     dimensions: Array(edsl.DimensionRequest),
@@ -34,6 +61,9 @@ type Intent = struct {
     exists: Array(edsl.ExistsRequest),
     having: Array(edsl.HavingRequest),
     group_count: Option(GroupCountMode),
+    # Optional provenance of time-dimension windows.  Absent/null means every
+    # time-dimension filter in `filters` is a directly supplied absolute bound.
+    time_windows: Option(Array(TimeWindowSpec)),
 };
 
 def intent_to_request: Fn(Intent) -> edsl.QueryRequest = fn(intent) {
@@ -62,8 +92,74 @@ def intent_from_request: Fn(edsl.QueryRequest) -> Intent = fn(request) {
         exists: [],
         having: [],
         group_count: 'None,
+        time_windows: 'None,
     };
     intent
+};
+
+# Shape validation of one time window (deterministic; no partial output).
+# NOTE: the window's own `reference`, if present, is an *untrusted* self-report.
+# Trust comes only from the external Host-injected context checked by
+# `time_context_ok`; a self-reported reference never enables compilation alone.
+def validate_time_window: Fn(TimeWindowSpec) -> Bool = fn(window) {
+    if window.start >= window.end {
+        fail!("time window start must be strictly before its end", window.dimension, window.start, window.end)
+    } else {
+        match window.kind {
+            'Direct => 'True,
+            'FixedWindow => 'True,
+            'Calendar => 'True,
+        }
+    }
+};
+
+# Trust-boundary check for relative time windows.  A relative window
+# (FixedWindow/Calendar) only compiles when an external trusted reference is
+# injected by the Host/caller (trusted != 'None); an Intent-embedded self-report
+# without that external context is not trusted.  When the trusted context is
+# present, any self-reported reference must be strictly equal to it.  This is a
+# pure decision predicate (testable); apply_time_windows fails on False.
+def time_context_ok: Fn(Option(Array(TimeWindowSpec)), Option(String)) -> Bool = fn(windows, trusted) {
+    match windows {
+        'None => 'True,
+        'Some(ws) => array.all(ws, fn(w) {
+            match w.kind {
+                'Direct => 'True,
+                'FixedWindow => match trusted {
+                    'Some(c) => match w.reference {
+                        'Some(r) => r == c,
+                        'None => 'True,
+                    },
+                    'None => 'False,
+                },
+                'Calendar => match trusted {
+                    'Some(c) => match w.reference {
+                        'Some(r) => r == c,
+                        'None => 'True,
+                    },
+                    'None => 'False,
+                },
+            }
+        }),
+    }
+};
+
+# Compile one validated time window into the two half-open absolute text filters
+# (Ge start / Lt end) on its declared time dimension.  Bounds stay parameterised.
+def time_window_to_filters: Fn(TimeWindowSpec) -> Array(edsl.FilterRequest) = fn(window) {
+    let lo: edsl.FilterRequest = {
+        id: window.dimension,
+        subject: window.subject,
+        op: 'Ge,
+        input: 'Text(window.start),
+    };
+    let hi: edsl.FilterRequest = {
+        id: window.dimension,
+        subject: window.subject,
+        op: 'Lt,
+        input: 'Text(window.end),
+    };
+    [lo, hi]
 };
 
 # --- unified-device vocabulary routing ------------------------------------
@@ -218,40 +314,361 @@ def guard_alarm_site_tenant: Fn(Intent, edsl.PreparedPayload) -> Bool = fn(inten
     }
 };
 
+# ---------------------------------------------------------------------------
+# Business status value -> storage code compilation (three-layer mapping).
+#
+# The public contract (DOMAIN.md section 3) exposes only *business* status
+# values ("在线"/"离线"/"正常").  The Resolver never sees storage codes and
+# does not choose which representation to send.  This layer deterministically
+# compiles each business value on a status dimension to the storage text the
+# source column stores before lowering, so the final SQL binding is the true
+# storage value.  Unknown business values are rejected deterministically, as
+# are non-text inputs; wrong operators and wrong types keep their
+# ontology-level rejections (status enum dimensions support Eq with Text).
+# ---------------------------------------------------------------------------
+
+def commu_dim_ids: Array(String) = [
+    "NetworkDeviceCommuState",
+    "PonDeviceCommuState",
+    "ServerCommuState",
+    "StorageCommuState",
+    "TerminalCommuState",
+    "CollabCommuState",
+];
+
+def run_health_dim_ids: Array(String) = [
+    "StorageRunningStatus",
+    "StorageHealthStatus",
+];
+
+def is_commu_dim: Fn(String) -> Bool = fn(id) { array.any(commu_dim_ids, fn(d) { d == id }) };
+def is_run_health_dim: Fn(String) -> Bool = fn(id) { array.any(run_health_dim_ids, fn(d) { d == id }) };
+def is_status_dim: Fn(String) -> Bool = fn(id) { is_commu_dim(id) || is_run_health_dim(id) };
+
+def commu_storage_code: Fn(String) -> Option(String) = fn(business) {
+    if business == "在线" { 'Some("0") }
+    else if business == "离线" { 'Some("1") }
+    else { 'None }
+};
+def normal_storage_code: Fn(String) -> Option(String) = fn(business) {
+    if business == "正常" { 'Some("1") }
+    else { 'None }
+};
+def status_storage_code: Fn(String, String) -> Option(String) = fn(dim, business) {
+    if is_commu_dim(dim) {
+        commu_storage_code(business)
+    } else if is_run_health_dim(dim) {
+        normal_storage_code(business)
+    } else {
+        'None
+    }
+};
+
+def map_status_filter: Fn(edsl.FilterRequest) -> edsl.FilterRequest = fn(filter) {
+    if is_status_dim(filter.id) {
+        match filter.input {
+            'Text(business) => match status_storage_code(filter.id, business) {
+                'Some(code) => do {
+                    let mapped: edsl.FilterRequest = {
+                        id: filter.id,
+                        subject: filter.subject,
+                        op: filter.op,
+                        input: 'Text(code),
+                    };
+                    mapped
+                },
+                'None => fail!("unknown business value for status dimension", filter.id, business),
+            },
+            _ => fail!("status dimension filter input must be text", filter.id, filter.input),
+        }
+    } else {
+        filter
+    }
+};
+
+def map_status_any_of_value: Fn(String, edsl.FilterInput) -> edsl.FilterInput = fn(dim, value) {
+    if is_status_dim(dim) {
+        match value {
+            'Text(business) => match status_storage_code(dim, business) {
+                'Some(code) => 'Text(code),
+                'None => fail!("unknown business value for status dimension", dim, business),
+            },
+            _ => fail!("status dimension filter input must be text", dim, value),
+        }
+    } else {
+        value
+    }
+};
+
+def map_status_any_of: Fn(edsl.AnyOfRequest) -> edsl.AnyOfRequest = fn(any_of) {
+    if is_status_dim(any_of.id) {
+        let values = array.map(any_of.values, fn(v) { map_status_any_of_value(any_of.id, v) });
+        let mapped: edsl.AnyOfRequest = {
+            id: any_of.id,
+            subject: any_of.subject,
+            values,
+        };
+        mapped
+    } else {
+        any_of
+    }
+};
+
+def map_status_exists: Fn(edsl.ExistsRequest) -> edsl.ExistsRequest = fn(exists) {
+    let filters = array.map(exists.filters, map_status_filter);
+    let any_of = array.map(exists.any_of, map_status_any_of);
+    let mapped: edsl.ExistsRequest = {
+        target: exists.target,
+        subject: exists.subject,
+        filters,
+        any_of,
+        min_matches: exists.min_matches,
+    };
+    mapped
+};
+
+def normalize_status_intent: Fn(Intent) -> Intent = fn(intent) {
+    let mapped: Intent = {
+        measures: intent.measures,
+        dimensions: intent.dimensions,
+        filters: array.map(intent.filters, map_status_filter),
+        any_of: array.map(intent.any_of, map_status_any_of),
+        ordering: intent.ordering,
+        limit: intent.limit,
+        offset: intent.offset,
+        partition: intent.partition,
+        exists: array.map(intent.exists, map_status_exists),
+        having: intent.having,
+        group_count: intent.group_count,
+        time_windows: intent.time_windows,
+    };
+    mapped
+};
+
+# Compile the declared time-window provenance into ordinary half-open absolute
+# time filters.  `trusted` is the external, Resolver-unwritable reference
+# context injected by the Host/caller.  Relative (FixedWindow/Calendar) windows
+# require a trusted context (and, when they self-report a reference, it must
+# equal the trusted value); otherwise compilation fails deterministically.
+# Only after this trust check do the absolute bounds enter the request as
+# Ge/Lt parameterised filters.
+def apply_time_windows: Fn(Intent, Option(String)) -> Intent = fn(intent, trusted) {
+    match intent.time_windows {
+        'None => intent,
+        'Some(windows) => do {
+            if !time_context_ok(intent.time_windows, trusted) {
+                fail!(
+                    "relative time window requires an external trusted report reference (Host-injected context); Intent self-reported reference is not trusted",
+                    intent,
+                )
+            } else {
+                let _validated: Array(Bool) = array.map(windows, validate_time_window);
+                let extra = array.flat_map(windows, time_window_to_filters);
+                let mapped: Intent = {
+                    measures: intent.measures,
+                    dimensions: intent.dimensions,
+                    filters: array.concat([intent.filters, extra]),
+                    any_of: intent.any_of,
+                    ordering: intent.ordering,
+                    limit: intent.limit,
+                    offset: intent.offset,
+                    partition: intent.partition,
+                    exists: intent.exists,
+                    having: intent.having,
+                    group_count: intent.group_count,
+                    time_windows: 'None,
+                };
+                mapped
+            }
+        }
+    }
+};
+
 # Lower a plain QueryRequest (measure-less or aggregated) to a Query.
+# The plain request carries no trusted time context, so relative time windows
+# cannot be present (they would fail deterministically at apply_time_windows).
 def make_query: Fn(edsl.QueryRequest) -> qb.Query = fn(request) {
-    let intent: Intent = intent_from_request(request);
+    let intent: Intent = apply_time_windows(normalize_status_intent(intent_from_request(request)), 'None);
     let payload: edsl.PreparedPayload = select_payload(intent);
     let _guarded: Bool = guard_alarm_site_tenant(intent, payload);
-    let plan: qb.Plan = edsl.lower(payload, request);
+    let plan: qb.Plan = edsl.lower(payload, intent_to_request(intent));
     qb.transform_sqlite(plan)
 };
 
-# Lower a full Intent:
-#   - group_count = 'Some('CountGroups) -> nested "count of groups passing
-#     HAVING" (returns Query directly through ontology lower_group_count);
-#   - otherwise -> ontology lower_any (request + any_of OR-groups + exists with
-#     optional min_matches/any_of + having) then transform.
+# Lower a full Intent without a trusted time context (used by callers that do
+# not have a Host-injected reference; relative windows fail deterministically).
 def make_intent_query: Fn(Intent) -> qb.Query = fn(intent) {
-    let payload: edsl.PreparedPayload = select_payload(intent);
-    let _guarded: Bool = guard_alarm_site_tenant(intent, payload);
-    match intent.group_count {
+    make_intent_query_context(intent, 'None)
+};
+
+# Lower a full Intent with an external trusted report reference context.
+# `trusted` must come from a Resolver-unwritable source (Host/injected context);
+# relative time windows compile only under this context.
+def make_intent_query_context: Fn(Intent, Option(String)) -> qb.Query = fn(intent, trusted) {
+    let normalized: Intent = apply_time_windows(normalize_status_intent(intent), trusted);
+    let payload: edsl.PreparedPayload = select_payload(normalized);
+    let _guarded: Bool = guard_alarm_site_tenant(normalized, payload);
+    match normalized.group_count {
         'Some('CountGroups) => edsl.lower_group_count(
             payload,
-            intent_to_request(intent),
-            intent.having,
+            intent_to_request(normalized),
+            normalized.having,
         ),
         _ => {
             let plan: qb.Plan = edsl.lower_any(
                 payload,
-                intent_to_request(intent),
-                intent.any_of,
-                intent.exists,
-                intent.having,
+                intent_to_request(normalized),
+                normalized.any_of,
+                normalized.exists,
+                normalized.having,
             );
             qb.transform_sqlite(plan)
         }
     }
 };
 
-export { Intent, GroupCountMode, intent_to_request, intent_from_request, make_query, make_intent_query };
+# ---------------------------------------------------------------------------
+# Request-scoped time-source authorization.
+#
+# A Resolver must not be able to disguise a relative window as an ordinary
+# absolute time filter.  The Host's per-request time_context (version 2)
+# declares which absolute text values were *directly* present in the request
+# (`direct_bounds`) plus the trusted report reference.  A plain time filter is
+# only authorized when its value is among the Host-declared direct bounds for
+# that time dimension.  Without declared direct bounds, a request that filters
+# a time dimension fails deterministically (the Host must supply request-scoped
+# direct bounds); requests without time conditions are unaffected.
+# ---------------------------------------------------------------------------
+
+def time_dimension_ids: Array(String) = [
+    "NetworkKpiTime", "NetOnlineKpiTime", "ApRadioKpiTime",
+    "ServerKpiTime", "PonKpiTime", "OnuKpiTime", "PonPortKpiTime",
+    "StorageKpiTime", "AlarmTime",
+];
+
+def is_time_dimension: Fn(String) -> Bool = fn(id) {
+    array.any(time_dimension_ids, fn(d) { d == id })
+};
+
+# One absolute text value the request itself directly provided for a time
+# dimension (Host-declared, Resolver-unwritable).
+type DirectBoundSpec = struct {
+    dimension: String,
+    value: String,
+};
+
+# Pure decision predicate: are the request's time-dimension filters authorized
+# by the Host-declared direct bounds?  (Testable; authorize_time_context fails
+# on False.)
+def time_filters_authorized: Fn(Array(edsl.FilterRequest), Option(Array(DirectBoundSpec))) -> Bool = fn(
+    filters, direct_bounds
+) {
+    let time_filters = array.filter(filters, fn(f) { is_time_dimension(f.id) });
+    if array.length(time_filters) == 0 {
+        'True
+    } else {
+        match direct_bounds {
+            'None => 'False,
+            'Some(bounds) => array.all(time_filters, fn(f) {
+                match f.input {
+                    'Text(value) => array.any(bounds, fn(b) {
+                        b.dimension == f.id && b.value == value
+                    }),
+                    _ => 'True,
+                }
+            }),
+        }
+    }
+};
+
+# Deterministic authorization: fail when a time-dimension filter is not a
+# Host-declared directly-provided absolute bound (or no direct bounds were
+# declared for this request).
+def authorize_time_context: Fn(Array(edsl.FilterRequest), Option(Array(DirectBoundSpec))) -> Bool = fn(
+    filters, direct_bounds
+) {
+    if time_filters_authorized(filters, direct_bounds) {
+        'True
+    } else {
+        fail!(
+            "time filter is not declared as a directly provided absolute bound in the request-scoped Host time context (report_reference/direct_bounds); Resolver may not fabricate absolute bounds",
+            filters,
+        )
+    }
+};
+
+# Direct-bound membership helper for a single absolute text value.
+def bound_contains: Fn(Array(DirectBoundSpec), String, String) -> Bool = fn(bounds, dimension, value) {
+    array.any(bounds, fn(b) { b.dimension == dimension && b.value == value })
+};
+
+# Pure decision predicate over the whole request-scoped time authorization:
+#   - plain time-dimension filters must be Host-declared direct bounds;
+#   - 'Direct time windows (user-supplied absolute window) must also have both
+#     bounds declared as direct input;
+#   - 'FixedWindow / 'Calendar windows require the trusted report reference.
+def time_context_authorized: Fn(Intent, Option(String), Option(Array(DirectBoundSpec))) -> Bool = fn(
+    intent, trusted, direct_bounds
+) {
+    if !time_filters_authorized(intent.filters, direct_bounds) {
+        'False
+    } else {
+        match intent.time_windows {
+            'None => 'True,
+            'Some(windows) => array.all(windows, fn(w) {
+                match w.kind {
+                    'Direct => match direct_bounds {
+                        'Some(bounds) =>
+                            bound_contains(bounds, w.dimension, w.start)
+                                && bound_contains(bounds, w.dimension, w.end),
+                        'None => 'False,
+                    },
+                    'FixedWindow => match trusted {
+                        'Some(_) => 'True,
+                        'None => 'False,
+                    },
+                    'Calendar => match trusted {
+                        'Some(_) => 'True,
+                        'None => 'False,
+                    },
+                }
+            }),
+        }
+    }
+};
+
+# Deterministic request-scoped authorization (fails on unauthorized time use).
+def authorize_request_time: Fn(Intent, Option(String), Option(Array(DirectBoundSpec))) -> Bool = fn(
+    intent, trusted, direct_bounds
+) {
+    if time_context_authorized(intent, trusted, direct_bounds) {
+        'True
+    } else {
+        fail!(
+            "request time use is not authorized by the request-scoped Host time context (direct bounds and/or trusted report reference); Resolver may not fabricate or disguise relative/absolute time input",
+            intent,
+        )
+    }
+};
+
+export {
+    Intent,
+    GroupCountMode,
+    TimeWindowKind,
+    TimeWindowSpec,
+    DirectBoundSpec,
+    intent_to_request,
+    intent_from_request,
+    validate_time_window,
+    time_context_ok,
+    time_window_to_filters,
+    apply_time_windows,
+    is_time_dimension,
+    time_filters_authorized,
+    authorize_time_context,
+    time_context_authorized,
+    authorize_request_time,
+    make_query,
+    make_intent_query,
+    make_intent_query_context,
+};
