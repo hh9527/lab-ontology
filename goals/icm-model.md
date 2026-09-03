@@ -23,8 +23,8 @@ EnterpriseKnowledge。组织方式可参考旧 `ent-1`，但实体、关系、�
   时间语义和统计口径。可公开 measure/dimension ID 及其业务含义，但不写 Intent/Query
   教程、CLI/SQL/bindings、物理 schema、Join 路径或实现细节。
 - 公共资料不得包含评测题、选择列表、隐藏知识 K、trap、标准答案或按题编号编写的提示。
-- `benchmarks/icm-eval.sqlite` 存在时，应按迭代和 Case 汇总失败类型，用它发现模型能力缺口；不要
-  把具体题目或答案硬编码进模型。Host 可通过 `feedbacks/icm-model.md` 补充改进重点。
+- A3 不读取 Benchmark SQLite 报告。Host 负责汇总测评结论，并通过
+  `feedbacks/icm-model.md` 提供改进重点；A3 不把具体题目或答案硬编码进模型。
 
 ## make-query
 
