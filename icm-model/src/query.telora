@@ -64,6 +64,9 @@ type Intent = struct {
     # Optional provenance of time-dimension windows.  Absent/null means every
     # time-dimension filter in `filters` is a directly supplied absolute bound.
     time_windows: Option(Array(TimeWindowSpec)),
+    # Optional paired-endpoint (peer) filters over a dual-end hub base (e.g.
+    # "links between two specified devices"); lower via ontology lower_peer.
+    peers: Option(Array(edsl.PeerRequest)),
 };
 
 def intent_to_request: Fn(Intent) -> edsl.QueryRequest = fn(intent) {
@@ -93,6 +96,7 @@ def intent_from_request: Fn(edsl.QueryRequest) -> Intent = fn(request) {
         having: [],
         group_count: 'None,
         time_windows: 'None,
+        peers: 'None,
     };
     intent
 };
@@ -441,6 +445,7 @@ def normalize_status_intent: Fn(Intent) -> Intent = fn(intent) {
         having: intent.having,
         group_count: intent.group_count,
         time_windows: intent.time_windows,
+        peers: intent.peers,
     };
     mapped
 };
@@ -477,6 +482,7 @@ def apply_time_windows: Fn(Intent, Option(String)) -> Intent = fn(intent, truste
                     having: intent.having,
                     group_count: intent.group_count,
                     time_windows: 'None,
+                    peers: intent.peers,
                 };
                 mapped
             }
@@ -501,6 +507,80 @@ def make_intent_query: Fn(Intent) -> qb.Query = fn(intent) {
     make_intent_query_context(intent, 'None)
 };
 
+# ---------------------------------------------------------------------------
+# Peer-mode geometry validation.
+#
+# The peer slice ("two specified participants at the two ends of the same hub
+# row") lowers through ontology `lower_peer`.  Before lowering we
+# deterministically reject every peer-mode shape that cannot be expressed by a
+# single PeerRequest, so user constraints are never silently dropped:
+#   - any non-empty any_of / exists / having list;
+#   - an active group_count mode;
+#   - a peers list that is not exactly one PeerRequest;
+#   - self-pair (same entity and same exact key);
+#   - unsupported participant pairs (terminal/collab/unknown entities, or a
+#     device-id participant paired with a port-DN participant).
+# Ordinary base filters, ordering, limit and offset are preserved as plain
+# QueryRequest fields.  `peer_mode_issue` is a pure decision predicate so
+# contract tests can assert each rejection without triggering a failure.
+# ---------------------------------------------------------------------------
+
+def is_device_peer_entity: Fn(String) -> Bool = fn(entity) {
+    entity == "net_device" || entity == "pon_device"
+        || entity == "server_device" || entity == "storage_device"
+};
+
+# Participant-pair surface of the peer routes declared on the physical-link hub
+# (keep aligned with the @edsl.peer_hub declarations in @src/model).  The four
+# device domains pair on device keys (aNeResId/zNeResId); network ports pair
+# only with ports on port DNs (aPortDn/zPortDn); terminal/collaboration devices
+# have no declared peer route.
+def peer_pair_supported: Fn(String, String) -> Bool = fn(origin, peer) {
+    let port_side: Bool = origin == "net_port" || peer == "net_port";
+    if port_side {
+        origin == "net_port" && peer == "net_port"
+    } else {
+        is_device_peer_entity(origin) && is_device_peer_entity(peer)
+    }
+};
+
+def peer_request_self_pair: Fn(edsl.PeerRequest) -> Bool = fn(peer) {
+    peer.origin.entity == peer.peer.entity && peer.origin.key == peer.peer.key
+};
+
+def peer_mode_issue: Fn(Intent) -> Option(String) = fn(intent) {
+    match intent.peers {
+        'None => 'None,
+        'Some(peers) => do {
+            let count: Int = array.length(peers);
+            if count == 0 {
+                'None
+            } else if count != 1 {
+                'Some("peer mode requires exactly one PeerRequest")
+            } else if array.length(intent.any_of) != 0 {
+                'Some("peer mode does not combine with subject any_of groups")
+            } else if array.length(intent.exists) != 0 {
+                'Some("peer mode does not combine with correlated existence filters")
+            } else if array.length(intent.having) != 0 {
+                'Some("peer mode does not combine with having group predicates")
+            } else if intent.group_count != 'None {
+                'Some("peer mode does not combine with count-of-groups mode")
+            } else {
+                let peer: edsl.PeerRequest = peers[0];
+                if peer_request_self_pair(peer) {
+                    'Some("peer origin and peer participant must be distinct (self-pair rejected)")
+                } else if !peer_pair_supported(peer.origin.entity, peer.peer.entity) {
+                    'Some(
+                        `unsupported peer participant pair for the physical-link hub (\{peer.origin.entity}, \{peer.peer.entity})`,
+                    )
+                } else {
+                    'None
+                }
+            }
+        }
+    }
+};
+
 # Lower a full Intent with an external trusted report reference context.
 # `trusted` must come from a Resolver-unwritable source (Host/injected context);
 # relative time windows compile only under this context.
@@ -508,21 +588,46 @@ def make_intent_query_context: Fn(Intent, Option(String)) -> qb.Query = fn(inten
     let normalized: Intent = apply_time_windows(normalize_status_intent(intent), trusted);
     let payload: edsl.PreparedPayload = select_payload(normalized);
     let _guarded: Bool = guard_alarm_site_tenant(normalized, payload);
-    match normalized.group_count {
-        'Some('CountGroups) => edsl.lower_group_count(
-            payload,
-            intent_to_request(normalized),
-            normalized.having,
-        ),
-        _ => {
-            let plan: qb.Plan = edsl.lower_any(
+    let peer_list: Array(edsl.PeerRequest) = match normalized.peers {
+        'None => [],
+        'Some(peers) => peers,
+    };
+    if array.length(peer_list) > 0 {
+        # Peer mode: geometry is validated before lowering.  A non-'None issue
+        # is a deterministic rejection - never a silent drop of any_of/exists/
+        # having/group_count or of extra peer requests.
+        match peer_mode_issue(normalized) {
+            'Some(reason) => fail!(
+                "peer intent rejected before lowering (exactly one PeerRequest; no any_of/exists/having/group_count combination; supported participant pair)",
+                reason,
+                normalized,
+            ),
+            'None => {
+                let plan: qb.Plan = edsl.lower_peer(
+                    payload,
+                    intent_to_request(normalized),
+                    peer_list,
+                );
+                qb.transform_sqlite(plan)
+            }
+        }
+    } else {
+        match normalized.group_count {
+            'Some('CountGroups) => edsl.lower_group_count(
                 payload,
                 intent_to_request(normalized),
-                normalized.any_of,
-                normalized.exists,
                 normalized.having,
-            );
-            qb.transform_sqlite(plan)
+            ),
+            _ => {
+                let plan: qb.Plan = edsl.lower_any(
+                    payload,
+                    intent_to_request(normalized),
+                    normalized.any_of,
+                    normalized.exists,
+                    normalized.having,
+                );
+                qb.transform_sqlite(plan)
+            }
         }
     }
 };
@@ -671,4 +776,7 @@ export {
     make_query,
     make_intent_query,
     make_intent_query_context,
+    peer_pair_supported,
+    peer_request_self_pair,
+    peer_mode_issue,
 };

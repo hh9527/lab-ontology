@@ -40,20 +40,24 @@
      "having":      [ HavingRequest, ... ],       // 可为空（聚合结果谓词）
      "group_count":  "CountGroups" | null,        // 组数计数模式
      "time_windows": [ TimeWindowSpec, ... ] | null // 可选：时间窗口来源（§4.8）
+     "peers":        [ PeerRequest, ... ] | null   // 可选：两指定 participant 配对（§4.5）
    }
    ```
 2. **QueryRequest 简写**：只含 `measures/dimensions/filters/ordering/limit/offset/
-   partition` 六个字段（`any_of/exists/having/group_count/time_windows` 按空/关闭
+   partition` 六个字段（`any_of/exists/having/group_count/time_windows/peers` 按空/关闭
    处理）。
 
 所有数组均可为空；`null` 表示该可选字段未启用。`time_windows` 只声明“由相对时间词
 换算得到的窗口”的来源与参考时刻；直接由用户给出的绝对时间边界放在 `filters` 中即可，
-无需 `time_windows`（缺省为 `null`）。
+无需 `time_windows`（缺省为 `null`）。`peers` 声明“两个指定 participant 位于同一链路
+两端”的配对过滤（仅完整 Intent 支持；缺省为 `null`）。
 
 两种形式必须清晰区分：`any_of` / `exists` / `having` / `group_count` 四个信封字段
 要么**全部出现**（完整 Intent），要么**全部省略**（QueryRequest 简写）。只出现其中
 一部分的“残缺信封”（如只带 `having` 而没有 `any_of`/`exists`）会被确定性拒绝，不会
-被当作忽略信封字段的简写请求处理。
+被当作忽略信封字段的简写请求处理。`time_windows` / `peers` 是完整 Intent 的**附加
+可选字段**：只在完整信封中出现，不能在 QueryRequest 简写上单独携带（否则被当作残缺
+信封确定性拒绝，绝不静默忽略这些约束）。
 
 ## 3. JSON 值编码（所有公开枚举的 JSON 表示）
 
@@ -185,8 +189,28 @@
   网络/PON/服务器/存储设备或网络端口（`net_port`），经双端 hub（A/Z 设备键；端口仅用
   A/Z port DN）编译为相关 union EXISTS `((A = participant.key) OR (Z = participant.key))`，
   保持链路 base grain、不 fan-out、同一链路只计一次；participant 属性筛选进入 bindings。
-  “两指定设备互为对端”与“peer 上的告警/属性”仍确定性拒绝；终端/协作无源链路关系，
-  不作为 participant 开放（见 `DOMAIN.md` §4）。
+  终端/协作无源链路关系，不作为 participant 开放（见 `DOMAIN.md` §4）。
+- **配对的 peer 路线（两指定 participant 之间的链路）**：Intent 顶层可选
+  `"peers": [{"subject": "...", "origin": {"entity": "<participant id>", "key": {"Text":
+  "<key>"}}, "peer": {"entity": "<participant id>", "key": {"Text": "<key>"}}}]`。链路为
+  base，`origin` 与 `peer` 必须各自给出明确 participant 实体与精确 key（= 该 participant
+  的稳定 key 值），经声明的 paired route 编译为单个含两个 participant alias 的 correlated
+  EXISTS，包含 `(A → origin, Z → peer)` 与 `(Z → origin, A → peer)` 两个交换分支；动态
+  key 绑定顺序 origin 后 peer，无外层 participant JOIN/fan-out。同类型与异构（网络/PON/
+  服务器/存储）配对、端口与端口配对（A/Z port DN）均支持；请求中 origin/peer 顺序交换
+  会按 origin→peer 重排绑定。自配（同实体同 key）、终端/协作 participant、缺路线/歧义/
+  未知实体确定性拒绝。peer 侧属性/分类过滤、peer 上的告警、peer KPI 与 peer 之上的
+  二次聚合仍明确拒绝。
+  - **participant 实体与配对**：设备键 route 的 participant 为 `net_device`/`pon_device`/
+    `server_device`/`storage_device`（四域内任意两两配对，含同型与异构）；端口 DN route
+    的 participant 为 `net_port`（只能与 `net_port` 配对，使用 A/Z port DN）。`terminal_
+    device`/`collab_device`、未知实体，以及 device-id participant 与 port-DN participant
+    混配均确定性拒绝。
+  - **组合边界（不静默丢约束）**：`peers` 必须**恰好一个** `PeerRequest`（空数组视为未
+    启用；多于一个确定性拒绝）。peer 模式不得与**非空** `any_of`/`exists`/`having` 或
+    `group_count` 组合；这些约束一旦出现，请求在 lowering 前确定性拒绝，绝不忽略。
+    普通链路 base filters（如 `LinkType`/`LinkDirection`）、`ordering`/`limit`/`offset`
+    仍按 QueryRequest 既有契约保留。
 
 ### 4.6 HavingRequest（聚合结果谓词）与 group_count
 
@@ -345,6 +369,13 @@
    `take`/`min_matches`/`limit`/`offset`、行级请求带 partition/having 等）以及残缺/
    非法 Intent 信封（`any_of`/`exists`/`having`/`group_count` 只出现一部分、或完整
    信封中字段类型错误）都会产生确定性、可归因的诊断，并且**不发布任何部分查询结果**。
+   残缺/非法信封还包括：在 QueryRequest 简写上单独携带 `time_windows`/`peers`（未提供
+   完整的 `any_of`/`exists`/`having`/`group_count`），会被确定性拒绝而不是静默忽略这些
+   可选约束。
+- **peer 模式非法组合确定性拒绝**：`peers` 非空时，非空 `any_of`/`exists`/`having`、
+   启用的 `group_count`、多于一个 `PeerRequest`、自配（同实体同 key）、终端/协作或未知
+   participant 实体、device-id participant 与 port-DN participant 混配都会在 lowering 前
+   确定性拒绝（不发布部分查询，也不降级为多个独立 EXISTS）。
 - 超出统一设备源能力的组合同样确定性失败、不发布任何部分结果：`DeviceCount` 带
   展示名称维度/筛选（`SiteName`/`TenantName`）、`DeviceCount` 带告警存在性
   （`exists`/`having` 中的告警条件）、或 `exists.target = "device"`（见 `DOMAIN.md`

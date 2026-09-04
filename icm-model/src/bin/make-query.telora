@@ -9,8 +9,8 @@
 #
 # This module decodes the intent (an `Intent` = ontology QueryRequest fields
 # plus optional `any_of` / `exists` / `having` / `group_count` / `time_windows`
-# envelope fields; `measures` may be empty for row projection) and lowers it to
-# a single parameterized Query encoded as the sole stdout Value.
+# / `peers` envelope fields; `measures` may be empty for row projection) and
+# lowers it to a single parameterized Query encoded as the sole stdout Value.
 #
 # The trusted report reference never comes from the Intent; it is read from the
 # Host-injected time_context. `direct_bounds` authorizes only absolute values
@@ -42,33 +42,30 @@ type TimeContextFile = struct {
 
 def config: entry.ContextConfig = {sources: ["input", "time_context"], envs: [], args: 'False};
 
-# Number of Intent envelope-only keys present in the raw object.  A valid full
-# Intent envelope carries all of them (arrays may be empty; group_count may be
-# null); a plain QueryRequest shorthand carries none.  Any other combination is
-# a malformed / partial envelope and fails deterministically below, so a lenient
-# QueryRequest decode can never silently drop exists/having/group_count.
-def envelope_key_count: Fn(Value) -> Int = fn(raw) {
+# Presence of one optional Intent-only key in the raw object.  A full Intent
+# envelope carries all four core capability keys (any_of / exists / having /
+# group_count - arrays may be empty; group_count may be null); time_windows and
+# peers are additional optional keys that only make sense on that full form.  A
+# plain QueryRequest shorthand carries none of them.  Detecting the optional
+# keys is required so that a shorthand never silently drops a peers or
+# time_windows constraint: any intent-only key with a missing core envelope is
+# a malformed / partial envelope and fails deterministically.
+def raw_has_key: Fn(Value, String) -> Bool = fn(raw, name) {
     match raw {
-        'Object(obj) => {
-            let key_present: Fn(String) -> Bool = fn(name) {
-                match dict.get(obj, name) {
-                    'Some(_) => 'True,
-                    'None => 'False,
-                }
-            };
-            let any_of: Bool = key_present("any_of");
-            let exists: Bool = key_present("exists");
-            let having: Bool = key_present("having");
-            let group_count: Bool = key_present("group_count");
-            let step1: Int = if any_of { 1 } else { 0 };
-            let step2: Int = if exists { step1 + 1 } else { step1 };
-            let step3: Int = if having { step2 + 1 } else { step2 };
-            let step4: Int = if group_count { step3 + 1 } else { step3 };
-            step4
+        'Object(obj) => match dict.get(obj, name) {
+            'Some(_) => 'True,
+            'None => 'False,
         },
-        _ => 0,
+        _ => 'False,
     }
 };
+
+def raw_has_any_of: Fn(Value) -> Bool = fn(raw) { raw_has_key(raw, "any_of") };
+def raw_has_exists: Fn(Value) -> Bool = fn(raw) { raw_has_key(raw, "exists") };
+def raw_has_having: Fn(Value) -> Bool = fn(raw) { raw_has_key(raw, "having") };
+def raw_has_group_count: Fn(Value) -> Bool = fn(raw) { raw_has_key(raw, "group_count") };
+def raw_has_time_windows: Fn(Value) -> Bool = fn(raw) { raw_has_key(raw, "time_windows") };
+def raw_has_peers: Fn(Value) -> Bool = fn(raw) { raw_has_key(raw, "peers") };
 
 def evaluate: Fn(entry.Context) -> Value = fn(ctx) {
     let raw: Value = match dict.get(ctx.sources, "input") {
@@ -89,21 +86,29 @@ def evaluate: Fn(entry.Context) -> Value = fn(ctx) {
         fail!("make-query: unsupported time_context version", context.version)
     } else {
         let trusted: Option(String) = context.report_reference;
-        let present: Int = envelope_key_count(raw);
-        let intent: facade.Intent = if present == 0 {
-            # Plain QueryRequest shorthand (no envelope fields present).
-            let request: edsl.QueryRequest = codec.decode(edsl.QueryRequest, raw)
-                |> result.unwrap;
-            facade.intent_from_request(request)
-        } else if present == 4 {
+        let full_envelope: Bool =
+            raw_has_any_of(raw) && raw_has_exists(raw) && raw_has_having(raw) && raw_has_group_count(raw);
+        let any_intent_key: Bool =
+            raw_has_any_of(raw) || raw_has_exists(raw) || raw_has_having(raw) || raw_has_group_count(raw)
+                || raw_has_time_windows(raw) || raw_has_peers(raw);
+        let intent: facade.Intent = if full_envelope {
             # Full Intent envelope.  Any structural/type mismatch is a
             # deterministic failure; never silently downgraded to QueryRequest.
             match codec.decode(facade.Intent, raw) {
                 'Ok(value) => value,
                 'Err(_) => fail!("make-query: invalid intent envelope", raw),
             }
-        } else {
+        } else if any_intent_key {
+            # Intent-only key(s) present without the complete core envelope
+            # (any_of/exists/having/group_count all required).  Rejecting this
+            # shape means a lenient QueryRequest decode can never silently drop
+            # exists/having/group_count/time_windows/peers constraints.
             fail!("make-query: partial intent envelope", raw)
+        } else {
+            # Plain QueryRequest shorthand (no envelope fields present).
+            let request: edsl.QueryRequest = codec.decode(edsl.QueryRequest, raw)
+                |> result.unwrap;
+            facade.intent_from_request(request)
         };
         let _authorized: Bool = facade.authorize_request_time(
             intent,
