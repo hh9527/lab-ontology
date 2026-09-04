@@ -1,0 +1,239 @@
+# spider-model/tests/query.telora
+#
+# Contract tests for the spider-model intent resolver.  These tests exercise
+# the public INTENT JSON contract end-to-end (parse -> validate -> lower ->
+# parameterized Query) and cover:
+#   - legal modeling intents (counts, filtered aggregates, group-by, list,
+#     range filters, ordering + Top N);
+#   - unknown vocabulary and type errors (intent_problem returns a problem);
+#   - illegal combinations (unselected ordering target, offset without
+#     ordering, non-positive limit);
+#   - parameter binding presence/order (no value literal in SQL text) and
+#     determinism (the same intent yields the same Query every time).
+#
+# The tests are structural: they assert SQL is non-empty, binding counts are
+# right, dynamic values never appear in the SQL text, and repeated lowering is
+# byte-identical.  They do not depend on the exact SQL formatting of a given
+# ontology version.
+
+import "@src/model" { payload };
+import "@src/query" {
+    Intent,
+    parse_intent,
+    intent_problem,
+    resolve,
+};
+import "ontology/query" as qb;
+import "std/array" as array;
+import "std/regex" as regex;
+
+# --- helpers ---------------------------------------------------------------
+
+def intent_of_text: Fn(String) -> Intent = fn(text) {
+    match parse_intent(text) {
+        'Ok(i) => i,
+        'Err(message) => fail!("test intent did not parse", message),
+    }
+};
+
+def run_text: Fn(String) -> qb.Query = fn(text) {
+    resolve(payload, intent_of_text(text))
+};
+
+def problem_text: Fn(String) -> Option(String) = fn(text) {
+    intent_problem(payload, intent_of_text(text))
+};
+
+def contains_literal: Fn(String, String) -> Bool = fn(sql, literal) {
+    regex.is_match(regex.compile(literal), sql)
+};
+
+def binding_count: Fn(qb.Query) -> Int = fn(q) {
+    array.length(q.bindings)
+};
+
+# --- valid intent fixtures -------------------------------------------------
+
+def total_singers_json: String = `{"measures":[{"id":"singer_count","mode":"all"}],"dimensions":[],"filters":[],"order":[],"limit":null,"offset":null}`;
+
+def france_age_stats_json: String = `{"measures":[{"id":"singer_age_avg","mode":"all"},{"id":"singer_age_min","mode":"all"},{"id":"singer_age_max","mode":"all"}],"dimensions":[],"filters":[{"id":"singer_country","op":"eq","value":"France"}],"order":[],"limit":null,"offset":null}`;
+
+def singers_by_country_json: String = `{"measures":[{"id":"singer_count","mode":"all"}],"dimensions":[{"id":"singer_country"}],"filters":[],"order":[],"limit":null,"offset":null}`;
+
+def stadium_range_list_json: String = `{"measures":[],"dimensions":[{"id":"stadium_location"},{"id":"stadium_name"}],"filters":[{"id":"stadium_capacity","op":"ge","value":5000},{"id":"stadium_capacity","op":"le","value":10000}],"order":[],"limit":null,"offset":null}`;
+
+def concerts_per_stadium_json: String = `{"measures":[{"id":"concert_count","mode":"all"}],"dimensions":[{"id":"stadium_name"}],"filters":[],"order":[],"limit":null,"offset":null}`;
+
+def stadium_top_capacity_json: String = `{"measures":[],"dimensions":[{"id":"stadium_name"},{"id":"stadium_capacity"}],"filters":[],"order":[{"measure":null,"dimension":"stadium_capacity","direction":"desc"}],"limit":3,"offset":null}`;
+
+def two_bindings_json: String = `{"measures":[],"dimensions":[{"id":"singer_name"},{"id":"singer_country"}],"filters":[{"id":"singer_country","op":"eq","value":"AAA"},{"id":"singer_name","op":"eq","value":"BBB"}],"order":[],"limit":null,"offset":null}`;
+
+# --- legal intent tests ----------------------------------------------------
+
+export def test_total_singers = do {
+    let q = run_text(total_singers_json);
+    let ok_sel = regex.is_match(regex.compile("SELECT"), q.sql);
+    let ok_rows = binding_count(q) == 0;
+    if ok_sel && ok_rows {
+        'True
+    } else {
+        fail!("total singers intent failed", q.sql)
+    }
+};
+
+export def test_filtered_age_stats = do {
+    let q = run_text(france_age_stats_json);
+    let no_literal = !contains_literal(q.sql, "France");
+    let ok_binds = binding_count(q) == 1;
+    if no_literal && ok_binds {
+        'True
+    } else {
+        fail!("filtered age stats intent failed", q.sql)
+    }
+};
+
+export def test_group_by_country = do {
+    let q = run_text(singers_by_country_json);
+    let ok_group = regex.is_match(regex.compile("GROUP BY"), q.sql);
+    if ok_group {
+        'True
+    } else {
+        fail!("group by country intent failed", q.sql)
+    }
+};
+
+export def test_stadium_range_list = do {
+    let q = run_text(stadium_range_list_json);
+    let ok_binds = binding_count(q) == 2;
+    let no_literal = !contains_literal(q.sql, "5000");
+    if ok_binds && no_literal {
+        'True
+    } else {
+        fail!("stadium range list intent failed", q.sql)
+    }
+};
+
+export def test_concerts_per_stadium = do {
+    let q = run_text(concerts_per_stadium_json);
+    let ok_join = regex.is_match(regex.compile("JOIN"), q.sql);
+    let ok_group = regex.is_match(regex.compile("GROUP BY"), q.sql);
+    if ok_join && ok_group {
+        'True
+    } else {
+        fail!("concerts per stadium intent failed", q.sql)
+    }
+};
+
+export def test_stadium_top_capacity = do {
+    let q = run_text(stadium_top_capacity_json);
+    let ok_order = regex.is_match(regex.compile("ORDER BY"), q.sql);
+    let ok_limit = binding_count(q) == 1;
+    if ok_order && ok_limit {
+        'True
+    } else {
+        fail!("stadium top capacity intent failed", q.sql)
+    }
+};
+
+# --- parameter binding order / determinism --------------------------------
+
+export def test_two_bindings_parameterized = do {
+    let q = run_text(two_bindings_json);
+    let ok_binds = binding_count(q) == 2;
+    let no_a = !contains_literal(q.sql, "AAA");
+    let no_b = !contains_literal(q.sql, "BBB");
+    let ordered = q.bindings[0] != q.bindings[1];
+    if ok_binds && no_a && no_b && ordered {
+        'True
+    } else {
+        fail!("two-binding parameterization failed", q.sql)
+    }
+};
+
+export def test_deterministic = do {
+    let a = run_text(two_bindings_json);
+    let b = run_text(two_bindings_json);
+    if a.sql == b.sql && a.bindings == b.bindings {
+        'True
+    } else {
+        fail!("repeated lowering is not deterministic")
+    }
+};
+
+# --- unknown vocabulary ----------------------------------------------------
+
+export def test_unknown_measure = do {
+    let text: String = `{"measures":[{"id":"singer_bogus","mode":"all"}],"dimensions":[],"filters":[],"order":[],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("unknown measure was accepted"),
+    }
+};
+
+export def test_unknown_dimension = do {
+    let text: String = `{"measures":[],"dimensions":[{"id":"bogus_dim"}],"filters":[],"order":[],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("unknown dimension was accepted"),
+    }
+};
+
+export def test_unknown_filter_dimension = do {
+    let text: String = `{"measures":[],"dimensions":[{"id":"singer_name"}],"filters":[{"id":"bogus_f","op":"eq","value":"x"}],"order":[],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("unknown filter dimension was accepted"),
+    }
+};
+
+# --- type errors -----------------------------------------------------------
+
+export def test_text_value_on_numeric_dimension = do {
+    let text: String = `{"measures":[],"dimensions":[{"id":"singer_name"}],"filters":[{"id":"singer_age","op":"eq","value":"old"}],"order":[],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("text value on a numeric dimension was accepted"),
+    }
+};
+
+export def test_unsupported_filter_operator = do {
+    let text: String = `{"measures":[],"dimensions":[{"id":"singer_name"}],"filters":[{"id":"singer_country","op":"contains","value":5}],"order":[],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("numeric value for a text operator was accepted"),
+    }
+};
+
+# --- illegal combinations --------------------------------------------------
+
+export def test_ordering_unselected_measure = do {
+    let text: String = `{"measures":[{"id":"singer_count","mode":"all"}],"dimensions":[],"filters":[],"order":[{"measure":"singer_age_avg","dimension":null,"direction":"desc"}],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("ordering by an unselected measure was accepted"),
+    }
+};
+
+export def test_ordering_unselected_dimension = do {
+    let text: String = `{"measures":[],"dimensions":[{"id":"singer_name"}],"filters":[],"order":[{"measure":null,"dimension":"singer_country","direction":"asc"}],"limit":null,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("ordering by an unselected dimension was accepted"),
+    }
+};
+
+export def test_offset_without_ordering = do {
+    let text: String = `{"measures":[{"id":"singer_count","mode":"all"}],"dimensions":[],"filters":[],"order":[],"limit":null,"offset":5}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("offset without ordering was accepted"),
+    }
+};
+
+export def test_nonpositive_limit = do {
+    let text: String = `{"measures":[],"dimensions":[{"id":"singer_name"}],"filters":[],"order":[],"limit":0,"offset":null}`;
+    match problem_text(text) {
+        'Some(_) => 'True,
+        'None => fail!("non-positive limit was accepted"),
+    }
+};
