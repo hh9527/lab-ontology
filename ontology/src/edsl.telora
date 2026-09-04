@@ -205,6 +205,23 @@ type ExistsRouteSpec = struct {
     target: Type,
 };
 
+# Type-level: dual-endpoint hub declaration, annotated on the hub entity (the
+# base grain of any request using the hub).  A hub row carries two role columns
+# (`left_field`, `right_field`) that both reference the participant entity's key
+# (`key_field` on `participant`).  The hub row is filtered by the participant
+# target when either role matches the participant's key; the two roles are
+# mutually exclusive endpoints of one hub row.  Multiple annotations fold by
+# appending.
+@property('Type)
+type DualHubDef = struct { hubs: Array(DualHubDecl) };
+
+type DualHubDecl = struct {
+    participant: Type,
+    key_field: Int,
+    left_field: Int,
+    right_field: Int,
+};
+
 # ---------------------------------------------------------------------------
 # Public request vocabulary.
 # ---------------------------------------------------------------------------
@@ -428,6 +445,19 @@ type RouteEntry = struct {
     target_reversed: Bool,
 };
 
+# A prepared, validated dual-endpoint hub route.  `hub` is the base-grain hub
+# entity whose rows carry two role columns (`left`/`right` field indexes) that
+# reference the participant entity (`participant`) through its stable key field
+# (`participant_key`).  A hub row is kept when its left or right endpoint
+# matches a participant key (each hub base row is counted once).
+type HubRouteEntry = struct {
+    hub: Int,
+    participant: Int,
+    participant_key: Int,
+    left: Int,
+    right: Int,
+};
+
 type PathResult = enum {
     'Safe(Array(Int)),
     'FanOut(Array(Int)),
@@ -442,6 +472,7 @@ type PreparedPayload = struct {
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
     routes: Array(RouteEntry),
+    hub_routes: Array(HubRouteEntry),
     paths: Array(Array(PathResult)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
@@ -612,6 +643,21 @@ def exists_route: Fn(Type, Type) -> Fn(td.TypeDesc, Option(ExistsRouteDef)) -> E
             'None => [spec],
         };
         let result: ExistsRouteDef = { routes: all };
+        result
+    }
+};
+
+# Dual-endpoint hub declaration on the hub entity type: the hub is the base
+# grain and its two role fields (`left_field`, `right_field`) reference the
+# participant entity's `key_field`.  Multiple annotations fold by appending.
+def dual_hub: Fn(Type, Int, Int, Int) -> Fn(td.TypeDesc, Option(DualHubDef)) -> DualHubDef = fn(participant, key_field, left_field, right_field) {
+    fn(ctx, previous) {
+        let spec: DualHubDecl = { participant, key_field, left_field, right_field };
+        let all = match previous {
+            'Some(p) => array.push(p.hubs, spec),
+            'None => [spec],
+        };
+        let result: DualHubDef = { hubs: all };
         result
     }
 };
@@ -1243,6 +1289,90 @@ def route_build: Fn(Array(EntityEntry), Array(RelationEntry)) -> RouteBuild = fn
 };
 
 # ---------------------------------------------------------------------------
+# Dual-endpoint hub preparation.
+#
+# A dual hub is declared on the hub entity with two role columns referencing a
+# participant/base entity's stable key.  Preparation validates roles, keys and
+# uniqueness, then stores the resolved hub route on the payload.  Lowering reads
+# only the prepared route and never rescans metadata.
+# ---------------------------------------------------------------------------
+
+type HubResult = enum { 'Ok(HubRouteEntry), 'Err(String) };
+
+type HubBuild = struct { routes: Array(HubRouteEntry), problems: Array(String) };
+
+def resolve_hub_decl: Fn(Array(EntityEntry), Int, DualHubDecl) -> HubResult = fn(entities, hub, hd) {
+    match find_entity_index(entities, hd.participant) {
+        'None => 'Err("dual hub participant entity is not part of this knowledge"),
+        'Some(participant) => do {
+            if participant == hub {
+                'Err("dual hub participant must differ from the hub entity")
+            } else {
+                let participant_entity = get_index(entities, participant);
+                let hub_entity = get_index(entities, hub);
+                if hd.key_field < 0 || hd.key_field >= array.length(participant_entity.fields) {
+                    'Err("dual hub participant key field is out of range")
+                } else if hd.key_field != participant_entity.key_field {
+                    'Err("dual hub participant key must be the participant entity's declared key")
+                } else if hd.left_field < 0 || hd.left_field >= array.length(hub_entity.fields) {
+                    'Err("dual hub left endpoint field is out of range")
+                } else if hd.right_field < 0 || hd.right_field >= array.length(hub_entity.fields) {
+                    'Err("dual hub right endpoint field is out of range")
+                } else if hd.left_field == hd.right_field {
+                    'Err("dual hub left and right endpoints must be distinct fields")
+                } else {
+                    let entry: HubRouteEntry = {
+                        hub,
+                        participant,
+                        participant_key: hd.key_field,
+                        left: hd.left_field,
+                        right: hd.right_field,
+                    };
+                    let ok: HubResult = 'Ok(entry);
+                    ok
+                }
+            }
+        },
+    }
+};
+
+# Pure, deterministic hub route collection: never fails, so tests can assert
+# both valid and invalid declarations.  `build_root` fails on the first problem.
+def hub_build: Fn(Array(EntityEntry)) -> HubBuild = fn(entities) {
+    let init: HubBuild = { routes: [], problems: [] };
+    let collected = array.fold(entities, init, fn(acc, entity) {
+        let dd = property.get_type_prop(entity.entity_type, DualHubDef);
+        let specs = match dd {
+            'Some(d) => d.hubs,
+            'None => [],
+        };
+        array.fold(specs, acc, fn(inner_acc, spec) {
+            let resolved = resolve_hub_decl(entities, entity.index, spec);
+            match resolved {
+                'Err(message) => do {
+                    let result: HubBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, message) };
+                    result
+                },
+                'Ok(entry) => do {
+                    let dup = array.find(inner_acc.routes, fn(r) { r.hub == entry.hub && r.participant == entry.participant });
+                    match dup {
+                        'Some(_) => do {
+                            let result: HubBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, "dual hub is ambiguous: multiple declarations reach the same participant from the same hub") };
+                            result
+                        },
+                        'None => do {
+                            let result: HubBuild = { routes: array.push(inner_acc.routes, entry), problems: inner_acc.problems };
+                            result
+                        },
+                    }
+                },
+            }
+        })
+    });
+    collected
+};
+
+# ---------------------------------------------------------------------------
 # Root preparation.
 # ---------------------------------------------------------------------------
 
@@ -1261,6 +1391,12 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
     } else {
         routes_build.routes
     };
+    let hub_build_result = hub_build(entities);
+    let hub_routes = if array.length(hub_build_result.problems) > 0 {
+        fail!("invalid dual hub declaration", get_index(hub_build_result.problems, 0))
+    } else {
+        hub_build_result.routes
+    };
     let paths = build_paths(n, relations);
     let payload: PreparedPayload = {
         revision,
@@ -1269,6 +1405,7 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
         dimensions,
         relations,
         routes,
+        hub_routes,
         paths,
         profile,
         authorize,
@@ -1306,7 +1443,10 @@ def correlation_feasible: Fn(PreparedPayload, String, String) -> Bool = fn(paylo
             } else {
                 match find_route(payload, base.index, t.index) {
                     'Some(_) => 'True,
-                    'None => lookup_existence_relation_opt(payload, base.index, t.index) != 'None,
+                    'None => match find_hub_route(payload, base.index, t.index) {
+                        'Some(_) => 'True,
+                        'None => lookup_existence_relation_opt(payload, base.index, t.index) != 'None,
+                    },
                 }
             },
         },
@@ -2161,6 +2301,13 @@ def find_route: Fn(PreparedPayload, Int, Int) -> Option(RouteEntry) = fn(payload
     array.find(payload.routes, fn(r) { r.base == base && r.target == target })
 };
 
+# Pure declared dual-hub lookup for a (hub base entity, participant target)
+# pair. Prepare-time validation guarantees at most one route per pair, so the
+# lookup is unambiguous.
+def find_hub_route: Fn(PreparedPayload, Int, Int) -> Option(HubRouteEntry) = fn(payload, hub_base, participant) {
+    array.find(payload.hub_routes, fn(r) { r.hub == hub_base && r.participant == participant })
+};
+
 # Correlation equality for an existence relation key pair. For a forward edge
 # `pair.from`/`pair.to` are on the outer/target entities; for a reverse edge the
 # roles swap, keeping the outer (correlated main) column on the left.
@@ -2238,11 +2385,45 @@ type ExistsResolution = struct {
     via: Option(Int),
 };
 
+# Inner body of a dual-hub union existence (hub base grain).  The hub's two role
+# columns (`route.left`/`route.right`) reference the participant entity's stable
+# key; the correlated union EXISTS keeps the hub base grain and each hub base
+# row is naturally counted at most once (no fan-out join, no unused dedup key).
+# Dynamic filters stay bound and must reference the participant entity (the
+# filter target).
+def build_hub_union_exists: Fn(PreparedPayload, HubRouteEntry, ExistsRequest) -> qb.Exists = fn(payload, route, spec) {
+    let hub_entry = get_index(payload.entities, route.hub);
+    let participant_entry = get_index(payload.entities, route.participant);
+    let left_field = get_index(hub_entry.fields, route.left);
+    let right_field = get_index(hub_entry.fields, route.right);
+    let key_field = get_index(participant_entry.fields, route.participant_key);
+    let left_hub_ref = qb.column_ref(hub_entry.alias, left_field.column);
+    let right_hub_ref = qb.column_ref(hub_entry.alias, right_field.column);
+    let participant_key_ref = qb.column_ref(participant_entry.alias, key_field.column);
+    let alt_left: Array(qb.ColumnEq) = [qb.column_eq(left_hub_ref, participant_key_ref)];
+    let alt_right: Array(qb.ColumnEq) = [qb.column_eq(right_hub_ref, participant_key_ref)];
+    let alternatives: Array(Array(qb.ColumnEq)) = [alt_left, alt_right];
+    let inner_filters = resolve_filters(payload, spec.filters);
+    let target_ok = array.all(inner_filters, fn(f) { f.entity == route.participant });
+    if !target_ok {
+        fail!("dual hub inner filter must reference the participant entity", spec.target)
+    } else if spec.min_matches != 'None {
+        fail!("dual hub union existence does not support minimum-match grouping in this slice", spec.target)
+    } else {
+        let inner_any = array.map(spec.any_of, fn(a) { any_of_on_target(payload, route.participant, a) });
+        let inner = append_filter_terms(combine_filters(array.map(inner_filters, fn(f) { f.expr })), inner_any);
+        let source = qb.source(participant_entry.alias, participant_entry.table);
+        qb.exists_union(source, alternatives, inner)
+    }
+};
+
 # Lower one correlated existence request. Rows of the base entity that have at
 # least one (or, with `min_matches`, at least N) related row in the target
-# entity are kept. The request is resolved either through an explicitly declared
-# bounded route (base -> via -> target) or through a declared one-hop relation
-# in either direction. Existence never amplifies the subject grain.
+# entity are kept. The request is resolved through an explicitly declared
+# bounded two-hop route (base -> via -> target), a declared dual-endpoint hub
+# union (the hub is the base grain and reaches the participant target through
+# either of its two role endpoints), or a declared one-hop relation in either
+# direction. Existence never amplifies the subject grain.
 def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> ExistsResolution = fn(payload, base_entity, spec) {
     let target = entity_by_id(payload, spec.target);
     if target == base_entity {
@@ -2262,18 +2443,25 @@ def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> ExistsResolution 
                 let result: ExistsResolution = { exists, via: 'Some(route.via) };
                 result
             },
-            'None => match lookup_existence_relation_opt(payload, base_entity, target) {
-                'Some(lookup) => do {
-                    let rel = get_index(payload.relations, lookup.index);
-                    let pairs = exists_pairs(rel.key);
-                    let base_entry = get_index(payload.entities, base_entity);
-                    let target_entry = get_index(payload.entities, target);
-                    let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
-                    let exists = build_correlated_exists(payload, target_entry, col_eqs, spec, target);
+            'None => match find_hub_route(payload, base_entity, target) {
+                'Some(hub_route) => do {
+                    let exists = build_hub_union_exists(payload, hub_route, spec);
                     let result: ExistsResolution = { exists, via: 'None };
                     result
                 },
-                'None => fail!("exists target has no declared relation or route from the base entity", spec.target),
+                'None => match lookup_existence_relation_opt(payload, base_entity, target) {
+                    'Some(lookup) => do {
+                        let rel = get_index(payload.relations, lookup.index);
+                        let pairs = exists_pairs(rel.key);
+                        let base_entry = get_index(payload.entities, base_entity);
+                        let target_entry = get_index(payload.entities, target);
+                        let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
+                        let exists = build_correlated_exists(payload, target_entry, col_eqs, spec, target);
+                        let result: ExistsResolution = { exists, via: 'None };
+                        result
+                    },
+                    'None => fail!("exists target has no declared relation, hub route or two-hop route from the base entity", spec.target),
+                },
             },
         }
     }
@@ -2541,6 +2729,10 @@ export {
     RouteEntry,
     RouteResult,
     RouteBuild,
+    DualHubDef,
+    DualHubDecl,
+    HubRouteEntry,
+    HubBuild,
     RelationKind,
     FilterOp,
     FilterInputKind,
@@ -2587,6 +2779,9 @@ export {
     exists_route,
     route_build,
     resolve_route,
+    dual_hub,
+    hub_build,
+    resolve_hub_decl,
     knowledge_graph,
     correlation_feasible,
     filters_on_entity,

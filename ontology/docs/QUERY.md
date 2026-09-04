@@ -924,6 +924,12 @@ EXISTS (SELECT 1 FROM <table> AS <alias>
 
 - `pairs` 非空，且每条 `ColumnEq` 的 `left` 是外层主 alias 的列，`right` 是
   `source.alias` 的列；`source.alias` 不得与外层主 alias 重名；
+- 当相关性不是单一等值合取时使用 **union 模式**：`exists_union(source,
+  alternatives, filter)` 使 `pairs` 为空，`alternatives` 是有序的封闭析取结构
+  （每个 alternative 是一个非空 `ColumnEq` 合取，alternative 之间为 OR），例如双端
+  hub 的 `outer.left = alias.key OR outer.right = alias.key`。每个等式严格连接一个
+  外层主 alias 列与内层 `source.alias` 列，不接受任意布尔 Expr 或 raw SQL。渲染为
+  `EXISTS (SELECT 1 FROM t AS a WHERE (alt1 AND ...) OR (...) [AND filter...])`；
 - `filter` 可选，是内层附加行谓词，其列只能引用外层主 alias 与 `source.alias`；
 - `grouping`/`having` 非空时是相关聚合 EXISTS（见“嵌套聚合”形状 2）；
 - 渲染为纯谓词，不产生 JOIN，因此外层 COUNT/SUM 不会被相关行的 fan-out 放大——

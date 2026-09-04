@@ -139,6 +139,7 @@ bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允�
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
 | `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`'Eq(RelationPair)`/`'And`/`'Or` 列等值组合 |
 | `exists_route(via, target)` | 类型 | 显式声明有界两跳相关存在路径：base → `via`（唯一、grain-safe owner）→ `target`（可组合 fold） |
+| `dual_hub(participant, key_field, left_field, right_field)` | 类型（hub 上） | 声明 hub 的两个角色化端点字段均引用 `participant` 的 `key_field`；base 命中任一角色即关联该 hub（可组合 fold） |
 | `enum_value(value, label)` | enum variant | 封闭值域的稳定值和展示标签 |
 
 同一字段的同型 property 按 `Option(previous)` 顺序 fold：字段 property 取最后一项，
@@ -561,6 +562,58 @@ WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id [AND al.level =
   绑定顺序与重复 lowering 逐字节确定。
 - 一跳直接/反向直接行为完全保留：未声明路线时按原有一跳逻辑解析。
 
+### 双端 hub（dual-end hub union slice）
+
+一个关系对象（hub）具有两个角色化端点：例如 `Pair` 行的 `left_member_id` 与
+`right_member_id` 都引用 `Member` 的 key。**hub 是 base grain**，participant
+（Member）是筛选 target：查询统计/列出按任一端 participant 筛选后的 hub，每个 hub
+base 行天然只计一次（一行一 hub，不依赖未使用的去重键）。对端（peer）路线属于后续
+轮次，本轮不实现，也不用普通 Join 假装支持 peer 路线。
+
+```telora
+@edsl.entity_id("pairs")
+@edsl.entity_source("pairs", "pr")
+@edsl.dual_hub(Member, 0, 2, 3)   # Pair.left_member_id = Member.id 或 Pair.right_member_id = Member.id
+type Pair = struct {
+    @edsl.column("id")            # 0: hub base grain key
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("kind")          # 1: hub 属性
+    kind: String,
+    @edsl.column("left_member_id")   # 2: 左端角色
+    left_member_id: Int,
+    @edsl.column("right_member_id")  # 3: 右端角色
+    right_member_id: Int,
+};
+```
+
+prepare 校验（`build_root` 对首个问题确定性失败，无部分 payload）：
+
+- 两个端点字段都必须在 hub 上、互不相同、在字段范围内（缺端/同端/越界拒绝）；
+- participant 必须已登记、与 hub 不同，且被引用字段必须是 participant **声明的
+  key**（非 key 字段或 participant 无 key 拒绝）；
+- 同一 hub 对同一 participant 的重复声明（歧义）拒绝。
+- 不要求、也不依据 hub 自身的稳定键作去重声明：hub base 行的一行一 hub 来自 base
+  grain 的行契约；任何“稳定键去重”都只在使用它的 lowering 中发生。
+
+lowering（`ExistsRequest` base = hub、target = participant）：hub 行只要任一角色命中
+participant key 就保留，用**相关 union EXISTS**（Query 基础层的 `exists_union` 封闭
+等值析取）生成：
+
+```text
+SELECT count(pr.id) AS PairCount
+FROM pairs AS pr
+WHERE EXISTS (SELECT 1 FROM members AS mb
+              WHERE (pr.left_member_id = mb.id OR pr.right_member_id = mb.id)
+                    [AND mb.kind = ?])
+```
+
+- 这是纯谓词：不产生 JOIN，hub base 行不被 fan-out 放大，每个 hub 行一次。
+- 内层筛选引用 participant（筛选 target）维度，动态值继续参数化；绑定顺序与重复
+  lowering 逐字节确定。
+- “经同一 hub 到 peer、peer 属性筛选、同端配对/base 自配”等对端路线属于后续轮次；
+  在提供可证明互斥配对与去重的原语前，不得用普通 Join 伪装已支持。
+
 ### 分组计数（count of groups）
 
 `lower_group_count(payload, request, having)` 对聚合/分组请求的“满足 HAVING 的组数”
@@ -648,6 +701,7 @@ type PreparedPayload = struct {
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
     routes: Array(RouteEntry),
+    hub_routes: Array(HubRouteEntry),
     paths: Array(Array(PathResult)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
@@ -739,4 +793,8 @@ EXISTS（SQL 形状、外层 grain 不被 Site→Alarm fan-out 放大、`min_mat
 内层筛选绑定顺序与重复 lowering 逐字节一致）；纯可行性/内层筛选探针对未知/自指/无关
 target 返回拒绝；路线 prepare 探针验证合法路线解析一次，并拒绝非唯一 owner、方向不匹配、
 同 base 同 target 多路线歧义与 `via`→target 关系歧义；较密的 hub/leaf 关系图在
-prepare 时保持有界不耗尽求值燃料。
+prepare 时保持有界不耗尽求值燃料。双端 hub 切片也纳入覆盖：payload 保存 Pair(hub base)→Member 双端路线；union EXISTS
+lowering 方向为 `FROM hub WHERE EXISTS(participant ...)`（左右角色两条 alternative、
+无 fan-out join、绑定顺序与逐字节确定性）、participant 属性内层筛选参数化、可行性
+探针，以及 prepare 对同端、非 key participant、participant 缺 key、端点越界与重复
+声明的确定性拒绝。

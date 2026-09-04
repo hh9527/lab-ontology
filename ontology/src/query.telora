@@ -202,8 +202,13 @@ type Join = struct {
 #           WHERE <left.col = alias.col> [AND ...] [AND <filter>]
 #           [GROUP BY <grouping>] [HAVING <having>])
 # `pairs` entries are ANDed equalities whose `left` is an outer main column and
-# whose `right` is a column of `source.alias`.  `filter` is an optional extra
-# predicate over the inner source (and, when desired, outer main columns).
+# whose `right` is a column of `source.alias`.  When the inner correlation is a
+# closed disjunction of ANDed equalities (e.g. a dual-endpoint hub union
+# `outer.l = alias.key OR outer.r = alias.key`), `alternatives` carries that
+# ordered list: each alternative is a non-empty conjunction of ColumnEq and each
+# equality strictly connects an outer main column (`left`) to an inner source
+# column (`right`).  `pairs` is empty in that mode.  `filter` is an optional
+# extra predicate over the inner source (and, when desired, outer main columns).
 # `grouping`/`having` make this a *correlated aggregate* EXISTS: rows of the
 # inner source that match the correlation are grouped and only groups whose
 # aggregate-result predicate holds make the EXISTS true (e.g. "subjects with at
@@ -212,6 +217,7 @@ type Join = struct {
 type Exists = struct {
     source: Source,
     pairs: Array(ColumnEq),
+    alternatives: Option(Array(Array(ColumnEq))),
     filter: Option(Expr),
     grouping: Array(Expr),
     having: Array(Having),
@@ -826,25 +832,37 @@ def partition_structure_ok: Fn(Plan, PartitionedTopN) -> Bool = fn(plan, pt) {
 };
 
 # A correlated EXISTS is well-formed when its inner source has a distinct
-# alias, at least one correlation pair exists, each pair correlates one outer
-# main alias column to one inner alias column, and the optional inner filter,
-# grouping expressions and (aggregate-call) HAVING measures are valid Exprs
-# over the outer aliases plus the inner alias.  Inside a correlated EXISTS the
-# HAVING measure must be a direct `'Call` aggregate expression: the inner
-# SELECT list is `1`, so there is no projected measure alias to reference.
+# alias and exactly one correlation mode holds: either at least one ANDed
+# equality pair (each correlating one outer main alias column to one inner
+# alias column), or (union mode) a closed `alternatives` list where each
+# alternative is a non-empty ANDed equality conjunction and every equality
+# strictly connects an outer main alias column to an inner alias column.  The
+# optional inner filter, grouping expressions and (aggregate-call) HAVING
+# measures are valid Exprs over the outer aliases plus the inner alias.  Inside
+# a correlated EXISTS the HAVING measure must be a direct `'Call` aggregate
+# expression: the inner SELECT list is `1`, so there is no projected measure
+# alias to reference.
+def alt_ok: Fn(Array(ColumnEq), String, Array(String)) -> Bool = fn(alt, inner, main_aliases) {
+    array.length(alt) > 0
+        && array.all(alt, fn(p) {
+            column_ref_id_ok(p.left)
+            && is_sql_identifier(p.right.source)
+            && is_sql_identifier(p.right.column)
+            && p.right.source == inner
+            && known_alias(main_aliases, p.left.source)
+        })
+};
+
+def alternatives_ok: Fn(Array(Array(ColumnEq)), String, Array(String)) -> Bool = fn(alternatives, inner, main_aliases) {
+    array.length(alternatives) > 0
+        && array.all(alternatives, fn(alt) { alt_ok(alt, inner, main_aliases) })
+};
+
 def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases) {
     let inner = ex.source.alias;
-    let base_ok = is_sql_identifier(ex.source.alias)
+    let id_ok = is_sql_identifier(ex.source.alias)
         && is_sql_identifier(ex.source.table)
-        && array.length(ex.pairs) > 0
         && !known_alias(main_aliases, inner);
-    let pairs_ok = array.all(ex.pairs, fn(p) {
-        column_ref_id_ok(p.left)
-        && is_sql_identifier(p.right.source)
-        && is_sql_identifier(p.right.column)
-        && p.right.source == inner
-        && known_alias(main_aliases, p.left.source)
-    });
     let allowed = array.push(main_aliases, inner);
     let filter_ok = match ex.filter {
         'Some(expr) => expr_valid(expr, allowed),
@@ -861,7 +879,22 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
                 }),
         }
     });
-    base_ok && pairs_ok && filter_ok && group_ok && having_ok
+    match ex.alternatives {
+        'Some(alternatives) => {
+            let alt_ok_result = array.length(ex.pairs) == 0 && alternatives_ok(alternatives, inner, main_aliases);
+            id_ok && alt_ok_result && filter_ok && group_ok && having_ok
+        },
+        'None => {
+            let pairs_ok = array.all(ex.pairs, fn(p) {
+                column_ref_id_ok(p.left)
+                && is_sql_identifier(p.right.source)
+                && is_sql_identifier(p.right.column)
+                && p.right.source == inner
+                && known_alias(main_aliases, p.left.source)
+            });
+            id_ok && array.length(ex.pairs) > 0 && pairs_ok && filter_ok && group_ok && having_ok
+        },
+    }
 };
 
 def exists_list_ok: Fn(Array(Exists), Array(String)) -> Bool = fn(exists_list, aliases) {
@@ -1639,10 +1672,10 @@ def render_exists_having_clause: Fn(Array(Having)) -> Tuple([String, Array(Val)]
 #   EXISTS (SELECT 1 FROM <table> AS <alias>
 #           WHERE <correlations> [AND <filter>]
 #           [GROUP BY ...] [HAVING ...])
+# With `alternatives` set (dual-endpoint hub union mode) the WHERE body is a
+# closed OR of ANDed equalities `(a1 AND a2) OR (b1 ...)`; otherwise it is the
+# ANDed `pairs` equalities.
 def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
-    let pairs_sql = string.join(array.map(ex.pairs, fn(p) {
-        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
-    }), " AND ");
     let filter_part = match ex.filter {
         'Some(expr) => {
             let rendered = render_expr(expr);
@@ -1655,9 +1688,27 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
     };
     let group_part = render_group_part(ex.grouping);
     let having_part = render_exists_having_clause(ex.having);
-    let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE \{pairs_sql}\{filter_part.0}\{group_part.0}\{having_part.0})`;
-    let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
-    (sql, binds)
+    match ex.alternatives {
+        'Some(alternatives) => do {
+            let alternative_sqls = array.map(alternatives, fn(alt) {
+                string.join(array.map(alt, fn(p) {
+                    `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                }), " AND ")
+            });
+            let union_sql = string.join(alternative_sqls, " OR ");
+            let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE (\{union_sql})\{filter_part.0}\{group_part.0}\{having_part.0})`;
+            let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
+            (sql, binds)
+        },
+        'None => do {
+            let pairs_sql = string.join(array.map(ex.pairs, fn(p) {
+                `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+            }), " AND ");
+            let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE \{pairs_sql}\{filter_part.0}\{group_part.0}\{having_part.0})`;
+            let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
+            (sql, binds)
+        },
+    }
 };
 
 # Renders the whole ` WHERE ...` clause combining the row filter and every
@@ -2259,6 +2310,7 @@ def exists: Fn(Source, Array(ColumnEq), Option(Expr)) -> Exists = fn(ex_source, 
     let item: Exists = {
         source: ex_source,
         pairs: pairs,
+        alternatives: 'None,
         filter: inner_filter,
         grouping: empty_group,
         having: empty_having,
@@ -2273,9 +2325,31 @@ def exists_grouped: Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array
     let item: Exists = {
         source: ex_source,
         pairs: pairs,
+        alternatives: 'None,
         filter: inner_filter,
         grouping: grouping,
         having: having_list,
+    };
+    item
+};
+
+# Correlated-union EXISTS predicate for a closed disjunction of ANDed column
+# equalities.  Each alternative in `alternatives` is a non-empty conjunction of
+# ColumnEq; every equality strictly connects an outer main column (`left`) to an
+# inner `source.alias` column (`right`).  `pairs` is empty in this mode and no
+# arbitrary boolean expression or raw SQL is accepted.  `inner_filter`
+# optionally narrows the inner rows further.
+def exists_union: Fn(Source, Array(Array(ColumnEq)), Option(Expr)) -> Exists = fn(ex_source, alternatives, inner_filter) {
+    let empty_pairs: Array(ColumnEq) = [];
+    let empty_group: Array(Expr) = [];
+    let empty_having: Array(Having) = [];
+    let item: Exists = {
+        source: ex_source,
+        pairs: empty_pairs,
+        alternatives: 'Some(alternatives),
+        filter: inner_filter,
+        grouping: empty_group,
+        having: empty_having,
     };
     item
 };
@@ -2436,6 +2510,7 @@ export {
     join_on,
     exists,
     exists_grouped,
+    exists_union,
     having,
     having_call,
     union_column,

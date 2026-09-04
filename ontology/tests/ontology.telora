@@ -423,7 +423,7 @@ def check_cross_module_prepared: Bool = do {
         'Scalar(call) => call.function == 'Substr && array.length(call.args) == 3,
         _ => 'False,
     };
-    let entities_ok = array.length(p.entities) == 12;
+    let entities_ok = array.length(p.entities) == 14;
     check(auth_ok, "cross-module: published authorization closure works")
         && check(computed_ok, "cross-module: published computed-dimension closure works")
         && check(entities_ok, "cross-module: published entity index available")
@@ -1488,6 +1488,217 @@ def check_route_rejects_ambiguous_second_hop: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Dual-endpoint hub slice (hub is the base grain; participant is the filter
+# target).
+#
+# Pair is the dual-endpoint hub whose two role columns reference Member's key.
+# Each hub base row is naturally counted once; the correlated union EXISTS
+# filters hubs whose left or right endpoint matches a participant.  This is a
+# participant attribute filter over the participant (inner) side.
+# ---------------------------------------------------------------------------
+
+def hub_base_request: edsl.QueryRequest = {
+    measures: [{ id: "PairCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def member_target_exists_spec: edsl.ExistsRequest = {
+    target: "members",
+    subject: "analyst",
+    filters: [],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def member_filtered_exists_spec: edsl.ExistsRequest = {
+    target: "members",
+    subject: "analyst",
+    filters: [{ id: "MemberKind", subject: "analyst", op: 'Eq, input: 'Text("vip") }],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def check_hub_route_prepared: Bool = do {
+    let p = knowledge.payload;
+    let members = entity_id_index(p.entities, "members");
+    let pairs = entity_id_index(p.entities, "pairs");
+    let route_ok = array.any(p.hub_routes, fn(r) { r.hub == pairs && r.participant == members });
+    check(route_ok, "hub: prepared payload stores the Pair(hub base) -> Member route")
+        && check(array.length(p.hub_routes) == 1, "hub: exactly one dual-hub route is declared")
+};
+
+def check_hub_union_exists_lowering: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, hub_base_request, [member_target_exists_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(pr.id) AS PairCount FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mb WHERE (pr.left_member_id = mb.id OR pr.right_member_id = mb.id))";
+    check(array.length(plan.exists) == 1 && array.length(plan.joins) == 0,
+        "hub: hub base grain uses one correlated EXISTS, no fan-out join")
+        && check(query.sql == expected_sql, "hub: SQL direction is FROM hub WHERE EXISTS(participant ...)")
+        && check(array.length(query.bindings) == 0, "hub: no bindings without dynamic values")
+};
+
+def check_hub_union_inner_filter: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, hub_base_request, [member_filtered_exists_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("vip")];
+    check(string.contains(query.sql, "AND mb.kind = ?"),
+        "hub: participant-attribute inner filters stay parameterized on the filter target")
+        && check(query.bindings == expected, "hub: inner filter binding order is deterministic")
+};
+
+def check_hub_union_deterministic: Bool = do {
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_full(knowledge.payload, hub_base_request, [member_target_exists_spec], []));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_full(knowledge.payload, hub_base_request, [member_target_exists_spec], []));
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings,
+        "hub: repeated lowering of the hub-base dual-end union is byte-identical")
+};
+
+def check_hub_union_feasible: Bool = do {
+    let p = knowledge.payload;
+    check(edsl.correlation_feasible(p, "pairs", "members"), "hub: hub base to participant target is feasible")
+        && check(!edsl.correlation_feasible(p, "pairs", "orders"), "hub: unrelated participant target is infeasible")
+        && check(!edsl.correlation_feasible(p, "pairs", "pairs"), "hub: self target is infeasible")
+};
+
+# ---------------------------------------------------------------------------
+# Dual-hub declaration fixtures (valid and invalid).
+# ---------------------------------------------------------------------------
+
+@edsl.entity_source("hp_t", "hp")
+type HubParticipant = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("tag")
+    tag: Int,
+};
+
+@edsl.entity_source("hpk_t", "hpk")
+type HubParticipantNoKey = struct {
+    @edsl.column("id")
+    id: Int,
+    @edsl.column("tag")
+    tag: Int,
+};
+
+@edsl.entity_source("h1_t", "h1")
+@edsl.dual_hub(HubParticipant, 0, 1, 2)
+type HubOne = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("hs_t", "hs")
+@edsl.dual_hub(HubParticipant, 0, 1, 1)
+type HubSame = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("hbk_t", "hbk")
+@edsl.dual_hub(HubParticipant, 1, 1, 2)
+type HubBadKey = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("hnk_t", "hnk")
+@edsl.dual_hub(HubParticipantNoKey, 0, 1, 2)
+type HubNoKey = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("hr_t", "hr")
+@edsl.dual_hub(HubParticipant, 0, 5, 2)
+type HubRange = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("hd_t", "hd")
+@edsl.dual_hub(HubParticipant, 0, 1, 2)
+@edsl.dual_hub(HubParticipant, 0, 1, 2)
+type HubDup = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+def hub_problem_count: Fn(Array(Type)) -> Int = fn(types) {
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.hub_build(graph.0);
+    array.length(build.problems)
+};
+
+def check_hub_route_valid: Bool = do {
+    let types: Array(Type) = [HubParticipant, HubOne];
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.hub_build(graph.0);
+    check(array.length(build.problems) == 0 && array.length(build.routes) == 1,
+        "hub prepare: valid dual-hub declaration resolves exactly one route")
+};
+
+def check_hub_route_rejects_same_endpoint: Bool = do {
+    let types: Array(Type) = [HubParticipant, HubSame];
+    check(hub_problem_count(types) > 0, "hub prepare: identical left/right endpoints are rejected")
+};
+
+def check_hub_route_rejects_non_key_participant: Bool = do {
+    let types: Array(Type) = [HubParticipant, HubBadKey];
+    check(hub_problem_count(types) > 0, "hub prepare: non-key participant reference is rejected")
+};
+
+def check_hub_route_rejects_missing_participant_key: Bool = do {
+    let types: Array(Type) = [HubParticipantNoKey, HubNoKey];
+    check(hub_problem_count(types) > 0, "hub prepare: participant without a declared key is rejected")
+};
+
+def check_hub_route_rejects_endpoint_range: Bool = do {
+    let types: Array(Type) = [HubParticipant, HubRange];
+    check(hub_problem_count(types) > 0, "hub prepare: out-of-range endpoint field is rejected")
+};
+
+def check_hub_route_rejects_duplicate: Bool = do {
+    let types: Array(Type) = [HubParticipant, HubDup];
+    check(hub_problem_count(types) > 0, "hub prepare: duplicate declarations to the same participant are rejected")
+};
+
+# ---------------------------------------------------------------------------
 # Denser-relation-graph fuel regression (hub + leaf fan-out/ring edges).
 # ---------------------------------------------------------------------------
 
@@ -1623,5 +1834,16 @@ export def test_ontology: Value = do {
     let c47 = check_route_rejects_ambiguous_target;
     let c48 = check_route_rejects_ambiguous_second_hop;
     let c49 = check_dense_relation_prepare_bounded;
+    let c50 = check_hub_route_prepared;
+    let c51 = check_hub_union_exists_lowering;
+    let c52 = check_hub_union_inner_filter;
+    let c53 = check_hub_union_deterministic;
+    let c54 = check_hub_union_feasible;
+    let c55 = check_hub_route_valid;
+    let c56 = check_hub_route_rejects_same_endpoint;
+    let c57 = check_hub_route_rejects_non_key_participant;
+    let c58 = check_hub_route_rejects_missing_participant_key;
+    let c59 = check_hub_route_rejects_endpoint_range;
+    let c60 = check_hub_route_rejects_duplicate;
     'String("ontology tests ok")
 };
