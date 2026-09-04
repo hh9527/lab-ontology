@@ -6,4 +6,4 @@
 不能表达时要求确定诊断，不接受绕过 eDSL 的 SQL 字符串。
 
 将结论写入 `icm-model/my-feedbacks/ontology.md`，只提出通用 Query/Ontology 基础层改进，
-并把领域词汇映射、具体能力取舍留给后续 `icm-model.icm-modeler`。
+并把领域词汇映射、具体能力取舍留给后续 `icm-model.icm-modeler-next`。
