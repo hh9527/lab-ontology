@@ -3522,3 +3522,115 @@ export def two_hop_exists_rejects_unknown_outer_alias = do {
     assert_ok(!qb.structure_ok(plan),
         "two-hop: an EXISTS outer column must resolve to a visible main alias")
 };
+
+# ---------------------------------------------------------------------------
+# Correlated-union EXISTS (closed alternatives): `exists_union` keeps a base row
+# when the inner source matches any alternative; each alternative is a non-empty
+# conjunction of ColumnEq and every equality connects an outer main column to an
+# inner source column.  The inner (target) table appears only inside the
+# subquery, never in the outer FROM/JOIN list.
+# ---------------------------------------------------------------------------
+
+def union_exists_plan: Fn() -> qb.Plan = fn() {
+    let plan: qb.Plan = {
+        revision: "test-union-exists",
+        sources: [qb.source("h", "hub")],
+        projection: [qb.aggregate('Count, qb.column("h", "id"), 'False, "hub_count")],
+        filter: 'None,
+        joins: [],
+        exists: [qb.exists_union(
+            qb.source("p", "part"),
+            [
+                [qb.column_eq(qb.column_ref("h", "left_id"), qb.column_ref("p", "id"))],
+                [qb.column_eq(qb.column_ref("h", "right_id"), qb.column_ref("p", "id"))],
+            ],
+            'Some(qb.scalar('Eq, [qb.column("p", "kind"), qb.bind_string("vip")])),
+        )],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def expected_union_exists_sql = "SELECT count(h.id) AS hub_count FROM hub AS h WHERE EXISTS (SELECT 1 FROM part AS p WHERE (h.left_id = p.id OR h.right_id = p.id) AND p.kind = ?)";
+
+def union_exists_probe_plan: Fn(qb.Exists) -> qb.Plan = fn(ex) {
+    let plan: qb.Plan = {
+        revision: "test-union-exists-probe",
+        sources: [qb.source("h", "hub")],
+        projection: [qb.aggregate('Count, qb.column("h", "id"), 'False, "hub_count")],
+        filter: 'None,
+        joins: [],
+        exists: [ex],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+export def union_exists_structure_accepts_alternatives = do {
+    let plan = union_exists_plan();
+    assert_ok(qb.structure_ok(plan) && array.length(plan.exists) == 1,
+        "union exists: closed equality alternatives are structurally valid")
+};
+
+export def union_exists_lowers_without_fanout_join = do {
+    let q = qb.transform_sqlite(union_exists_plan());
+    let expected: Array(qb.Val) = ['String("vip")];
+    assert_ok(q.sql == expected_union_exists_sql,
+        "union exists: lowers to a correlated EXISTS over the alternatives")
+        && assert_ok(q.bindings == expected, "union exists: participant filter binds in order")
+        && assert_ok(!string.contains(q.sql, "JOIN part"), "union exists: the inner source is never outer-joined")
+};
+
+export def union_exists_deterministic = do {
+    let q1 = qb.transform_sqlite(union_exists_plan());
+    let q2 = qb.transform_sqlite(union_exists_plan());
+    assert_ok(q1.sql == q2.sql && q1.bindings == q2.bindings,
+        "union exists: repeated lowering is byte-identical")
+};
+
+export def union_exists_profile_accepts = do {
+    assert_ok(qb.profile_accepts(union_exists_plan(), full_profile()),
+        "union exists: Exists plan is accepted by the full profile")
+};
+
+export def union_exists_rejects_empty_alternatives = do {
+    let empty_union: Array(Array(qb.ColumnEq)) = [];
+    let ex = qb.exists_union(qb.source("p", "part"), empty_union, 'None);
+    assert_ok(!qb.structure_ok(union_exists_probe_plan(ex)),
+        "union exists: an empty alternatives list is rejected")
+};
+
+export def union_exists_rejects_empty_alternative = do {
+    let empty_alt: Array(Array(qb.ColumnEq)) = [[]];
+    let ex = qb.exists_union(qb.source("p", "part"), empty_alt, 'None);
+    assert_ok(!qb.structure_ok(union_exists_probe_plan(ex)),
+        "union exists: an empty conjunction alternative is rejected")
+};
+
+export def union_exists_rejects_unknown_outer_alias = do {
+    let bad: Array(Array(qb.ColumnEq)) = [[qb.column_eq(qb.column_ref("ghost", "id"), qb.column_ref("p", "id"))]];
+    let ex = qb.exists_union(qb.source("p", "part"), bad, 'None);
+    assert_ok(!qb.structure_ok(union_exists_probe_plan(ex)),
+        "union exists: every equality outer column must be a visible main alias")
+};
+
+export def union_exists_rejects_inner_mismatch = do {
+    # A union equality whose right column is not on the inner source alias must
+    # be rejected: the equality must strictly connect outer and inner.
+    let bad: Array(Array(qb.ColumnEq)) = [[qb.column_eq(qb.column_ref("h", "id"), qb.column_ref("other", "id"))]];
+    let ex = qb.exists_union(qb.source("p", "part"), bad, 'None);
+    assert_ok(!qb.structure_ok(union_exists_probe_plan(ex)),
+        "union exists: every equality right column must belong to the inner source")
+};

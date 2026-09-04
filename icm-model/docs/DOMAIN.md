@@ -72,10 +72,12 @@
 - 开放文本维度（含子部件状态）的筛选值须等于库内存储文本；不存在编码转换。
 - 网络设备分类归一（`LSW`/`AC`/`WAC`/`AR`/`AP` → `ne.category.*`）与厂商拼写归一见
   §2；这些维度筛选时使用**归一后的稳定值**。
-- **物理链路/拓扑**：源材料确实包含物理链路实体与 A/Z 端设备/端口端点；但“任一端命中的
-  链路、同一链路去重、对端受控（另一端分类/两设备间链路）”需要基础层的互斥端点/对端
-  原语。在该原语可用前，模型不公开链路投影/计数/过滤能力，也不以不保粒度的普通 Join
-  或手工 SQL 模拟；相关请求确定性拒绝。接口口径沿用同样边界。
+- **物理链路/拓扑**：模型公开**链路对象**的稳定标识/名称/方向/类型与对象级计数/列表
+  （`LinkCount`、`LinkName`/`LinkDirection`/`LinkType`），筛选值参数化；方向稳定值
+  `"bidirectional"`（双向）/`"unidirectional"`（单向）。**设备相关链路（任一 A/Z 端命中、
+  同一链路去重）与对端受控（另一端分类/两设备间链路）尚未作为模型能力公开**：需要基础
+  层的双端 hub/互斥对端原语，相关请求确定性拒绝，不以不保粒度的普通 Join 或手工 SQL
+  模拟。接口口径沿用同样边界。
 
 ## 4. 业务关系与归属
 
@@ -156,6 +158,7 @@
 | `StorageDeviceCount` | 存储设备对象数 | 个 |
 | `TerminalDeviceCount` | 终端设备对象数 | 个 |
 | `CollabDeviceCount` | 协作设备对象数 | 个 |
+| `LinkCount` | 物理链路条数（对象级计数；设备相关/对端去重形态未公开） | 条 |
 | `AlarmCount` | 当前告警事件条数 | 条 |
 | `AlarmDeviceRefCount` | 告警关联的受影响设备/资源引用计数；`Distinct`=按资源标识去重后的跨域对象数（告警锚定的“有此类告警的设备/资源去重数量”），`All`=告警关联的引用行数。该口径与五域 `DeviceCount` 的对象域不同（含协作等告警资源），不可互换 | 个/行 |
 | `SiteCount` | 站点数 | 个 |
@@ -225,6 +228,7 @@ KPI 采样、治理视图或统一设备）。
 | 存储设备 | `StorageUsedCapacityRate`、`StorageTotalCapacity` | float |
 | 终端设备 | `TerminalDeviceId`、`TerminalName`、`TerminalClassification`、`TerminalIp`、`TerminalMac`、`TerminalModel`、`TerminalSn`、`TerminalAccessDeviceId`、`TerminalCommuState` | text |
 | 协作设备 | `CollabDeviceId`、`CollabName`、`CollabClassification`、`CollabIp`、`CollabCommuState` | text |
+| 物理链路 | `LinkName`、`LinkDirection`、`LinkType` | text |
 | KPI 采样 | `NetworkKpiTime`、`NetOnlineKpiTime`、`ApRadioKpiTime`、`ServerKpiTime`、`PonKpiTime`、`OnuKpiTime`、`PonPortKpiTime`、`StorageKpiTime` | time |
 | 存储子部件 | `StorageControllerName`、`StorageChassisName`、`StorageBackupPowerName`、`StorageBackupPowerStatus`、`StorageDiskType`、`StorageFanStatus`、`StoragePortType`、`StoragePsuStatus` | text |
 | 服务器子部件 | `ServerPsuName`、`ServerPsuStatus`、`ServerDiskType`、`ServerDiskStatus`、`ServerFanStatus`、`ServerNicMac`、`ServerPortType` | text |
