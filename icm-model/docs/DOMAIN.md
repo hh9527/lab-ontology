@@ -72,12 +72,17 @@
 - 开放文本维度（含子部件状态）的筛选值须等于库内存储文本；不存在编码转换。
 - 网络设备分类归一（`LSW`/`AC`/`WAC`/`AR`/`AP` → `ne.category.*`）与厂商拼写归一见
   §2；这些维度筛选时使用**归一后的稳定值**。
-- **物理链路/拓扑**：模型公开**链路对象**的稳定标识/名称/方向/类型与对象级计数/列表
-  （`LinkCount`、`LinkName`/`LinkDirection`/`LinkType`），筛选值参数化；方向稳定值
-  `"bidirectional"`（双向）/`"unidirectional"`（单向）。**设备相关链路（任一 A/Z 端命中、
-  同一链路去重）与对端受控（另一端分类/两设备间链路）尚未作为模型能力公开**：需要基础
-  层的双端 hub/互斥对端原语，相关请求确定性拒绝，不以不保粒度的普通 Join 或手工 SQL
-  模拟。接口口径沿用同样边界。
+- **物理链路/拓扑（A/Z 任一端切片）**：模型公开链路对象稳定标识/名称/方向/类型与
+  对象级计数/列表（`LinkCount`、`LinkName`/`LinkDirection`/`LinkType`），筛选值参数化；
+  方向稳定值 `"bidirectional"`（双向）/`"unidirectional"`（单向）。
+- **按任一端 participant 筛选/计数/列出链路（已支持，链路保持 base grain）**：网络设备、
+  PON 设备、服务器、存储设备与网络端口均声明为双端 participant（A/Z 设备键；
+  端口仅用 A/Z port DN）。链路 base + `exists(participant)` 编译为相关 union EXISTS
+  （`(A 键 = participant.key OR Z 键 = participant.key)`），不以 fan-out JOIN 复制链路行，
+  同一链路即使两端都命中也只计一次；participant 属性筛选值进入 bindings。
+- **不支持的形态（确定性拒绝）**：“两指定设备互为对端”与“peer 上的告警/属性”尚未公开，
+  需要基础层的互斥对端原语；相关请求确定性拒绝，不拼接 SQL 或用不保粒度的 Join。
+  终端/协作没有源声明链路关系，不开放为 participant。
 
 ## 4. 业务关系与归属
 
@@ -158,7 +163,7 @@
 | `StorageDeviceCount` | 存储设备对象数 | 个 |
 | `TerminalDeviceCount` | 终端设备对象数 | 个 |
 | `CollabDeviceCount` | 协作设备对象数 | 个 |
-| `LinkCount` | 物理链路条数（对象级计数；设备相关/对端去重形态未公开） | 条 |
+| `LinkCount` | 物理链路条数（链路为 base；可按任一端 participant 筛选/计数，同一链路只计一次；“两设备互为对端/peer 告警”未公开） | 条 |
 | `AlarmCount` | 当前告警事件条数 | 条 |
 | `AlarmDeviceRefCount` | 告警关联的受影响设备/资源引用计数；`Distinct`=按资源标识去重后的跨域对象数（告警锚定的“有此类告警的设备/资源去重数量”），`All`=告警关联的引用行数。该口径与五域 `DeviceCount` 的对象域不同（含协作等告警资源），不可互换 | 个/行 |
 | `SiteCount` | 站点数 | 个 |

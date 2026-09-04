@@ -181,6 +181,12 @@
   为 Join；`min_matches`、`filters`/`any_of`、绑定顺序规则与一跳一致。除模型已声明
   路线外，不存在任意图遍历或按字段名猜路径；路线缺失、方向不匹配、owner 非唯一、
   多候选路径或目标维度不属于路径终点时确定性失败且无部分输出。
+- **物理链路双端 participant（A/Z 任一端切片）**：链路为 base 时，`exists.target` 可为
+  网络/PON/服务器/存储设备或网络端口（`net_port`），经双端 hub（A/Z 设备键；端口仅用
+  A/Z port DN）编译为相关 union EXISTS `((A = participant.key) OR (Z = participant.key))`，
+  保持链路 base grain、不 fan-out、同一链路只计一次；participant 属性筛选进入 bindings。
+  “两指定设备互为对端”与“peer 上的告警/属性”仍确定性拒绝；终端/协作无源链路关系，
+  不作为 participant 开放（见 `DOMAIN.md` §4）。
 
 ### 4.6 HavingRequest（聚合结果谓词）与 group_count
 
