@@ -2707,6 +2707,348 @@ def check_measureless_existence_returns_subject_dims: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Closed field-to-field predicates (same-subject attribute comparison).
+# Domain-neutral synthetic fixture: two text attributes (color/shade), one int
+# attribute (score), one unauthorized attribute (secret) on the subject, and a
+# separate entity carrying a foreign text attribute.
+# ---------------------------------------------------------------------------
+
+def ff_eq_ops: Array(edsl.FilterOp) = ['Eq, 'Ne];
+def ff_text_kinds: Array(edsl.FilterInputKind) = ['Text];
+def ff_int_kinds: Array(edsl.FilterInputKind) = ['Int];
+def flag_false: Bool = 'False;
+
+@edsl.entity_id("ff_subjects")
+@edsl.entity_source("ff_subjects", "fs")
+type FfSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("color")
+    @edsl.dimension("FfColor", flag_true, flag_true, ff_eq_ops, ff_text_kinds)
+    color: String,
+    @edsl.column("shade")
+    @edsl.dimension("FfShade", flag_true, flag_true, ff_eq_ops, ff_text_kinds)
+    shade: String,
+    @edsl.column("score")
+    @edsl.dimension("FfScore", flag_true, flag_true, ff_eq_ops, ff_int_kinds)
+    score: Int,
+    @edsl.column("secret")
+    @edsl.dimension("FfSecret", flag_false, flag_false, ff_eq_ops, ff_text_kinds)
+    secret: String,
+};
+
+@edsl.entity_id("ff_others")
+@edsl.entity_source("ff_others", "fo")
+type FfOtherEntity = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("tag")
+    @edsl.dimension("FfTag", flag_true, flag_true, ff_eq_ops, ff_text_kinds)
+    tag: String,
+};
+
+def ff_entity_types: Array(Type) = [FfSubject, FfOtherEntity];
+
+def ff_authorize: Fn(String) -> Bool = fn(subject) { 'True };
+
+def ff_payload: edsl.PreparedPayload = do {
+    edsl.build_root("ff-v1", ff_entity_types, knowledge.profile, ff_authorize)
+};
+
+def ff_list_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "FfColor", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def ff_subject_index: Fn() -> Int = fn() {
+    match array.find(ff_payload.entities, fn(e) { e.id == "ff_subjects" }) {
+        'Some(e) => e.index,
+        'None => fail!("ff_subjects entity missing"),
+    }
+};
+
+def check_field_to_field_success: Bool = do {
+    let ff: edsl.FieldFilterRequest = {
+        subject: "analyst",
+        op: 'Eq,
+        left: "FfColor",
+        right: "FfShade",
+    };
+    let plan: qb.Plan = edsl.lower_field_filtered(ff_payload, ff_list_request, [ff]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(string.contains(query.sql, "WHERE fs.color = fs.shade"),
+        "field-to-field: comparing two subject attributes lowers to two column references")
+        && check(array.length(query.bindings) == 0, "field-to-field: no dynamic binding is produced")
+        && check(array.length(plan.projection) == 1, "field-to-field: hidden comparison never adds a projection column")
+};
+
+def check_field_to_field_combination_and_determinism: Bool = do {
+    let combined_request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "FfColor", subject: "analyst", input: 'None }],
+        filters: [{ id: "FfColor", subject: "analyst", op: 'Eq, input: 'Text("red") }],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let ff: edsl.FieldFilterRequest = {
+        subject: "analyst",
+        op: 'Ne,
+        left: "FfColor",
+        right: "FfShade",
+    };
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_field_filtered(ff_payload, combined_request, [ff]));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_field_filtered(ff_payload, combined_request, [ff]));
+    let expected: Array(qb.Val) = ['String("red")];
+    check(string.contains(q1.sql, "WHERE (fs.color = ? AND fs.color != fs.shade)"),
+        "field-to-field: combined with an ordinary scalar filter keeps deterministic predicate order")
+        && check(q1.bindings == expected, "field-to-field: scalar filter bindings are unchanged; no field-to-field bindings")
+        && check(q1.sql == q2.sql && q1.bindings == q2.bindings,
+            "field-to-field: repeated lowering is byte-identical")
+};
+
+def check_field_to_field_rejections: Bool = do {
+    let subject = ff_subject_index();
+    let unknown: edsl.FieldFilterRequest = { subject: "analyst", op: 'Eq, left: "FfColor", right: "NoSuchAttr" };
+    let unauthorized: edsl.FieldFilterRequest = { subject: "analyst", op: 'Eq, left: "FfColor", right: "FfSecret" };
+    let cross_entity: edsl.FieldFilterRequest = { subject: "analyst", op: 'Eq, left: "FfColor", right: "FfTag" };
+    let type_mismatch: edsl.FieldFilterRequest = { subject: "analyst", op: 'Eq, left: "FfColor", right: "FfScore" };
+    let illegal_op: edsl.FieldFilterRequest = { subject: "analyst", op: 'Contains, left: "FfColor", right: "FfShade" };
+    let ok: edsl.FieldFilterRequest = { subject: "analyst", op: 'Eq, left: "FfColor", right: "FfShade" };
+    check(!edsl.field_filter_ok(ff_payload, subject, unknown), "field-to-field: unknown attribute is rejected")
+        && check(!edsl.field_filter_ok(ff_payload, subject, unauthorized), "field-to-field: unauthorized attribute is rejected")
+        && check(!edsl.field_filter_ok(ff_payload, subject, cross_entity), "field-to-field: cross-entity attribute reference is rejected")
+        && check(!edsl.field_filter_ok(ff_payload, subject, type_mismatch), "field-to-field: type/domain mismatch is rejected")
+        && check(!edsl.field_filter_ok(ff_payload, subject, illegal_op), "field-to-field: text/illegal operator is rejected")
+        && check(edsl.field_filter_ok(ff_payload, subject, ok), "field-to-field: same-subject compatible Eq is feasible")
+};
+
+# ---------------------------------------------------------------------------
+# Related-aggregate references (hidden aggregate over a directly-related entity).
+# Synthetic domain-neutral fixture: subject -> event (one-to-many) with a count
+# measure on the event side; a reverse-declared pair; and an ambiguous pair.
+# ---------------------------------------------------------------------------
+
+@edsl.entity_id("rl_subjects")
+@edsl.entity_source("rl_subjects", "rs")
+@edsl.relation(RlEvent, fanout_kind, 0, 1)
+type RlSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RlRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+@edsl.entity_id("rl_events")
+@edsl.entity_source("rl_events", "re")
+type RlEvent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("RlEventCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("subject_id")
+    subject_id: Int,
+};
+
+# Reverse-declared relation: the child declares the safe link to the subject, so
+# subject grouping must join through the prepared reverse direction.
+@edsl.entity_id("rl_rev_subjects")
+@edsl.entity_source("rl_rev_subjects", "rv")
+type RlRevSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RlRevRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+@edsl.entity_id("rl_rev_events")
+@edsl.entity_source("rl_rev_events", "rt")
+@edsl.relation(RlRevSubject, safe_kind, 1, 0)
+type RlRevEvent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("RlRevEventCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("subject_id")
+    subject_id: Int,
+};
+
+# Ambiguous pair: two declared relations between the subject and the event
+# entity, so a related-aggregate reference cannot pick a unique path.
+@edsl.entity_source("rl_amb", "am")
+@edsl.relation(RlEvent, fanout_kind, 0, 1)
+@edsl.relation(RlEvent, fanout_kind, 0, 1)
+type RlAmbSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RlAmbRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+def rl_entity_types: Array(Type) = [RlSubject, RlEvent, RlRevSubject, RlRevEvent, RlAmbSubject];
+
+def rl_authorize: Fn(String) -> Bool = fn(subject) { subject == "analyst" };
+
+def rl_payload: edsl.PreparedPayload = do {
+    edsl.build_root("rl-v1", rl_entity_types, knowledge.profile, rl_authorize)
+};
+
+def rl_subject_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "RlRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Dimension("RlRegion"), direction: 'Asc }],
+    limit: 'Some(1),
+    offset: 'None,
+    partition: 'None,
+};
+
+def rl_subject_entity_index: Fn() -> Int = fn() {
+    match array.find(rl_payload.entities, fn(e) { e.id == "rl_subjects" }) {
+        'Some(e) => e.index,
+        'None => fail!("rl_subjects entity missing"),
+    }
+};
+
+def check_related_aggregate_ordering_top_n: Bool = do {
+    let internal: Array(edsl.InternalOrderRequest) = [
+        { measure: "RlEventCount", subject: "analyst", direction: 'Desc },
+    ];
+    let plan: qb.Plan = edsl.lower_internal_related(rl_payload, rl_subject_request, internal, []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(1)];
+    let expected_sql = "SELECT rs.region FROM rl_subjects AS rs INNER JOIN rl_events AS re ON rs.id = re.subject_id GROUP BY rs.region ORDER BY count(re.id) DESC, rs.region ASC LIMIT ?";
+    check(array.length(plan.projection) == 1 && array.length(plan.grouping) == 1,
+        "related aggregate: projection and grouping stay on the subject dimension")
+        && check(query.sql == expected_sql, "related aggregate: hidden related-count ordering with Top-N")
+        && check(query.bindings == expected, "related aggregate: hidden ordering adds no binding; Top-N limit binds once")
+};
+
+def check_related_aggregate_having: Bool = do {
+    let having_req: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "RlRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let having: Array(edsl.InternalHavingRequest) = [
+        { measure: "RlEventCount", subject: "analyst", op: 'Ge, threshold: 'Int(2) },
+    ];
+    let plan: qb.Plan = edsl.lower_internal_related(rl_payload, having_req, [], having);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(2)];
+    let expected_sql = "SELECT rs.region FROM rl_subjects AS rs INNER JOIN rl_events AS re ON rs.id = re.subject_id GROUP BY rs.region HAVING count(re.id) >= ?";
+    check(query.sql == expected_sql, "related aggregate: hidden related-count HAVING with a typed threshold")
+        && check(query.bindings == expected, "related aggregate: HAVING threshold is the single ordered binding")
+};
+
+def check_related_aggregate_reverse_relation: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "RlRevRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let internal: Array(edsl.InternalOrderRequest) = [
+        { measure: "RlRevEventCount", subject: "analyst", direction: 'Desc },
+    ];
+    let plan: qb.Plan = edsl.lower_internal_related(rl_payload, request, internal, []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT rv.region FROM rl_rev_subjects AS rv INNER JOIN rl_rev_events AS rt ON rv.id = rt.subject_id GROUP BY rv.region ORDER BY count(rt.id) DESC";
+    check(query.sql == expected_sql, "related aggregate: reverse-declared relation joins through the prepared direction")
+};
+
+def check_related_aggregate_deterministic_and_rejections: Bool = do {
+    let internal: Array(edsl.InternalOrderRequest) = [
+        { measure: "RlEventCount", subject: "analyst", direction: 'Desc },
+    ];
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_internal_related(rl_payload, rl_subject_request, internal, []));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_internal_related(rl_payload, rl_subject_request, internal, []));
+    let subject = rl_subject_entity_index();
+    let rev_subject = entity_id_index(rl_payload.entities, "rl_rev_subjects");
+    let amb_subject = entity_id_index(rl_payload.entities, "rl_amb");
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings, "related aggregate: repeated lowering is byte-identical")
+        && check(edsl.related_measure_ok(rl_payload, subject, "analyst", "RlEventCount"), "related aggregate probe: forward measure is feasible")
+        && check(edsl.related_measure_ok(rl_payload, rev_subject, "analyst", "RlRevEventCount"), "related aggregate probe: reverse-declared measure is feasible")
+        && check(!edsl.related_measure_ok(rl_payload, subject, "outsider", "RlEventCount"), "related aggregate probe: unauthorized subject role is rejected")
+        && check(!edsl.related_measure_ok(rl_payload, subject, "analyst", "MissingMeasure"), "related aggregate probe: unknown measure is rejected")
+        && check(!edsl.related_measure_ok(rl_payload, rev_subject, "analyst", "RlEventCount"), "related aggregate probe: no declared relation is rejected")
+        && check(!edsl.related_measure_ok(rl_payload, amb_subject, "analyst", "RlEventCount"), "related aggregate probe: ambiguous relation is rejected")
+};
+
+# ---------------------------------------------------------------------------
+# Explicit projection order (integrated feedback P1).
+#
+# Final column order is a result contract: the caller may interleave selected
+# measures and dimensions explicitly.  `lower_ordered` keeps the default
+# lowering otherwise; it only reorders the SELECT list and validates that every
+# requested measure/dimension appears exactly once (no omission/duplicate/hidden
+# reference).  Omitting the order preserves the default measure-then-dimension
+# behaviour.
+# ---------------------------------------------------------------------------
+
+def projection_labels: Fn(qb.Plan) -> Array(String) = fn(plan) {
+    array.map(plan.projection, fn(item) {
+        match item {
+            'Aggregate(agg) => agg.alias,
+            'Computed(c) => c.alias,
+            'Expr(expr) => match expr {
+                'Column(ref) => `col:\{ref.column}`,
+                _ => "expr",
+            },
+        }
+    })
+};
+
+def check_explicit_projection_order: Bool = do {
+    let order: Array(edsl.ProjectionToken) = [
+        'Dimension("OrderRegion"),
+        'Measure("OrderAmount"),
+        'Dimension("CustomerTier"),
+        'Measure("OrderCount"),
+        'Dimension("OrderWeek"),
+    ];
+    let plan: qb.Plan = edsl.lower_ordered(knowledge.payload, main_request, order);
+    let labels = projection_labels(plan);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(labels == ["col:region", "OrderAmount", "col:tier", "OrderCount", "expr"],
+        "explicit projection order: SELECT columns follow the interleaved caller order")
+        && check(array.length(plan.ordering) == 2 && plan.limit == 'Some(5),
+            "explicit projection order: filters/grouping/ordering/limit are unchanged")
+        && check(string.contains(query.sql, "o.region") && string.contains(query.sql, "c.tier"),
+            "explicit projection order: lowered SQL keeps deterministic SQL/bindings")
+};
+
+def check_default_projection_order_compat: Bool = do {
+    let default_plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    let ordered_default: qb.Plan = edsl.lower_ordered(knowledge.payload, main_request, []);
+    let labels_default = projection_labels(default_plan);
+    check(ordered_default == default_plan, "explicit projection order: empty order keeps the default plan")
+        && check(labels_default == ["OrderAmount", "OrderCount", "col:region", "expr", "col:tier"],
+            "explicit projection order: default order is measures then dimensions (compat)")
+};
+
+# ---------------------------------------------------------------------------
 # Entry.
 # ---------------------------------------------------------------------------
 
@@ -2805,5 +3147,14 @@ export def test_ontology: Value = do {
     let c92 = check_link_two_hop_lowering;
     let c93 = check_link_two_hop_returns_subject_dims_only;
     let c94 = check_link_two_hop_deterministic_and_absence;
+    let c95 = check_explicit_projection_order;
+    let c96 = check_default_projection_order_compat;
+    let c97 = check_field_to_field_success;
+    let c98 = check_field_to_field_combination_and_determinism;
+    let c99 = check_field_to_field_rejections;
+    let c100 = check_related_aggregate_ordering_top_n;
+    let c101 = check_related_aggregate_having;
+    let c102 = check_related_aggregate_reverse_relation;
+    let c103 = check_related_aggregate_deterministic_and_rejections;
     'String("ontology tests ok")
 };

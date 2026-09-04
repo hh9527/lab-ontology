@@ -884,8 +884,13 @@ Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimen
 distinct/absence 与行级排序的失败还包括：distinct 请求携带 measures、无维度、
 组合 Top Per Group、按未投影/未知/未授权维度排序；反存在用于 union 实体 base；
 行级排序目标是 measure 或未知/未授权维度；internal-top 请求携带 measures、无
-分组维度、内部 measure 为计算指标/跨 base 实体/未知/未授权，或维度 tie-breaker
-不是已选维度。paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
+分组维度、内部 measure 为计算指标/跨 base 实体（`lower_internal_top` 路径）/未知/
+未授权，或维度 tie-breaker
+不是已选维度。related aggregate（`lower_internal_related`）失败还包括：请求带
+measures、无分组维度、分组维度不在主体实体（grain 无法证明）、关联 measure 为
+computed/filtered、主体与关联实体之间无直接关系或关系歧义、filter 引用非主体属性、
+HAVING threshold 类型与聚合不兼容。field-to-field 谓词失败还包括：未知/未授权/非纯列属性、跨实体属性
+引用、两侧类型或 domain 不兼容、算子未被两侧支持或非比较算子。paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
 自配（同实体同 key 的 origin == peer）、未知 participant 实体、hub 没有覆盖该
 participant 对的 peer 路线、peer 路线端点同字段/越界/引用非 key 字段、同一 hub 上
 同一 participant 对的重复 peer 路线、union 实体 base 上的 peer 请求。把多个独立
@@ -925,9 +930,9 @@ SQL、确定性 bindings、可验证结构并明确拒绝边界。
    所属实体，其它实体的维度经安全路径 join 后投影；不引入虚构 COUNT，也不产生
    GROUP BY。fan-out 路径与任何会放大行的关系继续原子失败。
 6. **返回列顺序是结果契约**。`QueryRequest` 分别承载 measures 与 dimensions；
-   lowering 的 projection 顺序为：请求的 measures（按请求顺序，含其传递依赖），
-   随后是请求的 dimensions（按请求顺序）。跨类别不进行其它重排；调用方要控制类别
-   内顺序就按请求数组顺序书写。
+   默认 lowering 的 projection 顺序为：请求的 measures（按请求顺序，含其传递依赖），
+   随后是请求的 dimensions（按请求顺序）。需要跨类交错时调用方用
+   `lower_ordered(payload, request, order)` 显式声明（见下文“显式投影顺序”）。
 
 ### Spider round 3：内部排序聚合与关系存在
 
@@ -938,8 +943,9 @@ Top N，却不返回该聚合值（例如按每组记录数选出最大组，只
 的普通/条件 measure 与其方向；该 measure 只作为 ORDER BY 的内部聚合（lowering 经
 query 的 `OrderKey 'Aggregate` 表达），绝不出现在 projection。请求可携带筛选、
 维度排序 tie-breaker（必须是已选维度）与 `limit`；`qb.validate` 用 payload profile
-收窄内部聚合的 operator/aggregate/scalar。计算 measure、跨 base 实体的 measure、
-未知/未授权 measure 均原子拒绝。
+收窄内部聚合的 operator/aggregate/scalar。计算 measure、未知/未授权 measure 均
+原子拒绝；`lower_internal_top` 只接受 base 实体的 measure，跨 base 实体（关联实体）
+的隐藏聚合使用 `lower_internal_related`（见下文“跨关系隐藏聚合”）。
 
 **沿（已声明）关系的存在/筛选并只返回主体维度**。relation-existence 本身不需要
 link-count measure 来选择入口/路径：`lower_full(payload, request, exists, [])` 接受
@@ -949,6 +955,101 @@ link-count measure 来选择入口/路径：`lower_full(payload, request, exists
 主体维度，不新增 COUNT 或 GROUP BY。fan-out 首跳路线不再被拒绝：它走 link 形状，
 不会静默降级为外层 join；仍确定性拒绝非唯一/反向-only 首跳与 fan-out link 形状的
 `min_matches`。
+
+### 显式投影顺序（lower_ordered）
+
+最终列顺序是结果契约。`lower_ordered(payload, request, order)` 用 `ProjectionToken`
+（`'Measure(id)` / `'Dimension(id)`）显式声明所有已选择项的交错顺序：
+
+- 每个 token 必须恰好对应一个**已请求**的 measure 或 dimension；
+- 不允许遗漏、重复、引用隐藏计算或引用未选择项；
+- `order` 为空时完全保留默认行为（`lower` 的 measure-then-dimension 顺序，兼容既有
+  调用方）；
+- 显式顺序只改变 SELECT 列序：过滤、分组、排序、bindings 与 grain 不变；
+- 非法顺序产生稳定、可归因的 contract 诊断，不发布部分 Plan/Query；
+- 计算 measure 的传递依赖仍按默认位置投影（不被 token 引用，也不从 projection 移除）。
+
+### 跨关系隐藏聚合（related aggregate）
+
+外层主体可以沿**一条已 prepare、方向确定、授权且唯一**的直接关系，对关联实体计算
+聚合，并只把该聚合用于隐藏 ORDER BY/Top-N 或隐藏 HAVING，不加入最终投影。
+`lower_internal_related(payload, request, internal_orders, internal_having)`：
+
+```telora
+# internal_orders / internal_having 引用同一个封闭“关联聚合 measure”：
+# InternalOrderRequest {measure, subject, direction}
+# InternalHavingRequest {measure, subject, op, threshold}
+```
+
+语义与约束：
+
+- 请求只选主体维度（measures 为空），分组维度必须属于主体实体（否则无法证明主体
+  grain，原子失败）；关联侧多行只参与聚合、绝不放大最终主体结果；
+- 每个内部 measure 必须是已声明、已授权的**普通** measure（非 computed/filtered）；
+  若 measure 位于关联实体，则主体与关联实体之间必须**恰好一条**已声明直接关系
+  （正向或反向均可，lowering 依据 prepared 方向生成确定 INNER Join）；无关系/歧义
+  原子失败；
+- 关联侧沿用封闭 aggregate 枚举（Count/Sum/Avg/Min/Max）；`lowering` 只把聚合作为
+  `OrderKey 'Aggregate` / HAVING `'Call` 使用，不出现特例 SQL；
+- 隐藏 ORDER BY 支持升降序与 Top-N（`limit`）；隐藏 ORDER BY 本身不产生 binding；
+- 隐藏 HAVING 复用现有聚合比较算子与类型化 threshold；动态 threshold 进入 bindings
+  （`Count` 要求 `'Int`，其余聚合接受 `'Int`/`'Number`），类型不兼容原子失败；
+- projection 只含请求方选择的维度，聚合从不进入投影；显式 projection order 可与
+  `lower_ordered` 在已有 grouped listing 上配合使用；
+- 主体级普通 scalar filter/scope 先按既有确定顺序 lowering（要求引用主体实体属性，
+  保证 grain 可证明）；重复 lowering 的 SQL/bindings 完全一致；
+- 纯探针 `related_measure_ok(payload, subject_entity, role, measure_id)` 供测试断言
+  合法/未知 measure/越权/无关系/歧义而不触发失败；
+- `lower_internal_top` 仍是“关联 measure 位于主体自身”时的既有入口（隐藏
+  `OrderKey 'Aggregate`）；`lower_internal_related` 在其上扩展到直接关联实体。
+
+仍维持的边界（稳定、可归因的拒绝，而非静默近似）：任意深路径的关联聚合、关联侧
+computed/filtered measure、跨多跳 join 的聚合输入、HAVING threshold 类型不兼容等
+均不支持，不会通过加入投影聚合列、改用 EXISTS、结果后处理或近似另一关系来绕过。
+
+### 同主体 field-to-field 谓词（属性间比较）
+
+过滤既可以是“属性 vs 外部标量”，也可以是**同一 prepared 主体上的两个属性**之间的
+比较。公开契约如下：
+
+```telora
+type FieldFilterRequest = struct {
+    subject: String,   # 授权主体（role）
+    op: FilterOp,      # 封闭比较算子（至少 'Eq / 'Ne）
+    left: String,      # 主体实体上已声明、已授权、纯列属性的 id
+    right: String,     # 同一主体实体上的另一属性 id
+};
+```
+
+调用方式：
+
+```telora
+# 追加零个或多个 field-to-field 谓词；既有 lowering 全部保留
+let plan: qb.Plan = edsl.lower_field_filtered(payload, request, field_filters);
+
+# 纯可行性探针（不失败）：subject_entity 为 PreparedPayload 中的主体实体 index
+let feasible: Bool = edsl.field_filter_ok(payload, subject_entity, field_filter);
+```
+
+约束与验证：
+
+- **同主体**：`left` 与 `right` 必须属于同一 prepared 主体实体，且都是**已声明、已
+  授权、纯列承载**（非 computed/JSON）的属性（dimension id）；未知属性、越权属性、
+  computed/JSON 属性、其它实体属性（跨实体引用）一律稳定拒绝；
+- **算子**：只接受封闭比较算子（`'Eq`/`'Ne`/`'Gt`/`'Ge`/`'Lt`/`'Le`；最低 `'Eq`/
+  `'Ne`），且该算子必须同时被两侧属性声明支持；文本搜索算子（`'Contains` 等）拒绝；
+- **类型/domain 兼容**：封闭 enum 域要求两侧稳定值域相同；开放维度要求可比较标量类别
+  一致（text/int/number）；不兼容稳定拒绝；
+- **lowering**：只产生经验证的两个列引用比较（如 `a.x = a.y`），**不产生动态
+  binding**，也**不进入 projection**；
+- **profile 收窄**：谓词经知识 profile 校验。profile 只保留部分 scalar/算子能力时，
+  调用方只能引用该属性在 profile 下实际保留的算子能力；profile 不允许该比较 scalar 时
+  原子失败；
+- **组合顺序**：与普通标量过滤/scope 组合时，既有过滤先按既有确定顺序 lowering，
+  field-to-field 谓词按请求顺序作为尾部 AND 项追加；因为谓词不产生 binding，bindings
+  顺序不变；重复 lowering 得到完全一致的 SQL/bindings；
+- 实际 lowering 对非法形状原子失败、不发布部分 Plan/Query；纯探针 `field_filter_ok`
+  对成功/各类拒绝返回预期，供测试断言。
 
 ## 验证
 
@@ -1023,5 +1124,16 @@ spider round 4 测试另覆盖 fan-out 首跳的两跳 link 存在：`check_link
 correlated EXISTS 内 JOIN、无外层 fan-out join、目标过滤绑定）、
 `check_link_two_hop_returns_subject_dims_only`（measureless 只返回主体维度）与
 `check_link_two_hop_deterministic_and_absence`（重复 lowering 逐字节一致、NOT EXISTS
-反存在）。query 模块测试另覆盖 `qb.transform_sqlite_distinct`、`qb.exists_not`、
-`OrderKey 'Aggregate` 内部排序聚合与 `qb.exists_two_hop`（SQL/bindings/确定性）。
+反存在）。related aggregate 测试另覆盖 `check_related_aggregate_ordering_top_n`（隐藏
+关联计数排序 + Top-N）、`check_related_aggregate_having`（隐藏关联计数 HAVING + 阈值
+binding）、`check_related_aggregate_reverse_relation`（反向声明关系按 prepared 方向
+join）与 `check_related_aggregate_deterministic_and_rejections`（重复 lowering 一致；
+越权/未知 measure/无关系/歧义经 `related_measure_ok` 确定性拒绝）。显式投影顺序测试另覆盖 `check_explicit_projection_order`（跨 measure/dimension
+交错列序、只改 SELECT 列序）与 `check_default_projection_order_compat`（空 order 保留
+默认 measure-then-dimension 行为）。field-to-field 谓词测试另覆盖
+`check_field_to_field_success`（双列比较、无 binding、不加入投影）、
+`check_field_to_field_combination_and_determinism`（与普通标量过滤组合的谓词/bindings
+顺序与重复 lowering）与 `check_field_to_field_rejections`（未知/未授权/跨实体/类型不兼容/
+非法算子经纯探针确定性拒绝）。query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
+`qb.exists_not`、`OrderKey 'Aggregate` 内部排序聚合与 `qb.exists_two_hop`
+（SQL/bindings/确定性）。

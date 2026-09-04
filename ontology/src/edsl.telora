@@ -303,6 +303,18 @@ type FilterRequest = struct {
     input: FilterInput,
 };
 
+# A closed field-to-field predicate on ONE prepared subject: both `left` and
+# `right` name a declared, authorized, plain (column-backed) attribute
+# (dimension id) of the SAME subject entity; `op` is a closed comparison
+# operator (at least 'Eq / 'Ne).  Lowering produces a comparison of the two
+# validated column references only and never a dynamic binding.
+type FieldFilterRequest = struct {
+    subject: String,
+    op: FilterOp,
+    left: String,
+    right: String,
+};
+
 # A closed OR-group over a single dimension: a base row matches when its value
 # equals any of the listed values (lowered to the query `Or(Eq(...), ...)`).
 # Values keep request order and become parameterized bindings; there is no raw
@@ -327,6 +339,16 @@ type InternalOrderRequest = struct {
     measure: String,
     subject: String,
     direction: OrderDirection,
+};
+
+# One hidden HAVING predicate over an internal related aggregate (a declared
+# measure on the subject or on a directly-related entity).  The aggregate value
+# is used only by the HAVING comparison; it is never returned.
+type InternalHavingRequest = struct {
+    measure: String,
+    subject: String,
+    op: HavingOp,
+    threshold: FilterInput,
 };
 
 # Restricted Top Per Group request: partition the aggregated result by a set of
@@ -2082,6 +2104,200 @@ def append_filter_terms: Fn(Option(qb.Expr), Array(qb.Expr)) -> Option(qb.Expr) 
     })
 };
 
+# ---------------------------------------------------------------------------
+# Closed field-to-field predicates (same-subject attribute comparisons).
+# ---------------------------------------------------------------------------
+
+# Only the closed comparison operators are usable as field-to-field predicates;
+# text search operators always need an external value and are rejected here.
+def field_compare_op: Fn(FilterOp) -> Bool = fn(op) {
+    match op {
+        'Eq => 'True,
+        'Ne => 'True,
+        'Gt => 'True,
+        'Ge => 'True,
+        'Lt => 'True,
+        'Le => 'True,
+        'Contains => 'False,
+        'NotContains => 'False,
+        'StartsWith => 'False,
+        'EndsWith => 'False,
+    }
+};
+
+# Comparable category of a dimension: closed enums are "enum" (compared by the
+# stable value domain), open dimensions by their single comparable scalar kind.
+def comparable_kind: Fn(DimensionEntry) -> String = fn(entry) {
+    if array.length(entry.values) > 0 {
+        "enum"
+    } else if array.any(entry.input_kinds, fn(k) { k == 'Int }) {
+        "int"
+    } else if array.any(entry.input_kinds, fn(k) { k == 'Number }) {
+        "number"
+    } else if array.any(entry.input_kinds, fn(k) { k == 'Text }) {
+        "text"
+    } else {
+        "none"
+    }
+};
+
+# Type/domain compatibility: two closed enum domains are compatible only when
+# they publish the same stable value domain; open dimensions are compatible
+# only when they share the same comparable scalar kind.
+def field_domains_compatible: Fn(DimensionEntry, DimensionEntry) -> Bool = fn(left, right) {
+    if array.length(left.values) > 0 || array.length(right.values) > 0 {
+        array.length(left.values) > 0 && array.length(right.values) > 0
+            && left.values == right.values
+    } else {
+        let k_left = comparable_kind(left);
+        let k_right = comparable_kind(right);
+        k_left == k_right && k_left != "none"
+    }
+};
+
+# Resolve one attribute side of a field-to-field predicate: a declared,
+# authorized, plain (column-backed) dimension of the subject entity.  Unknown
+# attributes, attributes outside the subject, computed/JSON attributes and
+# unauthorized attributes fail atomically.
+def resolve_field_attr: Fn(PreparedPayload, Int, String) -> DimensionEntry = fn(payload, subject, id) {
+    match array.find(payload.dimensions, fn(d) { d.id == id }) {
+        'None => fail!("field-to-field predicate references an unknown attribute", id),
+        'Some(entry) => do {
+            if entry.entity != subject {
+                fail!("field-to-field predicate references an attribute outside the subject entity", id)
+            } else if entry.computed {
+                fail!("field-to-field predicate requires a plain column attribute", id)
+            } else if !entry.authorized {
+                fail!("field-to-field predicate references an unauthorized attribute", id)
+            } else {
+                entry
+            }
+        },
+    }
+};
+
+# Resolve a field-to-field predicate to a comparison of the two validated column
+# references.  The subject role must be authorized, the operator must be a
+# closed comparison supported by BOTH attributes, and the two attribute
+# type/domain must be compatible.  Lowering never creates a dynamic binding.
+def resolve_field_filter: Fn(PreparedPayload, Int, FieldFilterRequest) -> qb.Expr = fn(payload, subject, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for field-to-field predicate", spec.subject, spec.left, spec.right)
+    } else if !field_compare_op(spec.op) {
+        fail!("field-to-field predicate supports only comparison operators", spec.op)
+    } else {
+        let left = resolve_field_attr(payload, subject, spec.left);
+        let right = resolve_field_attr(payload, subject, spec.right);
+        if !array.any(left.ops, fn(o) { o == spec.op })
+            || !array.any(right.ops, fn(o) { o == spec.op }) {
+            fail!("field-to-field predicate uses an operation not supported by both attributes", spec.op)
+        } else if !field_domains_compatible(left, right) {
+            fail!("field-to-field predicate operands are type/domain incompatible", spec.left, spec.right)
+        } else {
+            let function: qb.ScalarFunction = match spec.op {
+                'Eq => 'Eq,
+                'Ne => 'Ne,
+                'Gt => 'Gt,
+                'Ge => 'Ge,
+                'Lt => 'Lt,
+                'Le => 'Le,
+                'Contains => fail!("field-to-field predicate supports only comparison operators", spec.op),
+                'NotContains => fail!("field-to-field predicate supports only comparison operators", spec.op),
+                'StartsWith => fail!("field-to-field predicate supports only comparison operators", spec.op),
+                'EndsWith => fail!("field-to-field predicate supports only comparison operators", spec.op),
+            };
+            qb.scalar(function, [dimension_expr(payload, left), dimension_expr(payload, right)])
+        }
+    }
+};
+
+# Pure feasibility probe for a field-to-field predicate on a subject entity.
+# Returns 'True when the predicate would lower to a validated two-column
+# comparison; 'False for an unauthorized role, a non-comparison operator, an
+# unknown/unauthorized/non-plain/cross-entity attribute, an operator not
+# supported by both attributes, or type/domain incompatibility.  Never fails.
+def field_filter_ok: Fn(PreparedPayload, Int, FieldFilterRequest) -> Bool = fn(payload, subject, spec) {
+    if !payload.authorize(spec.subject) {
+        'False
+    } else if !field_compare_op(spec.op) {
+        'False
+    } else {
+        let left_opt = array.find(payload.dimensions, fn(d) { d.id == spec.left });
+        let right_opt = array.find(payload.dimensions, fn(d) { d.id == spec.right });
+        match (left_opt, right_opt) {
+            ('None, _) => 'False,
+            (_, 'None) => 'False,
+            ('Some(left), 'Some(right)) => do {
+                let sides_ok = left.entity == subject && !left.computed && left.authorized
+                    && right.entity == subject && !right.computed && right.authorized;
+                if !sides_ok {
+                    'False
+                } else if !array.any(left.ops, fn(o) { o == spec.op })
+                    || !array.any(right.ops, fn(o) { o == spec.op }) {
+                    'False
+                } else if !field_domains_compatible(left, right) {
+                    'False
+                } else {
+                    'True
+                }
+            },
+        }
+    }
+};
+
+# The subject entity of a request (base entity), mirroring `lower_core`: the
+# first requested measure's entity when measures are present, otherwise the first
+# requested dimension's entity.
+def request_subject_entity: Fn(PreparedPayload, QueryRequest) -> Int = fn(payload, request) {
+    let measures = resolve_measures(payload, request.measures);
+    if array.length(measures) > 0 {
+        get_index(measures, 0).entry.entity
+    } else {
+        let dimensions = resolve_dimensions(payload, request.dimensions);
+        if array.length(dimensions) == 0 {
+            fail!("field-to-field predicate lowering requires at least one measure or dimension")
+        } else {
+            get_index(dimensions, 0).entry.entity
+        }
+    }
+};
+
+def rebuild_plan_filter: Fn(qb.Plan, Option(qb.Expr)) -> qb.Plan = fn(plan, filter) {
+    let rebuilt: qb.Plan = {
+        revision: plan.revision,
+        sources: plan.sources,
+        derived: plan.derived,
+        projection: plan.projection,
+        filter,
+        exists: plan.exists,
+        joins: plan.joins,
+        grouping: plan.grouping,
+        having: plan.having,
+        ordering: plan.ordering,
+        limit: plan.limit,
+        offset: plan.offset,
+        partition: plan.partition,
+    };
+    rebuilt
+};
+
+# Lower a request with zero or more closed field-to-field predicates on the
+# request subject.  Ordinary scalar filters/scopes are lowered first (unchanged
+# deterministic predicate order and bindings); the field-to-field predicates are
+# appended as trailing AND terms in request order and never add bindings.
+def lower_field_filtered: Fn(PreparedPayload, QueryRequest, Array(FieldFilterRequest)) -> qb.Plan = fn(payload, request, field_filters) {
+    let plan = lower_core(payload, request, [], [], [], [], [], []);
+    if array.length(field_filters) == 0 {
+        plan
+    } else {
+        let subject = request_subject_entity(payload, request);
+        let exprs = array.map(field_filters, fn(spec) { resolve_field_filter(payload, subject, spec) });
+        let filter = append_filter_terms(plan.filter, exprs);
+        let rebuilt = rebuild_plan_filter(plan, filter);
+        qb.validate(rebuilt, payload.profile)
+    }
+};
+
 # Enum closed-domain scope resolution (mirrors resolve_enum_filter). A scope
 # value must be a member of the referenced dimension's stable value domain.
 def resolve_enum_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> FilterResolution = fn(payload, entry, predicate) {
@@ -3374,6 +3590,247 @@ def lower_internal_top: Fn(PreparedPayload, QueryRequest, Array(InternalOrderReq
     lower_core(payload, request, [], [], [], [], [], internal_orders)
 };
 
+# ---------------------------------------------------------------------------
+# Closed related-aggregate references (hidden aggregate over a directly-related
+# entity).  A related measure may live on the subject entity (no join) or on an
+# entity connected to the subject by exactly ONE declared relation (join in the
+# prepared direction).  The aggregate is used only for hidden ORDER BY and/or
+# hidden HAVING; it never enters the projection.  Grouping stays on subject
+# dimensions so related rows only aggregate and never change subject grain.
+# ---------------------------------------------------------------------------
+
+# The single declared relation connecting two entities (in either direction),
+# or a stable attributable diagnostic when there is none / more than one.
+def related_relation_index: Fn(PreparedPayload, Int, Int) -> Int = fn(payload, base, entity) {
+    let conn = array.filter(array.enumerate(payload.relations), fn(p) {
+        (p.1.from == base && p.1.to == entity) || (p.1.from == entity && p.1.to == base)
+    });
+    if array.length(conn) == 0 {
+        fail!("related aggregate has no declared direct relation from the subject entity", base, entity)
+    } else if array.length(conn) > 1 {
+        fail!("related aggregate relation is ambiguous: multiple relations connect the subject and aggregate entities", base, entity)
+    } else {
+        get_index(conn, 0).0
+    }
+};
+
+# Deterministic INNER join to the related entity using the prepared relation's
+# column key; forward and reverse declarations both map to the same equality.
+def build_related_join: Fn(PreparedPayload, Int, Int) -> qb.Join = fn(payload, base, entity) {
+    let base_entry = get_index(payload.entities, base);
+    let entity_entry = get_index(payload.entities, entity);
+    let rel = get_index(payload.relations, related_relation_index(payload, base, entity));
+    let from_is_base = rel.from == base;
+    let pairs = exists_pairs(rel.key);
+    let conds = array.map(pairs, fn(pair) {
+        if from_is_base {
+            let base_field = get_index(base_entry.fields, pair.from);
+            let entity_field = get_index(entity_entry.fields, pair.to);
+            qb.on_eq(
+                qb.column_ref(base_entry.alias, base_field.column),
+                qb.column_ref(entity_entry.alias, entity_field.column),
+            )
+        } else {
+            let entity_field = get_index(entity_entry.fields, pair.from);
+            let base_field = get_index(base_entry.fields, pair.to);
+            qb.on_eq(
+                qb.column_ref(base_entry.alias, base_field.column),
+                qb.column_ref(entity_entry.alias, entity_field.column),
+            )
+        }
+    });
+    let condition = if array.length(conds) == 1 {
+        get_index(conds, 0)
+    } else {
+        qb.on_and(conds)
+    };
+    qb.join_on('Inner, qb.source(entity_entry.alias, entity_entry.table), condition)
+};
+
+# A closed aggregate call for a related-measure reference.  The measure must be
+# declared, plain (not computed/filtered), authorized for the subject, and --
+# when it lives off the subject -- connected by a single declared relation.
+def related_measure_call: Fn(PreparedPayload, Int, String, String) -> qb.AggregateCall = fn(payload, base, subject, measure_id) {
+    if !payload.authorize(subject) {
+        fail!("subject is not authorized for related aggregate measure", subject, measure_id)
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == measure_id }) {
+            'None => fail!("related aggregate references an unknown measure", measure_id),
+            'Some(entry) => do {
+                if entry.computed != 'None {
+                    fail!("related aggregate measure must be a plain measure", measure_id)
+                } else if entry.predicate != 'None {
+                    fail!("related aggregate measure must not be a filtered measure", measure_id)
+                } else {
+                    # When the measure lives off the subject, require exactly one
+                    # declared direct relation (stable attributable diagnostic).
+                    let rel_check: Int = if entry.entity != base {
+                        related_relation_index(payload, base, entry.entity)
+                    } else {
+                        -1
+                    };
+                    let entity = get_index(payload.entities, entry.entity);
+                    let field = get_index(entity.fields, entry.field);
+                    let call: qb.AggregateCall = {
+                        function: entry.aggregate,
+                        arg: qb.column(entity.alias, field.column),
+                        distinct: 'False,
+                        filter: 'None,
+                        alias: entry.alias,
+                    };
+                    call
+                }
+            },
+        }
+    }
+};
+
+def internal_threshold_kind_ok: Fn(qb.AggregateFunction, FilterInput) -> Bool = fn(function, input) {
+    match function {
+        'Count => match input { 'Int(_) => 'True, _ => 'False },
+        'Sum => match input { 'Int(_) => 'True, 'Number(_) => 'True, _ => 'False },
+        'Avg => match input { 'Int(_) => 'True, 'Number(_) => 'True, _ => 'False },
+        'Min => match input { 'Int(_) => 'True, 'Number(_) => 'True, _ => 'False },
+        'Max => match input { 'Int(_) => 'True, 'Number(_) => 'True, _ => 'False },
+    }
+};
+
+def internal_having_plan: Fn(PreparedPayload, Int, InternalHavingRequest) -> qb.Having = fn(payload, base, spec) {
+    let call = related_measure_call(payload, base, spec.subject, spec.measure);
+    if !internal_threshold_kind_ok(call.function, spec.threshold) {
+        fail!("related aggregate HAVING threshold type is incompatible with the aggregate", spec.measure, spec.threshold)
+    } else {
+        let op: qb.HavingOp = match spec.op {
+            'Eq => 'Eq,
+            'Ne => 'Ne,
+            'Gt => 'Gt,
+            'Ge => 'Ge,
+            'Lt => 'Lt,
+            'Le => 'Le,
+        };
+        qb.having_call(op, call.function, call.arg, 'False, to_val(spec.threshold))
+    }
+};
+
+# Pure feasibility probe for a related-measure reference on a subject entity:
+# 'True when the subject role is authorized and the measure is declared, plain,
+# and (when it lives off the subject) connected by exactly one declared direct
+# relation.  'False for an unauthorized role, unknown/computed/filtered measure,
+# a missing or ambiguous direct relation.  Never fails.
+def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(payload, subject, role, measure_id) {
+    if !payload.authorize(role) {
+        'False
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == measure_id }) {
+            'None => 'False,
+            'Some(entry) => do {
+                if entry.computed != 'None || entry.predicate != 'None {
+                    'False
+                } else if entry.entity == subject {
+                    'True
+                } else {
+                    let conn = array.filter(payload.relations, fn(r) {
+                        (r.from == subject && r.to == entry.entity)
+                            || (r.from == entry.entity && r.to == subject)
+                    });
+                    array.length(conn) == 1
+                }
+            },
+        }
+    }
+};
+
+# Lower a grouped subject listing with closed related-aggregate references.
+#   request: measures empty, grouping dimensions on the subject entity;
+#   internal_orders: hidden ORDER BY aggregates (Asc/Desc, Top-N via limit);
+#   internal_having: hidden HAVING predicates over the related aggregates.
+# Related entities (when the aggregate measure lives off the subject) are joined
+# through the single prepared relation; grouping keeps the subject grain, so
+# related rows only aggregate and never add output rows.  The projection is
+# exactly the requested dimensions; hidden aggregates never appear in it.
+def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrderRequest), Array(InternalHavingRequest)) -> qb.Plan = fn(payload, request, internal_orders, internal_having) {
+    if array.length(request.measures) > 0 {
+        fail!("related aggregate lowering requires a measureless request")
+    } else if array.length(request.dimensions) == 0 {
+        fail!("related aggregate lowering requires subject grouping dimensions")
+    } else if request.partition != 'None {
+        fail!("related aggregate lowering does not combine with top per group")
+    } else {
+        let dimensions = resolve_dimensions(payload, request.dimensions);
+        let base = get_index(dimensions, 0).entry.entity;
+        let dims_on_base = array.all(dimensions, fn(d) { d.entry.entity == base });
+        if !dims_on_base {
+            fail!("related aggregate lowering cannot prove subject grain: grouping dimensions must belong to the subject entity")
+        } else {
+            # Filter dimensions must also be subject-level (base columns), so the
+            # lowering never needs an extra relation to interpret the predicate.
+            let filter_resolutions = resolve_filters(payload, request.filters);
+            let filters_on_base = array.all(filter_resolutions, fn(f) { f.entity == base });
+            if !filters_on_base {
+                fail!("related aggregate filters must reference the subject entity (unprovable grain)", request.filters)
+            } else {
+                let scope_resolutions = array.flat_map(dimensions, fn(d) {
+                    array.map(d.entry.scope, fn(p) { resolve_scope(payload, d.entry, p) })
+                });
+                let filter_expr = combined_filter(scope_resolutions, filter_resolutions);
+                let order_calls = array.map(internal_orders, fn(spec) {
+                    let call = related_measure_call(payload, base, spec.subject, spec.measure);
+                    let key: qb.OrderKey = 'Aggregate(call);
+                    match spec.direction { 'Asc => qb.order_by(key, 'Asc), 'Desc => qb.order_by(key, 'Desc) }
+                });
+                let dim_orders = resolve_grouped_dim_orders(payload, request);
+                let ordering = array.concat([order_calls, dim_orders]);
+                let having_plans = array.map(internal_having, fn(spec) { internal_having_plan(payload, base, spec) });
+                let ref_entities = array.concat([
+                    array.map(internal_orders, fn(spec) {
+                        match array.find(payload.measures, fn(m) { m.id == spec.measure }) {
+                            'Some(entry) => entry.entity,
+                            'None => fail!("related aggregate references an unknown measure", spec.measure),
+                        }
+                    }),
+                    array.map(internal_having, fn(spec) {
+                        match array.find(payload.measures, fn(m) { m.id == spec.measure }) {
+                            'Some(entry) => entry.entity,
+                            'None => fail!("related aggregate references an unknown measure", spec.measure),
+                        }
+                    }),
+                ]);
+                let related_entities = array.fold(ref_entities, [], fn(acc, entity) {
+                    if entity == base || array.any(acc, fn(e) { e == entity }) {
+                        acc
+                    } else {
+                        array.push(acc, entity)
+                    }
+                });
+                let joins = array.map(related_entities, fn(entity) { build_related_join(payload, base, entity) });
+                let join_sources = array.map(joins, fn(j) { j.source });
+                let base_entry = get_index(payload.entities, base);
+                let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
+                let projection = array.map(dimensions, fn(d) { qb.expr_item(dimension_expr(payload, d.entry)) });
+                let grouping = array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) });
+                let limit = check_limit(request.limit);
+                let offset = check_offset(request.offset, array.length(request.ordering));
+                let plan: qb.Plan = {
+                    revision: payload.revision,
+                    sources,
+                    derived: 'None,
+                    projection,
+                    filter: filter_expr,
+                    exists: [],
+                    joins,
+                    grouping,
+                    having: having_plans,
+                    ordering,
+                    limit,
+                    offset,
+                    partition: 'None,
+                };
+                qb.validate(plan, payload.profile)
+            }
+        }
+    }
+};
+
 # Anti-existence entry: the base QueryRequest plus typed correlated-existence
 # requests that must NOT match.  Each `absence_spec` resolves the same declared
 # relation/route/hub shape as a positive existence and is lowered as
@@ -3412,6 +3869,142 @@ def lower_distinct: Fn(PreparedPayload, QueryRequest) -> qb.Query = fn(payload, 
             let plan = lower_core(payload, request, [], [], [], [], [], []);
             qb.transform_sqlite_distinct(plan)
         }
+    }
+};
+
+# One entry of an explicit projection order.  It must reference exactly one
+# selected (requested) measure or dimension; every requested measure/dimension
+# appears exactly once.
+type ProjectionToken = enum {
+    'Measure(String),
+    'Dimension(String),
+};
+
+def occurrences: Fn(Array(String), String) -> Int = fn(items, id) {
+    array.length(array.filter(items, fn(i) { i == id }))
+};
+
+# Rebuild a validated Plan's SELECT list in the caller's explicit interleaved
+# order.  Only the projection order changes: grouping, ordering, filters,
+# bindings and grain are untouched.  Every token must reference a requested
+# measure/dimension exactly once; any remaining projection items (transitive
+# dependencies of computed measures) stay projected after the ordered items.
+def reorder_projection: Fn(PreparedPayload, QueryRequest, qb.Plan, Array(ProjectionToken)) -> qb.Plan = fn(payload, request, plan, order) {
+    let measure_ids = array.map(request.measures, fn(m) { m.id });
+    let dimension_ids = array.map(request.dimensions, fn(d) { d.id });
+    let order_m = array.map(order, fn(t) {
+        match t {
+            'Measure(id) => [id],
+            'Dimension(_) => [],
+        }
+    });
+    let order_d = array.map(order, fn(t) {
+        match t {
+            'Dimension(id) => [id],
+            'Measure(_) => [],
+        }
+    });
+    let order_measure_ids = array.concat(order_m);
+    let order_dimension_ids = array.concat(order_d);
+    let missing = !array.all(measure_ids, fn(id) {
+        occurrences(order_measure_ids, id) == 1
+    }) || !array.all(dimension_ids, fn(id) {
+        occurrences(order_dimension_ids, id) == 1
+    });
+    let extra = !array.all(order_measure_ids, fn(id) {
+        occurrences(measure_ids, id) == 1
+    }) || !array.all(order_dimension_ids, fn(id) {
+        occurrences(dimension_ids, id) == 1
+    });
+    let dup = array.any(order_measure_ids, fn(id) { occurrences(order_measure_ids, id) > 1 })
+        || array.any(order_dimension_ids, fn(id) { occurrences(order_dimension_ids, id) > 1 });
+    if missing {
+        fail!("explicit projection order must list every requested measure and dimension exactly once", order)
+    } else if extra {
+        fail!("explicit projection order references an item that is not requested", order)
+    } else if dup {
+        fail!("explicit projection order must not repeat a measure or dimension", order)
+    } else if array.length(order) != array.length(measure_ids) + array.length(dimension_ids) {
+        fail!("explicit projection order must not omit any requested measure or dimension", order)
+    } else {
+        # Walk the tokens, claiming the matching projection item (measure by
+        # aggregate/computed alias, dimension by structural equality of its
+        # expression).  Unclaimed items (computed-measure dependencies) follow.
+        let ordered_items: Array(qb.SelectItem) = array.map(order, fn(token) {
+            match token {
+                'Measure(id) => match array.find(plan.projection, fn(item) {
+                    match item {
+                        'Aggregate(call) => call.alias == id,
+                        'Computed(ca) => ca.alias == id,
+                        'Expr(_) => 'False,
+                    }
+                }) {
+                    'Some(item) => item,
+                    'None => fail!("explicit projection order references a measure that is not projected", id),
+                },
+                'Dimension(id) => do {
+                    let entry = match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                        'Some(d) => d,
+                        'None => fail!("explicit projection order references an unknown dimension", id),
+                    };
+                    let expected = dimension_expr(payload, entry);
+                    match array.find(plan.projection, fn(item) {
+                        match item {
+                            'Expr(expr) => expr == expected,
+                            _ => 'False,
+                        }
+                    }) {
+                        'Some(item) => item,
+                        'None => fail!("explicit projection order references a dimension that is not projected", id),
+                    }
+                },
+            }
+        });
+        # Dependency-only items that were not claimed by any token (kept so a
+        # computed measure can still render) are appended after the ordered items.
+        let leftover = array.filter(plan.projection, fn(item) {
+            match item {
+                'Aggregate(call) => !array.any(order_measure_ids, fn(id) { id == call.alias }),
+                'Computed(ca) => !array.any(order_measure_ids, fn(id) { id == ca.alias }),
+                'Expr(expr) => !array.any(dimension_ids, fn(id) {
+                    match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                        'Some(d) => dimension_expr(payload, d) == expr,
+                        'None => 'False,
+                    }
+                }),
+            }
+        });
+        let projection = array.concat([ordered_items, leftover]);
+        let rebuilt: qb.Plan = {
+            revision: plan.revision,
+            sources: plan.sources,
+            derived: plan.derived,
+            projection,
+            filter: plan.filter,
+            exists: plan.exists,
+            joins: plan.joins,
+            grouping: plan.grouping,
+            having: plan.having,
+            ordering: plan.ordering,
+            limit: plan.limit,
+            offset: plan.offset,
+            partition: plan.partition,
+        };
+        qb.validate(rebuilt, payload.profile)
+    }
+};
+
+# Lower with an explicit interleaved projection order (P1).  The request is
+# otherwise lowered exactly like `lower`; the explicit order only reorders the
+# SELECT columns and is validated (exactly-once coverage of every requested
+# measure/dimension, no extra/hidden/duplicate references).  Omitting the order
+# (empty array) keeps the default measure-then-dimension order for compat.
+def lower_ordered: Fn(PreparedPayload, QueryRequest, Array(ProjectionToken)) -> qb.Plan = fn(payload, request, order) {
+    let plan = lower_core(payload, request, [], [], [], [], [], []);
+    if array.length(order) == 0 {
+        plan
+    } else {
+        reorder_projection(payload, request, plan, order)
     }
 };
 
@@ -3474,9 +4067,12 @@ export {
     MeasureInput,
     DimensionInput,
     InternalOrderRequest,
+    InternalHavingRequest,
+    ProjectionToken,
     MeasureRequest,
     DimensionRequest,
     FilterRequest,
+    FieldFilterRequest,
     OrderRequest,
     PartitionRequest,
     QueryRequest,
@@ -3541,10 +4137,18 @@ export {
     lower_absence,
     lower_distinct,
     lower_internal_top,
+    lower_internal_related,
+    lower_ordered,
+    lower_field_filtered,
     lower_group_count,
     resolve_row_ordering,
     resolve_grouped_dim_orders,
     internal_aggregate_order,
+    resolve_field_filter,
+    field_filter_ok,
+    related_measure_ok,
+    request_subject_entity,
+    reorder_projection,
     dimension_expr,
     dimension_domain,
     to_bind,

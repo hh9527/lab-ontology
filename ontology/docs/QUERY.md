@@ -147,6 +147,16 @@ alias 做 `'Add`/`'Sub` 算术组合。
 校验（`'If` 恰为 3，`'Instr`/`'Add`/`'Sub` 恰为 2）。computed expression 可以稳定
 用于 projection、grouping 和 ordering。
 
+比较算子的两个操作数都可以是 `'Column` 引用（同一查询主体/同一表上的两个属性之间
+比较），此时 lowering 只产生两个验证过的列引用（如 `fs.color = fs.shade`），
+不产生动态 binding；只有当某侧是 `'Bind` 时才产生参数化 `?` 与 binding。
+
+Ontology eDSL 以 `FieldFilterRequest` / `lower_field_filtered` 公开这一 shape（见
+`ONTOLOGY.md` 的“同主体 field-to-field 谓词”）。作为普通 Expr，它继续受 `PlanProfile`
+收窄：比较 scalar（`'Eq`/`'Ne`/…）必须出现在 `allowed_scalars`，`Column` 与 `Scalar`
+operator 必须被允许；profile 只保留部分能力时，调用方只能引用该属性在 profile 下
+实际保留的比较能力。
+
 SQLite JSON1 v1 词汇（`'JsonExtract`/`'JsonType`/`'JsonValid`）同样属于
 `allowed_scalars` 并消耗 `Scalar` operator。`JsonExtract`/`JsonType` 的第二个参数
 （JSON path）在结构校验中必须确认为字符串 `Bind`：列、计算表达式、Int/Float Bind
@@ -627,6 +637,13 @@ SELECT o.region FROM orders AS o GROUP BY o.region ORDER BY count(o.id) DESC LIM
   需在 `allowed_scalars`、`distinct='True` 需 `allow_distinct`。
 - v1 的 `partition` order_by 不接受 `'Aggregate`；内部排序聚合用于全局 `limit`
   Top N 形状。
+
+**跨关系隐藏聚合（related aggregate）**：聚合 arg 也可以是已 join 的关联源的列
+（外层按主体维度分组、INNER JOIN 关联源），机制完全一致——Query 层不区分聚合来自
+主体源还是 join 源，只要结构合法并分组即可；隐藏 `'Aggregate` 用于 ORDER BY 或
+HAVING `'Call`，不进入 projection、不产生额外 binding。Ontology eDSL 以
+`lower_internal_related` / `InternalOrderRequest` / `InternalHavingRequest` 公开该
+shape（见 `ONTOLOGY.md` 的“跨关系隐藏聚合”）。
 
 ## 条件聚合与计算聚合（filtered & computed aggregates）
 
@@ -1262,6 +1279,11 @@ HAVING 引用解析到已投影 aggregate/computed、EXISTS 的相关引用形�
 alias、内层 filter 引用可见 alias），以及 Join ON 条件树形状与 alias 引用。
 `validate` 在此基础上检查所有算子、join kind、aggregate、scalar 和 distinct 是否
 被 profile 接受。
+
+`Plan.projection` 是**保序**的 SELECT 列表：SELECT 列顺序严格等于 projection 数组
+顺序，QueryBuilder 不会按类别重排。领域层如需跨 measure/dimension 交错列序，由
+ontology eDSL 的 `lower_ordered`（显式 `ProjectionToken` 顺序）在构造 Plan 时控制；
+QueryBuilder 只负责保序渲染与结构验证。
 
 `transform_sqlite` 使用固定子句顺序：
 

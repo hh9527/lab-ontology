@@ -44,6 +44,13 @@ type IntentFilter = struct {
     value: ScalarValue,
 };
 
+# Same-subject field-to-field comparison (left attribute vs right attribute).
+type IntentFieldFilter = struct {
+    left: String,
+    right: String,
+    op: String,
+};
+
 type IntentExists = struct {
     target: String,
     filters: Array(IntentFilter),
@@ -55,14 +62,23 @@ type IntentOrder = struct {
     direction: String,
 };
 
+type IntentHaving = struct {
+    measure: String,
+    op: String,
+    value: ScalarValue,
+};
+
 type Intent = struct {
     measures: Array(IntentMeasure),
     dimensions: Array(IntentDimension),
     distinct: Bool,
+    column_order: Array(String),
     filters: Array(IntentFilter),
+    field_filters: Array(IntentFieldFilter),
     exists: Array(IntentExists),
     absence: Array(IntentExists),
     order: Array(IntentOrder),
+    having: Array(IntentHaving),
     limit: Option(Int),
     offset: Option(Int),
 };
@@ -455,6 +471,57 @@ def absence_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(pay
     })
 };
 
+def field_filter_issue: Fn(edsl.PreparedPayload, Intent, IntentFieldFilter) -> Option(String) = fn(payload, intent, e) {
+    if intent.distinct {
+        let s: Option(String) = 'Some("rule: field-to-field filters cannot be combined with a distinct list");
+        s
+    } else if internal_top_mode(intent) {
+        let s: Option(String) = 'Some("rule: field-to-field filters cannot be combined with internal top-N");
+        s
+    } else if array.length(intent.exists) > 0 || array.length(intent.absence) > 0 {
+        let s: Option(String) = 'Some("rule: field-to-field filters cannot be combined with existence filters");
+        s
+    } else {
+        let base = base_entity_index(payload, intent);
+        if base < 0 {
+            let s: Option(String) = 'Some("rule: field-to-field filter requires a subject entity");
+            s
+        } else {
+            match parse_op(e.op) {
+                'None => {
+                    let s: Option(String) = 'Some(`rule: unknown field-to-field operator \{e.op}`);
+                    s
+                },
+                'Some(op) => do {
+                    let req: edsl.FieldFilterRequest = {
+                        subject: subject,
+                        op,
+                        left: e.left,
+                        right: e.right,
+                    };
+                    if edsl.field_filter_ok(payload, base, req) {
+                        let none: Option(String) = 'None;
+                        none
+                    } else {
+                        let s: Option(String) = 'Some(`unsupported: field-to-field predicate \{e.left} \{e.op} \{e.right}`);
+                        s
+                    }
+                },
+            }
+        }
+    }
+};
+
+def field_filter_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
+    let init: Option(String) = 'None;
+    array.fold(intent.field_filters, init, fn(acc, e) {
+        match acc {
+            'Some(_) => acc,
+            'None => field_filter_issue(payload, intent, e),
+        }
+    })
+};
+
 def order_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
     let init: Option(String) = 'None;
     array.fold(intent.order, init, fn(acc, o) {
@@ -476,8 +543,25 @@ def internal_top_mode: Fn(Intent) -> Bool = fn(intent) {
     if array.length(intent.measures) > 0 {
         'False
     } else {
-        array.any(intent.order, fn(o) { o.measure != 'None })
+        let has_internal_order = array.any(intent.order, fn(o) { o.measure != 'None });
+        has_internal_order || array.length(intent.having) > 0
     }
+};
+
+# Exactly one declared direct relation between two entities (either direction);
+# used to admit a related-aggregate measure on a direct neighbour.
+def unique_direct_relation: Fn(edsl.PreparedPayload, Int, Int) -> Bool = fn(payload, a, b) {
+    let pairs = array.filter(payload.relations, fn(r) {
+        (r.from == a && r.to == b) || (r.from == b && r.to == a)
+    });
+    array.length(pairs) == 1
+};
+
+# Internal/related-aggregate measure is allowed on the subject base entity or
+# on a directly related entity with a single declared direct relation.
+def measure_entity_ok: Fn(edsl.PreparedPayload, Intent, Int) -> Bool = fn(payload, intent, measure_entity) {
+    let base = base_entity_index(payload, intent);
+    measure_entity == base || unique_direct_relation(payload, base, measure_entity)
 };
 
 def internal_order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Option(String) = fn(payload, intent, o) {
@@ -506,8 +590,8 @@ def internal_order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Optio
                 'Some(entry) => if entry.computed != 'None {
                     let s: Option(String) = 'Some(`unsupported: internal ordering measure \{mid} is a computed measure`);
                     s
-                } else if entry.entity != base_entity_index(payload, intent) {
-                    let s: Option(String) = 'Some(`unsupported: internal ordering measure \{mid} is not on the subject entity`);
+                } else if !measure_entity_ok(payload, intent, entry.entity) {
+                    let s: Option(String) = 'Some(`unsupported: internal ordering measure \{mid} is not on the subject or a unique direct relation`);
                     s
                 } else {
                     let none: Option(String) = 'None;
@@ -542,18 +626,100 @@ def internal_order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Optio
     }
 };
 
-def internal_top_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
-    if array.length(intent.dimensions) == 0 {
-        let s: Option(String) = 'Some("rule: internal top-N requires at least one grouping dimension");
+def parse_having_op: Fn(String) -> Option(edsl.HavingOp) = fn(op) {
+    match op {
+        "eq" => 'Some('Eq),
+        "ne" => 'Some('Ne),
+        "gt" => 'Some('Gt),
+        "ge" => 'Some('Ge),
+        "lt" => 'Some('Lt),
+        "le" => 'Some('Le),
+        _ => 'None,
+    }
+};
+
+def internal_having_issue: Fn(edsl.PreparedPayload, Intent, IntentHaving) -> Option(String) = fn(payload, intent, h) {
+    if intent.distinct {
+        let s: Option(String) = 'Some("rule: a distinct list cannot use an internal HAVING");
+        s
+    } else if intent.offset != 'None {
+        let s: Option(String) = 'Some("rule: internal HAVING does not support an offset");
+        s
+    } else if array.length(intent.exists) > 0 || array.length(intent.absence) > 0 {
+        let s: Option(String) = 'Some("rule: internal HAVING cannot be combined with existence filters");
         s
     } else {
-        let init: Option(String) = 'None;
-        array.fold(intent.order, init, fn(acc, o) {
-            match acc {
-                'Some(_) => acc,
-                'None => internal_order_issue(payload, intent, o),
+        match parse_having_op(h.op) {
+            'None => {
+                let s: Option(String) = 'Some(`rule: unknown internal HAVING operator \{h.op}`);
+                s
+            },
+            'Some(_) => match value_kind(h.value) {
+                'None => {
+                    let s: Option(String) = 'Some(`type: internal HAVING threshold on \{h.measure} must be a number`);
+                    s
+                },
+                'Some('Text) => {
+                    let s: Option(String) = 'Some(`type: internal HAVING threshold on \{h.measure} must be a number`);
+                    s
+                },
+                'Some(_) => match find_measure(payload, h.measure) {
+                    'None => {
+                        let s: Option(String) = 'Some(`vocab: internal HAVING references unknown measure \{h.measure}`);
+                        s
+                    },
+                    'Some(entry) => if entry.computed != 'None {
+                        let s: Option(String) = 'Some(`unsupported: internal HAVING measure \{h.measure} is a computed measure`);
+                        s
+                    } else if !measure_entity_ok(payload, intent, entry.entity) {
+                        let s: Option(String) = 'Some(`unsupported: internal HAVING measure \{h.measure} is not on the subject or a unique direct relation`);
+                        s
+                    } else {
+                        let none: Option(String) = 'None;
+                        none
+                    },
+                },
+            },
+        }
+    }
+};
+
+def internal_top_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
+    if array.length(intent.dimensions) == 0 {
+        let s: Option(String) = 'Some("rule: internal top-N/HAVING requires at least one grouping dimension");
+        s
+    } else {
+        let base = base_entity_index(payload, intent);
+        let bad_dim = array.find(intent.dimensions, fn(d) {
+            match find_dimension(payload, d.id) {
+                'Some(entry) => entry.entity != base,
+                'None => 'False,
             }
-        })
+        });
+        match bad_dim {
+            'Some(d) => {
+                let s: Option(String) = 'Some(`rule: internal top-N/HAVING grouping dimension \{d.id} must be on the subject entity`);
+                s
+            },
+            'None => do {
+                let init: Option(String) = 'None;
+                let order_issue_first = array.fold(intent.order, init, fn(acc, o) {
+                    match acc {
+                        'Some(_) => acc,
+                        'None => internal_order_issue(payload, intent, o),
+                    }
+                });
+                match order_issue_first {
+                    'Some(_) => order_issue_first,
+                    'None => array.fold(intent.having, init, fn(acc, h) {
+                        match acc {
+                            'Some(_) => acc,
+                            'None => internal_having_issue(payload, intent, h),
+                        }
+                    }),
+                }
+            },
+        }
     }
 };
 
@@ -612,6 +778,50 @@ def page_problem: Fn(Intent) -> Option(String) = fn(intent) {
 # Public intent validation.
 # ---------------------------------------------------------------------------
 
+def column_order_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
+    if array.length(intent.column_order) == 0 {
+        let none: Option(String) = 'None;
+        none
+    } else if intent.distinct {
+        let s: Option(String) = 'Some("rule: explicit column order is not supported with a distinct list; columns follow the dimensions order");
+        s
+    } else {
+        let selected = array.concat([
+            array.map(intent.measures, fn(m) { m.id }),
+            array.map(intent.dimensions, fn(d) { d.id }),
+        ]);
+        if array.length(intent.column_order) != array.length(selected) {
+            let s: Option(String) = 'Some("rule: explicit column order must list every selected measure/dimension exactly once");
+            s
+        } else {
+            let bad = array.find(intent.column_order, fn(tok) {
+                !contains_id(selected, tok)
+            });
+            match bad {
+                'Some(tok) => {
+                    let s: Option(String) = 'Some(`rule: column order references an unselected or unknown item \{tok}`);
+                    s
+                },
+                'None => do {
+                    let dup = array.find(intent.column_order, fn(tok) {
+                        array.length(array.filter(intent.column_order, fn(o) { o == tok })) > 1
+                    });
+                    match dup {
+                        'Some(tok) => {
+                            let s: Option(String) = 'Some(`rule: column order lists \{tok} more than once`);
+                            s
+                        },
+                        'None => {
+                            let none: Option(String) = 'None;
+                            none
+                        },
+                    }
+                },
+            }
+        }
+    }
+};
+
 def intent_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
     if array.length(intent.measures) == 0 && array.length(intent.dimensions) == 0 {
         let s: Option(String) = 'Some("rule: intent must select at least one measure or one dimension");
@@ -645,14 +855,26 @@ def intent_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payl
                                                         match p7 {
                                                             'Some(_) => p7,
                                                     'None => do {
-                                                        let p8 = if internal_top_mode(intent) {
-                                                            internal_top_problem(payload, intent)
-                                                        } else {
-                                                            order_problem(payload, intent)
-                                                        };
-                                                        match p8 {
-                                                            'Some(_) => p8,
-                                                            'None => page_problem(intent),
+                                                        let p7b = field_filter_problem(payload, intent);
+                                                        match p7b {
+                                                            'Some(_) => p7b,
+                                                            'None => do {
+                                                                let p8 = if internal_top_mode(intent) {
+                                                                    internal_top_problem(payload, intent)
+                                                                } else {
+                                                                    order_problem(payload, intent)
+                                                                };
+                                                                match p8 {
+                                                                    'Some(_) => p8,
+                                                                    'None => do {
+                                                                        let p8b = column_order_problem(payload, intent);
+                                                                        match p8b {
+                                                                            'Some(_) => p8b,
+                                                                            'None => page_problem(intent),
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
                                                         }
                                                     },
                                                         }
@@ -816,6 +1038,22 @@ def build_internal_top_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRe
     make_request(core.0, core.1, core.2, build_dimension_order_requests(intent), intent.limit, 'None)
 };
 
+def build_internal_having_requests: Fn(Intent) -> Array(edsl.InternalHavingRequest) = fn(intent) {
+    array.map(intent.having, fn(h) {
+        let op = match parse_having_op(h.op) {
+            'Some(o) => o,
+            'None => fail!("rule: unknown internal HAVING operator", h.op),
+        };
+        let req: edsl.InternalHavingRequest = {
+            measure: h.measure,
+            subject: subject,
+            op,
+            threshold: to_filter_input(h.value),
+        };
+        req
+    })
+};
+
 # The base request used by lower/lower_full/lower_absence: ordering/limit/offset
 # are applied by the finalizer instead, so they are not passed to the base.
 def build_base_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(payload, intent) {
@@ -846,6 +1084,18 @@ def build_related_requests: Fn(Array(IntentExists)) -> Array(edsl.ExistsRequest)
             filters,
             any_of: [],
             min_matches: 'None,
+        };
+        req
+    })
+};
+
+def build_field_filters: Fn(Intent) -> Array(edsl.FieldFilterRequest) = fn(intent) {
+    array.map(intent.field_filters, fn(e) {
+        let req: edsl.FieldFilterRequest = {
+            subject: subject,
+            op: op_of_string(e.op),
+            left: e.left,
+            right: e.right,
         };
         req
     })
@@ -891,6 +1141,19 @@ def ordered_projection: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> Array(qb.Se
     array.concat([dim_items, measure_items])
 };
 
+# Projection order driven by the explicit column_order intent (cross
+# measure/dimension interleaving).  Every token is a selected item id.
+def explicit_projection: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> Array(qb.SelectItem) = fn(payload, intent, plan) {
+    let measure_ids: Array(String) = array.map(intent.measures, fn(m) { m.id });
+    array.map(intent.column_order, fn(id) {
+        if contains_id(measure_ids, id) {
+            measure_select_item(plan, id)
+        } else {
+            qb.expr_item(dimension_expr_of(payload, id))
+        }
+    })
+};
+
 def build_ordering: Fn(edsl.PreparedPayload, Intent) -> Array(qb.OrderBy) = fn(payload, intent) {
     array.map(intent.order, fn(o) {
         match o.measure {
@@ -916,7 +1179,12 @@ def build_ordering: Fn(edsl.PreparedPayload, Intent) -> Array(qb.OrderBy) = fn(p
 };
 
 def finalize_plan: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> qb.Plan = fn(payload, intent, plan) {
-    let new_projection = ordered_projection(payload, intent, plan);
+    let new_projection =
+        if array.length(intent.column_order) > 0 {
+            explicit_projection(payload, intent, plan)
+        } else {
+            ordered_projection(payload, intent, plan)
+        };
     let ordering = build_ordering(payload, intent);
     let out: qb.Plan = {
         revision: plan.revision,
@@ -931,6 +1199,34 @@ def finalize_plan: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> qb.Plan = fn(pay
         ordering,
         limit: intent.limit,
         offset: intent.offset,
+        partition: plan.partition,
+    };
+    out
+};
+
+# Internal-related plans already carry their internal ORDER BY/HAVING/limit and
+# group by the subject dimensions; only the SELECT projection order may be
+# adjusted by column_order (all tokens are selected subject dimensions).
+def internal_projection_finalize: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> qb.Plan = fn(payload, intent, plan) {
+    let new_projection =
+        if array.length(intent.column_order) > 0 {
+            explicit_projection(payload, intent, plan)
+        } else {
+            ordered_projection(payload, intent, plan)
+        };
+    let out: qb.Plan = {
+        revision: plan.revision,
+        sources: plan.sources,
+        derived: plan.derived,
+        projection: new_projection,
+        filter: plan.filter,
+        exists: plan.exists,
+        joins: plan.joins,
+        grouping: plan.grouping,
+        having: plan.having,
+        ordering: plan.ordering,
+        limit: plan.limit,
+        offset: plan.offset,
         partition: plan.partition,
     };
     out
@@ -953,8 +1249,17 @@ def resolve: Fn(edsl.PreparedPayload, Intent) -> qb.Query = fn(payload, intent) 
                 } else if internal_top_mode(intent) {
                     let req = build_internal_top_request(payload, intent);
                     let internal_orders = build_measure_order_requests(intent);
-                    let plan = edsl.lower_internal_top(payload, req, internal_orders);
-                    let validated = qb.validate(plan, payload.profile);
+                    let internal_having = build_internal_having_requests(intent);
+                    let plan = edsl.lower_internal_related(payload, req, internal_orders, internal_having);
+                    let finalized = internal_projection_finalize(payload, intent, plan);
+                    let validated = qb.validate(finalized, payload.profile);
+                    qb.transform_sqlite(validated)
+                } else if array.length(intent.field_filters) > 0 {
+                    let base = build_base_request(payload, intent);
+                    let field_filters = build_field_filters(intent);
+                    let plan = edsl.lower_field_filtered(payload, base, field_filters);
+                    let finalized = finalize_plan(payload, intent, plan);
+                    let validated = qb.validate(finalized, payload.profile);
                     qb.transform_sqlite(validated)
                 } else {
                     let base = build_base_request(payload, intent);
@@ -1012,11 +1317,14 @@ export {
     IntentMeasure,
     IntentDimension,
     IntentFilter,
+    IntentFieldFilter,
     IntentExists,
     IntentOrder,
+    IntentHaving,
     Intent,
     subject,
     parse_op,
+    parse_having_op,
     is_text_op,
     value_kind,
     measure_issue,
@@ -1024,7 +1332,10 @@ export {
     filter_issue,
     exists_filter_issue,
     related_issue,
+    field_filter_issue,
+    field_filter_problem,
     order_issue,
+    column_order_problem,
     measure_problem,
     measure_grain_problem,
     dimension_problem,
@@ -1034,6 +1345,7 @@ export {
     order_problem,
     internal_top_mode,
     internal_order_issue,
+    internal_having_issue,
     internal_top_problem,
     distinct_problem,
     page_problem,
@@ -1049,10 +1361,14 @@ export {
     build_measure_order_requests,
     build_dimension_order_requests,
     build_internal_top_request,
+    build_internal_having_requests,
     build_related_requests,
+    build_field_filters,
     ordered_projection,
+    explicit_projection,
     build_ordering,
     finalize_plan,
+    internal_projection_finalize,
     resolve,
     intent_of_value,
     parse_intent,
