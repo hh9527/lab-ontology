@@ -78,11 +78,14 @@ type HavingRequest = struct {
     threshold: FilterInput,
 };
 
-# Paired-endpoint (peer) 请求：hub base 行的两个互斥端点分别由两个指定
-# participant 占据时才保留该 hub 行（见“配对的 peer 路线”）。
+# Paired-endpoint (peer) 请求：hub base 行的两个互斥端点分别由两个 participant
+# 占据时才保留该 hub 行（见“配对的 peer 路线”）。每侧 `PeerRef` 可携带可选精确
+# key 与零个或多个只引用自身 participant 实体的属性过滤；每侧至少一项可验证约束
+# （精确 key 和/或属性过滤），否则拒绝。
 type PeerRef = struct {
-    entity: String,        # participant 稳定实体 id
-    key: FilterInput,      # participant key 值（动态绑定）
+    entity: String,          # participant 稳定实体 id
+    key: Option(FilterInput),# 可选精确 key 值（动态绑定；与属性过滤在该 alias 内 AND）
+    filters: Array(FilterRequest),  # 仅引用自身 participant 实体的属性过滤（请求顺序）
 };
 type PeerRequest = struct {
     subject: String,
@@ -670,8 +673,9 @@ prepare 校验（`build_root` 对首个问题确定性失败，无部分 payload
 请求与 lowering（`lower_peer(payload, request, peers)`）：Query 基础层用封闭的
 `qb.PeerCorr`（`exists_peer`）把 **origin/peer 各自的内层 participant 表**与 hub
 角色列放在同一个相关 EXISTS 中，并生成两组端点交换分支。Ontology 只按 prepared route
-组装 origin/peer 的 table/alias、key 列、hub 角色列与 key 绑定；key 绑定属于各自的
-内层 alias（`origin_filter`/`peer_filter`）：
+组装 origin/peer 的 table/alias、key 列、hub 角色列，并把每侧约束（可选精确 key 与
+属性过滤）AND 到各自的 `origin_filter`/`peer_filter`（都留在同一个 correlated
+EXISTS 内、绑定到各自独立 alias）：
 
 ```text
 SELECT count(pr.id) AS PairCount
@@ -679,17 +683,38 @@ FROM pairs AS pr
 WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p
               WHERE ((pr.left_member_id = mb_o.id AND pr.right_member_id = mb_p.id)
                      OR (pr.right_member_id = mb_o.id AND pr.left_member_id = mb_p.id))
-                AND mb_o.id = ? AND mb_p.id = ?)
+                AND mb_o.kind = ? AND mb_p.kind = ?)
 ```
+
+每侧 `PeerRef` 规则：
+
+- 可选精确 key（`key: 'Some(...)`）与零个或多个属性过滤（`filters`）可混用；同一侧
+  key 与属性过滤在该 alias 内 AND（绑定顺序：该侧 key 先、属性过滤按请求顺序）；
+- **至少一项可验证约束**：每侧必须携带精确 key 或至少一个属性过滤；完全无约束的
+  participant 原子拒绝，杜绝宽泛笛卡尔匹配；
+- 属性过滤复用现有封闭 filter/operator/profile 词表与动态值绑定，只引用该 participant
+  自身实体上的已授权、可筛选维度；引用其它实体、未知/未授权维度、非法算子或值都原子
+  拒绝；
+- 绑定顺序确定：origin 侧约束先、peer 侧约束后，每侧内部 key 先于属性过滤；重复
+  lowering 逐字节一致。
+
+能力边界与拒绝：
 
 - 身份证明在 SQL 结构内：hub 端点值只经请求声明的 participant 表解释，跨表 key 碰撞
   不会把同一端点值同时解释为两种实体，也不会静默把两个 participant 配到同一端；
-- 两种端点交换分支对同类型与异构（不同表）participant 都生成；
-- 绑定顺序严格按占位符顺序（origin_filter 后 peer_filter），重复 lowering 逐字节确定；
+- **同实体身份不等**：origin/peer 是同一实体/表时，Query `PeerCorr` 的
+  `distinct_keys='True` 会渲染并校验 `origin.key <> peer.key`，单个 participant 行不能
+  同时占据 hub 两端（self-loop）；exact-key、attribute-only、key+attribute 一律适用。
+  相同属性过滤值可合法表示两个不同、都满足该属性的 participant（SQL 含身份不等证明）。
+  异构实体/不同表不增加裸 key 不等条件：两表相同 key 仍是不同身份，跨表 collision 继续
+  合法；
+- 两种端点交换分支对同类型与异构（不同表）participant 都生成；`dual_hub` 只表达单
+  participant 命中任一端，不会把同一 hub 上两个普通 existence request 猜成 peer；
 - 纯相关 EXISTS：不产生外层 participant JOIN、无 fan-out；
-- `peer == origin`（同实体同 key 的自配）、未知 participant 实体、hub 没有覆盖该
+- 同实体同 key 的自配、空约束 participant、未知 participant 实体、hub 没有覆盖该
   participant 对的 peer 路线、union 实体 base 都确定性拒绝；可用纯探针
-  `peer_request_ok(payload, hub_entity, request)` 断言可行/拒绝而不触发失败。
+  `peer_request_ok(payload, hub_entity, request)` 断言可行/拒绝而不触发失败；
+- peer 结果上的告警/KPI、二次聚合等未实现形状继续确定性拒绝。
 
 ### 分组计数（count of groups）
 
@@ -888,7 +913,15 @@ Pair(hub base) 的同 participant peer 路线；`lower_peer` 对两个指定 Mem
 逐字节一致；`peer_request_ok` 纯探针对合法/自配/未知实体/无路线 hub 返回预期；异构
 （不同 participant 表）peer 路线 forward/swap 请求都各自以请求声明的 participant
 表为内层源生成两组交换分支，跨表同值 key 保持独立内层 alias，杜绝把同一端点值同时
-解释为两种实体；query 结构测试验证两个 participant alias 都存在、各自只出现在自己
-的端点 equality 与 filter、两组交换分支齐全，并确定性拒绝同端、self-pair 身份缺失
-形状；prepare 对同端字段、非 key participant、越界与同一 participant 对的重复 peer
-路线确定性拒绝；同一 hub 的多类 participant `dual_hub` 元数据仍合法。
+解释为两种实体；filtered-participant 能力覆盖：同类型两侧属性过滤、异构两侧属性过滤、
+key+属性混合（同侧 AND，key 绑定先于属性）、A/Z 交换、跨表相同 key、两侧过滤值相同
+（各自独立 alias 绑定）、过滤引用错误实体、无约束 participant、未授权算子、self-pair、
+无 route，以及重复 lowering SQL/bindings 完全一致；同实体（exact-key / attribute-only /
+key+attribute）SQL 均含 `origin.key <> peer.key` 身份不等（self-loop 结构性证明），
+相同过滤值双 alias 成功且含身份不等，异构（不同表）不出现裸 key 不等、跨表相同 key
+保持合法；结构断言验证只有一个 correlated
+EXISTS、两个 participant alias、两个交换分支，每侧过滤只引用自己的 alias；query 结构
+测试验证两个 participant alias 都存在、各自只出现在自己的端点 equality 与 filter、
+两组交换分支齐全，并确定性拒绝同端、self-pair 身份缺失形状；prepare 对同端字段、非
+key participant、越界与同一 participant 对的重复 peer 路线确定性拒绝；同一 hub 的
+多类 participant `dual_hub` 元数据仍合法。

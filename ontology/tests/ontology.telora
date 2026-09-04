@@ -1753,14 +1753,14 @@ def peer_hub_base_request: edsl.QueryRequest = {
 
 def peer_ab_request: edsl.PeerRequest = {
     subject: "analyst",
-    origin: { entity: "members", key: 'Int(101) },
-    peer: { entity: "members", key: 'Int(202) },
+    origin: { entity: "members", key: 'Some('Int(101)), filters: [] },
+    peer: { entity: "members", key: 'Some('Int(202)), filters: [] },
 };
 
 def peer_ba_request: edsl.PeerRequest = {
     subject: "analyst",
-    origin: { entity: "members", key: 'Int(202) },
-    peer: { entity: "members", key: 'Int(101) },
+    origin: { entity: "members", key: 'Some('Int(202)), filters: [] },
+    peer: { entity: "members", key: 'Some('Int(101)), filters: [] },
 };
 
 def check_peer_route_prepared: Bool = do {
@@ -1778,7 +1778,7 @@ def check_peer_route_prepared: Bool = do {
 def check_peer_same_type_lowering: Bool = do {
     let plan: qb.Plan = edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]);
     let query: qb.Query = qb.transform_sqlite(plan);
-    let expected_sql = "SELECT count(pr.id) AS PairCount FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p WHERE ((pr.left_member_id = mb_o.id AND pr.right_member_id = mb_p.id) OR (pr.right_member_id = mb_o.id AND pr.left_member_id = mb_p.id)) AND mb_o.id = ? AND mb_p.id = ?)";
+    let expected_sql = "SELECT count(pr.id) AS PairCount FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p WHERE ((pr.left_member_id = mb_o.id AND pr.right_member_id = mb_p.id) OR (pr.right_member_id = mb_o.id AND pr.left_member_id = mb_p.id)) AND mb_o.id <> mb_p.id AND mb_o.id = ? AND mb_p.id = ?)";
     let expected: Array(qb.Val) = ['Int(101), 'Int(202)];
     check(query.sql == expected_sql, "peer: same-type pair lowers to a correlated EXISTS with two participant aliases and the two ordered exchange branches")
         && check(query.bindings == expected, "peer: origin/peer key binds belong to their own inner aliases in placeholder order")
@@ -1799,6 +1799,49 @@ def check_peer_same_type_swapped_equivalent: Bool = do {
             "peer: swapped participants mirror the origin/peer binding order")
 };
 
+def member_attr_vip_gold_req: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "members", key: 'None,
+        filters: [{ id: "MemberKind", subject: "analyst", op: 'Eq, input: 'Text("vip") }] },
+    peer: { entity: "members", key: 'None,
+        filters: [{ id: "MemberKind", subject: "analyst", op: 'Eq, input: 'Text("gold") }] },
+};
+
+def member_attr_same_value_req: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "members", key: 'None,
+        filters: [{ id: "MemberKind", subject: "analyst", op: 'Eq, input: 'Text("vip") }] },
+    peer: { entity: "members", key: 'None,
+        filters: [{ id: "MemberKind", subject: "analyst", op: 'Eq, input: 'Text("vip") }] },
+};
+
+def check_peer_same_type_attribute_only: Bool = do {
+    # Same participant table, attribute-only constraints on both sides: one
+    # correlated EXISTS, two distinct inner aliases, both exchange branches, and
+    # each filter bound to its own alias.
+    let plan: qb.Plan = edsl.lower_peer(knowledge.payload, peer_hub_base_request, [member_attr_vip_gold_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(pr.id) AS PairCount FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p WHERE ((pr.left_member_id = mb_o.id AND pr.right_member_id = mb_p.id) OR (pr.right_member_id = mb_o.id AND pr.left_member_id = mb_p.id)) AND mb_o.id <> mb_p.id AND mb_o.kind = ? AND mb_p.kind = ?)";
+    let expected: Array(qb.Val) = ['String("vip"), 'String("gold")];
+    check(query.sql == expected_sql, "peer: attribute-only same-type pair keeps one EXISTS and both exchange branches")
+        && check(query.bindings == expected, "peer: attribute filters bind to their own aliases in order")
+        && check(array.length(plan.joins) == 0 && array.length(plan.exists) == 1,
+            "peer: attribute-only pair emits no outer join and no fan-out")
+};
+
+def check_peer_same_type_attribute_same_value: Bool = do {
+    # Identical filter values on both sides stay on two distinct aliases (the
+    # SQL keeps two separate `?` bindings); nothing is merged or mis-paired.
+    let plan: qb.Plan = edsl.lower_peer(knowledge.payload, peer_hub_base_request, [member_attr_same_value_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("vip"), 'String("vip")];
+    check(string.contains(query.sql, "FROM members AS mb_o, members AS mb_p")
+            && string.contains(query.sql, "AND mb_o.id <> mb_p.id")
+            && string.contains(query.sql, "AND mb_o.kind = ? AND mb_p.kind = ?"),
+        "peer: same filter value on both sides keeps two distinct alias bindings AND the identity guard")
+        && check(query.bindings == expected, "peer: identical values bind once per alias in order")
+};
+
 def check_peer_deterministic: Bool = do {
     let q1: qb.Query = qb.transform_sqlite(edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]));
     let q2: qb.Query = qb.transform_sqlite(edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]));
@@ -1812,23 +1855,48 @@ def check_peer_request_probe: Bool = do {
     let orders = entity_id_index(p.entities, "orders");
     let self_req: edsl.PeerRequest = {
         subject: "analyst",
-        origin: { entity: "members", key: 'Int(101) },
-        peer: { entity: "members", key: 'Int(101) },
+        origin: { entity: "members", key: 'Some('Int(101)), filters: [] },
+        peer: { entity: "members", key: 'Some('Int(101)), filters: [] },
     };
     let unknown_req: edsl.PeerRequest = {
         subject: "analyst",
-        origin: { entity: "ghost", key: 'Int(1) },
-        peer: { entity: "members", key: 'Int(2) },
+        origin: { entity: "ghost", key: 'Some('Int(1)), filters: [] },
+        peer: { entity: "members", key: 'Some('Int(2)), filters: [] },
     };
     let unrelated_req: edsl.PeerRequest = {
         subject: "analyst",
-        origin: { entity: "members", key: 'Int(1) },
-        peer: { entity: "orders", key: 'Int(2) },
+        origin: { entity: "members", key: 'Some('Int(1)), filters: [] },
+        peer: { entity: "orders", key: 'Some('Int(2)), filters: [] },
     };
-    check(edsl.peer_request_ok(p, pairs, peer_ab_request), "peer probe: valid same-type pair is feasible")
+    # Filtered participant constraints (MemberKind dimension on members).
+    let attr_only_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "members", key: 'None, filters: [{ id: "MemberKind", subject: "analyst", op: 'Eq, input: 'Text("vip") }] },
+        peer: { entity: "members", key: 'Some('Int(202)), filters: [] },
+    };
+    let empty_origin_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "members", key: 'None, filters: [] },
+        peer: { entity: "members", key: 'Some('Int(202)), filters: [] },
+    };
+    let wrong_entity_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "members", key: 'None, filters: [{ id: "PairKind", subject: "analyst", op: 'Eq, input: 'Text("x") }] },
+        peer: { entity: "members", key: 'Some('Int(202)), filters: [] },
+    };
+    let bad_op_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "members", key: 'None, filters: [{ id: "MemberKind", subject: "analyst", op: 'Gt, input: 'Text("vip") }] },
+        peer: { entity: "members", key: 'Some('Int(202)), filters: [] },
+    };
+    check(edsl.peer_request_ok(p, pairs, peer_ab_request), "peer probe: valid exact-key pair is feasible")
+        && check(edsl.peer_request_ok(p, pairs, attr_only_req), "peer probe: attribute-only participant constraint is feasible")
         && check(!edsl.peer_request_ok(p, pairs, self_req), "peer probe: self-pair is rejected")
         && check(!edsl.peer_request_ok(p, pairs, unknown_req), "peer probe: unknown participant entity is rejected")
         && check(!edsl.peer_request_ok(p, pairs, unrelated_req), "peer probe: unrelated participant pair without a route is rejected")
+        && check(!edsl.peer_request_ok(p, pairs, empty_origin_req), "peer probe: an empty-constraint participant is rejected")
+        && check(!edsl.peer_request_ok(p, pairs, wrong_entity_req), "peer probe: a filter referencing another entity is rejected")
+        && check(!edsl.peer_request_ok(p, pairs, bad_op_req), "peer probe: an unsupported filter operator is rejected")
         && check(!edsl.peer_request_ok(p, orders, peer_ab_request), "peer probe: a hub without a peer route is rejected")
 };
 
@@ -1843,6 +1911,8 @@ def check_peer_request_probe: Bool = do {
 
 def count_agg: qb.AggregateFunction = 'Count;
 def no_requires: Array(Type) = [];
+def eq_ops: Array(edsl.FilterOp) = ['Eq];
+def text_kinds: Array(edsl.FilterInputKind) = ['Text];
 
 @edsl.entity_id("left_parts")
 @edsl.entity_source("left_parts", "lp")
@@ -1850,6 +1920,9 @@ type LeftPart = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
     id: Int,
+    @edsl.column("kind")
+    @edsl.dimension("LeftKind", flag_true, flag_true, eq_ops, text_kinds)
+    kind: String,
 };
 
 @edsl.entity_id("right_parts")
@@ -1858,6 +1931,9 @@ type RightPart = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
     id: Int,
+    @edsl.column("kind")
+    @edsl.dimension("RightKind", flag_true, flag_true, eq_ops, text_kinds)
+    kind: String,
 };
 
 @edsl.entity_id("typed_hub")
@@ -1895,14 +1971,14 @@ def typed_hub_request: edsl.QueryRequest = {
 
 def typed_forward_req: edsl.PeerRequest = {
     subject: "analyst",
-    origin: { entity: "left_parts", key: 'Int(11) },
-    peer: { entity: "right_parts", key: 'Int(22) },
+    origin: { entity: "left_parts", key: 'Some('Int(11)), filters: [] },
+    peer: { entity: "right_parts", key: 'Some('Int(22)), filters: [] },
 };
 
 def typed_swapped_req: edsl.PeerRequest = {
     subject: "analyst",
-    origin: { entity: "right_parts", key: 'Int(22) },
-    peer: { entity: "left_parts", key: 'Int(11) },
+    origin: { entity: "right_parts", key: 'Some('Int(22)), filters: [] },
+    peer: { entity: "left_parts", key: 'Some('Int(11)), filters: [] },
 };
 
 def check_typed_peer_route: Bool = do {
@@ -1936,6 +2012,55 @@ def check_typed_peer_swapped_sql: Bool = do {
         && check(query.bindings == expected, "typed peer: swapped bindings keep placeholder order on their own aliases")
 };
 
+def typed_attr_forward_req: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "left_parts", key: 'None,
+        filters: [{ id: "LeftKind", subject: "analyst", op: 'Eq, input: 'Text("a") }] },
+    peer: { entity: "right_parts", key: 'None,
+        filters: [{ id: "RightKind", subject: "analyst", op: 'Eq, input: 'Text("b") }] },
+};
+
+def typed_key_attr_req: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "left_parts", key: 'Some('Int(11)),
+        filters: [{ id: "LeftKind", subject: "analyst", op: 'Eq, input: 'Text("a") }] },
+    peer: { entity: "right_parts", key: 'Some('Int(22)),
+        filters: [{ id: "RightKind", subject: "analyst", op: 'Eq, input: 'Text("b") }] },
+};
+
+def check_typed_peer_attribute_only: Bool = do {
+    # Heterogeneous attribute-only participants: each side is constrained by its
+    # own entity's filter inside the SAME correlated EXISTS, both exchange
+    # branches remain, and the filters are bound to their own aliases.
+    let plan: qb.Plan = edsl.lower_peer(typed_payload, typed_hub_request, [typed_attr_forward_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(th.id) AS TypedHubCount FROM typed_hub AS th WHERE EXISTS (SELECT 1 FROM left_parts AS lp_o, right_parts AS rp_p WHERE ((th.left = lp_o.id AND th.right = rp_p.id) OR (th.right = lp_o.id AND th.left = rp_p.id)) AND lp_o.kind = ? AND rp_p.kind = ?)";
+    let expected: Array(qb.Val) = ['String("a"), 'String("b")];
+    check(query.sql == expected_sql, "typed peer: attribute-only sides keep one correlated EXISTS and both exchange branches")
+        && check(query.bindings == expected, "typed peer: each side's filter binds to its own alias in order")
+        && check(array.length(plan.joins) == 0 && array.length(plan.exists) == 1,
+            "typed peer: attribute-only pair emits no outer join and no fan-out")
+};
+
+def check_typed_peer_key_plus_attribute: Bool = do {
+    # Exact key and attribute filter on one side are ANDed within that alias;
+    # binding order is key first, then attribute filters (origin side, then peer
+    # side), and stays deterministic.
+    let plan: qb.Plan = edsl.lower_peer(typed_payload, typed_hub_request, [typed_key_attr_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(th.id) AS TypedHubCount FROM typed_hub AS th WHERE EXISTS (SELECT 1 FROM left_parts AS lp_o, right_parts AS rp_p WHERE ((th.left = lp_o.id AND th.right = rp_p.id) OR (th.right = lp_o.id AND th.left = rp_p.id)) AND (lp_o.id = ? AND lp_o.kind = ?) AND (rp_p.id = ? AND rp_p.kind = ?))";
+    let expected: Array(qb.Val) = ['Int(11), 'String("a"), 'Int(22), 'String("b")];
+    check(query.sql == expected_sql, "typed peer: key and attribute filter are ANDed inside each alias")
+        && check(query.bindings == expected, "typed peer: binding order is key then attributes per alias (origin then peer)")
+};
+
+def check_typed_peer_filtered_deterministic: Bool = do {
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_peer(typed_payload, typed_hub_request, [typed_key_attr_req]));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_peer(typed_payload, typed_hub_request, [typed_key_attr_req]));
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings,
+        "typed peer: repeated filtered lowering is byte-identical")
+};
+
 def check_typed_peer_cross_table_key_collision: Bool = do {
     # Heterogeneous participant tables may carry the SAME key value (here 22 on
     # both left_parts and right_parts).  Every equality connects a hub endpoint
@@ -1944,8 +2069,8 @@ def check_typed_peer_cross_table_key_collision: Bool = do {
     # endpoint value through both tables or silently collapse the pair.
     let collision_req: edsl.PeerRequest = {
         subject: "analyst",
-        origin: { entity: "left_parts", key: 'Int(22) },
-        peer: { entity: "right_parts", key: 'Int(22) },
+        origin: { entity: "left_parts", key: 'Some('Int(22)), filters: [] },
+        peer: { entity: "right_parts", key: 'Some('Int(22)), filters: [] },
     };
     let plan: qb.Plan = edsl.lower_peer(typed_payload, typed_hub_request, [collision_req]);
     let query: qb.Query = qb.transform_sqlite(plan);
@@ -2215,16 +2340,21 @@ export def test_ontology: Value = do {
     let c62 = check_peer_route_prepared;
     let c63 = check_peer_same_type_lowering;
     let c64 = check_peer_same_type_swapped_equivalent;
-    let c65 = check_peer_deterministic;
-    let c66 = check_peer_request_probe;
-    let c67 = check_typed_peer_route;
-    let c68 = check_typed_peer_forward_sql;
-    let c69 = check_typed_peer_swapped_sql;
-    let c70 = check_typed_peer_cross_table_key_collision;
-    let c71 = check_peer_route_valid;
-    let c72 = check_peer_route_rejects_same_endpoint;
-    let c73 = check_peer_route_rejects_non_key_participant;
-    let c74 = check_peer_route_rejects_endpoint_range;
-    let c75 = check_peer_route_rejects_duplicate;
+    let c65 = check_peer_same_type_attribute_only;
+    let c66 = check_peer_same_type_attribute_same_value;
+    let c67 = check_peer_deterministic;
+    let c68 = check_peer_request_probe;
+    let c69 = check_typed_peer_route;
+    let c70 = check_typed_peer_forward_sql;
+    let c71 = check_typed_peer_swapped_sql;
+    let c72 = check_typed_peer_attribute_only;
+    let c73 = check_typed_peer_key_plus_attribute;
+    let c74 = check_typed_peer_filtered_deterministic;
+    let c75 = check_typed_peer_cross_table_key_collision;
+    let c76 = check_peer_route_valid;
+    let c77 = check_peer_route_rejects_same_endpoint;
+    let c78 = check_peer_route_rejects_non_key_participant;
+    let c79 = check_peer_route_rejects_endpoint_range;
+    let c80 = check_peer_route_rejects_duplicate;
     'String("ontology tests ok")
 };

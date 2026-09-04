@@ -1814,6 +1814,14 @@ export def test_request_scoped_time_authorization = do {
 #     dynamic keys bind in origin-then-peer order; no outer participant JOIN.
 # ---------------------------------------------------------------------------
 
+def peer_ref_keyed: Fn(String, String) -> edsl.PeerRef = fn(entity, key) {
+    {entity: entity, key: 'Some('Text(key)), filters: []}
+};
+
+def peer_ref_filtered: Fn(String, Array(edsl.FilterRequest)) -> edsl.PeerRef = fn(entity, filters) {
+    {entity: entity, key: 'None, filters: filters}
+};
+
 def peer_intent_with: Fn(String, String, String, String) -> facade.Intent = fn(o_entity, o_key, p_entity, p_key) {
     {
         measures: [request_measure("LinkCount")],
@@ -1831,8 +1839,8 @@ def peer_intent_with: Fn(String, String, String, String) -> facade.Intent = fn(o
         peers: 'Some([
             {
                 subject: "analyst",
-                origin: {entity: o_entity, key: 'Text(o_key)},
-                peer: {entity: p_entity, key: 'Text(p_key)},
+                origin: peer_ref_keyed(o_entity, o_key),
+                peer: peer_ref_keyed(p_entity, p_key),
             },
         ]),
     }
@@ -1840,7 +1848,7 @@ def peer_intent_with: Fn(String, String, String, String) -> facade.Intent = fn(o
 
 export def test_peer_between_net_devices = assert_intent_query(
     peer_intent_with("net_device", "net-1", "net_device", "net-2"),
-    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, EntNetworkElement AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND d_o.id = ? AND d_p.id = ?)",
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, EntNetworkElement AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND d_o.id <> d_p.id AND d_o.id = ? AND d_p.id = ?)",
     ['String("net-1"), 'String("net-2")],
 );
 
@@ -1858,7 +1866,7 @@ export def test_peer_heterogeneous_order_swap = assert_intent_query(
 
 export def test_peer_between_net_ports = assert_intent_query(
     peer_intent_with("net_port", "ge-1", "net_port", "ge-2"),
-    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkPort AS p_o, EntNetworkPort AS p_p WHERE ((l.aPortDn = p_o.id AND l.zPortDn = p_p.id) OR (l.zPortDn = p_o.id AND l.aPortDn = p_p.id)) AND p_o.id = ? AND p_p.id = ?)",
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkPort AS p_o, EntNetworkPort AS p_p WHERE ((l.aPortDn = p_o.id AND l.zPortDn = p_p.id) OR (l.zPortDn = p_o.id AND l.aPortDn = p_p.id)) AND p_o.id <> p_p.id AND p_o.id = ? AND p_p.id = ?)",
     ['String("ge-1"), 'String("ge-2")],
 );
 
@@ -1935,8 +1943,8 @@ def peer_filtered_intent: facade.Intent = {
     peers: 'Some([
         {
             subject: "analyst",
-            origin: {entity: "net_device", key: 'Text("net-1")},
-            peer: {entity: "server_device", key: 'Text("srv-1")},
+            origin: peer_ref_keyed("net_device", "net-1"),
+            peer: peer_ref_keyed("server_device", "srv-1"),
         },
     ]),
 };
@@ -1961,21 +1969,21 @@ export def test_peer_base_filter_deterministic = assert_deterministic_intent(pee
 def peer_request_one: Fn(String, String, String, String) -> Array(edsl.PeerRequest) = fn(o_entity, o_key, p_entity, p_key) {
     [{
         subject: "analyst",
-        origin: {entity: o_entity, key: 'Text(o_key)},
-        peer: {entity: p_entity, key: 'Text(p_key)},
+        origin: peer_ref_keyed(o_entity, o_key),
+        peer: peer_ref_keyed(p_entity, p_key),
     }]
 };
 
 def peer_request_two: Array(edsl.PeerRequest) = [
     {
         subject: "analyst",
-        origin: {entity: "net_device", key: 'Text("net-1")},
-        peer: {entity: "net_device", key: 'Text("net-2")},
+        origin: peer_ref_keyed("net_device", "net-1"),
+        peer: peer_ref_keyed("net_device", "net-2"),
     },
     {
         subject: "analyst",
-        origin: {entity: "server_device", key: 'Text("srv-1")},
-        peer: {entity: "server_device", key: 'Text("srv-2")},
+        origin: peer_ref_keyed("server_device", "srv-1"),
+        peer: peer_ref_keyed("server_device", "srv-2"),
     },
 ];
 
@@ -2084,6 +2092,340 @@ export def test_peer_gate_not_two_exists = do {
         'True
     } else {
         fail!("peer request must lower to a single correlated EXISTS", query.sql)
+    };
+    'True
+};
+
+# ---------------------------------------------------------------------------
+# 49. Filtered paired-endpoint (PeerRef.filters + optional exact key).
+#     A physical link between "a participant matching constraint A" and "a
+#     participant matching constraint B" lowers to exactly ONE PeerRequest whose
+#     sides carry own-entity attribute filters and/or an exact key.  Same-entity
+#     routes add the alias key-inequality identity proof inside the same
+#     correlated EXISTS; heterogeneous routes never add a bare key inequality.
+#     All dynamic values stay parameterized in origin-then-peer order.
+# ---------------------------------------------------------------------------
+
+def peer_ref_mixed: Fn(String, Option(String), Array(edsl.FilterRequest)) -> edsl.PeerRef = fn(entity, key, filters) {
+    let key_input: Option(edsl.FilterInput) = match key {
+        'Some(k) => 'Some('Text(k)),
+        'None => 'None,
+    };
+    {entity: entity, key: key_input, filters: filters}
+};
+
+def peer_intent_refs: Fn(edsl.PeerRef, edsl.PeerRef) -> facade.Intent = fn(o, p) {
+    {
+        measures: [request_measure("LinkCount")],
+        dimensions: [],
+        filters: [],
+        any_of: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+        exists: [],
+        having: [],
+        group_count: 'None,
+        time_windows: 'None,
+        peers: 'Some([{subject: "analyst", origin: o, peer: p}]),
+    }
+};
+
+def f_name_startswith: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "NetworkDeviceName", subject: "analyst", op: 'StartsWith, input: 'Text(value)}
+};
+def f_name_eq: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "NetworkDeviceName", subject: "analyst", op: 'Eq, input: 'Text(value)}
+};
+def f_storage_name_startswith: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "StorageName", subject: "analyst", op: 'StartsWith, input: 'Text(value)}
+};
+def f_storage_subclass: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "StorageSubClass", subject: "analyst", op: 'Eq, input: 'Text(value)}
+};
+def f_terminal_name_eq: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "TerminalName", subject: "analyst", op: 'Eq, input: 'Text(value)}
+};
+def f_collab_name_eq: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "CollabName", subject: "analyst", op: 'Eq, input: 'Text(value)}
+};
+def f_netport_type_eq: Fn(String) -> edsl.FilterRequest = fn(value) {
+    {id: "NetPortType", subject: "analyst", op: 'Eq, input: 'Text(value)}
+};
+
+# Same entity: both sides filtered by name prefix; SQL keeps two participant
+# aliases, both A/Z exchange branches, the key-inequality proof and both
+# per-alias filter bindings.
+export def test_peer_same_type_filtered_prefixes = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, EntNetworkElement AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND d_o.id <> d_p.id AND instr(lower(d_o.name), lower(?)) = ? AND instr(lower(d_p.name), lower(?)) = ?)",
+    ['String("core"), 'Int(1), 'String("edge"), 'Int(1)],
+);
+
+export def test_peer_same_type_filtered_deterministic = assert_deterministic_intent(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    ),
+);
+
+# Heterogeneous network/storage: attribute filters per side, single paired
+# EXISTS, NO bare key-inequality (cross-table same key stays a legal identity).
+export def test_peer_hetero_type_filtered = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+        peer_ref_filtered("storage_device", [f_storage_name_startswith("stor")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, HuaweiStorageDevice AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND instr(lower(d_o.name), lower(?)) = ? AND instr(lower(d_p.name), lower(?)) = ?)",
+    ['String("core"), 'Int(1), 'String("stor"), 'Int(1)],
+);
+
+export def test_peer_hetero_classification_filtered = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_eq("core-01")]),
+        peer_ref_filtered("storage_device", [f_storage_subclass("HuaweiSmisStorageDevice")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, HuaweiStorageDevice AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND d_o.name = ? AND d_p.subClassName = ?)",
+    ['String("core-01"), 'String("HuaweiSmisStorageDevice")],
+);
+
+export def test_peer_hetero_filtered_deterministic = assert_deterministic_intent(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+        peer_ref_filtered("storage_device", [f_storage_name_startswith("stor")]),
+    ),
+);
+
+# Request-side exchange: storage becomes origin, network becomes peer; binding
+# order and alias/table assignment follow origin-then-peer.
+export def test_peer_hetero_filtered_order_swap = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_filtered("storage_device", [f_storage_name_startswith("stor")]),
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM HuaweiStorageDevice AS d_o, EntNetworkElement AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND instr(lower(d_o.name), lower(?)) = ? AND instr(lower(d_p.name), lower(?)) = ?)",
+    ['String("stor"), 'Int(1), 'String("core"), 'Int(1)],
+);
+
+# key + attribute mixed on one side (origin exact key, peer attribute filter);
+# key binds before that side's filters; same-entity proof present.
+export def test_peer_key_plus_attribute_mix = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_mixed("net_device", 'Some("net-1"), []),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, EntNetworkElement AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND d_o.id <> d_p.id AND d_o.id = ? AND instr(lower(d_p.name), lower(?)) = ?)",
+    ['String("net-1"), 'String("edge"), 'Int(1)],
+);
+
+export def test_peer_key_plus_attribute_mix_deterministic = assert_deterministic_intent(
+    peer_intent_refs(
+        peer_ref_mixed("net_device", 'Some("net-1"), []),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    ),
+);
+
+# The same attribute-filter value on both sides of a same-entity route is legal:
+# the two sides are still distinct participants because the SQL keeps the
+# key-inequality proof and two independent alias-local bindings.
+export def test_peer_same_entity_same_filter_value = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_eq("shared-name")]),
+        peer_ref_filtered("net_device", [f_name_eq("shared-name")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, EntNetworkElement AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND d_o.id <> d_p.id AND d_o.name = ? AND d_p.name = ?)",
+    ['String("shared-name"), 'String("shared-name")],
+);
+
+export def test_peer_same_filter_value_deterministic = assert_deterministic_intent(
+    peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_eq("shared-name")]),
+        peer_ref_filtered("net_device", [f_name_eq("shared-name")]),
+    ),
+);
+
+# Heterogeneous cross-table with the SAME key text on both sides and filters on
+# both sides: two participant aliases keep independent identity (no key
+# inequality needed for different tables).
+export def test_peer_hetero_cross_table_same_key_with_filters = assert_intent_query(
+    peer_intent_refs(
+        peer_ref_mixed("net_device", 'Some("shared-key-001"), [f_name_startswith("core")]),
+        peer_ref_mixed("storage_device", 'Some("shared-key-001"), [f_storage_name_startswith("stor")]),
+    ),
+    "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, HuaweiStorageDevice AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND (d_o.id = ? AND instr(lower(d_o.name), lower(?)) = ?) AND (d_p.id = ? AND instr(lower(d_p.name), lower(?)) = ?))",
+    ['String("shared-key-001"), 'String("core"), 'Int(1), 'String("shared-key-001"), 'String("stor"), 'Int(1)],
+);
+
+export def test_peer_hetero_same_key_filters_deterministic = assert_deterministic_intent(
+    peer_intent_refs(
+        peer_ref_mixed("net_device", 'Some("shared-key-001"), [f_name_startswith("core")]),
+        peer_ref_mixed("storage_device", 'Some("shared-key-001"), [f_storage_name_startswith("stor")]),
+    ),
+);
+
+# ---------------------------------------------------------------------------
+# 50. Filtered-peer deterministic rejection (ontology pure probe + facade gate).
+#     The lowering path never degrades to two independent EXISTS and never
+#     ignores a side constraint: unsupported filters / empty sides / self-pair /
+#     unpaired participants are rejected deterministically.
+# ---------------------------------------------------------------------------
+
+def physical_link_index = do {
+    match array.find(model.payload.entities, fn(e) { e.id == "physical_link" }) {
+        'Some(e) => e.index,
+        'None => fail!("physical_link entity is missing from the model payload"),
+    }
+};
+
+def peer_route_probe: Fn(edsl.PeerRequest) -> Bool = fn(peer) {
+    edsl.peer_request_ok(model.payload, physical_link_index, peer)
+};
+
+def peer_request_filtered: Fn(edsl.PeerRef, edsl.PeerRef) -> edsl.PeerRequest = fn(o, p) {
+    {subject: "analyst", origin: o, peer: p}
+};
+
+def expect_route_rejected: Fn(edsl.PeerRequest) -> Bool = fn(peer) {
+    if peer_route_probe(peer) == 'False {
+        'True
+    } else {
+        fail!("expected deterministic peer-route rejection", peer)
+    }
+};
+
+export def test_filtered_peer_rejects_empty_origin_side = do {
+    let peer = peer_request_filtered(
+        peer_ref_filtered("net_device", []),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    let _gate: Bool = expect_peer_rejected(peer_intent_refs(peer.origin, peer.peer));
+    'True
+};
+
+export def test_filtered_peer_rejects_wrong_entity_filter = do {
+    # StorageName is a storage-entity dimension; it cannot filter a net_device side.
+    let peer = peer_request_filtered(
+        peer_ref_filtered("net_device", [f_storage_name_startswith("stor")]),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    'True
+};
+
+export def test_filtered_peer_rejects_unsupported_operator = do {
+    # CommuState is a closed enum supporting only Eq; Contains is unauthorized.
+    let bad_filter: edsl.FilterRequest = {
+        id: "NetworkDeviceCommuState",
+        subject: "analyst",
+        op: 'Contains,
+        input: 'Text("在线"),
+    };
+    let peer = peer_request_filtered(
+        peer_ref_filtered("net_device", [bad_filter]),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    'True
+};
+
+export def test_filtered_peer_rejects_unknown_dimension = do {
+    let bad_filter: edsl.FilterRequest = {
+        id: "NoSuchDimension",
+        subject: "analyst",
+        op: 'Eq,
+        input: 'Text("x"),
+    };
+    let peer = peer_request_filtered(
+        peer_ref_filtered("net_device", [bad_filter]),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    'True
+};
+
+export def test_filtered_peer_rejects_unauthorized_subject = do {
+    let peer_filter: edsl.FilterRequest = {
+        id: "NetworkDeviceName",
+        subject: "intruder",
+        op: 'Eq,
+        input: 'Text("x"),
+    };
+    let peer = peer_request_filtered(
+        peer_ref_filtered("net_device", [peer_filter]),
+        peer_ref_filtered("net_device", [f_name_startswith("edge")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    'True
+};
+
+export def test_filtered_peer_rejects_self_pair_via_filters_only = do {
+    # Both sides filter-only (no exact keys); a same-entity route cannot be a
+    # single participant occupying both ends - the ontology probe still accepts
+    # two distinct rows, so a *self-keyed* pair remains the rejection case:
+    let peer = peer_request_filtered(
+        peer_ref_keyed("net_device", "net-1"),
+        peer_ref_keyed("net_device", "net-1"),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    let _gate: Bool = expect_peer_rejected(peer_intent_with("net_device", "net-1", "net_device", "net-1"));
+    'True
+};
+
+export def test_filtered_peer_rejects_terminal = do {
+    let peer = peer_request_filtered(
+        peer_ref_filtered("terminal_device", [f_terminal_name_eq("t-1")]),
+        peer_ref_filtered("terminal_device", [f_terminal_name_eq("t-2")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    let _gate: Bool = expect_peer_rejected(peer_intent_with("terminal_device", "t-1", "terminal_device", "t-2"));
+    'True
+};
+
+export def test_filtered_peer_rejects_collab = do {
+    let _probe: Bool = expect_route_rejected(
+        peer_request_filtered(
+            peer_ref_filtered("collab_device", [f_collab_name_eq("c-1")]),
+            peer_ref_filtered("collab_device", [f_collab_name_eq("c-2")]),
+        ),
+    );
+    let _gate: Bool = expect_peer_rejected(peer_intent_with("collab_device", "c-1", "collab_device", "c-2"));
+    'True
+};
+
+export def test_filtered_peer_rejects_device_port_mix = do {
+    let peer = peer_request_filtered(
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+        peer_ref_filtered("net_port", [f_netport_type_eq("GE")]),
+    );
+    let _probe: Bool = expect_route_rejected(peer);
+    let _gate: Bool = expect_peer_rejected(peer_intent_with("net_device", "net-1", "net_port", "ge-1"));
+    'True
+};
+
+# Structural proof: a filtered paired intent lowers to ONE correlated EXISTS
+# (never two independent dual-hub EXISTS) and compiles twice to the same bytes.
+export def test_filtered_peer_single_exists_gate = do {
+    let intent = peer_intent_refs(
+        peer_ref_filtered("net_device", [f_name_startswith("core")]),
+        peer_ref_filtered("storage_device", [f_storage_name_startswith("stor")]),
+    );
+    let _gate: Bool = expect_peer_accepted(intent);
+    let first: qb.Query = facade.make_intent_query(intent);
+    let second: qb.Query = facade.make_intent_query(intent);
+    let _deterministic: Bool = if first == second {
+        'True
+    } else {
+        fail!("filtered peer lowering is not deterministic")
+    };
+    let _single_exists: Bool = if first.sql == "SELECT count(l.id) AS LinkCount FROM EnterprisePhysicalLink AS l WHERE EXISTS (SELECT 1 FROM EntNetworkElement AS d_o, HuaweiStorageDevice AS d_p WHERE ((l.aNeResId = d_o.id AND l.zNeResId = d_p.id) OR (l.zNeResId = d_o.id AND l.aNeResId = d_p.id)) AND instr(lower(d_o.name), lower(?)) = ? AND instr(lower(d_p.name), lower(?)) = ?)" {
+        'True
+    } else {
+        fail!("filtered peer must lower to a single correlated EXISTS", first.sql)
     };
     'True
 };

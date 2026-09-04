@@ -3682,13 +3682,14 @@ def peer_corr_fixture: Fn(qb.Val, qb.Val) -> qb.PeerCorr = fn(origin, peer) {
     let branch_b = qb.peer_branch(b_origin, b_peer);
     let origin_filter: qb.Expr = qb.scalar('Eq, [qb.column("mo", "id"), qb.bind_val(origin)]);
     let peer_filter: qb.Expr = qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_val(peer)]);
-    qb.peer_corr(
+    qb.peer_corr_distinct(
         qb.source("mo", "members"),
         qb.source("mp", "members"),
         branch_a,
         branch_b,
         'Some(origin_filter),
         'Some(peer_filter),
+        'True,
     )
 };
 
@@ -3696,7 +3697,7 @@ export def peer_exists_lowers_to_two_ordered_branches = do {
     let ex = qb.exists_peer(peer_corr_fixture('Int(101), 'Int(202)));
     let q = qb.transform_sqlite(peer_probe_plan(ex));
     let expected: Array(qb.Val) = ['Int(101), 'Int(202)];
-    let expected_sql = "SELECT pr.id FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mo, members AS mp WHERE ((pr.left_id = mo.id AND pr.right_id = mp.id) OR (pr.right_id = mo.id AND pr.left_id = mp.id)) AND mo.id = ? AND mp.id = ?)";
+    let expected_sql = "SELECT pr.id FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mo, members AS mp WHERE ((pr.left_id = mo.id AND pr.right_id = mp.id) OR (pr.right_id = mo.id AND pr.left_id = mp.id)) AND mo.id <> mp.id AND mo.id = ? AND mp.id = ?)";
     assert_ok(q.sql == expected_sql,
         "peer: two inner participant aliases and the two ordered endpoint-exchange branches")
         && assert_ok(q.bindings == expected, "peer: origin/peer key binds belong to their own inner aliases in placeholder order")
@@ -3825,4 +3826,27 @@ export def peer_exists_placeholders_match_bindings = do {
     let ex = qb.exists_peer(peer_corr_fixture('Int(101), 'Int(202)));
     let q = qb.transform_sqlite(peer_probe_plan(ex));
     (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};
+
+export def peer_exists_cross_table_no_bare_key_guard = do {
+    # For participants of DIFFERENT entities/tables the same key value is still
+    # two different identities: NO bare `<>` inequality is added, and the pair
+    # stays legal (cross-table key collision).
+    let a_origin = qb.column_eq(peer_left_role, qb.column_ref("lo", "id"));
+    let a_peer = qb.column_eq(peer_right_role, qb.column_ref("rp", "id"));
+    let b_origin = qb.column_eq(peer_right_role, qb.column_ref("lo", "id"));
+    let b_peer = qb.column_eq(peer_left_role, qb.column_ref("rp", "id"));
+    let corr = qb.peer_corr(
+        qb.source("lo", "left_parts"),
+        qb.source("rp", "right_parts"),
+        qb.peer_branch(a_origin, a_peer),
+        qb.peer_branch(b_origin, b_peer),
+        'Some(qb.scalar('Eq, [qb.column("lo", "id"), qb.bind_int(22)])),
+        'Some(qb.scalar('Eq, [qb.column("rp", "id"), qb.bind_int(22)])),
+    );
+    let q = qb.transform_sqlite(peer_probe_plan(qb.exists_peer(corr)));
+    let expected: Array(qb.Val) = ['Int(22), 'Int(22)];
+    assert_ok(!string.contains(q.sql, "<>"), "peer: no bare key inequality across different participant tables")
+        && assert_ok(q.bindings == expected,
+            "peer: cross-table equal keys remain two independent bindings")
 };

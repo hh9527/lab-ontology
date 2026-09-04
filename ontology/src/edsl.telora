@@ -362,11 +362,16 @@ type HavingRequest = struct {
 };
 
 # One participant reference of a paired-endpoint request: the stable entity id
-# of the participant (must match one endpoint slot of the hub's paired route)
-# and the participant's key value (a dynamic scalar, always bound).
+# of the participant (must match one endpoint slot of the hub's paired route),
+# an optional exact key value (a dynamic scalar, always bound), and zero or more
+# attribute filters over the participant's OWN entity.  A participant side must
+# carry at least one verifiable constraint (exact key and/or attribute filter);
+# a completely unconstrained side is rejected so a broad cross-product match can
+# never be constructed.
 type PeerRef = struct {
     entity: String,
-    key: FilterInput,
+    key: Option(FilterInput),
+    filters: Array(FilterRequest),
 };
 
 # Paired-endpoint (peer) request on a hub base row: keep the hub row only when
@@ -2532,25 +2537,122 @@ def peer_inner_alias: Fn(EntityEntry, String) -> String = fn(entry, suffix) {
     `\{entry.alias}_\{suffix}`
 };
 
+# Build a dimension expression over a supplied inner alias (used inside the
+# paired-endpoint correlated EXISTS, where each participant has its own alias).
+def dimension_expr_on_alias: Fn(PreparedPayload, DimensionEntry, String) -> qb.Expr = fn(payload, entry, alias) {
+    let entity = get_index(payload.entities, entry.entity);
+    let field = get_index(entity.fields, entry.field);
+    let base = qb.column(alias, field.column);
+    entry.build(base)
+};
+
+# Resolve a paired-endpoint participant attribute filter dimension: the filter
+# must reference a declared dimension of the participant's OWN entity.
+def peer_filter_dimension: Fn(PreparedPayload, Int, FilterRequest) -> DimensionEntry = fn(payload, entity, req) {
+    if !payload.authorize(req.subject) {
+        fail!("subject is not authorized for paired-endpoint filter", req.subject, req.id)
+    } else {
+        match array.find(payload.dimensions, fn(d) { d.id == req.id }) {
+            'None => fail!("unknown paired-endpoint filter dimension", req.subject, req.id),
+            'Some(d) => if d.entity != entity {
+                fail!("paired-endpoint filter must reference its own participant entity", req.subject, req.id)
+            } else {
+                d
+            },
+        }
+    }
+};
+
+# Lower one closed participant attribute filter over the participant's inner
+# alias (enum domain, operation and input-kind validation reused).
+def peer_attr_expr: Fn(PreparedPayload, DimensionEntry, FilterRequest, String) -> qb.Expr = fn(payload, entry, req, alias) {
+    if !entry.authorized {
+        fail!("dimension is not authorized", req.subject, req.id)
+    } else if !entry.filterable {
+        fail!("dimension has no filter capability", req.subject, req.id)
+    } else if !array.any(entry.ops, fn(op) { op == req.op }) {
+        fail!("filter operation not supported for dimension", req.subject, req.id)
+    } else {
+        let base = dimension_expr_on_alias(payload, entry, alias);
+        if array.length(entry.values) > 0 {
+            match req.op {
+                'Eq => match req.input {
+                    'Text(s) => if array.any(entry.values, fn(v) { v.value == s }) {
+                        qb.scalar('Eq, [base, qb.bind_string(s)])
+                    } else {
+                        fail!("unknown enum value for dimension", req.subject, req.id, s)
+                    },
+                    _ => fail!("invalid enum filter value for dimension", req.subject, req.id, req.input),
+                },
+                'Ne => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'Gt => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'Ge => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'Lt => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'Le => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'Contains => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'NotContains => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'StartsWith => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+                'EndsWith => fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op),
+            }
+        } else if is_text_op(req.op) {
+            match req.input {
+                'Text(_) => if !filter_input_allowed(entry.input_kinds, req.input) {
+                    fail!("invalid filter value for dimension", req.subject, req.id)
+                } else {
+                    open_condition_expr(base, req.op, to_bind(req.input))
+                },
+                _ => fail!("text filter operation requires a text input value", req.subject, req.id),
+            }
+        } else if !filter_input_allowed(entry.input_kinds, req.input) {
+            fail!("invalid filter value for dimension", req.subject, req.id)
+        } else {
+            open_condition_expr(base, req.op, to_bind(req.input))
+        }
+    }
+};
+
+# Combine one side's constraints into a single alias-local predicate: the exact
+# key (when present) first, then the attribute filters in request order (AND).
+def peer_side_constraints: Fn(PreparedPayload, Int, String, PeerRef, String) -> Option(qb.Expr) = fn(payload, entity, alias, ref, key_col) {
+    if ref.key == 'None && array.length(ref.filters) == 0 {
+        fail!("paired-endpoint participant must carry at least one verifiable constraint (exact key or attribute filter)", ref.entity)
+    } else {
+        let key_expr: Option(qb.Expr) = match ref.key {
+            'Some(input) => 'Some(qb.scalar('Eq, [qb.column(alias, key_col), to_bind(input)])),
+            'None => 'None,
+        };
+        let attr_exprs = array.map(ref.filters, fn(req) {
+            let d = peer_filter_dimension(payload, entity, req);
+            peer_attr_expr(payload, d, req, alias)
+        });
+        append_filter_terms(key_expr, attr_exprs)
+    }
+};
+
 # Lower one paired-endpoint (peer) request on a hub base row.  The request names
-# two participant entities and their key values.  Lowering builds a correlated
+# two participant entities; each side carries an optional exact key and zero or
+# more attribute filters over its own entity.  Lowering builds a correlated
 # EXISTS over TWO inner participant sources (origin and peer aliases) whose
 # `WHERE` holds the two closed endpoint-exchange branches:
 #   (hub.A = origin.key AND hub.B = peer.key)
 #   OR (hub.B = origin.key AND hub.A = peer.key)
-# and additionally binds each specified participant key against its OWN inner
-# alias (origin_filter/peer_filter).  The participant entity therefore always
-# selects the validated inner source/alias, so a hub endpoint value is only
-# interpreted through the participant table the request declared.  Self-pair and
-# requests without a declared peer route fail atomically; the predicate is a
-# pure correlated EXISTS, so it never joins or fans out the hub base grain.
+# followed by the alias-local participant constraints (exact key then attribute
+# filters, ANDed per side; deterministic binding order: origin side first, then
+# peer side).  The participant entity always selects the validated inner
+# source/alias, so a hub endpoint value is only interpreted through the
+# participant table the request declared.  Self-pair, empty-constraint sides,
+# cross-entity filters and requests without a declared peer route fail
+# atomically; the predicate is a pure correlated EXISTS, so it never joins or
+# fans out the hub base grain.
 def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb.Exists = fn(payload, hub_entity, spec) {
     if !payload.authorize(spec.subject) {
         fail!("subject is not authorized for paired-endpoint request", spec.subject, spec.origin.entity, spec.peer.entity)
     } else {
         let origin_entity = entity_by_id(payload, spec.origin.entity);
         let peer_entity = entity_by_id(payload, spec.peer.entity);
-        if origin_entity == peer_entity && spec.origin.key == spec.peer.key {
+        if origin_entity == peer_entity
+            && spec.origin.key != 'None && spec.peer.key != 'None
+            && spec.origin.key == spec.peer.key {
             fail!("paired-endpoint request requires two distinct participants (self-pair rejected)", spec.origin.entity, spec.peer.entity)
         } else {
             match find_peer_route(payload, hub_entity, origin_entity, peer_entity) {
@@ -2559,41 +2661,87 @@ def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb.Exists = fn(payloa
                     let hub_entry = get_index(payload.entities, hub_entity);
                     let origin_entry = get_index(payload.entities, origin_entity);
                     let peer_entry = get_index(payload.entities, peer_entity);
-                    # The two hub role columns of the route.
-                    let hub_l = qb.column_ref(hub_entry.alias, get_index(hub_entry.fields, route.origin_field).column);
-                    let hub_r = qb.column_ref(hub_entry.alias, get_index(hub_entry.fields, route.peer_field).column);
-                    # Each participant contributes its own inner alias and key.
-                    let origin_alias = peer_inner_alias(origin_entry, "o");
-                    let peer_alias = peer_inner_alias(peer_entry, "p");
-                    let origin_key_col = get_index(origin_entry.fields, route_key_for(route, origin_entity)).column;
-                    let peer_key_col = get_index(peer_entry.fields, route_key_for(route, peer_entity)).column;
-                    let origin_key_ref = qb.column_ref(origin_alias, origin_key_col);
-                    let peer_key_ref = qb.column_ref(peer_alias, peer_key_col);
-                    # Two ordered exchange branches (both always present).
-                    let a_origin = qb.column_eq(hub_l, origin_key_ref);
-                    let a_peer = qb.column_eq(hub_r, peer_key_ref);
-                    let b_origin = qb.column_eq(hub_r, origin_key_ref);
-                    let b_peer = qb.column_eq(hub_l, peer_key_ref);
-                    let branch_a = qb.peer_branch(a_origin, a_peer);
-                    let branch_b = qb.peer_branch(b_origin, b_peer);
-                    # The specified participants are bound against their own
-                    # inner alias (identity proof lives in the SQL structure).
-                    let origin_bind: qb.Expr = qb.scalar('Eq, [qb.column(origin_alias, origin_key_col), to_bind(spec.origin.key)]);
-                    let peer_bind: qb.Expr = qb.scalar('Eq, [qb.column(peer_alias, peer_key_col), to_bind(spec.peer.key)]);
-                    let origin_source = qb.source(origin_alias, origin_entry.table);
-                    let peer_source = qb.source(peer_alias, peer_entry.table);
-                    let corr = qb.peer_corr(origin_source, peer_source, branch_a, branch_b, 'Some(origin_bind), 'Some(peer_bind));
-                    qb.exists_peer(corr)
+                    if origin_entry.union != 'None || peer_entry.union != 'None {
+                        fail!("paired-endpoint participants must be physical entities", spec.origin.entity, spec.peer.entity)
+                    } else {
+                        # The two hub role columns of the route.
+                        let hub_l = qb.column_ref(hub_entry.alias, get_index(hub_entry.fields, route.origin_field).column);
+                        let hub_r = qb.column_ref(hub_entry.alias, get_index(hub_entry.fields, route.peer_field).column);
+                        # Each participant contributes its own inner alias and key.
+                        let origin_alias = peer_inner_alias(origin_entry, "o");
+                        let peer_alias = peer_inner_alias(peer_entry, "p");
+                        let origin_key_col = get_index(origin_entry.fields, route_key_for(route, origin_entity)).column;
+                        let peer_key_col = get_index(peer_entry.fields, route_key_for(route, peer_entity)).column;
+                        let origin_key_ref = qb.column_ref(origin_alias, origin_key_col);
+                        let peer_key_ref = qb.column_ref(peer_alias, peer_key_col);
+                        # Two ordered exchange branches (both always present).
+                        let a_origin = qb.column_eq(hub_l, origin_key_ref);
+                        let a_peer = qb.column_eq(hub_r, peer_key_ref);
+                        let b_origin = qb.column_eq(hub_r, origin_key_ref);
+                        let b_peer = qb.column_eq(hub_l, peer_key_ref);
+                        let branch_a = qb.peer_branch(a_origin, a_peer);
+                        let branch_b = qb.peer_branch(b_origin, b_peer);
+                        # Participant constraints stay inside the same correlated
+                        # EXISTS, each bound to its own inner alias.
+                        let origin_filter = peer_side_constraints(payload, origin_entity, origin_alias, spec.origin, origin_key_col);
+                        let peer_filter = peer_side_constraints(payload, peer_entity, peer_alias, spec.peer, peer_key_col);
+                        let origin_source = qb.source(origin_alias, origin_entry.table);
+                        let peer_source = qb.source(peer_alias, peer_entry.table);
+                        let corr = qb.peer_corr_distinct(origin_source, peer_source, branch_a, branch_b, origin_filter, peer_filter, origin_entity == peer_entity);
+                        qb.exists_peer(corr)
+                    }
                 },
             }
         }
     }
 };
 
+# A participant side is verifiable when it carries an exact key or at least one
+# attribute filter.
+def peer_side_has_constraint: Fn(PeerRef) -> Bool = fn(ref) {
+    ref.key != 'None || array.length(ref.filters) > 0
+};
+
+# Pure per-filter check for a paired-endpoint participant attribute filter.
+def peer_side_filter_ok: Fn(PreparedPayload, Int, FilterRequest) -> Bool = fn(payload, entity, req) {
+    if !payload.authorize(req.subject) {
+        'False
+    } else {
+        match array.find(payload.dimensions, fn(d) { d.id == req.id }) {
+            'None => 'False,
+            'Some(d) => do {
+                if d.entity != entity {
+                    'False
+                } else if !d.authorized {
+                    'False
+                } else if !d.filterable {
+                    'False
+                } else if !array.any(d.ops, fn(op) { op == req.op }) {
+                    'False
+                } else if array.length(d.values) > 0 {
+                    match (req.op, req.input) {
+                        ('Eq, 'Text(s)) => array.any(d.values, fn(v) { v.value == s }),
+                        _ => 'False,
+                    }
+                } else if is_text_op(req.op) {
+                    match req.input {
+                        'Text(_) => filter_input_allowed(d.input_kinds, req.input),
+                        _ => 'False,
+                    }
+                } else {
+                    filter_input_allowed(d.input_kinds, req.input)
+                }
+            },
+        }
+    }
+};
+
 # Pure feasibility probe for a paired-endpoint request: 'True when the subject
-# is authorized, the two participants are registered (distinct when of the same
-# entity), and the base hub declares a peer route that can pair them.  Used by
-# tests to assert deterministic rejection without a failing lowering.
+# is authorized, both participant sides are registered and carry at least one
+# verifiable constraint over their own entity, the participants are distinct
+# when they share an exact key, and the base hub declares a peer route that can
+# pair them.  Used by tests to assert deterministic rejection without a failing
+# lowering.
 def peer_request_ok: Fn(PreparedPayload, Int, PeerRequest) -> Bool = fn(payload, hub_entity, spec) {
     if !payload.authorize(spec.subject) {
         'False
@@ -2604,7 +2752,16 @@ def peer_request_ok: Fn(PreparedPayload, Int, PeerRequest) -> Bool = fn(payload,
             ('Some(origin_entry), 'Some(peer_entry)) => do {
                 let origin_entity = origin_entry.index;
                 let peer_entity = peer_entry.index;
-                if origin_entity == peer_entity && spec.origin.key == spec.peer.key {
+                if origin_entry.union != 'None || peer_entry.union != 'None {
+                    'False
+                } else if origin_entity == peer_entity
+                    && spec.origin.key != 'None && spec.peer.key != 'None
+                    && spec.origin.key == spec.peer.key {
+                    'False
+                } else if !peer_side_has_constraint(spec.origin) || !peer_side_has_constraint(spec.peer) {
+                    'False
+                } else if !array.all(spec.origin.filters, fn(req) { peer_side_filter_ok(payload, origin_entity, req) })
+                    || !array.all(spec.peer.filters, fn(req) { peer_side_filter_ok(payload, peer_entity, req) }) {
                     'False
                 } else {
                     match find_peer_route(payload, hub_entity, origin_entity, peer_entity) {

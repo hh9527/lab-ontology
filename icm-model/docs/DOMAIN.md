@@ -83,16 +83,21 @@
 - **两指定 participant 互为对端（已支持，peer_hub）**：链路为 base，`origin` 命中一端、
   `peer` 命中另一端时该链路保留；编译为单个含两个 participant alias 的 correlated
   EXISTS，同时包含 `(A → origin, Z → peer)` 与 `(Z → origin, A → peer)` 两个交换分支，
-  不产生外层 JOIN/fan-out；动态 key 绑定顺序为 origin 后 peer。同类型与异构（网络/
-  PON/服务器/存储）配对均支持；端口仅在与另一端口（A/Z port DN）配对的路由中使用，
-  不把 device id 与 port DN 混成一条路由。origin/peer 均需明确实体与精确 key；自配、
-  终端/协作 participant、缺路线/歧义等确定性拒绝。
+  不产生外层 JOIN/fan-out。每侧 participant 由**可选精确 key 与/或自身实体属性过滤**
+  标识（名称前缀/分类/版本/别名等已授权维度；每侧至少一项可验证约束，完全无约束拒绝）；
+  动态 key/过滤值只进入 bindings，顺序 origin 后 peer、每侧 key 先于属性过滤。同类型与
+  异构（网络/PON/服务器/存储）配对均支持；端口仅在与另一端口（A/Z port DN）配对的路由
+  中使用，不把 device id 与 port DN 混成一条路由。origin/peer 为同一实体/表时 SQL 内含
+  alias key 不等证明（`<o.key> <> <p.key>`），单条 participant 行不能同时占据两端；
+  异构（不同表）不加裸 key 不等，跨表同值 key 仍属不同身份。自配（同实体同精确 key）、
+  终端/协作 participant、peer 过滤跨实体/未授权、缺路线/歧义等确定性拒绝。
 - **peer 模式组合边界（确定性拒绝，不静默丢约束）**：一次只能携带一个 `PeerRequest`，
   且不得与 subject `any_of`、`exists`、`having` 或 `group_count` 组合——这些约束一旦
   出现会与 peer 一起确定性拒绝（在 lowering 前），不会被忽略；普通链路 base filters、
   ordering、limit/offset 仍按 QueryRequest 既有契约保留。
-- **不支持的形态（确定性拒绝）**：peer 侧属性/分类过滤、peer 上的告警、peer KPI 及在
-  peer 之上的二次聚合仍未公开；相关请求确定性拒绝，不拼接 SQL 或用不保粒度的 Join。
+- **不支持的形态（确定性拒绝）**：peer 结果上的告警/KPI、对端维度分组、peer 之上的
+  二次聚合仍未公开；相关请求确定性拒绝，不拼接 SQL、不用不保粒度的 Join、也不把两个
+  独立 dual-hub EXISTS 描述成“相对两端”。
 
 ## 4. 业务关系与归属
 
@@ -173,7 +178,7 @@
 | `StorageDeviceCount` | 存储设备对象数 | 个 |
 | `TerminalDeviceCount` | 终端设备对象数 | 个 |
 | `CollabDeviceCount` | 协作设备对象数 | 个 |
-| `LinkCount` | 物理链路条数（链路为 base；可按任一端 participant 筛选/计数，同一链路只计一次；可用“两指定 participant 互为对端”计数，同一链路去重；peer 属性/分类、peer 告警、peer KPI 与二次聚合未公开） | 条 |
+| `LinkCount` | 物理链路条数（链路为 base；可按任一端 participant 筛选/计数，同一链路只计一次；可用“两指定 participant 互为对端”计数，同一链路去重，每侧 participant 由自身实体属性过滤/分类与/或精确 key 指定；peer 结果上的告警/KPI、对端维度分组与二次聚合未公开） | 条 |
 | `AlarmCount` | 当前告警事件条数 | 条 |
 | `AlarmDeviceRefCount` | 告警关联的受影响设备/资源引用计数；`Distinct`=按资源标识去重后的跨域对象数（告警锚定的“有此类告警的设备/资源去重数量”），`All`=告警关联的引用行数。该口径与五域 `DeviceCount` 的对象域不同（含协作等告警资源），不可互换 | 个/行 |
 | `SiteCount` | 站点数 | 个 |

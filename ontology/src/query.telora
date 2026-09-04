@@ -225,6 +225,14 @@ type PeerBranch = struct {
 # the participant table the request declared (identity is proven inside the SQL,
 # not by a type label).  Origin/peer filters and key binds belong to their own
 # inner aliases.  The predicate never joins/fans out the hub base grain.
+#
+# `distinct_keys` is the closed structural identity proof used when the two
+# participants belong to the SAME entity/table: the two inner key columns are
+# required to be unequal (`origin.key <> peer.key`) so a single participant row
+# can never occupy both endpoints of the same hub row (self-loop).  For
+# participants of DIFFERENT entities/tables it stays 'False: the same key value
+# in two different tables is still two different identities, so no bare-key
+# inequality is added.
 type PeerCorr = struct {
     origin: Source,
     peer: Source,
@@ -232,6 +240,7 @@ type PeerCorr = struct {
     branch_b: PeerBranch,
     origin_filter: Option(Expr),
     peer_filter: Option(Expr),
+    distinct_keys: Bool,
 };
 
 # Correlated existence (semi-join) filter.  Rendered as
@@ -939,7 +948,10 @@ def peer_side_eq_ok: Fn(ColumnEq, Array(String), String, ColumnRef) -> Bool = fn
 #     source, never through a bare value);
 #   - the two hub role columns are distinct (no same-side match);
 #   - the origin/peer filters reference only visible aliases plus their own
-#     inner alias (participant filters belong to the corresponding alias).
+#     inner alias (participant filters belong to the corresponding alias);
+#   - when `distinct_keys` is set (same-entity peer), the identity proof is
+#     well-formed: the two inner key columns are legal and live on the two
+#     distinct participant aliases.
 def peer_corr_ok: Fn(PeerCorr, Array(String)) -> Bool = fn(corr, main_aliases) {
     let origin_alias = corr.origin.alias;
     let peer_alias = corr.peer.alias;
@@ -971,8 +983,14 @@ def peer_corr_ok: Fn(PeerCorr, Array(String)) -> Bool = fn(corr, main_aliases) {
         'Some(expr) => expr_valid(expr, peer_allowed),
         'None => 'True,
     };
+    let distinct_ok = if corr.distinct_keys {
+        is_sql_identifier(origin_key.column) && is_sql_identifier(peer_key.column)
+        && origin_key.source != peer_key.source
+    } else {
+        'True
+    };
     origin_id_ok && peer_id_ok && hub_same && hub_roles && side_a_ok && side_b_ok
-        && origin_filter_ok && peer_filter_ok
+        && origin_filter_ok && peer_filter_ok && distinct_ok
 };
 
 def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases) {
@@ -1814,6 +1832,11 @@ def render_exists_having_clause: Fn(Array(Having)) -> Tuple([String, Array(Val)]
     (sql, binds)
 };
 
+# Renders one qualified column reference.
+def render_eq_col: Fn(ColumnRef) -> String = fn(col) {
+    `\{col.source}.\{col.column}`
+};
+
 # Renders one equality atom of a correlated predicate.
 def render_eq_sql: Fn(ColumnEq) -> String = fn(eq) {
     `\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`
@@ -1836,6 +1859,15 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
     let branch_a_sql = `(\{a_origin} AND \{a_peer})`;
     let branch_b_sql = `(\{b_origin} AND \{b_peer})`;
     let exchange_sql = `(\{branch_a_sql} OR \{branch_b_sql})`;
+    # Same-entity identity proof: the two participant rows must have distinct
+    # stable keys so one row can never occupy both endpoints of the hub row.
+    let distinct_part = if corr.distinct_keys {
+        let origin_key_sql = render_eq_col(corr.branch_a.origin.right);
+        let peer_key_sql = render_eq_col(corr.branch_a.peer.right);
+        (` AND \{origin_key_sql} <> \{peer_key_sql}`, "")
+    } else {
+        ("", "")
+    };
     let origin_part = match corr.origin_filter {
         'Some(expr) => {
             let rendered = render_expr(expr);
@@ -1856,7 +1888,7 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
             ("", empty)
         },
     };
-    let sql = `EXISTS (SELECT 1 FROM \{from_sql} WHERE \{exchange_sql}\{origin_part.0}\{peer_part.0})`;
+    let sql = `EXISTS (SELECT 1 FROM \{from_sql} WHERE \{exchange_sql}\{distinct_part.0}\{origin_part.0}\{peer_part.0})`;
     let binds = array.concat([origin_part.1, peer_part.1]);
     (sql, binds)
 };
@@ -2563,8 +2595,9 @@ def peer_branch: Fn(ColumnEq, ColumnEq) -> PeerBranch = fn(origin, peer) {
     item
 };
 
-# Correlated paired-endpoint (peer) body: origin/peer inner sources, the two
-# closed exchange branches and the per-participant filters.
+# Correlated paired-endpoint (peer) body for DIFFERENT participant entities:
+# origin/peer inner sources, the two closed exchange branches and the
+# per-participant filters (no bare-key inequality is added across tables).
 def peer_corr: Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr)) -> PeerCorr = fn(origin, peer, branch_a, branch_b, origin_filter, peer_filter) {
     let item: PeerCorr = {
         origin: origin,
@@ -2573,6 +2606,24 @@ def peer_corr: Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(E
         branch_b: branch_b,
         origin_filter: origin_filter,
         peer_filter: peer_filter,
+        distinct_keys: 'False,
+    };
+    item
+};
+
+# Correlated paired-endpoint (peer) body with the same-entity structural
+# identity proof.  `distinct_keys` ('True when origin/peer are the same
+# entity/table) adds the closed condition `origin.key <> peer.key` so one row
+# can never occupy both endpoints of the same hub row.
+def peer_corr_distinct: Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr), Bool) -> PeerCorr = fn(origin, peer, branch_a, branch_b, origin_filter, peer_filter, distinct_keys) {
+    let item: PeerCorr = {
+        origin: origin,
+        peer: peer,
+        branch_a: branch_a,
+        branch_b: branch_b,
+        origin_filter: origin_filter,
+        peer_filter: peer_filter,
+        distinct_keys: distinct_keys,
     };
     item
 };
@@ -2756,6 +2807,7 @@ export {
     exists_union,
     peer_branch,
     peer_corr,
+    peer_corr_distinct,
     exists_peer,
     having,
     having_call,

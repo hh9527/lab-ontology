@@ -155,6 +155,8 @@ type PeerBranch = struct {
 };
 
 # 同一 hub 行上的配对：两个内层 participant source 与两组端点交换分支。
+# `distinct_keys`（同实体时 'True）加入封闭身份证明 `origin.key <> peer.key`，
+# 防止同一 participant 行同时占据 hub 两端（self-loop）。
 type PeerCorr = struct {
     origin: Source,
     peer: Source,
@@ -162,6 +164,7 @@ type PeerCorr = struct {
     branch_b: PeerBranch,
     origin_filter: Option(Expr),
     peer_filter: Option(Expr),
+    distinct_keys: Bool,
 };
 
 type Exists = struct {
@@ -296,7 +299,8 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `exists_grouped` | `Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array(Having)) -> Exists` |
 | `exists_union` | `Fn(Source, Array(Array(ColumnEq)), Option(Expr)) -> Exists` |
 | `peer_branch` | `Fn(ColumnEq, ColumnEq) -> PeerBranch` |
-| `peer_corr` | `Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr)) -> PeerCorr` |
+| `peer_corr` | `Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr)) -> PeerCorr`（异构，无 key 不等证明） |
+| `peer_corr_distinct` | `Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr), Bool) -> PeerCorr`（同实体加入 `origin.key <> peer.key` 身份证明） |
 | `exists_peer` | `Fn(PeerCorr) -> Exists` |
 | `having` | `Fn(HavingOp, String, Val) -> Having` |
 | `having_call` | `Fn(HavingOp, AggregateFunction, Expr, Bool, Val) -> Having` |
@@ -1094,6 +1098,9 @@ let exists: qb.Exists = qb.exists_peer(corr);
   alias、两分支一致、participant filter 只引用自己的内层 alias；自配由 Ontology 在
   prepare/request 层按实体拒绝。
 - 该谓词是纯相关 EXISTS：不产生外层 JOIN，hub base grain 不被 fan-out。
+- **同实体身份证明**：origin/peer 属于同一实体/表时 `distinct_keys='True`，
+  `PeerCorr` 渲染 `origin.key <> peer.key`（封闭结构、经结构校验），单个 participant
+  行不能同时占据 hub 两端；异构（不同表）不加入裸 key 不等，相同 key 仍是不同身份。
 - 算子按 `Exists`/`Column` 与 filter 的 `Bind`/`Scalar` 计入；profile 需允许对应
   operator/scalar。
 
@@ -1224,6 +1231,6 @@ contains/starts-with/ends-with/not-contains 确定性 lowering，以及 JSON 的
 paired-endpoint（`PeerCorr`/`exists_peer`）覆盖：两个内层 participant alias 的
 correlated EXISTS 与两组端点交换分支 SQL/bindings、无外层 JOIN/fan-out、结构合法、
 未知 hub 角色 alias/同端字段/不一致分支/跨 alias participant filter 拒绝、等值 key
-跨 alias 合法、operator/profile（缺 `'Exists` 拒绝）、重复 lowering 逐字节一致与
-占位符/绑定数一致。
+跨 alias 合法、同实体 `origin.key <> peer.key` 身份证明与异构不加裸 key 不等、
+operator/profile（缺 `'Exists` 拒绝）、重复 lowering 逐字节一致与占位符/绑定数一致。
 新增能力都以领域无关 fixture 覆盖，不写入任何 ICM/企业业务名。
