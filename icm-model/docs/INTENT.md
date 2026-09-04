@@ -201,24 +201,29 @@
               "key":   {"Text": "<精确 key>"} | null,
               "filters": [ FilterRequest, ... ]}}
   ```
-  链路为 base；`origin`/`peer` 各自的身份由“可选精确 key 与/或自身实体属性过滤”表达。
-  每侧**至少携带一项可验证约束**（`key` 非 null 或 `filters` 非空），完全无约束的一侧
-  确定性拒绝，杜绝宽泛笛卡尔匹配。经声明的 paired route 编译为**单个**含两个 participant
-  alias 的 correlated EXISTS，包含 `(A → origin, Z → peer)` 与 `(Z → origin, A → peer)`
-  两个交换分支；动态 key/过滤值只进入 bindings，顺序 origin 后 peer（每侧内部 key 先于
-  属性过滤），无外层 participant JOIN/fan-out。同类型与异构（网络/PON/服务器/存储）配对、
-  端口与端口配对（A/Z port DN）均支持；请求中 origin/peer 顺序交换会按 origin→peer 重排
-  绑定。属性过滤只引用**该 participant 自身实体**上已授权、可筛选的维度（名称前缀/
-  分类/版本/别名等，见 `DOMAIN.md` §6 对应实体维度）；引用其它实体、未知/未授权维度、
-  不支持算子或未知值确定性拒绝。
+  链路为 base；`origin`/`peer` 各自的身份由 **entity-only / 可选精确 key / 自身实体属性
+  过滤**表达，且三者同属一个 peer 语义族：
+  - **entity-only**（`key: null` 且 `filters: []`）合法，表示“该 participant 实体集合
+    中的任意 participant”（type-only 配对，例如“网络设备与存储设备之间/互为对端”）；
+    该侧经声明 route 的实体/源表完成身份/类型校验，两侧 alias 由 A/Z 端点等式绑定到
+    hub 的相对角色，不是无约束笛卡尔积；
+  - 可选精确 key 与零个以上属性过滤可混用（同一侧 AND，key 绑定先于属性过滤）。
+  经声明的 paired route 编译为**单个**含两个 participant alias 的 correlated EXISTS，
+  包含 `(A → origin, Z → peer)` 与 `(Z → origin, A → peer)` 两个交换分支；动态 key/过滤
+  值只进入 bindings，顺序 origin 后 peer（每侧内部 key 先于属性过滤），无外层 participant
+  JOIN/fan-out。同类型与异构（网络/PON/服务器/存储）配对、端口与端口配对（A/Z port DN）
+  均支持；请求中 origin/peer 顺序交换会按 origin→peer 重排绑定。属性过滤只引用**该
+  participant 自身实体**上已授权、可筛选的维度（名称前缀/分类/版本/别名等，见
+  `DOMAIN.md` §6 对应实体维度）；引用其它实体、未知/未授权维度、不支持算子或未知值
+  确定性拒绝。
   - **同实体身份不等**：origin/peer 为同一实体/表时，SQL 在同一条 paired EXISTS 内加入
     alias key 不等证明（`<o.key> <> <p.key>`），单条 participant 行不能同时占据两端；
-    exact-key、attribute-only、key+attribute 一律适用，相同属性过滤值可表示两个满足该
-    属性的不同 participant。异构（不同表）不加入裸 key 不等条件：跨表同值 key 仍是不同
-    身份。
+    entity-only、exact-key、attribute-only、key+attribute 一律适用，相同属性过滤值可表示
+    两个满足该属性的不同 participant。异构（不同表）不加入裸 key 不等条件：跨表同值 key
+    仍是不同身份。
   - **拒绝（不降级）**：自配（同实体同精确 key）、终端/协作 participant、未知实体、hub
-    无对应 peer 路线、空约束一侧、peer 过滤跨实体/未授权/非法算子、device-id 与 port-DN
-    混配都确定性拒绝；拒绝后不降级为多个独立 EXISTS，也不发布部分查询。
+    无对应 peer 路线、peer 过滤跨实体/未授权/非法算子、device-id 与 port-DN 混配都确定性
+    拒绝；拒绝后不降级为多个独立 EXISTS，也不发布部分查询。
   - **participant 实体与配对**：设备键 route 的 participant 为 `net_device`/`pon_device`/
     `server_device`/`storage_device`（四域内任意两两配对，含同型与异构）；端口 DN route
     的 participant 为 `net_port`（只能与 `net_port` 配对，使用 A/Z port DN）。`terminal_
@@ -392,10 +397,12 @@
    完整的 `any_of`/`exists`/`having`/`group_count`），会被确定性拒绝而不是静默忽略这些
    可选约束。
 - **peer 模式非法组合确定性拒绝**：`peers` 非空时，非空 `any_of`/`exists`/`having`、
-   启用的 `group_count`、多于一个 `PeerRequest`、自配（同实体同 key）、空约束一侧（无
-   精确 key 且无属性过滤）、peer 过滤引用其它实体/未知/未授权维度或非法算子、终端/协作
-   或未知 participant 实体、device-id participant 与 port-DN participant 混配都会在
-   lowering 前确定性拒绝（不发布部分查询，也不降级为多个独立 EXISTS）。
+   启用的 `group_count`、多于一个 `PeerRequest`、自配（同实体同 key）、peer 过滤引用其它
+   实体/未知/未授权维度或非法算子、终端/协作或未知 participant 实体、device-id participant
+   与 port-DN participant 混配都会在 lowering 前确定性拒绝（不发布部分查询，也不降级为
+   多个独立 EXISTS）。**entity-only 侧合法**（`key: null` 且 `filters: []` 表示该实体集合
+   中任意 participant，type-only 配对）；若无法选择明确 participant 实体或过滤维度则拒绝，
+   不得回退为多个 dual-hub EXISTS。
 - **同实体 peer 的 SQL 结构**：origin/peer 同一实体/表时，correlated EXISTS 内含
    alias key 不等证明（`<o.key> <> <p.key>`），单条 participant 行不能同时占据两端；
    异构（不同表）不加裸 key 不等。动态 key/过滤值只进入 bindings，顺序 origin 后 peer、

@@ -83,9 +83,10 @@
 - **两指定 participant 互为对端（已支持，peer_hub）**：链路为 base，`origin` 命中一端、
   `peer` 命中另一端时该链路保留；编译为单个含两个 participant alias 的 correlated
   EXISTS，同时包含 `(A → origin, Z → peer)` 与 `(Z → origin, A → peer)` 两个交换分支，
-  不产生外层 JOIN/fan-out。每侧 participant 由**可选精确 key 与/或自身实体属性过滤**
-  标识（名称前缀/分类/版本/别名等已授权维度；每侧至少一项可验证约束，完全无约束拒绝）；
-  动态 key/过滤值只进入 bindings，顺序 origin 后 peer、每侧 key 先于属性过滤。同类型与
+  不产生外层 JOIN/fan-out。每侧 participant 身份可由 **entity-only**（仅实体类型，如
+  “某网络设备与某存储设备之间/互为对端”）、可选精确 key、自身实体属性过滤（名称前缀/
+  分类/版本/别名等已授权维度）或 key+属性混合表达；动态 key/过滤值只进入 bindings，顺序
+  origin 后 peer、每侧 key 先于属性过滤。同类型与
   异构（网络/PON/服务器/存储）配对均支持；端口仅在与另一端口（A/Z port DN）配对的路由
   中使用，不把 device id 与 port DN 混成一条路由。origin/peer 为同一实体/表时 SQL 内含
   alias key 不等证明（`<o.key> <> <p.key>`），单条 participant 行不能同时占据两端；
@@ -178,7 +179,7 @@
 | `StorageDeviceCount` | 存储设备对象数 | 个 |
 | `TerminalDeviceCount` | 终端设备对象数 | 个 |
 | `CollabDeviceCount` | 协作设备对象数 | 个 |
-| `LinkCount` | 物理链路条数（链路为 base；可按任一端 participant 筛选/计数，同一链路只计一次；可用“两指定 participant 互为对端”计数，同一链路去重，每侧 participant 由自身实体属性过滤/分类与/或精确 key 指定；peer 结果上的告警/KPI、对端维度分组与二次聚合未公开） | 条 |
+| `LinkCount` | 物理链路条数（链路为 base；可按任一端 participant 筛选/计数，同一链路只计一次；可用“两指定 participant 互为对端”计数，同一链路去重，每侧 participant 可由实体类型（type-only/entity-only）、自身实体属性过滤/分类、精确 key 或 key+属性混合指定；peer 结果上的告警/KPI、对端维度分组与二次聚合未公开） | 条 |
 | `AlarmCount` | 当前告警事件条数 | 条 |
 | `AlarmDeviceRefCount` | 告警关联的受影响设备/资源引用计数；`Distinct`=按资源标识去重后的跨域对象数（告警锚定的“有此类告警的设备/资源去重数量”），`All`=告警关联的引用行数。该口径与五域 `DeviceCount` 的对象域不同（含协作等告警资源），不可互换 | 个/行 |
 | `SiteCount` | 站点数 | 个 |

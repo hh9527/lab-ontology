@@ -2613,20 +2613,21 @@ def peer_attr_expr: Fn(PreparedPayload, DimensionEntry, FilterRequest, String) -
 
 # Combine one side's constraints into a single alias-local predicate: the exact
 # key (when present) first, then the attribute filters in request order (AND).
+# An entity-only `PeerRef` (key = 'None, filters = []) is allowed: the declared
+# participant entity (prepared route source/table) is itself the verified
+# identity/type constraint, so the side predicate is 'None (any participant of
+# that entity set, still tied to its own endpoint role by the exchange
+# equalities inside the single correlated EXISTS).
 def peer_side_constraints: Fn(PreparedPayload, Int, String, PeerRef, String) -> Option(qb.Expr) = fn(payload, entity, alias, ref, key_col) {
-    if ref.key == 'None && array.length(ref.filters) == 0 {
-        fail!("paired-endpoint participant must carry at least one verifiable constraint (exact key or attribute filter)", ref.entity)
-    } else {
-        let key_expr: Option(qb.Expr) = match ref.key {
-            'Some(input) => 'Some(qb.scalar('Eq, [qb.column(alias, key_col), to_bind(input)])),
-            'None => 'None,
-        };
-        let attr_exprs = array.map(ref.filters, fn(req) {
-            let d = peer_filter_dimension(payload, entity, req);
-            peer_attr_expr(payload, d, req, alias)
-        });
-        append_filter_terms(key_expr, attr_exprs)
-    }
+    let key_expr: Option(qb.Expr) = match ref.key {
+        'Some(input) => 'Some(qb.scalar('Eq, [qb.column(alias, key_col), to_bind(input)])),
+        'None => 'None,
+    };
+    let attr_exprs = array.map(ref.filters, fn(req) {
+        let d = peer_filter_dimension(payload, entity, req);
+        peer_attr_expr(payload, d, req, alias)
+    });
+    append_filter_terms(key_expr, attr_exprs)
 };
 
 # Lower one paired-endpoint (peer) request on a hub base row.  The request names
@@ -2640,10 +2641,12 @@ def peer_side_constraints: Fn(PreparedPayload, Int, String, PeerRef, String) -> 
 # filters, ANDed per side; deterministic binding order: origin side first, then
 # peer side).  The participant entity always selects the validated inner
 # source/alias, so a hub endpoint value is only interpreted through the
-# participant table the request declared.  Self-pair, empty-constraint sides,
-# cross-entity filters and requests without a declared peer route fail
-# atomically; the predicate is a pure correlated EXISTS, so it never joins or
-# fans out the hub base grain.
+# participant table the request declared.  An entity-only side (key = 'None,
+# filters = []) is allowed: the prepared participant entity is itself the
+# verified identity/type constraint.  Same-entity peers still carry the closed
+# `origin.key <> peer.key` identity proof.  Self-key, cross-entity filters and
+# requests without a declared peer route fail atomically; the predicate is a
+# pure correlated EXISTS, so it never joins or fans out the hub base grain.
 def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb.Exists = fn(payload, hub_entity, spec) {
     if !payload.authorize(spec.subject) {
         fail!("subject is not authorized for paired-endpoint request", spec.subject, spec.origin.entity, spec.peer.entity)
@@ -2696,12 +2699,6 @@ def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb.Exists = fn(payloa
     }
 };
 
-# A participant side is verifiable when it carries an exact key or at least one
-# attribute filter.
-def peer_side_has_constraint: Fn(PeerRef) -> Bool = fn(ref) {
-    ref.key != 'None || array.length(ref.filters) > 0
-};
-
 # Pure per-filter check for a paired-endpoint participant attribute filter.
 def peer_side_filter_ok: Fn(PreparedPayload, Int, FilterRequest) -> Bool = fn(payload, entity, req) {
     if !payload.authorize(req.subject) {
@@ -2737,11 +2734,12 @@ def peer_side_filter_ok: Fn(PreparedPayload, Int, FilterRequest) -> Bool = fn(pa
 };
 
 # Pure feasibility probe for a paired-endpoint request: 'True when the subject
-# is authorized, both participant sides are registered and carry at least one
-# verifiable constraint over their own entity, the participants are distinct
-# when they share an exact key, and the base hub declares a peer route that can
-# pair them.  Used by tests to assert deterministic rejection without a failing
-# lowering.
+# is authorized, both participant sides are registered (entity-only sides are
+# allowed: the prepared participant entity is itself the verified
+# identity/type constraint), optional attribute filters over their own entity are
+# valid, the participants are distinct when they share an exact key, and the
+# base hub declares a peer route that can pair them.  Used by tests to assert
+# deterministic rejection without a failing lowering.
 def peer_request_ok: Fn(PreparedPayload, Int, PeerRequest) -> Bool = fn(payload, hub_entity, spec) {
     if !payload.authorize(spec.subject) {
         'False
@@ -2757,8 +2755,6 @@ def peer_request_ok: Fn(PreparedPayload, Int, PeerRequest) -> Bool = fn(payload,
                 } else if origin_entity == peer_entity
                     && spec.origin.key != 'None && spec.peer.key != 'None
                     && spec.origin.key == spec.peer.key {
-                    'False
-                } else if !peer_side_has_constraint(spec.origin) || !peer_side_has_constraint(spec.peer) {
                     'False
                 } else if !array.all(spec.origin.filters, fn(req) { peer_side_filter_ok(payload, origin_entity, req) })
                     || !array.all(spec.peer.filters, fn(req) { peer_side_filter_ok(payload, peer_entity, req) }) {
