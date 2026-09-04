@@ -318,6 +318,17 @@ type OrderRequest = struct {
     direction: OrderDirection,
 };
 
+# One internal (non-projected) ordering aggregate of a grouped dimension
+# listing.  `measure` is a declared, authorized measure on the request's base
+# entity; its aggregate value only orders the groups (and a Top-N limit),
+# never a returned column.  `subject` authorizes the internal measure, and
+# `direction` selects Asc/Desc.
+type InternalOrderRequest = struct {
+    measure: String,
+    subject: String,
+    direction: OrderDirection,
+};
+
 # Restricted Top Per Group request: partition the aggregated result by a set of
 # selected dimensions and keep the top `take` rows per partition under a stable
 # ordering. v1 does not combine with a global limit or offset.
@@ -1301,30 +1312,32 @@ def resolve_route: Fn(Array(EntityEntry), Array(RelationEntry), Int, Type, Type)
                 } else if array.length(via_edges) > 1 {
                     'Err("exists route first hop is ambiguous: the base declares multiple relations to the via entity")
                 } else {
+                    # A bounded two-hop existence may have a FanOut first hop:
+                    # the whole A -> B -> C condition is a correlated predicate
+                    # (B and C never enter the outer FROM), so a one-to-many
+                    # first hop does not amplify the subject A grain.  The
+                    # first hop must still be a single declared forward
+                    # relation from the base to the via entity.
                     let first_via = get_index(via_edges, 0);
-                    if first_via.1.kind != 'Safe {
-                        'Err("exists route first hop must be a grain-safe (non fan-out) owner relation")
+                    let both = array.filter(array.enumerate(relations), fn(p) {
+                        (p.1.from == via && p.1.to == target) || (p.1.from == target && p.1.to == via)
+                    });
+                    if array.length(both) == 0 {
+                        'Err("exists route has no declared relation between the via entity and the target entity")
+                    } else if array.length(both) > 1 {
+                        'Err("exists route second hop is ambiguous: multiple relations connect the via entity and the target entity")
                     } else {
-                        let both = array.filter(array.enumerate(relations), fn(p) {
-                            (p.1.from == via && p.1.to == target) || (p.1.from == target && p.1.to == via)
-                        });
-                        if array.length(both) == 0 {
-                            'Err("exists route has no declared relation between the via entity and the target entity")
-                        } else if array.length(both) > 1 {
-                            'Err("exists route second hop is ambiguous: multiple relations connect the via entity and the target entity")
-                        } else {
-                            let second = get_index(both, 0);
-                            let entry: RouteEntry = {
-                                base,
-                                via,
-                                target,
-                                via_edge: first_via.0,
-                                target_edge: second.0,
-                                target_reversed: second.1.from == target,
-                            };
-                            let ok: RouteResult = 'Ok(entry);
-                            ok
-                        }
+                        let second = get_index(both, 0);
+                        let entry: RouteEntry = {
+                            base,
+                            via,
+                            target,
+                            via_edge: first_via.0,
+                            target_edge: second.0,
+                            target_reversed: second.1.from == target,
+                        };
+                        let ok: RouteResult = 'Ok(entry);
+                        ok
                     }
                 }
             },
@@ -2325,6 +2338,110 @@ def resolve_ordering: Fn(PreparedPayload, Array(OrderRequest), Array(String), Ar
     })
 };
 
+# Row-level (measureless) ordering: projection and ordering are two different
+# constraints.  A measureless list request may order by ANY authorized dimension
+# of the base grain even when that dimension is not projected (the ordering only
+# adds an ORDER BY expression; if the dimension lives on another entity the plan
+# additionally joins that entity through a grain-safe path).  Returns the ORDER
+# BY keys and the extra entity indexes the plan must join.  A measure ordering
+# target, an unknown dimension or an unauthorized dimension fails atomically.
+def resolve_row_ordering: Fn(PreparedPayload, Array(OrderRequest)) -> Tuple([Array(qb.OrderBy), Array(Int)]) = fn(payload, requests) {
+    let empty_orders: Array(qb.OrderBy) = [];
+    let empty_entities: Array(Int) = [];
+    let init: Tuple([Array(qb.OrderBy), Array(Int)]) = (empty_orders, empty_entities);
+    array.fold(requests, init, fn(acc, req) {
+        match req.target {
+            'Measure(id) => fail!("row-level ordering target must be a dimension, not a measure", id),
+            'Dimension(id) => do {
+                match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                    'None => fail!("ordering references an unknown dimension", id),
+                    'Some(entry) => do {
+                        if !entry.authorized {
+                            fail!("dimension is not authorized", id)
+                        } else {
+                            let ob = match req.direction {
+                                'Asc => qb.asc(dimension_expr(payload, entry)),
+                                'Desc => qb.desc(dimension_expr(payload, entry)),
+                            };
+                            let extra = if array.any(acc.1, fn(e) { e == entry.entity }) {
+                                acc.1
+                            } else {
+                                array.push(acc.1, entry.entity)
+                            };
+                            (array.push(acc.0, ob), extra)
+                        }
+                    },
+                }
+            },
+        }
+    })
+};
+
+# A grouped dimension listing orders by its REQUESTED dimensions only (they are
+# the grouping expressions); a measure ordering target must be supplied through
+# the separate internal-aggregate list.  Each dimension ordering target must be
+# selected (projected/grouped) so the ORDER BY stays on a grouping expression.
+def resolve_grouped_dim_orders: Fn(PreparedPayload, QueryRequest) -> Array(qb.OrderBy) = fn(payload, request) {
+    array.map(request.ordering, fn(req) {
+        match req.target {
+            'Dimension(id) => do {
+                if !array.any(array.map(request.dimensions, fn(d) { d.id }), fn(d) { d == id }) {
+                    fail!("grouped dimension ordering target must be requested", id)
+                } else {
+                    match array.find(payload.dimensions, fn(d) { d.id == id }) {
+                        'Some(entry) => if !entry.authorized {
+                            fail!("dimension is not authorized", id)
+                        } else {
+                            let expr = dimension_expr(payload, entry);
+                            match req.direction { 'Asc => qb.asc(expr), 'Desc => qb.desc(expr) }
+                        },
+                        'None => fail!("grouped dimension ordering references an unknown dimension", id),
+                    }
+                }
+            },
+            'Measure(_) => fail!("grouped dimension order targets must be requested dimensions (internal measures are passed separately)"),
+        }
+    })
+};
+
+# Internal (non-projected) ordering aggregate: an authorized declared measure on
+# the request's base entity whose aggregate value only orders the groups (and a
+# Top-N limit) and is never projected.  Computed measures (whose dependencies
+# must be projected) are rejected in this v1 shape; filtered measures keep their
+# inherent predicate as the aggregate's FILTER.
+def internal_aggregate_order: Fn(PreparedPayload, Int, InternalOrderRequest) -> qb.OrderBy = fn(payload, base_entity, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for internal ordering measure", spec.subject, spec.measure)
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == spec.measure }) {
+            'None => fail!("internal ordering references an unknown measure", spec.measure),
+            'Some(entry) => do {
+                if entry.computed != 'None {
+                    fail!("internal ordering measure must be a plain or filtered measure", spec.measure)
+                } else if entry.entity != base_entity {
+                    fail!("internal ordering measure must aggregate rows of the request base entity", spec.measure)
+                } else {
+                    let entity = get_index(payload.entities, entry.entity);
+                    let field = get_index(entity.fields, entry.field);
+                    let filter = match entry.predicate {
+                        'Some(_) => 'Some(resolve_measure_predicate(payload, entry)),
+                        'None => 'None,
+                    };
+                    let call: qb.AggregateCall = {
+                        function: entry.aggregate,
+                        arg: qb.column(entity.alias, field.column),
+                        distinct: 'False,
+                        filter,
+                        alias: entry.alias,
+                    };
+                    let key: qb.OrderKey = 'Aggregate(call);
+                    match spec.direction { 'Asc => qb.order_by(key, 'Asc), 'Desc => qb.order_by(key, 'Desc) }
+                }
+            },
+        }
+    }
+};
+
 def check_limit: Fn(Option(Int)) -> Option(Int) = fn(limit) {
     match limit {
         'None => 'None,
@@ -2897,16 +3014,53 @@ def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> ExistsResolution 
         let route_opt = find_route(payload, base_entity, target);
         match route_opt {
             'Some(route) => do {
-                # Declared two-hop route: base -> via (grain-safe join added by
-                # the caller through the payload route table) -> target.
+                # Declared two-hop route.  A grain-safe (owner) first hop keeps
+                # the owner-join lowering: base INNER JOIN via, then a correlated
+                # EXISTS on the target.  A FanOut first hop uses the bounded link
+                # lowering instead: B (via) and C (target) both stay inside ONE
+                # correlated EXISTS joined to each other, so the one-to-many
+                # first hop never amplifies the subject A grain.
+                let base_entry = get_index(payload.entities, base_entity);
                 let via_entry = get_index(payload.entities, route.via);
                 let target_entry = get_index(payload.entities, target);
-                let rel = get_index(payload.relations, route.target_edge);
-                let pairs = exists_pairs(rel.key);
-                let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(via_entry, target_entry, pair, route.target_reversed) });
-                let exists = build_correlated_exists(payload, target_entry, col_eqs, spec, target);
-                let result: ExistsResolution = { exists, via: 'Some(route.via) };
-                result
+                let via_rel = get_index(payload.relations, route.via_edge);
+                if via_rel.kind == 'Safe {
+                    let rel = get_index(payload.relations, route.target_edge);
+                    let pairs = exists_pairs(rel.key);
+                    let col_eqs = array.map(pairs, fn(pair) { exists_col_eq(via_entry, target_entry, pair, route.target_reversed) });
+                    let exists = build_correlated_exists(payload, target_entry, col_eqs, spec, target);
+                    let result: ExistsResolution = { exists, via: 'Some(route.via) };
+                    result
+                } else {
+                    if spec.min_matches != 'None {
+                        fail!("two-hop link existence does not support minimum-match grouping in this shape", spec.target)
+                    } else {
+                        let hop_pairs = array.map(exists_pairs(via_rel.key), fn(pair) {
+                            exists_col_eq(base_entry, via_entry, pair, 'False)
+                        });
+                        let target_rel = get_index(payload.relations, route.target_edge);
+                        let link_pairs = array.map(exists_pairs(target_rel.key), fn(pair) {
+                            exists_col_eq(via_entry, target_entry, pair, route.target_reversed)
+                        });
+                        let inner_filters = resolve_filters(payload, spec.filters);
+                        let on_target = array.all(inner_filters, fn(f) { f.entity == target });
+                        if !on_target {
+                            fail!("exists inner filter must reference the target entity", spec.target)
+                        } else {
+                            let inner_any = array.map(spec.any_of, fn(a) { any_of_on_target(payload, target, a) });
+                            let inner = append_filter_terms(combine_filters(array.map(inner_filters, fn(f) { f.expr })), inner_any);
+                            let exists = qb.exists_two_hop(
+                                qb.source(via_entry.alias, via_entry.table),
+                                hop_pairs,
+                                qb.source(target_entry.alias, target_entry.table),
+                                link_pairs,
+                                inner,
+                            );
+                            let result: ExistsResolution = { exists, via: 'None };
+                            result
+                        }
+                    }
+                }
             },
             'None => match find_hub_route(payload, base_entity, target) {
                 'Some(hub_route) => do {
@@ -3001,14 +3155,23 @@ type LoweredSources = struct {
 # the base entity from the first requested dimension. Existence filters keep the
 # base grain; having predicates constrain aggregated results.  Paired-endpoint
 # (peer) filters additionally constrain the base hub row to the two specified
-# participants on its two mutually exclusive endpoints.
-def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest), Array(PeerRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs, peer_specs) {
+# participants on its two mutually exclusive endpoints.  `absence_specs` are
+# correlated anti-existence requests: they keep base rows that have NO matching
+# related row in the target (lowered as `NOT EXISTS`).  `internal_orders` are
+# internal (non-projected) ordering aggregates of a grouped dimension listing:
+# the groups are ordered by an authorized measure that is never returned.
+def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest), Array(PeerRequest), Array(ExistsRequest), Array(InternalOrderRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs, peer_specs, absence_specs, internal_orders) {
     let measures = resolve_measures(payload, request.measures);
     let dimensions = resolve_dimensions(payload, request.dimensions);
     let measure_count = array.length(measures);
     let dimension_count = array.length(dimensions);
-    if measure_count == 0 && dimension_count == 0 {
+    let internal_group = array.length(internal_orders) > 0;
+    if internal_group && measure_count > 0 {
+        fail!("internal ordering aggregates require a measureless dimension request")
+    } else if measure_count == 0 && dimension_count == 0 {
         fail!("request must select at least one measure or one dimension")
+    } else if internal_group && dimension_count == 0 {
+        fail!("internal ordering aggregates require at least one grouping dimension")
     } else if measure_count == 0 && request.partition != 'None {
         fail!("top per group requires an aggregated measure")
     } else if measure_count == 0 && array.length(having_specs) > 0 {
@@ -3049,7 +3212,29 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
         });
         let requested_measure_ids = array.map(request.measures, fn(m) { m.id });
         let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
-        let ordering = resolve_ordering(payload, request.ordering, requested_measure_ids, requested_dimension_ids);
+        # An aggregated request may order only by its own selected measures and
+        # dimensions (the ORDER BY references grouped expressions / projected
+        # aggregate aliases).  A measureless (row-level) request treats
+        # projection and ordering as two different constraints: it may order by
+        # any authorized dimension of the base grain, projected or not; ordering
+        # by a non-projected dimension adds a grain-safe join to its entity.
+        let ordering_tuple = if measure_count > 0 {
+            let orders = resolve_ordering(payload, request.ordering, requested_measure_ids, requested_dimension_ids);
+            let no_extra: Array(Int) = [];
+            (orders, no_extra)
+        } else if internal_group {
+            # Grouped dimension listing: ORDER BY the internal (non-projected)
+            # ordering aggregates first, then the requested-dimension ordering
+            # tie-breakers (each on a grouping expression).
+            let agg_orders = array.map(internal_orders, fn(spec) { internal_aggregate_order(payload, base_entity, spec) });
+            let dim_orders = resolve_grouped_dim_orders(payload, request);
+            let no_extra: Array(Int) = [];
+            (array.concat([agg_orders, dim_orders]), no_extra)
+        } else {
+            resolve_row_ordering(payload, request.ordering)
+        };
+        let ordering = ordering_tuple.0;
+        let ordering_entities = ordering_tuple.1;
         let partition = check_partition(payload, request, dimensions, ordering);
         let limit = check_limit(request.limit);
         let offset = check_offset(request.offset, array.length(request.ordering));
@@ -3057,11 +3242,15 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
         let source_plan = match base_entry.union {
             'None => do {
                 let exists_resolutions = array.map(exists_specs, fn(spec) { resolve_exists(payload, base_entity, spec) });
+                let absence_resolutions = array.map(absence_specs, fn(spec) { resolve_exists(payload, base_entity, spec) });
                 let exists_plans = array.map(exists_resolutions, fn(r) { r.exists });
+                # Anti-existence: the same resolved correlated body rendered as
+                # `NOT EXISTS (...)`, keeping base rows with no matching related row.
+                let absence_plans = array.map(absence_resolutions, fn(r) { qb.exists_not(r.exists) });
                 # The via (owner) of a declared two-hop route becomes an ordinary
                 # grain-safe join target; the correlated EXISTS then references
                 # the joined owner alias, never the fan-out target edge.
-                let via_entities = array.flat_map(exists_resolutions, fn(r) {
+                let via_entities = array.flat_map(array.concat([exists_resolutions, absence_resolutions]), fn(r) {
                     match r.via {
                         'Some(v) => [v],
                         'None => [],
@@ -3078,23 +3267,23 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
                 let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
                 let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
                 let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
-                let targets = array.concat([filtered_measure_targets, via_entities, dim_entities, scope_entities, filter_entities, any_entities]);
+                let targets = array.concat([filtered_measure_targets, via_entities, dim_entities, scope_entities, filter_entities, any_entities, ordering_entities]);
                 let joins = select_joins(payload, base_entity, targets);
                 let join_sources = array.map(joins, fn(j) { j.source });
                 let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
-                let all_exists = array.concat([exists_plans, peer_exists_plans]);
+                let all_exists = array.concat([exists_plans, absence_plans, peer_exists_plans]);
                 let result: LoweredSources = { sources, derived: 'None, joins, exists: all_exists };
                 result
             },
             'Some(union) => do {
-                if array.length(exists_specs) > 0 {
+                if array.length(exists_specs) > 0 || array.length(absence_specs) > 0 {
                     fail!("union entity request does not support existence filters")
                 } else {
                     let measure_targets = array.concat(array.map(measures, fn(m) { m.entry.requires }));
                     let dim_entities = array.map(dimensions, fn(d) { d.entry.entity });
                     let scope_entities = array.map(scope_resolutions, fn(f) { f.entity });
                     let filter_entities = array.map(filter_resolutions, fn(f) { f.entity });
-                    let refs = array.concat([measure_targets, dim_entities, scope_entities, filter_entities, any_entities]);
+                    let refs = array.concat([measure_targets, dim_entities, scope_entities, filter_entities, any_entities, ordering_entities]);
                     let refs_ok = array.all(refs, fn(t) { t == base_entity });
                     if !refs_ok {
                         fail!("union entity request cannot join or filter another entity")
@@ -3124,7 +3313,7 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
         });
         let projection = array.concat([measure_items, dimension_items]);
         let none_grouping: Array(qb.Expr) = [];
-        let grouping = if measure_count > 0 {
+        let grouping = if measure_count > 0 || internal_group {
             array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) })
         } else {
             none_grouping
@@ -3151,19 +3340,19 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
 };
 
 def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
-    lower_core(payload, request, [], [], [], [])
+    lower_core(payload, request, [], [], [], [], [], [])
 };
 
 # Additive entry: the base QueryRequest plus typed existence filters and
 # aggregate-result (HAVING) predicates.
 def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, exists_specs, having_specs) {
-    lower_core(payload, request, [], exists_specs, having_specs, [])
+    lower_core(payload, request, [], exists_specs, having_specs, [], [], [])
 };
 
 # Additive entry with closed OR-groups on the subject filters (AnyOf), combined
 # with existence filters and HAVING predicates in a deterministic order.
 def lower_any: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs) {
-    lower_core(payload, request, any_of_specs, exists_specs, having_specs, [])
+    lower_core(payload, request, any_of_specs, exists_specs, having_specs, [], [], [])
 };
 
 # Additive entry with paired-endpoint (peer) filters: the base QueryRequest plus
@@ -3171,7 +3360,59 @@ def lower_any: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exis
 # exclusive endpoints are the two specified participants.  The peer predicates
 # are merged with the ordinary filters (AND) in request order.
 def lower_peer: Fn(PreparedPayload, QueryRequest, Array(PeerRequest)) -> qb.Plan = fn(payload, request, peer_specs) {
-    lower_core(payload, request, [], [], [], peer_specs)
+    lower_core(payload, request, [], [], [], peer_specs, [], [])
+};
+
+# Grouped dimension listing with internal (non-projected) ordering aggregates.
+# The request selects dimensions only (measures are empty) and, optionally,
+# filters / dimension ordering tie-breakers / limit (Top N).  Each internal
+# order names an authorized measure on the request base entity whose aggregate
+# value orders the groups but is never projected (e.g. return only the largest
+# group name, ordered by its record count).  Lowering keeps a grouped Plan whose
+# projection is the dimension rows only.
+def lower_internal_top: Fn(PreparedPayload, QueryRequest, Array(InternalOrderRequest)) -> qb.Plan = fn(payload, request, internal_orders) {
+    lower_core(payload, request, [], [], [], [], [], internal_orders)
+};
+
+# Anti-existence entry: the base QueryRequest plus typed correlated-existence
+# requests that must NOT match.  Each `absence_spec` resolves the same declared
+# relation/route/hub shape as a positive existence and is lowered as
+# `NOT EXISTS (...)`, so a base row is kept exactly when no related row (or, with
+# `min_matches`, no qualifying group) satisfies the correlated body.  NULL
+# semantics stay SQL-native.  Aggregate-result (HAVING) predicates are optional.
+def lower_absence: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, absence_specs, having_specs) {
+    lower_core(payload, request, [], [], having_specs, [], absence_specs, [])
+};
+
+# Distinct-row entry: a measureless dimension request whose result is a set of
+# mutually distinct rows (`SELECT DISTINCT`).  The request must select at least
+# one dimension and no measures; it may filter, order (by a projected
+# dimension) and limit/offset, but must not combine with top-per-group.  The
+# returned `Query` has deterministic SQL and bindings; SQLite requires the ORDER
+# BY terms of a SELECT DISTINCT to appear in the result set, so ordering
+# targets must be among the requested (projected) dimensions.
+def lower_distinct: Fn(PreparedPayload, QueryRequest) -> qb.Query = fn(payload, request) {
+    if array.length(request.measures) > 0 {
+        fail!("distinct rows requires a measureless dimension request")
+    } else if array.length(request.dimensions) == 0 {
+        fail!("distinct rows requires at least one dimension")
+    } else if request.partition != 'None {
+        fail!("distinct rows does not combine with top per group")
+    } else {
+        let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
+        let order_ok = array.all(request.ordering, fn(o) {
+            match o.target {
+                'Measure(id) => fail!("distinct rows ordering must reference a dimension", id),
+                'Dimension(id) => array.any(requested_dimension_ids, fn(d) { d == id }),
+            }
+        });
+        if !order_ok {
+            fail!("distinct rows ordering must reference a projected dimension")
+        } else {
+            let plan = lower_core(payload, request, [], [], [], [], [], []);
+            qb.transform_sqlite_distinct(plan)
+        }
+    }
 };
 
 # Count the number of groups of a grouped request that satisfy the given
@@ -3186,7 +3427,7 @@ def lower_group_count: Fn(PreparedPayload, QueryRequest, Array(HavingRequest)) -
     } else if array.length(request.measures) == 0 || array.length(request.dimensions) == 0 {
         fail!("group count request must select measures and grouping dimensions")
     } else {
-        let inner = lower_core(payload, request, [], [], having_specs, []);
+        let inner = lower_core(payload, request, [], [], having_specs, [], [], []);
         qb.count_groups(inner, payload.profile)
     }
 };
@@ -3232,6 +3473,7 @@ export {
     OrderTarget,
     MeasureInput,
     DimensionInput,
+    InternalOrderRequest,
     MeasureRequest,
     DimensionRequest,
     FilterRequest,
@@ -3296,7 +3538,13 @@ export {
     lower_full,
     lower_any,
     lower_peer,
+    lower_absence,
+    lower_distinct,
+    lower_internal_top,
     lower_group_count,
+    resolve_row_ordering,
+    resolve_grouped_dim_orders,
+    internal_aggregate_order,
     dimension_expr,
     dimension_domain,
     to_bind,

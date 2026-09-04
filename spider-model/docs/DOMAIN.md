@@ -1,5 +1,4 @@
 # concert_singer 领域模型 — DOMAIN.md
-
 本文是 `spider-model` Resolver 可读的知识包之一（与 `INTENT.md` 配套）。它只描述
 业务对象、领域词汇、概念关系、值域与统计口径。**不含**任何题目、标准答案、参考 SQL、
 物理 schema 或 Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现。
@@ -47,10 +46,14 @@
 | `singer_age_min` | 歌手年龄的最小值 | min |
 | `singer_age_max` | 歌手年龄的最大值 | max |
 | `stadium_count` | 场馆数量 | count |
+| `stadium_capacity_avg` | 场馆容量的平均值 | avg |
+| `stadium_capacity_max` | 场馆容量的最大值 | max |
 | `concert_count` | 演唱会数量 | count |
 | `singer_in_concert_count` | 参演关系条数（= 参演人次） | count |
 
-指标的 `all/distinct` 输入控制是否去重计数（`distinct` 仅对 count 类语义有意义）。
+指标的 `all/distinct` 输入控制是否去重计数（`distinct` 仅对 count 类语义有意义）；
+对同一物理属性，模型可声明多个不同聚合的指标（如容量的 avg/max、年龄的
+avg/min/max）。
 
 ### Dimension（维度 / 属性）
 
@@ -84,15 +87,33 @@
 
 - 请求只含 measure、不含 dimensions 时：对全量行做一次聚合。
 - 请求同时含 measure 与 dimensions 时：按全部 dimension 分组，各组分别聚合
-  （dimension 即分组键，同时出现在输出）。
-- 请求只含 dimensions、不含 measure 时：行级列表投影，不做分组、不引入虚拟计数。
+  （dimension 即分组键）。
+- 输出列顺序：dimensions（按请求顺序）在前，measures（按请求顺序）在后；不会为满足
+  排序或建立路径而加入未被请求的列或“幽灵计数”。
+- 请求只含 dimensions、不含 measure 时：行级列表投影；`distinct: true` 时对投影属性
+  去重（`SELECT DISTINCT`），否则保留重复行。
 - 多个 measure 必须同属一个业务对象粒度（同实体）。
-- 筛选按 AND 组合；排序目标必须是本请求已选择的 measure 或 dimension。
+- 筛选按 AND 组合；正相关存在（Exists）为 AND 语义，可表达“分别存在满足 A/B 的
+  相关记录”；反相关存在（absence / `NOT EXISTS`）表达“没有任何满足条件的相关记录”。
+- 排序目标：出现在 `measures` 的 measure 作为返回列排序；`measures` 为空的分组维度
+  请求可把主体实体上的普通/条件 measure 用作**内部排序聚合**（按每组统计值取 Top-N、
+  该统计值不返回）；未返回的 dimension 只能作为“纯行级、非去重、经安全路径可达”
+  列表的排序依据。
 - `limit` 截断结果行数、`offset` 跳过前若干行（`offset` 必须有排序）。
 
 ## 边界
 
-- 本模型 v1 覆盖：计数/均值/最值、按维度分组、文本/数值筛选、排序、Top-N 与分页。
-- 集合运算（EXCEPT/INTERSECT）、标量子查询、`NOT EXISTS`、按未显示列/未显示聚合的
-  分组与排序等基础层能力暂不可表达；相应意图会得到确定性拒绝诊断，不会退化为近似
-  SQL。
+- 本模型覆盖：计数/均值/最值、按维度分组、行级去重列表、文本/数值筛选、正相关存在、
+  反相关存在（NOT EXISTS）、fan-out 首跳两跳存在（如
+  `Singer → SingerInConcert → Concert`，只返回主体维度、不放大主体 grain）、内部排序
+  聚合（只返回分组维度、不返回统计值）、排序、Top-N 与分页。
+- 明确**不支持**（返回 `unsupported: …` 确定性诊断，不做近似替代）：
+  - 含返回聚合的请求再按“未返回”聚合排序/HAVING；
+  - 无可达关系路径的存在/反存在（未声明的一跳关系或两跳 `exists_route`）；
+  - 两个任意投影集合的一般集合运算（EXCEPT/INTERSECT）；
+  - 派生标量子查询比较。
+- 近似替代一律不被接受：不得为排序/路径需要加入额外 count/measure、丢弃 distinct、
+  引入不需要的分组或改变重复行语义。
+- 一致性保证：同一语义意图的不同同义表达与同一输入的重复执行必须得到一致结果
+  （受支持时逐字节相同；不受支持时给出同一类确定性 `unsupported` 诊断），不得因措辞
+  差异而一部分成功、一部分近似。

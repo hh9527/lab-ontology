@@ -97,7 +97,10 @@ type PeerRequest = struct {
 `lower(payload, request)`、`lower_full(payload, request, exists, having)` 与
 `lower_any(payload, request, any_of, exists, having)` 都接受 `QueryRequest`；
 `lower_full` 额外降低存在性过滤与分组谓词，`lower_any` 再叠加 subject 的 OR-group，
-`lower_peer(payload, request, peers)` 再叠加 paired-endpoint（peer）过滤。
+`lower_peer(payload, request, peers)` 再叠加 paired-endpoint（peer）过滤，
+`lower_absence(payload, request, absence, having)` 再叠加反相关存在（`NOT EXISTS`，
+“没有匹配关联记录”），`lower_distinct(payload, request)` 返回互不重复的行级结果
+（`SELECT DISTINCT`，`Query`）。
 基础请求可以没有
 `measures`：此时它是行级投影/列表请求（见下文“行级投影”）。
 `lower_group_count(payload, request, having)` 返回“满足 HAVING 的分组个数”（嵌套形状
@@ -105,8 +108,10 @@ type PeerRequest = struct {
 ordering/limit/offset/partition。
 
 `id` 来自知识模型声明的封闭业务词汇。筛选按请求顺序以 `And` 组合；筛选维度
-不必同时投影。排序目标必须是本请求已经选择的指标或维度。`limit` 存在时必须
-是正整数。
+不必同时投影。聚合（含指标）请求的排序目标必须是本请求已经选择的指标或维度
+（ORDER BY 引用分组表达式/已投影聚合 alias）；行级（无指标）请求把“投影”与
+“排序”当作两个独立约束，可以按**任意已授权**、且经 base 安全路径可达的维度排序
+——即使该维度不投影（C 不被迫出现在返回列）。`limit` 存在时必须是正整数。
 
 `offset` 是可选的页面偏移：存在时必须是非负整数，并且只有当请求带有稳定、确定的
 `ordering` 时才允许（否则原子失败）。`limit` 与 `offset` 一起降低为标准 Plan 的
@@ -124,8 +129,8 @@ ordering/limit/offset/partition。
 信息、列表），只投影维度属性、不引入虚构 COUNT 指标。此时必须至少选择一个
 `dimensions`，base 实体取自第一个请求维度所属实体；其他被引用实体（投影维度、
 筛选、排序、scope）必须经 base 的安全（不扩 grain）路径到达，fan-out 路径原子失败。
-行级请求不允许 `partition`，排序目标只能是维度，`limit`/`offset` 与授权/稳定排序
-规则照常生效。
+行级请求不允许 `partition`，排序目标只能是**已授权的维度**（可以不在投影中，见上文
+“投影与排序是两个不同约束”），`limit`/`offset` 与授权/稳定排序规则照常生效。
 
 筛选能力与 `FilterOp` 词表：比较算子 `'Eq`/`'Ne`/`'Gt`/`'Ge`/`'Lt`/`'Le` 降低到
 query 的封闭比较 scalar；文本算子 `'Contains`/`'StartsWith`/`'EndsWith`（大小写
@@ -536,8 +541,8 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
 
 ### 两跳相关存在（declared bounded route）
 
-KPI 事实或子部件往往不直接关联告警等稳定对象，而是经唯一 owner 实体再关联。Ontology
-不猜测任意可达路径：作者在 base 实体类型上显式声明路线：
+KPI 事实或子部件往往不直接关联告警等稳定对象，而是经中间实体再关联（唯一 owner
+或 link 实体）。Ontology 不猜测任意可达路径：作者在 base 实体类型上显式声明路线：
 
 ```telora
 @edsl.entity_id("components")
@@ -557,15 +562,17 @@ type Component = struct {
 `exists_route(via, target)` 是 base 实体上的 type-level property，可多次标注（按声明
 顺序 fold 追加）。prepare 时对每条路线做确定性校验并保存到 `PreparedPayload.routes`：
 
-- 第一跳 base → `via` 必须存在且**唯一**：base 上恰好一条声明到 `via` 的 forward 关系，
-  且 kind 为 `'Safe`（唯一、grain-safe）。关系缺失（反向-only 属于方向不匹配）、多条
-  候选、`'FanOut` owner 都原子拒绝。
+- 第一跳 base → `via` 必须存在且**唯一**：base 上恰好一条声明到 `via` 的 forward 关系。
+  关系缺失（反向-only 属于方向不匹配）、多条候选、同一 base 多条到达同一 target 的
+  路线（歧义路径）都原子拒绝。
 - 第二跳 `via` → `target` 使用已声明关系（任一方向，存在性语义允许 fan-out）；via 与
   target 之间关系缺失或存在多条候选关系都原子拒绝。
-- 同一 base 声明多条到达同一 target 的路线（歧义路径）原子拒绝。
 
-Lowering 一个两跳存在请求时只加 **grain-safe owner join**（base `INNER JOIN` via，
-不复制 base 行），再用 **correlated EXISTS** 关联 owner 与 target 内层：
+Lowering 依据第一跳的 kind 选择两种**封闭存在**形状，二者都只把整个 A→B→C 条件
+表达为谓词：
+
+- 第一跳 `'Safe`（唯一 owner）：保持 owner-join 形状——base `INNER JOIN` via（不复制
+  base 行），再用 correlated EXISTS 关联 owner 与 target 内层：
 
 ```text
 SELECT count(m.id) AS ComponentCount
@@ -574,9 +581,23 @@ INNER JOIN sites AS s ON m.site_id = s.id
 WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id [AND al.level = ?])
 ```
 
-- 永不为该 target 发射外层 fan-out join（`JOIN alarms`），因此 base 计数不被放大。
-- `min_matches`、内层 `any_of`、授权、profile 递归收窄与参数化绑定规则与一跳完全一致；
-  绑定顺序与重复 lowering 逐字节确定。
+- 第一跳 `'FanOut`（subject A 对 B 是 one-to-many）：改用 bounded **link** 形状——B
+  与 C 在**同一个 correlated EXISTS 内相互 INNER JOIN**，绝不放 B/C 进外层 FROM，
+  因此 one-to-many 首跳不会放大外层 A 的 grain：
+
+```text
+SELECT count(s.id) AS SubjectCount
+FROM link_subjects AS s
+WHERE EXISTS (SELECT 1 FROM link_owners AS b
+              INNER JOIN link_targets AS c ON b.id = c.owner_id
+              WHERE s.owner_id = b.id [AND c.level = ?])
+```
+
+- 永不为该 target 发射外层 fan-out join（`JOIN alarms`/`JOIN link_owners`），因此 base
+  计数不被放大；同一 subject 有多个匹配 B/C 时外层仍只计一次。
+- `Safe` owner-join 形状的 `min_matches`/内层 `any_of`/授权/profile 递归收窄与参数化
+  绑定规则与一跳完全一致；`FanOut` link 形状 v1 不支持 `min_matches` 分组（确定性
+  拒绝），内层 filter/any_of/授权/profile 收窄与绑定规则保持一致。
 - 一跳直接/反向直接行为完全保留：未声明路线时按原有一跳逻辑解析。
 
 ### 双端 hub（dual-end hub union slice）
@@ -856,10 +877,15 @@ QueryBuilder 的 `Val` 使用 untagged JSON codec，因此 Query 编码后的 bi
 引用未授权/不可筛选/未知枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术、
 Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimension、
 非法 JSON 筛选输入、按未请求 JSON Dimension 排序。相关存在失败还包括：目标即 base、
-没有声明一跳关系或路线、两跳路线第一跳非唯一 forward `'Safe` owner 关系
-（方向不匹配或非唯一 owner）、`via`/`target` 之间缺失或多条候选关系、同一 base 对
-同一 target 声明多条路线、内层筛选引用路径终点之外的实体、EXISTS 键含析取。
-paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
+没有声明一跳关系或路线、两跳路线第一跳缺失/反向-only（方向不匹配）或非唯一
+（多条候选）、`via`/`target` 之间缺失或多条候选关系、同一 base 对同一 target
+声明多条路线、内层筛选引用路径终点之外的实体、EXISTS 键含析取、fan-out link 形状
+使用 `min_matches` 分组。
+distinct/absence 与行级排序的失败还包括：distinct 请求携带 measures、无维度、
+组合 Top Per Group、按未投影/未知/未授权维度排序；反存在用于 union 实体 base；
+行级排序目标是 measure 或未知/未授权维度；internal-top 请求携带 measures、无
+分组维度、内部 measure 为计算指标/跨 base 实体/未知/未授权，或维度 tie-breaker
+不是已选维度。paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
 自配（同实体同 key 的 origin == peer）、未知 participant 实体、hub 没有覆盖该
 participant 对的 peer 路线、peer 路线端点同字段/越界/引用非 key 字段、同一 hub 上
 同一 participant 对的重复 peer 路线、union 实体 base 上的 peer 请求。把多个独立
@@ -869,6 +895,60 @@ Host 机制承载；公共 API 不返回 Rejection 或诊断数组。
 公共 Request、Plan、Query 和业务词汇均保持精确具名类型，不使用 `Any`、`Dyn` 或
 进程内 TypeId 作为交换协议。eDSL 只负责知识到 Plan；`transform_sqlite` 是端到端
 演示使用的 QueryBuilder 能力，不属于 eDSL API。
+
+## 查询形状边界（spider 评估复核）
+
+本轮明确以下通用形状的契约与用法。全部在封闭 Query eDSL 内表达：不开放 raw SQL、
+任意 Expr、alias 或 Join 拼装；不加入 Spider 专用实体或字段；新表达保持确定性
+SQL、确定性 bindings、可验证结构并明确拒绝边界。
+
+1. **投影与排序是两个不同约束**。行级（无指标）请求可以只返回 A、B，却按已授权
+   的维度 C 排序并取 Top N；C 不会被迫出现在返回列。若 C 属于另一个实体，则它经
+   base 的安全路径 join 进入 FROM（fan-out 路径仍原子失败）。聚合请求仍要求排序
+   目标必须是本请求已选择的指标/维度（否则 ORDER BY 无法引用分组表达式/已投影
+   聚合 alias）。
+2. **结果集 distinct（互不重复的维度行）**。`lower_distinct(payload, request)`
+   把无指标、至少一个维度的行级请求降低为 `qb.transform_sqlite_distinct` 的
+   `SELECT DISTINCT`：覆盖多维度、过滤、排序与 limit/offset 边界；不能被普通投影
+   或 `count(distinct ...)` 替代。排序目标必须是已投影（已请求）维度（SQLite 的
+   DISTINCT ORDER BY 规则）；不能与 Top Per Group 组合，也不能携带 measures。
+3. **没有匹配关联记录的主体**。`lower_absence(payload, request, absence_specs,
+   having)` 把每个 `absence_spec`（复用 `ExistsRequest` 的目标/主体/内层 filter/
+   min_matches 词汇）降低为同一相关 body 的 `NOT EXISTS`。两跳路线仍只加
+   grain-safe owner join；NULL 语义保持 SQL 原生；`plan.exists[i].negated` 为真。
+   这是纯相关反存在：不产生外层 JOIN、不放宽相关引用，`'Exists` operator 语义不变。
+4. **分别存在满足 A 和 B 的关联记录**。用 `lower_full(payload, request, [specA,
+   specB], [])` 表达两个**独立**的 correlated EXISTS（每个带各自内层 filter），在
+   WHERE 中 AND 合并。两个谓词各自成立即可，A、B 可以由不同的关联行满足，绝不会
+   被压成同一行上的 `A AND B`。
+5. **跨关系只投影维度、不附加 measure**。行级请求的 base 实体取自第一个请求维度
+   所属实体，其它实体的维度经安全路径 join 后投影；不引入虚构 COUNT，也不产生
+   GROUP BY。fan-out 路径与任何会放大行的关系继续原子失败。
+6. **返回列顺序是结果契约**。`QueryRequest` 分别承载 measures 与 dimensions；
+   lowering 的 projection 顺序为：请求的 measures（按请求顺序，含其传递依赖），
+   随后是请求的 dimensions（按请求顺序）。跨类别不进行其它重排；调用方要控制类别
+   内顺序就按请求数组顺序书写。
+
+### Spider round 3：内部排序聚合与关系存在
+
+**内部（未投影）排序聚合**。一个分组维度请求可以按“组内聚合结果”排序并取
+Top N，却不返回该聚合值（例如按每组记录数选出最大组，只返回组名）。
+`lower_internal_top(payload, request, internal_orders)`：`request` 只选择维度
+（measures 为空），`internal_orders` 逐条命名一个**已授权、位于请求 base 实体上**
+的普通/条件 measure 与其方向；该 measure 只作为 ORDER BY 的内部聚合（lowering 经
+query 的 `OrderKey 'Aggregate` 表达），绝不出现在 projection。请求可携带筛选、
+维度排序 tie-breaker（必须是已选维度）与 `limit`；`qb.validate` 用 payload profile
+收窄内部聚合的 operator/aggregate/scalar。计算 measure、跨 base 实体的 measure、
+未知/未授权 measure 均原子拒绝。
+
+**沿（已声明）关系的存在/筛选并只返回主体维度**。relation-existence 本身不需要
+link-count measure 来选择入口/路径：`lower_full(payload, request, exists, [])` 接受
+行级（measures 为空）请求，存在谓词保持主体 grain——一跳（任意方向，fan-out
+允许）与显式两跳 route 都只产生 correlated EXISTS/owner join（第一跳为 fan-out 时
+用 bounded link 形状，B/C 在同一个 EXISTS 内互相 JOIN），projection 仍只是请求的
+主体维度，不新增 COUNT 或 GROUP BY。fan-out 首跳路线不再被拒绝：它走 link 形状，
+不会静默降级为外层 join；仍确定性拒绝非唯一/反向-only 首跳与 fan-out link 形状的
+`min_matches`。
 
 ## 验证
 
@@ -899,7 +979,8 @@ binding 顺序）、HAVING（阈值绑定、需已选 measure）、EXISTS（fan-
 `join_on` 的 AND ON 条件）。本轮的受控两跳相关存在也纳入覆盖：知识 payload 保存
 Component → Site → Alarm 路线；两跳 lowering 只发 grain-safe owner join + 相关
 EXISTS（SQL 形状、外层 grain 不被 Site→Alarm fan-out 放大、`min_matches` 分组计数、
-内层筛选绑定顺序与重复 lowering 逐字节一致）；纯可行性/内层筛选探针对未知/自指/无关
+内层筛选绑定顺序与重复 lowering 逐字节一致）；fan-out 首跳的两跳路线走 link 形状
+（B/C 在同一个 EXISTS 内 JOIN）；纯可行性/内层筛选探针对未知/自指/无关
 target 返回拒绝；路线 prepare 探针验证合法路线解析一次，并拒绝非唯一 owner、方向不匹配、
 同 base 同 target 多路线歧义与 `via`→target 关系歧义；较密的 hub/leaf 关系图在
 prepare 时保持有界不耗尽求值燃料。双端 hub 切片也纳入覆盖：payload 保存 Pair(hub base)→Member 双端路线；union EXISTS
@@ -927,4 +1008,20 @@ EXISTS、两个 participant alias、两个交换分支，每侧过滤只引用�
 测试验证两个 participant alias 都存在、各自只出现在自己的端点 equality 与 filter、
 两组交换分支齐全，并确定性拒绝同端、self-pair 身份缺失形状；prepare 对同端字段、非
 key participant、越界与同一 participant 对的重复 peer 路线确定性拒绝；同一 hub 的
-多类 participant `dual_hub` 元数据仍合法。
+多类 participant `dual_hub` 元数据仍合法。本轮 spider 评估形状测试另覆盖：行级请求
+按未投影的已授权维度排序（含 Top N、返回列不含 C）、`lower_distinct` 的
+`SELECT DISTINCT`（多维度、含 JSON 维度过滤/排序/limit 的占位符顺序与确定性）、
+`lower_absence` 的 `NOT EXISTS`（零匹配主体、owner join、`negated` 结构标志）、
+两个独立 correlated EXISTS 表达“分别满足 A/B 的不同关联行”、跨关系无 measure 维度
+投影（无虚构 COUNT、无 GROUP BY）与返回列顺序契约（measures 在 dims 前、各自保持
+请求顺序）。spider round 3 测试另覆盖：`lower_internal_top` 分组维度请求只返回组列、
+按内部（未投影）聚合排序（含维度 tie-breaker 与 Top N 绑定）、`check_internal_top_group`
+的 SQL/分组/投影结构断言，以及 measureless 请求用直接关系（反向 fan-out）的
+correlated EXISTS 证明主体存在而只返回主体维度（无 link-count measure、无 join/group）。
+spider round 4 测试另覆盖 fan-out 首跳的两跳 link 存在：`check_link_route_prepared`
+（fan-out 首跳路线 resolve 一次）、`check_link_two_hop_lowering`（B/C 在同一个
+correlated EXISTS 内 JOIN、无外层 fan-out join、目标过滤绑定）、
+`check_link_two_hop_returns_subject_dims_only`（measureless 只返回主体维度）与
+`check_link_two_hop_deterministic_and_absence`（重复 lowering 逐字节一致、NOT EXISTS
+反存在）。query 模块测试另覆盖 `qb.transform_sqlite_distinct`、`qb.exists_not`、
+`OrderKey 'Aggregate` 内部排序聚合与 `qb.exists_two_hop`（SQL/bindings/确定性）。

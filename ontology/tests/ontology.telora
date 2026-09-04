@@ -561,6 +561,7 @@ def check_computed_dimension: Bool = do {
     let order_ok = array.length(plan.ordering) == 1 && (match get_index(plan.ordering, 0).key {
         'Expr(e) => is_head_expr(e),
         'AggregateRef(_) => 'False,
+        'Aggregate(_) => 'False,
     });
     let scope_ok = match plan.filter {
         'Some(f) => is_eq_bind(f, "kind", 'String("run")),
@@ -1305,7 +1306,8 @@ type GoodTarget = struct {
     site_id: Int,
 };
 
-# Invalid: first owner hop is fan-out (not unique / not grain-safe).
+# Fan-out first hop (valid bounded link existence: B/C stay inside ONE
+# correlated EXISTS, so the one-to-many first hop never fans out the base A).
 @edsl.entity_id("bad_fan_leaf")
 @edsl.entity_source("bad_fan_leaf", "bfl")
 @edsl.relation(BadFanOwner, fanout_kind, 1, 0)
@@ -1467,9 +1469,15 @@ def check_route_prepare_valid: Bool = do {
         "route prepare: valid two-hop declaration resolves exactly one route")
 };
 
-def check_route_rejects_nonunique_owner: Bool = do {
+def check_route_accepts_fanout_first_hop: Bool = do {
+    # A declared two-hop route whose first hop is FanOut is now accepted: the
+    # whole A -> B -> C condition lowers as one correlated EXISTS with an inner
+    # join to C, so the one-to-many first hop never fans out the subject A.
     let types: Array(Type) = [BadFanLeaf, BadFanOwner, BadFanTarget];
-    check(route_problem_count(types) > 0, "route prepare: non-unique (fan-out) owner hop is rejected")
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.route_build(graph.0, graph.1);
+    check(array.length(build.problems) == 0 && array.length(build.routes) == 1,
+        "route prepare: a fan-out first-hop route resolves exactly once (bounded link existence)")
 };
 
 def check_route_rejects_direction_mismatch: Bool = do {
@@ -2123,6 +2131,137 @@ def check_typed_peer_cross_table_key_collision: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Bounded two-hop existence with a FAN-OUT first hop (spider round 4).
+#
+# Subject A (LinkSubject) -> B (LinkOwner, one-to-many / FanOut) -> C
+# (LinkTarget).  The whole A -> B -> C condition is one correlated EXISTS whose
+# B and C are joined INSIDE the subquery, so B is never an outer join and the
+# subject A grain is never amplified.  Lowering returns only subject fields.
+# ---------------------------------------------------------------------------
+
+def int_kinds: Array(edsl.FilterInputKind) = ['Int];
+
+@edsl.entity_id("link_subjects")
+@edsl.entity_source("link_subjects", "ls")
+@edsl.relation(LinkOwner, fanout_kind, 2, 0)
+@edsl.exists_route(LinkOwner, LinkTarget)
+type LinkSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("LinkSubjectCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("name")
+    @edsl.dimension("LinkSubjectName", flag_true, flag_true, eq_ops, text_kinds)
+    name: String,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+@edsl.entity_id("link_owners")
+@edsl.entity_source("link_owners", "lo")
+@edsl.relation(LinkTarget, fanout_kind, 0, 2)
+type LinkOwner = struct {
+    @edsl.column("id")
+    id: Int,
+};
+
+@edsl.entity_id("link_targets")
+@edsl.entity_source("link_targets", "lt")
+type LinkTarget = struct {
+    @edsl.column("id")
+    id: Int,
+    @edsl.column("level")
+    @edsl.dimension("LinkTargetLevel", flag_true, flag_true, eq_ops, int_kinds)
+    level: Int,
+    @edsl.column("owner_id")
+    owner_id: Int,
+};
+
+def link_entity_types: Array(Type) = [LinkSubject, LinkOwner, LinkTarget];
+
+def link_authorize: Fn(String) -> Bool = fn(subject) { 'True };
+
+def link_payload: edsl.PreparedPayload = do {
+    edsl.build_root("link-v1", link_entity_types, knowledge.profile, link_authorize)
+};
+
+def link_subject_count_request: edsl.QueryRequest = {
+    measures: [{ id: "LinkSubjectCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def link_target_level_spec: edsl.ExistsRequest = {
+    target: "link_targets",
+    subject: "analyst",
+    filters: [{ id: "LinkTargetLevel", subject: "analyst", op: 'Eq, input: 'Int(2) }],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def link_target_exists_spec: edsl.ExistsRequest = {
+    target: "link_targets",
+    subject: "analyst",
+    filters: [],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def check_link_route_prepared: Bool = do {
+    let p = link_payload;
+    let route = if array.length(p.routes) == 1 { get_index(p.routes, 0) } else { fail!("expected one link route") };
+    let via_rel = get_index(p.relations, route.via_edge);
+    let kind_ok = match via_rel.kind { 'FanOut => 'True, 'Safe => 'False };
+    check(array.length(p.routes) == 1, "link: declared fan-out first-hop route is prepared once")
+        && check(kind_ok, "link: the first hop relation is FanOut")
+        && check(array.length(p.entities) == 3, "link: subject/owner/target entities prepared")
+};
+
+def check_link_two_hop_lowering: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(link_payload, link_subject_count_request, [link_target_level_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(2)];
+    let expected_sql = "SELECT count(ls.id) AS LinkSubjectCount FROM link_subjects AS ls WHERE EXISTS (SELECT 1 FROM link_owners AS lo INNER JOIN link_targets AS lt ON lo.id = lt.owner_id WHERE ls.owner_id = lo.id AND lt.level = ?)";
+    check(array.length(plan.joins) == 0 && array.length(plan.exists) == 1,
+        "link: no outer participant join; one correlated EXISTS carries the whole A -> B -> C body")
+        && check(query.sql == expected_sql, "link: B and C are joined inside the EXISTS; the subject grain is untouched")
+        && check(query.bindings == expected, "link: the target filter binds in placeholder order")
+        && check(!string.contains(query.sql, "JOIN link_owners"), "link: the fan-out first hop is never an outer JOIN")
+};
+
+def check_link_two_hop_returns_subject_dims_only: Bool = do {
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "LinkSubjectName", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let plan: qb.Plan = edsl.lower_full(link_payload, request, [link_target_exists_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT ls.name FROM link_subjects AS ls WHERE EXISTS (SELECT 1 FROM link_owners AS lo INNER JOIN link_targets AS lt ON lo.id = lt.owner_id WHERE ls.owner_id = lo.id)";
+    check(query.sql == expected_sql, "link: measureless existence returns only the subject dimension")
+        && check(array.length(plan.grouping) == 0 && array.length(plan.projection) == 1,
+            "link: no grouping or extra link-count column is introduced")
+};
+
+def check_link_two_hop_deterministic_and_absence: Bool = do {
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_full(link_payload, link_subject_count_request, [link_target_level_spec], []));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_full(link_payload, link_subject_count_request, [link_target_level_spec], []));
+    let absent: qb.Plan = edsl.lower_absence(link_payload, link_subject_count_request, [link_target_exists_spec], []);
+    let aq: qb.Query = qb.transform_sqlite(absent);
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings, "link: repeated lowering is byte-identical")
+        && check(string.contains(aq.sql, "WHERE NOT EXISTS (SELECT 1 FROM link_owners AS lo INNER JOIN link_targets AS lt ON lo.id = lt.owner_id WHERE ls.owner_id = lo.id)"),
+            "link: anti-existence of the whole A -> B -> C body lowers to NOT EXISTS")
+};
+
+# ---------------------------------------------------------------------------
 # Paired-route declaration fixtures (valid and invalid).
 # ---------------------------------------------------------------------------
 
@@ -2314,6 +2453,260 @@ def check_dense_relation_prepare_bounded: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Spider evaluation feedback: query shapes to review (generic, domain-neutral).
+#
+# 1. Projection and ordering are two different constraints: a measureless list
+#    may order by an authorized dimension that is not projected.
+# 2. Result-set distinct dimension rows (SELECT DISTINCT) across multi-dimension,
+#    filter, ordering and limit boundaries.
+# 3. Subjects with NO matching related row lower to a closed NOT EXISTS (NULL
+#    semantics stay SQL-native).
+# 4. Subjects having separate related rows satisfying A and B are two correlated
+#    EXISTS predicates, never a same-row `A AND B`.
+# 5. Cross-relation dimension projection without a measure keeps the row shape
+#    (no fictional COUNT, no GROUP BY).
+# 6. Output column order is the public contract: requested measures first (in
+#    request order), then requested dimensions (in request order).
+# ---------------------------------------------------------------------------
+
+def row_order_unprojected_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Dimension("CustomerTier"), direction: 'Asc }],
+    limit: 'Some(5),
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_row_order_unprojected_dimension: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, row_order_unprojected_request);
+    let proj_only_region = array.length(plan.projection) == 1
+        && (match get_index(plan.projection, 0) { 'Expr(e) => is_column(e, "o", "region"), _ => 'False });
+    let order_ok = array.length(plan.ordering) == 1
+        && (match get_index(plan.ordering, 0).key { 'Expr(e) => is_column(e, "c", "tier"), _ => 'False })
+        && (match get_index(plan.ordering, 0).direction { 'Asc => 'True, 'Desc => 'False });
+    let join_ok = array.length(plan.joins) == 1
+        && get_index(plan.joins, 0).source.alias == "c"
+        && get_index(plan.joins, 0).source.table == "customers";
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(5)];
+    check(proj_only_region, "row order: only the requested dimension is projected (C not forced into the output)")
+        && check(order_ok, "row order: ordering references the authorized, unprojected dimension")
+        && check(join_ok, "row order: the ordering dimension's entity is reached through a safe path")
+        && check(query.sql == "SELECT o.region FROM orders AS o INNER JOIN customers AS c ON o.customer_id = c.id ORDER BY c.tier ASC LIMIT ?"
+            && query.bindings == expected, "row order: ordering by an unprojected dimension keeps deterministic SQL and bindings")
+};
+
+def distinct_rows_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+        { id: "CustomerTier", subject: "analyst", input: 'None },
+    ],
+    filters: [],
+    ordering: [{ target: 'Dimension("OrderRegion"), direction: 'Asc }],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def distinct_json_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [
+        { id: "DeviceChannel", subject: "analyst", input: 'None },
+        { id: "DeviceOwner", subject: "analyst", input: 'None },
+    ],
+    filters: [{ id: "DeviceChannel", subject: "analyst", op: 'Eq, input: 'Text("api") }],
+    ordering: [{ target: 'Dimension("DeviceChannel"), direction: 'Asc }],
+    limit: 'Some(20),
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_distinct_rows: Bool = do {
+    let q1: qb.Query = edsl.lower_distinct(knowledge.payload, distinct_rows_request);
+    let expected_sql1 = "SELECT DISTINCT o.region, c.tier FROM orders AS o INNER JOIN customers AS c ON o.customer_id = c.id ORDER BY o.region ASC";
+    let q2: qb.Query = edsl.lower_distinct(knowledge.payload, distinct_json_request);
+    let expected_b: Array(qb.Val) = ['String("$.channel"), 'String("$.channel"), 'String("api"), 'String("$.channel"), 'Int(20)];
+    check(q1.sql == expected_sql1 && array.length(q1.bindings) == 0,
+        "distinct rows: mutually distinct multi-dimension rows with deterministic SQL and no bindings")
+        && check(string.contains(q2.sql, "SELECT DISTINCT json_extract(d.attributes_json, ?), d.owner"),
+            "distinct rows: distinct applies across dimensions/filter/order/limit")
+        && check(string.contains(q2.sql, "WHERE json_extract(d.attributes_json, ?) = ?")
+            && q2.bindings == expected_b, "distinct rows: filter and limit stay parameterized in placeholder order")
+};
+
+def component_count_request: edsl.QueryRequest = {
+    measures: [{ id: "ComponentCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def no_alarm_spec: edsl.ExistsRequest = {
+    target: "alarms",
+    subject: "analyst",
+    filters: [],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def check_absence_not_exists: Bool = do {
+    let plan: qb.Plan = edsl.lower_absence(knowledge.payload, component_count_request, [no_alarm_spec], []);
+    let negated = array.length(plan.exists) == 1 && get_index(plan.exists, 0).negated;
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(m.id) AS ComponentCount FROM components AS m INNER JOIN sites AS s ON m.site_id = s.id WHERE NOT EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id)";
+    check(negated, "absence: the correlated body is lowered in its negated structural form")
+        && check(query.sql == expected_sql, "absence: zero-match subjects lower to a single NOT EXISTS with the owner join")
+        && check(!string.contains(query.sql, "WHERE EXISTS"), "absence: no positive existence form is emitted")
+};
+
+def alarm_a_spec: edsl.ExistsRequest = {
+    target: "alarms",
+    subject: "analyst",
+    filters: [{ id: "AlarmLevel", subject: "analyst", op: 'Eq, input: 'Int(1) }],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def alarm_b_spec: edsl.ExistsRequest = {
+    target: "alarms",
+    subject: "analyst",
+    filters: [{ id: "AlarmLevel", subject: "analyst", op: 'Eq, input: 'Int(3) }],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def check_separate_exists_rows: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, component_count_request, [alarm_a_spec, alarm_b_spec], []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(1), 'Int(3)];
+    let two_subqueries = string.contains(query.sql,
+        "al.level = ?) AND EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id AND al.level = ?)");
+    check(array.length(plan.exists) == 2, "separate exists: A and B lower to two correlated EXISTS predicates")
+        && check(two_subqueries, "separate exists: A and B are two independent subqueries (may be satisfied by different rows)")
+        && check(query.bindings == expected, "separate exists: bindings keep request order")
+};
+
+def cross_relation_list_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [
+        { id: "OrderRegion", subject: "analyst", input: 'None },
+        { id: "CustomerTier", subject: "analyst", input: 'None },
+    ],
+    filters: [{ id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("east") }],
+    ordering: [{ target: 'Dimension("OrderRegion"), direction: 'Asc }],
+    limit: 'Some(25),
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_cross_relation_measureless_shape: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, cross_relation_list_request);
+    let only_exprs = array.all(plan.projection, fn(i) { is_expr_item(i) });
+    let no_group = array.length(plan.grouping) == 0;
+    let no_count = expr_item_count(plan.projection) == 2;
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(only_exprs && no_group && no_count, "cross-relation measureless: no fictional COUNT and no GROUP BY are introduced")
+        && check(string.contains(query.sql, "FROM orders AS o INNER JOIN customers AS c"), "cross-relation measureless: dimensions project across a safe join")
+};
+
+def check_projection_order_contract: Bool = do {
+    let plan: qb.Plan = edsl.lower(knowledge.payload, main_request);
+    let kinds: Array(String) = array.map(plan.projection, fn(item) {
+        match item {
+            'Aggregate(agg) => agg.alias,
+            'Computed(c) => c.alias,
+            'Expr(_) => "expr",
+        }
+    });
+    let expected: Array(String) = ["OrderAmount", "OrderCount", "expr", "expr", "expr"];
+    check(kinds == expected, "output order: requested measures precede requested dimensions, each in request order")
+};
+
+# ---------------------------------------------------------------------------
+# Spider round 3: internal (non-projected) ordering aggregate.
+#
+# A grouped dimension listing may ORDER BY an aggregate of the base entity (e.g.
+# the record count of each group) and take Top N while RETURNING only the
+# dimension (e.g. only the group name).  The ordering aggregate is internal:
+# it never appears in the projection.
+# ---------------------------------------------------------------------------
+
+def internal_top_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "DeviceOwner", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Dimension("DeviceOwner"), direction: 'Asc }],
+    limit: 'Some(1),
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_internal_top_group: Bool = do {
+    let internal: Array(edsl.InternalOrderRequest) = [
+        { measure: "DeviceCount", subject: "analyst", direction: 'Desc },
+    ];
+    let plan: qb.Plan = edsl.lower_internal_top(knowledge.payload, internal_top_request, internal);
+    let grouped = array.length(plan.grouping) == 1 && is_column(get_expr(plan.grouping, 0), "d", "owner");
+    let only_dim_projected = array.length(plan.projection) == 1
+        && (match get_index(plan.projection, 0) { 'Expr(e) => is_column(e, "d", "owner"), _ => 'False });
+    let order_ok = array.length(plan.ordering) == 2
+        && (match get_index(plan.ordering, 0).key { 'Aggregate(_) => 'True, _ => 'False })
+        && (match get_index(plan.ordering, 0).direction { 'Desc => 'True, 'Asc => 'False })
+        && (match get_index(plan.ordering, 1).key { 'Expr(e) => is_column(e, "d", "owner"), _ => 'False });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(1)];
+    check(grouped, "internal top: the request is grouped by its selected dimension")
+        && check(only_dim_projected, "internal top: only the dimension is returned; the aggregate is not projected")
+        && check(order_ok, "internal top: ordering is the internal aggregate DESC then the dimension tie-breaker ASC")
+        && check(query.sql == "SELECT d.owner FROM devices AS d GROUP BY d.owner ORDER BY count(d.id) DESC, d.owner ASC LIMIT ?"
+            && query.bindings == expected, "internal top: SQL returns only the group column ordered by the internal aggregate")
+};
+
+# ---------------------------------------------------------------------------
+# Spider round 3: existence/filter along relations while returning only subject
+# dimensions (no link-count measure is needed to choose the entry/path).
+# One-hop existence (either direction, fan-out allowed) and the declared
+# two-hop route both keep the subject grain as pure correlated EXISTS/owner-join
+# predicates; the projection stays the requested subject dimensions only.
+# ---------------------------------------------------------------------------
+
+def customer_tier_existence_list_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "CustomerTier", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def has_order_spec: edsl.ExistsRequest = {
+    target: "orders",
+    subject: "analyst",
+    filters: [],
+    any_of: [],
+    min_matches: 'None,
+};
+
+def check_measureless_existence_returns_subject_dims: Bool = do {
+    let plan: qb.Plan = edsl.lower_full(knowledge.payload, customer_tier_existence_list_request, [has_order_spec], []);
+    let only_tier = array.length(plan.projection) == 1
+        && (match get_index(plan.projection, 0) { 'Expr(e) => is_column(e, "c", "tier"), _ => 'False });
+    let query: qb.Query = qb.transform_sqlite(plan);
+    check(only_tier, "measureless existence: only the subject dimension is returned (no link-count measure added)")
+        && check(array.length(plan.exists) == 1 && array.length(plan.joins) == 0 && array.length(plan.grouping) == 0,
+            "measureless existence: the related-record proof is a correlated EXISTS predicate, not a join/count/group")
+        && check(query.sql == "SELECT c.tier FROM customers AS c WHERE EXISTS (SELECT 1 FROM orders AS o WHERE c.id = o.customer_id)",
+            "measureless existence: existence filter over a direct (reverse, fan-out) relation keeps the subject rows")
+};
+
+# ---------------------------------------------------------------------------
 # Entry.
 # ---------------------------------------------------------------------------
 
@@ -2362,7 +2755,7 @@ export def test_ontology: Value = do {
     let c42 = check_correlation_feasible;
     let c43 = check_exists_inner_filter_target;
     let c44 = check_route_prepare_valid;
-    let c45 = check_route_rejects_nonunique_owner;
+    let c45 = check_route_accepts_fanout_first_hop;
     let c46 = check_route_rejects_direction_mismatch;
     let c47 = check_route_rejects_ambiguous_target;
     let c48 = check_route_rejects_ambiguous_second_hop;
@@ -2400,5 +2793,17 @@ export def test_ontology: Value = do {
     let c80 = check_peer_route_rejects_duplicate;
     let c81 = check_peer_same_type_entity_only;
     let c82 = check_typed_peer_entity_only;
+    let c83 = check_row_order_unprojected_dimension;
+    let c84 = check_distinct_rows;
+    let c85 = check_absence_not_exists;
+    let c86 = check_separate_exists_rows;
+    let c87 = check_cross_relation_measureless_shape;
+    let c88 = check_projection_order_contract;
+    let c89 = check_internal_top_group;
+    let c90 = check_measureless_existence_returns_subject_dims;
+    let c91 = check_link_route_prepared;
+    let c92 = check_link_two_hop_lowering;
+    let c93 = check_link_two_hop_returns_subject_dims_only;
+    let c94 = check_link_two_hop_deterministic_and_absence;
     'String("ontology tests ok")
 };

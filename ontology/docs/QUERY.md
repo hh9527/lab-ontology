@@ -102,6 +102,30 @@ alias 做 `'Add`/`'Sub` 算术组合。
 > 使用 `qb.exists`/`qb.exists_grouped`/`qb.exists_union`/`qb.exists_peer`，不要直接
 > 写 Exists 记录字面量；对 `Exists` 做穷尽字段访问的下游要处理 `peer`。
 
+> **公共破坏性契约（anti-existence 与 distinct 轮）**：`Exists` 新增 `negated: Bool`
+> 字段，新增 `qb.exists_not` 构造器（把任一 correlated body 的 `negated` 置为 `'True`，
+> 渲染为 `NOT EXISTS (...)`）。新建 Exists 的下游应继续使用
+> `qb.exists`/`qb.exists_grouped`/`qb.exists_union`/`qb.exists_peer`/`qb.exists_not`，
+> 不要直接写 Exists 记录字面量。QueryBuilder 另新增 `qb.transform_sqlite_distinct`：
+> 把无分组、无聚合、纯表达式投影的行级 Plan 渲染为 `SELECT DISTINCT ...`
+> （SQLite 要求 DISTINCT 的 ORDER BY 项出现在结果集中，故排序目标必须是已投影
+> 表达式）。两者都不改变标准算子的语义，也不向 Plan 增加新字段。
+
+> **公共破坏性契约（internal ordering aggregate 轮）**：`OrderKey` 新增
+> `'Aggregate(AggregateCall)` variant（内部/未投影的排序聚合：分组 Plan 按该聚合
+> 值排序并取 Top N，但不投影它）。对 `OrderKey` 做穷尽 match 的下游必须处理
+> `'Aggregate`；`'Aggregate` 排序 key 只允许出现在**已分组** Plan 中（v1 不接受于
+> partition order_by），其 AggregateCall 的 function/arg/filter 继续受
+> operator/aggregate/scalar profile 收窄。
+
+> **公共破坏性契约（two-hop link 轮）**：`Exists` 新增 `link: Option(ExistsLink)`
+> 字段与 `ExistsLink` 类型，新增 `qb.exists_two_hop` 构造器：把整个 A→B→C 条件
+> 保持在一个 correlated EXISTS 内（B 与 C 在子查询内互相 JOIN）。新建 Exists 的
+> 下游应继续使用 `qb.exists`/`qb.exists_grouped`/`qb.exists_union`/`qb.exists_peer`/
+> `qb.exists_two_hop`/`qb.exists_not`，不要直接写 Exists 记录字面量。`link` 模式与
+> alternatives/grouping/having/peer 互斥；`link.pairs` 每边分别属于 `Exists.source`
+> 与 `link.source` 的 alias。
+
 标量语义（与 SQLite 行为一致）：
 
 | 函数 | 参数 | 语义 |
@@ -143,7 +167,7 @@ type JoinCondition = enum {
 type Join = struct { kind: JoinKind, source: Source, condition: JoinCondition };
 type Ordering = enum { 'Asc, 'Desc };
 type AggregateRef = struct { alias: String };
-type OrderKey = enum { 'Expr(Expr), 'AggregateRef(AggregateRef) };
+type OrderKey = enum { 'Expr(Expr), 'AggregateRef(AggregateRef), 'Aggregate(AggregateCall) };
 type OrderBy = struct { key: OrderKey, direction: Ordering };
 
 # Correlated EXISTS (semi-join) filter; `grouping`/`having` make it a
@@ -175,6 +199,16 @@ type Exists = struct {
     grouping: Array(Expr),
     having: Array(Having),
     peer: Option(PeerCorr),
+    negated: Bool,
+    link: Option(ExistsLink),
+};
+
+# Bounded correlated two-hop link body: B (`Exists.source`) is joined to C
+# (`source`) inside the same subquery; see "反存在过滤 / 两跳 link 存在".
+type ExistsLink = struct {
+    source: Source,
+    pairs: Array(ColumnEq),
+    filter: Option(Expr),
 };
 
 # Aggregate-result predicate; see "HAVING" and "嵌套聚合".
@@ -265,6 +299,7 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `validate_structure` | `Fn(Plan) -> Plan` | 结构非法时 `fail!`，成功时返回原 Plan |
 | `validate` | `Fn(Plan, PlanProfile) -> Plan` | 结构或能力非法时 `fail!`，成功时返回原 Plan |
 | `transform_sqlite` | `Fn(Plan) -> Query` | 合法 Plan 确定性转换为 SQLite Query |
+| `transform_sqlite_distinct` | `Fn(Plan) -> Query` | 行级（无分组/无聚合/纯表达式投影）Plan 渲染为 `SELECT DISTINCT ...`（distinct 行） |
 | `count_groups` | `Fn(Plan, PlanProfile) -> Query` | 结构/profile 校验内层后，统计通过 HAVING 的组数（嵌套聚合形状 1） |
 | `is_sql_identifier` | `Fn(String) -> Bool` | 检查 `^[A-Za-z_][A-Za-z0-9_]*$` |
 
@@ -298,6 +333,8 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `exists` | `Fn(Source, Array(ColumnEq), Option(Expr)) -> Exists` |
 | `exists_grouped` | `Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array(Having)) -> Exists` |
 | `exists_union` | `Fn(Source, Array(Array(ColumnEq)), Option(Expr)) -> Exists` |
+| `exists_not` | `Fn(Exists) -> Exists` | 同一 correlated body 的 `negated` 形式（渲染 `NOT EXISTS (...)`，anti-existence） |
+| `exists_two_hop` | `Fn(Source, Array(ColumnEq), Source, Array(ColumnEq), Option(Expr)) -> Exists` | bounded 两跳 link 存在（A→B→C 在同一 correlated EXISTS 内，B/C 子查询内互 JOIN） |
 | `peer_branch` | `Fn(ColumnEq, ColumnEq) -> PeerBranch` |
 | `peer_corr` | `Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr)) -> PeerCorr`（异构，无 key 不等证明） |
 | `peer_corr_distinct` | `Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr), Bool) -> PeerCorr`（同实体加入 `origin.key <> peer.key` 身份证明） |
@@ -547,6 +584,49 @@ bindings 严格按 SQL 占位符真实顺序：内层 SQL 文本把 window 表�
 列表中，因此顺序为 projection、隐藏列、window partition、window ordering、join、
 global filter、grouping，最后是外层 `take`。同一个合法 Plan 总是生成逐字节相同的
 SQL 与绑定顺序。
+
+## 内部（未投影）排序聚合
+
+`OrderKey 'Aggregate(AggregateCall)` 让一个**已分组** Plan 按未投影的聚合值排序并
+取 Top N：内部聚合与输出 projection 是分开的约束，聚合不会成为返回列。典型形状
+是“按每组记录数选出最大组，只返回组名”：
+
+```telora
+let internal: qb.AggregateCall = {
+    function: 'Count,
+    arg: qb.column("o", "id"),
+    distinct: 'False,
+    filter: 'None,
+    alias: "__internal",
+};
+let plan: qb.Plan = {
+    revision: "largest-group-v1",
+    sources: [qb.source("o", "orders")],
+    projection: [qb.expr_item(qb.column("o", "region"))],
+    filter: 'None,
+    exists: [],
+    joins: [],
+    grouping: [qb.column("o", "region")],
+    having: [],
+    ordering: [qb.order_by('Aggregate(internal), 'Desc)],
+    limit: 'Some(1),
+    offset: 'None,
+    derived: 'None,
+    partition: 'None,
+};
+```
+
+```sql
+SELECT o.region FROM orders AS o GROUP BY o.region ORDER BY count(o.id) DESC LIMIT ?
+```
+
+- `'Aggregate` 排序 key 只在分组 Plan 中合法（结构校验拒绝在未分组 Plan 中使用）；
+  它渲染该 AggregateCall 的完整聚合表达式（含 FILTER）。
+- operator/aggregate/scalar/distinct 仍递归受 profile 收窄：`'Aggregate` 排序消耗
+  `Aggregate` operator、其 function 需在 `allowed_aggregates`、arg/filter 的 scalar
+  需在 `allowed_scalars`、`distinct='True` 需 `allow_distinct`。
+- v1 的 `partition` order_by 不接受 `'Aggregate`；内部排序聚合用于全局 `limit`
+  Top N 形状。
 
 ## 条件聚合与计算聚合（filtered & computed aggregates）
 
@@ -1008,6 +1088,71 @@ WHERE EXISTS (SELECT 1 FROM alerts AS a WHERE d.id = a.device_id)
 
 非法引用（空 pairs、inner 列不是本 source、outer 列不是主 alias、内层 filter
 引用未知 alias、inner alias 与主 alias 重名）都会在结构校验中原子拒绝。
+
+## 结果集 distinct（SELECT DISTINCT）
+
+`qb.transform_sqlite_distinct(plan)` 把合法的行级 Plan（无 grouping、无 HAVING、
+无 partition、投影项全部是 `'Expr` 维度表达式）渲染为 `SELECT DISTINCT ...`：
+结果行互不重复，覆盖多维度、过滤、排序与 limit/offset 边界。这是结果集去重
+语义，不能退化为普通投影或 `count(distinct ...)`。
+
+- 投影决定返回列；过滤/排序/limit 与普通查询一致。
+- SQLite 要求 `SELECT DISTINCT` 的每个 `ORDER BY` 项都出现在结果集中，因此
+  wrapper 确定性要求每个排序目标都是已投影的表达式（按非投影列排序属于普通
+  `transform_sqlite` 的范围）。
+- bindings 严格按占位符顺序；同一 Plan 重复转换逐字节一致。
+- 聚合/分组/HAVING/分区 Plan 不在该行级 distinct 形状内，确定性失败、不发布
+  部分 Query。
+
+```telora
+let rows: qb.Query = qb.transform_sqlite_distinct(row_plan);
+```
+
+## 反存在过滤（NOT EXISTS）
+
+`qb.exists_not(ex)` 把任一已构造的 correlated `Exists` body 的 `negated` 置为
+`'True`，渲染为 `NOT EXISTS (...)`。它选择“没有满足条件的关联记录”的主体，
+NULL 语义保持 SQL 原生（当无相关行时 `NOT EXISTS` 为真，与 `NULL` 处理无关）；
+correlation、source、bindings 与 grain 语义与正向 `EXISTS` 完全相同。
+
+```telora
+let no_alerts: qb.Exists = qb.exists_not(qb.exists(
+    qb.source("a", "alerts"),
+    [qb.column_eq(qb.column_ref("d", "id"), qb.column_ref("a", "device_id"))],
+    'Some(qb.scalar('Eq, [qb.column("a", "level"), qb.bind_int(3)])),
+));
+```
+
+```sql
+SELECT d.id FROM devices AS d
+WHERE NOT EXISTS (SELECT 1 FROM alerts AS a
+                  WHERE d.id = a.device_id AND a.level = ?)
+```
+
+`negated` 只是谓词层取反：它不产生外层 JOIN、不放宽相关引用规则，`'Exists`
+operator 与 profile 语义不变（`NOT EXISTS` 仍属 existence 能力）。
+
+## 有界两跳 link 存在（A → B → C）
+
+`qb.exists_two_hop(hop_source, hop_pairs, link_source, link_pairs, link_filter)`
+让一个 base 主体 A 在**同一个 correlated EXISTS** 内表达“存在关联行 B、且 B 又关联
+满足条件的 C”：B（`hop_source`）与 C（`link_source`）在子查询内互相 `INNER JOIN`，
+A 只通过 `hop_pairs` 相关到 B。B 和 C 绝不出现在外层 projection/grouping/joins，
+因此即使 A→B 是一对多（fan-out）关系，外层 A 的 grain 也不会被放大；同一主体有多条
+匹配 B/C 时外层仍只计一次。
+
+```text
+EXISTS (SELECT 1 FROM <B> AS <b>
+        INNER JOIN <C> AS <c> ON <link.pairs (b.col = c.col)>
+        WHERE <hop.pairs (a.col = b.col)> [AND link_filter])
+```
+
+- `hop.pairs` 每个等式的 `left` 是外层主体 alias 列、`right` 是 B alias 列；
+  `link.pairs` 每个等式分别连接 B alias 与 C alias 的列。
+- `link.filter` 是可选的 C 侧谓词（复用封闭 Expr），动态值保持参数化。
+- 结构校验要求 B/C alias 合法、互异且不遮蔽外层 alias；不与其他 exists 模式组合；
+  operator/profile 递归收窄（`Exists` + `Column` + filter 的 scalar）。
+- 对同一 link body 使用 `exists_not` 即得 `NOT EXISTS` 的两跳反存在。
 
 ## 角色化 Join 与结构化 ON 条件
 

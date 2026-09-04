@@ -1,13 +1,22 @@
 # spider-model/src/query.telora
 #
-# Deterministic intent resolver.  The INTENT JSON (defined in docs/INTENT.md,
-# vocabulary in docs/DOMAIN.md) is decoded into the `Intent` type below,
-# validated against the prepared knowledge payload, lowered through the
-# ontology eDSL, and concretized into a parameterized SQLite Query
-# (`{sql, bindings}`).  All dynamic values stay in bindings; nothing is ever
-# concatenated into SQL text.  Unknown vocabulary, type errors and illegal
-# combinations are rejected deterministically (intent_problem) before any
-# lowering happens.
+# Deterministic intent resolver (v3).
+#
+# The INTENT JSON (defined in docs/INTENT.md, vocabulary in docs/DOMAIN.md) is
+# decoded into the `Intent` type, validated against the prepared knowledge
+# payload, lowered through the ontology eDSL/QueryBuilder, and concretized into
+# a parameterized SQLite Query ({sql, bindings}).
+#
+# v3 uses the ontology foundation's native capabilities where they exist:
+#   * positive correlated existence  -> lower_full  (records meeting A AND B)
+#   * anti-existence (NOT EXISTS)    -> lower_absence (no matching related row)
+#   * row-level SELECT DISTINCT      -> lower_distinct
+#   * measureless row ordering by a non-returned dimension is delegated to the
+#     base (projection and ordering are independent constraints there);
+# The resolver still owns the result-shape contract that the base leaves open:
+# output column order (dimensions first, then measures in request order) is
+# applied by a plan finalizer so returned columns faithfully match the intent.
+# Dynamic values always stay in bindings; nothing is concatenated into SQL text.
 
 import "ontology/edsl" as edsl;
 import "ontology/query" as qb;
@@ -35,6 +44,11 @@ type IntentFilter = struct {
     value: ScalarValue,
 };
 
+type IntentExists = struct {
+    target: String,
+    filters: Array(IntentFilter),
+};
+
 type IntentOrder = struct {
     measure: Option(String),
     dimension: Option(String),
@@ -44,7 +58,10 @@ type IntentOrder = struct {
 type Intent = struct {
     measures: Array(IntentMeasure),
     dimensions: Array(IntentDimension),
+    distinct: Bool,
     filters: Array(IntentFilter),
+    exists: Array(IntentExists),
+    absence: Array(IntentExists),
     order: Array(IntentOrder),
     limit: Option(Int),
     offset: Option(Int),
@@ -100,13 +117,47 @@ def value_kind: Fn(ScalarValue) -> Option(edsl.FilterInputKind) = fn(v) {
     }
 };
 
+def contains_id: Fn(Array(String), String) -> Bool = fn(items, id) {
+    array.any(items, fn(x) { x == id })
+};
+
+def base_entity_index: Fn(edsl.PreparedPayload, Intent) -> Int = fn(payload, intent) {
+    if array.length(intent.measures) > 0 {
+        match find_measure(payload, intent.measures[0].id) {
+            'Some(entry) => entry.entity,
+            'None => -1,
+        }
+    } else if array.length(intent.dimensions) > 0 {
+        match find_dimension(payload, intent.dimensions[0].id) {
+            'Some(entry) => entry.entity,
+            'None => -1,
+        }
+    } else {
+        -1
+    }
+};
+
+def entity_id_of: Fn(edsl.PreparedPayload, Int) -> String = fn(payload, index) {
+    let entry = payload.entities[index];
+    entry.id
+};
+
+# True when `to` is reachable from `from` through only grain-safe relations
+# (or is the same entity).
+def path_safe: Fn(edsl.PreparedPayload, Int, Int) -> Bool = fn(payload, from, to) {
+    match payload.paths[from][to] {
+        'Safe(_) => 'True,
+        _ => 'False,
+    }
+};
+
 # ---------------------------------------------------------------------------
 # Per-item validation issues (pure; each returns the first problem or None).
 # ---------------------------------------------------------------------------
 
 def measure_issue: Fn(edsl.PreparedPayload, IntentMeasure) -> Option(String) = fn(payload, m) {
     if m.mode != "all" && m.mode != "distinct" {
-        let s: Option(String) = 'Some(`invalid measure mode: \{m.mode}`);
+        let s: Option(String) = 'Some(`rule: invalid measure mode for \{m.id}: \{m.mode}`);
         s
     } else {
         match find_measure(payload, m.id) {
@@ -115,7 +166,7 @@ def measure_issue: Fn(edsl.PreparedPayload, IntentMeasure) -> Option(String) = f
                 none
             },
             'None => {
-                let s: Option(String) = 'Some(`unknown measure: \{m.id}`);
+                let s: Option(String) = 'Some(`vocab: unknown measure \{m.id}`);
                 s
             },
         }
@@ -125,11 +176,11 @@ def measure_issue: Fn(edsl.PreparedPayload, IntentMeasure) -> Option(String) = f
 def dimension_issue: Fn(edsl.PreparedPayload, IntentDimension) -> Option(String) = fn(payload, d) {
     match find_dimension(payload, d.id) {
         'None => {
-            let s: Option(String) = 'Some(`unknown dimension: \{d.id}`);
+            let s: Option(String) = 'Some(`vocab: unknown dimension \{d.id}`);
             s
         },
         'Some(entry) => if !entry.authorized {
-            let s: Option(String) = 'Some(`dimension is not authorized: \{d.id}`);
+            let s: Option(String) = 'Some(`vocab: dimension \{d.id} is not authorized`);
             s
         } else {
             let none: Option(String) = 'None;
@@ -141,35 +192,35 @@ def dimension_issue: Fn(edsl.PreparedPayload, IntentDimension) -> Option(String)
 def filter_issue: Fn(edsl.PreparedPayload, IntentFilter) -> Option(String) = fn(payload, f) {
     match find_dimension(payload, f.id) {
         'None => {
-            let s: Option(String) = 'Some(`unknown filter dimension: \{f.id}`);
+            let s: Option(String) = 'Some(`vocab: unknown filter dimension \{f.id}`);
             s
         },
         'Some(entry) => do {
             if !entry.authorized {
-                let s: Option(String) = 'Some(`filter dimension is not authorized: \{f.id}`);
+                let s: Option(String) = 'Some(`vocab: filter dimension \{f.id} is not authorized`);
                 s
             } else if !entry.filterable {
-                let s: Option(String) = 'Some(`filter dimension is not filterable: \{f.id}`);
+                let s: Option(String) = 'Some(`rule: filter dimension \{f.id} is not filterable`);
                 s
             } else {
                 match parse_op(f.op) {
                     'None => {
-                        let s: Option(String) = 'Some(`unknown filter operator: \{f.op}`);
+                        let s: Option(String) = 'Some(`rule: unknown filter operator \{f.op}`);
                         s
                     },
                     'Some(op) => do {
                         if !array.any(entry.ops, fn(o) { o == op }) {
-                            let s: Option(String) = 'Some(`filter operator not supported on \{f.id}: \{f.op}`);
+                            let s: Option(String) = 'Some(`rule: operator \{f.op} not supported on dimension \{f.id}`);
                             s
                         } else {
                             match value_kind(f.value) {
                                 'None => {
-                                    let s: Option(String) = 'Some(`filter value must be text or number on \{f.id}`);
+                                    let s: Option(String) = 'Some(`type: filter value on \{f.id} must be text or number`);
                                     s
                                 },
                                 'Some(kind) => do {
                                     if !array.any(entry.input_kinds, fn(k) { k == kind }) {
-                                        let s: Option(String) = 'Some(`filter value type not supported on \{f.id}`);
+                                        let s: Option(String) = 'Some(`type: value type not supported on dimension \{f.id}`);
                                         s
                                     } else if is_text_op(op) {
                                         match f.value {
@@ -178,7 +229,7 @@ def filter_issue: Fn(edsl.PreparedPayload, IntentFilter) -> Option(String) = fn(
                                                 none
                                             },
                                             _ => {
-                                                let s: Option(String) = 'Some(`text filter operator requires a text value on \{f.id}`);
+                                                let s: Option(String) = 'Some(`type: text operator on \{f.id} requires a text value`);
                                                 s
                                             },
                                         }
@@ -196,19 +247,75 @@ def filter_issue: Fn(edsl.PreparedPayload, IntentFilter) -> Option(String) = fn(
     }
 };
 
+def exists_filter_issue: Fn(edsl.PreparedPayload, Int, IntentFilter) -> Option(String) = fn(payload, target, f) {
+    match find_dimension(payload, f.id) {
+        'None => {
+            let s: Option(String) = 'Some(`vocab: unknown related filter dimension \{f.id}`);
+            s
+        },
+        'Some(entry) => if entry.entity != target {
+            let s: Option(String) = 'Some(`rule: related filter \{f.id} must reference the target entity`);
+            s
+        } else {
+            filter_issue(payload, f)
+        },
+    }
+};
+
+# Shared validation body for positive-exists and anti-exists specs.
+def related_issue: Fn(edsl.PreparedPayload, Intent, IntentExists, String) -> Option(String) = fn(payload, intent, e, kind) {
+    let base = base_entity_index(payload, intent);
+    if base < 0 {
+        let s: Option(String) = 'Some("rule: related filter requires a subject entity (select a measure or a dimension)");
+        s
+    } else {
+        match array.find(payload.entities, fn(en) { en.id == e.target }) {
+            'None => {
+                let s: Option(String) = 'Some(`vocab: unknown related target entity \{e.target}`);
+                s
+            },
+            'Some(target) => do {
+                if target.index == base {
+                    let s: Option(String) = 'Some(`rule: related target must differ from the subject entity: \{e.target}`);
+                    s
+                } else {
+                    let feasible = edsl.correlation_feasible(payload, entity_id_of(payload, base), e.target);
+                    if !feasible {
+                        let s: Option(String) = 'Some(`unsupported: no declared relation from the subject to related target \{e.target} (\{kind})`);
+                        s
+                    } else {
+                        let init: Option(String) = 'None;
+                        let inner = array.fold(e.filters, init, fn(acc, f) {
+                            match acc {
+                                'Some(_) => acc,
+                                'None => exists_filter_issue(payload, target.index, f),
+                            }
+                        });
+                        inner
+                    }
+                }
+            },
+        }
+    }
+};
+
 def order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Option(String) = fn(payload, intent, o) {
     if o.direction != "asc" && o.direction != "desc" {
-        let s: Option(String) = 'Some(`invalid order direction: \{o.direction}`);
+        let s: Option(String) = 'Some(`rule: invalid order direction \{o.direction}`);
         s
     } else if o.measure != 'None && o.dimension != 'None {
-        let s: Option(String) = 'Some("order must name exactly one measure or one dimension");
+        let s: Option(String) = 'Some("rule: order must name exactly one measure or one dimension");
         s
     } else {
         match o.measure {
             'Some(mid) => do {
-                let selected = array.any(intent.measures, fn(m) { m.id == mid });
+                let selected = contains_id(array.map(intent.measures, fn(m) { m.id }), mid);
                 if !selected {
-                    let s: Option(String) = 'Some(`ordering measure is not selected: \{mid}`);
+                    # Ordering by an aggregate that is not a returned column is a
+                    # base-layer capability gap.  It must be rejected explicitly
+                    # (never approximated by silently adding the measure to the
+                    # output).
+                    let s: Option(String) = 'Some(`unsupported: ordering by aggregate \{mid} that is not a returned column`);
                     s
                 } else {
                     match find_measure(payload, mid) {
@@ -217,7 +324,7 @@ def order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Option(String)
                             none
                         },
                         'None => {
-                            let s: Option(String) = 'Some(`ordering references unknown measure: \{mid}`);
+                            let s: Option(String) = 'Some(`vocab: ordering references unknown measure \{mid}`);
                             s
                         },
                     }
@@ -225,25 +332,48 @@ def order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Option(String)
             },
             'None => match o.dimension {
                 'Some(did) => do {
-                    let selected = array.any(intent.dimensions, fn(d) { d.id == did });
-                    if !selected {
-                        let s: Option(String) = 'Some(`ordering dimension is not selected: \{did}`);
-                        s
-                    } else {
+                    let selected = contains_id(array.map(intent.dimensions, fn(d) { d.id }), did);
+                    if selected {
                         match find_dimension(payload, did) {
                             'Some(_) => {
                                 let none: Option(String) = 'None;
                                 none
                             },
                             'None => {
-                                let s: Option(String) = 'Some(`ordering references unknown dimension: \{did}`);
+                                let s: Option(String) = 'Some(`vocab: ordering references unknown dimension \{did}`);
                                 s
+                            },
+                        }
+                    } else if array.length(intent.measures) > 0 {
+                        let s: Option(String) = 'Some(`rule: ordering dimension \{did} must be selected in an aggregated intent`);
+                        s
+                    } else if intent.distinct {
+                        let s: Option(String) = 'Some("rule: a distinct list can only order by a selected dimension");
+                        s
+                    } else {
+                        # Row-level ordering by a non-returned dimension is
+                        # supported when it is authorized and reachable from the
+                        # subject through a grain-safe path.
+                        match find_dimension(payload, did) {
+                            'None => {
+                                let s: Option(String) = 'Some(`vocab: ordering references unknown dimension \{did}`);
+                                s
+                            },
+                            'Some(entry) => if !entry.authorized {
+                                let s: Option(String) = 'Some(`vocab: ordering dimension \{did} is not authorized`);
+                                s
+                            } else if !path_safe(payload, base_entity_index(payload, intent), entry.entity) {
+                                let s: Option(String) = 'Some(`rule: hidden ordering dimension \{did} is not safely reachable from the subject`);
+                                s
+                            } else {
+                                let none: Option(String) = 'None;
+                                none
                             },
                         }
                     }
                 },
                 'None => {
-                    let s: Option(String) = 'Some("order must name a measure or a dimension");
+                    let s: Option(String) = 'Some("rule: order must name a measure or a dimension");
                     s
                 },
             },
@@ -255,14 +385,19 @@ def order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Option(String)
 # List-level validation issues.
 # ---------------------------------------------------------------------------
 
+def fold_problems: for(A) Fn(Fn(edsl.PreparedPayload, A) -> Option(String), edsl.PreparedPayload, Array(A)) -> Option(String) =
+    fn(issue, payload, items) {
+        let init: Option(String) = 'None;
+        array.fold(items, init, fn(acc, item) {
+            match acc {
+                'Some(_) => acc,
+                'None => issue(payload, item),
+            }
+        })
+    };
+
 def measure_problem: Fn(edsl.PreparedPayload, Array(IntentMeasure)) -> Option(String) = fn(payload, measures) {
-    let init: Option(String) = 'None;
-    array.fold(measures, init, fn(acc, m) {
-        match acc {
-            'Some(_) => acc,
-            'None => measure_issue(payload, m),
-        }
-    })
+    fold_problems(measure_issue, payload, measures)
 };
 
 def measure_grain_problem: Fn(edsl.PreparedPayload, Array(IntentMeasure)) -> Option(String) = fn(payload, measures) {
@@ -281,7 +416,7 @@ def measure_grain_problem: Fn(edsl.PreparedPayload, Array(IntentMeasure)) -> Opt
             }
         }) {
             'Some(m) => {
-                let s: Option(String) = 'Some(`measures do not share one entity grain: \{m.id}`);
+                let s: Option(String) = 'Some(`rule: measures do not share one entity grain: \{m.id}`);
                 s
             },
             'None => {
@@ -293,21 +428,29 @@ def measure_grain_problem: Fn(edsl.PreparedPayload, Array(IntentMeasure)) -> Opt
 };
 
 def dimension_problem: Fn(edsl.PreparedPayload, Array(IntentDimension)) -> Option(String) = fn(payload, dimensions) {
+    fold_problems(dimension_issue, payload, dimensions)
+};
+
+def filter_problem: Fn(edsl.PreparedPayload, Array(IntentFilter)) -> Option(String) = fn(payload, filters) {
+    fold_problems(filter_issue, payload, filters)
+};
+
+def exists_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
     let init: Option(String) = 'None;
-    array.fold(dimensions, init, fn(acc, d) {
+    array.fold(intent.exists, init, fn(acc, e) {
         match acc {
             'Some(_) => acc,
-            'None => dimension_issue(payload, d),
+            'None => related_issue(payload, intent, e, "exists"),
         }
     })
 };
 
-def filter_problem: Fn(edsl.PreparedPayload, Array(IntentFilter)) -> Option(String) = fn(payload, filters) {
+def absence_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
     let init: Option(String) = 'None;
-    array.fold(filters, init, fn(acc, f) {
+    array.fold(intent.absence, init, fn(acc, e) {
         match acc {
             'Some(_) => acc,
-            'None => filter_issue(payload, f),
+            'None => related_issue(payload, intent, e, "absence"),
         }
     })
 };
@@ -322,10 +465,118 @@ def order_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(paylo
     })
 };
 
+# ---------------------------------------------------------------------------
+# Internal (unprojected) ordering aggregate: a grouped-dimension request may
+# order by a measure on the base entity without returning that measure
+# (base `lower_internal_top`).  Only such "group top N by count, return the
+# group dimension only" intents use this path.
+# ---------------------------------------------------------------------------
+
+def internal_top_mode: Fn(Intent) -> Bool = fn(intent) {
+    if array.length(intent.measures) > 0 {
+        'False
+    } else {
+        array.any(intent.order, fn(o) { o.measure != 'None })
+    }
+};
+
+def internal_order_issue: Fn(edsl.PreparedPayload, Intent, IntentOrder) -> Option(String) = fn(payload, intent, o) {
+    if o.direction != "asc" && o.direction != "desc" {
+        let s: Option(String) = 'Some(`rule: invalid order direction \{o.direction}`);
+        s
+    } else if o.measure != 'None && o.dimension != 'None {
+        let s: Option(String) = 'Some("rule: order must name exactly one measure or one dimension");
+        s
+    } else if intent.distinct {
+        let s: Option(String) = 'Some("rule: a distinct list cannot order by an internal aggregate");
+        s
+    } else if intent.offset != 'None {
+        let s: Option(String) = 'Some("rule: internal top-N does not support an offset");
+        s
+    } else if array.length(intent.exists) > 0 || array.length(intent.absence) > 0 {
+        let s: Option(String) = 'Some("rule: internal top-N cannot be combined with existence filters");
+        s
+    } else {
+        match o.measure {
+            'Some(mid) => match find_measure(payload, mid) {
+                'None => {
+                    let s: Option(String) = 'Some(`vocab: ordering references unknown measure \{mid}`);
+                    s
+                },
+                'Some(entry) => if entry.computed != 'None {
+                    let s: Option(String) = 'Some(`unsupported: internal ordering measure \{mid} is a computed measure`);
+                    s
+                } else if entry.entity != base_entity_index(payload, intent) {
+                    let s: Option(String) = 'Some(`unsupported: internal ordering measure \{mid} is not on the subject entity`);
+                    s
+                } else {
+                    let none: Option(String) = 'None;
+                    none
+                },
+            },
+            'None => match o.dimension {
+                'Some(did) => do {
+                    let selected = contains_id(array.map(intent.dimensions, fn(d) { d.id }), did);
+                    if !selected {
+                        let s: Option(String) = 'Some(`rule: internal top-N tie-breaker \{did} must be a selected dimension`);
+                        s
+                    } else {
+                        match find_dimension(payload, did) {
+                            'Some(_) => {
+                                let none: Option(String) = 'None;
+                                none
+                            },
+                            'None => {
+                                let s: Option(String) = 'Some(`vocab: ordering references unknown dimension \{did}`);
+                                s
+                            },
+                        }
+                    }
+                },
+                'None => {
+                    let s: Option(String) = 'Some("rule: order must name a measure or a dimension");
+                    s
+                },
+            },
+        }
+    }
+};
+
+def internal_top_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
+    if array.length(intent.dimensions) == 0 {
+        let s: Option(String) = 'Some("rule: internal top-N requires at least one grouping dimension");
+        s
+    } else {
+        let init: Option(String) = 'None;
+        array.fold(intent.order, init, fn(acc, o) {
+            match acc {
+                'Some(_) => acc,
+                'None => internal_order_issue(payload, intent, o),
+            }
+        })
+    }
+};
+
+def distinct_problem: Fn(Intent) -> Option(String) = fn(intent) {
+    if intent.distinct && array.length(intent.measures) > 0 {
+        let s: Option(String) = 'Some("rule: distinct is only supported for measureless attribute lists");
+        s
+    } else if intent.distinct && array.length(intent.dimensions) == 0 {
+        let s: Option(String) = 'Some("rule: a distinct list must select at least one attribute dimension");
+        s
+    } else if intent.distinct && array.length(intent.absence) > 0 {
+        let s: Option(String) = 'Some("rule: a distinct list cannot be combined with absence filters");
+        s
+    } else {
+        let none: Option(String) = 'None;
+        none
+    }
+};
+
 def page_problem: Fn(Intent) -> Option(String) = fn(intent) {
     let limit_issue: Option(String) = match intent.limit {
         'Some(n) => if n <= 0 {
-            let s: Option(String) = 'Some("limit must be a positive integer");
+            let s: Option(String) = 'Some("rule: limit must be a positive integer");
             s
         } else {
             let none: Option(String) = 'None;
@@ -340,10 +591,10 @@ def page_problem: Fn(Intent) -> Option(String) = fn(intent) {
         'Some(_) => limit_issue,
         'None => match intent.offset {
             'Some(n) => if n < 0 {
-                let s: Option(String) = 'Some("offset must be a non-negative integer");
+                let s: Option(String) = 'Some("rule: offset must be a non-negative integer");
                 s
             } else if array.length(intent.order) == 0 {
-                let s: Option(String) = 'Some("offset requires a stable ordering");
+                let s: Option(String) = 'Some("rule: offset requires a stable ordering");
                 s
             } else {
                 let none: Option(String) = 'None;
@@ -363,7 +614,7 @@ def page_problem: Fn(Intent) -> Option(String) = fn(intent) {
 
 def intent_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payload, intent) {
     if array.length(intent.measures) == 0 && array.length(intent.dimensions) == 0 {
-        let s: Option(String) = 'Some("intent must select at least one measure or one dimension");
+        let s: Option(String) = 'Some("rule: intent must select at least one measure or one dimension");
         s
     } else {
         let p1 = measure_problem(payload, intent.measures);
@@ -382,10 +633,32 @@ def intent_problem: Fn(edsl.PreparedPayload, Intent) -> Option(String) = fn(payl
                                 match p4 {
                                     'Some(_) => p4,
                                     'None => do {
-                                        let p5 = order_problem(payload, intent);
+                                        let p5 = distinct_problem(intent);
                                         match p5 {
                                             'Some(_) => p5,
-                                            'None => page_problem(intent),
+                                            'None => do {
+                                                let p6 = exists_problem(payload, intent);
+                                                match p6 {
+                                                    'Some(_) => p6,
+                                                    'None => do {
+                                                        let p7 = absence_problem(payload, intent);
+                                                        match p7 {
+                                                            'Some(_) => p7,
+                                                    'None => do {
+                                                        let p8 = if internal_top_mode(intent) {
+                                                            internal_top_problem(payload, intent)
+                                                        } else {
+                                                            order_problem(payload, intent)
+                                                        };
+                                                        match p8 {
+                                                            'Some(_) => p8,
+                                                            'None => page_problem(intent),
+                                                        }
+                                                    },
+                                                        }
+                                                    },
+                                                }
+                                            },
                                         }
                                     },
                                 }
@@ -416,23 +689,23 @@ def to_filter_input: Fn(ScalarValue) -> edsl.FilterInput = fn(v) {
             let out: edsl.FilterInput = 'Number(f);
             out
         },
-        _ => fail!("filter value must be text or number"),
+        _ => fail!("type: filter value must be text or number"),
     }
 };
 
 def op_of_string: Fn(String) -> edsl.FilterOp = fn(op) {
     match parse_op(op) {
         'Some(o) => o,
-        'None => fail!("unknown filter operator", op),
+        'None => fail!("rule: unknown filter operator", op),
     }
 };
 
-def build_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(payload, intent) {
+def build_request_core: Fn(edsl.PreparedPayload, Intent) -> Tuple([Array(edsl.MeasureRequest), Array(edsl.DimensionRequest), Array(edsl.FilterRequest)]) = fn(payload, intent) {
     let measures: Array(edsl.MeasureRequest) = array.map(intent.measures, fn(m) {
         let input: edsl.MeasureInput = match m.mode {
             "all" => 'All,
             "distinct" => 'Distinct,
-            _ => fail!("invalid measure mode", m.mode),
+            _ => fail!("rule: invalid measure mode", m.mode),
         };
         let req: edsl.MeasureRequest = { id: m.id, subject: subject, input };
         req
@@ -450,7 +723,11 @@ def build_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(pa
         };
         req
     });
-    let ordering: Array(edsl.OrderRequest) = array.map(intent.order, fn(o) {
+    (measures, dimensions, filters)
+};
+
+def build_order_requests: Fn(Intent) -> Array(edsl.OrderRequest) = fn(intent) {
+    array.map(intent.order, fn(o) {
         let target: edsl.OrderTarget = match o.measure {
             'Some(mid) => {
                 let t: edsl.OrderTarget = 'Measure(mid);
@@ -461,27 +738,202 @@ def build_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(pa
                     let t: edsl.OrderTarget = 'Dimension(did);
                     t
                 },
-                'None => fail!("order must name a measure or a dimension"),
+                'None => fail!("rule: order must name a measure or a dimension"),
             },
         };
         let direction: edsl.OrderDirection = match o.direction {
             "asc" => 'Asc,
             "desc" => 'Desc,
-            _ => fail!("invalid order direction", o.direction),
+            _ => fail!("rule: invalid order direction", o.direction),
         };
         let req: edsl.OrderRequest = { target, direction };
         req
-    });
+    })
+};
+
+def make_request: Fn(Array(edsl.MeasureRequest), Array(edsl.DimensionRequest), Array(edsl.FilterRequest), Array(edsl.OrderRequest), Option(Int), Option(Int)) -> edsl.QueryRequest = fn(measures, dimensions, filters, ordering, limit, offset) {
     let request: edsl.QueryRequest = {
         measures,
         dimensions,
         filters,
         ordering,
-        limit: intent.limit,
-        offset: intent.offset,
+        limit,
+        offset,
         partition: 'None,
     };
     request
+};
+
+def order_to_request: Fn(IntentOrder) -> edsl.OrderRequest = fn(o) {
+    let target: edsl.OrderTarget = match o.measure {
+        'Some(mid) => {
+            let t: edsl.OrderTarget = 'Measure(mid);
+            t
+        },
+        'None => match o.dimension {
+            'Some(did) => {
+                let t: edsl.OrderTarget = 'Dimension(did);
+                t
+            },
+            'None => fail!("rule: order must name a measure or a dimension"),
+        },
+    };
+    let direction: edsl.OrderDirection = match o.direction {
+        "asc" => 'Asc,
+        "desc" => 'Desc,
+        _ => fail!("rule: invalid order direction", o.direction),
+    };
+    let req: edsl.OrderRequest = { target, direction };
+    req
+};
+
+# Internal (unprojected) ordering aggregates: only measure-target order items.
+def build_measure_order_requests: Fn(Intent) -> Array(edsl.InternalOrderRequest) = fn(intent) {
+    array.map(array.filter(intent.order, fn(o) { o.measure != 'None }), fn(o) {
+        let mid = match o.measure {
+            'Some(m) => m,
+            'None => fail!("rule: order must name a measure"),
+        };
+        let direction: edsl.OrderDirection = match o.direction {
+            "asc" => 'Asc,
+            "desc" => 'Desc,
+            _ => fail!("rule: invalid order direction", o.direction),
+        };
+        let req: edsl.InternalOrderRequest = { measure: mid, subject: subject, direction };
+        req
+    })
+};
+
+# Group dimension tie-breakers: only dimension-target order items.
+def build_dimension_order_requests: Fn(Intent) -> Array(edsl.OrderRequest) = fn(intent) {
+    array.map(array.filter(intent.order, fn(o) { o.dimension != 'None }), order_to_request)
+};
+
+# Internal top-N request: measures empty, dims/filters from the intent, dim
+# tie-breakers in ordering, and the top-N limit applied by the base.
+def build_internal_top_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(payload, intent) {
+    let core = build_request_core(payload, intent);
+    make_request(core.0, core.1, core.2, build_dimension_order_requests(intent), intent.limit, 'None)
+};
+
+# The base request used by lower/lower_full/lower_absence: ordering/limit/offset
+# are applied by the finalizer instead, so they are not passed to the base.
+def build_base_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(payload, intent) {
+    let core = build_request_core(payload, intent);
+    make_request(core.0, core.1, core.2, [], 'None, 'None)
+};
+
+# A full request (with ordering/limit/offset) is needed by lower_distinct.
+def build_full_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(payload, intent) {
+    let core = build_request_core(payload, intent);
+    make_request(core.0, core.1, core.2, build_order_requests(intent), intent.limit, intent.offset)
+};
+
+def build_related_requests: Fn(Array(IntentExists)) -> Array(edsl.ExistsRequest) = fn(specs) {
+    array.map(specs, fn(e) {
+        let filters: Array(edsl.FilterRequest) = array.map(e.filters, fn(f) {
+            let req: edsl.FilterRequest = {
+                id: f.id,
+                subject: subject,
+                op: op_of_string(f.op),
+                input: to_filter_input(f.value),
+            };
+            req
+        });
+        let req: edsl.ExistsRequest = {
+            target: e.target,
+            subject: subject,
+            filters,
+            any_of: [],
+            min_matches: 'None,
+        };
+        req
+    })
+};
+
+# ---------------------------------------------------------------------------
+# Finalizer: output column order (dimensions first, then measures), ordering,
+# limit and offset are applied on the lowered Plan so the emitted columns
+# faithfully match the intent.
+# ---------------------------------------------------------------------------
+
+def dimension_entry_of: Fn(edsl.PreparedPayload, String) -> edsl.DimensionEntry = fn(payload, id) {
+    match find_dimension(payload, id) {
+        'Some(entry) => entry,
+        'None => fail!("vocab: unknown dimension", id),
+    }
+};
+
+def dimension_expr_of: Fn(edsl.PreparedPayload, String) -> qb.Expr = fn(payload, id) {
+    edsl.dimension_expr(payload, dimension_entry_of(payload, id))
+};
+
+def measure_select_item: Fn(qb.Plan, String) -> qb.SelectItem = fn(plan, id) {
+    match array.find(plan.projection, fn(item) {
+        match item {
+            'Aggregate(call) => call.alias == id,
+            'Computed(ca) => ca.alias == id,
+            'Expr(_) => 'False,
+        }
+    }) {
+        'Some(item) => item,
+        'None => fail!("internal: projected measure item not found", id),
+    }
+};
+
+def ordered_projection: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> Array(qb.SelectItem) = fn(payload, intent, plan) {
+    let dim_items: Array(qb.SelectItem) = array.map(intent.dimensions, fn(d) {
+        qb.expr_item(dimension_expr_of(payload, d.id))
+    });
+    let measure_items: Array(qb.SelectItem) = array.map(intent.measures, fn(m) {
+        measure_select_item(plan, m.id)
+    });
+    array.concat([dim_items, measure_items])
+};
+
+def build_ordering: Fn(edsl.PreparedPayload, Intent) -> Array(qb.OrderBy) = fn(payload, intent) {
+    array.map(intent.order, fn(o) {
+        match o.measure {
+            'Some(mid) => match o.direction {
+                "asc" => qb.asc_aggregate(mid),
+                "desc" => qb.desc_aggregate(mid),
+                _ => fail!("rule: invalid order direction", o.direction),
+            },
+            'None => do {
+                let did = match o.dimension {
+                    'Some(d) => d,
+                    'None => fail!("rule: order must name a measure or a dimension"),
+                };
+                let expr = dimension_expr_of(payload, did);
+                match o.direction {
+                    "asc" => qb.asc(expr),
+                    "desc" => qb.desc(expr),
+                    _ => fail!("rule: invalid order direction", o.direction),
+                }
+            },
+        }
+    })
+};
+
+def finalize_plan: Fn(edsl.PreparedPayload, Intent, qb.Plan) -> qb.Plan = fn(payload, intent, plan) {
+    let new_projection = ordered_projection(payload, intent, plan);
+    let ordering = build_ordering(payload, intent);
+    let out: qb.Plan = {
+        revision: plan.revision,
+        sources: plan.sources,
+        derived: plan.derived,
+        projection: new_projection,
+        filter: plan.filter,
+        exists: plan.exists,
+        joins: plan.joins,
+        grouping: plan.grouping,
+        having: plan.having,
+        ordering,
+        limit: intent.limit,
+        offset: intent.offset,
+        partition: plan.partition,
+    };
+    out
 };
 
 # ---------------------------------------------------------------------------
@@ -490,14 +942,36 @@ def build_request: Fn(edsl.PreparedPayload, Intent) -> edsl.QueryRequest = fn(pa
 
 def resolve: Fn(edsl.PreparedPayload, Intent) -> qb.Query = fn(payload, intent) {
     if !payload.authorize(subject) {
-        fail!("subject is not authorized for spider intent")
+        fail!("auth: subject is not authorized for spider intent")
     } else {
         match intent_problem(payload, intent) {
-            'Some(message) => fail!("invalid spider intent", message),
+            'Some(message) => fail!(message),
             'None => do {
-                let request = build_request(payload, intent);
-                let plan = edsl.lower(payload, request);
-                qb.transform_sqlite(plan)
+                if intent.distinct {
+                    let full = build_full_request(payload, intent);
+                    edsl.lower_distinct(payload, full)
+                } else if internal_top_mode(intent) {
+                    let req = build_internal_top_request(payload, intent);
+                    let internal_orders = build_measure_order_requests(intent);
+                    let plan = edsl.lower_internal_top(payload, req, internal_orders);
+                    let validated = qb.validate(plan, payload.profile);
+                    qb.transform_sqlite(validated)
+                } else {
+                    let base = build_base_request(payload, intent);
+                    let exists = build_related_requests(intent.exists);
+                    let absence = build_related_requests(intent.absence);
+                    let lowered =
+                        if array.length(intent.absence) > 0 {
+                            edsl.lower_absence(payload, base, absence, [])
+                        } else if array.length(intent.exists) > 0 {
+                            edsl.lower_full(payload, base, exists, [])
+                        } else {
+                            edsl.lower(payload, base)
+                        };
+                    let finalized = finalize_plan(payload, intent, lowered);
+                    let validated = qb.validate(finalized, payload.profile);
+                    qb.transform_sqlite(validated)
+                }
             },
         }
     }
@@ -514,7 +988,7 @@ def intent_of_value: Fn(Value) -> Result(Intent, String) = fn(raw) {
             ok
         },
         'Err(_) => {
-            let err: Result(Intent, String) = 'Err("input JSON does not match the INTENT.md contract");
+            let err: Result(Intent, String) = 'Err("contract: input JSON does not match the INTENT.md contract");
             err
         },
     }
@@ -538,6 +1012,7 @@ export {
     IntentMeasure,
     IntentDimension,
     IntentFilter,
+    IntentExists,
     IntentOrder,
     Intent,
     subject,
@@ -547,17 +1022,37 @@ export {
     measure_issue,
     dimension_issue,
     filter_issue,
+    exists_filter_issue,
+    related_issue,
     order_issue,
     measure_problem,
     measure_grain_problem,
     dimension_problem,
     filter_problem,
+    exists_problem,
+    absence_problem,
     order_problem,
+    internal_top_mode,
+    internal_order_issue,
+    internal_top_problem,
+    distinct_problem,
     page_problem,
     intent_problem,
     to_filter_input,
     op_of_string,
-    build_request,
+    base_entity_index,
+    entity_id_of,
+    path_safe,
+    order_to_request,
+    build_base_request,
+    build_full_request,
+    build_measure_order_requests,
+    build_dimension_order_requests,
+    build_internal_top_request,
+    build_related_requests,
+    ordered_projection,
+    build_ordering,
+    finalize_plan,
     resolve,
     intent_of_value,
     parse_intent,

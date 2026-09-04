@@ -262,7 +262,12 @@ type PeerCorr = struct {
 # `PeerCorr`): when present, `pairs`/`alternatives`/`filter`/`grouping`/`having`
 # are empty and the body is the two-participant exchange predicate.  The
 # subquery is only a predicate: it never fans out the main FROM, so outer
-# COUNT/SUM keep the base grain.
+# COUNT/SUM keep the base grain.  `negated` marks the closed anti-existence
+# form `NOT EXISTS (...)` (subjects with no matching related row); the body is
+# otherwise identical and NULL semantics stay SQL-native.  `link` marks the
+# bounded correlated two-hop body (see `ExistsLink`): the whole A -> B -> C
+# condition stays inside ONE correlated EXISTS, so a fan-out first hop never
+# amplifies the outer A grain.
 type Exists = struct {
     source: Source,
     pairs: Array(ColumnEq),
@@ -271,6 +276,25 @@ type Exists = struct {
     grouping: Array(Expr),
     having: Array(Having),
     peer: Option(PeerCorr),
+    negated: Bool,
+    link: Option(ExistsLink),
+};
+
+# Bounded correlated two-hop existence body.  A base row A is kept when it has
+# an inner related row B (`Exists.source`, correlated by `Exists.pairs`) which
+# in turn has a related row C (`source`), joined inside the same subquery by
+# `pairs` (each equality connects a column of `Exists.source.alias` to a column
+# of `link.source.alias`).  `filter` optionally constrains C (and, if desired,
+# B / outer main columns).  Rendered as
+#   EXISTS (SELECT 1 FROM <B> AS <ba>
+#             INNER JOIN <C> AS <ca> ON <link.pairs>
+#           WHERE <Exists.pairs (A -> B)> [AND link.filter])
+# The whole body is a predicate only: B and C never appear in the outer
+# projection/grouping/joins, so a fan-out A -> B relation does not fan out A.
+type ExistsLink = struct {
+    source: Source,
+    pairs: Array(ColumnEq),
+    filter: Option(Expr),
 };
 
 # One declared output column of a `UnionBranch`: an explicit stable name and
@@ -310,12 +334,17 @@ type AggregateRef = struct {
     alias: String,
 };
 
-# Ordering key: either a plain expression or a reference to a projected
-# aggregate measure.  AggregateRef is only valid when the alias matches an
-# AggregateCall in `Plan.projection`.
+# Ordering key: a plain expression, a reference to a projected aggregate
+# measure, or a direct aggregate expression used only for ordering (an internal
+# ordering aggregate that is NOT projected -- e.g. return only the group name
+# but order the groups by `count(...) DESC`).  `'AggregateRef` is only valid
+# when the alias matches an AggregateCall in `Plan.projection`;
+# `'Aggregate(call)` carries its own AggregateCall and is only valid when the
+# Plan is grouped (it orders by an aggregate of each group).
 type OrderKey = enum {
     'Expr(Expr),
     'AggregateRef(AggregateRef),
+    'Aggregate(AggregateCall),
 };
 
 type OrderBy = struct {
@@ -458,6 +487,10 @@ def order_key_operators: Fn(OrderKey) -> Array(Operator) = fn(key) {
     match key {
         'Expr(expr) => expr_operators(expr),
         'AggregateRef(_) => ['Aggregate],
+        # A direct ordering aggregate consumes the same operator set as a
+        # projected aggregate (Aggregate plus the operator usage of its
+        # argument and aggregate-local filter).
+        'Aggregate(call) => aggregate_operators(call),
     }
 };
 
@@ -497,18 +530,30 @@ def exists_operators: Fn(Array(Exists)) -> Array(Operator) = fn(exists_list) {
                 };
                 ops_union(acc, with_peer)
             },
-            'None => do {
-                let with_exists = ops_union(acc, ['Exists]);
-                let with_filter = match ex.filter {
-                    'Some(expr) => ops_union(with_exists, expr_operators(expr)),
-                    'None => with_exists,
-                };
-                let with_group = if array.length(ex.grouping) > 0 {
-                    ops_union(ops_union(with_filter, exprs_operators(ex.grouping)), ['Group])
-                } else {
-                    with_filter
-                };
-                ops_union(with_group, having_operators(ex.having))
+            'None => match ex.link {
+                # Bounded two-hop link body: one correlated EXISTS reading the B
+                # and C inner columns (Column) plus the link filter's operators.
+                'Some(link) => do {
+                    let base: Array(Operator) = ['Exists, 'Column];
+                    let with_filter = match link.filter {
+                        'Some(expr) => ops_union(base, expr_operators(expr)),
+                        'None => base,
+                    };
+                    ops_union(acc, with_filter)
+                },
+                'None => do {
+                    let with_exists = ops_union(acc, ['Exists]);
+                    let with_filter = match ex.filter {
+                        'Some(expr) => ops_union(with_exists, expr_operators(expr)),
+                        'None => with_exists,
+                    };
+                    let with_group = if array.length(ex.grouping) > 0 {
+                        ops_union(ops_union(with_filter, exprs_operators(ex.grouping)), ['Group])
+                    } else {
+                        with_filter
+                    };
+                    ops_union(with_group, having_operators(ex.having))
+                },
             },
         }
     })
@@ -776,12 +821,19 @@ def projected_measure_aliases: Fn(Plan) -> Array(String) = fn(plan) {
     })
 };
 
-# An ordering key is valid when a plain expression is a valid Expr, or when an
-# AggregateRef names a valid SQL identifier that is a projected measure alias.
+# An ordering key is valid when a plain expression is a valid Expr, when an
+# AggregateRef names a valid SQL identifier that is a projected measure alias,
+# or when a direct ordering aggregate carries a valid argument/filter over the
+# visible source aliases (the aggregate itself is validated by profile checks).
 def order_key_valid: Fn(OrderKey, Array(String), Array(String)) -> Bool = fn(key, source_aliases, measure_aliases) {
     match key {
         'Expr(expr) => expr_valid(expr, source_aliases),
         'AggregateRef(ref) => is_sql_identifier(ref.alias) && known_alias(measure_aliases, ref.alias),
+        'Aggregate(call) => expr_valid(call.arg, source_aliases)
+            && (match call.filter {
+                'Some(expr) => expr_valid(expr, source_aliases),
+                'None => 'True,
+            }),
     }
 };
 
@@ -881,6 +933,9 @@ def partition_structure_ok: Fn(Plan, PartitionedTopN) -> Bool = fn(plan, pt) {
                 'Expr(expr) => expr_member(plan.grouping, expr),
                 'AggregateRef(ref) => is_sql_identifier(ref.alias)
                     && known_alias(projected_measure_aliases(plan), ref.alias),
+                # v1 partition ordering does not take a direct (unprojected)
+                # ordering aggregate.
+                'Aggregate(_) => 'False,
             }
         });
     let tie_break_ok = array.all(plan.grouping, fn(group_expr) {
@@ -891,6 +946,7 @@ def partition_structure_ok: Fn(Plan, PartitionedTopN) -> Bool = fn(plan, pt) {
                 match ob.key {
                     'Expr(expr) => expr == group_expr,
                     'AggregateRef(_) => 'False,
+                    'Aggregate(_) => 'False,
                 }
             })
         }
@@ -993,46 +1049,87 @@ def peer_corr_ok: Fn(PeerCorr, Array(String)) -> Bool = fn(corr, main_aliases) {
         && origin_filter_ok && peer_filter_ok && distinct_ok
 };
 
+# Structural validation of the bounded correlated two-hop link body:
+#   - the hop source (`ex.source`, B) is a legal alias distinct from the main
+#     aliases;
+#   - the link source (`link.source`, C) is legal and distinct from both;
+#   - `ex.pairs` correlates an outer main alias column to a hop-source column;
+#   - `link.pairs` joins the hop-source alias to the link-source alias;
+#   - `link.filter` is a valid Expr over the main + hop + link aliases;
+#   - the other single-source modes are not combined with the link mode.
+def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, link, main_aliases) {
+    let hop = ex.source.alias;
+    let hop_ok = is_sql_identifier(ex.source.alias) && is_sql_identifier(ex.source.table)
+        && !known_alias(main_aliases, hop);
+    let link_source_ok = is_sql_identifier(link.source.alias) && is_sql_identifier(link.source.table)
+        && link.source.alias != hop
+        && !known_alias(main_aliases, link.source.alias);
+    let hop_pairs_ok = array.length(ex.pairs) > 0 && array.all(ex.pairs, fn(p) {
+        column_ref_id_ok(p.left)
+            && is_sql_identifier(p.right.source)
+            && is_sql_identifier(p.right.column)
+            && p.right.source == hop
+            && known_alias(main_aliases, p.left.source)
+    });
+    let link_pairs_ok = array.length(link.pairs) > 0 && array.all(link.pairs, fn(p) {
+        column_ref_id_ok(p.left) && column_ref_id_ok(p.right)
+            && p.left.source == hop
+            && p.right.source == link.source.alias
+    });
+    let mode_ok = ex.alternatives == 'None && ex.filter == 'None
+        && array.length(ex.grouping) == 0 && array.length(ex.having) == 0
+        && ex.peer == 'None;
+    let allowed = array.concat([main_aliases, [hop, link.source.alias]]);
+    let filter_ok = match link.filter {
+        'Some(expr) => expr_valid(expr, allowed),
+        'None => 'True,
+    };
+    hop_ok && link_source_ok && hop_pairs_ok && link_pairs_ok && mode_ok && filter_ok
+};
+
 def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases) {
     match ex.peer {
         'Some(corr) => peer_corr_ok(corr, main_aliases),
-        'None => do {
-            let inner = ex.source.alias;
-            let id_ok = is_sql_identifier(ex.source.alias)
-                && is_sql_identifier(ex.source.table)
-                && !known_alias(main_aliases, inner);
-            let allowed = array.push(main_aliases, inner);
-            let filter_ok = match ex.filter {
-                'Some(expr) => expr_valid(expr, allowed),
-                'None => 'True,
-            };
-            let group_ok = array.all(ex.grouping, fn(expr) { expr_valid(expr, allowed) });
-            let having_ok = array.all(ex.having, fn(h) {
-                match h.measure {
-                    'Ref(_) => 'False,
-                    'Call(call) => expr_valid(call.arg, allowed)
-                        && (match call.filter {
-                            'Some(expr) => expr_valid(expr, allowed),
-                            'None => 'True,
-                        }),
+        'None => match ex.link {
+            'Some(link) => link_structure_ok(ex, link, main_aliases),
+            'None => do {
+                let inner = ex.source.alias;
+                let id_ok = is_sql_identifier(ex.source.alias)
+                    && is_sql_identifier(ex.source.table)
+                    && !known_alias(main_aliases, inner);
+                let allowed = array.push(main_aliases, inner);
+                let filter_ok = match ex.filter {
+                    'Some(expr) => expr_valid(expr, allowed),
+                    'None => 'True,
+                };
+                let group_ok = array.all(ex.grouping, fn(expr) { expr_valid(expr, allowed) });
+                let having_ok = array.all(ex.having, fn(h) {
+                    match h.measure {
+                        'Ref(_) => 'False,
+                        'Call(call) => expr_valid(call.arg, allowed)
+                            && (match call.filter {
+                                'Some(expr) => expr_valid(expr, allowed),
+                                'None => 'True,
+                            }),
+                    }
+                });
+                match ex.alternatives {
+                    'Some(alternatives) => {
+                        let alt_ok_result = array.length(ex.pairs) == 0 && alternatives_ok(alternatives, inner, main_aliases);
+                        id_ok && alt_ok_result && filter_ok && group_ok && having_ok
+                    },
+                    'None => {
+                        let pairs_ok = array.all(ex.pairs, fn(p) {
+                            column_ref_id_ok(p.left)
+                                && is_sql_identifier(p.right.source)
+                                && is_sql_identifier(p.right.column)
+                                && p.right.source == inner
+                                && known_alias(main_aliases, p.left.source)
+                        });
+                        id_ok && array.length(ex.pairs) > 0 && pairs_ok && filter_ok && group_ok && having_ok
+                    },
                 }
-            });
-            match ex.alternatives {
-                'Some(alternatives) => {
-                    let alt_ok_result = array.length(ex.pairs) == 0 && alternatives_ok(alternatives, inner, main_aliases);
-                    id_ok && alt_ok_result && filter_ok && group_ok && having_ok
-                },
-                'None => {
-                    let pairs_ok = array.all(ex.pairs, fn(p) {
-                        column_ref_id_ok(p.left)
-                            && is_sql_identifier(p.right.source)
-                            && is_sql_identifier(p.right.column)
-                            && p.right.source == inner
-                            && known_alias(main_aliases, p.left.source)
-                    });
-                    id_ok && array.length(ex.pairs) > 0 && pairs_ok && filter_ok && group_ok && having_ok
-                },
-            }
+            },
         },
     }
 };
@@ -1117,6 +1214,7 @@ def derived_outer_cols_ok: Fn(Plan, String, Array(String)) -> Bool = fn(plan, al
         match ob.key {
             'Expr(expr) => expr_derived_cols_ok(expr, alias, names),
             'AggregateRef(_) => 'True,
+            'Aggregate(call) => aggregate_call_derived_cols_ok(call, alias, names),
         }
     });
     let partition_cols_ok = match plan.partition {
@@ -1125,6 +1223,7 @@ def derived_outer_cols_ok: Fn(Plan, String, Array(String)) -> Bool = fn(plan, al
                 match ob.key {
                     'Expr(expr) => expr_derived_cols_ok(expr, alias, names),
                     'AggregateRef(_) => 'True,
+                    'Aggregate(_) => 'True,
                 }
             }),
         'None => 'True,
@@ -1208,6 +1307,18 @@ def derived_plan_ok: Fn(Plan, DerivedSource) -> Bool = fn(plan, ds) {
     let grouping_ok = array.all(plan.grouping, fn(expr) { expr_valid(expr, aliases) });
     let measure_aliases = projected_measure_aliases(plan);
     let ordering_ok = array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases, measure_aliases) });
+    let direct_order_agg = array.any(plan.ordering, fn(ob) {
+        match ob.key {
+            'Aggregate(_) => 'True,
+            'Expr(_) => 'False,
+            'AggregateRef(_) => 'False,
+        }
+    });
+    let order_agg_group_ok = if direct_order_agg {
+        array.length(plan.grouping) > 0
+    } else {
+        'True
+    };
     let limit_ok = match plan.limit {
         'Some(value) => value >= 0,
         'None => 'True,
@@ -1228,7 +1339,8 @@ def derived_plan_ok: Fn(Plan, DerivedSource) -> Bool = fn(plan, ds) {
     let having_ok_result = having_list_ok(plan, aliases, plan.having);
     physical_empty && derived_structure_ok(ds)
         && projection_nonempty && projection_ok && filter_ok
-        && grouping_ok && ordering_ok && limit_ok && offset_ok
+        && grouping_ok && ordering_ok && order_agg_group_ok
+        && limit_ok && offset_ok
         && offset_ordering_ok && partition_ok && measures_ok
         && having_ok_result
         && derived_outer_cols_ok(plan, ds.alias, names)
@@ -1263,6 +1375,21 @@ def structure_ok_tables: Fn(Plan) -> Bool = fn(plan) {
     let having_ok_result = having_list_ok(plan, aliases, plan.having);
     let measure_aliases = projected_measure_aliases(plan);
     let ordering_ok = array.all(plan.ordering, fn(ob) { order_key_valid(ob.key, aliases, measure_aliases) });
+    # A direct (unprojected) ordering aggregate orders each GROUP of a grouped
+    # query, so the Plan must be grouped (otherwise ORDER BY count(...) over
+    # ungrouped dimension columns is not a valid aggregate shape).
+    let direct_order_agg = array.any(plan.ordering, fn(ob) {
+        match ob.key {
+            'Aggregate(_) => 'True,
+            'Expr(_) => 'False,
+            'AggregateRef(_) => 'False,
+        }
+    });
+    let order_agg_group_ok = if direct_order_agg {
+        array.length(plan.grouping) > 0
+    } else {
+        'True
+    };
     let limit_ok = match plan.limit {
         'Some(value) => value >= 0,
         'None => 'True,
@@ -1282,8 +1409,8 @@ def structure_ok_tables: Fn(Plan) -> Bool = fn(plan) {
     let measures_ok = measure_aliases_distinct(plan) && computed_items_ok(plan);
     sources_nonempty && projection_nonempty && source_ids_ok && join_ids_ok
         && join_conds_ok && projection_ok && filter_ok && exists_ok
-        && grouping_ok && having_ok_result && ordering_ok && limit_ok
-        && offset_ok && offset_ordering_ok && partition_ok && measures_ok
+        && grouping_ok && having_ok_result && ordering_ok && order_agg_group_ok
+        && limit_ok && offset_ok && offset_ordering_ok && partition_ok && measures_ok
 };
 
 # Failing structural validation for a plan over physical table sources.
@@ -1348,6 +1475,7 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
                     'Expr(expr) => expr_member(plan.grouping, expr),
                     'AggregateRef(ref) => is_sql_identifier(ref.alias)
                         && known_alias(projected_measure_aliases(plan), ref.alias),
+                    'Aggregate(_) => 'False,
                 }
             }),
         'None => 'True,
@@ -1362,6 +1490,7 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
                     match ob.key {
                         'Expr(expr) => expr == group_expr,
                         'AggregateRef(_) => 'False,
+                        'Aggregate(_) => 'False,
                     }
                 })
             }
@@ -1453,6 +1582,7 @@ def order_key_scalars_ok: Fn(OrderKey, Array(ScalarFunction)) -> Bool = fn(key, 
     match key {
         'Expr(expr) => expr_scalars_ok(expr, allowed),
         'AggregateRef(_) => 'True,
+        'Aggregate(call) => aggregate_call_scalars_ok(call, allowed),
     }
 };
 
@@ -1524,13 +1654,19 @@ def peer_corr_scalars_ok: Fn(PeerCorr, Array(ScalarFunction)) -> Bool = fn(corr,
 def exists_body_scalars_ok: Fn(Exists, Array(ScalarFunction)) -> Bool = fn(ex, allowed) {
     match ex.peer {
         'Some(corr) => peer_corr_scalars_ok(corr, allowed),
-        'None => do {
-            let filter_ok = match ex.filter {
+        'None => match ex.link {
+            'Some(link) => match link.filter {
                 'Some(expr) => expr_scalars_ok(expr, allowed),
                 'None => 'True,
-            };
-            let group_ok = array.all(ex.grouping, fn(expr) { expr_scalars_ok(expr, allowed) });
-            filter_ok && group_ok && having_list_scalars_ok(ex.having, allowed)
+            },
+            'None => do {
+                let filter_ok = match ex.filter {
+                    'Some(expr) => expr_scalars_ok(expr, allowed),
+                    'None => 'True,
+                };
+                let group_ok = array.all(ex.grouping, fn(expr) { expr_scalars_ok(expr, allowed) });
+                filter_ok && group_ok && having_list_scalars_ok(ex.having, allowed)
+            },
         },
     }
 };
@@ -1538,14 +1674,20 @@ def exists_body_scalars_ok: Fn(Exists, Array(ScalarFunction)) -> Bool = fn(ex, a
 def exists_body_aggregates_ok: Fn(Exists, Array(AggregateFunction)) -> Bool = fn(ex, allowed) {
     match ex.peer {
         'Some(_) => 'True,
-        'None => array.all(ex.having, fn(h) { having_measure_aggregate_ok(h.measure, allowed) }),
+        'None => match ex.link {
+            'Some(_) => 'True,
+            'None => array.all(ex.having, fn(h) { having_measure_aggregate_ok(h.measure, allowed) }),
+        },
     }
 };
 
 def exists_body_distinct_ok: Fn(Exists) -> Bool = fn(ex) {
     match ex.peer {
         'Some(_) => 'True,
-        'None => array.all(ex.having, fn(h) { having_measure_distinct_ok(h.measure) }),
+        'None => match ex.link {
+            'Some(_) => 'True,
+            'None => array.all(ex.having, fn(h) { having_measure_distinct_ok(h.measure) }),
+        },
     }
 };
 
@@ -1575,7 +1717,14 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
     });
     let aggregates_ok = array.all(plan.projection, fn(item) { select_aggregate_ok(item, profile.allowed_aggregates) })
         && having_list_aggregates_ok(plan.having, profile.allowed_aggregates)
-        && array.all(plan.exists, fn(ex) { exists_body_aggregates_ok(ex, profile.allowed_aggregates) });
+        && array.all(plan.exists, fn(ex) { exists_body_aggregates_ok(ex, profile.allowed_aggregates) })
+        && array.all(plan.ordering, fn(ob) {
+            match ob.key {
+                'Aggregate(call) => array.any(profile.allowed_aggregates, fn(a) { a == call.function }),
+                'Expr(_) => 'True,
+                'AggregateRef(_) => 'True,
+            }
+        });
     let scalars_ok = array.all(plan.projection, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
         && (match plan.filter {
             'Some(expr) => expr_scalars_ok(expr, profile.allowed_scalars),
@@ -1601,6 +1750,13 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
         })
         && array.all(plan.having, fn(h) { having_measure_distinct_ok(h.measure) })
         && array.all(plan.exists, fn(ex) { exists_body_distinct_ok(ex) })
+        && array.all(plan.ordering, fn(ob) {
+            match ob.key {
+                'Aggregate(call) => call.distinct == 'False,
+                'Expr(_) => 'True,
+                'AggregateRef(_) => 'True,
+            }
+        })
     };
     # `'Partition` itself is covered by ops_ok via `operators(plan)`; here we
     # check the scalars used by the partition keys and partition ordering.
@@ -1905,40 +2061,68 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
 def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
     match ex.peer {
         'Some(corr) => render_peer_corr(corr),
-        'None => do {
-            let filter_part = match ex.filter {
-                'Some(expr) => {
-                    let rendered = render_expr(expr);
-                    (` AND \{rendered.0}`, rendered.1)
-                },
-                'None => {
-                    let empty: Array(Val) = [];
-                    ("", empty)
-                },
-            };
-            let group_part = render_group_part(ex.grouping);
-            let having_part = render_exists_having_clause(ex.having);
-            match ex.alternatives {
-                'Some(alternatives) => do {
-                    let alternative_sqls = array.map(alternatives, fn(alt) {
-                        string.join(array.map(alt, fn(p) {
+        'None => match ex.link {
+            'Some(link) => do {
+                # Bounded correlated two-hop link body: the whole A -> B -> C
+                # condition stays inside ONE correlated EXISTS.  B (`ex.source`)
+                # is INNER JOINed to C (`link.source`) inside the subquery, so a
+                # fan-out A -> B first hop never fans out the outer A rows.
+                let hop_from = `\{ex.source.table} AS \{ex.source.alias}`;
+                let link_from = `\{link.source.table} AS \{link.source.alias}`;
+                let on_sql = string.join(array.map(link.pairs, fn(p) {
+                    `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                }), " AND ");
+                let corr_sql = string.join(array.map(ex.pairs, fn(p) {
+                    `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                }), " AND ");
+                let link_filter_part = match link.filter {
+                    'Some(expr) => {
+                        let rendered = render_expr(expr);
+                        (` AND \{rendered.0}`, rendered.1)
+                    },
+                    'None => {
+                        let empty: Array(Val) = [];
+                        ("", empty)
+                    },
+                };
+                let sql = `EXISTS (SELECT 1 FROM \{hop_from} INNER JOIN \{link_from} ON \{on_sql} WHERE \{corr_sql}\{link_filter_part.0})`;
+                (sql, link_filter_part.1)
+            },
+            'None => do {
+                let filter_part = match ex.filter {
+                    'Some(expr) => {
+                        let rendered = render_expr(expr);
+                        (` AND \{rendered.0}`, rendered.1)
+                    },
+                    'None => {
+                        let empty: Array(Val) = [];
+                        ("", empty)
+                    },
+                };
+                let group_part = render_group_part(ex.grouping);
+                let having_part = render_exists_having_clause(ex.having);
+                match ex.alternatives {
+                    'Some(alternatives) => do {
+                        let alternative_sqls = array.map(alternatives, fn(alt) {
+                            string.join(array.map(alt, fn(p) {
+                                `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                            }), " AND ")
+                        });
+                        let union_sql = string.join(alternative_sqls, " OR ");
+                        let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE (\{union_sql})\{filter_part.0}\{group_part.0}\{having_part.0})`;
+                        let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
+                        (sql, binds)
+                    },
+                    'None => do {
+                        let pairs_sql = string.join(array.map(ex.pairs, fn(p) {
                             `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
-                        }), " AND ")
-                    });
-                    let union_sql = string.join(alternative_sqls, " OR ");
-                    let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE (\{union_sql})\{filter_part.0}\{group_part.0}\{having_part.0})`;
-                    let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
-                    (sql, binds)
-                },
-                'None => do {
-                    let pairs_sql = string.join(array.map(ex.pairs, fn(p) {
-                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
-                    }), " AND ");
-                    let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE \{pairs_sql}\{filter_part.0}\{group_part.0}\{having_part.0})`;
-                    let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
-                    (sql, binds)
-                },
-            }
+                        }), " AND ");
+                        let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE \{pairs_sql}\{filter_part.0}\{group_part.0}\{having_part.0})`;
+                        let binds = array.concat([filter_part.1, group_part.1, having_part.1]);
+                        (sql, binds)
+                    },
+                }
+            },
         },
     }
 };
@@ -1956,7 +2140,17 @@ def render_where_clause: Fn(Option(Expr), Array(Exists)) -> Tuple([String, Array
     };
     let has_filter = filter != 'None;
     let has_exists = array.length(exists_list) > 0;
-    let exists_parts = array.map(exists_list, render_exists);
+    # A negated exists renders as `NOT EXISTS (...)` (anti-existence).  The
+    # correlated body, source, bindings and grain semantics are unchanged; only
+    # the SQL keyword prefix differs.
+    let exists_parts = array.map(exists_list, fn(ex) {
+        let rendered = render_exists(ex);
+        if ex.negated {
+            (`NOT \{rendered.0}`, rendered.1)
+        } else {
+            rendered
+        }
+    });
     let exists_sqls = array.map(exists_parts, fn(p) { p.0 });
     let exists_binds = array.concat(array.map(exists_parts, fn(p) { p.1 }));
     let sql = if has_filter && has_exists {
@@ -2019,6 +2213,9 @@ def render_order_key: Fn(OrderKey, Plan) -> Tuple([String, Array(Val)]) = fn(key
                 _ => fail!("ordering references an unprojected measure", plan, ref),
             }
         },
+        # A direct ordering aggregate renders its own aggregate expression (the
+        # internal value used only to order the groups is never projected).
+        'Aggregate(call) => render_aggregate_call(call),
     }
 };
 
@@ -2069,7 +2266,7 @@ def render_from_clause: Fn(Plan) -> Tuple([String, Array(Val)]) = fn(plan) {
     }
 };
 
-def render_unpartitioned: Fn(Plan) -> Query = fn(plan) {
+def render_unpartitioned: Fn(Plan, Bool) -> Query = fn(plan, distinct) {
     let rendered_items = array.map(plan.projection, fn(item) { render_select_item(item, plan) });
     let select_sql = string.join(array.map(rendered_items, fn(pair) { pair.0 }), ", ");
     let select_bindings = array.concat(array.map(rendered_items, fn(pair) { pair.1 }));
@@ -2156,7 +2353,8 @@ def render_unpartitioned: Fn(Plan) -> Query = fn(plan) {
     ];
     let all_bindings = array.concat(binding_groups);
 
-    let sql = `SELECT \{select_sql} FROM \{from_sql}\{join_text}\{where_clause.0}\{group_part.0}\{having_part.0}\{order_part.0}\{limit_part.0}\{offset_part.0}`;
+    let select_prefix = if distinct { "SELECT DISTINCT " } else { "SELECT " };
+    let sql = `\{select_prefix}\{select_sql} FROM \{from_sql}\{join_text}\{where_clause.0}\{group_part.0}\{having_part.0}\{order_part.0}\{limit_part.0}\{offset_part.0}`;
 
     let result: Query = {sql: sql, bindings: all_bindings};
     result
@@ -2247,6 +2445,9 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
                 'None => `__q_ok_\{pair.0}`,
             },
             'AggregateRef(r) => r.alias,
+            # A direct ordering aggregate is rejected by partition structure
+            # validation before rendering.
+            'Aggregate(_) => "__q_rejected",
         };
         let empty: Array(Val) = [];
         (`\{ref} \{direction_sql(pair.1.direction)}`, empty)
@@ -2258,6 +2459,7 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
                 'None => 'True,
             },
             'AggregateRef(_) => 'False,
+            'Aggregate(_) => 'False,
         }
     });
     let ok_hidden = array.map(ok_hidden_parts, fn(pair) {
@@ -2267,6 +2469,10 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
                 (`\{rendered.0} AS __q_ok_\{pair.0}`, rendered.1)
             },
             'AggregateRef(_) => {
+                let empty: Array(Val) = [];
+                ("", empty)
+            },
+            'Aggregate(_) => {
                 let empty: Array(Val) = [];
                 ("", empty)
             },
@@ -2358,7 +2564,7 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
 def render_plan: Fn(Plan) -> Query = fn(plan) {
     match plan.partition {
         'Some(pt) => render_partitioned(plan, pt),
-        'None => render_unpartitioned(plan),
+        'None => render_unpartitioned(plan, 'False),
     }
 };
 
@@ -2369,6 +2575,53 @@ def render_plan: Fn(Plan) -> Query = fn(plan) {
 def transform_sqlite: Fn(Plan) -> Query = fn(plan) {
     let structured = validate_structure(plan);
     render_plan(structured)
+};
+
+# Deterministic distinct-row lowering: renders the same validated Plan as
+# `SELECT DISTINCT ...`, producing a result set of mutually distinct rows.
+# The Plan must be an ungrouped, aggregate-free projection of plain dimension
+# expressions (a row/listing shape); no grouped/HAVING/partitioned body is
+# accepted.  SQLite requires every ORDER BY term of a SELECT DISTINCT to appear
+# in the result set, so each ordering key must be an expression that is one of
+# the projected expressions (an ordering-by-non-projected-column is a plain
+# (non-distinct) lowering concern).  Bindings keep placeholder order and the
+# same Plan always produces byte-identical SQL/bindings.
+def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
+    let structured = validate_structure(plan);
+    if structured.partition != 'None {
+        fail!("distinct row lowering does not combine with partitioned top N", plan)
+    } else if array.length(structured.grouping) > 0 {
+        fail!("distinct row lowering requires an ungrouped row projection", plan)
+    } else if array.length(structured.having) > 0 {
+        fail!("distinct row lowering does not accept HAVING predicates", plan)
+    } else if !array.all(structured.projection, fn(item) {
+        match item {
+            'Expr(_) => 'True,
+            'Aggregate(_) => 'False,
+            'Computed(_) => 'False,
+        }
+    }) {
+        fail!("distinct row lowering requires a projection of plain dimension expressions", plan)
+    } else {
+        let projected: Array(Expr) = array.map(structured.projection, fn(item) {
+            match item {
+                'Expr(expr) => expr,
+                _ => fail!("distinct row projection is not expression-only", plan),
+            }
+        });
+        let order_ok = array.all(structured.ordering, fn(ob) {
+            match ob.key {
+                'Expr(expr) => expr_member(projected, expr),
+                'AggregateRef(_) => 'False,
+                'Aggregate(_) => 'False,
+            }
+        });
+        if !order_ok {
+            fail!("distinct row ordering must reference a projected dimension expression", plan)
+        } else {
+            render_unpartitioned(structured, 'True)
+        }
+    }
 };
 
 # Nested aggregate primitive (shape 1): count the rows produced by a grouped
@@ -2547,6 +2800,8 @@ def exists: Fn(Source, Array(ColumnEq), Option(Expr)) -> Exists = fn(ex_source, 
         grouping: empty_group,
         having: empty_having,
         peer: 'None,
+        negated: 'False,
+        link: 'None,
     };
     item
 };
@@ -2563,6 +2818,8 @@ def exists_grouped: Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array
         grouping: grouping,
         having: having_list,
         peer: 'None,
+        negated: 'False,
+        link: 'None,
     };
     item
 };
@@ -2585,6 +2842,8 @@ def exists_union: Fn(Source, Array(Array(ColumnEq)), Option(Expr)) -> Exists = f
         grouping: empty_group,
         having: empty_having,
         peer: 'None,
+        negated: 'False,
+        link: 'None,
     };
     item
 };
@@ -2642,6 +2901,51 @@ def exists_peer: Fn(PeerCorr) -> Exists = fn(corr) {
         grouping: empty_group,
         having: empty_having,
         peer: 'Some(corr),
+        negated: 'False,
+        link: 'None,
+    };
+    item
+};
+
+# Closed anti-existence wrapper: `exists_not(ex)` returns the same correlated
+# body as `ex` with `negated = 'True`, so lowering renders `NOT EXISTS (...)`
+# instead of `EXISTS (...)`.  Only the negation flag changes; correlation,
+# source, bindings and grain semantics are identical.  Used to select subjects
+# with no (or, with a grouped body, no qualifying) matching related row.
+def exists_not: Fn(Exists) -> Exists = fn(ex) {
+    let item: Exists = {
+        source: ex.source,
+        pairs: ex.pairs,
+        alternatives: ex.alternatives,
+        filter: ex.filter,
+        grouping: ex.grouping,
+        having: ex.having,
+        peer: ex.peer,
+        negated: 'True,
+        link: ex.link,
+    };
+    item
+};
+
+# Correlated two-hop existence over a declared link path: the outer subject (A)
+# is correlated to an inner hop row B (`hop_source`/`hop_pairs`), which is joined
+# inside the same subquery to a related row C (`link_source`/`link_pairs`);
+# `link_filter` optionally constrains C.  The body stays one correlated EXISTS,
+# so a fan-out A -> B first hop never amplifies the outer A grain.
+def exists_two_hop: Fn(Source, Array(ColumnEq), Source, Array(ColumnEq), Option(Expr)) -> Exists = fn(hop_source, hop_pairs, link_source, link_pairs, link_filter) {
+    let empty_group: Array(Expr) = [];
+    let empty_having: Array(Having) = [];
+    let link: ExistsLink = {source: link_source, pairs: link_pairs, filter: link_filter};
+    let item: Exists = {
+        source: hop_source,
+        pairs: hop_pairs,
+        alternatives: 'None,
+        filter: 'None,
+        grouping: empty_group,
+        having: empty_having,
+        peer: 'None,
+        negated: 'False,
+        link: 'Some(link),
     };
     item
 };
@@ -2745,6 +3049,7 @@ export {
     JoinCondition,
     Join,
     Exists,
+    ExistsLink,
     PeerBranch,
     PeerCorr,
     UnionColumn,
@@ -2766,6 +3071,7 @@ export {
     profile_accepts,
     validate,
     transform_sqlite,
+    transform_sqlite_distinct,
     count_groups,
     scalar_name,
     aggregate_name,
@@ -2805,6 +3111,8 @@ export {
     exists,
     exists_grouped,
     exists_union,
+    exists_not,
+    exists_two_hop,
     peer_branch,
     peer_corr,
     peer_corr_distinct,
