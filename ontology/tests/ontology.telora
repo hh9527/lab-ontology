@@ -1698,6 +1698,372 @@ def check_hub_route_rejects_duplicate: Bool = do {
     check(hub_problem_count(types) > 0, "hub prepare: duplicate declarations to the same participant are rejected")
 };
 
+# A second dual-hub participant fixture used only to prove the guard above.
+@edsl.entity_source("hp2_t", "hp2")
+type HubParticipantTwo = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("h2_t", "h2")
+@edsl.dual_hub(HubParticipant, 0, 1, 2)
+@edsl.dual_hub(HubParticipantTwo, 0, 1, 2)
+type HubTwoParticipant = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+def check_hub_route_accepts_multi_participant: Bool = do {
+    # A hub may legitimately declare a dual-hub route for MULTIPLE participant
+    # tables (the physical-link multi-participant shape).  Only a duplicate
+    # route for the same (hub, participant) pair is ambiguous; paired endpoints
+    # are expressed by the explicit peer_hub route, never by pairing dual-hub
+    # request constraints.
+    let types: Array(Type) = [HubParticipant, HubParticipantTwo, HubTwoParticipant];
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.hub_build(graph.0);
+    check(array.length(build.problems) == 0 && array.length(build.routes) == 2,
+        "hub prepare: a hub may declare dual-hub routes for multiple participant types")
+};
+
+# ---------------------------------------------------------------------------
+# Paired-endpoint (peer) route slice.
+#
+# Pair (hub base) additionally declares a peer_hub route whose two role fields
+# both reference Member's key.  A paired request keeps a hub row only when its
+# two endpoints are the two specified participants (origin and peer), in either
+# endpoint order (the two exchange branches).  No participant join, no fan-out.
+# ---------------------------------------------------------------------------
+
+def peer_hub_base_request: edsl.QueryRequest = {
+    measures: [{ id: "PairCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def peer_ab_request: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "members", key: 'Int(101) },
+    peer: { entity: "members", key: 'Int(202) },
+};
+
+def peer_ba_request: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "members", key: 'Int(202) },
+    peer: { entity: "members", key: 'Int(101) },
+};
+
+def check_peer_route_prepared: Bool = do {
+    let p = knowledge.payload;
+    let pairs = entity_id_index(p.entities, "pairs");
+    let members = entity_id_index(p.entities, "members");
+    let route_ok = array.any(p.peer_routes, fn(r) {
+        r.hub == pairs && r.origin_entity == members && r.peer_entity == members
+        && r.origin_field == 2 && r.peer_field == 3 && r.exchange
+    });
+    check(route_ok, "peer: prepared payload stores the Pair peer route (same participant, exchange allowed)")
+        && check(array.length(p.peer_routes) == 1, "peer: exactly one paired route is declared")
+};
+
+def check_peer_same_type_lowering: Bool = do {
+    let plan: qb.Plan = edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(pr.id) AS PairCount FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p WHERE ((pr.left_member_id = mb_o.id AND pr.right_member_id = mb_p.id) OR (pr.right_member_id = mb_o.id AND pr.left_member_id = mb_p.id)) AND mb_o.id = ? AND mb_p.id = ?)";
+    let expected: Array(qb.Val) = ['Int(101), 'Int(202)];
+    check(query.sql == expected_sql, "peer: same-type pair lowers to a correlated EXISTS with two participant aliases and the two ordered exchange branches")
+        && check(query.bindings == expected, "peer: origin/peer key binds belong to their own inner aliases in placeholder order")
+        && check(array.length(plan.joins) == 0 && array.length(plan.exists) == 1,
+            "peer: one correlated EXISTS, no outer participant join; the hub grain is not fanned out")
+};
+
+def check_peer_same_type_swapped_equivalent: Bool = do {
+    # Swapping origin/peer of the same participant type must produce the same
+    # SQL text (the exchange covers both endpoint assignments); only the two
+    # key bindings exchange places.
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ba_request]));
+    let expected1: Array(qb.Val) = ['Int(101), 'Int(202)];
+    let expected2: Array(qb.Val) = ['Int(202), 'Int(101)];
+    check(q1.sql == q2.sql, "peer: same-type participants share one exchange SQL shape")
+        && check(q1.bindings == expected1 && q2.bindings == expected2,
+            "peer: swapped participants mirror the origin/peer binding order")
+};
+
+def check_peer_deterministic: Bool = do {
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_peer(knowledge.payload, peer_hub_base_request, [peer_ab_request]));
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings,
+        "peer: repeated lowering is byte-identical")
+};
+
+def check_peer_request_probe: Bool = do {
+    let p = knowledge.payload;
+    let pairs = entity_id_index(p.entities, "pairs");
+    let orders = entity_id_index(p.entities, "orders");
+    let self_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "members", key: 'Int(101) },
+        peer: { entity: "members", key: 'Int(101) },
+    };
+    let unknown_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "ghost", key: 'Int(1) },
+        peer: { entity: "members", key: 'Int(2) },
+    };
+    let unrelated_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "members", key: 'Int(1) },
+        peer: { entity: "orders", key: 'Int(2) },
+    };
+    check(edsl.peer_request_ok(p, pairs, peer_ab_request), "peer probe: valid same-type pair is feasible")
+        && check(!edsl.peer_request_ok(p, pairs, self_req), "peer probe: self-pair is rejected")
+        && check(!edsl.peer_request_ok(p, pairs, unknown_req), "peer probe: unknown participant entity is rejected")
+        && check(!edsl.peer_request_ok(p, pairs, unrelated_req), "peer probe: unrelated participant pair without a route is rejected")
+        && check(!edsl.peer_request_ok(p, orders, peer_ab_request), "peer probe: a hub without a peer route is rejected")
+};
+
+# ---------------------------------------------------------------------------
+# Heterogeneous paired-endpoint route fixture: the two hub endpoints reference
+# two different participant tables.  Physical-link A/Z endpoints are NOT type
+# roles, so the heterogeneous pair must still render BOTH endpoint-exchange
+# branches.  Each equality connects a hub endpoint value to the key column of
+# the participant table the request declared, so a key collision across the two
+# tables can never be silently interpreted as the same endpoint.
+# ---------------------------------------------------------------------------
+
+def count_agg: qb.AggregateFunction = 'Count;
+def no_requires: Array(Type) = [];
+
+@edsl.entity_id("left_parts")
+@edsl.entity_source("left_parts", "lp")
+type LeftPart = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("right_parts")
+@edsl.entity_source("right_parts", "rp")
+type RightPart = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("typed_hub")
+@edsl.entity_source("typed_hub", "th")
+@edsl.peer_hub(LeftPart, 0, 1, RightPart, 0, 2)
+type TypedHub = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("TypedHubCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+def typed_entity_types: Array(Type) = [TypedHub, LeftPart, RightPart];
+
+def typed_authorize: Fn(String) -> Bool = fn(subject) { 'True };
+
+def typed_payload: edsl.PreparedPayload = do {
+    let result: edsl.PreparedPayload = edsl.build_root("typed-hub-v1", typed_entity_types, knowledge.profile, typed_authorize);
+    result
+};
+
+def typed_hub_request: edsl.QueryRequest = {
+    measures: [{ id: "TypedHubCount", subject: "analyst", input: 'All }],
+    dimensions: [],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def typed_forward_req: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "left_parts", key: 'Int(11) },
+    peer: { entity: "right_parts", key: 'Int(22) },
+};
+
+def typed_swapped_req: edsl.PeerRequest = {
+    subject: "analyst",
+    origin: { entity: "right_parts", key: 'Int(22) },
+    peer: { entity: "left_parts", key: 'Int(11) },
+};
+
+def check_typed_peer_route: Bool = do {
+    let p = typed_payload;
+    let route = get_index(p.peer_routes, 0);
+    check(array.length(p.peer_routes) == 1, "typed peer: heterogeneous route is prepared")
+        && check(route.origin_entity != route.peer_entity,
+            "typed peer: the two endpoints reference two different participant entities")
+};
+
+def check_typed_peer_forward_sql: Bool = do {
+    let plan: qb.Plan = edsl.lower_peer(typed_payload, typed_hub_request, [typed_forward_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(th.id) AS TypedHubCount FROM typed_hub AS th WHERE EXISTS (SELECT 1 FROM left_parts AS lp_o, right_parts AS rp_p WHERE ((th.left = lp_o.id AND th.right = rp_p.id) OR (th.right = lp_o.id AND th.left = rp_p.id)) AND lp_o.id = ? AND rp_p.id = ?)";
+    let expected: Array(qb.Val) = ['Int(11), 'Int(22)];
+    check(query.sql == expected_sql, "typed peer: origin/peer each correlated through its OWN participant table, both exchange branches present")
+        && check(query.bindings == expected, "typed peer: bindings are origin key then peer key on their own aliases")
+        && check(array.length(plan.joins) == 0 && array.length(plan.exists) == 1,
+            "typed peer: one correlated EXISTS, no outer participant join and no fan-out")
+};
+
+def check_typed_peer_swapped_sql: Bool = do {
+    # A swapped request order still renders both endpoint-exchange branches and
+    # now leads with the RIGHT-parts participant as the origin inner source: the
+    # participant entity selects the inner alias, so the SQL keeps identity.
+    let plan: qb.Plan = edsl.lower_peer(typed_payload, typed_hub_request, [typed_swapped_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(th.id) AS TypedHubCount FROM typed_hub AS th WHERE EXISTS (SELECT 1 FROM right_parts AS rp_o, left_parts AS lp_p WHERE ((th.left = rp_o.id AND th.right = lp_p.id) OR (th.right = rp_o.id AND th.left = lp_p.id)) AND rp_o.id = ? AND lp_p.id = ?)";
+    let expected: Array(qb.Val) = ['Int(22), 'Int(11)];
+    check(query.sql == expected_sql, "typed peer: swapped request correlates each participant through its own table")
+        && check(query.bindings == expected, "typed peer: swapped bindings keep placeholder order on their own aliases")
+};
+
+def check_typed_peer_cross_table_key_collision: Bool = do {
+    # Heterogeneous participant tables may carry the SAME key value (here 22 on
+    # both left_parts and right_parts).  Every equality connects a hub endpoint
+    # to ONE declared participant table, and the two participants are distinct
+    # inner aliases in the SQL, so the predicate can never reinterpret a single
+    # endpoint value through both tables or silently collapse the pair.
+    let collision_req: edsl.PeerRequest = {
+        subject: "analyst",
+        origin: { entity: "left_parts", key: 'Int(22) },
+        peer: { entity: "right_parts", key: 'Int(22) },
+    };
+    let plan: qb.Plan = edsl.lower_peer(typed_payload, typed_hub_request, [collision_req]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT count(th.id) AS TypedHubCount FROM typed_hub AS th WHERE EXISTS (SELECT 1 FROM left_parts AS lp_o, right_parts AS rp_p WHERE ((th.left = lp_o.id AND th.right = rp_p.id) OR (th.right = lp_o.id AND th.left = rp_p.id)) AND lp_o.id = ? AND rp_p.id = ?)";
+    let expected: Array(qb.Val) = ['Int(22), 'Int(22)];
+    check(query.sql == expected_sql, "typed peer: equal keys across different tables stay separate inner aliases")
+        && check(query.bindings == expected, "typed peer: cross-table equal keys bind in placeholder order")
+};
+
+# ---------------------------------------------------------------------------
+# Paired-route declaration fixtures (valid and invalid).
+# ---------------------------------------------------------------------------
+
+@edsl.entity_source("pk_t", "pk")
+type PeerKey = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_source("prs_t", "prs")
+@edsl.peer_hub(PeerKey, 0, 1, PeerKey, 0, 1)
+type PeerSameField = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("pok_t", "pok")
+@edsl.peer_hub(PeerKey, 0, 1, PeerKey, 0, 2)
+type PeerOk = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("prk_t", "prk")
+@edsl.peer_hub(PeerKey, 1, 1, PeerKey, 0, 2)
+type PeerBadKey = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("pdup_t", "pdup")
+@edsl.peer_hub(PeerKey, 0, 1, PeerKey, 0, 2)
+@edsl.peer_hub(PeerKey, 0, 1, PeerKey, 0, 2)
+type PeerDup = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+@edsl.entity_source("poke_t", "poke")
+@edsl.peer_hub(PeerKey, 0, 1, PeerKey, 0, 3)
+type PeerOutOfRange = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("left")
+    left: Int,
+    @edsl.column("right")
+    right: Int,
+};
+
+def peer_problem_count: Fn(Array(Type)) -> Int = fn(types) {
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.peer_build(graph.0);
+    array.length(build.problems)
+};
+
+def check_peer_route_valid: Bool = do {
+    let types: Array(Type) = [PeerKey, PeerOk];
+    let graph = edsl.knowledge_graph(types);
+    let build = edsl.peer_build(graph.0);
+    let route = if array.length(build.routes) == 1 { get_index(build.routes, 0) } else { fail!("expected one peer route") };
+    let route_ok = route.origin_entity == route.peer_entity && route.exchange
+        && route.origin_field == 1 && route.peer_field == 2;
+    check(array.length(build.problems) == 0 && array.length(build.routes) == 1 && route_ok,
+        "peer prepare: valid same-participant pair resolves exactly one exchange route")
+};
+
+def check_peer_route_rejects_same_endpoint: Bool = do {
+    let types: Array(Type) = [PeerKey, PeerSameField];
+    check(peer_problem_count(types) > 0, "peer prepare: identical origin/peer endpoint fields are rejected")
+};
+
+def check_peer_route_rejects_non_key_participant: Bool = do {
+    let types: Array(Type) = [PeerKey, PeerBadKey];
+    check(peer_problem_count(types) > 0, "peer prepare: non-key participant reference is rejected")
+};
+
+def check_peer_route_rejects_endpoint_range: Bool = do {
+    let types: Array(Type) = [PeerKey, PeerOutOfRange];
+    check(peer_problem_count(types) > 0, "peer prepare: out-of-range endpoint field is rejected")
+};
+
+def check_peer_route_rejects_duplicate: Bool = do {
+    let types: Array(Type) = [PeerKey, PeerDup];
+    check(peer_problem_count(types) > 0, "peer prepare: duplicate paired routes on one hub are rejected")
+};
+
 # ---------------------------------------------------------------------------
 # Denser-relation-graph fuel regression (hub + leaf fan-out/ring edges).
 # ---------------------------------------------------------------------------
@@ -1845,5 +2211,20 @@ export def test_ontology: Value = do {
     let c58 = check_hub_route_rejects_missing_participant_key;
     let c59 = check_hub_route_rejects_endpoint_range;
     let c60 = check_hub_route_rejects_duplicate;
+    let c61 = check_hub_route_accepts_multi_participant;
+    let c62 = check_peer_route_prepared;
+    let c63 = check_peer_same_type_lowering;
+    let c64 = check_peer_same_type_swapped_equivalent;
+    let c65 = check_peer_deterministic;
+    let c66 = check_peer_request_probe;
+    let c67 = check_typed_peer_route;
+    let c68 = check_typed_peer_forward_sql;
+    let c69 = check_typed_peer_swapped_sql;
+    let c70 = check_typed_peer_cross_table_key_collision;
+    let c71 = check_peer_route_valid;
+    let c72 = check_peer_route_rejects_same_endpoint;
+    let c73 = check_peer_route_rejects_non_key_participant;
+    let c74 = check_peer_route_rejects_endpoint_range;
+    let c75 = check_peer_route_rejects_duplicate;
     'String("ontology tests ok")
 };

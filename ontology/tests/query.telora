@@ -3634,3 +3634,195 @@ export def union_exists_rejects_inner_mismatch = do {
     assert_ok(!qb.structure_ok(union_exists_probe_plan(ex)),
         "union exists: every equality right column must belong to the inner source")
 };
+
+# ---------------------------------------------------------------------------
+# Closed paired-endpoint (peer) correlated EXISTS.
+#
+# A peer predicate keeps a hub base row when the ORIGIN and PEER participants
+# (each proven through its own inner source alias) occupy the two mutually
+# exclusive endpoints of that row, in either endpoint order.  It renders as a
+# correlated EXISTS with TWO inner participant sources and the two ordered
+# endpoint-exchange branches; participant key binds belong to the corresponding
+# inner alias.  No participant is ever outer-joined, so the hub grain is not
+# fanned out.
+# ---------------------------------------------------------------------------
+
+def peer_probe_plan: Fn(qb.Exists) -> qb.Plan = fn(ex) {
+    let plan: qb.Plan = {
+        revision: "test-peer-probe",
+        sources: [qb.source("pr", "pairs")],
+        projection: [qb.expr_item(qb.column("pr", "id"))],
+        filter: 'None,
+        exists: [ex],
+        joins: [],
+        grouping: [],
+        having: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        derived: 'None,
+        partition: 'None,
+    };
+    plan
+};
+
+def peer_left_role: qb.ColumnRef = qb.column_ref("pr", "left_id");
+def peer_right_role: qb.ColumnRef = qb.column_ref("pr", "right_id");
+def peer_origin_key: qb.ColumnRef = qb.column_ref("mo", "id");
+def peer_peer_key: qb.ColumnRef = qb.column_ref("mp", "id");
+
+# Build a valid closed paired correlation over the members table used twice
+# (origin alias `mo`, peer alias `mp`).
+def peer_corr_fixture: Fn(qb.Val, qb.Val) -> qb.PeerCorr = fn(origin, peer) {
+    let a_origin = qb.column_eq(peer_left_role, peer_origin_key);
+    let a_peer = qb.column_eq(peer_right_role, peer_peer_key);
+    let b_origin = qb.column_eq(peer_right_role, peer_origin_key);
+    let b_peer = qb.column_eq(peer_left_role, peer_peer_key);
+    let branch_a = qb.peer_branch(a_origin, a_peer);
+    let branch_b = qb.peer_branch(b_origin, b_peer);
+    let origin_filter: qb.Expr = qb.scalar('Eq, [qb.column("mo", "id"), qb.bind_val(origin)]);
+    let peer_filter: qb.Expr = qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_val(peer)]);
+    qb.peer_corr(
+        qb.source("mo", "members"),
+        qb.source("mp", "members"),
+        branch_a,
+        branch_b,
+        'Some(origin_filter),
+        'Some(peer_filter),
+    )
+};
+
+export def peer_exists_lowers_to_two_ordered_branches = do {
+    let ex = qb.exists_peer(peer_corr_fixture('Int(101), 'Int(202)));
+    let q = qb.transform_sqlite(peer_probe_plan(ex));
+    let expected: Array(qb.Val) = ['Int(101), 'Int(202)];
+    let expected_sql = "SELECT pr.id FROM pairs AS pr WHERE EXISTS (SELECT 1 FROM members AS mo, members AS mp WHERE ((pr.left_id = mo.id AND pr.right_id = mp.id) OR (pr.right_id = mo.id AND pr.left_id = mp.id)) AND mo.id = ? AND mp.id = ?)";
+    assert_ok(q.sql == expected_sql,
+        "peer: two inner participant aliases and the two ordered endpoint-exchange branches")
+        && assert_ok(q.bindings == expected, "peer: origin/peer key binds belong to their own inner aliases in placeholder order")
+        && assert_ok(!string.contains(q.sql, " JOIN "), "peer: no outer participant join; no fan-out")
+};
+
+export def peer_exists_structure_accepts = do {
+    qb.structure_ok(peer_probe_plan(qb.exists_peer(peer_corr_fixture('Int(1), 'Int(2)))))
+};
+
+export def peer_exists_rejects_unknown_hub_role_alias = do {
+    # The hub role columns must reference a visible outer alias.
+    let ghost: qb.ColumnRef = qb.column_ref("ghost", "left_id");
+    let a_origin = qb.column_eq(ghost, peer_origin_key);
+    let a_peer = qb.column_eq(peer_right_role, peer_peer_key);
+    let b_origin = qb.column_eq(peer_right_role, peer_origin_key);
+    let b_peer = qb.column_eq(peer_left_role, peer_peer_key);
+    let corr = qb.peer_corr(
+        qb.source("mo", "members"),
+        qb.source("mp", "members"),
+        qb.peer_branch(a_origin, a_peer),
+        qb.peer_branch(b_origin, b_peer),
+        'Some(qb.scalar('Eq, [qb.column("mo", "id"), qb.bind_int(1)])),
+        'Some(qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_int(2)])),
+    );
+    !qb.structure_ok(peer_probe_plan(qb.exists_peer(corr)))
+};
+
+export def peer_exists_rejects_same_endpoint = do {
+    # Same-side match: the two hub role columns must be distinct.
+    let a_origin = qb.column_eq(peer_left_role, peer_origin_key);
+    let a_peer = qb.column_eq(peer_left_role, peer_peer_key);
+    let b_origin = qb.column_eq(peer_left_role, peer_origin_key);
+    let b_peer = qb.column_eq(peer_left_role, peer_peer_key);
+    let corr = qb.peer_corr(
+        qb.source("mo", "members"),
+        qb.source("mp", "members"),
+        qb.peer_branch(a_origin, a_peer),
+        qb.peer_branch(b_origin, b_peer),
+        'Some(qb.scalar('Eq, [qb.column("mo", "id"), qb.bind_int(1)])),
+        'Some(qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_int(2)])),
+    );
+    !qb.structure_ok(peer_probe_plan(qb.exists_peer(corr)))
+};
+
+export def peer_exists_rejects_inconsistent_branches = do {
+    # The two exchange branches must swap the SAME two hub roles and SAME inner
+    # key columns; an inconsistent branch loses the identity proof shape.
+    let a_origin = qb.column_eq(peer_left_role, peer_origin_key);
+    let a_peer = qb.column_eq(peer_right_role, peer_peer_key);
+    let b_origin = qb.column_eq(peer_right_role, peer_origin_key);
+    let b_peer = qb.column_eq(qb.column_ref("pr", "other_col"), peer_peer_key);
+    let corr = qb.peer_corr(
+        qb.source("mo", "members"),
+        qb.source("mp", "members"),
+        qb.peer_branch(a_origin, a_peer),
+        qb.peer_branch(b_origin, b_peer),
+        'Some(qb.scalar('Eq, [qb.column("mo", "id"), qb.bind_int(1)])),
+        'Some(qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_int(2)])),
+    );
+    !qb.structure_ok(peer_probe_plan(qb.exists_peer(corr)))
+};
+
+export def peer_exists_rejects_cross_alias_participant_filter = do {
+    # A participant filter must belong to its own inner alias; referencing the
+    # other participant alias breaks the identity proof.
+    let a_origin = qb.column_eq(peer_left_role, peer_origin_key);
+    let a_peer = qb.column_eq(peer_right_role, peer_peer_key);
+    let b_origin = qb.column_eq(peer_right_role, peer_origin_key);
+    let b_peer = qb.column_eq(peer_left_role, peer_peer_key);
+    let corr = qb.peer_corr(
+        qb.source("mo", "members"),
+        qb.source("mp", "members"),
+        qb.peer_branch(a_origin, a_peer),
+        qb.peer_branch(b_origin, b_peer),
+        'Some(qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_int(1)])),
+        'Some(qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_int(2)])),
+    );
+    !qb.structure_ok(peer_probe_plan(qb.exists_peer(corr)))
+};
+
+export def peer_exists_equal_key_values_across_aliases = do {
+    # Cross-table key collisions are legal at the AST level because each
+    # equality is tied to its own participant alias; the SQL never reinterprets
+    # one endpoint value through both tables in a single equality.
+    qb.structure_ok(peer_probe_plan(qb.exists_peer(peer_corr_fixture('Int(7), 'Int(7)))))
+};
+
+export def peer_exists_operator_vocabulary = do {
+    let ex = qb.exists_peer(peer_corr_fixture('Int(1), 'Int(2)));
+    let expected: Array(qb.Operator) = [
+        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Exists,
+    ];
+    qb.operators(peer_probe_plan(ex)) == expected
+};
+
+export def peer_exists_profile_accepts = do {
+    let ex = qb.exists_peer(peer_corr_fixture('Int(1), 'Int(2)));
+    let plan = peer_probe_plan(ex);
+    qb.profile_accepts(plan, full_profile())
+};
+
+export def peer_exists_profile_rejects_without_exists = do {
+    # A paired correlation is an Exists capability; removing 'Exists must reject
+    # it even when the underlying equality/scalar capabilities are allowed.
+    let ex = qb.exists_peer(peer_corr_fixture('Int(1), 'Int(2)));
+    let plan = peer_probe_plan(ex);
+    let no_exists: qb.PlanProfile = {
+        allowed_operators: ['Source, 'Project, 'Column, 'Bind, 'Scalar],
+        allowed_join_kinds: ['Inner],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Eq, 'And, 'Or],
+        allow_distinct: 'True,
+    };
+    !qb.profile_accepts(plan, no_exists)
+};
+
+export def peer_exists_deterministic = do {
+    let ex = qb.exists_peer(peer_corr_fixture('Int(101), 'Int(202)));
+    let q1 = qb.transform_sqlite(peer_probe_plan(ex));
+    let q2 = qb.transform_sqlite(peer_probe_plan(ex));
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+};
+
+export def peer_exists_placeholders_match_bindings = do {
+    let ex = qb.exists_peer(peer_corr_fixture('Int(101), 'Int(202)));
+    let q = qb.transform_sqlite(peer_probe_plan(ex));
+    (array.length(string.split(q.sql, "?")) - 1) == array.length(q.bindings)
+};

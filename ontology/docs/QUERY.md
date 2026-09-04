@@ -38,6 +38,7 @@ type ScalarFunction = enum {
     'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
 };
 type ScalarCall = struct { function: ScalarFunction, args: Array(Expr) };
+
 type Expr = enum {
     'Column(ColumnRef),
     'Bind(Val),
@@ -95,6 +96,12 @@ alias 做 `'Add`/`'Sub` 算术组合。
 > 记录字面量必须补 `derived: 'None`（使用派生源时置 `'Some(qb.derived_source(...))`
 > 并把 `sources` 留空）；对 Plan 做穷尽构造的下游必须处理新字段。
 
+> **公共破坏性契约（paired-endpoint 轮）**：`Exists` 新增 `peer` 字段
+> （`Option(PeerCorr)`），新增 `PeerBranch`/`PeerCorr` 类型与
+> `qb.peer_branch`/`qb.peer_corr`/`qb.exists_peer` 构造器。新建 Exists 的下游应继续
+> 使用 `qb.exists`/`qb.exists_grouped`/`qb.exists_union`/`qb.exists_peer`，不要直接
+> 写 Exists 记录字面量；对 `Exists` 做穷尽字段访问的下游要处理 `peer`。
+
 标量语义（与 SQLite 行为一致）：
 
 | 函数 | 参数 | 语义 |
@@ -141,12 +148,30 @@ type OrderBy = struct { key: OrderKey, direction: Ordering };
 
 # Correlated EXISTS (semi-join) filter; `grouping`/`having` make it a
 # correlated aggregate EXISTS.  See "存在性过滤 (EXISTS)" and "嵌套聚合".
+# `peer`（`Option(PeerCorr)`）是 paired-endpoint 模式：见 "配对的 peer EXISTS"。
+type PeerBranch = struct {
+    origin: ColumnEq,
+    peer: ColumnEq,
+};
+
+# 同一 hub 行上的配对：两个内层 participant source 与两组端点交换分支。
+type PeerCorr = struct {
+    origin: Source,
+    peer: Source,
+    branch_a: PeerBranch,
+    branch_b: PeerBranch,
+    origin_filter: Option(Expr),
+    peer_filter: Option(Expr),
+};
+
 type Exists = struct {
     source: Source,
     pairs: Array(ColumnEq),
+    alternatives: Option(Array(Array(ColumnEq))),
     filter: Option(Expr),
     grouping: Array(Expr),
     having: Array(Having),
+    peer: Option(PeerCorr),
 };
 
 # Aggregate-result predicate; see "HAVING" and "嵌套聚合".
@@ -269,6 +294,10 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `join_on` | `Fn(JoinKind, Source, JoinCondition) -> Join` |
 | `exists` | `Fn(Source, Array(ColumnEq), Option(Expr)) -> Exists` |
 | `exists_grouped` | `Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array(Having)) -> Exists` |
+| `exists_union` | `Fn(Source, Array(Array(ColumnEq)), Option(Expr)) -> Exists` |
+| `peer_branch` | `Fn(ColumnEq, ColumnEq) -> PeerBranch` |
+| `peer_corr` | `Fn(Source, Source, PeerBranch, PeerBranch, Option(Expr), Option(Expr)) -> PeerCorr` |
+| `exists_peer` | `Fn(PeerCorr) -> Exists` |
 | `having` | `Fn(HavingOp, String, Val) -> Having` |
 | `having_call` | `Fn(HavingOp, AggregateFunction, Expr, Bool, Val) -> Having` |
 | `union_column` | `Fn(String, Expr) -> UnionColumn` |
@@ -1025,6 +1054,49 @@ ON 条件中的每个列引用都必须解析到该 plan 可见的 source/join a
 原子拒绝。`'And`/`'Or` 为空同样拒绝。Join 的 `'Join` operator 与 `allowed_join_kinds`
 继续由 profile 收窄。
 
+## 配对的 peer EXISTS（PeerCorr）
+
+`Exists.peer: Option(PeerCorr)` 是封闭的 paired-endpoint 相关谓词：同一个 hub
+base 行的两个互斥端点分别由 **origin** 与 **peer** participant 占据。它用**两个
+内层源**的 correlated EXISTS 表达，同一结构内引用 hub、origin participant 与 peer
+participant，以及两组被封闭验证的端点交换分支：
+
+```text
+EXISTS (SELECT 1 FROM <origin.table> AS <oa>, <peer.table> AS <pa>
+        WHERE ((<hub.A> = <oa.key> AND <hub.B> = <pa.key>)
+               OR (<hub.B> = <oa.key> AND <hub.A> = <pa.key>))
+        [AND origin_filter][AND peer_filter])
+```
+
+```telora
+let a_origin: qb.ColumnEq = qb.column_eq(qb.column_ref("pr", "left_id"), qb.column_ref("mo", "id"));
+let a_peer: qb.ColumnEq = qb.column_eq(qb.column_ref("pr", "right_id"), qb.column_ref("mp", "id"));
+let b_origin: qb.ColumnEq = qb.column_eq(qb.column_ref("pr", "right_id"), qb.column_ref("mo", "id"));
+let b_peer: qb.ColumnEq = qb.column_eq(qb.column_ref("pr", "left_id"), qb.column_ref("mp", "id"));
+let corr: qb.PeerCorr = qb.peer_corr(
+    qb.source("mo", "members"),
+    qb.source("mp", "members"),
+    qb.peer_branch(a_origin, a_peer),
+    qb.peer_branch(b_origin, b_peer),
+    'Some(qb.scalar('Eq, [qb.column("mo", "id"), qb.bind_int(101)])),
+    'Some(qb.scalar('Eq, [qb.column("mp", "id"), qb.bind_int(202)])),
+);
+let exists: qb.Exists = qb.exists_peer(corr);
+```
+
+- 每个 equality 的 `left` 是一个**已校验**的 hub 角色列（外主 alias），`right` 是该
+  participant 内层 alias 的 key 列；两个交换分支共享同一对 hub 角色列并交换 origin/peer
+  的 key 列。
+- **身份证明在 SQL 结构内**：origin/peer 的 key 绑定属于各自的 `origin_filter`/
+  `peer_filter`，只作用于对应内层 alias，因此同一端点值不会被两个异构 participant 表
+  同时解释（跨表 key 碰撞不会静默同端配对）。
+- 结构校验要求两个角色列互异（拒绝 same-side）、origin/peer 内层 alias 互异且不遮蔽主
+  alias、两分支一致、participant filter 只引用自己的内层 alias；自配由 Ontology 在
+  prepare/request 层按实体拒绝。
+- 该谓词是纯相关 EXISTS：不产生外层 JOIN，hub base grain 不被 fan-out。
+- 算子按 `Exists`/`Column` 与 filter 的 `Bind`/`Scalar` 计入；profile 需允许对应
+  operator/scalar。
+
 ## 验证与转换保证
 
 结构校验覆盖：非空 sources/projection、合法标识符、source alias 引用、标量参数
@@ -1149,4 +1221,9 @@ measure、EXISTS 相关引用、空 Join 条件、count_groups 内层未知列�
 非法引用拒绝场景、角色化 Join/复合 ON 的成功与非法 alias 拒绝场景、大小写归一的
 contains/starts-with/ends-with/not-contains 确定性 lowering，以及 JSON 的成功场景
 与拒绝场景（Extract/Type/Valid 错误 arity、非字符串 path、Profile 缺 scalar）。
+paired-endpoint（`PeerCorr`/`exists_peer`）覆盖：两个内层 participant alias 的
+correlated EXISTS 与两组端点交换分支 SQL/bindings、无外层 JOIN/fan-out、结构合法、
+未知 hub 角色 alias/同端字段/不一致分支/跨 alias participant filter 拒绝、等值 key
+跨 alias 合法、operator/profile（缺 `'Exists` 拒绝）、重复 lowering 逐字节一致与
+占位符/绑定数一致。
 新增能力都以领域无关 fixture 覆盖，不写入任何 ICM/企业业务名。

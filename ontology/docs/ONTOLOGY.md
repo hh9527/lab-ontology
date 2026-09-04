@@ -77,11 +77,24 @@ type HavingRequest = struct {
     op: HavingOp,
     threshold: FilterInput,
 };
+
+# Paired-endpoint (peer) 请求：hub base 行的两个互斥端点分别由两个指定
+# participant 占据时才保留该 hub 行（见“配对的 peer 路线”）。
+type PeerRef = struct {
+    entity: String,        # participant 稳定实体 id
+    key: FilterInput,      # participant key 值（动态绑定）
+};
+type PeerRequest = struct {
+    subject: String,
+    origin: PeerRef,
+    peer: PeerRef,
+};
 ```
 
 `lower(payload, request)`、`lower_full(payload, request, exists, having)` 与
 `lower_any(payload, request, any_of, exists, having)` 都接受 `QueryRequest`；
-`lower_full` 额外降低存在性过滤与分组谓词，`lower_any` 再叠加 subject 的 OR-group。
+`lower_full` 额外降低存在性过滤与分组谓词，`lower_any` 再叠加 subject 的 OR-group，
+`lower_peer(payload, request, peers)` 再叠加 paired-endpoint（peer）过滤。
 基础请求可以没有
 `measures`：此时它是行级投影/列表请求（见下文“行级投影”）。
 `lower_group_count(payload, request, having)` 返回“满足 HAVING 的分组个数”（嵌套形状
@@ -140,6 +153,7 @@ bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允�
 | `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`'Eq(RelationPair)`/`'And`/`'Or` 列等值组合 |
 | `exists_route(via, target)` | 类型 | 显式声明有界两跳相关存在路径：base → `via`（唯一、grain-safe owner）→ `target`（可组合 fold） |
 | `dual_hub(participant, key_field, left_field, right_field)` | 类型（hub 上） | 声明 hub 的两个角色化端点字段均引用 `participant` 的 `key_field`；base 命中任一角色即关联该 hub（可组合 fold） |
+| `peer_hub(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field)` | 类型（hub 上） | 声明同一 hub 行的 paired-endpoint 路线：两个角色字段分别引用两个 participant 的 key；同 participant 时允许端点交换（可组合 fold） |
 | `enum_value(value, label)` | enum variant | 封闭值域的稳定值和展示标签 |
 
 同一字段的同型 property 按 `Option(previous)` 顺序 fold：字段 property 取最后一项，
@@ -567,8 +581,9 @@ WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id [AND al.level =
 一个关系对象（hub）具有两个角色化端点：例如 `Pair` 行的 `left_member_id` 与
 `right_member_id` 都引用 `Member` 的 key。**hub 是 base grain**，participant
 （Member）是筛选 target：查询统计/列出按任一端 participant 筛选后的 hub，每个 hub
-base 行天然只计一次（一行一 hub，不依赖未使用的去重键）。对端（peer）路线属于后续
-轮次，本轮不实现，也不用普通 Join 假装支持 peer 路线。
+base 行天然只计一次（一行一 hub，不依赖未使用的去重键）。本切片只表达“单
+participant 命中任一端”；“同一 hub 行的两个互斥端点分别由两个 participant 占据”
+由下一节的 paired-endpoint（peer）路线显式表达，不用普通 Join 假装支持 peer。
 
 ```telora
 @edsl.entity_id("pairs")
@@ -611,8 +626,70 @@ WHERE EXISTS (SELECT 1 FROM members AS mb
 - 这是纯谓词：不产生 JOIN，hub base 行不被 fan-out 放大，每个 hub 行一次。
 - 内层筛选引用 participant（筛选 target）维度，动态值继续参数化；绑定顺序与重复
   lowering 逐字节确定。
-- “经同一 hub 到 peer、peer 属性筛选、同端配对/base 自配”等对端路线属于后续轮次；
-  在提供可证明互斥配对与去重的原语前，不得用普通 Join 伪装已支持。
+- `dual_hub` 仍只表达“单 participant 命中任一端”。一个 hub 可以**合法地为多类
+  participant 声明** `dual_hub`（例如 PhysicalLink 的多种 participant 表）；prepare
+  只拒绝同一 (hub, participant) 的重复声明。请求 lowering 不得把同一 hub 上的多个独立
+  `dual_hub` constraints 解释为配对端点；要表达同一 hub 行上的两个互斥端点，必须使用
+  下一节的显式 paired-endpoint（peer）路线。
+
+### 配对的 peer 路线（paired-endpoint hub slice）
+
+`peer_hub` 表达“同一 hub 行上两个互斥端点分别由两个 participant 占据”的语义。
+hub 是 base grain；origin 与 peer 是两个**指定 participant**（`PeerRef {entity, key}`）。
+只有 origin 命中一端、peer 命中另一端时 hub 行才保留；同一 hub 行、peer ≠ origin、
+无同端匹配、无笛卡尔积、无 fan-out。
+
+```telora
+@edsl.entity_id("pairs")
+@edsl.entity_source("pairs", "pr")
+@edsl.dual_hub(Member, 0, 2, 3)
+@edsl.peer_hub(Member, 0, 2, Member, 0, 3)  # 两个端点都引用 Member.key
+type Pair = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("kind")
+    kind: String,
+    @edsl.column("left_member_id")
+    left_member_id: Int,
+    @edsl.column("right_member_id")
+    right_member_id: Int,
+};
+```
+
+prepare 校验（`build_root` 对首个问题确定性失败，无部分 payload）：
+
+- origin/peer participant 必须已登记、与 hub 不同；被引用的 key 字段必须是该
+  participant **声明的 key**（非 key 字段或 participant 无 key 拒绝）；
+- 两个端点字段都必须在 hub 上、互不相同、在字段范围内（缺端/同端/越界拒绝）；
+- 同一 hub 上同一 participant 对的重复/歧义 peer 路线拒绝；不同 participant 对（含
+  多 participant 表）可各自声明 peer 路线；
+- 两个端点引用同一 participant 实体与引用不同 participant 表都被支持；端点交换分支
+  与实体是否“同名同表”无关（物理链路 A/Z 不是类型角色）。
+
+请求与 lowering（`lower_peer(payload, request, peers)`）：Query 基础层用封闭的
+`qb.PeerCorr`（`exists_peer`）把 **origin/peer 各自的内层 participant 表**与 hub
+角色列放在同一个相关 EXISTS 中，并生成两组端点交换分支。Ontology 只按 prepared route
+组装 origin/peer 的 table/alias、key 列、hub 角色列与 key 绑定；key 绑定属于各自的
+内层 alias（`origin_filter`/`peer_filter`）：
+
+```text
+SELECT count(pr.id) AS PairCount
+FROM pairs AS pr
+WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p
+              WHERE ((pr.left_member_id = mb_o.id AND pr.right_member_id = mb_p.id)
+                     OR (pr.right_member_id = mb_o.id AND pr.left_member_id = mb_p.id))
+                AND mb_o.id = ? AND mb_p.id = ?)
+```
+
+- 身份证明在 SQL 结构内：hub 端点值只经请求声明的 participant 表解释，跨表 key 碰撞
+  不会把同一端点值同时解释为两种实体，也不会静默把两个 participant 配到同一端；
+- 两种端点交换分支对同类型与异构（不同表）participant 都生成；
+- 绑定顺序严格按占位符顺序（origin_filter 后 peer_filter），重复 lowering 逐字节确定；
+- 纯相关 EXISTS：不产生外层 participant JOIN、无 fan-out；
+- `peer == origin`（同实体同 key 的自配）、未知 participant 实体、hub 没有覆盖该
+  participant 对的 peer 路线、union 实体 base 都确定性拒绝；可用纯探针
+  `peer_request_ok(payload, hub_entity, request)` 断言可行/拒绝而不触发失败。
 
 ### 分组计数（count of groups）
 
@@ -702,6 +779,7 @@ type PreparedPayload = struct {
     relations: Array(RelationEntry),
     routes: Array(RouteEntry),
     hub_routes: Array(HubRouteEntry),
+    peer_routes: Array(PeerRouteEntry),
     paths: Array(Array(PathResult)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
@@ -754,7 +832,12 @@ Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimen
 非法 JSON 筛选输入、按未请求 JSON Dimension 排序。相关存在失败还包括：目标即 base、
 没有声明一跳关系或路线、两跳路线第一跳非唯一 forward `'Safe` owner 关系
 （方向不匹配或非唯一 owner）、`via`/`target` 之间缺失或多条候选关系、同一 base 对
-同一 target 声明多条路线、内层筛选引用路径终点之外的实体、EXISTS 键含析取。诊断由
+同一 target 声明多条路线、内层筛选引用路径终点之外的实体、EXISTS 键含析取。
+paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
+自配（同实体同 key 的 origin == peer）、未知 participant 实体、hub 没有覆盖该
+participant 对的 peer 路线、peer 路线端点同字段/越界/引用非 key 字段、同一 hub 上
+同一 participant 对的重复 peer 路线、union 实体 base 上的 peer 请求。把多个独立
+`dual_hub` 请求约束当作配对端点使用不是受支持的形状，必须用显式 peer 路线。诊断由
 Host 机制承载；公共 API 不返回 Rejection 或诊断数组。
 
 公共 Request、Plan、Query 和业务词汇均保持精确具名类型，不使用 `Any`、`Dyn` 或
@@ -797,4 +880,15 @@ prepare 时保持有界不耗尽求值燃料。双端 hub 切片也纳入覆盖�
 lowering 方向为 `FROM hub WHERE EXISTS(participant ...)`（左右角色两条 alternative、
 无 fan-out join、绑定顺序与逐字节确定性）、participant 属性内层筛选参数化、可行性
 探针，以及 prepare 对同端、非 key participant、participant 缺 key、端点越界与重复
-声明的确定性拒绝。
+声明的确定性拒绝。paired-endpoint（peer）切片也纳入覆盖：payload 保存
+Pair(hub base) 的同 participant peer 路线；`lower_peer` 对两个指定 Member key 生成
+双内层 alias 的 correlated EXISTS（`((left = mo.id AND right = mp.id) OR
+(right = mo.id AND left = mp.id)) AND mo.id = ? AND mp.id = ?`）、bindings 按占位符
+顺序、无外层 JOIN/fan-out、交换顺序共享同一 SQL 形状且 key 绑定镜像、重复 lowering
+逐字节一致；`peer_request_ok` 纯探针对合法/自配/未知实体/无路线 hub 返回预期；异构
+（不同 participant 表）peer 路线 forward/swap 请求都各自以请求声明的 participant
+表为内层源生成两组交换分支，跨表同值 key 保持独立内层 alias，杜绝把同一端点值同时
+解释为两种实体；query 结构测试验证两个 participant alias 都存在、各自只出现在自己
+的端点 equality 与 filter、两组交换分支齐全，并确定性拒绝同端、self-pair 身份缺失
+形状；prepare 对同端字段、非 key participant、越界与同一 participant 对的重复 peer
+路线确定性拒绝；同一 hub 的多类 participant `dual_hub` 元数据仍合法。

@@ -222,6 +222,25 @@ type DualHubDecl = struct {
     right_field: Int,
 };
 
+# Type-level paired-endpoint (peer) route declaration on the hub entity.  The
+# hub row's two role fields (`origin_field`/`peer_field`) reference the key
+# fields of two participant entities (`origin_participant`/`peer_participant`).
+# When both participants are the SAME entity (same key field), the two
+# endpoints are symmetric and both endpoint-exchange branches are allowed;
+# otherwise each participant is pinned to its own declared endpoint role.
+# Multiple annotations fold by appending.
+@property('Type)
+type PeerHubDef = struct { hubs: Array(PeerHubDecl) };
+
+type PeerHubDecl = struct {
+    origin_participant: Type,
+    origin_key: Int,
+    origin_field: Int,
+    peer_participant: Type,
+    peer_key: Int,
+    peer_field: Int,
+};
+
 # ---------------------------------------------------------------------------
 # Public request vocabulary.
 # ---------------------------------------------------------------------------
@@ -342,6 +361,24 @@ type HavingRequest = struct {
     threshold: FilterInput,
 };
 
+# One participant reference of a paired-endpoint request: the stable entity id
+# of the participant (must match one endpoint slot of the hub's paired route)
+# and the participant's key value (a dynamic scalar, always bound).
+type PeerRef = struct {
+    entity: String,
+    key: FilterInput,
+};
+
+# Paired-endpoint (peer) request on a hub base row: keep the hub row only when
+# its two mutually exclusive endpoints are the two specified participants
+# (`origin` and `peer`) of the hub's declared paired route.  `peer` must differ
+# from `origin`; self-pair and same-side matches are rejected deterministically.
+type PeerRequest = struct {
+    subject: String,
+    origin: PeerRef,
+    peer: PeerRef,
+};
+
 # ---------------------------------------------------------------------------
 # Prepared payload types.
 # ---------------------------------------------------------------------------
@@ -458,6 +495,23 @@ type HubRouteEntry = struct {
     right: Int,
 };
 
+# A prepared, validated paired-endpoint route.  `hub` is the hub entity whose
+# row carries the two role fields (`origin_field`/`peer_field`); `origin_entity`
+# (`origin_key`) and `peer_entity` (`peer_key`) are the two participant
+# entities and their declared key fields.  `exchange` is 'True when both role
+# fields reference the same participant entity/key (both endpoint assignments
+# are legal); otherwise each participant is pinned to its own endpoint slot.
+type PeerRouteEntry = struct {
+    hub: Int,
+    origin_entity: Int,
+    origin_key: Int,
+    origin_field: Int,
+    peer_entity: Int,
+    peer_key: Int,
+    peer_field: Int,
+    exchange: Bool,
+};
+
 type PathResult = enum {
     'Safe(Array(Int)),
     'FanOut(Array(Int)),
@@ -473,6 +527,7 @@ type PreparedPayload = struct {
     relations: Array(RelationEntry),
     routes: Array(RouteEntry),
     hub_routes: Array(HubRouteEntry),
+    peer_routes: Array(PeerRouteEntry),
     paths: Array(Array(PathResult)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
@@ -658,6 +713,24 @@ def dual_hub: Fn(Type, Int, Int, Int) -> Fn(td.TypeDesc, Option(DualHubDef)) -> 
             'None => [spec],
         };
         let result: DualHubDef = { hubs: all };
+        result
+    }
+};
+
+# Paired-endpoint (peer) route declaration on the hub entity type.  The two hub
+# role fields (`origin_field`, `peer_field`) reference the declared key fields
+# (`origin_key`, `peer_key`) of the two participant entities.  When the two
+# participants are the same entity the pair is symmetric and both endpoint
+# assignments are allowed; otherwise each participant is pinned to its slot.
+# Multiple annotations fold by appending.
+def peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td.TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
+    fn(ctx, previous) {
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field };
+        let all = match previous {
+            'Some(p) => array.push(p.hubs, spec),
+            'None => [spec],
+        };
+        let result: PeerHubDef = { hubs: all };
         result
     }
 };
@@ -1354,14 +1427,129 @@ def hub_build: Fn(Array(EntityEntry)) -> HubBuild = fn(entities) {
                     result
                 },
                 'Ok(entry) => do {
+                    # A dual hub expresses "one participant hits either
+                    # endpoint".  A hub may legitimately declare such a route for
+                    # MULTIPLE participant types; only a duplicate route for the
+                    # same (hub, participant) pair is ambiguous.  Expressing two
+                    # mutually exclusive endpoints is the explicit `peer_hub`
+                    # route, never a pair of independent dual-hub requests.
                     let dup = array.find(inner_acc.routes, fn(r) { r.hub == entry.hub && r.participant == entry.participant });
                     match dup {
                         'Some(_) => do {
-                            let result: HubBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, "dual hub is ambiguous: multiple declarations reach the same participant from the same hub") };
+                            let result: HubBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, "dual hub is ambiguous: duplicate declarations reach the same participant from the same hub") };
                             result
                         },
                         'None => do {
                             let result: HubBuild = { routes: array.push(inner_acc.routes, entry), problems: inner_acc.problems };
+                            result
+                        },
+                    }
+                },
+            }
+        })
+    });
+    collected
+};
+
+# ---------------------------------------------------------------------------
+# Paired-endpoint (peer) route preparation.
+#
+# A peer route is declared on the hub entity with the two role fields that
+# reference the key fields of two participant entities.  Preparation validates
+# roles, keys, field direction and uniqueness, then stores the resolved route on
+# the payload.  Lowering reads only the prepared route and never rescans
+# metadata.  Multiple independent `dual_hub` declarations on one hub are already
+# rejected above, so a pair can never silently compile into two independent
+# EXISTS that may hit the same endpoint.
+# ---------------------------------------------------------------------------
+
+type PeerResult = enum { 'Ok(PeerRouteEntry), 'Err(String) };
+
+type PeerBuild = struct { routes: Array(PeerRouteEntry), problems: Array(String) };
+
+def resolve_peer_decl: Fn(Array(EntityEntry), Int, PeerHubDecl) -> PeerResult = fn(entities, hub, declaration) {
+    match (find_entity_index(entities, declaration.origin_participant), find_entity_index(entities, declaration.peer_participant)) {
+        ('None, _) => 'Err("peer hub origin participant entity is not part of this knowledge"),
+        (_, 'None) => 'Err("peer hub peer participant entity is not part of this knowledge"),
+        ('Some(origin_entity), 'Some(peer_entity)) => do {
+            if origin_entity == hub {
+                'Err("peer hub origin participant must differ from the hub entity")
+            } else if peer_entity == hub {
+                'Err("peer hub peer participant must differ from the hub entity")
+            } else {
+                let origin_entity_entry = get_index(entities, origin_entity);
+                let peer_entity_entry = get_index(entities, peer_entity);
+                let hub_entity = get_index(entities, hub);
+                let field_count = array.length(hub_entity.fields);
+                if declaration.origin_key < 0 || declaration.origin_key >= array.length(origin_entity_entry.fields) {
+                    'Err("peer hub origin participant key field is out of range")
+                } else if declaration.origin_key != origin_entity_entry.key_field {
+                    'Err("peer hub origin participant key must be the participant entity's declared key")
+                } else if declaration.peer_key < 0 || declaration.peer_key >= array.length(peer_entity_entry.fields) {
+                    'Err("peer hub peer participant key field is out of range")
+                } else if declaration.peer_key != peer_entity_entry.key_field {
+                    'Err("peer hub peer participant key must be the participant entity's declared key")
+                } else if declaration.origin_field < 0 || declaration.origin_field >= field_count {
+                    'Err("peer hub origin endpoint field is out of range")
+                } else if declaration.peer_field < 0 || declaration.peer_field >= field_count {
+                    'Err("peer hub peer endpoint field is out of range")
+                } else if declaration.origin_field == declaration.peer_field {
+                    'Err("peer hub origin and peer endpoints must be distinct fields")
+                } else {
+                    let exchange = origin_entity == peer_entity;
+                    let entry: PeerRouteEntry = {
+                        hub,
+                        origin_entity,
+                        origin_key: declaration.origin_key,
+                        origin_field: declaration.origin_field,
+                        peer_entity,
+                        peer_key: declaration.peer_key,
+                        peer_field: declaration.peer_field,
+                        exchange,
+                    };
+                    let ok: PeerResult = 'Ok(entry);
+                    ok
+                }
+            }
+        },
+    }
+};
+
+# Pure, deterministic peer route collection: never fails, so tests can assert
+# both valid and invalid declarations.  `build_root` fails on the first problem.
+# A hub may declare at most one paired route; more than one would be ambiguous.
+def peer_build: Fn(Array(EntityEntry)) -> PeerBuild = fn(entities) {
+    let init: PeerBuild = { routes: [], problems: [] };
+    let collected = array.fold(entities, init, fn(acc, entity) {
+        let pd = property.get_type_prop(entity.entity_type, PeerHubDef);
+        let specs = match pd {
+            'Some(d) => d.hubs,
+            'None => [],
+        };
+        array.fold(specs, acc, fn(inner_acc, spec) {
+            let resolved = resolve_peer_decl(entities, entity.index, spec);
+            match resolved {
+                'Err(message) => do {
+                    let result: PeerBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, message) };
+                    result
+                },
+                'Ok(entry) => do {
+                    # Duplicate/ambiguous declaration: two paired routes for the
+                    # SAME participant pair on one hub would make the lookup
+                    # ambiguous.  Different participant pairs on one hub (the
+                    # multi-participant physical-link shape) remain legal.
+                    let dup = array.find(inner_acc.routes, fn(r) {
+                        r.hub == entry.hub
+                        && ((r.origin_entity == entry.origin_entity && r.peer_entity == entry.peer_entity)
+                            || (r.origin_entity == entry.peer_entity && r.peer_entity == entry.origin_entity))
+                    });
+                    match dup {
+                        'Some(_) => do {
+                            let result: PeerBuild = { routes: inner_acc.routes, problems: array.push(inner_acc.problems, "peer hub is ambiguous: duplicate paired-endpoint route for the same participant pair") };
+                            result
+                        },
+                        'None => do {
+                            let result: PeerBuild = { routes: array.push(inner_acc.routes, entry), problems: inner_acc.problems };
                             result
                         },
                     }
@@ -1397,6 +1585,12 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
     } else {
         hub_build_result.routes
     };
+    let peer_build_result = peer_build(entities);
+    let peer_routes = if array.length(peer_build_result.problems) > 0 {
+        fail!("invalid paired-endpoint hub declaration", get_index(peer_build_result.problems, 0))
+    } else {
+        peer_build_result.routes
+    };
     let paths = build_paths(n, relations);
     let payload: PreparedPayload = {
         revision,
@@ -1406,6 +1600,7 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
         relations,
         routes,
         hub_routes,
+        peer_routes,
         paths,
         profile,
         authorize,
@@ -2308,6 +2503,120 @@ def find_hub_route: Fn(PreparedPayload, Int, Int) -> Option(HubRouteEntry) = fn(
     array.find(payload.hub_routes, fn(r) { r.hub == hub_base && r.participant == participant })
 };
 
+# Pure paired-endpoint route lookup for a (hub base, origin entity, peer entity)
+# triple, matching the declared route in either participant order.  Prepare-time
+# validation guarantees at most one peer route per hub, so the lookup is
+# unambiguous.
+def find_peer_route: Fn(PreparedPayload, Int, Int, Int) -> Option(PeerRouteEntry) = fn(payload, hub_base, origin_entity, peer_entity) {
+    array.find(payload.peer_routes, fn(r) {
+        r.hub == hub_base
+        && ((r.origin_entity == origin_entity && r.peer_entity == peer_entity)
+            || (r.origin_entity == peer_entity && r.peer_entity == origin_entity))
+    })
+};
+
+# The participant key field index of a peer route that belongs to `entity`.
+def route_key_for: Fn(PeerRouteEntry, Int) -> Int = fn(route, entity) {
+    if route.origin_entity == entity { route.origin_key } else { route.peer_key }
+};
+
+# The hub endpoint field index of a peer route whose slot references `entity`.
+def route_field_for: Fn(PeerRouteEntry, Int) -> Int = fn(route, entity) {
+    if route.origin_entity == entity { route.origin_field } else { route.peer_field }
+};
+
+# The derived inner alias of a participant in a paired correlation.  Origin and
+# peer always use DIFFERENT aliases, even when they reference the same physical
+# participant table.
+def peer_inner_alias: Fn(EntityEntry, String) -> String = fn(entry, suffix) {
+    `\{entry.alias}_\{suffix}`
+};
+
+# Lower one paired-endpoint (peer) request on a hub base row.  The request names
+# two participant entities and their key values.  Lowering builds a correlated
+# EXISTS over TWO inner participant sources (origin and peer aliases) whose
+# `WHERE` holds the two closed endpoint-exchange branches:
+#   (hub.A = origin.key AND hub.B = peer.key)
+#   OR (hub.B = origin.key AND hub.A = peer.key)
+# and additionally binds each specified participant key against its OWN inner
+# alias (origin_filter/peer_filter).  The participant entity therefore always
+# selects the validated inner source/alias, so a hub endpoint value is only
+# interpreted through the participant table the request declared.  Self-pair and
+# requests without a declared peer route fail atomically; the predicate is a
+# pure correlated EXISTS, so it never joins or fans out the hub base grain.
+def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb.Exists = fn(payload, hub_entity, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for paired-endpoint request", spec.subject, spec.origin.entity, spec.peer.entity)
+    } else {
+        let origin_entity = entity_by_id(payload, spec.origin.entity);
+        let peer_entity = entity_by_id(payload, spec.peer.entity);
+        if origin_entity == peer_entity && spec.origin.key == spec.peer.key {
+            fail!("paired-endpoint request requires two distinct participants (self-pair rejected)", spec.origin.entity, spec.peer.entity)
+        } else {
+            match find_peer_route(payload, hub_entity, origin_entity, peer_entity) {
+                'None => fail!("base hub declares no paired-endpoint route for the requested participants", spec.origin.entity, spec.peer.entity),
+                'Some(route) => do {
+                    let hub_entry = get_index(payload.entities, hub_entity);
+                    let origin_entry = get_index(payload.entities, origin_entity);
+                    let peer_entry = get_index(payload.entities, peer_entity);
+                    # The two hub role columns of the route.
+                    let hub_l = qb.column_ref(hub_entry.alias, get_index(hub_entry.fields, route.origin_field).column);
+                    let hub_r = qb.column_ref(hub_entry.alias, get_index(hub_entry.fields, route.peer_field).column);
+                    # Each participant contributes its own inner alias and key.
+                    let origin_alias = peer_inner_alias(origin_entry, "o");
+                    let peer_alias = peer_inner_alias(peer_entry, "p");
+                    let origin_key_col = get_index(origin_entry.fields, route_key_for(route, origin_entity)).column;
+                    let peer_key_col = get_index(peer_entry.fields, route_key_for(route, peer_entity)).column;
+                    let origin_key_ref = qb.column_ref(origin_alias, origin_key_col);
+                    let peer_key_ref = qb.column_ref(peer_alias, peer_key_col);
+                    # Two ordered exchange branches (both always present).
+                    let a_origin = qb.column_eq(hub_l, origin_key_ref);
+                    let a_peer = qb.column_eq(hub_r, peer_key_ref);
+                    let b_origin = qb.column_eq(hub_r, origin_key_ref);
+                    let b_peer = qb.column_eq(hub_l, peer_key_ref);
+                    let branch_a = qb.peer_branch(a_origin, a_peer);
+                    let branch_b = qb.peer_branch(b_origin, b_peer);
+                    # The specified participants are bound against their own
+                    # inner alias (identity proof lives in the SQL structure).
+                    let origin_bind: qb.Expr = qb.scalar('Eq, [qb.column(origin_alias, origin_key_col), to_bind(spec.origin.key)]);
+                    let peer_bind: qb.Expr = qb.scalar('Eq, [qb.column(peer_alias, peer_key_col), to_bind(spec.peer.key)]);
+                    let origin_source = qb.source(origin_alias, origin_entry.table);
+                    let peer_source = qb.source(peer_alias, peer_entry.table);
+                    let corr = qb.peer_corr(origin_source, peer_source, branch_a, branch_b, 'Some(origin_bind), 'Some(peer_bind));
+                    qb.exists_peer(corr)
+                },
+            }
+        }
+    }
+};
+
+# Pure feasibility probe for a paired-endpoint request: 'True when the subject
+# is authorized, the two participants are registered (distinct when of the same
+# entity), and the base hub declares a peer route that can pair them.  Used by
+# tests to assert deterministic rejection without a failing lowering.
+def peer_request_ok: Fn(PreparedPayload, Int, PeerRequest) -> Bool = fn(payload, hub_entity, spec) {
+    if !payload.authorize(spec.subject) {
+        'False
+    } else {
+        match (array.find(payload.entities, fn(e) { e.id == spec.origin.entity }), array.find(payload.entities, fn(e) { e.id == spec.peer.entity })) {
+            ('None, _) => 'False,
+            (_, 'None) => 'False,
+            ('Some(origin_entry), 'Some(peer_entry)) => do {
+                let origin_entity = origin_entry.index;
+                let peer_entity = peer_entry.index;
+                if origin_entity == peer_entity && spec.origin.key == spec.peer.key {
+                    'False
+                } else {
+                    match find_peer_route(payload, hub_entity, origin_entity, peer_entity) {
+                        'None => 'False,
+                        'Some(_) => 'True,
+                    }
+                }
+            },
+        }
+    }
+};
+
 # Correlation equality for an existence relation key pair. For a forward edge
 # `pair.from`/`pair.to` are on the outer/target entities; for a reverse edge the
 # roles swap, keeping the outer (correlated main) column on the left.
@@ -2534,8 +2843,10 @@ type LoweredSources = struct {
 # Shared lowering pipeline. Measures may be empty: the request then projects
 # row-level dimension attributes (no grouping, no aggregate items) and derives
 # the base entity from the first requested dimension. Existence filters keep the
-# base grain; having predicates constrain aggregated results.
-def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs) {
+# base grain; having predicates constrain aggregated results.  Paired-endpoint
+# (peer) filters additionally constrain the base hub row to the two specified
+# participants on its two mutually exclusive endpoints.
+def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest), Array(PeerRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs, peer_specs) {
     let measures = resolve_measures(payload, request.measures);
     let dimensions = resolve_dimensions(payload, request.dimensions);
     let measure_count = array.length(measures);
@@ -2553,6 +2864,20 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
             if grain_ok { first } else { fail!("requested measures are not grain-compatible") }
         } else {
             get_index(dimensions, 0).entry.entity
+        };
+        # Paired-endpoint (peer) requests resolve against the base hub entity's
+        # declared peer route as correlated EXISTS predicates over the two
+        # participant inner sources (no outer participant join, no fan-out).
+        # They require a physical hub entity.
+        let peer_exists_plans: Array(qb.Exists) = if array.length(peer_specs) > 0 {
+            let hub_entry = get_index(payload.entities, base_entity);
+            match hub_entry.union {
+                'None => array.map(peer_specs, fn(spec) { resolve_peer(payload, base_entity, spec) }),
+                'Some(_) => fail!("paired-endpoint requests require a physical hub entity", base_entity),
+            }
+        } else {
+            let empty: Array(qb.Exists) = [];
+            empty
         };
         let scope_resolutions = array.flat_map(dimensions, fn(d) {
             array.map(d.entry.scope, fn(p) { resolve_scope(payload, d.entry, p) })
@@ -2601,7 +2926,8 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
                 let joins = select_joins(payload, base_entity, targets);
                 let join_sources = array.map(joins, fn(j) { j.source });
                 let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
-                let result: LoweredSources = { sources, derived: 'None, joins, exists: exists_plans };
+                let all_exists = array.concat([exists_plans, peer_exists_plans]);
+                let result: LoweredSources = { sources, derived: 'None, joins, exists: all_exists };
                 result
             },
             'Some(union) => do {
@@ -2669,19 +2995,27 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
 };
 
 def lower: Fn(PreparedPayload, QueryRequest) -> qb.Plan = fn(payload, request) {
-    lower_core(payload, request, [], [], [])
+    lower_core(payload, request, [], [], [], [])
 };
 
 # Additive entry: the base QueryRequest plus typed existence filters and
 # aggregate-result (HAVING) predicates.
 def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, exists_specs, having_specs) {
-    lower_core(payload, request, [], exists_specs, having_specs)
+    lower_core(payload, request, [], exists_specs, having_specs, [])
 };
 
 # Additive entry with closed OR-groups on the subject filters (AnyOf), combined
 # with existence filters and HAVING predicates in a deterministic order.
 def lower_any: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, any_of_specs, exists_specs, having_specs) {
-    lower_core(payload, request, any_of_specs, exists_specs, having_specs)
+    lower_core(payload, request, any_of_specs, exists_specs, having_specs, [])
+};
+
+# Additive entry with paired-endpoint (peer) filters: the base QueryRequest plus
+# one or more `PeerRequest`s that keep hub base rows whose two mutually
+# exclusive endpoints are the two specified participants.  The peer predicates
+# are merged with the ordinary filters (AND) in request order.
+def lower_peer: Fn(PreparedPayload, QueryRequest, Array(PeerRequest)) -> qb.Plan = fn(payload, request, peer_specs) {
+    lower_core(payload, request, [], [], [], peer_specs)
 };
 
 # Count the number of groups of a grouped request that satisfy the given
@@ -2696,7 +3030,7 @@ def lower_group_count: Fn(PreparedPayload, QueryRequest, Array(HavingRequest)) -
     } else if array.length(request.measures) == 0 || array.length(request.dimensions) == 0 {
         fail!("group count request must select measures and grouping dimensions")
     } else {
-        let inner = lower_core(payload, request, [], [], having_specs);
+        let inner = lower_core(payload, request, [], [], having_specs, []);
         qb.count_groups(inner, payload.profile)
     }
 };
@@ -2752,6 +3086,8 @@ export {
     AnyOfRequest,
     HavingOp,
     HavingRequest,
+    PeerRef,
+    PeerRequest,
     FieldEntry,
     EnumValueEntry,
     EntityEntry,
@@ -2760,6 +3096,11 @@ export {
     RelationEntry,
     PathResult,
     PreparedPayload,
+    PeerHubDef,
+    PeerHubDecl,
+    PeerRouteEntry,
+    PeerResult,
+    PeerBuild,
     column,
     key,
     measure,
@@ -2782,6 +3123,15 @@ export {
     dual_hub,
     hub_build,
     resolve_hub_decl,
+    peer_hub,
+    peer_build,
+    resolve_peer_decl,
+    find_peer_route,
+    route_key_for,
+    route_field_for,
+    peer_inner_alias,
+    resolve_peer,
+    peer_request_ok,
     knowledge_graph,
     correlation_feasible,
     filters_on_entity,
@@ -2789,6 +3139,7 @@ export {
     lower,
     lower_full,
     lower_any,
+    lower_peer,
     lower_group_count,
     dimension_expr,
     dimension_domain,
