@@ -3684,8 +3684,8 @@ def lower_internal_top: Fn(PreparedPayload, QueryRequest, Array(InternalOrderReq
 # ---------------------------------------------------------------------------
 # Closed related-aggregate references (hidden aggregate over a bounded declared
 # route).  A related measure may live on the subject entity (no join) or on an
-# entity reached from the subject through exactly ONE eligible prepared route of
-# AT MOST TWO declared relations (subject -> intermediate -> population).  The
+# entity reached from the subject through exactly ONE eligible declared route
+# within the ontology-wide `path_depth_cap`.  The
 # aggregate is used only for hidden ORDER BY/Top-N and/or hidden HAVING; it
 # never enters the projection.  Grouping stays on subject dimensions so related
 # rows only aggregate and never change the subject grain.  Every hop comes from
@@ -3705,70 +3705,76 @@ type RelatedRouteStatus = enum {
     'Same,        # aggregate population is the subject itself (no join)
     'Ok(AggregateRoute),
     'Missing,     # no declared route at all
-    'Ambiguous,   # more than one eligible route of at most two relations
-    'OverDepth,   # reachable only through more than two declared relations
+    'Ambiguous,   # more than one eligible bounded route
 };
 
 def connects: Fn(Int, Int, RelationEntry) -> Bool = fn(a, b, r) {
     (r.from == a && r.to == b) || (r.from == b && r.to == a)
 };
 
-# One-hop candidate routes: every declared relation directly connecting the
-# subject and the aggregate population (either direction).
-def one_hop_routes: Fn(Array(RelationEntry), Int, Int) -> Array(Array(Int)) = fn(relations, subject, target) {
-    let enumerated = array.enumerate(relations);
-    array.fold(enumerated, [], fn(acc, pair) {
-        if connects(subject, target, pair.1) {
-            array.push(acc, [pair.0])
+# Enumerate every simple undirected traversal of declared relations from the
+# subject to the aggregate population, bounded by the same cap used by prepared
+# ontology paths. Entity-local visited state prevents cycles; relation order
+# makes the result deterministic. Classification retains every shortest route
+# for ambiguity detection instead of choosing one by declaration order; longer
+# detours do not make a direct or otherwise shorter route ambiguous.
+def aggregate_route_paths: Fn(Array(RelationEntry), Int, Int, Array(Bool), Array(Int), Int) -> Array(Array(Int)) =
+    fn(relations, current, target, visited, path, depth) {
+        if depth >= path_depth_cap {
+            []
         } else {
-            acc
-        }
-    })
-};
-
-# Two-hop candidate routes: every ordered pair (i, j) of declared relations that
-# reaches the aggregate population through a proper intermediate entity distinct
-# from both endpoints.  The route is never chosen by declaration order; all
-# candidates are enumerated so uniqueness is exact.
-def two_hop_routes: Fn(Array(RelationEntry), Int, Int) -> Array(Array(Int)) = fn(relations, subject, target) {
-    let n = array.length(relations);
-    let empty: Array(Array(Int)) = [];
-    array.fold(int_range(n), empty, fn(acc, i) {
-        let ri = get_index(relations, i);
-        let mid: Option(Int) = if ri.from == subject {
-            'Some(ri.to)
-        } else if ri.to == subject {
-            'Some(ri.from)
-        } else {
-            'None
-        };
-        match mid {
-            'None => acc,
-            'Some(x) => if x == subject || x == target {
-                acc
-            } else {
-                array.fold(int_range(n), acc, fn(inner, j) {
-                    if connects(x, target, get_index(relations, j)) {
-                        array.push(inner, [i, j])
+            let enumerated = array.enumerate(relations);
+            array.fold(enumerated, [], fn(acc, pair) {
+                let relation = pair.1;
+                let next: Option(Int) = if relation.from == current {
+                    'Some(relation.to)
+                } else if relation.to == current {
+                    'Some(relation.from)
+                } else {
+                    'None
+                };
+                match next {
+                    'None => acc,
+                    'Some(entity) => if visited_at(visited, entity) {
+                        acc
                     } else {
-                        inner
-                    }
-                })
-            },
+                        let route = array.push(path, pair.0);
+                        if entity == target {
+                            array.push(acc, route)
+                        } else {
+                            let next_visited = set_at(visited, entity, 'True);
+                            array.concat([acc, aggregate_route_paths(relations, entity, target, next_visited, route, depth + 1)])
+                        }
+                    },
+                }
+            })
         }
+    };
+
+def shortest_route_length: Fn(Array(Array(Int))) -> Int = fn(routes) {
+    let first = array.length(get_index(routes, 0));
+    array.fold(routes, first, fn(shortest, route) {
+        let length = array.length(route);
+        if length < shortest { length } else { shortest }
     })
 };
 
 # Pure route classifier for a related-aggregate reference: exactly one eligible
-# route of at most two declared relations is required; 'Missing / 'Ambiguous /
-# 'OverDepth distinguish the rejection for attributable diagnostics.  Never
-# fails, so tests can assert each boundary.
+# shortest simple route within `path_depth_cap` is required. Multiple equally
+# short routes are ambiguous. Never fails, so tests can assert the boundaries.
 def related_route_status: Fn(PreparedPayload, Int, Int) -> RelatedRouteStatus = fn(payload, subject, target) {
     if target == subject {
         'Same
     } else {
         let relations = payload.relations;
-        let candidates = array.concat([one_hop_routes(relations, subject, target), two_hop_routes(relations, subject, target)]);
+        let visited: Array(Bool) = array.map(payload.entities, fn(entity) { entity.index == subject });
+        let all_candidates = aggregate_route_paths(relations, subject, target, visited, [], 0);
+        let candidates = if array.length(all_candidates) == 0 {
+            all_candidates
+        } else {
+            let shortest = shortest_route_length(all_candidates);
+            array.filter(all_candidates, fn(route) { array.length(route) == shortest })
+        };
         let count = array.length(candidates);
         if count == 1 {
             let route: AggregateRoute = { target, hops: get_index(candidates, 0) };
@@ -3776,30 +3782,18 @@ def related_route_status: Fn(PreparedPayload, Int, Int) -> RelatedRouteStatus = 
             result
         } else if count > 1 {
             'Ambiguous
-        } else {
-            # No eligible route: distinguish an over-depth route (reachable only
-            # through more than two declared relations, recorded by the prepared
-            # path matrix) from a missing/undeclared route.
-            let row = get_index(payload.paths, subject);
-            match get_index(row, target) {
-                'Safe(seq) => if array.length(seq) > 2 { 'OverDepth } else { 'Missing },
-                'FanOut(seq) => if array.length(seq) > 2 { 'OverDepth } else { 'Missing },
-                'Missing => 'Missing,
-                'Truncated => 'Missing,
-            }
-        }
+        } else { 'Missing }
     }
 };
 
 # Lowering-time resolver: the single eligible route or a stable attributable
-# diagnostic (missing / ambiguous / over-depth / unauthorized base entity).
+# diagnostic (missing / ambiguous / unauthorized base entity).
 def related_route_for: Fn(PreparedPayload, Int, Int) -> AggregateRoute = fn(payload, subject, target) {
     match related_route_status(payload, subject, target) {
         'Ok(route) => route,
         'Same => fail!("related aggregate measure lives on the subject entity and needs no route", subject),
         'Missing => fail!("related aggregate has no declared route from the subject entity to the aggregate entity", subject, target),
-        'Ambiguous => fail!("related aggregate route is ambiguous: multiple declared routes of at most two relations connect the subject and aggregate entities", subject, target),
-        'OverDepth => fail!("related aggregate route exceeds the supported two-relation depth from the subject entity to the aggregate entity", subject, target),
+        'Ambiguous => fail!("related aggregate route is ambiguous: multiple bounded declared routes connect the subject and aggregate entities", subject, target),
     }
 };
 
@@ -3859,8 +3853,8 @@ def aggregate_route_joins: Fn(PreparedPayload, Int, AggregateRoute) -> Array(qb.
 
 # A closed aggregate call for a related-measure reference.  The measure must be
 # declared, plain (not computed/filtered), authorized for the subject, and --
-# when it lives off the subject -- reached through exactly one eligible route of
-# at most two declared relations.
+# when it lives off the subject -- reached through exactly one eligible bounded
+# declared route.
 def related_measure_call: Fn(PreparedPayload, Int, String, String) -> qb.AggregateCall = fn(payload, base, subject, measure_id) {
     if !payload.authorize(subject) {
         fail!("subject is not authorized for related aggregate measure", subject, measure_id)
@@ -3874,15 +3868,13 @@ def related_measure_call: Fn(PreparedPayload, Int, String, String) -> qb.Aggrega
                     fail!("related aggregate measure must not be a filtered measure", measure_id)
                 } else {
                     # When the measure lives off the subject, require exactly one
-                    # eligible route of at most two declared relations (stable
-                    # attributable diagnostics for missing/ambiguous/over-depth).
+                    # eligible simple route within the ontology-wide path cap.
                     let entity_index = if entry.entity != base {
                         match related_route_status(payload, base, entry.entity) {
                             'Ok(_) => entry.entity,
                             'Same => fail!("related aggregate measure lives on the subject entity and needs no route", subject, measure_id),
                             'Missing => fail!("related aggregate has no declared route from the subject entity to the aggregate entity", subject, measure_id),
-                            'Ambiguous => fail!("related aggregate route is ambiguous: multiple declared routes of at most two relations connect the subject and aggregate entities", subject, measure_id),
-                            'OverDepth => fail!("related aggregate route exceeds the supported two-relation depth from the subject entity to the aggregate entity", subject, measure_id),
+                            'Ambiguous => fail!("related aggregate route is ambiguous: multiple bounded declared routes connect the subject and aggregate entities", subject, measure_id),
                         }
                     } else {
                         entry.entity
@@ -3933,8 +3925,8 @@ def internal_having_plan: Fn(PreparedPayload, Int, InternalHavingRequest) -> qb.
 # Pure feasibility probe for a related-measure reference on a subject entity:
 # 'True when the subject role is authorized and the measure is declared, plain,
 # and (when it lives off the subject) reached through exactly one eligible route
-# of at most two declared relations.  'False for an unauthorized role,
-# unknown/computed/filtered measure, a missing, ambiguous or over-depth route.
+# within the ontology-wide path cap. 'False for an unauthorized role,
+# unknown/computed/filtered measure, or a missing/ambiguous route.
 # Never fails.
 def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(payload, subject, role, measure_id) {
     if !payload.authorize(role) {
@@ -3951,7 +3943,6 @@ def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(pa
                         'Ok(_) => 'True,
                         'Missing => 'False,
                         'Ambiguous => 'False,
-                        'OverDepth => 'False,
                     }
                 }
             },
@@ -3964,7 +3955,7 @@ def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(pa
 #   internal_orders: hidden ORDER BY aggregates (Asc/Desc, Top-N via limit);
 #   internal_having: hidden HAVING predicates over the related aggregates.
 # Related entities (when the aggregate measure lives off the subject) are joined
-# through exactly one eligible prepared route of at most two declared relations
+# through exactly one eligible bounded declared route
 # (the joins materialize in deterministic dependency order; the same route serves
 # hidden ORDER BY/Top-N and hidden HAVING); grouping keeps the subject grain, so
 # related rows only aggregate and never add output rows.  The projection is

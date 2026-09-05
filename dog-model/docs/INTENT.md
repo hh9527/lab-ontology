@@ -175,7 +175,7 @@ direction, and `limit` gives the number of leading groups.  Used for questions s
 as "owner who owns the most dogs" or "breed with the most dogs", returning only the
 group's columns and never adding the ranking measure.  The ranking measure may
 live on the group entity itself, on a directly related entity, or on a population
-reached through a unique declared route of at most two relations (the route joins
+reached through a unique shortest declared route within the ontology path cap (the route joins
 are materialized in deterministic dependency order and never widen the group rows).
 
 ```json

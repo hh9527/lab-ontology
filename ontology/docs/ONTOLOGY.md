@@ -989,9 +989,8 @@ distinct/absence 与行级排序的失败还包括：distinct 请求携带 measu
 未授权，或维度 tie-breaker
 不是已选维度。related aggregate（`lower_internal_related`）失败还包括：请求带
 measures、无分组维度、分组维度不在主体实体（grain 无法证明）、关联 measure 为
-computed/filtered、subject role 未授权、主体与聚合实体之间无可用限定路线
-（missing）、存在多条长度 ≤ 2 的歧义路线、聚合实体只经超过两条关系的路线可达
-（over-depth；这些拒绝彼此可区分：missing / ambiguous / over-depth）、filter 引用
+computed/filtered、subject role 未授权、主体与聚合实体之间无可用有界路线
+（missing）、存在多条等长最短路线（ambiguous）、filter 引用
 非主体属性、HAVING threshold 类型与聚合不兼容。field-to-field 谓词失败还包括：未知/未授权/非纯列属性、跨实体属性
 引用、两侧类型或 domain 不兼容、算子未被两侧支持或非比较算子。hidden same-source HAVING
 （`lower_hidden_having`）失败还包括：请求非聚合（无 measure）或缺少分组维度、隐藏
@@ -1129,21 +1128,21 @@ subject 与 order/HAVING 字段——不暴露表、列、alias 或 join 数组�
 - 主体级普通 scalar filter/scope 先按既有确定顺序 lowering（要求引用主体实体属性，
   保证 grain 可证明）；重复 lowering 的 SQL/bindings 完全一致；
 - 纯探针 `related_measure_ok(payload, subject_entity, role, measure_id)` 供测试断言
-  合法/未知 measure/越权/无路线/歧义/过深而不触发失败；
+  合法/未知 measure/越权/无路线/歧义而不触发失败；
 - `lower_internal_top` 仍是“关联 measure 位于主体自身”时的既有入口（隐藏
-  `OrderKey 'Aggregate`）；`lower_internal_related` 在其上扩展到至多两跳的直接/中间
-  关联实体。
+  `OrderKey 'Aggregate`）；`lower_internal_related` 在其上扩展到统一
+  `path_depth_cap` 内的最短 relation 路径。
 
 **限定路线的拒绝边界**（原子失败、带可归因诊断：subject/measure/entity，绝不发布
 部分 Plan）：恰好一条可用路线是必需条件——
 - **missing（无已声明路线）**：主体与聚合实体之间没有可用路线 → 拒绝；
-- **ambiguous（歧义）**：存在多条长度 ≤ 2 的路线（例如直接关系与两条关系路线并存，
-  或两条不同的两跳路线）→ 拒绝；路线**绝不按声明顺序挑选**；
-- **over-depth（过深）**：聚合实体只经超过两条关系的路线可达 → 拒绝；
-- **cyclic / unauthorized**：路线不构成合法简单两跳链、subject role 未授权、
+- **ambiguous（歧义）**：存在多条等长最短路线 → 拒绝；较长 detour 不制造歧义，
+  路线也**绝不按声明顺序挑选**；
+- **bounded**：只枚举统一 `path_depth_cap` 内、不重复实体的简单路径；
+- **cyclic / unauthorized**：路线无法构成合法简单链、subject role 未授权、
   measure 未知/computed/filtered → 拒绝。
 
-仍维持的边界（稳定、可归因的拒绝，而非静默近似）：任意深（>2 跳）路线的关联聚合、
+仍维持的边界（稳定、可归因的拒绝，而非静默近似）：超过统一 path cap 的关联聚合、
 关联侧 computed/filtered measure、HAVING threshold 类型不兼容等均不支持，不会通过
 加入投影聚合列、改用 EXISTS、结果后处理或近似另一关系来绕过。
 
@@ -1457,10 +1456,9 @@ related aggregate 测试另覆盖合成 `rm_subjects`/`rm_intermediates`/`rm_eve
 主体维度分组、只投影主体维度）、`check_related_two_hop_having`（同一两跳 route 的隐藏
 聚合 HAVING 精确 SQL/绑定、隐藏 measure 不投影）、
 `check_related_two_hop_determinism`（重复 lowering 逐字节一致）与
-`check_related_two_hop_rejection_probes`（唯一两跳 route 可行；直接+两跳并存歧义、
-仅三跳可达 over-depth、无已声明路线 missing、越权 role、未知 measure 都经
-`related_measure_ok` 确定性拒绝，并断言 over-depth 主体经 prepared 路径矩阵只以三跳
-到达聚合实体）。集合运算测试另覆盖
+`check_related_two_hop_rejection_probes`（唯一两跳 route 可行；直接路线优先于较长
+detour；唯一三跳 route 可 lower 为三个依赖有序 join 的精确 SQL；无已声明路线、越权
+role、未知 measure 经 `related_measure_ok` 确定性拒绝）。集合运算测试另覆盖
 `check_set_intersect_direct`（直接 INTERSECT + 左到右 bindings）、
 `check_set_union_and_except_keywords`（去重 UNION/EXCEPT 关键字，非 UNION ALL）、
 `check_set_outer_count`（外层单列 count over 派生集合）与 `check_set_deterministic`
