@@ -815,6 +815,7 @@ def payload: edsl.PreparedPayload = edsl.build_root(
 `build_root(revision, entity_types, profile, authorize)` 显式收集所列实体的 property，
 建立索引，验证关系图，校验相关存在路线，预计算有界路径并返回 `PreparedPayload`。
 payload 含实体、指标、维度、枚举目录、关系、已声明路线（`routes`）、路径矩阵、
+Safe 路径歧义矩阵（`ambiguous_paths`，供必须唯一选择路由的隐藏 join 使用）、
 profile 和普通 closure。业务 lowering 只消费 payload，不重新扫描 metadata 或执行 BFS。
 
 ```telora
@@ -828,6 +829,7 @@ type PreparedPayload = struct {
     hub_routes: Array(HubRouteEntry),
     peer_routes: Array(PeerRouteEntry),
     paths: Array(Array(PathResult)),
+    ambiguous_paths: Array(Array(Bool)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
 };
@@ -888,13 +890,28 @@ distinct/absence 与行级排序的失败还包括：distinct 请求携带 measu
 未授权，或维度 tie-breaker
 不是已选维度。related aggregate（`lower_internal_related`）失败还包括：请求带
 measures、无分组维度、分组维度不在主体实体（grain 无法证明）、关联 measure 为
-computed/filtered、主体与关联实体之间无直接关系或关系歧义、filter 引用非主体属性、
-HAVING threshold 类型与聚合不兼容。field-to-field 谓词失败还包括：未知/未授权/非纯列属性、跨实体属性
-引用、两侧类型或 domain 不兼容、算子未被两侧支持或非比较算子。paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
+computed/filtered、subject role 未授权、主体与聚合实体之间无可用限定路线
+（missing）、存在多条长度 ≤ 2 的歧义路线、聚合实体只经超过两条关系的路线可达
+（over-depth；这些拒绝彼此可区分：missing / ambiguous / over-depth）、filter 引用
+非主体属性、HAVING threshold 类型与聚合不兼容。field-to-field 谓词失败还包括：未知/未授权/非纯列属性、跨实体属性
+引用、两侧类型或 domain 不兼容、算子未被两侧支持或非比较算子。hidden same-source HAVING
+（`lower_hidden_having`）失败还包括：请求非聚合（无 measure）或缺少分组维度、隐藏
+measure 未知/未授权/位于其它实体、隐藏 measure 为 computed 或 filtered、HAVING
+threshold 类型不兼容。attribute-versus-aggregate（`lower_attribute_compare`）失败还包括：
+请求带 measures 或无列表维度、外层属性未知/未授权/computed/不属 base 实体、内层
+measure 未知/未授权/computed/filtered、算子不受支持、两侧类型/domain 不兼容
+（text-vs-number、enum-vs-number 等跨类别组合）。paired-endpoint（peer）失败还包括：同一 (hub, participant) 的重复 `dual_hub` 声明、
 自配（同实体同 key 的 origin == peer）、未知 participant 实体、hub 没有覆盖该
 participant 对的 peer 路线、peer 路线端点同字段/越界/引用非 key 字段、同一 hub 上
 同一 participant 对的重复 peer 路线、union 实体 base 上的 peer 请求。把多个独立
-`dual_hub` 请求约束当作配对端点使用不是受支持的形状，必须用显式 peer 路线。诊断由
+`dual_hub` 请求约束当作配对端点使用不是受支持的形状，必须用显式 peer 路线。ranked
+grouped-key（`lower_ranked_key_compare`）失败还包括：外层属性未知/未授权/computed、
+外层属性所属实体只能经 **fan-out 路由**到达、经 **多条不同 Safe 路径（歧义路由）**
+到达（绝不由声明顺序选择）、与 base **无已声明路由**、外层为 **derived（union）
+Plan** 且父属性需要新增 join、分组维度未知/未授权/computed、外层属性与分组 key
+类型/domain 不兼容、排名 measure 未知/未授权/computed/filtered/不在内层
+population grain/`requires` 非空、scope filter 归属或输入错误；这些路由失败彼此
+可区分（fan-out / 歧义 / 缺失 / derived-join），调用者据此修正意图或模型。诊断由
 Host 机制承载；公共 API 不返回 Rejection 或诊断数组。
 
 公共 Request、Plan、Query 和业务词汇均保持精确具名类型，不使用 `Any`、`Dyn` 或
@@ -971,8 +988,11 @@ link-count measure 来选择入口/路径：`lower_full(payload, request, exists
 
 ### 跨关系隐藏聚合（related aggregate）
 
-外层主体可以沿**一条已 prepare、方向确定、授权且唯一**的直接关系，对关联实体计算
-聚合，并只把该聚合用于隐藏 ORDER BY/Top-N 或隐藏 HAVING，不加入最终投影。
+外层主体可以沿**恰好一条已 prepare、方向确定、授权且唯一的限定路线**，对关联实体
+（聚合 population）计算聚合，并只把该聚合用于隐藏 ORDER BY/Top-N 或隐藏 HAVING，
+不加入最终投影。路线由**已声明关系构成，长度至多两条**（主体 → 中间实体 →
+聚合 population；一条关系即原有直接关系行为）。调用方只提供已授权 measure id、
+subject 与 order/HAVING 字段——不暴露表、列、alias 或 join 数组。
 `lower_internal_related(payload, request, internal_orders, internal_having)`：
 
 ```telora
@@ -986,9 +1006,14 @@ link-count measure 来选择入口/路径：`lower_full(payload, request, exists
 - 请求只选主体维度（measures 为空），分组维度必须属于主体实体（否则无法证明主体
   grain，原子失败）；关联侧多行只参与聚合、绝不放大最终主体结果；
 - 每个内部 measure 必须是已声明、已授权的**普通** measure（非 computed/filtered）；
-  若 measure 位于关联实体，则主体与关联实体之间必须**恰好一条**已声明直接关系
-  （正向或反向均可，lowering 依据 prepared 方向生成确定 INNER Join）；无关系/歧义
-  原子失败；
+  若 measure 位于关联实体，则主体到该实体必须存在**恰好一条可用的限定路线**：
+  - 长度 1：正向或反向声明的一条直接关系（原有直接关系行为不变）；
+  - 长度 2：主体 → 中间实体 → 聚合 population 的两条已声明关系（每跳可以是任一
+    方向；路线上的 fan-out 方向允许，因为被到达的行全部由隐藏聚合消费，分组仍精确
+    停在主体维度）；
+  - route 的 join 按**确定性依赖顺序**物化（先到中间实体、再到聚合 population），
+    同一 route 同时服务于隐藏 ORDER BY/Top-N 与隐藏 HAVING；join 按 source alias
+    复用、不重复。
 - 关联侧沿用封闭 aggregate 枚举（Count/Sum/Avg/Min/Max）；`lowering` 只把聚合作为
   `OrderKey 'Aggregate` / HAVING `'Call` 使用，不出现特例 SQL；
 - 隐藏 ORDER BY 支持升降序与 Top-N（`limit`）；隐藏 ORDER BY 本身不产生 binding；
@@ -999,13 +1024,23 @@ link-count measure 来选择入口/路径：`lower_full(payload, request, exists
 - 主体级普通 scalar filter/scope 先按既有确定顺序 lowering（要求引用主体实体属性，
   保证 grain 可证明）；重复 lowering 的 SQL/bindings 完全一致；
 - 纯探针 `related_measure_ok(payload, subject_entity, role, measure_id)` 供测试断言
-  合法/未知 measure/越权/无关系/歧义而不触发失败；
+  合法/未知 measure/越权/无路线/歧义/过深而不触发失败；
 - `lower_internal_top` 仍是“关联 measure 位于主体自身”时的既有入口（隐藏
-  `OrderKey 'Aggregate`）；`lower_internal_related` 在其上扩展到直接关联实体。
+  `OrderKey 'Aggregate`）；`lower_internal_related` 在其上扩展到至多两跳的直接/中间
+  关联实体。
 
-仍维持的边界（稳定、可归因的拒绝，而非静默近似）：任意深路径的关联聚合、关联侧
-computed/filtered measure、跨多跳 join 的聚合输入、HAVING threshold 类型不兼容等
-均不支持，不会通过加入投影聚合列、改用 EXISTS、结果后处理或近似另一关系来绕过。
+**限定路线的拒绝边界**（原子失败、带可归因诊断：subject/measure/entity，绝不发布
+部分 Plan）：恰好一条可用路线是必需条件——
+- **missing（无已声明路线）**：主体与聚合实体之间没有可用路线 → 拒绝；
+- **ambiguous（歧义）**：存在多条长度 ≤ 2 的路线（例如直接关系与两条关系路线并存，
+  或两条不同的两跳路线）→ 拒绝；路线**绝不按声明顺序挑选**；
+- **over-depth（过深）**：聚合实体只经超过两条关系的路线可达 → 拒绝；
+- **cyclic / unauthorized**：路线不构成合法简单两跳链、subject role 未授权、
+  measure 未知/computed/filtered → 拒绝。
+
+仍维持的边界（稳定、可归因的拒绝，而非静默近似）：任意深（>2 跳）路线的关联聚合、
+关联侧 computed/filtered measure、HAVING threshold 类型不兼容等均不支持，不会通过
+加入投影聚合列、改用 EXISTS、结果后处理或近似另一关系来绕过。
 
 ### 同主体 field-to-field 谓词（属性间比较）
 
@@ -1050,6 +1085,187 @@ let feasible: Bool = edsl.field_filter_ok(payload, subject_entity, field_filter)
   顺序不变；重复 lowering 得到完全一致的 SQL/bindings；
 - 实际 lowering 对非法形状原子失败、不发布部分 Plan/Query；纯探针 `field_filter_ok`
   对成功/各类拒绝返回预期，供测试断言。
+
+### 同主体隐藏聚合 HAVING（hidden same-source aggregate HAVING）
+
+`lower_hidden_having(payload, request, hidden)` 让**聚合（分组）请求**额外携带零个或
+多个 HAVING 谓词，谓词引用一个**已授权、位于请求 base 实体上、但未被投影**的普通
+measure：
+
+```telora
+type InternalHavingRequest = struct {
+    measure: String,    # base 实体上已声明、已授权的普通（非 computed/filtered）measure
+    subject: String,
+    op: HavingOp,       # 'Eq / 'Ne / 'Gt / 'Ge / 'Lt / 'Le
+    threshold: FilterInput,
+};
+
+# request 必须是聚合请求（至少一个 measure 与至少一个分组维度）
+let plan: qb.Plan = edsl.lower_hidden_having(payload, request, hidden);
+# 纯可行性探针（不失败）：subject_entity 为 PreparedPayload 中的主体实体 index
+let feasible: Bool = edsl.same_source_having_ok(payload, subject_entity, role, measure_id);
+```
+
+约束与语义：
+
+- 隐藏 measure 只参与分组/HAVING 校验与 SQL 生成，**绝不进入 projection**
+  （请求结果列保持原本的 measures/dimensions 投影，不新增列）；
+- 多个隐藏谓词与既有 HAVING 一起按请求顺序 AND，绑定顺序确定（threshold 动态值按
+  谓词顺序追加）；重复 lowering 的 SQL/bindings 逐字节一致；
+- 隐藏 measure 必须是 base 实体的**简单聚合**：unknown、未授权、computed、filtered、
+  跨 base 实体、或者请求非聚合/无分组维度（无法证明分组）都原子失败，不发布部分
+  Plan；
+- 既有 `HavingRequest`（已选 measure 上的 HAVING）行为不改变、不削弱；
+- profile 递归收窄照常生效（隐藏聚合同样经知识 profile 校验）。
+
+### 属性 vs 标量聚合子查询（attribute-versus-scalar aggregate comparison）
+
+`lower_attribute_compare(payload, request, comparisons)` 让**行级（measureless）列表
+请求**按“外层属性 与 一个独立验证的内层标量聚合 的比较”保留 base 行：
+
+```telora
+type ScalarCompareRequest = struct {
+    attribute: String,    # base 实体上已声明、已授权、纯列承载的 dimension id
+    subject: String,      # 授权主体（role）
+    op: HavingOp,         # 封闭比较算子 'Eq / 'Ne / 'Gt / 'Ge / 'Lt / 'Le
+    measure: String,      # 已声明、已授权、普通（简单）measure 的 id
+    scope_filters: Array(FilterRequest),  # 有序的内层 scope 过滤（空 = 全局聚合）
+};
+
+# request 必须是 measureless、至少一个列表维度的行级请求
+let plan: qb.Plan = edsl.lower_attribute_compare(payload, request, comparisons);
+# 纯可行性探针（不失败）：base_entity 为 PreparedPayload 中的主体实体 index
+let feasible: Bool = edsl.attribute_compare_ok(payload, base_entity, role, attribute_id, measure_id);
+# scoped 纯探针（不失败）：额外校验每个 scope filter 的完整 filter/ownership 契约
+let scoped_feasible: Bool = edsl.scoped_attribute_compare_ok(payload, base_entity, role, attribute_id, measure_id, scope_filters);
+```
+
+这是 query-core Plan-level `scalar_comparisons` 的封闭 typed 入口：每个比较作为
+**独立的标量聚合比较谓词**只在 WHERE 中渲染为
+`<outer 属性列> <op> (SELECT <agg>(<内层列>) FROM <内层实体表> AS <alias>
+[WHERE <scope filters>])`，
+与普通 filters 以既有顺序 AND；投影、分组、排序、bindings 与 grain 均不变。
+
+**内层 scope filters（scoped comparisons）**：
+
+- `scope_filters` 是**有序**的 `FilterRequest` 数组，每条都解析到**内层 measure 自身
+  实体**的维度与词汇：每条 filter 只收窄内层标量聚合的输入行（进入标量子查询的
+  `WHERE`），**绝不**进入外层 plan filter，也**绝不**按外层属性实体解析；
+- 多个 scope filters 以确定性 **AND** 语义按声明顺序组合；
+- 内层标量计划保持**扁平且非递归**：scope filters 不会授权 join、grouping、嵌套
+  标量比较、raw SQL、alias、表名或开放表达式；内层仍是单源单聚合；
+- 未知维度、未授权维度、不可筛选维度、算子不被维度支持、非法输入类型/枚举值、以及
+  **属于其它实体（含外层属性实体）**的维度都原子失败（带可归因诊断：维度 id 与
+  measure id）；纯探针 `scoped_attribute_compare_ok` 对完整 filter/ownership 契约
+  返回预期而不失败；
+- 空 `scope_filters` 完全保留**全局聚合**行为（与既有无 scope 请求一致）；
+- **binding 顺序**：外层请求 filters 先（原有顺序），随后每个 comparison 按请求
+  顺序、该 comparison 的 scope filters 按声明顺序进入子查询的占位符，最后是外层
+  分页（limit/offset）；
+- profile 递归收窄照常生效：内层聚合函数、scope filter 所用 scalar 都必须被允许，
+  否则 `profile_accepts`/validation 拒绝。
+
+类型/domain 兼容（**类型安全是契约的一部分**，通过 `std/type-desc` 反射 prepared
+`FieldEntry.ty` 的 `Type` 元数据判定，绝不依据 filterability、算子列表、名称或样例
+值推断）：
+
+| 侧面 | 类别推导 | 数值族 |
+| --- | --- | --- |
+| 外层属性 | 其 prepared 字段 `Type` 的 kind | `'Int` / `'Float` 为受支持的数值族 |
+| `Count` | 结果恒为整数 | 数值族 |
+| `Sum` / `Avg` | 数值输入、数值结果 | 数值族 |
+| `Min` / `Max` | 保留其输入列的可比较类别（数值列即数值族） | 取决于输入列 |
+
+- 只有**两侧都属于数值族**（Int/Float）的比较被接受；text-vs-number、
+  enum-vs-number 及其它跨类别组合被纯探针与 lowering 双重拒绝，并给出可归因诊断
+  （指出属性 id 与 measure id）；
+- 内层 measure 必须是已声明、已授权、**简单聚合**（非 computed/filtered）；外层
+  attribute 必须是已授权、纯列承载、位于请求 base 实体的 dimension（computed/
+  未授权/其它实体拒绝）；
+- 算子只接受封闭比较；NULL 语义保持 SQL 原生（比较与 scope filter 都不注入
+  `coalesce`）；
+- **不做自然语言量化**：foundation 只暴露“比较 + 聚合”的精确结构，不解释
+  “any/all”等词；那是领域层职责；
+- 重复 lowering 的 SQL/bindings 逐字节一致；profile 对外层与内层能力**递归**收窄。
+
+### 排序分组键比较（ranked grouped-key comparison）
+
+`lower_ranked_key_compare(payload, request, comparisons)` 暴露 query-core 的
+`RankedKeyComparison`：measureless 行级请求的外层行，被“外层属性 vs **按聚合排序后
+第一个分组的 key**”过滤。它是**独立的 typed request**，绝不通过把排名组作为外层
+结果、暴露排名 measure、或接受 SQL/表/列/alias fragment 来模拟：
+
+```telora
+type RankedKeyCompareRequest = struct {
+    attribute: String,               # 外层属性（request base 实体或其安全父实体上的 dimension id）
+    subject: String,
+    op: HavingOp,                    # 封闭比较算子
+    group: String,                   # 内层分组维度 id（内层 population 实体）
+    measure: String,                 # 排名 measure id（同一内层 population grain）
+    direction: OrderDirection,       # 'Asc / 'Desc
+    scope_filters: Array(FilterRequest),  # 有序内层 scope 过滤（空 = 全局）
+};
+
+let plan: qb.Plan = edsl.lower_ranked_key_compare(payload, request, comparisons);
+let feasible: Bool = edsl.ranked_key_compare_ok(payload, base_entity, role,
+    attribute_id, group_id, measure_id, direction, scope_filters);
+```
+
+语义与约束：
+
+- 外层属性、内层分组维度、排名 measure 都通过**已声明的领域词汇与关系归属**解析：
+  - 外层 attribute 必须是已授权、纯列的 dimension。它既可以位于 request base 实体，
+    **也可以位于从 base 经“恰好一条已 prepare 的 Safe 路径”可达的父实体**
+    （safe parent-attribute join）：此时 lowering 把该 Safe 路径的 join 物化到外层
+    Plan（按 source alias 复用已存在 join，只追加缺失边；`sources` 与 `joins`
+    在 `qb.validate` 前一致重建），隐藏比较 `ColumnRef` 使用属主实体的 alias；
+  - 内层 `group` 维度必须是已授权、纯列、位于**内层 population 实体**的 dimension；
+  - 排名 `measure` 必须是已声明、已授权、**简单聚合**（非 computed/filtered），且
+    **必须位于内层 population 实体**（grain）；measure 的 `requires` 必须为空（无
+    额外必需实体/路由的测量）；否则给出可归因诊断（角色：外层 key / 分组 key /
+    排名 measure / 路由）；
+- **类型兼容**在外层属性与分组 key 之间按封闭可比较类别判定（复用
+  `field_domains_compatible`：同 enum 稳定值域或同为开放 text/int/number 类别）；
+  排名 measure 的类型**独立**——它只用于聚合排序，不参与该兼容判定；
+- `scope_filters` 属于内层 population，按声明顺序以确定性 AND 组合，绝不泄漏到
+  外层 filter 或改变外层投影；
+- lowering 只生成 query-core 的 grouped-key scalar spec：
+  `<outer> <op> (SELECT <group key> FROM <population> [WHERE <scope>] GROUP BY
+  <group key> ORDER BY <measure agg> <ASC|DESC> LIMIT 1)`；外层投影逐字保持、排名
+  measure 永不投影，safe parent-attribute join 也不改变外层 detail grain（Inner
+  join，不放大行）；比较 attribute 与排名 measure 都**不进入投影**；
+- **外层父属性路由的拒绝边界**（诊断可区分，调用者可据此修正意图或模型，绝不发布
+  部分 Plan）：
+  - **fan-out-only 路由**：owner 只能经 fan-out 关系到达（join 会放大 detail
+    grain）→ 拒绝；
+  - **歧义路由**：owner 经**多条不同 Safe 路径**（并行/其它歧义已声明 Safe 路由）
+    到达 → 拒绝；路线**绝不按声明顺序挑选**。prepare 阶段对每个 (source, target)
+    预计算“Safe 路径多于一条”的歧义矩阵 `PreparedPayload.ambiguous_paths`，
+    lowering 与纯探针都据此拒绝；
+  - **缺失/未声明路由**：owner 与 base 无任何已声明可达关系 → 拒绝；
+  - **derived（union）外层 Plan**：base 为联合实体且父属性在 base 之外、需要新增
+    join → 拒绝（derived UNION ALL 外层不能携带物理 join）。
+- 未知/未授权/跨归属/类型不兼容/不支持（measure 在错误 grain、requires 非空）
+  的请求原子失败；NULL 语义保持 SQL 原生；重复 lowering 逐字节一致；profile 递归
+  收窄（缺内层排名聚合函数等拒绝）。纯探针 `ranked_key_compare_ok` 对 fan-out、
+  歧义、缺失与 derived-join 路由都返回拒绝而不失败。
+
+### 集合运算（set operations）
+
+两个已授权的 ontology 请求先经正常 lowering 成为完整 Plan，然后可以按集合语义组合：
+`lower_set(kind, payload, left_req, right_req)` 直接返回集合 `Query`，
+`lower_set_count(kind, payload, left_req, right_req)` 在派生集合上返回 `count(1)`。
+`kind` 复用 Query 的 `qb.SetOpKind`（`'Intersect`/`'Except`/`'Union`，后者为去重
+union，不是 UNION ALL）。
+
+- 操作数投影必须非空、arity 相同且逐位置类别兼容；两个操作数都不得携带本地
+  ordering/limit/offset/partition（否则会改变嵌入语义，稳定拒绝）；
+- bindings 按从左到右操作数顺序拼接（含嵌套操作数），动态值不进入 SQL；
+- `lower_set_count` 的外层只暴露一个 count 列，不暴露操作数列；
+- 拒绝（空操作数、零列投影、arity/位置类型不匹配、非法 kind、越权来源/字段、不可嵌入
+  的本地排序/分页、不安全的嵌套组合）原子失败、不发布部分 Query；query 层纯探针
+  `qb.set_ok(kind, left_plan, right_plan)` 用于区分“不支持复合形状”与“词表错误”；
+- 重复 lowering 的 SQL/bindings 完全一致。
 
 ## 验证
 
@@ -1128,12 +1344,70 @@ correlated EXISTS 内 JOIN、无外层 fan-out join、目标过滤绑定）、
 关联计数排序 + Top-N）、`check_related_aggregate_having`（隐藏关联计数 HAVING + 阈值
 binding）、`check_related_aggregate_reverse_relation`（反向声明关系按 prepared 方向
 join）与 `check_related_aggregate_deterministic_and_rejections`（重复 lowering 一致；
-越权/未知 measure/无关系/歧义经 `related_measure_ok` 确定性拒绝）。显式投影顺序测试另覆盖 `check_explicit_projection_order`（跨 measure/dimension
+越权/未知 measure/无关系/歧义经 `related_measure_ok` 确定性拒绝）。bounded two-hop
+related aggregate 测试另覆盖合成 `rm_subjects`/`rm_intermediates`/`rm_events` fixture：
+`check_related_two_hop_ordering_top_n`（subject → intermediate → event population 的
+唯一两跳 route：隐藏 count 排序 + Top-N 的精确 SQL、两个 route join 依依赖顺序、只按
+主体维度分组、只投影主体维度）、`check_related_two_hop_having`（同一两跳 route 的隐藏
+聚合 HAVING 精确 SQL/绑定、隐藏 measure 不投影）、
+`check_related_two_hop_determinism`（重复 lowering 逐字节一致）与
+`check_related_two_hop_rejection_probes`（唯一两跳 route 可行；直接+两跳并存歧义、
+仅三跳可达 over-depth、无已声明路线 missing、越权 role、未知 measure 都经
+`related_measure_ok` 确定性拒绝，并断言 over-depth 主体经 prepared 路径矩阵只以三跳
+到达聚合实体）。集合运算测试另覆盖
+`check_set_intersect_direct`（直接 INTERSECT + 左到右 bindings）、
+`check_set_union_and_except_keywords`（去重 UNION/EXCEPT 关键字，非 UNION ALL）、
+`check_set_outer_count`（外层单列 count over 派生集合）与 `check_set_deterministic`
+（重复 lowering 一致）。显式投影顺序测试另覆盖 `check_explicit_projection_order`（跨 measure/dimension
 交错列序、只改 SELECT 列序）与 `check_default_projection_order_compat`（空 order 保留
 默认 measure-then-dimension 行为）。field-to-field 谓词测试另覆盖
 `check_field_to_field_success`（双列比较、无 binding、不加入投影）、
 `check_field_to_field_combination_and_determinism`（与普通标量过滤组合的谓词/bindings
 顺序与重复 lowering）与 `check_field_to_field_rejections`（未知/未授权/跨实体/类型不兼容/
-非法算子经纯探针确定性拒绝）。query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
+非法算子经纯探针确定性拒绝）。hidden same-source HAVING 测试另覆盖
+`check_hidden_having_same_source`（隐藏 OrderCount HAVING 不进入投影、SQL
+`GROUP BY ... HAVING count(...) >= ?`、阈值绑定）与
+`check_hidden_having_determinism_and_probe`（重复 lowering 一致；同源/越权/未知/跨实体
+measure 经 `same_source_having_ok` 确定性拒绝）。attribute-versus-aggregate 测试另覆盖
+`check_attribute_vs_scalar_aggregate`（**数值正例**：外层 Int 属性 OrderId vs 数值
+`sum(OrderAmount)`——Plan 级单一标量聚合比较谓词、投影只含列表维度、
+`o.order_id > (SELECT sum(o.amount) FROM orders AS o)` 的 SQL 形状、无动态绑定）与
+`check_attribute_vs_scalar_aggregate_probe_and_determinism`（重复 lowering 逐字节一致；
+数值外层 + 数值聚合与 Count 整数结果可行；text-vs-number（OrderRegion vs sum）、
+enum-vs-number（CustomerTier vs count）、越权、未知/跨实体属性、未知 measure 经
+`attribute_compare_ok` 确定性拒绝）。scoped attribute-versus-aggregate 测试另覆盖
+合成领域 `sc_accounts`/`sc_txns` fixture：`check_scoped_attribute_compare_positive`
+（数值外层 ScAccountId vs 带**两个有序 scope filter** 的 `avg` 内层聚合，精确
+SQL/bindings、投影保持、无 join/EXISTS、无 `coalesce`）、
+`check_scoped_attribute_compare_min_max`（带单 scope filter 的 `max`/`min` 聚合精确
+SQL/bindings）、`check_scoped_attribute_compare_empty_and_determinism`（空 scope
+保持全局聚合行为、`scoped_attribute_compare_ok([])` 与既有无 scope 探针一致、重复
+lowering 逐字节一致）、`check_scoped_attribute_compare_profile_and_projection`
+（全 profile 接受、缺 `Avg` 的 profile 递归拒绝、投影保持）与
+`check_scoped_attribute_compare_rejections`（scope filter 属于外层 base 实体而非内层
+实体、跨实体维度、未知/未授权/不可筛选维度、不支持算子、非法输入类型、越权 role 全部
+经 `scoped_attribute_compare_ok` 确定性拒绝；两个合法内层实体 scope filter 可行）。
+ranked grouped-key comparison 测试另覆盖合成 `sc_accounts`/`sc_txns` fixture：
+`check_ranked_key_positive`（多实体正例：外层 account kind 行被“按
+`max(amount_max) DESC` 排名第一的 txn category key”过滤，精确 projection/SQL/
+bindings）、`check_ranked_key_scoped_and_min_asc`（带内层 scope filter 的 asc
+`min` 排名与直接同 grain `count` DESC 排名的精确 SQL/bindings）、
+`check_ranked_key_rejections`（外 key/分组 key 类型不兼容、measure 非内层
+population grain、未知外属性/分组维度/measure、未授权分组维度、scope 归属/输入
+错误全部经 `ranked_key_compare_ok` 拒绝）与
+`check_ranked_key_determinism_profile_and_compat`（重复 lowering 逐字节一致、
+全 profile 接受而缺排名聚合的 profile 拒绝、既有 scalar aggregate comparison 未被
+注入/保持不变）。ranked outer-join 与路由边界另覆盖合成
+`rk_lines`/`rk_parents`/`rk_events`（及 fan-out/歧义/union 变体）fixture：
+`check_ranked_key_outer_parent_join`（detail-grain base 的比较属性位于安全可达的
+父实体：外层 Plan 精确物化唯一 Safe 路径的 Inner join、SQL/bindings/projection
+精确、detail grain 不被分组、比较属性与排名 measure 不进入投影、探针可行）与
+`check_ranked_key_fanout_route_rejected`（fan-out-only owner 被探针拒绝，base 自身
+属性仍可行）、`check_ranked_key_ambiguous_route_rejected`（两条并行 Safe 路由：
+路径矩阵仍记录首条 Safe 路径、`ambiguous_paths` 歧义标志为真、探针拒绝而不按声明
+顺序选择）、`check_ranked_key_missing_route_rejected`（与 base 无已声明路由的
+owner 被拒绝）及 `check_ranked_key_derived_plan_join_rejected`（derived(union)
+外层 Plan 对需要新增 join 的父属性拒绝、base 自身属性可行）。
+query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
 `qb.exists_not`、`OrderKey 'Aggregate` 内部排序聚合与 `qb.exists_two_hop`
 （SQL/bindings/确定性）。

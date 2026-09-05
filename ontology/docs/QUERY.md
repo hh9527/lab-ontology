@@ -126,6 +126,19 @@ alias 做 `'Add`/`'Sub` 算术组合。
 > alternatives/grouping/having/peer 互斥；`link.pairs` 每边分别属于 `Exists.source`
 > 与 `link.source` 的 alias。
 
+> **公共破坏性契约（Plan-level scalar aggregate comparison 轮）**：`Plan` 新增
+> `scalar_comparisons: Array(ScalarAggregateComparison)` 字段；新增
+> `ScalarAggregateComparison` 类型（`outer: ColumnRef` + 封闭比较 op +
+> 扁平 `inner: ScalarSubquery`）、`qb.scalar_subquery_spec` 与
+> `qb.scalar_aggregate_comparison(outer, op, inner)` 构造器（构造器返回比较项，
+> 绝不返回 `Expr`）。`Expr` 保持恰好 `'Column/'Bind/'Scalar` 三个 variant，
+> 不参与标量聚合比较。每个谓词只在 WHERE 中作为额外的括号化谓词渲染为
+> `<outer.column> <op> <(SELECT <agg>(...) FROM ...)>`（op 仅限
+> `'Eq/'Ne/'Lt/'Le/'Gt/'Ge`，NULL 语义由 SQLite 原生保证）；bindings 按
+> 确定性的谓词顺序收集，随后是该谓词内层 join/filter 表达式顺序。所有 Plan
+> 记录字面量必须补 `scalar_comparisons: []`（无比较时为空数组）。内层聚合的
+> operator/join/aggregate/scalar/distinct 能力由 profile **递归**收窄。
+
 标量语义（与 SQLite 行为一致）：
 
 | 函数 | 参数 | 语义 |
@@ -245,6 +258,9 @@ type DerivedSource = struct {
     branches: Array(UnionBranch),
 };
 
+# Closed set operations between two validated Plans.
+type SetOpKind = enum { 'Intersect, 'Except, 'Union };
+
 type Plan = struct {
     revision: String,
     sources: Array(Source),
@@ -259,6 +275,8 @@ type Plan = struct {
     limit: Option(Int),
     offset: Option(Int),
     partition: Option(PartitionedTopN),
+    scalar_comparisons: Array(ScalarAggregateComparison),
+    ranked_key_comparisons: Array(RankedKeyComparison),
 };
 
 type PartitionedTopN = struct {
@@ -310,6 +328,9 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `validate` | `Fn(Plan, PlanProfile) -> Plan` | 结构或能力非法时 `fail!`，成功时返回原 Plan |
 | `transform_sqlite` | `Fn(Plan) -> Query` | 合法 Plan 确定性转换为 SQLite Query |
 | `transform_sqlite_distinct` | `Fn(Plan) -> Query` | 行级（无分组/无聚合/纯表达式投影）Plan 渲染为 `SELECT DISTINCT ...`（distinct 行） |
+| `transform_sqlite_set` | `Fn(SetOpKind, Plan, Plan) -> Query` | 两个可嵌入 Plan 的封闭集合运算（INTERSECT/EXCEPT/distinct UNION） |
+| `transform_sqlite_set_count` | `Fn(SetOpKind, Plan, Plan) -> Query` | `SELECT count(1) FROM (<set>) AS __q_set`（外层计数，单列） |
+| `set_ok` | `Fn(SetOpKind, Plan, Plan) -> Bool` | 纯可行性：结构合法、可嵌入、投影非空且同 arity、位置类别兼容 |
 | `count_groups` | `Fn(Plan, PlanProfile) -> Query` | 结构/profile 校验内层后，统计通过 HAVING 的组数（嵌套聚合形状 1） |
 | `is_sql_identifier` | `Fn(String) -> Bool` | 检查 `^[A-Za-z_][A-Za-z0-9_]*$` |
 
@@ -1171,6 +1192,103 @@ EXISTS (SELECT 1 FROM <B> AS <b>
   operator/profile 递归收窄（`Exists` + `Column` + filter 的 scalar）。
 - 对同一 link body 使用 `exists_not` 即得 `NOT EXISTS` 的两跳反存在。
 
+## 集合运算（INTERSECT / EXCEPT / distinct UNION）
+
+`transform_sqlite_set(kind, left, right)` 组合两个**完整、已结构校验**的 Plan：
+每个可嵌入操作数渲染成**裸 select-statement**，并用集合关键字直接连接
+（`INTERSECT`/`EXCEPT`/`UNION`，后者为去重 union，不是内部 UNION ALL）。
+SQLite 只接受 compound-select 顶层为裸 select 项：`(SELECT ...) INTERSECT
+(SELECT ...)` 这种在顶层为每个操作数加括号的形式会在执行前被 SQLite 拒绝，因此
+query-core 从不为顶层操作数加括号：
+
+```text
+SELECT <投影...> FROM <表> AS <alias> [WHERE ...] [GROUP BY ...] [HAVING ...]
+  INTERSECT/EXCEPT/UNION
+SELECT <投影...> FROM <表> AS <alias> [WHERE ...] [GROUP BY ...] [HAVING ...]
+```
+
+- 每个操作数必须可嵌入：无本地 ordering/limit/offset/partition（grouping/HAVING
+  保留在操作数内部）；投影非空且 arity 相同；逐位置投影类别兼容（expr/agg/computed
+  必须一致）。
+- 操作数的公共投影逐字保留：SELECT 列、列序都来自操作数自身，compound 形式不会
+  引入任何 helper 列（无 `__q_*` 别名注入）。
+- bindings 按从左到右的操作数顺序确定性拼接（含嵌套操作数），动态值绝不进入 SQL。
+- `transform_sqlite_set_count(kind, left, right)` 需要把集合结果当作外层计数源时，
+  用**合法的 derived-table 形式**把整个可执行 compound select 包一次：
+  `SELECT count(1) FROM (<compound select>) AS __q_set`（唯一合法的包层处），外层
+  只暴露一个 count 列，不暴露操作数列。
+- `set_ok(kind, left, right)` 是纯可行性探针（不失败）。
+- 非法形状（空/零列操作数、arity 或位置类别不匹配、不可嵌入操作数）原子失败，不发布
+  部分 Query；同一输入的重复 lowering 逐字节一致。
+- `tests/query.telora` 对 `INTERSECT`/`EXCEPT`/`UNION` 分别断言精确 SQLite-valid
+  字符串（含每操作数 filter 与从左到右 binding 顺序），并断言不存在
+  `) INTERSECT (SELECT` / `) UNION (SELECT` / `) EXCEPT (SELECT` 这类被 SQLite
+  拒绝的顶层括号形式。
+
+## 排序分组键标量比较（ranked grouped-key scalar comparison）
+
+`ScalarAggregateComparison` 只能返回**一个聚合值**。当 shape 需要把外层属性与
+“按聚合排序后的第一个分组的 key”比较时，使用**独立、不重叠**的 typed spec
+`RankedKeyComparison`（`Plan.ranked_key_comparisons: Array(RankedKeyComparison)`）：
+
+```telora
+type RankedKeySubquery = struct {
+    source: Source,
+    joins: Array(Join),
+    filter: Option(Expr),
+    keys: Array(Expr),        # 恰好一个投影/分组 key 表达式（结构校验长度==1）
+    order: AggregateCall,     # 唯一封闭聚合排序表达式（可带聚合局部 filter）
+    direction: Ordering,      # 'Asc / 'Desc
+};
+
+type RankedKeyComparison = struct {
+    outer: ColumnRef,         # 外层可见 alias 的列
+    op: ScalarFunction,       # 封闭比较算子（同 scalar aggregate comparison）
+    inner: RankedKeySubquery,
+};
+```
+
+构造器：`qb.ranked_key_subquery_spec(source, joins, filter, keys, order, direction)`
+与 `qb.ranked_key_comparison(outer, op, inner)`。
+
+### 形状与渲染
+
+内层查询恰好投影/分组**一个** key 表达式、按**一个**封闭聚合排序表达式（required
+`direction`）对分组排序并取首组 key；渲染为括号化的 scalar select，子句顺序与
+绑定顺序确定：
+
+```text
+<outer.column> <op> (SELECT <key> FROM <table> AS <alias> [JOIN ...]
+                     [WHERE <row filter>]
+                     GROUP BY <key>
+                     ORDER BY <order-aggregate> <ASC|DESC> LIMIT 1)
+```
+
+- 允许内层 joins 与可选 row filter，但**不允许**任意 projection、HAVING、offset、
+  partition、set operation、嵌套 scalar subquery 或 raw SQL；`LIMIT 1` 是固定语义；
+- 外层比较只保留满足 `<outer> <op> <key>` 的行；外层投影逐字保留（与本机制无关的
+  projection/列序不改变）；
+- bindings 顺序确定：外层 row filter/exists/既有 scalar comparisons 之后是每个
+  ranked comparison（按数组顺序），其子查询内按占位符顺序 = key（SELECT）、
+  row filter、key（GROUP BY）、ordering aggregate 表达式；
+- NULL 语义保持 SQL 原生（比较与聚合都不注入 `coalesce`）。
+
+### 校验与 profile
+
+- 结构校验要求：source/join 标识符合法；内层 alias 互异且**不泄漏**到外层（key/
+  filter/order 只能引用内层 alias；外层 outer `ColumnRef` 必须命名外层可见 alias）；
+  `keys` 长度必须为 **1**（缺分组、多 key 拒绝）；order 必须是封闭聚合调用，其
+  arg/aggregate-local filter 都是内层 alias 上的合法 Expr；`op` 必须是封闭比较算子；
+  非法标识符、alias 泄漏、未知 outer 引用、未知内层列、空/多 key、非比较算子全部被
+  `structure_ok`/`validate_structure` 原子拒绝；
+- profile **递归收窄**：内层 ordering aggregate 函数必须在 `allowed_aggregates`、
+  join kind 必须在 `allowed_join_kinds`、distinct 语义服从 `allow_distinct`、key /
+  order arg / aggregate-local filter / row filter 所用 scalar 必须在 `allowed_scalars`；
+  算子集合经 `operators` 计入（Source/Column/Aggregate/Group/Order/Filter/Join/
+  Bind/Scalar）。
+- 既有 `ScalarAggregateComparison`/`ScalarSubquery`/`scalar_comparisons` 保持
+  source-compatible 且行为不变。
+
 ## 角色化 Join 与结构化 ON 条件
 
 `JoinCondition` 是封闭的 ON 谓词树：`'Eq(ColumnEq)` 原子由
@@ -1400,4 +1518,13 @@ correlated EXISTS 与两组端点交换分支 SQL/bindings、无外层 JOIN/fan-
 未知 hub 角色 alias/同端字段/不一致分支/跨 alias participant filter 拒绝、等值 key
 跨 alias 合法、同实体 `origin.key <> peer.key` 身份证明与异构不加裸 key 不等、
 operator/profile（缺 `'Exists` 拒绝）、重复 lowering 逐字节一致与占位符/绑定数一致。
-新增能力都以领域无关 fixture 覆盖，不写入任何 ICM/企业业务名。
+集合运算测试覆盖 `INTERSECT`/`EXCEPT`/`UNION` 的**裸可执行 compound-select** 精确
+SQL（每个操作数含自己的 filter、bindings 从左到右拼接）、带 `GROUP BY` 操作数的
+SQLite-valid 形状、`set_count` 的 derived-table 单层包裹、投影保持（无 helper 列）、
+`set_ok` 拒绝本地 ordering/arity 不匹配等既有负向校验，以及重复 lowering 逐字节
+一致。排序分组键标量比较测试覆盖：升/降序聚合 rank 的精确 SQL/bindings（含
+`ORDER BY <agg> ASC/DESC LIMIT 1`）、内层 join 与 row filter 的确定性子句/绑定顺序、
+外层无关投影逐字保持、profile 递归（缺内层 ordering aggregate 拒绝）、以及缺分组/
+多 key/外层 alias 泄漏/内层未知列/非法标识符/未知 outer 引用/非比较算子的结构拒绝，
+外加重复 lowering 与原生 NULL（无 `coalesce`）。新增能力都以领域无关 fixture 覆盖，
+不写入任何 ICM/企业业务名。

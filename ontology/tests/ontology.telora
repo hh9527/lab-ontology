@@ -2887,6 +2887,7 @@ type RlRevEvent = struct {
 
 # Ambiguous pair: two declared relations between the subject and the event
 # entity, so a related-aggregate reference cannot pick a unique path.
+@edsl.entity_id("rl_amb")
 @edsl.entity_source("rl_amb", "am")
 @edsl.relation(RlEvent, fanout_kind, 0, 1)
 @edsl.relation(RlEvent, fanout_kind, 0, 1)
@@ -2997,6 +2998,1094 @@ def check_related_aggregate_deterministic_and_rejections: Bool = do {
 };
 
 # ---------------------------------------------------------------------------
+# Related-aggregate over a bounded two-hop declared route (ontology feedback).
+#
+# RmSubject -> RmIntermediate -> RmEvent: the hidden aggregate population is
+# reached through exactly one eligible route of TWO declared relations (the
+# intermediate hop is declared on RmSubject, the event hop on RmIntermediate),
+# while grouping stays exactly on the subject dimension RmRegion.  A fan-out
+# direction is allowed inside the route; the aggregate measure stays hidden.
+# The same route serves hidden ORDER BY/Top-N and hidden HAVING.
+#
+# Rejection probes use an ambiguous subject (direct one-hop PLUS the two-hop
+# route), an over-depth subject (three-hop-only route), a missing subject (no
+# declared route) and unauthorized/unknown roles.
+# ---------------------------------------------------------------------------
+
+@edsl.entity_id("rm_subjects")
+@edsl.entity_source("rm_subjects", "rms")
+@edsl.relation(RmIntermediate, safe_kind, 1, 0)
+type RmSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("intermediate_id")
+    intermediate_id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RmRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+@edsl.entity_id("rm_intermediates")
+@edsl.entity_source("rm_intermediates", "rmi")
+@edsl.relation(RmEvent, fanout_kind, 0, 1)
+type RmIntermediate = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+};
+
+@edsl.entity_id("rm_events")
+@edsl.entity_source("rm_events", "rme")
+type RmEvent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("RmEventCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("intermediate_id")
+    intermediate_id: Int,
+};
+
+# Ambiguous: a direct relation to the event population AND the two-hop route
+# through the intermediate both exist, so no single route can be chosen.
+@edsl.entity_id("rm_amb_subjects")
+@edsl.entity_source("rm_amb_subjects", "rmas")
+@edsl.relation(RmEvent, safe_kind, 0, 0)
+@edsl.relation(RmIntermediate, safe_kind, 2, 0)
+type RmAmbSubject = struct {
+    @edsl.column("event_id")
+    event_id: Int,
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("intermediate_id")
+    intermediate_id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RmAmbRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+# Over-depth: the only route to the event population is three hops
+# (deep_mid -> intermediate -> event), beyond the supported two-relation depth.
+@edsl.entity_id("rm_deep_subjects")
+@edsl.entity_source("rm_deep_subjects", "rmds")
+@edsl.relation(RmDeepMid, safe_kind, 0, 0)
+type RmDeepSubject = struct {
+    @edsl.column("deep_mid_id")
+    deep_mid_id: Int,
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RmDeepRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+@edsl.entity_id("rm_deep_mids")
+@edsl.entity_source("rm_deep_mids", "rmdm")
+@edsl.relation(RmIntermediate, safe_kind, 1, 0)
+type RmDeepMid = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("intermediate_id")
+    intermediate_id: Int,
+};
+
+# Missing: no declared route from this subject to any aggregate population.
+@edsl.entity_id("rm_missing_subjects")
+@edsl.entity_source("rm_missing_subjects", "rmms")
+type RmMissingSubject = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("region")
+    @edsl.dimension("RmMissingRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+};
+
+def rm_entity_types: Array(Type) = [
+    RmSubject, RmIntermediate, RmEvent,
+    RmAmbSubject, RmDeepSubject, RmDeepMid, RmMissingSubject,
+];
+
+def rm_authorize: Fn(String) -> Bool = fn(subject) { subject == "analyst" };
+
+def rm_payload: edsl.PreparedPayload = do {
+    edsl.build_root("rm-v1", rm_entity_types, knowledge.profile, rm_authorize)
+};
+
+def rm_subject_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "RmRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [{ target: 'Dimension("RmRegion"), direction: 'Asc }],
+    limit: 'Some(1),
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_related_two_hop_ordering_top_n: Bool = do {
+    # Hidden count ordering over the two-hop population with Top-N: exact SQL,
+    # both route joins, subject-only grouping and projection, and the measure
+    # never appears in the projection.
+    let internal: Array(edsl.InternalOrderRequest) = [
+        { measure: "RmEventCount", subject: "analyst", direction: 'Desc },
+    ];
+    let plan: qb.Plan = edsl.lower_internal_related(rm_payload, rm_subject_request, internal, []);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT rms.region FROM rm_subjects AS rms INNER JOIN rm_intermediates AS rmi ON rms.intermediate_id = rmi.id INNER JOIN rm_events AS rme ON rmi.id = rme.intermediate_id GROUP BY rms.region ORDER BY count(rme.id) DESC, rms.region ASC LIMIT ?";
+    let expected: Array(qb.Val) = ['Int(1)];
+    let join_count = array.length(plan.joins) == 2;
+    let only_region_projected = array.length(plan.projection) == 1
+        && (match get_index(plan.projection, 0) { 'Expr(e) => is_column(e, "rms", "region"), _ => 'False });
+    let grouped_by_region = array.length(plan.grouping) == 1
+        && is_column(get_expr(plan.grouping, 0), "rms", "region");
+    check(query.sql == expected_sql, "related two-hop: hidden count ordering over the two-hop route with Top-N renders exact SQL")
+        && check(query.bindings == expected, "related two-hop: the Top-N limit binds once")
+        && check(join_count, "related two-hop: exactly the two route joins are materialized")
+        && check(only_region_projected, "related two-hop: the projection is only the subject grouping dimension")
+        && check(grouped_by_region, "related two-hop: grouping stays exactly on the subject dimension")
+};
+
+def check_related_two_hop_having: Bool = do {
+    # Hidden aggregate HAVING over the SAME two-hop route: exact SQL, joins and
+    # the typed threshold binding; the hidden measure is not projected.
+    let request: edsl.QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "RmRegion", subject: "analyst", input: 'None }],
+        filters: [],
+        ordering: [],
+        limit: 'None,
+        offset: 'None,
+        partition: 'None,
+    };
+    let having: Array(edsl.InternalHavingRequest) = [
+        { measure: "RmEventCount", subject: "analyst", op: 'Ge, threshold: 'Int(2) },
+    ];
+    let plan: qb.Plan = edsl.lower_internal_related(rm_payload, request, [], having);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT rms.region FROM rm_subjects AS rms INNER JOIN rm_intermediates AS rmi ON rms.intermediate_id = rmi.id INNER JOIN rm_events AS rme ON rmi.id = rme.intermediate_id GROUP BY rms.region HAVING count(rme.id) >= ?";
+    let expected: Array(qb.Val) = ['Int(2)];
+    let hidden_not_projected = !array.any(plan.projection, fn(item) {
+        match item {
+            'Aggregate(agg) => agg.alias == "RmEventCount",
+            'Computed(c) => c.alias == "RmEventCount",
+            'Expr(_) => 'False,
+        }
+    });
+    check(query.sql == expected_sql, "related two-hop: hidden aggregate HAVING over the same two-hop route renders exact SQL")
+        && check(query.bindings == expected, "related two-hop: the HAVING threshold is the single ordered binding")
+        && check(hidden_not_projected, "related two-hop: the hidden measure never appears in the projection")
+};
+
+def check_related_two_hop_determinism: Bool = do {
+    let internal: Array(edsl.InternalOrderRequest) = [
+        { measure: "RmEventCount", subject: "analyst", direction: 'Desc },
+    ];
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_internal_related(rm_payload, rm_subject_request, internal, []));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_internal_related(rm_payload, rm_subject_request, internal, []));
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings,
+        "related two-hop: repeated lowering is byte-identical")
+};
+
+def check_related_two_hop_rejection_probes: Bool = do {
+    let p = rm_payload;
+    let subject = entity_id_index(p.entities, "rm_subjects");
+    let amb = entity_id_index(p.entities, "rm_amb_subjects");
+    let deep = entity_id_index(p.entities, "rm_deep_subjects");
+    let events = entity_id_index(p.entities, "rm_events");
+    let missing = entity_id_index(p.entities, "rm_missing_subjects");
+    let deep_path_len = match get_index(get_index(p.paths, deep), events) {
+        'Safe(seq) => array.length(seq),
+        'FanOut(seq) => array.length(seq),
+        _ => 0,
+    };
+    check(edsl.related_measure_ok(p, subject, "analyst", "RmEventCount"), "related two-hop probe: a unique two-hop route is feasible")
+        && check(!edsl.related_measure_ok(p, amb, "analyst", "RmEventCount"), "related two-hop probe: a direct-plus-two-hop ambiguous route is rejected")
+        && check(!edsl.related_measure_ok(p, deep, "analyst", "RmEventCount"), "related two-hop probe: an over-depth (three-hop-only) route is rejected")
+        && check(!edsl.related_measure_ok(p, missing, "analyst", "RmEventCount"), "related two-hop probe: a missing route is rejected")
+        && check(!edsl.related_measure_ok(p, subject, "outsider", "RmEventCount"), "related two-hop probe: an unauthorized role is rejected")
+        && check(!edsl.related_measure_ok(p, subject, "analyst", "MissingMeasure"), "related two-hop probe: an unknown measure is rejected")
+        && check(deep_path_len == 3, "related two-hop probe: the over-depth subject reaches the population only through three relations")
+};
+
+# ---------------------------------------------------------------------------
+# Closed set operations (INTERSECT / EXCEPT / distinct UNION) over two lowered
+# ontology requests with compatible projections (synthetic/domain-neutral).
+# ---------------------------------------------------------------------------
+
+def set_region_east: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [{ id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("east") }],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def set_region_north: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [{ id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("north") }],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_set_intersect_direct: Bool = do {
+    let q: qb.Query = edsl.lower_set('Intersect, knowledge.payload, set_region_east, set_region_north);
+    let expected: Array(qb.Val) = ['String("east"), 'String("north")];
+    let expected_sql = "SELECT o.region FROM orders AS o WHERE o.region = ? INTERSECT SELECT o.region FROM orders AS o WHERE o.region = ?";
+    check(q.sql == expected_sql, "set ops: direct INTERSECT keeps both operand queries as bare executable compound terms")
+        && check(q.bindings == expected, "set ops: bindings concatenate left-to-right operand order")
+        && check(!string.contains(q.sql, ") INTERSECT ("), "set ops: no SQLite-rejected top-level operand parentheses")
+};
+
+def check_set_union_and_except_keywords: Bool = do {
+    let union_q: qb.Query = edsl.lower_set('Union, knowledge.payload, set_region_east, set_region_north);
+    let except_q: qb.Query = edsl.lower_set('Except, knowledge.payload, set_region_east, set_region_north);
+    check(string.contains(union_q.sql, " UNION "), "set ops: distinct UNION uses the set-union keyword between bare operands")
+        && check(string.contains(except_q.sql, " EXCEPT "), "set ops: EXCEPT lowers to the set keyword")
+        && check(!string.contains(union_q.sql, "UNION ALL"), "set ops: distinct UNION is not UNION ALL")
+        && check(!string.contains(union_q.sql, ") UNION (") && !string.contains(except_q.sql, ") EXCEPT ("),
+            "set ops: operands are never wrapped in the SQLite-rejected parenthesized form")
+};
+
+def check_set_outer_count: Bool = do {
+    let q: qb.Query = edsl.lower_set_count('Intersect, knowledge.payload, set_region_east, set_region_north);
+    let expected: Array(qb.Val) = ['String("east"), 'String("north")];
+    check(string.contains(q.sql, "SELECT count(1) FROM (SELECT o.region FROM orders AS o WHERE o.region = ? INTERSECT SELECT o.region FROM orders AS o WHERE o.region = ?) AS __q_set"),
+        "set ops: outer count wraps the executable compound select once as a derived table")
+        && check(q.bindings == expected, "set ops: outer count keeps operand bindings in order")
+};
+
+def check_set_deterministic: Bool = do {
+    let q1: qb.Query = edsl.lower_set('Intersect, knowledge.payload, set_region_east, set_region_north);
+    let q2: qb.Query = edsl.lower_set('Intersect, knowledge.payload, set_region_east, set_region_north);
+    let c1: qb.Query = edsl.lower_set_count('Union, knowledge.payload, set_region_east, set_region_north);
+    let c2: qb.Query = edsl.lower_set_count('Union, knowledge.payload, set_region_east, set_region_north);
+    q1.sql == q2.sql && q1.bindings == q2.bindings
+        && c1.sql == c2.sql && c1.bindings == c2.bindings
+};
+
+# ---------------------------------------------------------------------------
+# Hidden same-source aggregate HAVING.
+# ---------------------------------------------------------------------------
+
+def hidden_having_request: edsl.QueryRequest = {
+    measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_hidden_having_same_source: Bool = do {
+    let hidden: Array(edsl.InternalHavingRequest) = [
+        { measure: "OrderCount", subject: "analyst", op: 'Ge, threshold: 'Int(2) },
+    ];
+    let plan: qb.Plan = edsl.lower_hidden_having(knowledge.payload, hidden_having_request, hidden);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['Int(2)];
+    let hidden_not_projected = !array.any(plan.projection, fn(item) {
+        match item {
+            'Aggregate(agg) => agg.alias == "OrderCount",
+            'Computed(c) => c.alias == "OrderCount",
+            'Expr(_) => 'False,
+        }
+    });
+    check(hidden_not_projected, "hidden having: the hidden measure never appears in the projection")
+        && check(string.contains(query.sql, "GROUP BY o.region HAVING count(o.order_id) >= ?"),
+            "hidden having: hidden same-source aggregate HAVING lowers over the grouped request")
+        && check(query.bindings == expected, "hidden having: threshold enters ordered bindings")
+};
+
+def check_hidden_having_determinism_and_probe: Bool = do {
+    let hidden: Array(edsl.InternalHavingRequest) = [
+        { measure: "OrderCount", subject: "analyst", op: 'Gt, threshold: 'Int(1) },
+    ];
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_hidden_having(knowledge.payload, hidden_having_request, hidden));
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_hidden_having(knowledge.payload, hidden_having_request, hidden));
+    let orders = entity_id_index(knowledge.payload.entities, "orders");
+    let customers = entity_id_index(knowledge.payload.entities, "customers");
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings, "hidden having: repeated lowering is byte-identical")
+        && check(edsl.same_source_having_ok(knowledge.payload, orders, "analyst", "OrderCount"), "hidden having probe: same-source measure is feasible")
+        && check(!edsl.same_source_having_ok(knowledge.payload, orders, "outsider", "OrderCount"), "hidden having probe: unauthorized subject is rejected")
+        && check(!edsl.same_source_having_ok(knowledge.payload, orders, "analyst", "MissingMeasure"), "hidden having probe: unknown measure is rejected")
+        && check(!edsl.same_source_having_ok(knowledge.payload, customers, "analyst", "OrderCount"), "hidden having probe: cross-entity measure is rejected")
+};
+
+# ---------------------------------------------------------------------------
+# Attribute versus scalar aggregate subquery (ontology phase).
+# ---------------------------------------------------------------------------
+
+def attribute_compare_listing_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_attribute_vs_scalar_aggregate: Bool = do {
+    # Numeric outer attribute (OrderId, Int key/plain dimension) vs numeric
+    # aggregate result (sum(OrderAmount), Float): the one type-compatible shape
+    # the public contract supports as a positive case.
+    let orders = entity_id_index(knowledge.payload.entities, "orders");
+    let spec: edsl.ScalarCompareRequest = {
+        attribute: "OrderId",
+        subject: "analyst",
+        op: 'Gt,
+        measure: "OrderAmount",
+        scope_filters: [],
+    };
+    let plan: qb.Plan = edsl.lower_attribute_compare(knowledge.payload, attribute_compare_listing_request, [spec]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = [];
+    check(array.length(plan.scalar_comparisons) == 1, "attribute compare: exactly one Plan-level comparison predicate")
+        && check(array.length(plan.projection) == 1 && expr_item_count(plan.projection) == 1,
+            "attribute compare: the outer listing projection keeps the requested dimension only")
+        && check(string.contains(query.sql, "SELECT o.region FROM orders AS o WHERE o.order_id > (SELECT sum(o.amount) FROM orders AS o)"),
+            "attribute compare: numeric outer attribute is compared to a parenthesized numeric scalar aggregate subquery")
+        && check(query.bindings == expected, "attribute compare: no dynamic values enter the comparison")
+};
+
+def check_attribute_vs_scalar_aggregate_probe_and_determinism: Bool = do {
+    let orders = entity_id_index(knowledge.payload.entities, "orders");
+    let customers = entity_id_index(knowledge.payload.entities, "customers");
+    let spec: edsl.ScalarCompareRequest = {
+        attribute: "OrderId",
+        subject: "analyst",
+        op: 'Gt,
+        measure: "OrderAmount",
+        scope_filters: [],
+    };
+    let p1: qb.Plan = edsl.lower_attribute_compare(knowledge.payload, attribute_compare_listing_request, [spec]);
+    let p2: qb.Plan = edsl.lower_attribute_compare(knowledge.payload, attribute_compare_listing_request, [spec]);
+    let q1: qb.Query = qb.transform_sqlite(p1);
+    let q2: qb.Query = qb.transform_sqlite(p2);
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings, "attribute compare: repeated lowering is byte-identical")
+        && check(edsl.attribute_compare_ok(knowledge.payload, orders, "analyst", "OrderId", "OrderAmount"),
+            "attribute compare probe: a numeric outer attribute and a numeric aggregate result are feasible")
+        && check(edsl.attribute_compare_ok(knowledge.payload, orders, "analyst", "OrderId", "OrderCount"),
+            "attribute compare probe: Count's integer result is part of the numeric family")
+        && check(!edsl.attribute_compare_ok(knowledge.payload, orders, "outsider", "OrderId", "OrderAmount"),
+            "attribute compare probe: an unauthorized role is rejected")
+        && check(!edsl.attribute_compare_ok(knowledge.payload, orders, "analyst", "MissingAttribute", "OrderAmount"),
+            "attribute compare probe: an unknown attribute is rejected")
+        && check(!edsl.attribute_compare_ok(knowledge.payload, customers, "analyst", "OrderRegion", "OrderAmount"),
+            "attribute compare probe: an attribute off the base entity is rejected")
+        && check(!edsl.attribute_compare_ok(knowledge.payload, orders, "analyst", "OrderRegion", "OrderAmount"),
+            "attribute compare probe: text-vs-number (OrderRegion vs sum) is type-incompatible and rejected")
+        && check(!edsl.attribute_compare_ok(knowledge.payload, customers, "analyst", "CustomerTier", "CustomerCount"),
+            "attribute compare probe: enum-text-vs-number (CustomerTier vs count) is type-incompatible and rejected")
+        && check(!edsl.attribute_compare_ok(knowledge.payload, orders, "analyst", "OrderId", "MissingMeasure"),
+            "attribute compare probe: an unknown measure is rejected")
+};
+
+# ---------------------------------------------------------------------------
+# Scoped attribute-versus-scalar-aggregate comparisons (ontology feedback).
+#
+# `ScalarCompareRequest.scope_filters` narrows the INNER measure's own rows with
+# an ordered list of closed `FilterRequest` values resolved against the inner
+# measure's entity and vocabulary.  The scalar inner plan stays flat and
+# non-recursive: no joins, grouping, nested comparisons, raw SQL, aliases,
+# tables or open expressions are introduced.  Empty scope preserves the global
+# aggregate behavior.
+# ---------------------------------------------------------------------------
+
+def sc_avg_agg: qb.AggregateFunction = 'Avg;
+def sc_max_agg: qb.AggregateFunction = 'Max;
+def sc_min_agg: qb.AggregateFunction = 'Min;
+def sc_sum_agg: qb.AggregateFunction = 'Sum;
+def sc_int_kinds: Array(edsl.FilterInputKind) = ['Int];
+
+@edsl.entity_id("sc_accounts")
+@edsl.entity_source("sc_accounts", "sa")
+type ScAccount = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.dimension("ScAccountId", flag_true, flag_true, eq_ops, sc_int_kinds)
+    id: Int,
+    @edsl.column("kind")
+    @edsl.dimension("ScAccountKind", flag_true, flag_true, eq_ops, text_kinds)
+    kind: String,
+};
+
+@edsl.entity_id("sc_txns")
+@edsl.entity_source("sc_txns", "st")
+type ScTxn = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("ScTxnCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("account_id")
+    account_id: Int,
+    @edsl.column("amount_avg")
+    @edsl.measure("ScTxnAvg", sc_avg_agg, no_requires)
+    amount_avg: Float,
+    @edsl.column("amount_max")
+    @edsl.measure("ScTxnMax", sc_max_agg, no_requires)
+    amount_max: Float,
+    @edsl.column("amount_min")
+    @edsl.measure("ScTxnMin", sc_min_agg, no_requires)
+    amount_min: Float,
+    @edsl.column("category")
+    @edsl.dimension("ScTxnCategory", flag_true, flag_true, eq_ops, text_kinds)
+    category: String,
+    @edsl.column("status")
+    @edsl.dimension("ScTxnStatus", flag_true, flag_true, eq_ops, text_kinds)
+    status: String,
+    @edsl.column("secret")
+    @edsl.dimension("ScTxnSecret", flag_false, flag_true, eq_ops, text_kinds)
+    secret: String,
+    @edsl.column("ref")
+    @edsl.dimension("ScTxnRef", flag_true, flag_false, eq_ops, text_kinds)
+    ref: String,
+};
+
+def sc_entity_types: Array(Type) = [ScAccount, ScTxn];
+
+def sc_authorize: Fn(String) -> Bool = fn(subject) { subject == "analyst" };
+
+def sc_payload: edsl.PreparedPayload = do {
+    edsl.build_root("sc-v1", sc_entity_types, knowledge.profile, sc_authorize)
+};
+
+def sc_listing_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "ScAccountId", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def sc_account_index: Fn() -> Int = fn() {
+    match array.find(sc_payload.entities, fn(e) { e.id == "sc_accounts" }) {
+        'Some(e) => e.index,
+        'None => fail!("sc_accounts entity missing"),
+    }
+};
+
+def sc_txn_index: Fn() -> Int = fn() {
+    match array.find(sc_payload.entities, fn(e) { e.id == "sc_txns" }) {
+        'Some(e) => e.index,
+        'None => fail!("sc_txns entity missing"),
+    }
+};
+
+def sc_compare_spec: Fn(String, Array(edsl.FilterRequest)) -> edsl.ScalarCompareRequest = fn(measure, scope_filters) {
+    let spec: edsl.ScalarCompareRequest = {
+        attribute: "ScAccountId",
+        subject: "analyst",
+        op: 'Gt,
+        measure: measure,
+        scope_filters: scope_filters,
+    };
+    spec
+};
+
+def sc_two_scope_spec: edsl.ScalarCompareRequest = sc_compare_spec("ScTxnAvg", [
+    { id: "ScTxnCategory", subject: "analyst", op: 'Eq, input: 'Text("travel") },
+    { id: "ScTxnStatus", subject: "analyst", op: 'Eq, input: 'Text("cleared") },
+]);
+
+def sc_empty_scope_spec: edsl.ScalarCompareRequest = sc_compare_spec("ScTxnAvg", []);
+
+def check_scoped_attribute_compare_positive: Bool = do {
+    # Numeric outer attribute (ScAccountId, Int) compared with a filtered
+    # numeric avg aggregate over the inner entity, with TWO ordered scope
+    # filters (AND, deterministic declared order, exact SQL/bindings).
+    let plan: qb.Plan = edsl.lower_attribute_compare(sc_payload, sc_listing_request, [sc_two_scope_spec]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = ['String("travel"), 'String("cleared")];
+    let expected_sql = "SELECT sa.id FROM sc_accounts AS sa WHERE sa.id > (SELECT avg(st.amount_avg) FROM sc_txns AS st WHERE (st.category = ? AND st.status = ?))";
+    check(array.length(plan.scalar_comparisons) == 1, "scoped compare: exactly one Plan-level comparison predicate")
+        && check(array.length(plan.projection) == 1 && expr_item_count(plan.projection) == 1,
+            "scoped compare: the exact outer projection is preserved (listing dimension only)")
+        && check(query.sql == expected_sql, "scoped compare: inner scope filters AND inside the scalar subquery in declared order")
+        && check(query.bindings == expected, "scoped compare: scope filter values bind in declared order inside the subquery")
+        && check(array.length(plan.joins) == 0 && array.length(plan.exists) == 0,
+            "scoped compare: the scalar inner plan stays flat (no joins/EXISTS)")
+        && check(!string.contains(query.sql, "coalesce"), "scoped compare: native NULL semantics (no injected coalesce)")
+};
+
+def check_scoped_attribute_compare_min_max: Bool = do {
+    # Filtered min/max aggregates are also expressible through the same scoped
+    # shape.
+    let max_spec = sc_compare_spec("ScTxnMax", [
+        { id: "ScTxnCategory", subject: "analyst", op: 'Eq, input: 'Text("travel") },
+    ]);
+    let min_spec = sc_compare_spec("ScTxnMin", [
+        { id: "ScTxnStatus", subject: "analyst", op: 'Eq, input: 'Text("cleared") },
+    ]);
+    let max_q: qb.Query = qb.transform_sqlite(edsl.lower_attribute_compare(sc_payload, sc_listing_request, [max_spec]));
+    let min_q: qb.Query = qb.transform_sqlite(edsl.lower_attribute_compare(sc_payload, sc_listing_request, [min_spec]));
+    let expected_max: Array(qb.Val) = ['String("travel")];
+    let expected_min: Array(qb.Val) = ['String("cleared")];
+    check(string.contains(max_q.sql, "sa.id > (SELECT max(st.amount_max) FROM sc_txns AS st WHERE st.category = ?)"),
+        "scoped compare: filtered max aggregate renders with its single scope filter")
+        && check(string.contains(min_q.sql, "sa.id > (SELECT min(st.amount_min) FROM sc_txns AS st WHERE st.status = ?)"),
+            "scoped compare: filtered min aggregate renders with its single scope filter")
+        && check(max_q.bindings == expected_max && min_q.bindings == expected_min,
+            "scoped compare: min/max scope bindings keep declared order")
+};
+
+def check_scoped_attribute_compare_empty_and_determinism: Bool = do {
+    let accounts = sc_account_index();
+    let p1: qb.Plan = edsl.lower_attribute_compare(sc_payload, sc_listing_request, [sc_empty_scope_spec]);
+    let p2: qb.Plan = edsl.lower_attribute_compare(sc_payload, sc_listing_request, [sc_empty_scope_spec]);
+    let q1: qb.Query = qb.transform_sqlite(p1);
+    let q2: qb.Query = qb.transform_sqlite(p2);
+    let expected_sql = "SELECT sa.id FROM sc_accounts AS sa WHERE sa.id > (SELECT avg(st.amount_avg) FROM sc_txns AS st)";
+    let expected: Array(qb.Val) = [];
+    check(q1.sql == expected_sql && q1.bindings == expected,
+        "scoped compare: empty scope preserves the global (unscoped) aggregate behavior")
+        && check(edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", []),
+            "scoped compare probe: empty-scope scoped probe is feasible (compatible with the unscoped probe)")
+        && check(edsl.attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg"),
+            "scoped compare: the existing unscoped probe stays useful")
+        && check(q1.sql == q2.sql && q1.bindings == q2.bindings,
+            "scoped compare: repeated lowering is byte-identical")
+};
+
+def check_scoped_attribute_compare_profile_and_projection: Bool = do {
+    let plan: qb.Plan = edsl.lower_attribute_compare(sc_payload, sc_listing_request, [sc_two_scope_spec]);
+    let narrow: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+            'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order, 'Limit,
+            'Offset, 'Partition,
+        ],
+        allowed_join_kinds: ['Inner, 'Left],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'Lower, 'Length, 'JsonExtract, 'JsonType, 'JsonValid, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allow_distinct: 'True,
+    };
+    check(qb.profile_accepts(plan, knowledge.profile), "scoped compare: the full profile accepts the scoped plan")
+        && check(!qb.profile_accepts(plan, narrow),
+            "scoped compare: a profile without the Avg aggregate rejects the scoped plan recursively")
+        && check(array.length(plan.projection) == 1,
+            "scoped compare: the exact projection stays the requested listing dimension")
+};
+
+def check_scoped_attribute_compare_rejections: Bool = do {
+    let accounts = sc_account_index();
+    let txns = sc_txn_index();
+    # Scope filter owned by the OUTER (base) entity rather than the inner
+    # measure's entity: rejected (never resolved against the outer attribute
+    # entity, never moved into the outer plan filter).
+    let outer_owned: Array(edsl.FilterRequest) = [
+        { id: "ScAccountId", subject: "analyst", op: 'Eq, input: 'Int(7) },
+    ];
+    # Cross-entity scope: a dimension of a third/unrelated entity.
+    let cross_owned: Array(edsl.FilterRequest) = [
+        { id: "OrderRegion", subject: "analyst", op: 'Eq, input: 'Text("east") },
+    ];
+    let unknown: Array(edsl.FilterRequest) = [
+        { id: "MissingDim", subject: "analyst", op: 'Eq, input: 'Text("x") },
+    ];
+    let unauthorized: Array(edsl.FilterRequest) = [
+        { id: "ScTxnSecret", subject: "analyst", op: 'Eq, input: 'Text("x") },
+    ];
+    let unfilterable: Array(edsl.FilterRequest) = [
+        { id: "ScTxnRef", subject: "analyst", op: 'Eq, input: 'Text("x") },
+    ];
+    let bad_op: Array(edsl.FilterRequest) = [
+        { id: "ScTxnCategory", subject: "analyst", op: 'Contains, input: 'Text("travel") },
+    ];
+    let bad_input: Array(edsl.FilterRequest) = [
+        { id: "ScTxnCategory", subject: "analyst", op: 'Eq, input: 'Int(5) },
+    ];
+    let outer_role: Array(edsl.FilterRequest) = [
+        { id: "ScTxnCategory", subject: "outsider", op: 'Eq, input: 'Text("travel") },
+    ];
+    check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", outer_owned),
+        "scoped compare probe: a scope filter owned by the outer base entity (not the inner entity) is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", cross_owned),
+            "scoped compare probe: a cross-entity scope dimension is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", unknown),
+            "scoped compare probe: an unknown scope dimension is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", unauthorized),
+            "scoped compare probe: an unauthorized scope dimension is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", unfilterable),
+            "scoped compare probe: an unfilterable scope dimension is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", bad_op),
+            "scoped compare probe: an unsupported scope filter operator is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", bad_input),
+            "scoped compare probe: an invalid scope filter input type is rejected")
+        && check(!edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", outer_role),
+            "scoped compare probe: an unauthorized scope filter subject is rejected")
+        && check(edsl.scoped_attribute_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnAvg", [
+            { id: "ScTxnCategory", subject: "analyst", op: 'Eq, input: 'Text("travel") },
+            { id: "ScTxnStatus", subject: "analyst", op: 'Eq, input: 'Text("cleared") },
+        ]),
+        "scoped compare probe: two inner-entity scope filters on the same measure are feasible")
+};
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Ranked grouped-key comparison (ontology typed entry).
+#
+# `lower_ranked_key_compare` exposes the query-core `RankedKeyComparison`: outer
+# detail rows are kept when their attribute equals (or otherwise compares to)
+# the grouping key of the FIRST inner group after aggregate ordering, rendered
+# as `(SELECT <key> ... GROUP BY <key> ORDER BY <agg> <dir> LIMIT 1)`.  The
+# ranking measure is never projected; the outer projection is unchanged.
+# ---------------------------------------------------------------------------
+
+def sc_ranked_kind_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "ScAccountKind", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def sc_ranked_txn_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "ScTxnCategory", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def sc_ranked_spec: Fn(String, String, edsl.OrderDirection, Array(edsl.FilterRequest)) -> edsl.RankedKeyCompareRequest = fn(measure, group, direction, scope) {
+    let spec: edsl.RankedKeyCompareRequest = {
+        attribute: "ScAccountKind",
+        subject: "analyst",
+        op: 'Eq,
+        group: group,
+        measure: measure,
+        direction: direction,
+        scope_filters: scope,
+    };
+    spec
+};
+
+def sc_ranked_self_spec: Fn(String, edsl.OrderDirection, Array(edsl.FilterRequest)) -> edsl.RankedKeyCompareRequest = fn(measure, direction, scope) {
+    let spec: edsl.RankedKeyCompareRequest = {
+        attribute: "ScTxnCategory",
+        subject: "analyst",
+        op: 'Eq,
+        group: "ScTxnCategory",
+        measure: measure,
+        direction: direction,
+        scope_filters: scope,
+    };
+    spec
+};
+
+def check_ranked_key_positive: Bool = do {
+    # Multi-entity positive: outer account kind rows are filtered by the related
+    # txn category whose max(amount_max) ranks first (DESC).  The outer
+    # projection is only the requested listing dimension.
+    let spec = sc_ranked_spec("ScTxnMax", "ScTxnCategory", 'Desc, []);
+    let plan: qb.Plan = edsl.lower_ranked_key_compare(sc_payload, sc_ranked_kind_request, [spec]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected: Array(qb.Val) = [];
+    let expected_sql = "SELECT sa.kind FROM sc_accounts AS sa WHERE sa.kind = (SELECT st.category FROM sc_txns AS st GROUP BY st.category ORDER BY max(st.amount_max) DESC LIMIT 1)";
+    check(array.length(plan.ranked_key_comparisons) == 1, "ranked key: exactly one Plan-level grouped-key comparison predicate")
+        && check(array.length(plan.projection) == 1 && expr_item_count(plan.projection) == 1,
+            "ranked key: the exact outer projection is preserved (only the listing dimension)")
+        && check(query.sql == expected_sql, "ranked key: outer detail rows compare to the first group key after max aggregate ranking")
+        && check(query.bindings == expected, "ranked key: the max-rank comparison binds no dynamic values")
+        && check(!string.contains(query.sql, "coalesce"), "ranked key: native NULL comparison behavior")
+};
+
+def check_ranked_key_scoped_and_min_asc: Bool = do {
+    # Scoped positive: an ordered inner scope filter narrows the ranked groups
+    # (deterministic AND inside the subquery).  Ascending min-rank direct-source
+    # positive is also covered.
+    let scoped = sc_ranked_spec("ScTxnMin", "ScTxnCategory", 'Asc, [
+        { id: "ScTxnStatus", subject: "analyst", op: 'Eq, input: 'Text("cleared") },
+    ]);
+    let q1: qb.Query = qb.transform_sqlite(edsl.lower_ranked_key_compare(sc_payload, sc_ranked_kind_request, [scoped]));
+    let expected1: Array(qb.Val) = ['String("cleared")];
+    let self_spec = sc_ranked_self_spec("ScTxnCount", 'Desc, []);
+    let q2: qb.Query = qb.transform_sqlite(edsl.lower_ranked_key_compare(sc_payload, sc_ranked_txn_request, [self_spec]));
+    check(q1.sql == "SELECT sa.kind FROM sc_accounts AS sa WHERE sa.kind = (SELECT st.category FROM sc_txns AS st WHERE st.status = ? GROUP BY st.category ORDER BY min(st.amount_min) ASC LIMIT 1)"
+            && q1.bindings == expected1,
+        "ranked key: a scoped ascending min-rank grouped-key subquery keeps deterministic clause and binding order")
+        && check(q2.sql == "SELECT st.category FROM sc_txns AS st WHERE st.category = (SELECT st.category FROM sc_txns AS st GROUP BY st.category ORDER BY count(st.id) DESC LIMIT 1)",
+            "ranked key: a direct-source (same-grain) rank comparison lowers without any extra machinery")
+        && check(array.length(q2.bindings) == 0, "ranked key: the direct-source count-rank comparison binds nothing")
+};
+
+def check_ranked_key_rejections: Bool = do {
+    let accounts = sc_account_index();
+    let txns = sc_txn_index();
+    let incompatible = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountId", "ScTxnCategory", "ScTxnMax", 'Desc, []);
+    let bad_grain = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "ScAccountKind", "ScTxnMax", 'Desc, []);
+    let bad_attr = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "MissingAttr", "ScTxnCategory", "ScTxnMax", 'Desc, []);
+    let bad_group = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "MissingGroup", "ScTxnMax", 'Desc, []);
+    let bad_measure = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "ScTxnCategory", "MissingMeasure", 'Desc, []);
+    let unauthorized_group = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "ScTxnSecret", "ScTxnMax", 'Desc, []);
+    let bad_scope_owner = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "ScTxnCategory", "ScTxnMax", 'Desc, [
+        { id: "ScAccountKind", subject: "analyst", op: 'Eq, input: 'Text("premium") },
+    ]);
+    let bad_scope_value = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "ScTxnCategory", "ScTxnMax", 'Desc, [
+        { id: "ScTxnCategory", subject: "analyst", op: 'Eq, input: 'Int(3) },
+    ]);
+    let ok = edsl.ranked_key_compare_ok(sc_payload, accounts, "analyst", "ScAccountKind", "ScTxnCategory", "ScTxnMax", 'Desc, []);
+    check(!incompatible, "ranked key probe: incompatible outer-key/group-key types are rejected")
+        && check(!bad_grain, "ranked key probe: a ranking measure off the inner population grain is rejected")
+        && check(!bad_attr, "ranked key probe: an unknown outer attribute is rejected")
+        && check(!bad_group, "ranked key probe: an unknown grouping dimension is rejected")
+        && check(!bad_measure, "ranked key probe: an unknown ranking measure is rejected")
+        && check(!unauthorized_group, "ranked key probe: an unauthorized grouping dimension is rejected")
+        && check(!bad_scope_owner, "ranked key probe: a scope filter owned outside the inner population is rejected")
+        && check(!bad_scope_value, "ranked key probe: an invalid scope filter input type is rejected")
+        && check(ok, "ranked key probe: a compatible multi-entity max-rank comparison is feasible")
+};
+
+def check_ranked_key_determinism_profile_and_compat: Bool = do {
+    let spec = sc_ranked_spec("ScTxnMax", "ScTxnCategory", 'Desc, []);
+    let p1: qb.Plan = edsl.lower_ranked_key_compare(sc_payload, sc_ranked_kind_request, [spec]);
+    let p2: qb.Plan = edsl.lower_ranked_key_compare(sc_payload, sc_ranked_kind_request, [spec]);
+    let q1: qb.Query = qb.transform_sqlite(p1);
+    let q2: qb.Query = qb.transform_sqlite(p2);
+    let narrow: qb.PlanProfile = {
+        allowed_operators: [
+            'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
+            'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order, 'Limit,
+            'Offset, 'Partition,
+        ],
+        allowed_join_kinds: ['Inner, 'Left],
+        allowed_aggregates: ['Count],
+        allowed_scalars: ['Substr, 'Instr, 'If, 'Add, 'Sub, 'Lower, 'Length, 'JsonExtract, 'JsonType, 'JsonValid, 'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not],
+        allow_distinct: 'True,
+    };
+    check(q1.sql == q2.sql && q1.bindings == q2.bindings, "ranked key: repeated lowering is byte-identical")
+        && check(qb.profile_accepts(p1, knowledge.profile), "ranked key: the full profile accepts the ranked comparison")
+        && check(!qb.profile_accepts(p1, narrow), "ranked key: a profile without the inner ranking aggregate rejects recursively")
+        && check(array.length(p1.scalar_comparisons) == 0, "ranked key: existing scalar aggregate comparisons stay unchanged (none injected)")
+};
+
+# ---------------------------------------------------------------------------
+# Ranked grouped-key comparison with the hidden outer attribute on a safely
+# reachable PARENT entity (ontology feedback: materialize the ranked outer
+# join).  RkLine is the detail-grain base; its Safe owner RkParent carries the
+# compared zone attribute; the inner population RkEvent is unrelated and only
+# supplies the ranked grouping key.  Lowering must add exactly the prepared
+# safe-path join so the owning alias is visible, without touching the original
+# detail grain or projection.
+# ---------------------------------------------------------------------------
+
+@edsl.entity_id("rk_lines")
+@edsl.entity_source("rk_lines", "rl")
+@edsl.relation(RkParent, safe_kind, 2, 0)
+type RkLine = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("label")
+    @edsl.dimension("RkLineLabel", flag_true, flag_true, eq_ops, text_kinds)
+    label: String,
+    @edsl.column("parent_id")
+    parent_id: Int,
+};
+
+@edsl.entity_id("rk_parents")
+@edsl.entity_source("rk_parents", "rp")
+type RkParent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("zone")
+    @edsl.dimension("RkParentZone", flag_true, flag_true, eq_ops, text_kinds)
+    zone: String,
+};
+
+@edsl.entity_id("rk_events")
+@edsl.entity_source("rk_events", "re")
+type RkEvent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("RkEventCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("zone")
+    @edsl.dimension("RkEventZone", flag_true, flag_true, eq_ops, text_kinds)
+    zone: String,
+};
+
+def rk_entity_types: Array(Type) = [RkLine, RkParent, RkEvent];
+
+def rk_authorize: Fn(String) -> Bool = fn(subject) { 'True };
+
+def rk_payload: edsl.PreparedPayload = do {
+    edsl.build_root("rk-v1", rk_entity_types, knowledge.profile, rk_authorize)
+};
+
+def rk_line_listing_request: edsl.QueryRequest = {
+    measures: [],
+    dimensions: [{ id: "RkLineLabel", subject: "analyst", input: 'None }],
+    filters: [],
+    ordering: [],
+    limit: 'None,
+    offset: 'None,
+    partition: 'None,
+};
+
+def check_ranked_key_outer_parent_join: Bool = do {
+    # Detail-grain base (rk_lines) whose hidden outer comparison attribute
+    # (RkParentZone) lives on its safely reachable parent (rk_parents).  The
+    # prepared Safe path's join must be materialized in the outer plan so the
+    # owning alias rp is visible; the exact projection (only the requested
+    # listing dimension) and the detail grain are preserved, and neither the
+    # comparison attribute nor the ranking measure is exposed.
+    let spec: edsl.RankedKeyCompareRequest = {
+        attribute: "RkParentZone",
+        subject: "analyst",
+        op: 'Eq,
+        group: "RkEventZone",
+        measure: "RkEventCount",
+        direction: 'Desc,
+        scope_filters: [],
+    };
+    let plan: qb.Plan = edsl.lower_ranked_key_compare(rk_payload, rk_line_listing_request, [spec]);
+    let query: qb.Query = qb.transform_sqlite(plan);
+    let expected_sql = "SELECT rl.label FROM rk_lines AS rl INNER JOIN rk_parents AS rp ON rl.parent_id = rp.id WHERE rp.zone = (SELECT re.zone FROM rk_events AS re GROUP BY re.zone ORDER BY count(re.id) DESC LIMIT 1)";
+    let expected: Array(qb.Val) = [];
+    let join_ok = array.length(plan.joins) == 1
+        && (match get_index(plan.joins, 0).kind { 'Inner => 'True, 'Left => 'False })
+        && get_index(plan.joins, 0).source.alias == "rp"
+        && get_index(plan.joins, 0).source.table == "rk_parents";
+    let lines = entity_id_index(rk_payload.entities, "rk_lines");
+    check(query.sql == expected_sql, "ranked outer join: exact SQL materializes the safe-path parent join for the hidden comparison attribute")
+        && check(query.bindings == expected, "ranked outer join: no dynamic values are bound")
+        && check(join_ok, "ranked outer join: the outer plan carries exactly the prepared safe-path parent join")
+        && check(array.length(plan.ranked_key_comparisons) == 1, "ranked outer join: exactly one grouped-key comparison predicate")
+        && check(array.length(plan.projection) == 1
+            && (match get_index(plan.projection, 0) { 'Expr(e) => is_column(e, "rl", "label"), _ => 'False }),
+            "ranked outer join: the original detail-grain projection is preserved (no attribute or ranking measure exposed)")
+        && check(array.length(plan.grouping) == 0, "ranked outer join: the detail grain is not grouped")
+        && check(edsl.ranked_key_compare_ok(rk_payload, lines, "analyst", "RkParentZone", "RkEventZone", "RkEventCount", 'Desc, []),
+            "ranked outer join probe: an attribute on a safely reachable parent is feasible")
+};
+
+# ---------------------------------------------------------------------------
+# Ranked grouped-key comparison route-rejection boundary (ontology feedback:
+# close ranked outer-route safety).  Synthetic domain-neutral fixtures only.
+#
+# 1. A fan-out-only route to the attribute owner must be rejected (a join would
+#    amplify the detail grain).
+# 2. Parallel / otherwise ambiguous Safe routes to the attribute owner must be
+#    rejected: the route is never chosen by declaration order.
+# 3. A missing/undeclared route to the attribute owner must be rejected.
+# 4. A derived (union) outer plan that would need the added safe join must be
+#    rejected (non-physical outer plan).
+# The pure probe asserts every rejection without failing; lowering rejects each
+# shape with its own diagnostic and never emits a partial plan.
+# ---------------------------------------------------------------------------
+
+@edsl.entity_id("rk_fan_lines")
+@edsl.entity_source("rk_fan_lines", "rfl")
+@edsl.relation(RkFanParent, fanout_kind, 2, 0)
+type RkFanLine = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("label")
+    @edsl.dimension("RkFanLineLabel", flag_true, flag_true, eq_ops, text_kinds)
+    label: String,
+    @edsl.column("parent_id")
+    parent_id: Int,
+};
+
+@edsl.entity_id("rk_fan_parents")
+@edsl.entity_source("rk_fan_parents", "rfp")
+type RkFanParent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("zone")
+    @edsl.dimension("RkFanParentZone", flag_true, flag_true, eq_ops, text_kinds)
+    zone: String,
+};
+
+def rk_fan_entity_types: Array(Type) = [RkFanLine, RkFanParent, RkEvent];
+
+def rk_fan_payload: edsl.PreparedPayload = do {
+    edsl.build_root("rk-fan-v1", rk_fan_entity_types, knowledge.profile, rk_authorize)
+};
+
+@edsl.entity_id("rk_amb_lines")
+@edsl.entity_source("rk_amb_lines", "ral")
+@edsl.relation(RkAmbParent, safe_kind, 2, 0)
+@edsl.relation(RkAmbParent, safe_kind, 3, 0)
+type RkAmbLine = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("label")
+    @edsl.dimension("RkAmbLineLabel", flag_true, flag_true, eq_ops, text_kinds)
+    label: String,
+    @edsl.column("primary_parent_id")
+    primary_parent_id: Int,
+    @edsl.column("secondary_parent_id")
+    secondary_parent_id: Int,
+};
+
+@edsl.entity_id("rk_amb_parents")
+@edsl.entity_source("rk_amb_parents", "rap")
+type RkAmbParent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("zone")
+    @edsl.dimension("RkAmbParentZone", flag_true, flag_true, eq_ops, text_kinds)
+    zone: String,
+};
+
+def rk_amb_entity_types: Array(Type) = [RkAmbLine, RkAmbParent, RkEvent];
+
+def rk_amb_payload: edsl.PreparedPayload = do {
+    edsl.build_root("rk-amb-v1", rk_amb_entity_types, knowledge.profile, rk_authorize)
+};
+
+def rk_union_branch_a_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "id" },
+    { field: 1, column: "label" },
+    { field: 2, column: "parent_id" },
+];
+
+def rk_union_branch_b_cols: Array(edsl.UnionColumnDecl) = [
+    { field: 0, column: "key" },
+    { field: 1, column: "name" },
+    { field: 2, column: "owner_id" },
+];
+
+def rk_union_branches: Array(edsl.UnionBranchDecl) = [
+    { table: "rk_union_a", alias: "ua", columns: rk_union_branch_a_cols, filter: 'None },
+    { table: "rk_union_b", alias: "ub", columns: rk_union_branch_b_cols, filter: 'None },
+];
+
+# A derived (union) base entity: it declares a Safe relation to a parent owner,
+# but the outer plan is a derived UNION ALL with no physical source/join slot,
+# so a ranked parent-attribute join cannot be represented.
+@edsl.entity_id("rk_union_lines")
+@edsl.union_source("u", rk_union_branches)
+@edsl.relation(RkUnionParent, safe_kind, 2, 0)
+type RkUnionLine = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("label")
+    @edsl.dimension("RkUnionLabel", flag_true, flag_true, eq_ops, text_kinds)
+    label: String,
+    @edsl.column("parent_id")
+    parent_id: Int,
+};
+
+@edsl.entity_id("rk_union_parents")
+@edsl.entity_source("rk_union_parents", "rup")
+type RkUnionParent = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    id: Int,
+    @edsl.column("zone")
+    @edsl.dimension("RkUnionParentZone", flag_true, flag_true, eq_ops, text_kinds)
+    zone: String,
+};
+
+def rk_union_entity_types: Array(Type) = [RkUnionLine, RkUnionParent, RkEvent];
+
+def rk_union_payload: edsl.PreparedPayload = do {
+    edsl.build_root("rk-union-v1", rk_union_entity_types, knowledge.profile, rk_authorize)
+};
+
+def check_ranked_key_fanout_route_rejected: Bool = do {
+    # The attribute owner is reachable only through a fan-out route; a hidden
+    # outer comparison join would multiply the detail grain.  The pure probe
+    # rejects it, and lowering fails with the fan-out diagnostic (no partial
+    # plan, no silent grain amplification).
+    let p = rk_fan_payload;
+    let lines = entity_id_index(p.entities, "rk_fan_lines");
+    let parents = entity_id_index(p.entities, "rk_fan_parents");
+    let path_is_fanout = match get_index(get_index(p.paths, lines), parents) {
+        'FanOut(_) => 'True,
+        _ => 'False,
+    };
+    let probe_rejects = !edsl.ranked_key_compare_ok(p, lines, "analyst", "RkFanParentZone", "RkEventZone", "RkEventCount", 'Desc, []);
+    let probe_control = edsl.ranked_key_compare_ok(p, lines, "analyst", "RkFanLineLabel", "RkEventZone", "RkEventCount", 'Desc, []);
+    check(path_is_fanout, "ranked route rejection: the owner is reachable only through a fan-out route")
+        && check(probe_rejects, "ranked route rejection probe: an attribute on a fan-out-only owner is rejected")
+        && check(probe_control, "ranked route rejection probe: an attribute on the base entity itself stays feasible")
+};
+
+def check_ranked_key_ambiguous_route_rejected: Bool = do {
+    # Two parallel Safe routes connect the detail base to the same attribute
+    # owner.  The path matrix still records a first Safe path, but the route is
+    # never chosen by declaration order: the prepared ambiguity matrix flags it
+    # and both the probe and lowering reject it.
+    let p = rk_amb_payload;
+    let lines = entity_id_index(p.entities, "rk_amb_lines");
+    let parents = entity_id_index(p.entities, "rk_amb_parents");
+    let path_is_safe = match get_index(get_index(p.paths, lines), parents) {
+        'Safe(_) => 'True,
+        _ => 'False,
+    };
+    let amb_flag = get_index(get_index(p.ambiguous_paths, lines), parents);
+    let probe_rejects = !edsl.ranked_key_compare_ok(p, lines, "analyst", "RkAmbParentZone", "RkEventZone", "RkEventCount", 'Desc, []);
+    let probe_control = edsl.ranked_key_compare_ok(p, lines, "analyst", "RkAmbLineLabel", "RkEventZone", "RkEventCount", 'Desc, []);
+    check(path_is_safe && amb_flag, "ranked route rejection: the ambiguity matrix flags parallel safe routes to the owner")
+        && check(probe_rejects, "ranked route rejection probe: an attribute on an ambiguously reachable owner is rejected")
+        && check(probe_control, "ranked route rejection probe: an attribute on the base entity itself stays feasible")
+};
+
+def check_ranked_key_missing_route_rejected: Bool = do {
+    # Missing/undeclared route: the attribute owner (rk_events) is unrelated to
+    # the detail base (rk_lines).  The probe rejects it; lowering fails with the
+    # missing-route diagnostic instead of guessing a path.
+    let p = rk_payload;
+    let lines = entity_id_index(p.entities, "rk_lines");
+    let events = entity_id_index(p.entities, "rk_events");
+    let path_missing = match get_index(get_index(p.paths, lines), events) {
+        'Missing => 'True,
+        _ => 'False,
+    };
+    let probe_rejects = !edsl.ranked_key_compare_ok(p, lines, "analyst", "RkEventZone", "RkEventZone", "RkEventCount", 'Desc, []);
+    check(path_missing, "ranked route rejection: the attribute owner has no declared route from the detail base")
+        && check(probe_rejects, "ranked route rejection probe: an attribute on an unreachable owner is rejected")
+};
+
+def check_ranked_key_derived_plan_join_rejected: Bool = do {
+    # A derived (union) base entity declares a Safe route to the attribute owner,
+    # but the outer plan is a derived UNION ALL with no physical source/join
+    # slot: the added ranked join cannot be represented safely, so the probe
+    # rejects the off-base attribute even though the route is Safe and unique.
+    let p = rk_union_payload;
+    let union_lines = entity_id_index(p.entities, "rk_union_lines");
+    let union_parents = entity_id_index(p.entities, "rk_union_parents");
+    let base_is_union = match get_index(p.entities, union_lines).union {
+        'Some(_) => 'True,
+        'None => 'False,
+    };
+    let safe_route = match get_index(get_index(p.paths, union_lines), union_parents) {
+        'Safe(_) => 'True,
+        _ => 'False,
+    };
+    let probe_rejects = !edsl.ranked_key_compare_ok(p, union_lines, "analyst", "RkUnionParentZone", "RkEventZone", "RkEventCount", 'Desc, []);
+    let probe_base_attr = edsl.ranked_key_compare_ok(p, union_lines, "analyst", "RkUnionLabel", "RkEventZone", "RkEventCount", 'Desc, []);
+    check(base_is_union && safe_route, "ranked route rejection: a derived union base has a unique Safe route to the owner")
+        && check(probe_rejects, "ranked route rejection probe: a derived outer plan that would need the added join is rejected")
+        && check(probe_base_attr, "ranked route rejection probe: an attribute on the derived base entity itself stays feasible")
+};
+
 # Explicit projection order (integrated feedback P1).
 #
 # Final column order is a result contract: the caller may interleave selected
@@ -3156,5 +4245,31 @@ export def test_ontology: Value = do {
     let c101 = check_related_aggregate_having;
     let c102 = check_related_aggregate_reverse_relation;
     let c103 = check_related_aggregate_deterministic_and_rejections;
+    let c104 = check_set_intersect_direct;
+    let c105 = check_set_union_and_except_keywords;
+    let c106 = check_set_outer_count;
+    let c107 = check_set_deterministic;
+    let c108 = check_hidden_having_same_source;
+    let c109 = check_hidden_having_determinism_and_probe;
+    let c110 = check_attribute_vs_scalar_aggregate;
+    let c111 = check_attribute_vs_scalar_aggregate_probe_and_determinism;
+    let c112 = check_scoped_attribute_compare_positive;
+    let c113 = check_scoped_attribute_compare_min_max;
+    let c114 = check_scoped_attribute_compare_empty_and_determinism;
+    let c115 = check_scoped_attribute_compare_profile_and_projection;
+    let c116 = check_scoped_attribute_compare_rejections;
+    let c117 = check_ranked_key_positive;
+    let c118 = check_ranked_key_scoped_and_min_asc;
+    let c119 = check_ranked_key_rejections;
+    let c120 = check_ranked_key_determinism_profile_and_compat;
+    let c121 = check_ranked_key_outer_parent_join;
+    let c122 = check_ranked_key_fanout_route_rejected;
+    let c123 = check_ranked_key_ambiguous_route_rejected;
+    let c124 = check_ranked_key_missing_route_rejected;
+    let c125 = check_ranked_key_derived_plan_join_rejected;
+    let c126 = check_related_two_hop_ordering_top_n;
+    let c127 = check_related_two_hop_having;
+    let c128 = check_related_two_hop_determinism;
+    let c129 = check_related_two_hop_rejection_probes;
     'String("ontology tests ok")
 };

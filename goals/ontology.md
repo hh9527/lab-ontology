@@ -6,6 +6,10 @@ types 和 type/member/variant properties 声明知识，一次性准备知识图
 
 ## 功能要求
 
+- 当 `feedbacks/ontology.md` 作为当前 artifact 输入时，其中明确标注为 ontology phase
+  的领域无关 lowering 属于本阶段必交范围；必须基于 query-core 已发布的原语完成 typed
+  eDSL API、验证、诊断、文档与测试，不得把部分实现作为 artifact 成功。
+
 - 用 typed property 表达实体数据源、字段列映射、key、指标、普通维度、计算维度、
   实体关系和 enum variant 的稳定值与标签。
 - `build_root` 显式接收实体类型、PlanProfile 和授权函数，收集 property，验证知识，

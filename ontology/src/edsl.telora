@@ -570,6 +570,11 @@ type PreparedPayload = struct {
     hub_routes: Array(HubRouteEntry),
     peer_routes: Array(PeerRouteEntry),
     paths: Array(Array(PathResult)),
+    # `ambiguous_paths[s][t]` is True when more than one distinct Safe path
+    # connects entity s to entity t (parallel or otherwise ambiguous declared
+    # Safe routes).  Precomputed once at prepare time; a hidden join route that
+    # must not be chosen by declaration order rejects on this matrix.
+    ambiguous_paths: Array(Array(Bool)),
     profile: qb.PlanProfile,
     authorize: Fn(String) -> Bool,
 };
@@ -1294,6 +1299,69 @@ def build_paths: Fn(Int, Array(RelationEntry)) -> Array(Array(PathResult)) = fn(
 };
 
 # ---------------------------------------------------------------------------
+# Safe-path ambiguity precomputation (prepare-time only).
+#
+# The path matrix records only the FIRST deterministic Safe path (by relation
+# enumeration order).  Hidden join routes that must never be chosen by
+# declaration order (the ranked grouped-key outer-attribute owner) additionally
+# consult `ambiguous_paths`: a cell is True when the owning entity is reachable
+# from the base through MORE THAN ONE distinct Safe path (parallel or otherwise
+# ambiguous declared Safe routes).  Counting is bounded per source by the same
+# depth cap as the path BFS and never runs on the hot path.
+# ---------------------------------------------------------------------------
+
+# Increment a path-count cell, capping at 2 (only "more than one" is needed).
+def path_count_add: Fn(Array(Int), Int) -> Array(Int) = fn(counts, index) {
+    let current = get_index(counts, index);
+    if current >= 2 {
+        counts
+    } else {
+        int_set_at(counts, index, current + 1)
+    }
+};
+
+def int_set_at: Fn(Array(Int), Int, Int) -> Array(Int) = fn(values, index, value) {
+    let enumerated = array.enumerate(values);
+    array.map(enumerated, fn(pair) { if pair.0 == index { value } else { pair.1 } })
+};
+
+# Count distinct simple Safe paths from the source: `counts[to]` is the number
+# of distinct Safe paths (length >= 1, <= path_depth_cap) from the source to
+# entity `to`.  `path_visited` marks the nodes on the CURRENT path only, so
+# parallel/diverging branches each keep their own ancestry (a diamond shape is
+# counted twice).  Folded counts thread across branches.
+def dfs_safe_path_counts: Fn(Array(Int), Array(Bool), Int, Array(RelationEntry), Int) -> Array(Int) = fn(counts, path_visited, node, relations, depth) {
+    if depth >= path_depth_cap {
+        counts
+    } else {
+        let enumerated = array.enumerate(relations);
+        array.fold(enumerated, counts, fn(acc, pair) {
+            let rel = pair.1;
+            if rel.from != node || rel.kind != 'Safe || visited_at(path_visited, rel.to) {
+                acc
+            } else {
+                let counts2 = path_count_add(acc, rel.to);
+                let visited2 = set_at(path_visited, rel.to, 'True);
+                dfs_safe_path_counts(counts2, visited2, rel.to, relations, depth + 1)
+            }
+        })
+    }
+};
+
+# The ambiguity row of one source: cell `to` is True when entity `to` is reached
+# from `from` through more than one distinct Safe path (self is never reached).
+def ambiguous_source_row: Fn(Int, Int, Array(RelationEntry)) -> Array(Bool) = fn(from, n, relations) {
+    let counts: Array(Int) = array.map(int_range(n), fn(i) { 0 });
+    let visited: Array(Bool) = array.map(int_range(n), fn(i) { i == from });
+    let counted = dfs_safe_path_counts(counts, visited, from, relations, 0);
+    array.map(counted, fn(c) { c >= 2 })
+};
+
+def build_ambiguous_paths: Fn(Int, Array(RelationEntry)) -> Array(Array(Bool)) = fn(n, relations) {
+    array.map(int_range(n), fn(from) { ambiguous_source_row(from, n, relations) })
+};
+
+# ---------------------------------------------------------------------------
 # Correlated-existence route preparation.
 #
 # A route is the author's explicit declaration of a bounded two-hop existence
@@ -1635,6 +1703,7 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
         peer_build_result.routes
     };
     let paths = build_paths(n, relations);
+    let ambiguous_paths = build_ambiguous_paths(n, relations);
     let payload: PreparedPayload = {
         revision,
         entities,
@@ -1645,6 +1714,7 @@ def build_root: Fn(String, Array(Type), qb.PlanProfile, Fn(String) -> Bool) -> P
         hub_routes,
         peer_routes,
         paths,
+        ambiguous_paths,
         profile,
         authorize,
     };
@@ -2277,6 +2347,8 @@ def rebuild_plan_filter: Fn(qb.Plan, Option(qb.Expr)) -> qb.Plan = fn(plan, filt
         limit: plan.limit,
         offset: plan.offset,
         partition: plan.partition,
+        scalar_comparisons: plan.scalar_comparisons,
+        ranked_key_comparisons: plan.ranked_key_comparisons,
     };
     rebuilt
 };
@@ -3550,6 +3622,8 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
             limit: if partition == 'None { limit } else { 'None },
             offset: if partition == 'None { offset } else { 'None },
             partition,
+            scalar_comparisons: [],
+        ranked_key_comparisons: [],
         };
         qb.validate(plan, payload.profile)
     }
@@ -3591,51 +3665,150 @@ def lower_internal_top: Fn(PreparedPayload, QueryRequest, Array(InternalOrderReq
 };
 
 # ---------------------------------------------------------------------------
-# Closed related-aggregate references (hidden aggregate over a directly-related
-# entity).  A related measure may live on the subject entity (no join) or on an
-# entity connected to the subject by exactly ONE declared relation (join in the
-# prepared direction).  The aggregate is used only for hidden ORDER BY and/or
-# hidden HAVING; it never enters the projection.  Grouping stays on subject
-# dimensions so related rows only aggregate and never change subject grain.
+# Closed related-aggregate references (hidden aggregate over a bounded declared
+# route).  A related measure may live on the subject entity (no join) or on an
+# entity reached from the subject through exactly ONE eligible prepared route of
+# AT MOST TWO declared relations (subject -> intermediate -> population).  The
+# aggregate is used only for hidden ORDER BY/Top-N and/or hidden HAVING; it
+# never enters the projection.  Grouping stays on subject dimensions so related
+# rows only aggregate and never change the subject grain.  Every hop comes from
+# prepared relation metadata; callers provide only the authorized measure id,
+# subject and order/HAVING fields (no tables/columns/aliases/join arrays).  The
+# existing direct-relation behavior is the one-hop case of this route.
 # ---------------------------------------------------------------------------
 
-# The single declared relation connecting two entities (in either direction),
-# or a stable attributable diagnostic when there is none / more than one.
-def related_relation_index: Fn(PreparedPayload, Int, Int) -> Int = fn(payload, base, entity) {
-    let conn = array.filter(array.enumerate(payload.relations), fn(p) {
-        (p.1.from == base && p.1.to == entity) || (p.1.from == entity && p.1.to == base)
-    });
-    if array.length(conn) == 0 {
-        fail!("related aggregate has no declared direct relation from the subject entity", base, entity)
-    } else if array.length(conn) > 1 {
-        fail!("related aggregate relation is ambiguous: multiple relations connect the subject and aggregate entities", base, entity)
+# One related-aggregate route: the aggregate population entity and the ordered
+# declared-relation hops from the subject to it (dependency order).
+type AggregateRoute = struct {
+    target: Int,
+    hops: Array(Int),
+};
+
+type RelatedRouteStatus = enum {
+    'Same,        # aggregate population is the subject itself (no join)
+    'Ok(AggregateRoute),
+    'Missing,     # no declared route at all
+    'Ambiguous,   # more than one eligible route of at most two relations
+    'OverDepth,   # reachable only through more than two declared relations
+};
+
+def connects: Fn(Int, Int, RelationEntry) -> Bool = fn(a, b, r) {
+    (r.from == a && r.to == b) || (r.from == b && r.to == a)
+};
+
+# One-hop candidate routes: every declared relation directly connecting the
+# subject and the aggregate population (either direction).
+def one_hop_routes: Fn(Array(RelationEntry), Int, Int) -> Array(Array(Int)) = fn(relations, subject, target) {
+    let enumerated = array.enumerate(relations);
+    array.fold(enumerated, [], fn(acc, pair) {
+        if connects(subject, target, pair.1) {
+            array.push(acc, [pair.0])
+        } else {
+            acc
+        }
+    })
+};
+
+# Two-hop candidate routes: every ordered pair (i, j) of declared relations that
+# reaches the aggregate population through a proper intermediate entity distinct
+# from both endpoints.  The route is never chosen by declaration order; all
+# candidates are enumerated so uniqueness is exact.
+def two_hop_routes: Fn(Array(RelationEntry), Int, Int) -> Array(Array(Int)) = fn(relations, subject, target) {
+    let n = array.length(relations);
+    let empty: Array(Array(Int)) = [];
+    array.fold(int_range(n), empty, fn(acc, i) {
+        let ri = get_index(relations, i);
+        let mid: Option(Int) = if ri.from == subject {
+            'Some(ri.to)
+        } else if ri.to == subject {
+            'Some(ri.from)
+        } else {
+            'None
+        };
+        match mid {
+            'None => acc,
+            'Some(x) => if x == subject || x == target {
+                acc
+            } else {
+                array.fold(int_range(n), acc, fn(inner, j) {
+                    if connects(x, target, get_index(relations, j)) {
+                        array.push(inner, [i, j])
+                    } else {
+                        inner
+                    }
+                })
+            },
+        }
+    })
+};
+
+# Pure route classifier for a related-aggregate reference: exactly one eligible
+# route of at most two declared relations is required; 'Missing / 'Ambiguous /
+# 'OverDepth distinguish the rejection for attributable diagnostics.  Never
+# fails, so tests can assert each boundary.
+def related_route_status: Fn(PreparedPayload, Int, Int) -> RelatedRouteStatus = fn(payload, subject, target) {
+    if target == subject {
+        'Same
     } else {
-        get_index(conn, 0).0
+        let relations = payload.relations;
+        let candidates = array.concat([one_hop_routes(relations, subject, target), two_hop_routes(relations, subject, target)]);
+        let count = array.length(candidates);
+        if count == 1 {
+            let route: AggregateRoute = { target, hops: get_index(candidates, 0) };
+            let result: RelatedRouteStatus = 'Ok(route);
+            result
+        } else if count > 1 {
+            'Ambiguous
+        } else {
+            # No eligible route: distinguish an over-depth route (reachable only
+            # through more than two declared relations, recorded by the prepared
+            # path matrix) from a missing/undeclared route.
+            let row = get_index(payload.paths, subject);
+            match get_index(row, target) {
+                'Safe(seq) => if array.length(seq) > 2 { 'OverDepth } else { 'Missing },
+                'FanOut(seq) => if array.length(seq) > 2 { 'OverDepth } else { 'Missing },
+                'Missing => 'Missing,
+                'Truncated => 'Missing,
+            }
+        }
     }
 };
 
-# Deterministic INNER join to the related entity using the prepared relation's
-# column key; forward and reverse declarations both map to the same equality.
-def build_related_join: Fn(PreparedPayload, Int, Int) -> qb.Join = fn(payload, base, entity) {
-    let base_entry = get_index(payload.entities, base);
-    let entity_entry = get_index(payload.entities, entity);
-    let rel = get_index(payload.relations, related_relation_index(payload, base, entity));
-    let from_is_base = rel.from == base;
+# Lowering-time resolver: the single eligible route or a stable attributable
+# diagnostic (missing / ambiguous / over-depth / unauthorized base entity).
+def related_route_for: Fn(PreparedPayload, Int, Int) -> AggregateRoute = fn(payload, subject, target) {
+    match related_route_status(payload, subject, target) {
+        'Ok(route) => route,
+        'Same => fail!("related aggregate measure lives on the subject entity and needs no route", subject),
+        'Missing => fail!("related aggregate has no declared route from the subject entity to the aggregate entity", subject, target),
+        'Ambiguous => fail!("related aggregate route is ambiguous: multiple declared routes of at most two relations connect the subject and aggregate entities", subject, target),
+        'OverDepth => fail!("related aggregate route exceeds the supported two-relation depth from the subject entity to the aggregate entity", subject, target),
+    }
+};
+
+# Deterministic INNER join for one route hop: the prepared relation connects the
+# already-visible left entity to the new right (join source) entity; forward and
+# reverse declarations both map to the same column equality.
+def route_hop_join: Fn(PreparedPayload, Int, Int, Int) -> qb.Join = fn(payload, left_entity, right_entity, rel_index) {
+    let left_entry = get_index(payload.entities, left_entity);
+    let right_entry = get_index(payload.entities, right_entity);
+    let rel = get_index(payload.relations, rel_index);
+    let from_is_left = rel.from == left_entity;
     let pairs = exists_pairs(rel.key);
     let conds = array.map(pairs, fn(pair) {
-        if from_is_base {
-            let base_field = get_index(base_entry.fields, pair.from);
-            let entity_field = get_index(entity_entry.fields, pair.to);
+        if from_is_left {
+            let left_field = get_index(left_entry.fields, pair.from);
+            let right_field = get_index(right_entry.fields, pair.to);
             qb.on_eq(
-                qb.column_ref(base_entry.alias, base_field.column),
-                qb.column_ref(entity_entry.alias, entity_field.column),
+                qb.column_ref(left_entry.alias, left_field.column),
+                qb.column_ref(right_entry.alias, right_field.column),
             )
         } else {
-            let entity_field = get_index(entity_entry.fields, pair.from);
-            let base_field = get_index(base_entry.fields, pair.to);
+            let right_field = get_index(right_entry.fields, pair.from);
+            let left_field = get_index(left_entry.fields, pair.to);
             qb.on_eq(
-                qb.column_ref(base_entry.alias, base_field.column),
-                qb.column_ref(entity_entry.alias, entity_field.column),
+                qb.column_ref(left_entry.alias, left_field.column),
+                qb.column_ref(right_entry.alias, right_field.column),
             )
         }
     });
@@ -3644,12 +3817,33 @@ def build_related_join: Fn(PreparedPayload, Int, Int) -> qb.Join = fn(payload, b
     } else {
         qb.on_and(conds)
     };
-    qb.join_on('Inner, qb.source(entity_entry.alias, entity_entry.table), condition)
+    qb.join_on('Inner, qb.source(right_entry.alias, right_entry.table), condition)
+};
+
+type AggregateWalk = struct { current: Int, joins: Array(qb.Join) };
+
+# Materialize the route's joins in deterministic dependency order (the hops are
+# already ordered from the subject toward the aggregate population).
+def aggregate_route_joins: Fn(PreparedPayload, Int, AggregateRoute) -> Array(qb.Join) = fn(payload, subject, route) {
+    let init: AggregateWalk = { current: subject, joins: [] };
+    let walked = array.fold(route.hops, init, fn(acc, rel_index) {
+        let rel = get_index(payload.relations, rel_index);
+        let next = if rel.from == acc.current { rel.to } else { rel.from };
+        let join = route_hop_join(payload, acc.current, next, rel_index);
+        let result: AggregateWalk = { current: next, joins: array.push(acc.joins, join) };
+        result
+    });
+    if walked.current != route.target {
+        fail!("related aggregate route did not terminate at the aggregate entity", subject, route.target)
+    } else {
+        walked.joins
+    }
 };
 
 # A closed aggregate call for a related-measure reference.  The measure must be
 # declared, plain (not computed/filtered), authorized for the subject, and --
-# when it lives off the subject -- connected by a single declared relation.
+# when it lives off the subject -- reached through exactly one eligible route of
+# at most two declared relations.
 def related_measure_call: Fn(PreparedPayload, Int, String, String) -> qb.AggregateCall = fn(payload, base, subject, measure_id) {
     if !payload.authorize(subject) {
         fail!("subject is not authorized for related aggregate measure", subject, measure_id)
@@ -3663,13 +3857,20 @@ def related_measure_call: Fn(PreparedPayload, Int, String, String) -> qb.Aggrega
                     fail!("related aggregate measure must not be a filtered measure", measure_id)
                 } else {
                     # When the measure lives off the subject, require exactly one
-                    # declared direct relation (stable attributable diagnostic).
-                    let rel_check: Int = if entry.entity != base {
-                        related_relation_index(payload, base, entry.entity)
+                    # eligible route of at most two declared relations (stable
+                    # attributable diagnostics for missing/ambiguous/over-depth).
+                    let entity_index = if entry.entity != base {
+                        match related_route_status(payload, base, entry.entity) {
+                            'Ok(_) => entry.entity,
+                            'Same => fail!("related aggregate measure lives on the subject entity and needs no route", subject, measure_id),
+                            'Missing => fail!("related aggregate has no declared route from the subject entity to the aggregate entity", subject, measure_id),
+                            'Ambiguous => fail!("related aggregate route is ambiguous: multiple declared routes of at most two relations connect the subject and aggregate entities", subject, measure_id),
+                            'OverDepth => fail!("related aggregate route exceeds the supported two-relation depth from the subject entity to the aggregate entity", subject, measure_id),
+                        }
                     } else {
-                        -1
+                        entry.entity
                     };
-                    let entity = get_index(payload.entities, entry.entity);
+                    let entity = get_index(payload.entities, entity_index);
                     let field = get_index(entity.fields, entry.field);
                     let call: qb.AggregateCall = {
                         function: entry.aggregate,
@@ -3714,9 +3915,10 @@ def internal_having_plan: Fn(PreparedPayload, Int, InternalHavingRequest) -> qb.
 
 # Pure feasibility probe for a related-measure reference on a subject entity:
 # 'True when the subject role is authorized and the measure is declared, plain,
-# and (when it lives off the subject) connected by exactly one declared direct
-# relation.  'False for an unauthorized role, unknown/computed/filtered measure,
-# a missing or ambiguous direct relation.  Never fails.
+# and (when it lives off the subject) reached through exactly one eligible route
+# of at most two declared relations.  'False for an unauthorized role,
+# unknown/computed/filtered measure, a missing, ambiguous or over-depth route.
+# Never fails.
 def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(payload, subject, role, measure_id) {
     if !payload.authorize(role) {
         'False
@@ -3726,14 +3928,14 @@ def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(pa
             'Some(entry) => do {
                 if entry.computed != 'None || entry.predicate != 'None {
                     'False
-                } else if entry.entity == subject {
-                    'True
                 } else {
-                    let conn = array.filter(payload.relations, fn(r) {
-                        (r.from == subject && r.to == entry.entity)
-                            || (r.from == entry.entity && r.to == subject)
-                    });
-                    array.length(conn) == 1
+                    match related_route_status(payload, subject, entry.entity) {
+                        'Same => 'True,
+                        'Ok(_) => 'True,
+                        'Missing => 'False,
+                        'Ambiguous => 'False,
+                        'OverDepth => 'False,
+                    }
                 }
             },
         }
@@ -3745,7 +3947,9 @@ def related_measure_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(pa
 #   internal_orders: hidden ORDER BY aggregates (Asc/Desc, Top-N via limit);
 #   internal_having: hidden HAVING predicates over the related aggregates.
 # Related entities (when the aggregate measure lives off the subject) are joined
-# through the single prepared relation; grouping keeps the subject grain, so
+# through exactly one eligible prepared route of at most two declared relations
+# (the joins materialize in deterministic dependency order; the same route serves
+# hidden ORDER BY/Top-N and hidden HAVING); grouping keeps the subject grain, so
 # related rows only aggregate and never add output rows.  The projection is
 # exactly the requested dimensions; hidden aggregates never appear in it.
 def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrderRequest), Array(InternalHavingRequest)) -> qb.Plan = fn(payload, request, internal_orders, internal_having) {
@@ -3802,7 +4006,21 @@ def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrde
                         array.push(acc, entity)
                     }
                 });
-                let joins = array.map(related_entities, fn(entity) { build_related_join(payload, base, entity) });
+                # Resolve each off-subject aggregate population's unique eligible
+                # route and materialize its joins in deterministic dependency
+                # order; joins already present by source alias are reused.
+                let none_joins: Array(qb.Join) = [];
+                let joins = array.fold(related_entities, none_joins, fn(acc, entity) {
+                    let route = related_route_for(payload, base, entity);
+                    let route_joins = aggregate_route_joins(payload, base, route);
+                    array.fold(route_joins, acc, fn(inner, j) {
+                        if array.any(inner, fn(e) { e.source.alias == j.source.alias }) {
+                            inner
+                        } else {
+                            array.push(inner, j)
+                        }
+                    })
+                });
                 let join_sources = array.map(joins, fn(j) { j.source });
                 let base_entry = get_index(payload.entities, base);
                 let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
@@ -3824,9 +4042,371 @@ def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrde
                     limit,
                     offset,
                     partition: 'None,
+        scalar_comparisons: [],
+        ranked_key_comparisons: [],
                 };
                 qb.validate(plan, payload.profile)
             }
+        }
+    }
+};
+
+# Hidden same-source aggregate HAVING: a grouped (aggregated) request may carry
+# zero or more HAVING predicates over authorized, plain measures of its proven
+# base entity that are NOT projected.  The hidden measure still participates in
+# grouping/HAVING validation and SQL generation but never appears in the
+# projection.  Multiple predicates AND with deterministic order and binding
+# order.  Computed/filtered/unknown/unauthorized/cross-entity measures and
+# ungrouped requests fail atomically.
+def lower_hidden_having: Fn(PreparedPayload, QueryRequest, Array(InternalHavingRequest)) -> qb.Plan = fn(payload, request, hidden_having) {
+    if array.length(request.measures) == 0 {
+        fail!("hidden aggregate HAVING requires an aggregated (grouped) request with at least one measure")
+    } else if array.length(request.dimensions) == 0 {
+        fail!("hidden aggregate HAVING requires grouping dimensions")
+    } else {
+        let base = request_subject_entity(payload, request);
+        let base_plan = lower_core(payload, request, [], [], [], [], [], []);
+        if array.length(hidden_having) == 0 {
+            base_plan
+        } else {
+            let hidden = array.map(hidden_having, fn(spec) { internal_having_plan(payload, base, spec) });
+            let having = array.concat([base_plan.having, hidden]);
+            let rebuilt: qb.Plan = {
+                revision: base_plan.revision,
+                sources: base_plan.sources,
+                derived: base_plan.derived,
+                projection: base_plan.projection,
+                filter: base_plan.filter,
+                exists: base_plan.exists,
+                joins: base_plan.joins,
+                grouping: base_plan.grouping,
+                having,
+                ordering: base_plan.ordering,
+                limit: base_plan.limit,
+                offset: base_plan.offset,
+                partition: base_plan.partition,
+        scalar_comparisons: base_plan.scalar_comparisons,
+        ranked_key_comparisons: base_plan.ranked_key_comparisons,
+            };
+            qb.validate(rebuilt, payload.profile)
+        }
+    }
+};
+
+# Pure feasibility probe for a same-source hidden HAVING measure on a subject
+# entity: 'True when the role is authorized and the measure is declared, plain,
+# and lives on the subject itself; 'False for unknown/computed/filtered/unauthorized
+# or a cross-entity measure.  Never fails.
+def same_source_having_ok: Fn(PreparedPayload, Int, String, String) -> Bool = fn(payload, subject, role, measure_id) {
+    if !payload.authorize(role) {
+        'False
+    } else {
+        match array.find(payload.measures, fn(m) { m.id == measure_id }) {
+            'None => 'False,
+            'Some(entry) => entry.computed == 'None && entry.predicate == 'None && entry.entity == subject,
+        }
+    }
+};
+
+# A closed attribute-versus-scalar-aggregate comparison: keeps the base rows of
+# a measureless row-level request whose outer plain attribute value satisfies a
+# closed comparison against ONE scalar aggregate computed by a separately
+# validated inner measure (possibly on another entity's own grain).  The ordered
+# `scope_filters` narrow the INNER aggregate's own rows (each filter references a
+# declared, authorized, filterable dimension of the inner measure's own entity
+# and vocabulary; it is never resolved against the outer attribute entity and
+# never moved into the outer plan filter).  Empty scope preserves the global
+# aggregate behavior.  No natural-language quantifier ("any"/"all") is
+# interpreted here.
+type ScalarCompareRequest = struct {
+    attribute: String,   # an authorized, plain dimension of the request base entity
+    subject: String,
+    op: HavingOp,
+    measure: String,     # an authorized, plain (simple) declared measure
+    scope_filters: Array(FilterRequest),  # ordered inner scope filters (empty = unscoped)
+};
+
+def having_op_scalar_function: Fn(HavingOp) -> qb.ScalarFunction = fn(op) {
+    match op {
+        'Eq => 'Eq,
+        'Ne => 'Ne,
+        'Lt => 'Lt,
+        'Le => 'Le,
+        'Gt => 'Gt,
+        'Ge => 'Ge,
+    }
+};
+
+# Field type category, resolved from the prepared field's Type metadata through
+# std/type-desc reflection (never inferred from filterability, operator lists,
+# names, key flags or sample values).  Int and Float form the intentionally
+# supported closed numeric family of this public contract.
+def field_is_numeric: Fn(EntityEntry, Int) -> Bool = fn(entity, field_index) {
+    let field = get_index(entity.fields, field_index);
+    let kind = td.kind(field.ty);
+    match kind {
+        'Int => 'True,
+        'Float => 'True,
+        _ => 'False,
+    }
+};
+
+# Aggregate result category from the declared aggregate's result semantics:
+# Count is integer; Sum/Avg require a numeric column and produce a numeric
+# result; Min/Max preserve the comparable category of their (numeric) input
+# column.  The aggregate call itself never infers from sample values.
+def measure_numeric_result: Fn(PreparedPayload, MeasureEntry) -> Bool = fn(payload, entry) {
+    match entry.aggregate {
+        'Count => 'True,
+        'Sum => 'True,
+        'Avg => 'True,
+        _ => field_is_numeric(get_index(payload.entities, entry.entity), entry.field),
+    }
+};
+
+# Closed type compatibility for an attribute-versus-aggregate comparison: the
+# outer attribute's prepared field type and the inner aggregate result must
+# both be members of the numeric family.  Any other cross-category pair (text
+# vs number, enum vs number, ...) is rejected.
+def compare_categories_compatible: Fn(PreparedPayload, Int, DimensionEntry, MeasureEntry) -> Bool = fn(payload, base, attr, inner) {
+    let base_entry = get_index(payload.entities, base);
+    field_is_numeric(base_entry, attr.field) && measure_numeric_result(payload, inner)
+};
+
+# Value-level validation for one scope filter against a resolved dimension:
+# enum domains accept only 'Eq over a member stable value; text search
+# operators require a 'Text value and the dimension's declared input kinds; all
+# other operators require an allowed input kind.
+def scope_filter_value_ok: Fn(DimensionEntry, FilterOp, FilterInput) -> Bool = fn(d, op, input) {
+    if array.length(d.values) > 0 {
+        match op {
+            'Eq => match input {
+                'Text(s) => array.any(d.values, fn(v) { v.value == s }),
+                _ => 'False,
+            },
+            _ => 'False,
+        }
+    } else if is_text_op(op) {
+        match input {
+            'Text(_) => filter_input_allowed(d.input_kinds, input),
+            _ => 'False,
+        }
+    } else {
+        filter_input_allowed(d.input_kinds, input)
+    }
+};
+
+# Pure feasibility check for ONE inner scope filter: the filter must belong to
+# the inner measure's own entity and vocabulary (unknown/unauthorized/
+# unfilterable/cross-entity dimensions, unsupported operators and invalid
+# input types are all rejected).  Never fails.
+def scope_filter_ok: Fn(PreparedPayload, Int, FilterRequest) -> Bool = fn(payload, inner, spec) {
+    if !payload.authorize(spec.subject) {
+        'False
+    } else {
+        match array.find(payload.dimensions, fn(d) { d.id == spec.id }) {
+            'None => 'False,
+            'Some(d) => d.entity == inner && d.authorized && d.filterable
+                && array.any(d.ops, fn(op) { op == spec.op })
+                && scope_filter_value_ok(d, spec.op, spec.input),
+        }
+    }
+};
+
+# Resolve ONE ordered scope filter against the inner measure's own entity.  The
+# expression is built over the inner entity's own prepared alias (the scalar
+# subquery's single source), so it narrows only the inner aggregate's rows and
+# is never moved into the outer plan filter nor resolved against the outer
+# attribute entity.  Scope filters never authorize joins, grouping, nested
+# scalar comparisons, raw SQL, aliases, tables or open expressions.
+def resolve_inner_scope_filter: Fn(PreparedPayload, Int, FilterRequest) -> qb.Expr = fn(payload, inner, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for comparison scope filter", spec.subject, spec.id)
+    } else {
+        match array.find(payload.dimensions, fn(d) { d.id == spec.id }) {
+            'None => fail!("comparison scope filter references an unknown dimension", spec.id),
+            'Some(d) => do {
+                if d.entity != inner {
+                    fail!("comparison scope filter must reference the inner measure's own entity", spec.id)
+                } else if !d.authorized {
+                    fail!("comparison scope filter references a dimension that is not authorized", d.id)
+                } else if !d.filterable {
+                    fail!("comparison scope filter references a dimension with no filter capability", d.id)
+                } else if !array.any(d.ops, fn(op) { op == spec.op }) {
+                    fail!("comparison scope filter uses an operation not supported by the dimension", d.id, spec.op)
+                } else if array.length(d.values) > 0 {
+                    if spec.op != 'Eq {
+                        fail!("comparison scope filter on enum dimension supports only Eq", d.id, spec.op)
+                    } else {
+                        match spec.input {
+                            'Text(s) => if array.any(d.values, fn(v) { v.value == s }) {
+                                qb.scalar('Eq, [dimension_expr(payload, d), qb.bind_string(s)])
+                            } else {
+                                fail!("comparison scope filter references an unknown enum value for dimension", d.id, s)
+                            },
+                            _ => fail!("comparison scope filter uses an invalid enum value for dimension", d.id, spec.input),
+                        }
+                    }
+                } else if is_text_op(spec.op) {
+                    match spec.input {
+                        'Text(_) => if !filter_input_allowed(d.input_kinds, spec.input) {
+                            fail!("comparison scope filter uses an invalid value for the dimension", d.id, spec.input)
+                        } else {
+                            let base = dimension_expr(payload, d);
+                            let bound = to_bind(spec.input);
+                            open_condition_expr(base, spec.op, bound)
+                        },
+                        _ => fail!("comparison scope filter text operation requires a text input value", d.id),
+                    }
+                } else if !filter_input_allowed(d.input_kinds, spec.input) {
+                    fail!("comparison scope filter uses an invalid value for the dimension", d.id, spec.input)
+                } else {
+                    let base = dimension_expr(payload, d);
+                    let bound = to_bind(spec.input);
+                    open_condition_expr(base, spec.op, bound)
+                }
+            },
+        }
+    }
+};
+
+# Combine the ordered scope filters into one deterministic left-associative AND
+# expression (empty scope yields 'None, preserving the global aggregate shape).
+# Binding order inside the subquery follows the filters' declared order.
+def resolve_comparison_scope: Fn(PreparedPayload, Int, Array(FilterRequest)) -> Option(qb.Expr) = fn(payload, inner, scope_filters) {
+    let exprs = array.map(scope_filters, fn(f) { resolve_inner_scope_filter(payload, inner, f) });
+    append_filter_terms('None, exprs)
+};
+
+# Resolve one comparison to a Plan-level scalar aggregate comparison: the outer
+# side is the base entity's plain column attribute, the inner side is the
+# measure's entity with its declared aggregate over the measure's column and the
+# ordered inner scope filters (each against the inner measure's own entity).
+def resolve_scalar_compare: Fn(PreparedPayload, Int, ScalarCompareRequest) -> qb.ScalarAggregateComparison = fn(payload, base, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for attribute-versus-aggregate comparison", spec.subject, spec.attribute)
+    } else {
+        let attr = match array.find(payload.dimensions, fn(d) { d.id == spec.attribute }) {
+            'Some(d) => d,
+            'None => fail!("attribute-versus-aggregate comparison references an unknown attribute", spec.attribute),
+        };
+        if attr.computed {
+            fail!("attribute-versus-aggregate outer attribute must be a plain column-backed dimension", spec.attribute)
+        } else if !attr.authorized {
+            fail!("attribute-versus-aggregate outer attribute is not authorized", spec.attribute)
+        } else if attr.entity != base {
+            fail!("attribute-versus-aggregate outer attribute must belong to the request base entity", spec.attribute)
+        } else {
+            let inner = match array.find(payload.measures, fn(m) { m.id == spec.measure }) {
+                'Some(m) => m,
+                'None => fail!("attribute-versus-aggregate comparison references an unknown measure", spec.measure),
+            };
+            if inner.computed != 'None {
+                fail!("attribute-versus-aggregate inner measure must be a plain aggregate", spec.measure)
+            } else if inner.predicate != 'None {
+                fail!("attribute-versus-aggregate inner measure must be a simple aggregate", spec.measure)
+            } else if !compare_categories_compatible(payload, base, attr, inner) {
+                fail!("attribute-versus-aggregate comparison requires compatible numeric types on both sides", spec.attribute, spec.measure)
+            } else {
+                let base_entry = get_index(payload.entities, base);
+                let attr_field = get_index(base_entry.fields, attr.field);
+                let outer_ref = qb.column_ref(base_entry.alias, attr_field.column);
+                let inner_entry = get_index(payload.entities, inner.entity);
+                let inner_field = get_index(inner_entry.fields, inner.field);
+                let inner_filter = resolve_comparison_scope(payload, inner.entity, spec.scope_filters);
+                let inner_spec = qb.scalar_subquery_spec(
+                    qb.source(inner_entry.alias, inner_entry.table),
+                    [],
+                    inner_filter,
+                    inner.aggregate,
+                    qb.column(inner_entry.alias, inner_field.column),
+                    'False,
+                    'None,
+                );
+                qb.scalar_aggregate_comparison(outer_ref, having_op_scalar_function(spec.op), inner_spec)
+            }
+        }
+    }
+};
+
+# Pure feasibility probe for one comparison: 'True when the role is authorized,
+# the outer attribute is an authorized, plain, base-entity dimension, the inner
+# measure is declared, plain and simple, AND the two sides are type-compatible
+# (both members of the numeric family per prepared field Type metadata and the
+# aggregate result semantics).  'False otherwise; never fails.
+def attribute_compare_ok: Fn(PreparedPayload, Int, String, String, String) -> Bool = fn(payload, base, role, attribute_id, measure_id) {
+    if !payload.authorize(role) {
+        'False
+    } else {
+        let attr = array.find(payload.dimensions, fn(d) { d.id == attribute_id });
+        let measure = array.find(payload.measures, fn(m) { m.id == measure_id });
+        match (attr, measure) {
+            ('Some(d), 'Some(m)) => !d.computed && d.authorized && d.entity == base
+                && m.computed == 'None && m.predicate == 'None
+                && compare_categories_compatible(payload, base, d, m),
+            _ => 'False,
+        }
+    }
+};
+
+# Scoped feasibility probe: like `attribute_compare_ok`, plus every ordered
+# scope filter must satisfy the complete filter/ownership contract against the
+# inner measure's own entity (authorization, ownership, filterability, operator
+# and value/type compatibility).  Never fails; 'False for any violation.
+def scoped_attribute_compare_ok: Fn(PreparedPayload, Int, String, String, String, Array(FilterRequest)) -> Bool = fn(payload, base, role, attribute_id, measure_id, scope_filters) {
+    if !payload.authorize(role) {
+        'False
+    } else {
+        let attr = array.find(payload.dimensions, fn(d) { d.id == attribute_id });
+        let measure = array.find(payload.measures, fn(m) { m.id == measure_id });
+        match (attr, measure) {
+            ('Some(d), 'Some(m)) => if !(!d.computed && d.authorized && d.entity == base
+                && m.computed == 'None && m.predicate == 'None
+                && compare_categories_compatible(payload, base, d, m)) {
+                'False
+            } else {
+                array.all(scope_filters, fn(f) { scope_filter_ok(payload, m.entity, f) })
+            },
+            _ => 'False,
+        }
+    }
+};
+
+# Additive entry: a measureless row-level (listing) request whose base rows are
+# kept when every ordered attribute-versus-aggregate comparison holds.  The
+# requested dimensions are projected unchanged; the comparisons render as
+# Plan-level scalar aggregate subqueries in WHERE with deterministic order and
+# native NULL semantics.
+def lower_attribute_compare: Fn(PreparedPayload, QueryRequest, Array(ScalarCompareRequest)) -> qb.Plan = fn(payload, request, comparisons) {
+    if array.length(request.measures) > 0 {
+        fail!("attribute-versus-aggregate comparison requires a measureless row-level request")
+    } else if array.length(request.dimensions) == 0 {
+        fail!("attribute-versus-aggregate comparison requires at least one listing dimension")
+    } else {
+        let base = request_subject_entity(payload, request);
+        let base_plan = lower_core(payload, request, [], [], [], [], [], []);
+        if array.length(comparisons) == 0 {
+            base_plan
+        } else {
+            let resolved = array.map(comparisons, fn(spec) { resolve_scalar_compare(payload, base, spec) });
+            let rebuilt: qb.Plan = {
+                revision: base_plan.revision,
+                sources: base_plan.sources,
+                derived: base_plan.derived,
+                projection: base_plan.projection,
+                filter: base_plan.filter,
+                exists: base_plan.exists,
+                joins: base_plan.joins,
+                grouping: base_plan.grouping,
+                having: base_plan.having,
+                ordering: base_plan.ordering,
+                limit: base_plan.limit,
+                offset: base_plan.offset,
+                partition: base_plan.partition,
+                scalar_comparisons: resolved,
+        ranked_key_comparisons: [],
+            };
+            qb.validate(rebuilt, payload.profile)
         }
     }
 };
@@ -3839,6 +4419,325 @@ def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrde
 # semantics stay SQL-native.  Aggregate-result (HAVING) predicates are optional.
 def lower_absence: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(HavingRequest)) -> qb.Plan = fn(payload, request, absence_specs, having_specs) {
     lower_core(payload, request, [], [], having_specs, [], absence_specs, [])
+};
+
+# ---------------------------------------------------------------------------
+# Ranked grouped-key comparison (ontology typed entry over the query-core
+# `RankedKeyComparison`).  A measureless row-level request keeps outer rows when
+# `<outer attribute> <op> <grouping key of the first inner group after aggregate
+# ordering>` (the inner grouped-key scalar subquery).  This is ONLY lowered to
+# the new query-core grouped-key scalar spec: the ranked group is never returned
+# as the outer result, the ranking measure is never projected, and no
+# SQL/table/column/alias fragment is accepted.
+# ---------------------------------------------------------------------------
+
+# A closed typed request for the ranked grouped-key comparison shape:
+# outer attribute id (request base entity), comparison operator, inner grouping
+# dimension id, ranking measure id (inner population grain), direction, and the
+# ordered inner scope filters.
+type RankedKeyCompareRequest = struct {
+    attribute: String,
+    subject: String,
+    op: HavingOp,
+    group: String,           # inner grouping dimension id (inner population entity)
+    measure: String,         # ranking measure id (same inner population grain)
+    direction: OrderDirection,
+    scope_filters: Array(FilterRequest),
+};
+
+def to_qb_ordering: Fn(OrderDirection) -> qb.Ordering = fn(direction) {
+    match direction {
+        'Asc => 'Asc,
+        'Desc => 'Desc,
+    }
+};
+
+# Type compatibility between the outer attribute and the returned grouping key:
+# both are declared dimensions, so the reusable closed comparable-category check
+# (`field_domains_compatible`) applies.  The ranking measure's own type is
+# independent (it is only used for aggregate ordering) and is NOT part of this
+# compatibility decision.
+def ranked_key_categories_compatible: Fn(PreparedPayload, DimensionEntry, String) -> Bool = fn(payload, attr, group_id) {
+    match array.find(payload.dimensions, fn(d) { d.id == group_id }) {
+        'Some(g) => field_domains_compatible(attr, g),
+        'None => 'False,
+    }
+};
+
+# Resolve the inner population entity, grouping dimension, ranking measure and
+# the query-core grouped-key spec.  All roles are validated atomically with
+# diagnostics naming the failing role (outer key / group key / ranking measure /
+# route / scope filter).
+def resolve_ranked_key_compare: Fn(PreparedPayload, Int, RankedKeyCompareRequest) -> qb.RankedKeyComparison = fn(payload, base, spec) {
+    if !payload.authorize(spec.subject) {
+        fail!("subject is not authorized for ranked grouped-key comparison", spec.subject, spec.attribute)
+    } else {
+        let attr = match array.find(payload.dimensions, fn(d) { d.id == spec.attribute }) {
+            'Some(d) => d,
+            'None => fail!("ranked grouped-key comparison references an unknown outer attribute", spec.attribute),
+        };
+        if attr.computed {
+            fail!("ranked grouped-key outer attribute must be a plain column-backed dimension", spec.attribute)
+        } else if !attr.authorized {
+            fail!("ranked grouped-key outer attribute is not authorized", spec.attribute)
+        } else {
+            let group = match array.find(payload.dimensions, fn(d) { d.id == spec.group }) {
+                'Some(d) => d,
+                'None => fail!("ranked grouped-key comparison references an unknown grouping dimension", spec.group),
+            };
+            if group.computed {
+                fail!("ranked grouped-key grouping dimension must be plain column-backed", spec.group)
+            } else if !group.authorized {
+                fail!("ranked grouped-key grouping dimension is not authorized", spec.group)
+            } else if !field_domains_compatible(attr, group) {
+                fail!("ranked grouped-key outer attribute and grouping key are type/domain incompatible", spec.attribute, spec.group)
+            } else {
+                let population = group.entity;
+                let measure = match array.find(payload.measures, fn(m) { m.id == spec.measure }) {
+                    'Some(m) => m,
+                    'None => fail!("ranked grouped-key comparison references an unknown ranking measure", spec.measure),
+                };
+                if measure.computed != 'None {
+                    fail!("ranked grouped-key ranking measure must be a plain aggregate", spec.measure)
+                } else if measure.predicate != 'None {
+                    fail!("ranked grouped-key ranking measure must be a simple aggregate", spec.measure)
+                } else if measure.entity != population {
+                    fail!("ranked grouped-key ranking measure must live on the inner population grain", spec.measure)
+                } else if array.length(measure.requires) > 0 {
+                    fail!("ranked grouped-key ranking measure requires unsupported extra entities (no safe route)", spec.measure)
+                } else {
+                    # The outer attribute may live on the request base entity OR on
+                    # an unambiguous, grain-preserving (safe) reachable entity.  The
+                    # outer ColumnRef always uses the OWNING entity's alias; the
+                    # join that makes that alias visible is added by the lowering
+                    # entry (reusing an existing outer join when possible).
+                    let attr_entry = get_index(payload.entities, attr.entity);
+                    let attr_field = get_index(attr_entry.fields, attr.field);
+                    let pop_entry = get_index(payload.entities, population);
+                    let group_field = get_index(pop_entry.fields, group.field);
+                    let key_expr = qb.column(pop_entry.alias, group_field.column);
+                    let measure_field = get_index(pop_entry.fields, measure.field);
+                    let order_call: qb.AggregateCall = {
+                        function: measure.aggregate,
+                        arg: qb.column(pop_entry.alias, measure_field.column),
+                        distinct: 'False,
+                        filter: 'None,
+                        alias: "__rank_order",
+                    };
+                    let inner_filter = resolve_comparison_scope(payload, population, spec.scope_filters);
+                    let inner = qb.ranked_key_subquery_spec(
+                        qb.source(pop_entry.alias, pop_entry.table),
+                        [],
+                        inner_filter,
+                        [key_expr],
+                        order_call,
+                        to_qb_ordering(spec.direction),
+                    );
+                    let outer_ref = qb.column_ref(attr_entry.alias, attr_field.column);
+                    qb.ranked_key_comparison(outer_ref, having_op_scalar_function(spec.op), inner)
+                }
+            }
+        }
+    }
+};
+
+# Route classification of the hidden ranked grouped-key outer attribute from the
+# request base entity to the attribute's owning entity.
+type RankedAttrRoute = enum {
+    'OnBase,                   # attribute belongs to the request base entity
+    'SafeUnique(Array(Int)),   # reachable through exactly one prepared Safe path
+    'Ambiguous,                # reachable through multiple declared Safe routes
+    'FanOut,                   # reachable only through a fan-out route
+    'Missing,                  # no declared route
+    'Truncated,                # route search was truncated
+};
+
+# Classify the route to the ranked grouped-key outer attribute's owning entity:
+# base-entity attributes need no route; off-base entities are resolved through
+# the prepared path matrix (a Safe path is required) and the prepared ambiguity
+# matrix (more than one distinct Safe route is rejected, never chosen by
+# declaration order).
+def ranked_attr_route: Fn(PreparedPayload, Int, Int) -> RankedAttrRoute = fn(payload, base, target) {
+    if target == base {
+        'OnBase
+    } else {
+        let row = get_index(payload.paths, base);
+        let amb_row = get_index(payload.ambiguous_paths, base);
+        match get_index(row, target) {
+            'Safe(seq) => if get_index(amb_row, target) {
+                'Ambiguous
+            } else {
+                let result: RankedAttrRoute = 'SafeUnique(seq);
+                result
+            },
+            'FanOut(_) => 'FanOut,
+            'Missing => 'Missing,
+            'Truncated => 'Truncated,
+        }
+    }
+};
+
+# The joins of the prepared Safe path from the request base entity to the ranked
+# grouped-key outer attribute's owning entity (path order preserved).  Fan-out,
+# ambiguous, missing or truncated routes are rejected deterministically with
+# distinct diagnostics: only a unique grain-safe path may be materialized as
+# outer joins, and a route is never chosen by declaration order.
+def ranked_outer_path_joins: Fn(PreparedPayload, Int, Int) -> Array(qb.Join) = fn(payload, base, target) {
+    match ranked_attr_route(payload, base, target) {
+        'SafeUnique(seq) => array.map(seq, fn(r_index) {
+            let r = get_index(payload.relations, r_index);
+            let to_entity = get_index(payload.entities, r.to);
+            let kind: qb.JoinKind = match r.kind { 'Safe => 'Inner, 'FanOut => 'Left };
+            qb.join_on(
+                kind,
+                qb.source(to_entity.alias, to_entity.table),
+                key_to_condition(payload, r.from, r.to, r.key),
+            )
+        }),
+        'Ambiguous => fail!("ranked grouped-key outer attribute owner is reachable through multiple declared safe routes; declare a single unambiguous route to the attribute owner", target),
+        'FanOut => fail!("ranked grouped-key outer attribute reaches its entity only through a fan-out route; only a grain-safe route may be joined", target),
+        'Missing => fail!("ranked grouped-key outer attribute entity has no declared route from the request base entity", target),
+        'Truncated => fail!("ranked grouped-key outer attribute route search was truncated", target),
+        'OnBase => fail!("ranked grouped-key outer attribute belongs to the request base entity and needs no route", target),
+    }
+};
+
+# Pure feasibility probe for one ranked grouped-key comparison: outer attribute /
+# grouping dimension authorization, ownership and type compatibility, ranking
+# measure grain and simplicity, plus every ordered scope filter's full
+# filter/ownership contract against the inner population.  The outer attribute
+# must live on the request base entity or be reachable from it through exactly
+# one prepared Safe path whose joins a physical outer plan can carry; a fan-out,
+# ambiguous, missing or truncated route, or a derived (union) base that would
+# need the added join, is rejected.  Never fails.
+def ranked_key_compare_ok: Fn(PreparedPayload, Int, String, String, String, String, OrderDirection, Array(FilterRequest)) -> Bool = fn(payload, base, role, attribute_id, group_id, measure_id, direction, scope_filters) {
+    if !payload.authorize(role) {
+        'False
+    } else {
+        let attr = array.find(payload.dimensions, fn(d) { d.id == attribute_id });
+        let group = array.find(payload.dimensions, fn(d) { d.id == group_id });
+        match (attr, group) {
+            ('Some(a), 'Some(g)) => do {
+                let route_ok = match ranked_attr_route(payload, base, a.entity) {
+                    'OnBase => 'True,
+                    'SafeUnique(_) => do {
+                        # A safe parent-attribute join needs a physical outer plan;
+                        # a derived (union) base cannot represent the added join.
+                        let base_entry = get_index(payload.entities, base);
+                        match base_entry.union { 'None => 'True, 'Some(_) => 'False }
+                    },
+                    'Ambiguous => 'False,
+                    'FanOut => 'False,
+                    'Missing => 'False,
+                    'Truncated => 'False,
+                };
+                if !(!a.computed && a.authorized && route_ok
+                    && !g.computed && g.authorized && field_domains_compatible(a, g)) {
+                    'False
+                } else {
+                    let population = g.entity;
+                    match array.find(payload.measures, fn(m) { m.id == measure_id }) {
+                        'None => 'False,
+                        'Some(m) => if m.computed != 'None || m.predicate != 'None
+                            || m.entity != population || array.length(m.requires) > 0 {
+                            'False
+                        } else {
+                            array.all(scope_filters, fn(f) { scope_filter_ok(payload, population, f) })
+                        },
+                    }
+                }
+            },
+            _ => 'False,
+        }
+    }
+};
+
+# Append the needed joins after the existing outer joins, reusing any join
+# already present by source alias (the existing occurrence is kept).
+def merge_outer_joins: Fn(Array(qb.Join), Array(qb.Join)) -> Array(qb.Join) = fn(existing, needed) {
+    array.fold(needed, existing, fn(acc, j) {
+        if array.any(acc, fn(e) { e.source.alias == j.source.alias }) {
+            acc
+        } else {
+            array.push(acc, j)
+        }
+    })
+};
+
+# The distinct off-base owning entities of the ranked grouped-key outer
+# attributes, in first-use request order.  Attributes on the base entity itself
+# need no route (current behavior is preserved).
+def ranked_off_base_entities: Fn(PreparedPayload, Int, Array(RankedKeyCompareRequest)) -> Array(Int) = fn(payload, base, comparisons) {
+    array.fold(comparisons, [], fn(acc, spec) {
+        let attr = match array.find(payload.dimensions, fn(d) { d.id == spec.attribute }) {
+            'Some(d) => d,
+            'None => fail!("ranked grouped-key comparison references an unknown outer attribute", spec.attribute),
+        };
+        if attr.entity == base || array.any(acc, fn(e) { e == attr.entity }) {
+            acc
+        } else {
+            array.push(acc, attr.entity)
+        }
+    })
+};
+
+# Additive entry: a measureless row-level (listing) request whose base rows are
+# kept when every ordered ranked grouped-key comparison holds.  The requested
+# dimensions are projected unchanged; each comparison renders as a Plan-level
+# grouped-key scalar subquery predicate in WHERE (never changing the outer
+# projection, never exposing the ranking measure).  When the hidden outer
+# comparison attribute lives off the request base entity, its owning entity is
+# resolved through the prepared path matrix (exactly one Safe path is required;
+# a fan-out-only, ambiguous, missing or truncated route is rejected with a
+# distinct diagnostic and never chosen by declaration order) and that path's
+# joins are materialized in the outer plan, reusing joins already present by
+# source alias; sources and joins are rebuilt consistently before validation.
+# A derived (union) outer plan that would need the added join is rejected.
+def lower_ranked_key_compare: Fn(PreparedPayload, QueryRequest, Array(RankedKeyCompareRequest)) -> qb.Plan = fn(payload, request, comparisons) {
+    if array.length(request.measures) > 0 {
+        fail!("ranked grouped-key comparison requires a measureless row-level request")
+    } else if array.length(request.dimensions) == 0 {
+        fail!("ranked grouped-key comparison requires at least one listing dimension")
+    } else {
+        let base = request_subject_entity(payload, request);
+        let base_plan = lower_core(payload, request, [], [], [], [], [], []);
+        if array.length(comparisons) == 0 {
+            base_plan
+        } else {
+            let resolved = array.map(comparisons, fn(spec) { resolve_ranked_key_compare(payload, base, spec) });
+            let off_base = ranked_off_base_entities(payload, base, comparisons);
+            let needed = array.fold(off_base, [], fn(acc, target) {
+                array.concat([acc, ranked_outer_path_joins(payload, base, target)])
+            });
+            let joins = merge_outer_joins(base_plan.joins, needed);
+            let sources = if array.length(needed) == 0 {
+                base_plan.sources
+            } else {
+                match base_plan.derived {
+                    'Some(_) => fail!("ranked grouped-key outer attribute join requires a physical outer plan; a derived (union) base cannot be joined safely", base),
+                    'None => array.concat([[get_index(base_plan.sources, 0)], array.map(joins, fn(j) { j.source })]),
+                }
+            };
+            let rebuilt: qb.Plan = {
+                revision: base_plan.revision,
+                sources,
+                derived: base_plan.derived,
+                projection: base_plan.projection,
+                filter: base_plan.filter,
+                exists: base_plan.exists,
+                joins,
+                grouping: base_plan.grouping,
+                having: base_plan.having,
+                ordering: base_plan.ordering,
+                limit: base_plan.limit,
+                offset: base_plan.offset,
+                partition: base_plan.partition,
+                scalar_comparisons: base_plan.scalar_comparisons,
+                ranked_key_comparisons: resolved,
+            };
+            qb.validate(rebuilt, payload.profile)
+        }
+    }
 };
 
 # Distinct-row entry: a measureless dimension request whose result is a set of
@@ -3989,6 +4888,8 @@ def reorder_projection: Fn(PreparedPayload, QueryRequest, qb.Plan, Array(Project
             limit: plan.limit,
             offset: plan.offset,
             partition: plan.partition,
+        scalar_comparisons: plan.scalar_comparisons,
+        ranked_key_comparisons: plan.ranked_key_comparisons,
         };
         qb.validate(rebuilt, payload.profile)
     }
@@ -4006,6 +4907,27 @@ def lower_ordered: Fn(PreparedPayload, QueryRequest, Array(ProjectionToken)) -> 
     } else {
         reorder_projection(payload, request, plan, order)
     }
+};
+
+# Closed set operations between two fully lowered ontology requests.  Each
+# operand request is lowered through the normal authorized ontology pipeline;
+# the two resulting Plans must have equal non-zero projection arity and
+# positionally compatible projection shapes, and must carry no local
+# ordering/limit/offset/partition.  The result is a closed set Query
+# (INTERSECT / EXCEPT / distinct UNION).
+def lower_set: Fn(qb.SetOpKind, PreparedPayload, QueryRequest, QueryRequest) -> qb.Query = fn(kind, payload, left_req, right_req) {
+    let left = lower_core(payload, left_req, [], [], [], [], [], []);
+    let right = lower_core(payload, right_req, [], [], [], [], [], []);
+    qb.transform_sqlite_set(kind, left, right)
+};
+
+# Outer count over a closed set operation: the derived set is wrapped by
+# `SELECT count(1) FROM (<set>) AS __q_set`; the result exposes exactly one count
+# column and none of the operand columns.
+def lower_set_count: Fn(qb.SetOpKind, PreparedPayload, QueryRequest, QueryRequest) -> qb.Query = fn(kind, payload, left_req, right_req) {
+    let left = lower_core(payload, left_req, [], [], [], [], [], []);
+    let right = lower_core(payload, right_req, [], [], [], [], [], []);
+    qb.transform_sqlite_set_count(kind, left, right)
 };
 
 # Count the number of groups of a grouped request that satisfy the given
@@ -4068,6 +4990,8 @@ export {
     DimensionInput,
     InternalOrderRequest,
     InternalHavingRequest,
+    ScalarCompareRequest,
+    RankedKeyCompareRequest,
     ProjectionToken,
     MeasureRequest,
     DimensionRequest,
@@ -4140,13 +5064,23 @@ export {
     lower_internal_related,
     lower_ordered,
     lower_field_filtered,
+    lower_set,
+    lower_set_count,
+    lower_hidden_having,
     lower_group_count,
+    lower_attribute_compare,
     resolve_row_ordering,
     resolve_grouped_dim_orders,
     internal_aggregate_order,
     resolve_field_filter,
     field_filter_ok,
     related_measure_ok,
+    same_source_having_ok,
+    attribute_compare_ok,
+    scoped_attribute_compare_ok,
+    resolve_ranked_key_compare,
+    ranked_key_compare_ok,
+    lower_ranked_key_compare,
     request_subject_entity,
     reorder_projection,
     dimension_expr,

@@ -8,6 +8,10 @@ crate 内部通过 `@src/query` 导入，外部依赖者通过 `ontology/query` 
 
 ## 功能要求
 
+- 当 `feedbacks/ontology.md` 作为当前 artifact 输入时，其中明确标注为 query-core phase
+  的领域无关基础能力属于本阶段必交范围；不得以“应由 ontology 或后续阶段实现”为由
+  跳过。先完成底层封闭 Plan/Expr、验证和 SQLite 具体化，再由 ontology 阶段包装。
+
 - 用封闭具名类型表达 `Val`、`Expr`、聚合、数据源、Join、排序、`Plan`、
   `PlanProfile` 和 `Query`。
 - Plan 完整保留 revision、有序投影、筛选、Join、分组、排序和可选 limit。

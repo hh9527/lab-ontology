@@ -4,7 +4,8 @@ Telora 提供 `eval`、`eval-with`、`run` 和 `serve` 四种执行模式。它�
 选择一个公开导出，但对导出值的类型、Host 输入和执行生命周期有不同要求。
 
 标准库模块见 [`LIBSTD.md`](LIBSTD.md)，EES 与 Actor 协议见 [`EES.md`](EES.md)，完整
-命令参数见 [`TELORA-CLI.md`](TELORA-CLI.md)。
+命令参数见 [`TELORA-CLI.md`](TELORA-CLI.md)。开发期如何组合模块检查、语义查询、
+入口执行与预期失败门禁，见 [`TESTING.md`](TESTING.md)。
 
 ## 选择执行模式
 
