@@ -80,11 +80,12 @@ non-empty.  Result columns are exactly the selected dimensions in the declared
 order: no base column is prepended and no code dimension is replaced by a
 descriptive one.  `dimensions` may keep a grain-safe base dimension first (its
 entity determines the base grain for cross-entity safety); an optional
-`output_order` array lists every selected dimension exactly once and controls the
-final column order independently (fed to the foundation's explicit
-reorder-projection capability).  `output_order` must be a permutation of the
-selected dimensions; omissions, duplicates, extras, or unselected items are
-rejected.  Supports filters, ordering, `limit`, and `offset`.
+`output_order` controls the final column order independently. Strings are the
+row-level dimension shorthand; aggregate projections use explicit
+`{"kind":"dimension","id":...}` and `{"kind":"measure","id":...}` tokens.
+Every selected projection item must occur exactly once; omissions, duplicates,
+extras, or unselected items are rejected. Supports filters, ordering, `limit`,
+and `offset`.
 
 Selection rules:
 - select exactly the requested columns — never a nearby descriptive field or an

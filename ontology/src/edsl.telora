@@ -37,6 +37,7 @@ type KeyFlag = struct { value: Bool };
 type MeasureDef = struct {
     id: String,
     aggregate: qb.AggregateFunction,
+    input: MeasureInput,
     requires: Array(Type),
 };
 
@@ -481,6 +482,7 @@ type MeasureEntry = struct {
     entity: Int,
     field: Int,
     aggregate: qb.AggregateFunction,
+    input: MeasureInput,
     alias: String,
     requires: Array(Int),
     predicate: Option(ScopePredicate),
@@ -599,7 +601,16 @@ def key: Fn(Bool) -> Fn(property.FieldPropertyCtx, Option(KeyFlag)) -> KeyFlag =
 
 def measure: Fn(String, qb.AggregateFunction, Array(Type)) -> Fn(property.FieldPropertyCtx, Option(MeasureDef)) -> MeasureDef = fn(id, aggregate, requires) {
     fn(ctx, previous) {
-        let result: MeasureDef = { id, aggregate, requires };
+        let result: MeasureDef = { id, aggregate, input: 'All, requires };
+        result
+    }
+};
+
+# A measure whose stable vocabulary id denotes DISTINCT aggregate semantics.
+# The input mode is model knowledge, not a per-query caller choice.
+def distinct_measure: Fn(String, qb.AggregateFunction, Array(Type)) -> Fn(property.FieldPropertyCtx, Option(MeasureDef)) -> MeasureDef = fn(id, aggregate, requires) {
+    fn(ctx, previous) {
+        let result: MeasureDef = { id, aggregate, input: 'Distinct, requires };
         result
     }
 };
@@ -954,6 +965,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     entity: entity.index,
                     field: f.index,
                     aggregate: d.aggregate,
+                    input: d.input,
                     alias: d.id,
                     requires: resolve_required(entities, d.requires),
                     predicate: 'None,
@@ -970,6 +982,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     entity: entity.index,
                     field: f.index,
                     aggregate: spec.aggregate,
+                    input: 'All,
                     alias: spec.id,
                     requires: resolve_required(entities, spec.requires),
                     predicate: 'Some(spec.predicate),
@@ -986,6 +999,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     entity: entity.index,
                     field: f.index,
                     aggregate: 'Count,
+                    input: 'All,
                     alias: spec.id,
                     requires: [],
                     predicate: 'None,
@@ -1807,8 +1821,10 @@ def resolve_measure_entry: Fn(PreparedPayload, MeasureRequest) -> ResolvedMeasur
         fail!("subject is not authorized for measure", req.subject, req.id)
     } else {
         match array.find(payload.measures, fn(m) { m.id == req.id }) {
-            'Some(entry) => do {
-                let distinct = match req.input { 'Distinct => 'True, 'All => 'False };
+            'Some(entry) => if req.input != entry.input {
+                fail!("measure input does not match its declared ontology semantics", req.id)
+            } else {
+                let distinct = match entry.input { 'Distinct => 'True, 'All => 'False };
                 let result: ResolvedMeasure = { entry, distinct };
                 result
             },
@@ -1823,7 +1839,8 @@ def resolve_measure_by_id: Fn(PreparedPayload, String, String) -> ResolvedMeasur
     } else {
         match array.find(payload.measures, fn(m) { m.id == id }) {
             'Some(entry) => do {
-                let result: ResolvedMeasure = { entry, distinct: 'False };
+                let distinct = match entry.input { 'Distinct => 'True, 'All => 'False };
+                let result: ResolvedMeasure = { entry, distinct };
                 result
             },
             'None => fail!("unknown measure dependency", subject, id),
@@ -2718,7 +2735,7 @@ def internal_aggregate_order: Fn(PreparedPayload, Int, InternalOrderRequest) -> 
                     let call: qb.AggregateCall = {
                         function: entry.aggregate,
                         arg: qb.column(entity.alias, field.column),
-                        distinct: 'False,
+                        distinct: entry.input == 'Distinct,
                         filter,
                         alias: entry.alias,
                     };
@@ -3875,7 +3892,7 @@ def related_measure_call: Fn(PreparedPayload, Int, String, String) -> qb.Aggrega
                     let call: qb.AggregateCall = {
                         function: entry.aggregate,
                         arg: qb.column(entity.alias, field.column),
-                        distinct: 'False,
+                        distinct: entry.input == 'Distinct,
                         filter: 'None,
                         alias: entry.alias,
                     };
@@ -3909,7 +3926,7 @@ def internal_having_plan: Fn(PreparedPayload, Int, InternalHavingRequest) -> qb.
             'Lt => 'Lt,
             'Le => 'Le,
         };
-        qb.having_call(op, call.function, call.arg, 'False, to_val(spec.threshold))
+        qb.having_call(op, call.function, call.arg, call.distinct, to_val(spec.threshold))
     }
 };
 
@@ -4520,7 +4537,7 @@ def resolve_ranked_key_compare: Fn(PreparedPayload, Int, RankedKeyCompareRequest
                     let order_call: qb.AggregateCall = {
                         function: measure.aggregate,
                         arg: qb.column(pop_entry.alias, measure_field.column),
-                        distinct: 'False,
+                        distinct: measure.input == 'Distinct,
                         filter: 'None,
                         alias: "__rank_order",
                     };
@@ -5022,6 +5039,7 @@ export {
     column,
     key,
     measure,
+    distinct_measure,
     filtered_measure,
     computed_measure,
     dimension,

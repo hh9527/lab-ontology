@@ -941,7 +941,9 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
 
 - `measures`/`dimensions` 是 id 字符串数组；`filters` 是**有序**数组；`ordering`
   是 target/id/direction 对象数组（`target` 为 `"Measure"` 或 `"Dimension"`）；
-  `limit`/`offset` 是 null 或非负整数；`output_order` 是可选的已选维度重排数组。
+  `limit`/`offset` 是 null 或非负整数；`output_order` 是可选的投影 token 数组。字符串
+  token 是行级维度的兼容简写；通用形式为 `{"kind":"dimension","id":...}` 或
+  `{"kind":"measure","id":...}`，必须把请求中的 measure/dimension 各列恰好列出一次。
 - `filters` 条目有两种封闭形式：
   - 标量：`{"dimension": id, "op": op, "kind": kind, "value": value}`；
   - field-to-field 谓词：`{"left": id, "op": op, "right": id}`（无 value；只允许
@@ -954,6 +956,11 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
   静默发明 measure/dimension/grouping/join/projection。
 - 授权 subject 是执行上下文：Factory 每次 vocabulary 访问与嵌套子句都使用同一
   subject；`payload.authorize` 拒绝时原子失败。
+- measure 的 aggregate input 是本体语义，不是 Intent 参数。`@edsl.measure(...)`
+  声明固定 `'All`；`@edsl.distinct_measure(...)` 声明固定 `'Distinct`。两者都以独立、
+  稳定的 measure id 暴露，Factory 按 id 从 `PreparedPayload` 读取 input；调用者不能把
+  同一个业务 measure 临时切换为另一种语义。distinct measure 还必须通过
+  `PlanProfile.allow_distinct` 的执行能力校验。
 - 纯结构探针 `query_intent_ok(payload, subject, intent)`：未授权 subject、非对象
   Intent、未知 op/kind、请求字段类型错误、非 `list` 上的 field-to-field 谓词等都返回
   `False`，供绿色单元测试断言。它不判断 vocabulary、授权、grain 或路径可行性，不能

@@ -23,7 +23,7 @@ Resolver 写出的输入只引用 `DOMAIN.md` 声明的稳定 measure/dimension/
   "ordering":   [ { "target": "Measure"|"Dimension", "id": "...", "direction": "Asc"|"Desc" }, ... ],
   "limit":      int | null,
   "offset":     int | null,
-  "output_order": [ "dimension id", ... ],   // list/compare/ranked：空 = 默认列序；非空 = 精确
+  "output_order": [ "dimension id", ... ],   // list/aggregate/compare/ranked；通用 token 可标记 measure/dimension
   "exists":     [ ExistsSpec, ... ],
   "having":     [ HavingSpec, ... ],
   "hidden_having": [ HavingSpec, ... ]

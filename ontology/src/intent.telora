@@ -151,12 +151,17 @@ def parse_input: Fn(String, Value) -> edsl.FilterInput = fn(kind, value) {
     input
 };
 
-def parse_measure_requests: Fn(String, Array(Value)) -> Array(edsl.MeasureRequest) = fn(subject, items) {
+def parse_measure_requests: Fn(edsl.PreparedPayload, String, Array(Value)) -> Array(edsl.MeasureRequest) = fn(payload, subject, items) {
     array.map(items, fn(item) {
+        let id = as_string(item);
+        let input = match array.find(payload.measures, fn(measure) { measure.id == id }) {
+            'Some(measure) => measure.input,
+            'None => fail!("unknown measure", subject, id),
+        };
         let request: edsl.MeasureRequest = {
-            id: as_string(item),
+            id,
             subject,
-            input: 'All,
+            input,
         };
         request
     })
@@ -375,7 +380,7 @@ def build_set_branch: Fn(edsl.PreparedPayload, String, Value) -> qb.Plan = fn(pa
             if !no_local_window_ok(obj) {
                 fail!("set branch must not carry a local ordering, limit, or offset", branch)
             } else {
-                let request = build_request(subject, obj);
+                let request = build_request(payload, subject, obj);
                 let exists: Array(edsl.ExistsRequest) =
                     array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                 let having: Array(edsl.HavingRequest) =
@@ -401,55 +406,40 @@ def build_set_branch: Fn(edsl.PreparedPayload, String, Value) -> qb.Plan = fn(pa
     }
 };
 
-def dimension_ids: Fn(Array(edsl.DimensionRequest)) -> Array(String) = fn(dims) {
-    array.map(dims, fn(dimension) { dimension.id })
-};
-
-def output_order_ok: Fn(Array(String), Array(String)) -> Bool = fn(selected, output) {
-    if array.length(selected) != array.length(output) {
-        'False
-    } else {
-        let all_selected = array.all(output, fn(id) {
-            array.any(selected, fn(sel) { sel == id })
-        });
-        let no_duplicates = array.all(output, fn(id) {
-            let matches = array.filter(output, fn(other) { other == id });
-            array.length(matches) == 1
-        });
-        all_selected && no_duplicates
+def parse_projection_token: Fn(Value) -> edsl.ProjectionToken = fn(value) {
+    match value {
+        # Backward-compatible row-list shorthand.
+        'String(id) => 'Dimension(id),
+        'Object(obj) => do {
+            let kind = as_string(field(obj, "kind"));
+            let id = as_string(field(obj, "id"));
+            match kind {
+                "measure" => 'Measure(id),
+                "dimension" => 'Dimension(id),
+                _ => fail!("unsupported output_order token kind", kind),
+            }
+        },
+        _ => fail!("output_order entry is not a projection token", value),
     }
 };
 
-def dimension_tokens_from: Fn(Array(String)) -> Array(edsl.ProjectionToken) = fn(ids) {
-    array.map(ids, fn(id) {
-        let token: edsl.ProjectionToken = 'Dimension(id);
-        token
-    })
-};
-
-def reorder_if_requested: Fn(edsl.PreparedPayload, edsl.QueryRequest, qb.Plan, Array(String)) -> qb.Plan =
+def reorder_if_requested: Fn(edsl.PreparedPayload, edsl.QueryRequest, qb.Plan, Array(edsl.ProjectionToken)) -> qb.Plan =
     fn(payload, request, plan, output) {
         if array.length(output) == 0 {
             plan
         } else {
-            let selected = dimension_ids(request.dimensions);
-            if output_order_ok(selected, output) {
-                let tokens = dimension_tokens_from(output);
-                let ordered: qb.Plan = edsl.reorder_projection(payload, request, plan, tokens);
-                ordered
-            } else {
-                fail!("output_order must list every selected dimension exactly once", output)
-            }
+            let ordered: qb.Plan = edsl.reorder_projection(payload, request, plan, output);
+            ordered
         }
     };
 
-def lower_list_with_order: Fn(edsl.PreparedPayload, edsl.QueryRequest, Array(String)) -> qb.Plan = fn(payload, request, output) {
+def lower_list_with_order: Fn(edsl.PreparedPayload, edsl.QueryRequest, Array(edsl.ProjectionToken)) -> qb.Plan = fn(payload, request, output) {
     let base_plan: qb.Plan = edsl.lower(payload, request);
     reorder_if_requested(payload, request, base_plan, output)
 };
 
-def build_request: Fn(String, Dict(Value)) -> edsl.QueryRequest = fn(subject, obj) {
-    let measures = parse_measure_requests(subject, as_array(field(obj, "measures")));
+def build_request: Fn(edsl.PreparedPayload, String, Dict(Value)) -> edsl.QueryRequest = fn(payload, subject, obj) {
+    let measures = parse_measure_requests(payload, subject, as_array(field(obj, "measures")));
     let dimensions = parse_dimension_requests(subject, as_array(field(obj, "dimensions")));
     let filter_values = scalar_filter_items(as_array(field(obj, "filters")));
     let filters: Array(edsl.FilterRequest) = array.map(filter_values, fn(item) { parse_filter(subject, item) });
@@ -503,11 +493,11 @@ def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(paylo
         if array.length(field_values) != 0 && op != "list" {
             fail!("field-to-field predicates are only supported by the list shape", op)
         } else {
-            let request = build_request(subject, obj);
+            let request = build_request(payload, subject, obj);
             match op {
                 "list" => {
                     let output_values = array_opt(obj, "output_order");
-                    let output: Array(String) = array.map(output_values, as_string);
+                    let output: Array(edsl.ProjectionToken) = array.map(output_values, parse_projection_token);
                     let plan: qb.Plan = if array.length(field_values) != 0 {
                         let field_filters: Array(edsl.FieldFilterRequest) =
                             array.map(field_values, fn(item) { parse_field_filter(subject, item) });
@@ -530,6 +520,8 @@ def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(paylo
                     if array.length(request.measures) == 0 {
                         fail!("aggregate requires at least one visible measure; use top for hidden group ordering")
                     } else {
+                        let output_values = array_opt(obj, "output_order");
+                        let output: Array(edsl.ProjectionToken) = array.map(output_values, parse_projection_token);
                         let hidden_values = array_opt(obj, "hidden_having");
                         if array.length(hidden_values) != 0 {
                             # Hidden same-source aggregate HAVING over a grouped
@@ -541,7 +533,8 @@ def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(paylo
                             } else {
                                 let hidden: Array(edsl.InternalHavingRequest) =
                                     array.map(hidden_values, fn(item) { parse_internal_having(subject, item) });
-                                let plan: qb.Plan = edsl.lower_hidden_having(payload, request, hidden);
+                                let base_plan: qb.Plan = edsl.lower_hidden_having(payload, request, hidden);
+                                let plan = reorder_if_requested(payload, request, base_plan, output);
                                 qb.transform_sqlite(plan)
                             }
                         } else {
@@ -549,7 +542,8 @@ def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(paylo
                                 array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                             let having: Array(edsl.HavingRequest) =
                                 array.map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                            let plan: qb.Plan = edsl.lower_full(payload, request, exists, having);
+                            let base_plan: qb.Plan = edsl.lower_full(payload, request, exists, having);
+                            let plan = reorder_if_requested(payload, request, base_plan, output);
                             qb.transform_sqlite(plan)
                         }
                     }
@@ -607,7 +601,7 @@ def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(paylo
                     let base_plan: qb.Plan =
                         edsl.lower_attribute_compare(payload, request, comparisons);
                     let output_values = array_opt(obj, "output_order");
-                    let output: Array(String) = array.map(output_values, as_string);
+                    let output: Array(edsl.ProjectionToken) = array.map(output_values, parse_projection_token);
                     let plan = reorder_if_requested(payload, request, base_plan, output);
                     qb.transform_sqlite(plan)
                 },
@@ -617,7 +611,7 @@ def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(paylo
                     let base_plan: qb.Plan =
                         edsl.lower_ranked_key_compare(payload, request, comparisons);
                     let output_values = array_opt(obj, "output_order");
-                    let output: Array(String) = array.map(output_values, as_string);
+                    let output: Array(edsl.ProjectionToken) = array.map(output_values, parse_projection_token);
                     let plan = reorder_if_requested(payload, request, base_plan, output);
                     qb.transform_sqlite(plan)
                 },
@@ -674,6 +668,24 @@ def string_array_ok: Fn(Value) -> Bool = fn(value) {
     }
 };
 
+def projection_token_shape_ok: Fn(Value) -> Bool = fn(value) {
+    match value {
+        'String(_) => 'True,
+        'Object(obj) => match (dict.get(obj, "kind"), dict.get(obj, "id")) {
+            ('Some('String(kind)), 'Some('String(_))) => kind == "measure" || kind == "dimension",
+            _ => 'False,
+        },
+        _ => 'False,
+    }
+};
+
+def projection_token_array_ok: Fn(Value) -> Bool = fn(value) {
+    match value {
+        'Array(items) => array.all(items, projection_token_shape_ok),
+        _ => 'False,
+    }
+};
+
 def filter_entry_shape_ok: Fn(Value) -> Bool = fn(value) {
     match value {
         'Object(obj) => do {
@@ -704,7 +716,7 @@ def request_field_shape_ok: Fn(Dict(Value)) -> Bool = fn(obj) {
     let offset_ok = optional_null_or_int_ok(dict.get(obj, "offset"));
     let output_ok = match dict.get(obj, "output_order") {
         'None => 'True,
-        'Some(value) => string_array_ok(value),
+        'Some(value) => projection_token_array_ok(value),
     };
     let exists_ok = match dict.get(obj, "exists") { 'None => 'True, 'Some(value) => is_array_value(value) };
     let having_ok = match dict.get(obj, "having") { 'None => 'True, 'Some(value) => is_array_value(value) };

@@ -25,7 +25,7 @@ SQL Query。领域内**没有**自定义 parser/lowering 分支。
   "dimensions": [ "<dimension id>", ... ],
   "filters":    [ Filter | FieldFilter, ... ],   // AND；FieldFilter 仅 list 可用
   "ordering":   [ Order, ... ],
-  "output_order": [ "<dimension id>", ... ],      // 仅 list 可用，可省略
+  "output_order": [ "<dimension id>", ... ],      // list/aggregate/compare/ranked 可用，可省略
   "exists":     [ Exists, ... ],                  // exists/absence 的相关条件；count/aggregate 可带
   "having":     [ Having, ... ],
   "hidden_having": [ InternalHaving, ... ],       // aggregate（同源）/ top（关联）可用
@@ -90,7 +90,7 @@ modeling 数据猜测替代值；未知或疑似拼写问题仍按原值查询�
 
 | op | measures | dimensions | 可用附加 | 语义 |
 | --- | --- | --- | --- | --- |
-| `list` | 空 | 至少 1 | filters(含 FieldFilter), ordering(Dimension), output_order, limit/offset | 行级列表；按 dimensions 请求序投影；output_order 可把已选维度重排（须恰好列全一次） |
+| `list` | 空 | 至少 1 | filters(含 FieldFilter), ordering(Dimension), output_order, limit/offset | 行级列表；按 dimensions 请求序投影；字符串 output_order 可把已选维度重排 |
 | `count` | 1 个 count 指标 | 空 | filters, exists, having | 单行计数 |
 | `aggregate` | 至少 1 | 至少 1 | filters, exists, having, hidden_having(同源), ordering | 分组聚合；投影列序固定为 measures（请求序）在前、dimensions（请求序）在后 |
 | `top` | 空 | 至少 1 | filters, ordering(Measure 隐藏排序), hidden_having(关联), limit/offset | 关联聚合隐藏 Top-N；投影只含 dimensions（请求序），聚合绝不进投影 |
@@ -105,7 +105,9 @@ modeling 数据猜测替代值；未知或疑似拼写问题仍按原值查询�
 - 隐藏计算（top 排序、hidden_having）不得改写成可见 measure/额外投影列。
 - 只含 dimensions → 行级；只含 measures → 全量单行；measures+dimensions → 分组。
 - `limit` 正整数；`offset` 非负且需搭配非空 `ordering`/确定排序语义的 top。
-- `output_order` 只对 `list` 生效（用于显式投影列序，见 `INTENT` 投影列规则）。
+- `output_order` 对 `list`/`aggregate`/`compare`/`ranked` 生效。字符串是维度 token 的
+  兼容简写；measure 与 dimension 混排使用 `{"kind":"measure|dimension","id":...}`，
+  且必须把所有已选投影项恰好列出一次。
 
 ## 字符串字面量保真
 
@@ -119,8 +121,8 @@ modeling 数据猜测替代值；未知或疑似拼写问题仍按原值查询�
 
 - 多跳或无 `exists_route`/无法唯一证明直接关系的关联聚合、存在路由；
 - `top`/`hidden_having` 的目标 measure 位于多跳或无法唯一证明直接关系的实体；
-- `output_order` 用在 `list` 以外的形状；distinct 计数（对某维度取值去重后的计数值，本
-  公共协议不提供 distinct 计数 measure）；
+- `output_order` 用在不支持的形状；distinct 计数（当前 spider 模型没有发布固定为
+  Distinct input 的独立 measure id）；
 - 任意表名/列名/alias/Join/SQL/表达式作为输入；
 - 把隐藏排序/HAVING 所需的聚合作为可见 measure 混入投影；
 - `aggregate` 的 `hidden_having` 与 `having`/`exists` 混用；`top` 携带可见 measures。
@@ -210,7 +212,7 @@ modeling 数据猜测替代值；未知或疑似拼写问题仍按原值查询�
 - `vocab:` 未知 measure/dimension/entity/exists target/ordering id；
 - `type:` 文本维度配数值值或反之、`kind` 与 `value` 不符、文本算子配非字符串值、字段比较
   类型不兼容；
-- `rule:` 非法/不支持算子、`output_order` 非 list、非正 limit、offset 无排序、跨粒度组合、
+- `rule:` 非法/不支持算子、`output_order` 用于不支持的 shape、非正 limit、offset 无排序、跨粒度组合、
   FieldFilter 用于非 list 形状、top 携带 measures；
 - `unsupported:` 无唯一直接关系/无路由的关联聚合或存在、多跳隐藏聚合、distinct 计数、
   一般集合运算与派生标量子查询（本领域不发布 `set`/`set_count`/`compare`/`ranked` 形状的
