@@ -1,29 +1,120 @@
 # Cross-model checks for the model-derived intent lowering factory.
+#
+# The factory is bound only to a `PreparedPayload` and a caller subject.  These
+# checks drive it over TWO structurally different domain-neutral prepared models
+# (the fictional enterprise `@src/knowledge` payload and a local org teams /
+# members model) and assert exact SQL, bindings and determinism for the closed
+# intent shapes: list, count, field-to-field predicates, hidden row ordering,
+# selected HAVING, hidden HAVING, related existence/absence, related hidden
+# ordering (top), distinct, set combination and set count.
+#
+# `query_intent_ok` is the pure contract probe used for the rejection checks;
+# the real lowering rejects the same shapes atomically with `fail!` and never
+# emits a partial Query.
 
-import "@src/intent" { query_intent_lower_factory };
-import "@src/knowledge" { payload };
+import "@src/edsl" as edsl;
+import "@src/intent" { query_intent_lower_factory, query_intent_ok };
+import "@src/knowledge" { payload, profile };
 import "@src/query" as qb;
 import "std/array" as array;
 import "std/json" as json;
 import "std/result" as result;
 import "std/value" { Value };
 
-def lower_intent: Fn(Value) -> qb.Query = query_intent_lower_factory(payload, "analyst");
+# ---------------------------------------------------------------------------
+# Second structurally different prepared model (domain-neutral "org" model).
+# ---------------------------------------------------------------------------
+
+def count_agg: qb.AggregateFunction = 'Count;
+def sum_agg: qb.AggregateFunction = 'Sum;
+def flag_true: Bool = 'True;
+def eq_ops: Array(edsl.FilterOp) = ['Eq];
+def ge_ops: Array(edsl.FilterOp) = ['Eq, 'Ge, 'Le];
+def text_kinds: Array(edsl.FilterInputKind) = ['Text];
+def int_kinds: Array(edsl.FilterInputKind) = ['Int];
+def no_requires: Array(Type) = [];
+def fanout_kind: edsl.RelationKind = 'FanOut;
+
+# Canonical field order (alphabetical): 0 code, 1 headcount, 2 id, 3 region,
+# 4 zone.
+@edsl.entity_id("org_teams")
+@edsl.entity_source("org_teams", "t")
+type OrgTeam = struct {
+    @edsl.column("code")
+    @edsl.dimension("OrgCode", flag_true, flag_true, eq_ops, text_kinds)
+    code: String,
+    @edsl.column("headcount")
+    @edsl.measure("TeamHeadSum", sum_agg, no_requires)
+    headcount: Int,
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("TeamCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("region")
+    @edsl.dimension("OrgRegion", flag_true, flag_true, eq_ops, text_kinds)
+    region: String,
+    @edsl.column("zone")
+    @edsl.dimension("OrgZone", flag_true, flag_true, eq_ops, text_kinds)
+    zone: String,
+};
+
+# Canonical field order: 0 id, 1 team_id.  Members declare the reverse fan-out
+# relation to their team, so teams reach members through the prepared direction.
+@edsl.entity_id("org_members")
+@edsl.entity_source("org_members", "m")
+@edsl.relation(OrgTeam, fanout_kind, 1, 2)
+type OrgMember = struct {
+    @edsl.column("id")
+    @edsl.key(flag_true)
+    @edsl.measure("OrgMemberCount", count_agg, no_requires)
+    id: Int,
+    @edsl.column("team_id")
+    team_id: Int,
+};
+
+def org_entity_types: Array(Type) = [OrgTeam, OrgMember];
+
+def org_authorize: Fn(String) -> Bool = fn(subject) { subject == "analyst" };
+
+def org_payload: edsl.PreparedPayload = do {
+    let result: edsl.PreparedPayload = edsl.build_root("org-v1", org_entity_types, profile, org_authorize);
+    result
+};
+
+# ---------------------------------------------------------------------------
+# Factories and helpers.
+# ---------------------------------------------------------------------------
+
+def lower_knowledge: Fn(Value) -> qb.Query = query_intent_lower_factory(payload, "analyst");
+def lower_org: Fn(Value) -> qb.Query = query_intent_lower_factory(org_payload, "analyst");
 
 def parse: Fn(String) -> Value = fn(source) {
     json.parse(source) |> result.unwrap
 };
 
-def assert_query: Fn(String, Value, Int) -> Bool = fn(label, intent, expected_bindings) {
-    let query = lower_intent(intent);
-    if query.sql != "" && array.length(query.bindings) == expected_bindings {
+def assert_knowledge: Fn(String, Value, String, Array(qb.Val)) -> Bool = fn(label, intent, expected_sql, expected) {
+    let query = lower_knowledge(intent);
+    if query.sql == expected_sql && query.bindings == expected {
         'True
     } else {
-        fail!("derived intent lowering mismatch", label, query.sql, query.bindings)
+        fail!("derived knowledge intent mismatch", label, query.sql, query.bindings, expected_sql, expected)
     }
 };
 
-export def count_members = assert_query(
+def assert_org: Fn(String, Value, String, Array(qb.Val)) -> Bool = fn(label, intent, expected_sql, expected) {
+    let query = lower_org(intent);
+    if query.sql == expected_sql && query.bindings == expected {
+        'True
+    } else {
+        fail!("derived org intent mismatch", label, query.sql, query.bindings, expected_sql, expected)
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Positive shapes on the knowledge model.
+# ---------------------------------------------------------------------------
+
+export def count_members = assert_knowledge(
     "count-members",
     parse(r#"{
         "op": "count",
@@ -36,10 +127,11 @@ export def count_members = assert_query(
         "limit": null,
         "offset": null
     }"#),
-    0,
+    "SELECT count(mb.id) AS MemberCount FROM members AS mb",
+    [],
 );
 
-export def filtered_members = assert_query(
+export def filtered_members = assert_knowledge(
     "filtered-members",
     parse(r#"{
         "op": "list",
@@ -54,10 +146,230 @@ export def filtered_members = assert_query(
         "limit": null,
         "offset": null
     }"#),
-    1,
+    "SELECT mb.kind FROM members AS mb WHERE mb.kind = ?",
+    ['String("staff")],
 );
 
-export def deterministic = do {
+export def knowledge_distinct = assert_knowledge(
+    "knowledge-distinct",
+    parse(r#"{
+        "op": "distinct",
+        "measures": [],
+        "dimensions": ["MemberKind"],
+        "filters": [],
+        "ordering": [],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT DISTINCT mb.kind FROM members AS mb",
+    [],
+);
+
+# ---------------------------------------------------------------------------
+# Positive shapes on the org model.
+# ---------------------------------------------------------------------------
+
+export def org_field_to_field = assert_org(
+    "org-field-to-field",
+    parse(r#"{
+        "op": "list",
+        "measures": [],
+        "dimensions": ["OrgRegion"],
+        "filters": [
+            {"left": "OrgCode", "op": "eq", "right": "OrgZone"}
+        ],
+        "ordering": [],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT t.region FROM org_teams AS t WHERE t.code = t.zone",
+    [],
+);
+
+export def org_hidden_row_ordering = assert_org(
+    "org-hidden-row-ordering",
+    parse(r#"{
+        "op": "list",
+        "measures": [],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [
+            {"target": "Dimension", "id": "OrgZone", "direction": "Asc"}
+        ],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT t.region FROM org_teams AS t ORDER BY t.zone ASC",
+    [],
+);
+
+export def org_selected_having = assert_org(
+    "org-selected-having",
+    parse(r#"{
+        "op": "aggregate",
+        "measures": ["TeamCount"],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [],
+        "having": [
+            {"measure": "TeamCount", "op": "ge", "kind": "int", "value": 2}
+        ],
+        "exists": [],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT count(t.id) AS TeamCount, t.region FROM org_teams AS t GROUP BY t.region HAVING count(t.id) >= ?",
+    ['Int(2)],
+);
+
+export def org_hidden_having = assert_org(
+    "org-hidden-having",
+    parse(r#"{
+        "op": "aggregate",
+        "measures": ["TeamCount"],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [],
+        "having": [],
+        "hidden_having": [
+            {"measure": "TeamHeadSum", "op": "ge", "kind": "int", "value": 5}
+        ],
+        "exists": [],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT count(t.id) AS TeamCount, t.region FROM org_teams AS t GROUP BY t.region HAVING sum(t.headcount) >= ?",
+    ['Int(5)],
+);
+
+export def org_related_exists = assert_org(
+    "org-related-exists",
+    parse(r#"{
+        "op": "exists",
+        "measures": [],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [],
+        "exists": [
+            {"target": "org_members", "filters": [], "min_matches": null}
+        ],
+        "having": [],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT t.region FROM org_teams AS t WHERE EXISTS (SELECT 1 FROM org_members AS m WHERE t.id = m.team_id)",
+    [],
+);
+
+export def org_related_absence = assert_org(
+    "org-related-absence",
+    parse(r#"{
+        "op": "absence",
+        "measures": [],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [],
+        "exists": [
+            {"target": "org_members", "filters": [], "min_matches": null}
+        ],
+        "having": [],
+        "limit": null,
+        "offset": null
+    }"#),
+    "SELECT t.region FROM org_teams AS t WHERE NOT EXISTS (SELECT 1 FROM org_members AS m WHERE t.id = m.team_id)",
+    [],
+);
+
+export def org_related_hidden_ordering = assert_org(
+    "org-related-hidden-ordering",
+    parse(r#"{
+        "op": "top",
+        "measures": [],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [
+            {"target": "Measure", "id": "OrgMemberCount", "direction": "Desc"}
+        ],
+        "limit": 1,
+        "offset": null
+    }"#),
+    "SELECT t.region FROM org_teams AS t INNER JOIN org_members AS m ON t.id = m.team_id GROUP BY t.region ORDER BY count(m.id) DESC LIMIT ?",
+    ['Int(1)],
+);
+
+export def org_set_intersect = assert_org(
+    "org-set-intersect",
+    parse(r#"{
+        "op": "set",
+        "kind": "intersect",
+        "branches": [
+            {
+                "shape": "row",
+                "measures": [],
+                "dimensions": ["OrgRegion"],
+                "filters": [
+                    {"dimension": "OrgRegion", "op": "eq", "kind": "text", "value": "north"}
+                ],
+                "ordering": [],
+                "limit": null,
+                "offset": null
+            },
+            {
+                "shape": "row",
+                "measures": [],
+                "dimensions": ["OrgRegion"],
+                "filters": [
+                    {"dimension": "OrgRegion", "op": "eq", "kind": "text", "value": "south"}
+                ],
+                "ordering": [],
+                "limit": null,
+                "offset": null
+            }
+        ]
+    }"#),
+    "SELECT t.region FROM org_teams AS t WHERE t.region = ? INTERSECT SELECT t.region FROM org_teams AS t WHERE t.region = ?",
+    ['String("north"), 'String("south")],
+);
+
+export def org_set_count = assert_org(
+    "org-set-count",
+    parse(r#"{
+        "op": "set_count",
+        "kind": "intersect",
+        "branches": [
+            {
+                "shape": "row",
+                "measures": [],
+                "dimensions": ["OrgRegion"],
+                "filters": [
+                    {"dimension": "OrgRegion", "op": "eq", "kind": "text", "value": "north"}
+                ],
+                "ordering": [],
+                "limit": null,
+                "offset": null
+            },
+            {
+                "shape": "row",
+                "measures": [],
+                "dimensions": ["OrgRegion"],
+                "filters": [
+                    {"dimension": "OrgRegion", "op": "eq", "kind": "text", "value": "south"}
+                ],
+                "ordering": [],
+                "limit": null,
+                "offset": null
+            }
+        ]
+    }"#),
+    "SELECT count(1) FROM (SELECT t.region FROM org_teams AS t WHERE t.region = ? INTERSECT SELECT t.region FROM org_teams AS t WHERE t.region = ?) AS __q_set",
+    ['String("north"), 'String("south")],
+);
+
+# ---------------------------------------------------------------------------
+# Determinism: repeated lowering is byte-identical across both models.
+# ---------------------------------------------------------------------------
+
+export def deterministic_knowledge = do {
     let intent = parse(r#"{
         "op": "list",
         "measures": [],
@@ -71,11 +383,127 @@ export def deterministic = do {
         "limit": null,
         "offset": null
     }"#);
-    let first = lower_intent(intent);
-    let second = lower_intent(intent);
+    let first = lower_knowledge(intent);
+    let second = lower_knowledge(intent);
     if first == second {
         'True
     } else {
-        fail!("derived intent lowering is not deterministic", first, second)
+        fail!("knowledge intent lowering is not deterministic", first, second)
+    }
+};
+
+export def deterministic_org = do {
+    let intent = parse(r#"{
+        "op": "aggregate",
+        "measures": ["TeamCount"],
+        "dimensions": ["OrgRegion"],
+        "filters": [],
+        "ordering": [],
+        "having": [],
+        "hidden_having": [
+            {"measure": "TeamHeadSum", "op": "ge", "kind": "int", "value": 5}
+        ],
+        "exists": [],
+        "limit": null,
+        "offset": null
+    }"#);
+    let first = lower_org(intent);
+    let second = lower_org(intent);
+    if first.sql == second.sql && first.bindings == second.bindings {
+        'True
+    } else {
+        fail!("org intent lowering is not deterministic", first, second)
+    }
+};
+
+# ---------------------------------------------------------------------------
+# Rejection probes (pure `query_intent_ok`, never fails).
+# ---------------------------------------------------------------------------
+
+def valid_knowledge_intent: Value = parse(r#"{
+    "op": "list",
+    "measures": [],
+    "dimensions": ["MemberKind"],
+    "filters": [],
+    "ordering": [],
+    "exists": [],
+    "having": [],
+    "limit": null,
+    "offset": null
+}"#);
+
+export def rejects_unauthorized_subject = do {
+    if !query_intent_ok(payload, "outsider", valid_knowledge_intent) {
+        'True
+    } else {
+        fail!("intent probe: an unauthorized subject should be rejected")
+    }
+};
+
+export def rejects_unknown_op = do {
+    let intent = parse(r#"{"op": "wizard", "measures": [], "dimensions": [], "filters": [], "ordering": []}"#);
+    if !query_intent_ok(payload, "analyst", intent) {
+        'True
+    } else {
+        fail!("intent probe: an unsupported op should be rejected")
+    }
+};
+
+export def rejects_malformed_measures = do {
+    let intent = parse(r#"{"op": "count", "measures": "MemberCount", "dimensions": [], "filters": [], "ordering": []}"#);
+    if !query_intent_ok(payload, "analyst", intent) {
+        'True
+    } else {
+        fail!("intent probe: a malformed measures field should be rejected")
+    }
+};
+
+export def rejects_field_predicate_outside_list = do {
+    # field-to-field predicates are a row-level list shape; using one inside an
+    # aggregate shape is rejected by the structural probe (and by lowering).
+    let intent = parse(r#"{
+        "op": "aggregate",
+        "measures": ["TeamCount"],
+        "dimensions": ["OrgRegion"],
+        "filters": [
+            {"left": "OrgCode", "op": "eq", "right": "OrgZone"}
+        ],
+        "ordering": [],
+        "having": [],
+        "limit": null,
+        "offset": null
+    }"#);
+    if !query_intent_ok(org_payload, "analyst", intent) {
+        'True
+    } else {
+        fail!("intent probe: a field-to-field predicate outside the list shape should be rejected")
+    }
+};
+
+export def rejects_unsupported_set_kind = do {
+    let intent = parse(r#"{"op": "set", "kind": "fuzzy", "branches": []}"#);
+    if !query_intent_ok(payload, "analyst", intent) {
+        'True
+    } else {
+        fail!("intent probe: an unsupported set kind should be rejected")
+    }
+};
+
+export def positive_control_intents = do {
+    if query_intent_ok(payload, "analyst", valid_knowledge_intent)
+        && query_intent_ok(org_payload, "analyst", parse(r#"{
+            "op": "list",
+            "measures": [],
+            "dimensions": ["OrgRegion"],
+            "filters": [
+                {"left": "OrgCode", "op": "eq", "right": "OrgZone"}
+            ],
+            "ordering": [],
+            "limit": null,
+            "offset": null
+        }"#)) {
+        'True
+    } else {
+        fail!("intent probe: valid intents should be accepted")
     }
 };

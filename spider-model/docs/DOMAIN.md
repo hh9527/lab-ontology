@@ -47,7 +47,7 @@ Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现
 | `course_count` | 课程数量 | count |
 | `department_count` | 系数量 | count |
 | `degree_count` | 学位项目数量 | count |
-| `degree_summary_count` | 学位摘要名（按名称去重计数） | count |
+| `degree_summary_count` | 学位项目行中“学位摘要名”非空值计数 | count |
 | `section_count` | 教学班数量 | count |
 | `semester_count` | 学期数量 | count |
 | `student_count` | 学生数量 | count |
@@ -57,7 +57,8 @@ Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现
 | `transcript_count` | 成绩单数量 | count |
 | `transcript_content_count` | 成绩单项数量 | count |
 
-指标的 `all/distinct` 输入控制是否去重计数。
+指标是对业务对象行（或对象上非空属性）的 `count` 计数；本公共协议不提供对某维度取值
+去重的计数 measure。
 
 ### Dimension（维度 / 属性）
 
@@ -110,8 +111,8 @@ Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现
 
 ### 同主体属性比较（field-to-field）
 
-- 契约允许同一主体实体的**类型兼容、纯列属性对**之间做比较（见 `INTENT.md` 的
-  `field_filters`）。
+- 契约允许同一主体实体的**类型兼容、纯列属性对**之间做比较（`list` 形状的 FieldFilter，
+  见 `INTENT.md`）。
 - 本领域暴露的受支持属性对示例：`student_current_address` vs `student_permanent_address`
   （同为整数地址引用，`eq`/`ne`）。其它属性组合需类型兼容且被模型声明支持；不兼容组合
   稳定拒绝，不做字符串或 SQL 旁路。
@@ -126,9 +127,10 @@ Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现
 ## 统计口径
 
 - 只含 measures → 全量单行聚合；含 measures+dimensions → 按全部 dimensions 分组聚合。
-- 输出列顺序：默认 `dimensions`（请求序）在前、`measures`（请求序）在后；可用
-  `column_order` 显式覆盖（跨 measure/dimension 交错；内部 top-N/隐藏 HAVING 分支同样
-  生效，仅 distinct 列表例外）。
+- 投影列序由契约形状固定：`list`/`distinct`/`top`/`exists`/`absence` 按 `dimensions`
+  请求序；`aggregate` 为 measures（请求序）在前、dimensions（请求序）在后；`count` 为单
+  列。`list` 可用 `output_order` 重排已选维度（见 `INTENT.md`）；其它形状不得携带
+  `output_order`。
 - “详情”有明确映射：`course_description`/`section_description`/`department_description`/
   `degree_description`/`semester_description`/`student_details`/`transcript_details`，
   不用姓名集合近似。
@@ -139,12 +141,14 @@ Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现
 
 ## 边界
 
-- 支持：列表/去重列表、过滤、计数/去重计数、分组、隐藏维度排序、内部（未投影）排序
-  聚合、跨关系隐藏聚合（related aggregate：沿一条已声明直接关系的隐藏 Top-N 与隐藏
-  HAVING，聚合不进投影、HAVING threshold 参数化）、正反相关存在（含两跳 link 存在）、
-  同主体属性比较、Top-N 与分页。
+- 支持：列表/去重列表、过滤、计数、分组、按已选/未选维度排序、跨关系隐藏聚合（related
+  aggregate：沿一条已声明直接关系或显式 `exists_route` 的隐藏 Top-N 与隐藏 HAVING，聚合
+  不进投影、HAVING threshold 参数化）、正反相关存在（含两跳 link 存在）、同主体属性
+  比较、Top-N 与分页。
 - 不支持（确定性 `unsupported:` 诊断，不做近似替代）：请求已含返回聚合时再按不返回
-  聚合排序/HAVING；多跳或无法唯一证明直接关系的关联聚合；无可达路径的存在；跨主体
-  属性比较；一般集合运算（EXCEPT/INTERSECT）；派生标量子查询。
+  聚合排序/HAVING（同源 `hidden_having` 与可见 `having`/`exists` 混用）；多跳或无法唯一
+  证明直接关系的关联聚合；无可达路径的存在；跨主体属性比较；对维度取值去重后的计数值
+  （distinct count）；一般集合运算（EXCEPT/INTERSECT）；派生标量子查询；`output_order`
+  用于 `list` 以外形状。
 - 一致性：同义表达与重复执行必须结果一致（受支持时逐字节相同，否则同一类
   `unsupported`）。

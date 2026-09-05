@@ -898,6 +898,68 @@ offset 位于 limit 之后。使用 `offset` 的请求必须带有稳定排序�
 QueryBuilder 的 `Val` 使用 untagged JSON codec，因此 Query 编码后的 bindings 是
 `["gold", 5]` 这样的原生 JSON 标量，不是 variant wrapper。
 
+## 从本体派生查询能力（query_intent_lower_factory）
+
+`query_intent_lower_factory(payload, subject)` 只绑定一个已 prepare 的
+`PreparedPayload` 与一个调用主体，机械派生封闭的 `Value -> Query` 能力：
+
+```telora
+import "@src/intent" { query_intent_lower_factory, query_intent_ok };
+
+def payload: edsl.PreparedPayload = edsl.build_root(...);  # 唯一需要新领域作者声明的东西
+def lower: Fn(Value) -> qb.Query = query_intent_lower_factory(payload, "analyst");
+```
+
+领域**不得**再写独立的查询程序补写自己的查询空间；新增领域只声明本体（`build_root`
+模型 + profile + 授权），再加一个薄 Host 入口调用 Factory。Factory 的 Intent 解析、
+结构校验、能力判断、关系规划、投影整理与 SQL 转换全部在 foundation 内完成；它不含
+任何领域实体、字段、关系或值分支。Intent 值只引用**稳定 measure/dimension/entity
+id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw SQL/Expr。
+
+```json
+{ "op": "list", "measures": [], "dimensions": ["MemberKind"],
+  "filters": [{"dimension": "MemberKind", "op": "eq", "kind": "text", "value": "staff"}],
+  "ordering": [], "exists": [], "having": [], "limit": null, "offset": null }
+```
+
+### 支持形状（`op`）
+
+| op | 语义 | 备注 |
+| --- | --- | --- |
+| `list` | 行级维度投影（可筛选/排序）；支持 field-to-field 谓词与 `output_order` | measureless；隐藏行排序允许 |
+| `count` | 标量聚合摘要 + 筛选/existence/selected HAVING | `measures` 单/多个聚合无分组 |
+| `aggregate` | 分组聚合 + 可选 ordering/limit/selected HAVING/existence | 可选 `hidden_having`（同源隐藏聚合 HAVING） |
+| `top` | 分组 Top-N，按隐藏相关聚合排序（只返回组列） | 可选 `hidden_having`（related 隐藏 HAVING） |
+| `distinct` | 互不重复的行级维度投影（SELECT DISTINCT） | |
+| `exists` / `absence` | 保留 base 行/组存在（不存在）相关关联记录 | related existence/absence |
+| `compare` | 行级列表 + 属性 vs 标量聚合比较 | `comparisons` |
+| `ranked` | 外层明细行与隐藏 top/bottom 分组键比较 | `ranked` |
+| `set` | 两个兼容投影的 union/intersect/except | `branches` |
+| `set_count` | 集合之上的外层 count(1) | `branches` |
+
+### 通用字段与规则
+
+- `measures`/`dimensions` 是 id 字符串数组；`filters` 是**有序**数组；`ordering`
+  是 target/id/direction 对象数组（`target` 为 `"Measure"` 或 `"Dimension"`）；
+  `limit`/`offset` 是 null 或非负整数；`output_order` 是可选的已选维度重排数组。
+- `filters` 条目有两种封闭形式：
+  - 标量：`{"dimension": id, "op": op, "kind": kind, "value": value}`；
+  - field-to-field 谓词：`{"left": id, "op": op, "right": id}`（无 value；只允许
+    `list` 形状；比较同一 subject 实体的两个纯列属性）。
+- `exists`/`having` 用于相关存在/absence、selected HAVING；`hidden_having` 引用
+  隐藏聚合 measure（`aggregate` 的同源隐藏 HAVING / `top` 的 related 隐藏 HAVING）。
+- 隐藏排序/HAVING/辅助值**永不进入投影**；返回投影精确且可用 `output_order` 显式
+  重排。重复 lowering 的 SQL/bindings 逐字节一致。
+- 能力只有当 prepared 模型能证明该形状时才可用：不根据标识拼写推断业务含义，也不
+  静默发明 measure/dimension/grouping/join/projection。
+- 授权 subject 是执行上下文：Factory 每次 vocabulary 访问与嵌套子句都使用同一
+  subject；`payload.authorize` 拒绝时原子失败。
+- 纯结构探针 `query_intent_ok(payload, subject, intent)`：未授权 subject、非对象
+  Intent、未知 op/kind、请求字段类型错误、非 `list` 上的 field-to-field 谓词等都返回
+  `False`，供绿色单元测试断言。它不判断 vocabulary、授权、grain 或路径可行性，不能
+  当作完整的 `CanLower`；真实 lowering 才执行这些语义检查，并对失败形状原子
+  `fail!`，不发布部分 Query。
+
 ## 失败语义与边界
 
 以下情况原子失败：未知 id、授权失败、缺失筛选能力、非法筛选输入、未知枚举值、
@@ -941,7 +1003,13 @@ grouped-key（`lower_ranked_key_compare`）失败还包括：外层属性未知/
 Plan** 且父属性需要新增 join、分组维度未知/未授权/computed、外层属性与分组 key
 类型/domain 不兼容、排名 measure 未知/未授权/computed/filtered/不在内层
 population grain/`requires` 非空、scope filter 归属或输入错误；这些路由失败彼此
-可区分（fan-out / 歧义 / 缺失 / derived-join），调用者据此修正意图或模型。诊断由
+可区分（fan-out / 歧义 / 缺失 / derived-join），调用者据此修正意图或模型。
+model-derived intent factory（`query_intent_lower_factory`）失败还包括：未授权
+subject、非对象 Intent、未知 op / set kind / branch shape、请求字段类型错误、
+未知/未授权词汇（measure/dimension/entity id）、field-to-field 谓词用于非
+`list` 形状、field 谓词属性未知/未授权/非纯列/跨实体/类型或 domain 不兼容、
+`aggregate` 的 `hidden_having` 与 selected having/existence 组合、missing/ambiguous
+路径、grain 不兼容；全部原子失败、不发布部分 Query。诊断由
 Host 机制承载；公共 API 不返回 Rejection 或诊断数组。
 
 公共 Request、Plan、Query 和业务词汇均保持精确具名类型，不使用 `Any`、`Dyn` 或
@@ -1303,6 +1371,7 @@ union，不是 UNION ALL）。
 
 ```bash
 ./bin/telora -C ontology check @test/ontology
+./bin/telora -C ontology check @test/intent
 ```
 
 `tests/ontology.telora` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复
@@ -1440,4 +1509,15 @@ owner 被拒绝）及 `check_ranked_key_derived_plan_join_rejected`（derived(un
 外层 Plan 对需要新增 join 的父属性拒绝、base 自身属性可行）。
 query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
 `qb.exists_not`、`OrderKey 'Aggregate` 内部排序聚合与 `qb.exists_two_hop`
-（SQL/bindings/确定性）。
+（SQL/bindings/确定性）。model-derived intent factory 测试（`@test/intent`）另覆盖
+**两份结构不同的领域中性模型**（虚构企业 `@src/knowledge` 与本地 org
+teams/members 模型）：`count_members`/`filtered_members`/`knowledge_distinct`
+（精确 SQL/bindings），`org_field_to_field`（`list` 内 field-to-field 谓词降低为
+双列比较、无 binding）、`org_hidden_row_ordering`（行级按未投影维度排序）、
+`org_selected_having` / `org_hidden_having`（selected 与隐藏同源聚合 HAVING 精确
+SQL/bindings）、`org_related_exists` / `org_related_absence`（相关存在/NOT EXISTS）、
+`org_related_hidden_ordering`（`top`：隐藏相关聚合排序 + Top-N 的 route join）、
+`org_set_intersect` / `org_set_count`（集合组合与外层 count），以及
+`deterministic_knowledge` / `deterministic_org`（重复 lowering 逐字节一致）；拒绝侧
+经纯探针 `query_intent_ok` 覆盖未授权 subject、未知 op、malformed measures、非
+`list` 上的 field-to-field 谓词、未知 set kind，并保留合法 intent 的正控断言。
