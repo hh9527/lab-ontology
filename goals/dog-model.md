@@ -27,8 +27,10 @@ vocabulary, raw expressions, aliases, tables, columns, or join fragments.
 
 ## Delivery
 
-Deliver `docs/DOMAIN.md`, `docs/INTENT.md`, `src/model.telora`, `src/query.telora`,
-`src/bin/make-query.telora`, `tests/query.telora`, and `telora-crate.json`. Cover supported modeling
+Deliver `docs/DOMAIN.md`, `docs/INTENT.md`, `src/model.telora`,
+`src/bin/make-query.telora`, `tests/query.telora`, and `telora-crate.json`. Do not add a domain
+`src/query.telora`; derive lowering by binding the prepared payload to the public ontology Factory.
+Cover supported modeling
 shapes, invalid vocabulary/types/combinations, binding order, stable rejection, and repeated
 lowering determinism. Run every command listed in the plan and begin the final answer with
 `完成任务。`.

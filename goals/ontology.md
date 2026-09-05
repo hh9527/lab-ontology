@@ -23,6 +23,10 @@ types 和 type/member/variant properties 声明知识，一次性准备知识图
 - 授权、查询能力和筛选能力分别表达；已知但不可用的维度得到 capability 诊断。
 - Lowering 生成完整标准 Plan，并用知识声明的 `PlanProfile` 验证。
 - 失败通过带外诊断表达，不发布部分 Plan 或 Query。
+- 提供领域无关的 `query_intent_lower_factory`：只绑定 `PreparedPayload` 与调用主体，
+  即机械派生封闭 `Value -> Query` 能力。领域不得通过独立查询程序补写自己的查询空间。
+- Factory 的 Intent vocabulary、结构校验、能力判断、关系规划、投影整理和 SQL 转换都属于
+  foundation；新增领域只声明本体。缺失业务语义必须补为 typed property 或公共查询形状。
 
 ## 边界
 
@@ -35,8 +39,10 @@ crate 内部使用 `@src/query`，外部依赖者使用 `ontology/query`；所�
 ## 交付物
 
 - `src/edsl.telora`：property providers、prepared knowledge 和 Request lowering。
+- `src/intent.telora`：从 prepared 本体机械派生的公共 Intent lowering Factory。
 - `src/knowledge.telora`：小型、领域中性的完整建模示例。
 - `tests/ontology.telora`：property、关系、筛选、排序、Top N、枚举值域、失败路径和确定性契约测试。
+- `tests/intent.telora`：至少使用两份不同模型验证 Factory 不含领域类型或实体分支。
 - `docs/ONTOLOGY.md`：企业知识作者可独立使用的公共契约与指南。
 - `telora-crate.json`：声明统一 crate 的 Query 与 Ontology 模块。
 
@@ -46,4 +52,5 @@ crate 内部使用 `@src/query`，外部依赖者使用 `ontology/query`；所�
 
 ```bash
 ./bin/telora -C ontology check @test/ontology
+./bin/telora -C ontology check @test/intent
 ```

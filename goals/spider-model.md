@@ -39,6 +39,9 @@ Resolver 将符合 `INTENT.md` 的 JSON 写入 `spider-eval/input.json`。适配
 
 ## 交付
 
-交付 `docs/DOMAIN.md`、`docs/INTENT.md`、`src/model.telora`、`src/query.telora`、
-`src/bin/make-query.telora`、`tests/query.telora` 和 `telora-crate.json`。测试至少覆盖各类合法
+交付 `docs/DOMAIN.md`、`docs/INTENT.md`、`src/model.telora`、
+`src/bin/make-query.telora`、`tests/query.telora` 和 `telora-crate.json`。不得保留领域
+`src/query.telora`：直接把 prepared payload 交给
+`ontology/intent::query_intent_lower_factory`。真实业务差异必须表达为本体知识；公共封闭
+Intent 缺少领域无关形状时，反馈 Foundation 缺口，不得补领域查询分支。测试至少覆盖各类合法
 modeling 意图、未知词汇、类型错误、非法组合、参数绑定顺序和相同输入的确定性。

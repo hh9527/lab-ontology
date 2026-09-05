@@ -30,7 +30,10 @@ tables, columns, or Join fragments.
 
 ## Delivery
 
-Deliver `docs/DOMAIN.md`, `docs/INTENT.md`, `src/model.telora`, `src/query.telora`,
-`src/bin/make-query.telora`, `tests/query.telora`, and `telora-crate.json`. Cover supported modeling
+Deliver `docs/DOMAIN.md`, `docs/INTENT.md`, `src/model.telora`,
+`src/bin/make-query.telora`, `tests/query.telora`, and `telora-crate.json`. Do not retain a
+domain `src/query.telora`: bind `ontology/intent::query_intent_lower_factory` directly to the
+prepared payload. Express genuine business differences in the model; report a Foundation gap when
+the public closed Intent protocol lacks a domain-independent shape. Cover supported modeling
 shapes, invalid vocabulary/types/combinations, binding order, stable rejection, and repeated lowering
 determinism. Run every command listed in the plan and begin the final answer with `完成任务。`.
