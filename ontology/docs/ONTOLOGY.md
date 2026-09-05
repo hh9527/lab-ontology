@@ -12,6 +12,36 @@ import "@src/query" as qb;
 外部 crate 通过 `ontology/edsl` 和 `ontology/query` 导入公共模块。`@src/edsl`
 是 ontology crate 内部使用的路径；示例知识位于 `@src/knowledge`。
 
+## 从本体派生查询能力
+
+领域 crate 只需要声明并构建 `PreparedPayload`。公共 `ontology/intent` 模块提供
+`query_intent_lower_factory`，将 prepared 本体机械派生为封闭的 Intent lowering：
+
+```telora
+import "@src/model" { payload };
+import "ontology/intent" { query_intent_lower_factory };
+import "ontology/query" as qb;
+import "std/value" { Value };
+
+def lower_intent: Fn(Value) -> qb.Query =
+    query_intent_lower_factory(payload, "resolver");
+```
+
+第一个参数是领域本体经 `build_root` 验证和预计算后的值；第二个参数是执行上下文提供的
+授权主体，不是领域查询规则。返回函数只接受使用稳定 measure、dimension、entity id 的
+业务 Intent，并依据本体中的 source、column、grain、relation、capability 和授权信息生成
+参数化 `Query`。领域不需要另写关系选择、聚合规划、投影整理或 SQL 生成代码。
+
+当前封闭 Intent 协议覆盖 `list`、`count`、`aggregate`、`top`、`distinct`、`exists`、
+`absence`、`set`、`compare` 与 `ranked`。未知操作、非法组合、未知或未授权 vocabulary、
+不唯一关系路径以及不兼容 grain 都原子失败，不产生部分 Query。同一 payload、subject 和
+Intent 的重复 lowering 必须得到逐值相同的 SQL 与 bindings。
+
+`tests/intent.telora` 使用 ontology 自带知识模型验证跨模型派生；领域测试只需把自己的
+payload 交给同一 Factory。新增查询形状应扩展公共封闭协议和通用 lowering，不应在领域
+crate 中增加查询分支。模型无法表达某项业务语义时，应扩充本体 property，而不是以领域
+`query.telora` 补写程序。
+
 ## 公共请求类型
 
 ```telora

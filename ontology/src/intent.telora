@@ -1,10 +1,9 @@
-# Closed intent lowering for the dog kennel model.
+# Model-derived lowering from a closed intent Value to Query.
 #
-# This module implements the deterministic translation from a resolver intent
-# (a plain JSON `Value` produced from dog-eval/input.json) into a parameterized
-# SQLite `Query`.  The intent vocabulary is documented in docs/INTENT.md and is
-# expressed only in business terms; the module never accepts SQL vocabulary,
-# table/column names, aliases, or join fragments.
+# The factory binds one prepared ontology model and one caller subject, then
+# mechanically derives a deterministic `Value -> Query` lowering capability.
+# Intent values refer only to stable measure, dimension and entity ids published
+# by the model; they never carry tables, columns, aliases or join fragments.
 #
 # Supported intent `op` values:
 #   "list"       row-level projection of dimensions (optionally filtered/sorted).
@@ -18,9 +17,8 @@
 #   "compare"    attribute-versus-scalar-aggregate comparison over a list request.
 #   "ranked"     outer-detail rows compared with the hidden top/bottom grouped key.
 
-import "@src/model" { payload };
-import "ontology/edsl" as edsl;
-import "ontology/query" as qb;
+import "@src/edsl" as edsl;
+import "@src/query" as qb;
 import "std/array" as array;
 import "std/dict" as dict;
 import "std/value" { Value };
@@ -153,36 +151,36 @@ def parse_input: Fn(String, Value) -> edsl.FilterInput = fn(kind, value) {
     input
 };
 
-def parse_measure_requests: Fn(Array(Value)) -> Array(edsl.MeasureRequest) = fn(items) {
+def parse_measure_requests: Fn(String, Array(Value)) -> Array(edsl.MeasureRequest) = fn(subject, items) {
     array.map(items, fn(item) {
         let request: edsl.MeasureRequest = {
             id: as_string(item),
-            subject: "resolver",
+            subject,
             input: 'All,
         };
         request
     })
 };
 
-def parse_dimension_requests: Fn(Array(Value)) -> Array(edsl.DimensionRequest) = fn(items) {
+def parse_dimension_requests: Fn(String, Array(Value)) -> Array(edsl.DimensionRequest) = fn(subject, items) {
     array.map(items, fn(item) {
         let request: edsl.DimensionRequest = {
             id: as_string(item),
-            subject: "resolver",
+            subject,
             input: 'None,
         };
         request
     })
 };
 
-def parse_filter: Fn(Value) -> edsl.FilterRequest = fn(item) {
+def parse_filter: Fn(String, Value) -> edsl.FilterRequest = fn(subject, item) {
     let obj = as_object(item);
     let dimension = as_string(field(obj, "dimension"));
     let op = parse_op(as_string(field(obj, "op")));
     let input = parse_input(as_string(field(obj, "kind")), field(obj, "value"));
     let request: edsl.FilterRequest = {
         id: dimension,
-        subject: "resolver",
+        subject,
         op,
         input,
     };
@@ -211,13 +209,13 @@ def parse_order: Fn(Value) -> edsl.OrderRequest = fn(item) {
     request
 };
 
-def parse_internal_order: Fn(Value) -> edsl.InternalOrderRequest = fn(item) {
+def parse_internal_order: Fn(String, Value) -> edsl.InternalOrderRequest = fn(subject, item) {
     let obj = as_object(item);
     let target_kind = as_string(field(obj, "target"));
     if target_kind == "Measure" {
         let request: edsl.InternalOrderRequest = {
             measure: as_string(field(obj, "id")),
-            subject: "resolver",
+            subject,
             direction: parse_direction(as_string(field(obj, "direction"))),
         };
         request
@@ -226,16 +224,16 @@ def parse_internal_order: Fn(Value) -> edsl.InternalOrderRequest = fn(item) {
     }
 };
 
-def parse_exists: Fn(Value) -> edsl.ExistsRequest = fn(item) {
+def parse_exists: Fn(String, Value) -> edsl.ExistsRequest = fn(subject, item) {
     let obj = as_object(item);
     let target = as_string(field(obj, "target"));
     let filter_values = as_array(field(obj, "filters"));
-    let filters: Array(edsl.FilterRequest) = array.map(filter_values, parse_filter);
+    let filters: Array(edsl.FilterRequest) = array.map(filter_values, fn(filter) { parse_filter(subject, filter) });
     let no_any: Array(edsl.AnyOfRequest) = [];
     let min_matches = opt_int(dict.get(obj, "min_matches"));
     let spec: edsl.ExistsRequest = {
         target,
-        subject: "resolver",
+        subject,
         filters,
         any_of: no_any,
         min_matches,
@@ -243,21 +241,21 @@ def parse_exists: Fn(Value) -> edsl.ExistsRequest = fn(item) {
     spec
 };
 
-def parse_having: Fn(Value) -> edsl.HavingRequest = fn(item) {
+def parse_having: Fn(String, Value) -> edsl.HavingRequest = fn(subject, item) {
     let obj = as_object(item);
     let measure = as_string(field(obj, "measure"));
     let op = parse_having_op(as_string(field(obj, "op")));
     let threshold = parse_input(as_string(field(obj, "kind")), field(obj, "value"));
     let request: edsl.HavingRequest = {
         measure,
-        subject: "resolver",
+        subject,
         op,
         threshold,
     };
     request
 };
 
-def parse_compare: Fn(Value) -> edsl.ScalarCompareRequest = fn(item) {
+def parse_compare: Fn(String, Value) -> edsl.ScalarCompareRequest = fn(subject, item) {
     let obj = as_object(item);
     let attribute = as_string(field(obj, "attribute"));
     let op = parse_having_op(as_string(field(obj, "op")));
@@ -266,10 +264,10 @@ def parse_compare: Fn(Value) -> edsl.ScalarCompareRequest = fn(item) {
         'Some(value) => as_array(value),
         'None => [],
     };
-    let scope: Array(edsl.FilterRequest) = array.map(scope_values, parse_filter);
+    let scope: Array(edsl.FilterRequest) = array.map(scope_values, fn(filter) { parse_filter(subject, filter) });
     let spec: edsl.ScalarCompareRequest = {
         attribute,
-        subject: "resolver",
+        subject,
         op,
         measure,
         scope_filters: scope,
@@ -277,7 +275,7 @@ def parse_compare: Fn(Value) -> edsl.ScalarCompareRequest = fn(item) {
     spec
 };
 
-def parse_ranked_key: Fn(Value) -> edsl.RankedKeyCompareRequest = fn(item) {
+def parse_ranked_key: Fn(String, Value) -> edsl.RankedKeyCompareRequest = fn(subject, item) {
     let obj = as_object(item);
     let attribute = as_string(field(obj, "attribute"));
     let op = parse_having_op(as_string(field(obj, "op")));
@@ -288,10 +286,10 @@ def parse_ranked_key: Fn(Value) -> edsl.RankedKeyCompareRequest = fn(item) {
         'Some(value) => as_array(value),
         'None => [],
     };
-    let scope: Array(edsl.FilterRequest) = array.map(scope_values, parse_filter);
+    let scope: Array(edsl.FilterRequest) = array.map(scope_values, fn(filter) { parse_filter(subject, filter) });
     let spec: edsl.RankedKeyCompareRequest = {
         attribute,
-        subject: "resolver",
+        subject,
         op,
         group,
         measure,
@@ -324,7 +322,7 @@ def has_unknown_key: Fn(Dict(Value), Array(String)) -> Bool = fn(obj, allowed) {
     })
 };
 
-def build_set_branch: Fn(Value) -> qb.Plan = fn(branch) {
+def build_set_branch: Fn(edsl.PreparedPayload, String, Value) -> qb.Plan = fn(payload, subject, branch) {
     let obj = as_object(branch);
     if has_unknown_key(obj, set_branch_keys) {
         fail!("set branch contains unsupported keys", branch)
@@ -334,11 +332,11 @@ def build_set_branch: Fn(Value) -> qb.Plan = fn(branch) {
             if !no_local_window_ok(obj) {
                 fail!("set branch must not carry a local ordering, limit, or offset", branch)
             } else {
-                let request = build_request(obj);
+                let request = build_request(subject, obj);
                 let exists: Array(edsl.ExistsRequest) =
-                    array.map(array_opt(obj, "exists"), parse_exists);
+                    array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                 let having: Array(edsl.HavingRequest) =
-                    array.map(array_opt(obj, "having"), parse_having);
+                    array.map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                 if shape == "row" {
                     if array.length(exists) != 0 || array.length(having) != 0 {
                         fail!("row set branch must not carry existence or having constraints", branch)
@@ -386,8 +384,8 @@ def dimension_tokens_from: Fn(Array(String)) -> Array(edsl.ProjectionToken) = fn
     })
 };
 
-def reorder_if_requested: Fn(edsl.QueryRequest, qb.Plan, Array(String)) -> qb.Plan =
-    fn(request, plan, output) {
+def reorder_if_requested: Fn(edsl.PreparedPayload, edsl.QueryRequest, qb.Plan, Array(String)) -> qb.Plan =
+    fn(payload, request, plan, output) {
         if array.length(output) == 0 {
             plan
         } else {
@@ -402,16 +400,16 @@ def reorder_if_requested: Fn(edsl.QueryRequest, qb.Plan, Array(String)) -> qb.Pl
         }
     };
 
-def lower_list_with_order: Fn(edsl.QueryRequest, Array(String)) -> qb.Plan = fn(request, output) {
+def lower_list_with_order: Fn(edsl.PreparedPayload, edsl.QueryRequest, Array(String)) -> qb.Plan = fn(payload, request, output) {
     let base_plan: qb.Plan = edsl.lower(payload, request);
-    reorder_if_requested(request, base_plan, output)
+    reorder_if_requested(payload, request, base_plan, output)
 };
 
-def build_request: Fn(Dict(Value)) -> edsl.QueryRequest = fn(obj) {
-    let measures = parse_measure_requests(as_array(field(obj, "measures")));
-    let dimensions = parse_dimension_requests(as_array(field(obj, "dimensions")));
+def build_request: Fn(String, Dict(Value)) -> edsl.QueryRequest = fn(subject, obj) {
+    let measures = parse_measure_requests(subject, as_array(field(obj, "measures")));
+    let dimensions = parse_dimension_requests(subject, as_array(field(obj, "dimensions")));
     let filter_values = as_array(field(obj, "filters"));
-    let filters: Array(edsl.FilterRequest) = array.map(filter_values, parse_filter);
+    let filters: Array(edsl.FilterRequest) = array.map(filter_values, fn(item) { parse_filter(subject, item) });
     let order_values = as_array(field(obj, "ordering"));
     let ordering: Array(edsl.OrderRequest) = array.map(order_values, parse_order);
     let limit = opt_int(dict.get(obj, "limit"));
@@ -432,7 +430,7 @@ def build_request: Fn(Dict(Value)) -> edsl.QueryRequest = fn(obj) {
 # Public lowering entry: intent Value -> Query
 # ---------------------------------------------------------------------------
 
-def lower_intent: Fn(Value) -> qb.Query = fn(intent) {
+def lower_intent: Fn(edsl.PreparedPayload, String, Value) -> qb.Query = fn(payload, subject, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "set" {
@@ -440,26 +438,26 @@ def lower_intent: Fn(Value) -> qb.Query = fn(intent) {
         let branches = as_array(field(obj, "branches"));
         let branch_count = array.length(branches);
         if branch_count == 2 {
-            let left = build_set_branch(branches[0]);
-            let right = build_set_branch(branches[1]);
+            let left = build_set_branch(payload, subject, branches[0]);
+            let right = build_set_branch(payload, subject, branches[1]);
             qb.transform_sqlite_set(kind, left, right)
         } else {
             fail!("set intent requires exactly two branches", branch_count)
         }
     } else {
-        let request = build_request(obj);
+        let request = build_request(subject, obj);
         match op {
             "list" => {
                 let output_values = array_opt(obj, "output_order");
                 let output: Array(String) = array.map(output_values, as_string);
-                let plan: qb.Plan = lower_list_with_order(request, output);
+                let plan: qb.Plan = lower_list_with_order(payload, request, output);
                 qb.transform_sqlite(plan)
             },
             "count" => {
                 let exists: Array(edsl.ExistsRequest) =
-                    array.map(array_opt(obj, "exists"), parse_exists);
+                    array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                 let having: Array(edsl.HavingRequest) =
-                    array.map(array_opt(obj, "having"), parse_having);
+                    array.map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                 let plan: qb.Plan = edsl.lower_full(payload, request, exists, having);
                 qb.transform_sqlite(plan)
             },
@@ -468,9 +466,9 @@ def lower_intent: Fn(Value) -> qb.Query = fn(intent) {
                     fail!("aggregate requires at least one visible measure; use top for hidden group ordering")
                 } else {
                     let exists: Array(edsl.ExistsRequest) =
-                        array.map(array_opt(obj, "exists"), parse_exists);
+                        array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                     let having: Array(edsl.HavingRequest) =
-                        array.map(array_opt(obj, "having"), parse_having);
+                        array.map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                     let plan: qb.Plan = edsl.lower_full(payload, request, exists, having);
                     qb.transform_sqlite(plan)
                 }
@@ -481,7 +479,7 @@ def lower_intent: Fn(Value) -> qb.Query = fn(intent) {
                 } else {
                     let order_values = array_opt(obj, "ordering");
                     let internal_orders: Array(edsl.InternalOrderRequest) =
-                        array.map(order_values, parse_internal_order);
+                        array.map(order_values, fn(item) { parse_internal_order(subject, item) });
                     let internal_having: Array(edsl.InternalHavingRequest) = [];
                     let top_request: edsl.QueryRequest = {
                         measures: request.measures,
@@ -507,38 +505,38 @@ def lower_intent: Fn(Value) -> qb.Query = fn(intent) {
             },
             "exists" => {
                 let exists: Array(edsl.ExistsRequest) =
-                    array.map(array_opt(obj, "exists"), parse_exists);
+                    array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                 let having: Array(edsl.HavingRequest) =
-                    array.map(array_opt(obj, "having"), parse_having);
+                    array.map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                 let plan: qb.Plan = edsl.lower_full(payload, request, exists, having);
                 qb.transform_sqlite(plan)
             },
             "absence" => {
                 let absence: Array(edsl.ExistsRequest) =
-                    array.map(array_opt(obj, "exists"), parse_exists);
+                    array.map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                 let having: Array(edsl.HavingRequest) =
-                    array.map(array_opt(obj, "having"), parse_having);
+                    array.map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                 let plan: qb.Plan = edsl.lower_absence(payload, request, absence, having);
                 qb.transform_sqlite(plan)
             },
             "compare" => {
                 let comparisons: Array(edsl.ScalarCompareRequest) =
-                    array.map(as_array(field(obj, "comparisons")), parse_compare);
+                    array.map(as_array(field(obj, "comparisons")), fn(item) { parse_compare(subject, item) });
                 let base_plan: qb.Plan =
                     edsl.lower_attribute_compare(payload, request, comparisons);
                 let output_values = array_opt(obj, "output_order");
                 let output: Array(String) = array.map(output_values, as_string);
-                let plan = reorder_if_requested(request, base_plan, output);
+                let plan = reorder_if_requested(payload, request, base_plan, output);
                 qb.transform_sqlite(plan)
             },
             "ranked" => {
                 let comparisons: Array(edsl.RankedKeyCompareRequest) =
-                    array.map(as_array(field(obj, "ranked")), parse_ranked_key);
+                    array.map(as_array(field(obj, "ranked")), fn(item) { parse_ranked_key(subject, item) });
                 let base_plan: qb.Plan =
                     edsl.lower_ranked_key_compare(payload, request, comparisons);
                 let output_values = array_opt(obj, "output_order");
                 let output: Array(String) = array.map(output_values, as_string);
-                let plan = reorder_if_requested(request, base_plan, output);
+                let plan = reorder_if_requested(payload, request, base_plan, output);
                 qb.transform_sqlite(plan)
             },
             _ => fail!("unsupported intent op", op),
@@ -546,4 +544,8 @@ def lower_intent: Fn(Value) -> qb.Query = fn(intent) {
     }
 };
 
-export { lower_intent };
+def query_intent_lower_factory: Fn(edsl.PreparedPayload, String) -> Fn(Value) -> qb.Query = fn(payload, subject) {
+    fn(intent) { lower_intent(payload, subject, intent) }
+};
+
+export { query_intent_lower_factory };
