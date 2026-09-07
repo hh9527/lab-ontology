@@ -46,15 +46,15 @@ crate 中增加查询分支。模型无法表达某项业务语义时，应扩�
 ## 公共请求类型
 
 ```telora
-type MeasureInput = enum { 'All, 'Distinct };
-type DimensionInput = enum { 'None };
-type FilterInput = enum { 'Text(String), 'Number(Float), 'Int(Int) };
+type MeasureInput = enum { All, Distinct };
+type DimensionInput = enum { None };
+type FilterInput = enum { Text(String), Number(Float), Int(Int) };
 type FilterOp = enum {
-    'Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le,
-    'Contains, 'NotContains, 'StartsWith, 'EndsWith,
+    Eq, Ne, Gt, Ge, Lt, Le,
+    Contains, NotContains, StartsWith, EndsWith,
 };
-type OrderDirection = enum { 'Asc, 'Desc };
-type OrderTarget = enum { 'Measure(String), 'Dimension(String) };
+type OrderDirection = enum { Asc, Desc };
+type OrderTarget = enum { Measure(String), Dimension(String) };
 
 type MeasureRequest = struct { id: String, subject: String, input: MeasureInput };
 type DimensionRequest = struct { id: String, subject: String, input: DimensionInput };
@@ -98,10 +98,10 @@ type ExistsRequest = struct {
     subject: String,
     filters: Array(FilterRequest),   # 相关实体行上的附加条件（AND）
     any_of: Array(AnyOfRequest),     # 相关实体行上的 OR-group（约束 EXISTS 内层）
-    min_matches: Option(Int),        # 'Some(n)：至少 n 条匹配相关行（相关聚合 EXISTS）
+    min_matches: Option(Int),        # Some(n)：至少 n 条匹配相关行（相关聚合 EXISTS）
 };
 
-type HavingOp = enum { 'Eq, 'Ne, 'Gt, 'Ge, 'Lt, 'Le };
+type HavingOp = enum { Eq, Ne, Gt, Ge, Lt, Le };
 type HavingRequest = struct {
     measure: String,       # 本请求已选择的指标 id
     subject: String,
@@ -163,12 +163,12 @@ ordering/limit/offset/partition。
 行级请求不允许 `partition`，排序目标只能是**已授权的维度**（可以不在投影中，见上文
 “投影与排序是两个不同约束”），`limit`/`offset` 与授权/稳定排序规则照常生效。
 
-筛选能力与 `FilterOp` 词表：比较算子 `'Eq`/`'Ne`/`'Gt`/`'Ge`/`'Lt`/`'Le` 降低到
-query 的封闭比较 scalar；文本算子 `'Contains`/`'StartsWith`/`'EndsWith`（大小写
-不敏感）与 `'NotContains`（大小写敏感）通过 query 的封闭 `'Instr`/`'Lower`/
-`'Length`/`'Substr`/`'Add`/`'Sub` 词表表达。所有运行期值始终作为参数化 Bind 进入
+筛选能力与 `FilterOp` 词表：比较算子 `Eq`/`Ne`/`Gt`/`Ge`/`Lt`/`Le` 降低到
+query 的封闭比较 scalar；文本算子 `Contains`/`StartsWith`/`EndsWith`（大小写
+不敏感）与 `NotContains`（大小写敏感）通过 query 的封闭 `Instr`/`Lower`/
+`Length`/`Substr`/`Add`/`Sub` 词表表达。所有运行期值始终作为参数化 Bind 进入
 bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允许的算子与输入类型；
-文本算子要求 `'Text` 输入。封闭 enum 值域仍只支持 `'Eq`。
+文本算子要求 `Text` 输入。封闭 enum 值域仍只支持 `Eq`。
 
 ## 知识声明 API
 
@@ -180,7 +180,7 @@ bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允�
 | `key(value)` | 字段 | 实体 key 标记 |
 | `measure(id, aggregate, requires)` | 字段 | 指标、聚合方式和额外必需实体 |
 | `filtered_measure(id, aggregate, requires, predicate)` | 字段 | 带领域声明固有 predicate 的条件指标（可组合 fold） |
-| `computed_measure(id, op, left, right)` | 字段 | 以已声明指标为依赖的受限计算指标（`'Add`/`'Sub`） |
+| `computed_measure(id, op, left, right)` | 字段 | 以已声明指标为依赖的受限计算指标（`Add`/`Sub`） |
 | `dimension(id, authorized, filterable, ops, input_kinds)` | 字段 | 普通维度及其能力 |
 | `computed_dimension(id, authorized, filterable, ops, input_kinds, build)` | 字段 | 从字段表达式构造的计算维度 |
 | `json_dimension(id, authorized, filterable, ops, input_kinds, path)` | 字段 | 把被标注字段的物理 JSON 列按固定 path 声明为业务维度（可组合 fold） |
@@ -189,7 +189,7 @@ bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允�
 | `union_source(alias, branches)` | 类型 | 联合（多来源）实体：有序物理分支 UNION ALL（与 `entity_source` 互斥） |
 | `entity_id(id)` | 类型 | 实体的稳定业务 id（供存在性过滤/行级目标引用；缺省为 alias） |
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
-| `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`'Eq(RelationPair)`/`'And`/`'Or` 列等值组合 |
+| `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`Eq(RelationPair)`/`And`/`Or` 列等值组合 |
 | `exists_route(via, target)` | 类型 | 显式声明有界两跳相关存在路径：base → `via`（唯一、grain-safe owner）→ `target`（可组合 fold） |
 | `dual_hub(participant, key_field, left_field, right_field)` | 类型（hub 上） | 声明 hub 的两个角色化端点字段均引用 `participant` 的 `key_field`；base 命中任一角色即关联该 hub（可组合 fold） |
 | `peer_hub(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field)` | 类型（hub 上） | 声明同一 hub 行的 paired-endpoint 路线：两个角色字段分别引用两个 participant 的 key；同 participant 时允许端点交换（可组合 fold） |
@@ -202,25 +202,25 @@ relation 追加到关系数组。关系字段索引是编译器规范化后的�
 ### 实体、指标与维度
 
 ```telora
-def flag_true: Bool = 'True;
-def flag_false: Bool = 'False;
+def flag_true: Bool = True;
+def flag_false: Bool = False;
 def no_types: Array(Type) = [];
-def eq_ops: Array(edsl.FilterOp) = ['Eq];
-def text_kinds: Array(edsl.FilterInputKind) = ['Text];
+def eq_ops: Array(edsl.FilterOp) = [edsl.FilterOp.Eq];
+def text_kinds: Array(edsl.FilterInputKind) = [edsl.FilterInputKind.Text];
 
 @edsl.entity_source("orders", "o")
-@edsl.relation(Customer, 'Safe, 1, 0)
+@edsl.relation(Customer, edsl.RelationKind.Safe, 1, 0)
 type Order = struct {
     @edsl.column("order_id")
     @edsl.key(flag_true)
-    @edsl.measure("OrderCount", 'Count, no_types)
+    @edsl.measure("OrderCount", qb.AggregateFunction.Count, no_types)
     order_id: Int,
 
     @edsl.column("customer_id")
     customer_id: Int,
 
     @edsl.column("amount")
-    @edsl.measure("OrderAmount", 'Sum, no_types)
+    @edsl.measure("OrderAmount", qb.AggregateFunction.Sum, no_types)
     amount: Float,
 
     @edsl.column("region")
@@ -245,8 +245,8 @@ def month_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
 };
 ```
 
-`build` 可使用 query 的任意封闭标量，包括 `'Substr`、`'Instr`、`'If`、`'Add`、
-`'Sub` 和比较/逻辑算子；标量 arity 由 query 校验。所有常量保持为 `Bind`，不会
+`build` 可使用 query 的任意封闭标量，包括 `Substr`、`Instr`、`If`、`Add`、
+`Sub` 和比较/逻辑算子；标量 arity 由 query 校验。所有常量保持为 `Bind`，不会
 成为预渲染 SQL。计算表达式可以稳定用于 projection、grouping、filtering 和
 ordering（同一个 `Fn(qb.Expr) -> qb.Expr` 在多个子句复用，bindings 按子句顺序
 各自计位）。
@@ -255,7 +255,7 @@ ordering（同一个 `Fn(qb.Expr) -> qb.Expr` 在多个子句复用，bindings �
 def head_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
     let sep: qb.Expr = qb.bind_string(" ");
     let pos: qb.Expr = qb.instr(col, sep);
-    let found: qb.Expr = qb.scalar('Gt, [pos, qb.bind_int(0)]);
+    let found: qb.Expr = qb.scalar(qb.ScalarFunction.Gt, [pos, qb.bind_int(0)]);
     let rest: qb.Expr = qb.sub(pos, qb.bind_int(1));
     qb.scalar_if(found, qb.substr([col, qb.bind_int(1), rest]), col)
 };
@@ -282,7 +282,7 @@ type Device = struct {
   SQL literal 或 identifier；JSON Dimension 复用现有 authorization、filterable、
   ops、input kinds、enum domain、scope、grain、relation path、grouping、ordering
   与 Top Per Group 检查。
-- knowledge Profile 必须显式允许所使用的 JSON scalar：缺 `'JsonExtract` 的 Profile
+- knowledge Profile 必须显式允许所使用的 JSON scalar：缺 `JsonExtract` 的 Profile
   在 lowering 时原子失败。
 - 同一 JSON Dimension 在 projection/grouping/filter/order 中重复 lowering 时保持
   确定性与正确 binding 顺序（顶层 `$.channel` 与嵌套 `$.retry.count` 均可用于授权
@@ -298,13 +298,13 @@ type Device = struct {
 ```telora
 type ScopePredicate = struct {
     field: Int,          # 成员所属实体的规范字段索引
-    op: FilterOp,        # 'Eq / 'Ge / 'Le
-    input: FilterInput,  # 'Text(...) / 'Number(...) / 'Int(...)
+    op: FilterOp,        # Eq / Ge / Le
+    input: FilterInput,  # Text(...) / Number(...) / Int(...)
 };
 ```
 
 ```telora
-def head_scope: Array(edsl.ScopePredicate) = [{field: 1, op: 'Eq, input: 'Text("run")}];
+def head_scope: Array(edsl.ScopePredicate) = [{field: 1, op: edsl.FilterOp.Eq, input: edsl.FilterInput.Text("run")}];
 
 type Trace = struct {
     @edsl.column("label")
@@ -333,14 +333,14 @@ predicate 的行计入该指标。predicate 复用 `ScopePredicate`（引用同�
 固有 predicate 只通过查询的 `FILTER (WHERE ...)` 限定该指标自身，绝不展平成互相
 冲突的全局 AND。
 
-`computed_measure` 以已声明的指标（普通、条件或计算）为依赖，用受限 `'Add`/`'Sub`
+`computed_measure` 以已声明的指标（普通、条件或计算）为依赖，用受限 `Add`/`Sub`
 组合聚合结果。依赖必须存在、已授权、grain 兼容且 relation path 兼容；依赖图必须
-无环；alias 唯一无歧义。v1 只暴露 `'Add`/`'Sub`，不开放 raw SQL、任意函数、
+无环；alias 唯一无歧义。v1 只暴露 `Add`/`Sub`，不开放 raw SQL、任意函数、
 用户算术表达式或除法。
 
 ```telora
-def run_predicate: edsl.ScopePredicate = {field: 1, op: 'Eq, input: 'Text("run")};
-def skip_predicate: edsl.ScopePredicate = {field: 1, op: 'Eq, input: 'Text("skip")};
+def run_predicate: edsl.ScopePredicate = {field: 1, op: edsl.FilterOp.Eq, input: edsl.FilterInput.Text("run")};
+def skip_predicate: edsl.ScopePredicate = {field: 1, op: edsl.FilterOp.Eq, input: edsl.FilterInput.Text("skip")};
 
 type Trace = struct {
     @edsl.column("id")
@@ -359,12 +359,12 @@ type Trace = struct {
 - 请求计算指标时，其传递依赖会自动进入 projection；最终计算指标可作为普通
   ordering 与 Top Per Group 分区内排序的目标（先完成 measure lowering 再分区排名）。
 - 这是领域模型作者声明业务指标的能力，不是让最终调用者构造任意条件聚合。
-- `'Add`/`'Sub` 使用 SQLite 原生数值与 NULL 语义；`count`（含 FILTER）永不返回
+- `Add`/`Sub` 使用 SQLite 原生数值与 NULL 语义；`count`（含 FILTER）永不返回
   NULL，计数净额总是定义良好，lowering 不自动插入 `coalesce`。
 - 能力不按特定领域名称或数据形状硬编码：除 Trace 的 run/skip 互斥计数外，
   `@src/test_knowledge` 还以 Approval（审批状态 approved/rejected）演示同一套
   `filtered_measure`/`computed_measure`/lowering 公共路径，声明互斥条件计数及其
-  `'Add`（`ApprovalTotal`）与 `'Sub`（`ApprovalNet`）组合。
+  `Add`（`ApprovalTotal`）与 `Sub`（`ApprovalNet`）组合。
 
 ### Top Per Group
 
@@ -374,19 +374,19 @@ type Trace = struct {
 
 ```telora
 let request: edsl.QueryRequest = {
-    measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
+    measures: [{ id: "OrderAmount", subject: "analyst", input: edsl.MeasureInput.All }],
     dimensions: [
-        { id: "OrderRegion", subject: "analyst", input: 'None },
-        { id: "OrderWeek", subject: "analyst", input: 'None },
+        { id: "OrderRegion", subject: "analyst", input: edsl.DimensionInput.None },
+        { id: "OrderWeek", subject: "analyst", input: edsl.DimensionInput.None },
     ],
     filters: [],
     ordering: [
-        { target: 'Measure("OrderAmount"), direction: 'Desc },
-        { target: 'Dimension("OrderWeek"), direction: 'Asc },
+        { target: edsl.OrderTarget.Measure("OrderAmount"), direction: edsl.OrderDirection.Desc },
+        { target: edsl.OrderTarget.Dimension("OrderWeek"), direction: edsl.OrderDirection.Asc },
     ],
-    limit: 'None,
-    offset: 'None,
-    partition: 'Some({ by: ["OrderRegion"], take: 2 }),
+    limit: None,
+    offset: None,
+    partition: Some({ by: ["OrderRegion"], take: 2 }),
 };
 ```
 
@@ -409,11 +409,11 @@ let request: edsl.QueryRequest = {
 ```telora
 type CustomerTier = enum {
     @edsl.enum_value("gold", "Gold customer")
-    'Gold,
+    Gold,
     @edsl.enum_value("silver", "Silver customer")
-    'Silver,
+    Silver,
     @edsl.enum_value("bronze", "Bronze customer")
-    'Bronze,
+    Bronze,
 };
 
 type Customer = struct {
@@ -431,7 +431,7 @@ type Customer = struct {
 
 ### 关系与安全路径
 
-`'Safe` 关系不扩张当前 grain；`'FanOut` 会扩张 grain。准备阶段对实体图按源实体运行
+`Safe` 关系不扩张当前 grain；`FanOut` 会扩张 grain。准备阶段对实体图按源实体运行
 有界广度优先遍历（单源一次遍历记录到所有可达实体的路径；深度上限 8，关系目录索引序
 确定性优先），只保存最短的确定性路径矩阵，不在热路径执行 BFS。多个目标按请求顺序
 合并并复用已有边。只有全 Safe 路径能进入 Plan；fan-out-only、不可达或被深度截断的
@@ -440,7 +440,7 @@ prepare 耗尽求值燃料（`tests/ontology.telora` 内含较密 hub/leaf 关�
 
 关系键可以结构化：`relation(target, kind, from_field, to_field)` 是单列等值糖，
 `relation_key(target, kind, key)` 接受 `RelationKey`，其中
-`'Eq(RelationPair)` 为单列等值，`'And`/`'Or`（非空）组合列等值
+`Eq(RelationPair)` 为单列等值，`And`/`Or`（非空）组合列等值
 （`RelationPair.from` 是声明实体、`to` 是目标实体的规范字段索引）。复合/析取键降低
 为 query 的 `join_on`/`on_eq`/`on_and`/`on_or` 结构化 ON 树，不引入 raw SQL。
 同一物理表的角色（a/z 端、父子同表、双口径）以不同实体类型共享同一物理表建模：每个
@@ -454,7 +454,7 @@ ICM 专用关系类型。
 `@edsl.column` 给出该逻辑字段的稳定输出列名。每个分支通过
 `columns: Array(UnionColumnDecl { field, column })` 把全部规范逻辑字段映射到该分支的
 物理列（`field` 为规范字段索引，`column` 为该分支的物理列名；映射必须完整、不重复且
-按字段索引升序）。`filter: Option(ScopePredicate)` 是该分支固定的行级过滤（`'Eq`
+按字段索引升序）。`filter: Option(ScopePredicate)` 是该分支固定的行级过滤（`Eq`
 over 一个逻辑字段），会解析到该分支映射后的物理列；不接受 raw SQL/Expr。
 
 ```telora
@@ -471,8 +471,8 @@ def merged_item_branch_b_cols: Array(edsl.UnionColumnDecl) = [
     { field: 3, column: "account_key" },
 ];
 def merged_item_branches: Array(edsl.UnionBranchDecl) = [
-    { table: "items_a", alias: "a", columns: merged_item_branch_a_cols, filter: 'None },
-    { table: "items_b", alias: "b", columns: merged_item_branch_b_cols, filter: 'Some({ field: 2, op: 'Eq, input: 'Text("retail") }) },
+    { table: "items_a", alias: "a", columns: merged_item_branch_a_cols, filter: None },
+    { table: "items_b", alias: "b", columns: merged_item_branch_b_cols, filter: Some({ field: 2, op: edsl.FilterOp.Eq, input: edsl.FilterInput.Text("retail") }) },
 ];
 
 @edsl.entity_id("merged_items")
@@ -491,11 +491,11 @@ type MergedItem = struct {
 
 `build_root`/prepare 校验联合实体：分支非空、逻辑字段列非空且不重复、每个分支映射完整
 规范字段集一次且按升序、物理列/表/分支 alias/联合 alias 均为合法标识符、分支 alias
-唯一且不与联合 alias 冲突、固定分支过滤为合法字段上的 `'Eq`；映射缺失/重复/越界/
+唯一且不与联合 alias 冲突、固定分支过滤为合法字段上的 `Eq`；映射缺失/重复/越界/
 顺序错/非法物理列都原子失败。prepared 表示供热路径直接使用。请求 base 为联合实体时，
 lowering 使用 query 已发布的 `derived_source`/`union_branch`/`union_column`：输出名
 用联合逻辑列名，输入表达式用各分支映射后的物理列；Plan `sources` 为空、
-`derived: 'Some(...)`、无 join/EXISTS；projection/filter/aggregate/grouping/HAVING/
+`derived: Some(...)`、无 join/EXISTS；projection/filter/aggregate/grouping/HAVING/
 ordering/partition 全部作用于联合逻辑 alias。动态值按“分支声明顺序后接外层表达式
 顺序”进入 bindings；重复 lowering 逐字节确定。
 
@@ -515,37 +515,37 @@ Partition。
 let list_request: edsl.QueryRequest = {
     measures: [],
     dimensions: [
-        { id: "OrderRegion", subject: "analyst", input: 'None },
-        { id: "CustomerTier", subject: "analyst", input: 'None },
+        { id: "OrderRegion", subject: "analyst", input: edsl.DimensionInput.None },
+        { id: "CustomerTier", subject: "analyst", input: edsl.DimensionInput.None },
     ],
-    filters: [{ id: "OrderRegion", subject: "analyst", op: 'Contains, input: 'Text("east") }],
-    ordering: [{ target: 'Dimension("OrderRegion"), direction: 'Asc }],
-    limit: 'Some(25),
-    offset: 'None,
-    partition: 'None,
+    filters: [{ id: "OrderRegion", subject: "analyst", op: edsl.FilterOp.Contains, input: edsl.FilterInput.Text("east") }],
+    ordering: [{ target: edsl.OrderTarget.Dimension("OrderRegion"), direction: edsl.OrderDirection.Asc }],
+    limit: Some(25),
+    offset: None,
+    partition: None,
 };
 let plan: qb.Plan = edsl.lower(knowledge.payload, list_request);
 ```
 
 规则：必须有维度；base 实体取第一个请求维度所属实体；被引用实体必须经 base 的
 安全路径（fan-out 会放大行、原子拒绝）；不允许 `partition`；排序目标只能是维度；
-`limit`/`offset` 照常；筛选与 scope 照常。文本筛选（`'Contains`/`'StartsWith`/
-`'EndsWith`/`'NotContains`）保持参数化并降低到封闭的
-`'Instr`/`'Lower`/`'Length`/`'Substr` 词表。
+`limit`/`offset` 照常；筛选与 scope 照常。文本筛选（`Contains`/`StartsWith`/
+`EndsWith`/`NotContains`）保持参数化并降低到封闭的
+`Instr`/`Lower`/`Length`/`Substr` 词表。
 
 ### 存在性过滤（EXISTS）
 
 ```telora
 let request: edsl.QueryRequest = {
-    measures: [{ id: "CustomerCount", subject: "analyst", input: 'All }],
+    measures: [{ id: "CustomerCount", subject: "analyst", input: edsl.MeasureInput.All }],
     dimensions: [],
     filters: [],
     ordering: [],
-    limit: 'None,
-    offset: 'None,
-    partition: 'None,
+    limit: None,
+    offset: None,
+    partition: None,
 };
-let exists: edsl.ExistsRequest = { target: "orders", subject: "analyst", filters: [], min_matches: 'None };
+let exists: edsl.ExistsRequest = { target: "orders", subject: "analyst", filters: [], min_matches: None };
 let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
 ```
 
@@ -557,11 +557,11 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
 - 两跳（受控多跳）：当 base 与目标之间没有一跳关系时，lowering 使用作者在 base 上
   显式声明的 `@edsl.exists_route(via, target)` 路线（见下文“两跳相关存在”）。路线在
   prepare 时校验并存入 payload，热路径不做元数据扫描或 BFS；请求无需感知路线。
-- fan-out 关系允许（存在性不放大主体 grain）。`min_matches: 'None` 时是普通相关
-  EXISTS；`min_matches: 'Some(n)`（正整数）时是相关聚合 EXISTS：内层按相关性分组并
+- fan-out 关系允许（存在性不放大主体 grain）。`min_matches: None` 时是普通相关
+  EXISTS；`min_matches: Some(n)`（正整数）时是相关聚合 EXISTS：内层按相关性分组并
   `HAVING count(关联 id) >= n`，仍保持主体 grain（Parent 计数 + `exists child`/
   `child count >= n` 不被 Child 行放大；普通 fan-out join 仍原子拒绝）。
-- 关系键必须是列等值合取（`'Eq` 或 `'And`）；析取键在 EXISTS 中原子拒绝；分组存在性
+- 关系键必须是列等值合取（`Eq` 或 `And`）；析取键在 EXISTS 中原子拒绝；分组存在性
   要求单列合取键（一个 ColumnEq）。
 - 内层 `filters` 只能引用目标实体维度，动态值进入 bindings；任何引用路径终点之外实体
   的内层筛选都原子失败。
@@ -578,12 +578,12 @@ KPI 事实或子部件往往不直接关联告警等稳定对象，而是经中�
 ```telora
 @edsl.entity_id("components")
 @edsl.entity_source("components", "m")
-@edsl.relation(Site, 'Safe, 1, 0)          # component.site_id -> site.id
+@edsl.relation(Site, edsl.RelationKind.Safe, 1, 0)          # component.site_id -> site.id
 @edsl.exists_route(Site, Alarm)            # 显式：base -> Site -> Alarm
 type Component = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
-    @edsl.measure("ComponentCount", 'Count, no_types)
+    @edsl.measure("ComponentCount", qb.AggregateFunction.Count, no_types)
     id: Int,
     @edsl.column("site_id")
     site_id: Int,
@@ -602,7 +602,7 @@ type Component = struct {
 Lowering 依据第一跳的 kind 选择两种**封闭存在**形状，二者都只把整个 A→B→C 条件
 表达为谓词：
 
-- 第一跳 `'Safe`（唯一 owner）：保持 owner-join 形状——base `INNER JOIN` via（不复制
+- 第一跳 `Safe`（唯一 owner）：保持 owner-join 形状——base `INNER JOIN` via（不复制
   base 行），再用 correlated EXISTS 关联 owner 与 target 内层：
 
 ```text
@@ -612,7 +612,7 @@ INNER JOIN sites AS s ON m.site_id = s.id
 WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id [AND al.level = ?])
 ```
 
-- 第一跳 `'FanOut`（subject A 对 B 是 one-to-many）：改用 bounded **link** 形状——B
+- 第一跳 `FanOut`（subject A 对 B 是 one-to-many）：改用 bounded **link** 形状——B
   与 C 在**同一个 correlated EXISTS 内相互 INNER JOIN**，绝不放 B/C 进外层 FROM，
   因此 one-to-many 首跳不会放大外层 A 的 grain：
 
@@ -741,9 +741,9 @@ WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p
 每侧 `PeerRef` 规则：
 
 - `entity` 选择 prepared route 中的已声明 participant 实体/源表；entity-only
-  （`key = 'None, filters = []`）合法，表示“该实体集合中的任意 participant”，不是无约束
+  （`key = None, filters = []`）合法，表示“该实体集合中的任意 participant”，不是无约束
   笛卡尔语义——两侧 alias 分别通过端点等式绑定到 hub 的相对角色；
-- 可选精确 key（`key: 'Some(...)`）与零个或多个属性过滤（`filters`）可混用；同一侧
+- 可选精确 key（`key: Some(...)`）与零个或多个属性过滤（`filters`）可混用；同一侧
   key 与属性过滤在该 alias 内 AND（绑定顺序：该侧 key 先、属性过滤按请求顺序）；
 - 属性过滤复用现有封闭 filter/operator/profile 词表与动态值绑定，只引用该 participant
   自身实体上的已授权、可筛选维度；引用其它实体、未知/未授权维度、非法算子或值都原子
@@ -756,7 +756,7 @@ WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p
 - 身份证明在 SQL 结构内：hub 端点值只经请求声明的 participant 表解释，跨表 key 碰撞
   不会把同一端点值同时解释为两种实体，也不会静默把两个 participant 配到同一端；
 - **同实体身份不等**：origin/peer 是同一实体/表时，Query `PeerCorr` 的
-  `distinct_keys='True` 会渲染并校验 `origin.key <> peer.key`，单个 participant 行不能
+  `distinct_keys=True` 会渲染并校验 `origin.key <> peer.key`，单个 participant 行不能
   同时占据 hub 两端（self-loop）；exact-key、attribute-only、key+attribute 一律适用。
   相同属性过滤值可合法表示两个不同、都满足该属性的 participant（SQL 含身份不等证明）。
   异构实体/不同表不增加裸 key 不等条件：两表相同 key 仍是不同身份，跨表 collision 继续
@@ -776,16 +776,16 @@ WHERE EXISTS (SELECT 1 FROM members AS mb_o, members AS mb_p
 
 ```telora
 let group_request: edsl.QueryRequest = {
-    measures: [{ id: "OrderAmount", subject: "analyst", input: 'All }],
-    dimensions: [{ id: "OrderRegion", subject: "analyst", input: 'None }],
+    measures: [{ id: "OrderAmount", subject: "analyst", input: edsl.MeasureInput.All }],
+    dimensions: [{ id: "OrderRegion", subject: "analyst", input: edsl.DimensionInput.None }],
     filters: [],
     ordering: [],
-    limit: 'None,
-    offset: 'None,
-    partition: 'None,
+    limit: None,
+    offset: None,
+    partition: None,
 };
 let having: edsl.HavingRequest = {
-    measure: "OrderAmount", subject: "analyst", op: 'Ge, threshold: 'Number(100.0),
+    measure: "OrderAmount", subject: "analyst", op: edsl.HavingOp.Ge, threshold: edsl.FilterInput.Number(100.0),
 };
 let query: qb.Query = edsl.lower_group_count(knowledge.payload, group_request, [having]);
 ```
@@ -799,8 +799,8 @@ ordering/limit/offset/partition，且必须同时选择指标与分组维度。
 let having: edsl.HavingRequest = {
     measure: "OrderAmount",
     subject: "analyst",
-    op: 'Ge,
-    threshold: 'Number(100.0),
+    op: edsl.HavingOp.Ge,
+    threshold: edsl.FilterInput.Number(100.0),
 };
 let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [], [having]);
 ```
@@ -811,7 +811,7 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [], [having]);
   校验；HAVING 与分组 Top N 组合时 HAVING 进入内层分组查询。
 - 无 measure 的行级请求带 HAVING 原子失败（"having requires an aggregated measure"）。
 - 使用 HAVING/EXISTS/Lower/Length 时，profile 的 `allowed_operators` 需含
-  `'Having`/`'Exists`、`allowed_scalars` 需含所用 scalar（`'Lower`/`'Length` 等），
+  `Having`/`Exists`、`allowed_scalars` 需含所用 scalar（`Lower`/`Length` 等），
   否则 `qb.validate` 原子拒绝。
 
 ## 准备知识
@@ -819,18 +819,18 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [], [having]);
 ```telora
 def profile: qb.PlanProfile = {
     allowed_operators: [
-        'Source, 'Project, 'Column, 'Bind, 'Scalar, 'Aggregate,
-        'Filter, 'Exists, 'Join, 'Group, 'Having, 'Order,
-        'Limit, 'Offset, 'Partition,
+        qb.Operator.Source, qb.Operator.Project, qb.Operator.Column, qb.Operator.Bind, qb.Operator.Scalar, qb.Operator.Aggregate,
+        qb.Operator.Filter, qb.Operator.Exists, qb.Operator.Join, qb.Operator.Group, qb.Operator.Having, qb.Operator.Order,
+        qb.Operator.Limit, qb.Operator.Offset, qb.Operator.Partition,
     ],
-    allowed_join_kinds: ['Inner, 'Left],
-    allowed_aggregates: ['Count, 'Sum, 'Avg, 'Min, 'Max],
+    allowed_join_kinds: [qb.JoinKind.Inner, qb.JoinKind.Left],
+    allowed_aggregates: [qb.AggregateFunction.Count, qb.AggregateFunction.Sum, qb.AggregateFunction.Avg, qb.AggregateFunction.Min, qb.AggregateFunction.Max],
     allowed_scalars: [
-        'Substr, 'Instr, 'If, 'Add, 'Sub, 'Lower, 'Length,
-        'JsonExtract, 'JsonType, 'JsonValid,
-        'Eq, 'Ne, 'Lt, 'Le, 'Gt, 'Ge, 'And, 'Or, 'Not,
+        qb.ScalarFunction.Substr, qb.ScalarFunction.Instr, qb.ScalarFunction.If, qb.ScalarFunction.Add, qb.ScalarFunction.Sub, qb.ScalarFunction.Lower, qb.ScalarFunction.Length,
+        qb.ScalarFunction.JsonExtract, qb.ScalarFunction.JsonType, qb.ScalarFunction.JsonValid,
+        qb.ScalarFunction.Eq, qb.ScalarFunction.Ne, qb.ScalarFunction.Lt, qb.ScalarFunction.Le, qb.ScalarFunction.Gt, qb.ScalarFunction.Ge, qb.ScalarFunction.And, qb.ScalarFunction.Or, qb.ScalarFunction.Not,
     ],
-    allow_distinct: 'True,
+    allow_distinct: True,
 };
 
 def authorize: Fn(String) -> Bool = fn(subject) { subject == "analyst" };
@@ -870,17 +870,17 @@ type PreparedPayload = struct {
 
 ```telora
 let request: edsl.QueryRequest = {
-    measures: [{ id: "OrderCount", subject: "analyst", input: 'All }],
-    dimensions: [{ id: "CustomerTier", subject: "analyst", input: 'None }],
+    measures: [{ id: "OrderCount", subject: "analyst", input: edsl.MeasureInput.All }],
+    dimensions: [{ id: "CustomerTier", subject: "analyst", input: edsl.DimensionInput.None }],
     filters: [
-        { id: "CustomerTier", subject: "analyst", op: 'Eq, input: 'Text("gold") },
+        { id: "CustomerTier", subject: "analyst", op: edsl.FilterOp.Eq, input: edsl.FilterInput.Text("gold") },
     ],
     ordering: [
-        { target: 'Measure("OrderCount"), direction: 'Desc },
-        { target: 'Dimension("CustomerTier"), direction: 'Asc },
+        { target: edsl.OrderTarget.Measure("OrderCount"), direction: edsl.OrderDirection.Desc },
+        { target: edsl.OrderTarget.Dimension("CustomerTier"), direction: edsl.OrderDirection.Asc },
     ],
-    limit: 'Some(5),
-    offset: 'Some(5),
+    limit: Some(5),
+    offset: Some(5),
 };
 
 let plan: qb.Plan = edsl.lower(payload, request);
@@ -958,7 +958,7 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
 - 授权 subject 是执行上下文：Factory 每次 vocabulary 访问与嵌套子句都使用同一
   subject；`payload.authorize` 拒绝时原子失败。
 - measure 的 aggregate input 是本体语义，不是 Intent 参数。`@edsl.measure(...)`
-  声明固定 `'All`；`@edsl.distinct_measure(...)` 声明固定 `'Distinct`。两者都以独立、
+  声明固定 `All`；`@edsl.distinct_measure(...)` 声明固定 `Distinct`。两者都以独立、
   稳定的 measure id 暴露，Factory 按 id 从 `PreparedPayload` 读取 input；调用者不能把
   同一个业务 measure 临时切换为另一种语义。distinct measure 还必须通过
   `PlanProfile.allow_distinct` 的执行能力校验。
@@ -977,7 +977,7 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
 未选择的 partition 维度、未请求的 partition 排序目标、非稳定 partition 排序、
 非正或超上限的 `take`、partition 与全局 limit/offset 组合、条件指标 predicate
 引用未授权/不可筛选/未知枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术、
-Profile 缺 `'JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimension、
+Profile 缺 `JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimension、
 非法 JSON 筛选输入、按未请求 JSON Dimension 排序。相关存在失败还包括：目标即 base、
 没有声明一跳关系或路线、两跳路线第一跳缺失/反向-only（方向不匹配）或非唯一
 （多条候选）、`via`/`target` 之间缺失或多条候选关系、同一 base 对同一 target
@@ -1043,7 +1043,7 @@ SQL、确定性 bindings、可验证结构并明确拒绝边界。
    having)` 把每个 `absence_spec`（复用 `ExistsRequest` 的目标/主体/内层 filter/
    min_matches 词汇）降低为同一相关 body 的 `NOT EXISTS`。两跳路线仍只加
    grain-safe owner join；NULL 语义保持 SQL 原生；`plan.exists[i].negated` 为真。
-   这是纯相关反存在：不产生外层 JOIN、不放宽相关引用，`'Exists` operator 语义不变。
+   这是纯相关反存在：不产生外层 JOIN、不放宽相关引用，`Exists` operator 语义不变。
 4. **分别存在满足 A 和 B 的关联记录**。用 `lower_full(payload, request, [specA,
    specB], [])` 表达两个**独立**的 correlated EXISTS（每个带各自内层 filter），在
    WHERE 中 AND 合并。两个谓词各自成立即可，A、B 可以由不同的关联行满足，绝不会
@@ -1063,7 +1063,7 @@ Top N，却不返回该聚合值（例如按每组记录数选出最大组，只
 `lower_internal_top(payload, request, internal_orders)`：`request` 只选择维度
 （measures 为空），`internal_orders` 逐条命名一个**已授权、位于请求 base 实体上**
 的普通/条件 measure 与其方向；该 measure 只作为 ORDER BY 的内部聚合（lowering 经
-query 的 `OrderKey 'Aggregate` 表达），绝不出现在 projection。请求可携带筛选、
+query 的 `OrderKey Aggregate` 表达），绝不出现在 projection。请求可携带筛选、
 维度排序 tie-breaker（必须是已选维度）与 `limit`；`qb.validate` 用 payload profile
 收窄内部聚合的 operator/aggregate/scalar。计算 measure、未知/未授权 measure 均
 原子拒绝；`lower_internal_top` 只接受 base 实体的 measure，跨 base 实体（关联实体）
@@ -1081,7 +1081,7 @@ link-count measure 来选择入口/路径：`lower_full(payload, request, exists
 ### 显式投影顺序（lower_ordered）
 
 最终列顺序是结果契约。`lower_ordered(payload, request, order)` 用 `ProjectionToken`
-（`'Measure(id)` / `'Dimension(id)`）显式声明所有已选择项的交错顺序：
+（`Measure(id)` / `Dimension(id)`）显式声明所有已选择项的交错顺序：
 
 - 每个 token 必须恰好对应一个**已请求**的 measure 或 dimension；
 - 不允许遗漏、重复、引用隐藏计算或引用未选择项；
@@ -1120,10 +1120,10 @@ subject 与 order/HAVING 字段——不暴露表、列、alias 或 join 数组�
     同一 route 同时服务于隐藏 ORDER BY/Top-N 与隐藏 HAVING；join 按 source alias
     复用、不重复。
 - 关联侧沿用封闭 aggregate 枚举（Count/Sum/Avg/Min/Max）；`lowering` 只把聚合作为
-  `OrderKey 'Aggregate` / HAVING `'Call` 使用，不出现特例 SQL；
+  `OrderKey Aggregate` / HAVING `Call` 使用，不出现特例 SQL；
 - 隐藏 ORDER BY 支持升降序与 Top-N（`limit`）；隐藏 ORDER BY 本身不产生 binding；
 - 隐藏 HAVING 复用现有聚合比较算子与类型化 threshold；动态 threshold 进入 bindings
-  （`Count` 要求 `'Int`，其余聚合接受 `'Int`/`'Number`），类型不兼容原子失败；
+  （`Count` 要求 `Int`，其余聚合接受 `Int`/`Number`），类型不兼容原子失败；
 - projection 只含请求方选择的维度，聚合从不进入投影；显式 projection order 可与
   `lower_ordered` 在已有 grouped listing 上配合使用；
 - 主体级普通 scalar filter/scope 先按既有确定顺序 lowering（要求引用主体实体属性，
@@ -1131,7 +1131,7 @@ subject 与 order/HAVING 字段——不暴露表、列、alias 或 join 数组�
 - 纯探针 `related_measure_ok(payload, subject_entity, role, measure_id)` 供测试断言
   合法/未知 measure/越权/无路线/歧义而不触发失败；
 - `lower_internal_top` 仍是“关联 measure 位于主体自身”时的既有入口（隐藏
-  `OrderKey 'Aggregate`）；`lower_internal_related` 在其上扩展到统一
+  `OrderKey Aggregate`）；`lower_internal_related` 在其上扩展到统一
   `path_depth_cap` 内的最短 relation 路径。
 
 **限定路线的拒绝边界**（原子失败、带可归因诊断：subject/measure/entity，绝不发布
@@ -1155,7 +1155,7 @@ subject 与 order/HAVING 字段——不暴露表、列、alias 或 join 数组�
 ```telora
 type FieldFilterRequest = struct {
     subject: String,   # 授权主体（role）
-    op: FilterOp,      # 封闭比较算子（至少 'Eq / 'Ne）
+    op: FilterOp,      # 封闭比较算子（至少 Eq / Ne）
     left: String,      # 主体实体上已声明、已授权、纯列属性的 id
     right: String,     # 同一主体实体上的另一属性 id
 };
@@ -1176,8 +1176,8 @@ let feasible: Bool = edsl.field_filter_ok(payload, subject_entity, field_filter)
 - **同主体**：`left` 与 `right` 必须属于同一 prepared 主体实体，且都是**已声明、已
   授权、纯列承载**（非 computed/JSON）的属性（dimension id）；未知属性、越权属性、
   computed/JSON 属性、其它实体属性（跨实体引用）一律稳定拒绝；
-- **算子**：只接受封闭比较算子（`'Eq`/`'Ne`/`'Gt`/`'Ge`/`'Lt`/`'Le`；最低 `'Eq`/
-  `'Ne`），且该算子必须同时被两侧属性声明支持；文本搜索算子（`'Contains` 等）拒绝；
+- **算子**：只接受封闭比较算子（`Eq`/`Ne`/`Gt`/`Ge`/`Lt`/`Le`；最低 `Eq`/
+  `Ne`），且该算子必须同时被两侧属性声明支持；文本搜索算子（`Contains` 等）拒绝；
 - **类型/domain 兼容**：封闭 enum 域要求两侧稳定值域相同；开放维度要求可比较标量类别
   一致（text/int/number）；不兼容稳定拒绝；
 - **lowering**：只产生经验证的两个列引用比较（如 `a.x = a.y`），**不产生动态
@@ -1201,7 +1201,7 @@ measure：
 type InternalHavingRequest = struct {
     measure: String,    # base 实体上已声明、已授权的普通（非 computed/filtered）measure
     subject: String,
-    op: HavingOp,       # 'Eq / 'Ne / 'Gt / 'Ge / 'Lt / 'Le
+    op: HavingOp,       # Eq / Ne / Gt / Ge / Lt / Le
     threshold: FilterInput,
 };
 
@@ -1232,7 +1232,7 @@ let feasible: Bool = edsl.same_source_having_ok(payload, subject_entity, role, m
 type ScalarCompareRequest = struct {
     attribute: String,    # base 实体上已声明、已授权、纯列承载的 dimension id
     subject: String,      # 授权主体（role）
-    op: HavingOp,         # 封闭比较算子 'Eq / 'Ne / 'Gt / 'Ge / 'Lt / 'Le
+    op: HavingOp,         # 封闭比较算子 Eq / Ne / Gt / Ge / Lt / Le
     measure: String,      # 已声明、已授权、普通（简单）measure 的 id
     scope_filters: Array(FilterRequest),  # 有序的内层 scope 过滤（空 = 全局聚合）
 };
@@ -1276,7 +1276,7 @@ let scoped_feasible: Bool = edsl.scoped_attribute_compare_ok(payload, base_entit
 
 | 侧面 | 类别推导 | 数值族 |
 | --- | --- | --- |
-| 外层属性 | 其 prepared 字段 `Type` 的 kind | `'Int` / `'Float` 为受支持的数值族 |
+| 外层属性 | 其 prepared 字段 `Type` 的 kind | `Int` / `Float` 为受支持的数值族 |
 | `Count` | 结果恒为整数 | 数值族 |
 | `Sum` / `Avg` | 数值输入、数值结果 | 数值族 |
 | `Min` / `Max` | 保留其输入列的可比较类别（数值列即数值族） | 取决于输入列 |
@@ -1307,7 +1307,7 @@ type RankedKeyCompareRequest = struct {
     op: HavingOp,                    # 封闭比较算子
     group: String,                   # 内层分组维度 id（内层 population 实体）
     measure: String,                 # 排名 measure id（同一内层 population grain）
-    direction: OrderDirection,       # 'Asc / 'Desc
+    direction: OrderDirection,       # Asc / Desc
     scope_filters: Array(FilterRequest),  # 有序内层 scope 过滤（空 = 全局）
 };
 
@@ -1360,7 +1360,7 @@ let feasible: Bool = edsl.ranked_key_compare_ok(payload, base_entity, role,
 两个已授权的 ontology 请求先经正常 lowering 成为完整 Plan，然后可以按集合语义组合：
 `lower_set(kind, payload, left_req, right_req)` 直接返回集合 `Query`，
 `lower_set_count(kind, payload, left_req, right_req)` 在派生集合上返回 `count(1)`。
-`kind` 复用 Query 的 `qb.SetOpKind`（`'Intersect`/`'Except`/`'Union`，后者为去重
+`kind` 复用 Query 的 `qb.SetOpKind`（`Intersect`/`Except`/`Union`，后者为去重
 union，不是 UNION ALL）。
 
 - 操作数投影必须非空、arity 相同且逐位置类别兼容；两个操作数都不得携带本地
@@ -1377,12 +1377,12 @@ union，不是 UNION ALL）。
 在资产根目录运行：
 
 ```bash
-./bin/telora -C ontology check @test/ontology
-./bin/telora -C ontology check @test/intent
+./bin/telora -C ontology test ontology
+./bin/telora -C ontology test intent
 ```
 
 `tests/ontology.telora` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复
-lowering 确定性、封闭枚举值域、封闭计算表达式（`'If`/`'Instr` 参与
+lowering 确定性、封闭枚举值域、封闭计算表达式（`If`/`Instr` 参与
 projection/grouping/ordering）、分页（offset 降低与绑定顺序、确定性）、领域
 scope（声明、合并顺序、参数化）、Top Per Group（每分区 Top 2、computed 维度
 tie-breaker、与全局 limit/offset 不组合）、条件/计算指标（FILTER lowering、
@@ -1398,7 +1398,7 @@ Dimension 拒绝（Profile 缺 JsonExtract、未授权 JSON Dimension、非法�
 行级投影（无虚构 COUNT、无 grouping、跨安全 join 列表、contains 参数化绑定）、
 文本筛选算子（starts-with/contains/not-contains/ends-with 的封闭 lowering 与
 binding 顺序）、HAVING（阈值绑定、需已选 measure）、EXISTS（fan-out 必需实体改为
-相关存在谓词、不产生 fan-out join）与结构化复合关系键（`'And` 合取键降低为
+相关存在谓词、不产生 fan-out join）与结构化复合关系键（`And` 合取键降低为
 `join_on` 的 AND ON 条件）。本轮的受控两跳相关存在也纳入覆盖：知识 payload 保存
 Component → Site → Alarm 路线；两跳 lowering 只发 grain-safe owner join + 相关
 EXISTS（SQL 形状、外层 grain 不被 Site→Alarm fan-out 放大、`min_matches` 分组计数、
@@ -1514,7 +1514,7 @@ population grain、未知外属性/分组维度/measure、未授权分组维度�
 owner 被拒绝）及 `check_ranked_key_derived_plan_join_rejected`（derived(union)
 外层 Plan 对需要新增 join 的父属性拒绝、base 自身属性可行）。
 query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
-`qb.exists_not`、`OrderKey 'Aggregate` 内部排序聚合与 `qb.exists_two_hop`
+`qb.exists_not`、`OrderKey Aggregate` 内部排序聚合与 `qb.exists_two_hop`
 （SQL/bindings/确定性）。model-derived intent factory 测试（`@test/intent`）另覆盖
 **两份结构不同的领域中性模型**（虚构企业 `@src/test_knowledge` 与本地 org
 teams/members 模型）：`count_members`/`filtered_members`/`knowledge_distinct`

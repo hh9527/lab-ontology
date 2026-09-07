@@ -4,8 +4,7 @@ Telora 提供 `eval`、`eval-with`、`run` 和 `serve` 四种执行模式。它�
 选择一个公开导出，但对导出值的类型、Host 输入和执行生命周期有不同要求。
 
 标准库模块见 [`LIBSTD.md`](LIBSTD.md)，EES 与 Actor 协议见 [`EES.md`](EES.md)，完整
-命令参数见 [`TELORA-CLI.md`](TELORA-CLI.md)。开发期如何组合模块检查、语义查询、
-入口执行与预期失败门禁，见 [`TESTING.md`](TESTING.md)。
+命令参数见 [`TELORA-CLI.md`](TELORA-CLI.md)。
 
 ## 选择执行模式
 
@@ -33,9 +32,9 @@ Telora 提供 `eval`、`eval-with`、`run` 和 `serve` 四种执行模式。它�
 ```telora
 import "std/value" {Value};
 
-export def answer: Value = 'Object({
-    value: 'Int(42),
-    label: 'String("answer"),
+export def answer: Value = Value.Object({
+    value: Value.Int(42),
+    label: Value.String("answer"),
 });
 ```
 
@@ -58,13 +57,13 @@ import "std/entry" as entry;
 def config: entry.ContextConfig = {
     sources: ["request"],
     envs: ["TARGET"],
-    args: 'True,
+    args: True,
 };
 
 export def evaluate = entry.main(config, fn(ctx) {
     match dict.get(ctx.sources, "request") {
-        'Some(value) => value,
-        'None => fail!("missing request source"),
+        Some(value) => value,
+        None => fail!("missing request source"),
     }
 });
 ```
@@ -91,7 +90,7 @@ type Context = struct {
 };
 ```
 
-只有 config 声明的 source 和 env 才能进入 Context。`args: 'False` 表示入口不接受命令
+只有 config 声明的 source 和 env 才能进入 Context。`args: False` 表示入口不接受命令
 参数。`eval-with` 调用一次 evaluate 函数并把返回 Value 编码到 stdout；它没有 Actor
 事件、State 或 EES。
 
@@ -103,19 +102,20 @@ type Context = struct {
 import "std/actor" as actor;
 import "std/ees" as ees;
 import "std/entry" as entry;
+import "std/value" {Value};
 
 type State = struct {handled: Int};
 
-def config: entry.ContextConfig = {sources: [], envs: [], args: 'False};
+def config: entry.ContextConfig = {sources: [], envs: [], args: False};
 
-export def run = entry.run(config, ees.none, fn(ctx) {
+export def run = entry.run(State, config, ees.none, fn(ctx) {
     let reduce: Fn(State, actor.Event) -> actor.Transition(State) = fn(state, event) {
         match event {
-            'Request(request) => (
+            actor.Event.Request(request) => (
                 {handled: state.handled + 1},
-                [actor.reply(request.id, 'String("done"))],
+                [actor.reply(request.id, Value.String("done"))],
             ),
-            'EesReply(_) => fail!("unexpected EES reply"),
+            actor.Event.EesReply(_) => fail!("unexpected EES reply"),
         }
     };
     ({handled: 0}, reduce)
@@ -138,14 +138,14 @@ model；需要外部能力时换成明确的 `ees.Config` 并处理 `actor.EesRe
 区别由 Host 生命周期和请求 transport 决定：
 
 ```telora
-export def serve = entry.serve(config, ees.none, fn(ctx) {
+export def serve = entry.serve(State, config, ees.none, fn(ctx) {
     let reduce: Fn(State, actor.Event) -> actor.Transition(State) = fn(state, event) {
         match event {
-            'Request(request) => (
+            actor.Event.Request(request) => (
                 {handled: state.handled + 1},
                 [actor.reply(request.id, request.input)],
             ),
-            'EesReply(_) => fail!("unexpected EES reply"),
+            actor.Event.EesReply(_) => fail!("unexpected EES reply"),
         }
     };
     ({handled: 0}, reduce)
@@ -201,7 +201,7 @@ telora eval-with @src/app:evaluate -- first second
 telora run @src/app:run -- first second
 ```
 
-只有 `ContextConfig.args == 'True` 的入口接受这些参数。
+只有 `ContextConfig.args == True` 的入口接受这些参数。
 
 ## EES
 

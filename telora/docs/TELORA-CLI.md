@@ -12,7 +12,7 @@ canonical crate name、模块清单和直接依赖名称；workspace 根的 `tel
 
 Telora 从当前目录向上查找最近的 `telora-config.json`，因此命令可以从 workspace 内
 任意目录执行。`-C` 可以显式改变查找的起始目录。`telora lock` 是唯一写入 lock 的
-命令；`eval`、`eval-with`、`run`、`serve`、`check`、`query` 和 LSP 要求 lock 已存在且与配置一致。
+命令；`eval`、`eval-with`、`run`、`serve`、`test`、`check`、`query` 和 LSP 要求 lock 已存在且与配置一致。
 命令参数使用稳定逻辑模块 ID，不使用物理文件名：
 
 ```text
@@ -23,6 +23,8 @@ telora -C examples/my-crate run @src/app:run --source request=stdin+json://
 telora -C examples/my-crate run @src/app:run --ees-var tenant=production
 telora -C examples/my-crate serve @src/app:serve --bind stdio://
 telora -C examples/my-crate check @test/compiler
+telora -C examples/my-crate test compiler
+telora -C examples/my-crate test parser/expressions
 telora -C examples/my-crate query modules
 telora -C examples/my-crate query at @src/app
 telora -C examples/my-crate query at @src/compiler -k type,let,def,import
@@ -46,6 +48,61 @@ export def lowering_case = do {
 ```
 
 多个独立检查应写成多个具名 export，使 best-effort `check` 可以继续不依赖失败项的根。
+
+`test NAME` 选择当前 crate 的 `tests/NAME.telora`，先完成模块检查和初始化，再执行
+入口直接公开导出的 `std/test.Test`。
+`NAME` 不带后缀，可以包含子目录；不接受绝对路径、`..`、通配符或 export selector。
+当前只支持显式选择一个测试。Host 先准备整个 `tests/` 的模块清单，再解析和求值从
+该入口可达的模块；测试模块可以相互 import，源码不能反向 import 测试。完整规则见
+[`WORKSPACE.md`](WORKSPACE.md#test-root)。
+
+```telora
+import "std/test" as test;
+import "std/value" {Value};
+
+export def accepts = test.should_ok(fn() { 1 + 1 });
+export def rejects = test.should_fail_with(fn() { fail!("expected rejection") }, "rejection");
+export def inputs = test.with_fixtures(["fixtures/a.json", "fixtures/b.yaml"], fn(value) {
+    test.should_ok(fn() {
+        match value { Value.Object(_) => True, _ => fail!("expected object", value) }
+    })
+});
+```
+
+`should_ok`、`should_fail` 和 `should_fail_with` 保存零参数 thunk；构造时不执行。
+`should_ok` 接受任何正常返回值，包括 `False` 和 `Err(...)`。`should_fail` 要求
+可恢复的执行失败；`should_fail_with` 还要求主错误消息包含非空、区分大小写的子串。
+通过的预期失败会被消费，warning 仍按用例报告；普通失败后继续执行其他用例。
+语法、类型、import 和模块初始化错误阻止全部用例执行。资源耗尽等终止错误会中止
+调用，不能作为预期失败通过。
+
+`with_fixtures` 的 factory 接收一个 sourced `Value` 并返回子 Test，可以返回嵌套
+fixture 组。Host 在调用本组第一个 factory 前准备全部直接输入，同一个文件在组内
+只读取一次；重复条目仍分别计数。坏文件或 factory 失败只影响该用例，空组失败。
+fixture 支持 JSON/YAML/YML/TOML 路径和 `file+json://`、`file+yaml://`、
+`file+toml://`；不支持 stdin、网络或通配展开。路径相对实际调用 `with_fixtures`
+的模块，导入和重导出不改变基准；绝对路径和越过声明 crate 根的路径被拒绝。
+fixture 不产生 import 边，来源使用 `@test-ctx/<入口>/<导出名>/<索引路径>`，
+入口和导出名分别进行 UTF-8 percent encoding。
+
+Test 按公开导出名排序，组内按数组顺序深度优先执行。显式重导出按入口的公开名称
+执行，两个别名执行两次；普通导入不会执行被导入模块的 Test。其他导出可作为 helper，
+测试发现以直接导出的 Test 为单位。容器和 Dyn 中的 Test 不参与发现。没有直接 Test 导出时失败。
+
+stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增加 `test`、
+`fixtures`、`sources` 和 `phase`（discovery、fixture、factory、execution）；随后
+输出对应 case，最后恰好一个 summary。成功组不额外计数，`total == passed + failed`。
+中止设置 `aborted: true`，不伪造未启动用例结果。至少一个用例通过且没有失败才退出 0，
+普通失败退出 1。参数错误沿用 clap；准备失败在 stderr 输出 `telora.error/v1`，
+没有求值 summary。该命令不进入 reducer 或应用 EES 调度。
+
+默认最多展开 10,000 个 Test/失败 fixture 节点，最多嵌套 64 层，fixture 累计保留
+预算为 256 MiB（源码字节、每个逻辑数据节点 64 字节和解码 payload 字节）。每份
+输入仍受 DataLimits 约束。所有 factory、thunk 和数据物化共享一个 session 配额。
+
+`check @test/NAME` 使用相同清单，但只检查和初始化模块，不执行 Test 或读取 fixture，
+保留 `telora.check/v1`；显式的
+`query at/exports @test/NAME` 同样支持嵌套测试与测试依赖。
 
 - `eval module:name` 要求公开导出 `name: Value`，直接求值并编码为 JSON。
   `eval-with` 要求导出 `entry.Eval`。其 `entry.ContextConfig` 声明 source、环境变量和
