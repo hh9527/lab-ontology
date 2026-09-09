@@ -149,6 +149,11 @@ ordering/limit/offset/partition。
 `limit`/`offset`；有限结果属于业务查询语义，不能把有限行数或底层 `truncated=false`
 解释为已覆盖全量的证明——需要遍历完整分组结果时必须显式分页。
 
+`PartitionRequest` 的 `@check` 在构造时要求 `by` 非空、`take` 位于
+`1..qb.max_partition_take`。普通构造、`Unchecked` 完成和 merge-update 都会执行此
+约束；codec 解码拒绝返回 `Err(BlameError)`。非法值不能先构造成该类型再等待 lowering
+拒绝。维度存在性、权限、grain 和稳定排序依赖完整模型，仍由 lowering 验证。
+
 `partition` 是受限的 Top Per Group 请求：对已按请求维度聚合的结果按 `by` 中的维度
 分区，在每个分区内部按稳定 `ordering` 排序并保留前 `take` 行。`take` 必须是正上限
 内的正整数；存在 `partition` 时不得同时使用全局 `limit` 或 `offset`（v1 组合原子
@@ -1379,7 +1384,13 @@ union，不是 UNION ALL）。
 ```bash
 ./bin/telora -C ontology test ontology
 ./bin/telora -C ontology test intent
+./bin/telora -C ontology test model-rules
+python3 scripts/test-model-diagnostics.py
 ```
+
+`model-rules` 验证局部类型约束的构造、解码与更新边界。诊断脚本通过 CLI 检查
+`tests/diagnostics/rejections.telora` 的预期失败、消息、rule 模块与数据来源；该入口
+故意失败，应通过脚本验收，不应作为期望退出 0 的普通套件运行。
 
 `tests/ontology.telora` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复
 lowering 确定性、封闭枚举值域、封闭计算表达式（`If`/`Instr` 参与

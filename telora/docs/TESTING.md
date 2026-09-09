@@ -143,10 +143,17 @@ From the lab-ontology root, use the same local `bin/telora` for all commands:
 ./bin/telora -C ontology test query
 ./bin/telora -C ontology test ontology
 ./bin/telora -C ontology test intent
+./bin/telora -C ontology test model-rules
 ./bin/telora -C world-model test query
 ./bin/telora -C spider-model test query
 ./bin/telora -C dog-model test query
+python3 scripts/test-model-diagnostics.py
 ```
+
+The diagnostic script consumes intentionally failing cases under
+`ontology/tests/diagnostics/rejections.telora` and asserts their public JSONL
+messages, rule modules and data sources. Run this entry through the script;
+its direct `telora test` exit status is intentionally nonzero.
 
 Also check each model's `@src/bin/make-query` and smoke-test the corresponding
 `bin/*-make-query` entry with valid and invalid inputs. A probe-only test is
