@@ -355,6 +355,15 @@ type InternalHavingRequest = struct {
 # Restricted Top Per Group request: partition the aggregated result by a set of
 # selected dimensions and keep the top `take` rows per partition under a stable
 # ordering. v1 does not combine with a global limit or offset.
+@check(fn(part) {
+    if array.length(part.by) == 0 {
+        Err(blame!("partition must name at least one dimension", part.by))
+    } else if part.take <= 0 || part.take > qb.max_partition_take {
+        Err(blame!("partition take must be a positive integer within the upper bound", part.take))
+    } else {
+        Ok(())
+    }
+})
 type PartitionRequest = struct {
     by: Array(String),   # dimension ids defining the partitions
     take: Int,           # positive integer with an upper bound (max_partition_take)
@@ -831,7 +840,7 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
 # must be Eq over a valid logical field.
 def branch_mapping_ok: Fn(Array(FieldEntry), UnionBranchDecl) -> Array(String) = fn(fields, branch) {
     if array.length(branch.columns) != array.length(fields) {
-        fail!("union branch must map every logical field exactly once")
+        fail!("union branch must map every logical field exactly once", branch.columns, fields)
     } else {
         let bad_order = array.find(branch.columns, fn(c) {
             c.field < 0 || c.field >= array.length(fields)
@@ -840,19 +849,21 @@ def branch_mapping_ok: Fn(Array(FieldEntry), UnionBranchDecl) -> Array(String) =
         let bad_duplicate = array.find(mapped, fn(pair) {
             array.length(array.filter(branch.columns, fn(o) { o.field == pair.1.field })) > 1
         });
-        if bad_order != None {
-            fail!("union branch column mapping is out of range")
-        } else if bad_duplicate != None {
-            fail!("union branch maps the same logical field more than once")
+        if let Some(column) = bad_order {
+            fail!("union branch column mapping is out of range", column.field, fields)
+        } else if let Some(duplicate) = bad_duplicate {
+            let conflicts = array.filter(branch.columns, fn(column) { column.field == duplicate.1.field });
+            fail!("union branch maps the same logical field more than once",
+                get_index(conflicts, 0).field, get_index(conflicts, 1).field)
         } else {
             # deterministic, consistent order: canonical field i must appear at
             # position i (an ascending, exactly-once mapping)
             let order_bad = array.any(mapped, fn(pair) { pair.1.field != pair.0 });
             let bad_col = array.find(branch.columns, fn(c) { !qb.is_sql_identifier(c.column) });
             if order_bad {
-                fail!("union branch column mapping must use a consistent ascending field order")
-            } else if bad_col != None {
-                fail!("union branch physical column is not a legal identifier")
+                fail!("union branch column mapping must use a consistent ascending field order", branch.columns)
+            } else if let Some(column) = bad_col {
+                fail!("union branch physical column is not a legal identifier", column.column)
             } else {
                 array.map(branch.columns, fn(c) { c.column })
             }
@@ -2771,22 +2782,18 @@ def check_offset: Fn(Option(Int), Int) -> Option(Int) = fn(offset, ordering_len)
 
 # Validate and lower a Top Per Group request. Partition dimensions must be
 # selected, authorized and grain-compatible; the ordering must be stable (it
-# must cover every non-partition selected dimension); `take` must be a positive
-# integer within the query upper bound; global limit/offset are not combined.
+# must cover every non-partition selected dimension); global limit/offset are
+# not combined. PartitionRequest construction already checks by/take locally.
 # The resolved ordering is reused as the partition-internal ordering.
 def check_partition: Fn(PreparedPayload, QueryRequest, Array(ResolvedDimension), Array(qb.OrderBy)) -> Option(qb.PartitionedTopN) = fn(payload, request, dimensions, ordering) {
     match request.partition {
         None => None,
         Some(part) => do {
             let requested_dimension_ids = array.map(request.dimensions, fn(d) { d.id });
-            if array.length(part.by) == 0 {
-                fail!("partition must name at least one dimension")
-            } else if part.take <= 0 || part.take > qb.max_partition_take {
-                fail!("partition take must be a positive integer within the upper bound", part.take)
-            } else if request.limit != None || request.offset != None {
-                fail!("top per group does not combine with a global limit or offset")
+            if request.limit != None || request.offset != None {
+                fail!("top per group does not combine with a global limit or offset", request.limit, request.offset, part)
             } else if array.length(request.ordering) == 0 {
-                fail!("top per group requires a stable, deterministic ordering")
+                fail!("top per group requires a stable, deterministic ordering", request.ordering, part)
             } else {
                 let partition_dims = array.map(part.by, fn(id) {
                     if !array.any(requested_dimension_ids, fn(d) { d == id }) {
