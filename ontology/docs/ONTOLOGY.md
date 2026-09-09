@@ -209,7 +209,7 @@ def eq_ops: Array(edsl.FilterOp) = [edsl.FilterOp.Eq];
 def text_kinds: Array(edsl.FilterInputKind) = [edsl.FilterInputKind.Text];
 
 @edsl.entity_source("orders", "o")
-@edsl.relation(Customer, edsl.RelationKind.Safe, 1, 0)
+@edsl.relation(Customer.type, edsl.RelationKind.Safe, 1, 0)
 type Order = struct {
     @edsl.column("order_id")
     @edsl.key(flag_true)
@@ -578,8 +578,8 @@ KPI 事实或子部件往往不直接关联告警等稳定对象，而是经中�
 ```telora
 @edsl.entity_id("components")
 @edsl.entity_source("components", "m")
-@edsl.relation(Site, edsl.RelationKind.Safe, 1, 0)          # component.site_id -> site.id
-@edsl.exists_route(Site, Alarm)            # 显式：base -> Site -> Alarm
+@edsl.relation(Site.type, edsl.RelationKind.Safe, 1, 0)    # component.site_id -> site.id
+@edsl.exists_route(Site.type, Alarm.type)  # 显式：base -> Site -> Alarm
 type Component = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -643,7 +643,7 @@ participant 命中任一端”；“同一 hub 行的两个互斥端点分别由
 ```telora
 @edsl.entity_id("pairs")
 @edsl.entity_source("pairs", "pr")
-@edsl.dual_hub(Member, 0, 2, 3)   # Pair.left_member_id = Member.id 或 Pair.right_member_id = Member.id
+@edsl.dual_hub(Member.type, 0, 2, 3)   # Pair.left_member_id = Member.id 或 Pair.right_member_id = Member.id
 type Pair = struct {
     @edsl.column("id")            # 0: hub base grain key
     @edsl.key(flag_true)
@@ -697,8 +697,8 @@ hub 是 base grain；origin 与 peer 是两个**指定 participant**（`PeerRef 
 ```telora
 @edsl.entity_id("pairs")
 @edsl.entity_source("pairs", "pr")
-@edsl.dual_hub(Member, 0, 2, 3)
-@edsl.peer_hub(Member, 0, 2, Member, 0, 3)  # 两个端点都引用 Member.key
+@edsl.dual_hub(Member.type, 0, 2, 3)
+@edsl.peer_hub(Member.type, 0, 2, Member.type, 0, 3)  # 两个端点都引用 Member.key
 type Pair = struct {
     @edsl.column("id")
     @edsl.key(flag_true)
@@ -837,7 +837,7 @@ def authorize: Fn(String) -> Bool = fn(subject) { subject == "analyst" };
 
 def payload: edsl.PreparedPayload = edsl.build_root(
     "enterprise-v1",
-    [Order, Customer],
+    [Order.type, Customer.type],
     profile,
     authorize,
 );

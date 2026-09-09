@@ -1465,11 +1465,10 @@ Source, Project, Column, Bind, Scalar, Aggregate, Filter, Exists, Join, Group, H
 
 ```telora
 import "std/codec" as codec;
-import "std/result" as result;
 import "std/value" { Value };
 
-let encoded: Value = codec.encode(Value, query);
-let decoded: qb.Query = codec.decode(qb.Query, encoded) |> result.unwrap;
+let encoded: Value = codec.encode(Value.type, query);
+let decoded: qb.Query = codec.decode(qb.Query.type, encoded).unwrap!();
 ```
 
 编码后的 Query 形状如下，不含 variant wrapper：
