@@ -5,13 +5,13 @@
 确定性地降低为 QueryBuilder `Plan`。
 
 ```telora
-import "@src/edsl" as edsl;
+import "@src/ontology" as edsl;
 import "@src/query" as qb;
 ```
 
-外部 crate 通过 `ontology/edsl` 和 `ontology/query` 导入公共模块。`@src/edsl`
-是 ontology crate 内部使用的路径；受 test-root import 限制，共享测试知识暂位于
-`@src/test_knowledge`，但不属于 ontology 公共 API。
+外部 crate 通过 `ontology/ontology` 和 `ontology/query` 导入公共模块。`@src/ontology`
+是 ontology crate 内部使用的路径。共享测试知识位于 `tests/test_knowledge.telora`，
+测试通过 `@test/test_knowledge` 导入；它不属于 ontology 公共 API，也不列入生产模块清单。
 
 ## 从本体派生查询能力
 
@@ -367,7 +367,7 @@ type Trace = struct {
 - `Add`/`Sub` 使用 SQLite 原生数值与 NULL 语义；`count`（含 FILTER）永不返回
   NULL，计数净额总是定义良好，lowering 不自动插入 `coalesce`。
 - 能力不按特定领域名称或数据形状硬编码：除 Trace 的 run/skip 互斥计数外，
-  `@src/test_knowledge` 还以 Approval（审批状态 approved/rejected）演示同一套
+  `@test/test_knowledge` 还以 Approval（审批状态 approved/rejected）演示同一套
   `filtered_measure`/`computed_measure`/lowering 公共路径，声明互斥条件计数及其
   `Add`（`ApprovalTotal`）与 `Sub`（`ApprovalNet`）组合。
 
@@ -1527,7 +1527,7 @@ owner 被拒绝）及 `check_ranked_key_derived_plan_join_rejected`（derived(un
 query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
 `qb.exists_not`、`OrderKey Aggregate` 内部排序聚合与 `qb.exists_two_hop`
 （SQL/bindings/确定性）。model-derived intent factory 测试（`@test/intent`）另覆盖
-**两份结构不同的领域中性模型**（虚构企业 `@src/test_knowledge` 与本地 org
+**两份结构不同的领域中性模型**（虚构企业 `@test/test_knowledge` 与本地 org
 teams/members 模型）：`count_members`/`filtered_members`/`knowledge_distinct`
 （精确 SQL/bindings），`org_field_to_field`（`list` 内 field-to-field 谓词降低为
 双列比较、无 binding）、`org_hidden_row_ordering`（行级按未投影维度排序）、

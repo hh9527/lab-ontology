@@ -139,7 +139,7 @@ From the lab-ontology root, use the same local `bin/telora` for all commands:
 
 ```bash
 ./bin/telora -C ontology check @src/query
-./bin/telora -C ontology check @src/edsl
+./bin/telora -C ontology check @src/ontology
 ./bin/telora -C ontology test query
 ./bin/telora -C ontology test ontology
 ./bin/telora -C ontology test intent

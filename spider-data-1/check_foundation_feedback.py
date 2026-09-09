@@ -24,8 +24,8 @@ def main() -> int:
         ]
     else:
         requirements = [
-            ("ontology/src/edsl.telora", r"lower_hidden_having"),
-            ("ontology/src/edsl.telora", r"scalar.{0,40}subquery"),
+            ("ontology/src/ontology.telora", r"lower_hidden_having"),
+            ("ontology/src/ontology.telora", r"scalar.{0,40}subquery"),
             ("ontology/docs/ONTOLOGY.md", r"scalar.{0,40}subquery|标量.{0,20}子查询"),
             ("ontology/tests/ontology.telora", r"scalar.{0,40}subquery"),
         ]

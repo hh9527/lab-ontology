@@ -38,9 +38,9 @@ crate 内部使用 `@src/query`，外部依赖者使用 `ontology/query`；所�
 
 ## 交付物
 
-- `src/edsl.telora`：property providers、prepared knowledge 和 Request lowering。
+- `src/ontology.telora`：property providers、prepared knowledge 和 Request lowering。
 - `src/intent.telora`：从 prepared 本体机械派生的公共 Intent lowering Factory。
-- `src/test_knowledge.telora`：受当前 test-root import 限制保留的领域中性测试 fixture；不是公共 API。
+- `tests/test_knowledge.telora`：通过 `@test/test_knowledge` 共享的领域中性测试 fixture；不是公共 API。
 - `tests/ontology.telora`：property、关系、筛选、排序、Top N、枚举值域、失败路径和确定性契约测试。
 - `tests/intent.telora`：至少使用两份不同模型验证 Factory 不含领域类型或实体分支。
 - `docs/ONTOLOGY.md`：企业知识作者可独立使用的公共契约与指南。

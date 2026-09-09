@@ -20,7 +20,7 @@ expected = {
     ("limit", (0,)): ("plan limit must be non-negative", "ontology/query"),
     ("offset", (0,)): ("plan offset must be non-negative", "ontology/query"),
     ("missing_field", (0,)): ("intent field is missing", "ontology/intent"),
-    ("duplicate_mapping", ()): ("union branch maps the same logical field more than once", "ontology/edsl"),
+    ("duplicate_mapping", ()): ("union branch maps the same logical field more than once", "ontology/ontology"),
 }
 seen = set()
 
