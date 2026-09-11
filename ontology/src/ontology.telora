@@ -370,6 +370,19 @@ type PartitionRequest = struct {
     take: Int,           # positive integer with an upper bound (max_partition_take)
 };
 
+# Request-local numeric constraints hold at construction, including decoding
+# and merge-update. Ordering feasibility is checked after lowering resolves it.
+@check(fn(request) {
+    let limit = match request.limit {
+        Some(n) => if n > 0 { Ok(()) } else { Err(blame!("limit must be a positive integer", n)) },
+        None => Ok(()),
+    };
+    limit?;
+    match request.offset {
+        Some(n) => if n >= 0 { Ok(()) } else { Err(blame!("offset must be a non-negative integer", n)) },
+        None => Ok(()),
+    }
+})
 type QueryRequest = struct {
     measures: Array(MeasureRequest),
     dimensions: Array(DimensionRequest),
@@ -2362,23 +2375,7 @@ def request_subject_entity: Fn(PreparedPayload, QueryRequest) -> Int = fn(payloa
 };
 
 def rebuild_plan_filter: Fn(qb.Plan, Option(qb.Expr)) -> qb.Plan = fn(plan, filter) {
-    let rebuilt: qb.Plan = {
-        revision: plan.revision,
-        sources: plan.sources,
-        derived: plan.derived,
-        projection: plan.projection,
-        filter,
-        exists: plan.exists,
-        joins: plan.joins,
-        grouping: plan.grouping,
-        having: plan.having,
-        ordering: plan.ordering,
-        limit: plan.limit,
-        offset: plan.offset,
-        partition: plan.partition,
-        scalar_comparisons: plan.scalar_comparisons,
-        ranked_key_comparisons: plan.ranked_key_comparisons,
-    };
+    let rebuilt = plan <~ { filter };
     rebuilt
 };
 
@@ -3549,7 +3546,7 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
         let ordering = ordering_tuple.0;
         let ordering_entities = ordering_tuple.1;
         let partition = check_partition(payload, request, dimensions, ordering);
-        let limit = check_limit(request.limit);
+        let limit = request.limit;
         let offset = check_offset(request.offset, array.length(request.ordering));
         let base_entry = get_index(payload.entities, base_entity);
         let source_plan = match base_entry.union {
@@ -4042,7 +4039,7 @@ def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrde
                 let sources = array.concat([[qb.source(base_entry.alias, base_entry.table)], join_sources]);
                 let projection = array.map(dimensions, fn(d) { qb.expr_item(dimension_expr(payload, d.entry)) });
                 let grouping = array.map(dimensions, fn(d) { dimension_expr(payload, d.entry) });
-                let limit = check_limit(request.limit);
+                let limit = request.limit;
                 let offset = check_offset(request.offset, array.length(request.ordering));
                 let plan: qb.Plan = {
                     revision: payload.revision,
@@ -4087,23 +4084,7 @@ def lower_hidden_having: Fn(PreparedPayload, QueryRequest, Array(InternalHavingR
         } else {
             let hidden = array.map(hidden_having, fn(spec) { internal_having_plan(payload, base, spec) });
             let having = array.concat([base_plan.having, hidden]);
-            let rebuilt: qb.Plan = {
-                revision: base_plan.revision,
-                sources: base_plan.sources,
-                derived: base_plan.derived,
-                projection: base_plan.projection,
-                filter: base_plan.filter,
-                exists: base_plan.exists,
-                joins: base_plan.joins,
-                grouping: base_plan.grouping,
-                having,
-                ordering: base_plan.ordering,
-                limit: base_plan.limit,
-                offset: base_plan.offset,
-                partition: base_plan.partition,
-        scalar_comparisons: base_plan.scalar_comparisons,
-        ranked_key_comparisons: base_plan.ranked_key_comparisons,
-            };
+            let rebuilt = base_plan <~ { having };
             qb.validate(rebuilt, payload.profile)
         }
     }
@@ -4405,23 +4386,7 @@ def lower_attribute_compare: Fn(PreparedPayload, QueryRequest, Array(ScalarCompa
             base_plan
         } else {
             let resolved = array.map(comparisons, fn(spec) { resolve_scalar_compare(payload, base, spec) });
-            let rebuilt: qb.Plan = {
-                revision: base_plan.revision,
-                sources: base_plan.sources,
-                derived: base_plan.derived,
-                projection: base_plan.projection,
-                filter: base_plan.filter,
-                exists: base_plan.exists,
-                joins: base_plan.joins,
-                grouping: base_plan.grouping,
-                having: base_plan.having,
-                ordering: base_plan.ordering,
-                limit: base_plan.limit,
-                offset: base_plan.offset,
-                partition: base_plan.partition,
-                scalar_comparisons: resolved,
-        ranked_key_comparisons: [],
-            };
+            let rebuilt = base_plan <~ { scalar_comparisons: resolved, ranked_key_comparisons: [] };
             qb.validate(rebuilt, payload.profile)
         }
     }
@@ -4734,23 +4699,7 @@ def lower_ranked_key_compare: Fn(PreparedPayload, QueryRequest, Array(RankedKeyC
                     None => array.concat([[get_index(base_plan.sources, 0)], array.map(joins, fn(j) { j.source })]),
                 }
             };
-            let rebuilt: qb.Plan = {
-                revision: base_plan.revision,
-                sources,
-                derived: base_plan.derived,
-                projection: base_plan.projection,
-                filter: base_plan.filter,
-                exists: base_plan.exists,
-                joins,
-                grouping: base_plan.grouping,
-                having: base_plan.having,
-                ordering: base_plan.ordering,
-                limit: base_plan.limit,
-                offset: base_plan.offset,
-                partition: base_plan.partition,
-                scalar_comparisons: base_plan.scalar_comparisons,
-                ranked_key_comparisons: resolved,
-            };
+            let rebuilt = base_plan <~ { sources, joins, ranked_key_comparisons: resolved };
             qb.validate(rebuilt, payload.profile)
         }
     }
@@ -4890,23 +4839,7 @@ def reorder_projection: Fn(PreparedPayload, QueryRequest, qb.Plan, Array(Project
             }
         });
         let projection = array.concat([ordered_items, leftover]);
-        let rebuilt: qb.Plan = {
-            revision: plan.revision,
-            sources: plan.sources,
-            derived: plan.derived,
-            projection,
-            filter: plan.filter,
-            exists: plan.exists,
-            joins: plan.joins,
-            grouping: plan.grouping,
-            having: plan.having,
-            ordering: plan.ordering,
-            limit: plan.limit,
-            offset: plan.offset,
-            partition: plan.partition,
-        scalar_comparisons: plan.scalar_comparisons,
-        ranked_key_comparisons: plan.ranked_key_comparisons,
-        };
+        let rebuilt = plan <~ { projection };
         qb.validate(rebuilt, payload.profile)
     }
 };
