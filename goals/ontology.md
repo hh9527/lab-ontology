@@ -1,5 +1,7 @@
 # Ontology 目标
 
+开始任务时，参考 `goals/telora-context.md`，按当前需要阅读语言与工具资料；准备工作属于本次任务。
+
 `ontology` 是领域无关的 EnterpriseKnowledge eDSL。它让企业作者通过 nominal entity
 types 和 type/member/variant properties 声明知识，一次性准备知识图，并把有类型
 `QueryRequest` 确定性地 lowering 为同一 crate 中 `query` 模块的标准 Plan。

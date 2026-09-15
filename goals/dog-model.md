@@ -1,5 +1,7 @@
 # Spider `dog_kennels` domain model
 
+开始任务时，参考 `goals/telora-context.md`，按当前需要阅读语言与工具资料；准备工作属于本次任务。
+
 Use the explicitly provided `dog_kennels` schema, SQLite database, and modeling examples to build
 an EnterpriseKnowledge model in `dog-model/` on top of the `ontology` eDSL. Implement a
 deterministic closed intent-to-parameterized-SQL entry point.

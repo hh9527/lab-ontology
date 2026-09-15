@@ -1,5 +1,7 @@
 # Query 目标
 
+开始任务时，参考 `goals/telora-context.md`，按当前需要阅读语言与工具资料；准备工作属于本次任务。
+
 `ontology/src/query.telora` 是统一 `ontology` crate 中领域无关的结构化查询基础模块。
 它定义稳定的 Plan vocabulary、能力 Profile、结构验证，以及确定性的 SQLite
 `Plan -> Query` 转换。Ontology eDSL 和具体企业模型只通过该公共模块使用 Query 能力。

@@ -1,5 +1,7 @@
 # Review Ontology for Spider world_1
 
+Use `goals/telora-context.md` as the language and tooling reference; read the relevant materials as needed during this task.
+
 Use only the provided `world_1` schema, SQLite database, and modeling examples to review the
 Query/Ontology foundation delivered by `ontology.foundation-next`.
 

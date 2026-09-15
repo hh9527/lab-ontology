@@ -1,5 +1,7 @@
 # Spider `student_transcripts_tracking` 领域模型目标
 
+开始任务时，参考 `goals/telora-context.md`，按当前需要阅读语言与工具资料；准备工作属于本次任务。
+
 使用计划显式提供的 schema、SQLite 数据库和 modeling 用例，在 `spider-model/` 中建立一个
 基于 `ontology` eDSL 的 EnterpriseKnowledge，并实现自然语言意图到参数化 SQL Query 的确定性入口。
 当前 `spider-model/` 中的旧演唱会领域资产只是上一轮实验遗留；必须完整替换为学生成绩单跟踪领域，
