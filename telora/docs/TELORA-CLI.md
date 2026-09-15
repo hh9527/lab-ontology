@@ -6,18 +6,23 @@ Telora CLI 及其运行时适配器共同充当运行时宿主（Host）：它�
 workspace、crate manifest、模块清单和依赖来源的完整用法见
 [`WORKSPACE.md`](WORKSPACE.md)。
 
+编译限制通过 workspace 配置的 `compiler` 设置，没有对应 CLI 参数。
+运行时 `runtime.fuel` 和 `runtime.memoryLimit` 分别默认 100 和 1024，单位为
+1,000,000 fuel 和 MiB（`1 << 20` 字节）。显式的 `--with-fuel N`、`--with-memory-limit N`
+逐项覆盖配置；未传入的项保留配置值。`--report-usage` 输出会话实际使用的上限和用量。
+
 每个 Telora crate 的模块位于 `src/`，测试位于 `tests/`。`telora-crate.json` 声明
 canonical crate name、模块清单和直接依赖名称；workspace 根的 `telora-config.json`
 选择这些名称的唯一来源，`telora-lock.json` 固定完整包图。
 
 Telora 从当前目录向上查找最近的 `telora-config.json`，因此命令可以从 workspace 内
 任意目录执行。`-C` 可以显式改变查找的起始目录。`telora lock` 是唯一写入 lock 的
-命令；`eval`、`eval-with`、`run`、`serve`、`test`、`check`、`query` 和 LSP 要求 lock 已存在且与配置一致。
+命令；`eval`、`run`、`serve`、`test`、`check`、`query` 和 LSP 要求 lock 已存在且与配置一致。
 命令参数使用稳定逻辑模块 ID，不使用物理文件名：
 
 ```text
 telora -C examples/my-crate eval @src/model:answer
-telora -C examples/my-crate eval-with @src/model:evaluate --source request=request.json -- arg
+telora -C examples/my-crate run @src/model < request.json
 telora -C examples/my-crate run @src/app:run
 telora -C examples/my-crate run @src/app:run --source request=stdin+json://
 telora -C examples/my-crate run @src/app:run --ees-var tenant=production
@@ -32,27 +37,47 @@ telora -C examples/my-crate query exports @src/compiler
 telora -C examples/my-crate query at @src/compiler:12:3
 telora -C examples/my-crate query exports std/string
 telora -C examples/my-crate query at std/array -p flat_map
-telora -C examples/my-crate run @src/invalid:run --best-effort
+telora -C examples/my-crate check @src/invalid
 telora -C examples/my-crate lock
 ```
 
-`check` 的输入仍是完整 Module，不是任意表达式 scratch。模块顶层使用 `def` 声明
+批量检查当前 crate：
+
+```sh
+telora -C examples/my-crate check --lib
+telora -C examples/my-crate check --tests
+telora -C examples/my-crate check --lib --tests --only-types
+```
+
+`--lib` 选择清单中的全部模块，含私有模块与数据模块；`--tests` 递归选择 tests/ 下
+全部模块，含辅助模块，但不执行测试用例。两者可组合，与显式 MODULE_ID 互斥。
+多个根共用一次整图求解和初始化，空集合成功；summary 的 `roots` 列出按名称排序的根。
+任何静态错误都会阻止整图初始化，不提供每个目标独立的 summary。
+
+`--only-types` 在类型闭合及 seal 后停止，不读取数据内容、不执行 property 或模块值。
+普通 check 继续到整图初始化完成。summary 的 `static_seconds` 包含 seal，
+`execution_seconds` 包含 codegen、链接和 VM 初始化；纯类型模式、静态失败或空集合时
+后者为零。`check_seconds` 为这两个阶段之和，`catalog_seconds` 单独记录清单准备。
+
+`check` 的输入是完整模块或批量模块选择，不是任意表达式 scratch。模块顶层使用 `def` 声明
 计算根并至少显式 export 一项；顶层 `let`、裸调用和 final expression 均不合法。
 需要局部步骤时把它们放进 `do`：
 
 ```telora
-export def lowering_case = do {
+export def lowering_case: () = do {
     let plan = lower(request);
-    validate_plan.must_ok!(plan)
+    validate_plan(plan).unwrap!();
 };
 ```
 
-多个独立检查应写成多个具名 export，使 best-effort `check` 可以继续不依赖失败项的根。
+上述写法用于模块初始化诊断。行为测试应把被测计算放进 Test thunk，并用多个具名
+Test export 隔离用例；不要先在顶层计算断言再把结果包装成 Test。具体写法见
+[测试最佳实践](TESTING.md)。
 
 `test NAME` 选择当前 crate 的 `tests/NAME.telora`，先完成模块检查和初始化，再执行
 入口直接公开导出的 `std/test.Test`。
 `NAME` 不带后缀，可以包含子目录；不接受绝对路径、`..`、通配符或 export selector。
-当前只支持显式选择一个测试。Host 先准备整个 `tests/` 的模块清单，再解析和求值从
+当前只支持显式选择一个测试入口（入口可以导出多个用例）。Host 先准备整个 `tests/` 的模块清单，再解析和求值从
 该入口可达的模块；测试模块可以相互 import，源码不能反向 import 测试。完整规则见
 [`WORKSPACE.md`](WORKSPACE.md#test-root)。
 
@@ -60,9 +85,9 @@ export def lowering_case = do {
 import "std/test" as test;
 import "std/value" {Value};
 
-export def accepts = test.should_ok(fn() { 1 + 1 });
-export def rejects = test.should_fail_with(fn() { fail!("expected rejection") }, "rejection");
-export def inputs = test.with_fixtures(["fixtures/a.json", "fixtures/b.yaml"], fn(value) {
+export def accepts: test.Test = test.should_ok(fn() { 1 + 1 });
+export def rejects: test.Test = test.should_fail_with(fn() { fail!("expected rejection") }, "rejection");
+export def inputs: test.Test = test.with_fixtures(["fixtures/a.json", "fixtures/b.yaml"], fn(value) {
     test.should_ok(fn() {
         match value { Value.Object(_) => True, _ => fail!("expected object", value) }
     })
@@ -104,51 +129,33 @@ stdout 使用 `telora.test/v2`：diagnostic 保留原有字段，并为用例增
 保留 `telora.check/v1`；显式的
 `query at/exports @test/NAME` 同样支持嵌套测试与测试依赖。
 
-- `eval module:name` 要求公开导出 `name: Value`，直接求值并编码为 JSON。
-  `eval-with` 要求导出 `entry.Eval`。其 `entry.ContextConfig` 声明 source、环境变量和
-  参数能力；两条命令都不进入 reducer/effect loop。
-- `run module:name` 和 `serve module:name --bind stdio://` 分别要求导出
-  `entry.Run(State)` 和 `entry.Serve(State)`。`run` 投递一次 Request 并在 Reply 后输出
-  Value；`serve` 持续把每行 JSON 转成 Request，每个 Reply 产生一行
-  JSON 响应。成功响应是 `{"ok": value, "error": false, "diagnostics": [...]}`；请求
-  触发可恢复 failure 时是 `{"ok": null, "error": true, "diagnostics": [...]}`，服务
-  继续处理下一行。当前诊断 JSON 只稳定公开 `message`。资源耗尽、取消等终止性失败，
-  以及初始化和 Entry 协议错误仍带外报告并终止进程。
-- `run` 和 `serve` 在 `ees.Config` 中声明命名 native model，并以 `ees.Config.vars` 与
-  `--ees-var` 绑定 locator 变量。model 由 `std/ees.imos_model` 或
-  `std/ees.sqlite_model` 构造。
-  reducer 发出 `actor.EesCall`，Host 完成调用后投递 `actor.EesReply`；多步行为的阶段
-  和关联信息保存在显式 State。应用 EES 与 package Host 的私有 IMOS Service 完全隔离。
-- `entry.ContextConfig.sources` 声明初始化 source。声明的名称必须全部提供，CLI 也不能
-  提供未声明或重复的名称。
-  `--source name=path.json` 按 `.json/.yaml/.yml/.toml` 推断格式；
-  `file+json://path`、`file+yaml://path`、`file+toml://path` 显式指定 transport 与格式；
-  `stdin+json://`、`stdin+yaml://`、`stdin+toml://` 从标准输入读取一次。
-  单次命令最多声明一个 stdin source。`serve --bind stdio://` 已把 stdin 用作 JSONL
-  请求通道，因此不能再用 stdin 初始化 source。
-  Main 收到的 Dict key 就是 `name`。值的诊断来源固定为 `@run-ctx/name`，不会暴露文件
-  路径；该来源名不是模块，不能 import，也不会由 `query modules` 列出。
-- `telora -C context run module:name` 从 `context` 开始向上发现 workspace config，并以包含
+- `eval module:name` 读取 Value 导出。
+- `run module` 选择 MainService，读取 stdin JSON，输出一个 JSON Value。
+- `serve module --bind stdio://` 持续处理 JSONL，响应含 ok/error/diagnostics；诊断保留
+  severity、message、labels、notes。语言失败和请求配额耗尽不影响下一条请求。
+- `@service.source("name")` 声明初始化来源，--source 的名称集合须精确匹配。
+  来源使用文件 JSON/YAML/TOML，stdin 保留给请求。逻辑来源为 @service/name。
+  参见 [执行模式](EXEC-MODE.md)。
+- `telora -C context run module` 从 `context` 开始向上发现 workspace config，并以包含
   `context` 的 member crate 解析 module selector。
-- `run ... --best-effort` 只在遇到问题时用于扩大诊断覆盖。它在启动 Entry 前对 Main 做
-  best-effort 诊断求值；只要出现任何 error，stderr 输出 `telora.run/v1` JSONL 诊断与
-  error summary，非零退出且不产生任何 Entry effect，即使一个不依赖失败的干净根值仍能
-  算出。没有 error 时仍重新走严格 Entry/运行时 lifecycle；成功结果的最终验收使用普通
-  `run`。本参数用于调查问题时扩大诊断覆盖。
+- 多根初始化诊断使用 `check`；静态诊断使用 `check --only-types`。运行命令不提供
+  `--best-effort`，初始化失败不启动 Entry，不为诊断额外预执行用户代码。
 - `run`、`check` 和 `query` 的 `-C context` 都从 `context` 开始向上发现 workspace；
   `check` 和 `query` 接受完整稳定模块 ID，`check @test/...` 检查测试入口；`run` 和
-  `serve` 接受 `MODULE:EXPORT`。
-- `check` 用 best-effort 模式继续彼此独立的求值，以一次收集更多诊断；最终判定仍然
-  严格。stdout 完全采用 `telora.check/v1` JSONL：先输出诊断 records，最后输出一条
-  `summary` record。只有完整求值并形成内部 semantic Module graph 时 summary 才是
-  `status: "ok"`；它不把递归 TypeMetadata 等内部图物化为外部 owned value。任何
-  语法、类型、解析或运行时失败都会得到 `status: "error"` 和非零退出。
-  纯导出以 `eval` / `eval-with` 验收；应用 service 仍以 `run` 为准，因为 `run` 还经过
-  Entry 和 reducer/effect 调度。
+  `serve` 接受 `MODULE`。
+- `check` 先完成全图模块、符号和类型求解及 seal，再编译并初始化；静态阶段不执行
+  Telora 代码。静态错误阻止整图初始化。初始化可继续独立任务以收集诊断，但最终判定
+  仍然严格。stdout 使用 `telora.check/v1` JSONL，先输出诊断，最后输出一份 summary；
+  任一静态或初始化错误都得到 `status: "error"` 和非零退出。
+  诊断的 `module` 表示 primary 规则位置所属模块，`session` 保留选择器。初始化产生的
+  诊断另带 `initialization`：`module`、`node` 标识当时执行的初始化根，具名根还提供
+  `symbol` 和 `name`；property 等非具名根的后两项为 null。这些 ID 属于本次封闭图。
+  它记录实际触发，不是导入者或所有受影响导出的清单；缓存失败只报告原事件一次。
+  纯导出以 eval 验收；服务以 run/serve 验收。
 - `query`（可见别名 `q`）输出 `telora.query/v1` JSONL 语义记录。`query modules`
   列出当前 crate 可见的规范模块 ID；`query exports <module>` 查询公共接口；
   `query at <module>` 查询顶层 local definitions，追加 `:<line>` 或 `:<line>:<column>`
-  查询与源码行或位置相交的事实。它查询 recoverable CST 和部分语义/求值证据图，因此
+  查询与源码行或位置相交的事实。它查询静态 MIR，不执行元数据或模块值，因此
   在模块损坏时仍可返回不受影响的事实；命令成功只表示查询完成，不表示模块能够通过
   `check` 或 `run`。
 - `query modules` 列出本 crate 的 public/private source、dependency 的 public source

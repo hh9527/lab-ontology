@@ -10,9 +10,8 @@
 
 - 阅读和编写当前实现支持的 Telora 源码；
 - 理解 workspace、crate manifest、lock、module selector、import、test 和 diagnostics 的边界；
-- 使用 `eval` 验收导出的纯 `Value`，使用 `eval-with` 验收带 context source 的纯入口；
+- 使用 `eval` 验收导出的纯 `Value`，使用 `run` 验收 TransformService 的单次数据转换；
 - 使用 `check` 完成模块与测试检查，使用 `query` 完成模块和类型知识发现；
-- 理解 `run`/`serve` 只用于 reducer/effect 应用入口，本实验角色不得用它们替代纯入口；
+- `run`/`serve` 共享 MainService 类型入口；初始化来源与查询输入分离，不提供用户态外部 I/O；
 - 不执行 `lock`，不修改 Host 管理的 workspace config 或 lock；
 - 依据实际诊断修正代码，不依赖未实现或旧版本命令。
-

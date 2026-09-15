@@ -1,170 +1,230 @@
-# Telora testing
+# Telora 测试最佳实践
 
-Telora separates module checking from behavior tests.
+本文面向 Telora 程序作者和库作者，说明如何把语言契约写成可独立执行、可定位失败的
+测试。语言语义见 [语言设计](../docs/design/LANGUAGE.md)，命令和 JSONL 协议见
+[CLI 指南](TELORA-CLI.md)，测试模块的路径与可见性见 [Workspace 指南](WORKSPACE.md#test-root)。
 
-## Static checks
+## 先区分检查与行为测试
 
-`telora check MODULE` parses, types, and initializes a complete module. Use it
-for source modules and for development-time diagnostics:
+`telora check MODULE` 解析、检查并初始化模块，适合发现语法、类型、导入和初始化
+问题。`telora test NAME` 在这些步骤成功后，执行 `tests/NAME.telora` 直接导出的
+`std/test.Test`。`check` 成功不代表行为断言通过。
 
-```bash
-telora check @src/model
-```
+`check --lib` 检查当前 crate 清单中的全部模块；`check --tests` 检查 tests/ 下全部
+模块，也可组合使用。多个根共用一张图并输出一份 summary，不逐模块独立运行。
+加 `--only-types` 时只检查静态类型闭合，不初始化、不执行 Test，也不读取数据内容。
+批量检查适合库的静态/初始化门禁；运行期正反例仍应放在 Test thunk 中。
 
-A successful check does not run Test thunks or fixture factories. It does
-initialize module values, which can call functions. Keep behavior checks inside
-test thunks: a top-level `def passed = validate(input);` runs too early, even if
-a Test later returns `passed`. Store reusable behavior in a function instead.
+| 要验证的契约 | 合适的验证方式 |
+| --- | --- |
+| 普通计算的结果、转换、边界条件 | `test.should_ok` 内显式断言 |
+| 函数返回 `Err` 或 `None` | 在 thunk 内匹配并检查返回值 |
+| 可恢复的执行失败及其消息 | `test.should_fail` / `test.should_fail_with` |
+| 语法、类型、导入或模块初始化失败 | 独立运行 `check`，检查退出码与诊断 |
+| 导出签名和语义查询结果 | 运行 `query`，检查对应输出 |
+| 服务初始化、请求隔离和 Host 协议 | run/serve 集成验证 |
 
-## Behavior tests
+`test` 不自动驱动服务入口。资源耗尽、取消等终止错误不能当作预期失败通过；
+测试初始化错误也不能由尚未执行的 `should_fail` 捕获。
 
-Test modules live below `tests/`. A test entry directly exports values of type
-`std/test.Test`, and is selected by its path without the `.telora` suffix:
+## 把计算放进 thunk，显式断言结果
+
+下面是完整的 `tests/arithmetic.telora`：
 
 ```telora
 import "std/test" as test;
 
-def positive: Fn() -> Bool = fn() { 1 + 1 == 2 };
+def twice: Fn(Int) -> Int = fn(value) { value * 2 };
 
-export def accepts = test.should_ok(fn() {
-    if positive() { True } else { fail!("unexpected sum") }
+export def doubles_positive: test.Test = test.should_ok(fn() {
+    let actual = twice(3);
+    if actual == 6 { True } else { fail!("unexpected doubled value", actual) }
 });
 
-export def rejects = test.should_fail_with(fn() {
-    raise!("invalid input")
-}, "invalid input");
+export def doubles_zero: test.Test = test.should_ok(fn() {
+    let actual = twice(0);
+    if actual == 0 { True } else { fail!("zero must stay zero", actual) }
+});
 ```
 
-```bash
-telora test model
-```
+`should_ok` 的含义是“正常返回”，不是“返回 True”，也不是“返回 Ok”。正常返回
+`False`、`Err(...)` 或 `None` 都会通过。需要验证结果时，必须匹配结果或让不满足的
+条件执行 `fail!`。
 
-`should_ok`, `should_fail`, and `should_fail_with` retain their zero-argument
-thunks and execute them only when the test runs. `should_ok` accepts any normal
-return value, including `False` and `Err(...)`; use an assertion that calls
-`fail!` when a Boolean condition must hold.
+不要写顶层 `def actual: Int = twice(3);`，再在 Test 中读取它来代替测试计算。
+顶层值在模块初始化时计算；失败会阻止整个入口执行。可复用类型、decorator、纯输入
+常量和函数可以放在顶层，被测调用与断言放进零参数 thunk。计算复杂的输入准备也宜
+封装成函数，在需要它的用例中调用。
 
-`should_fail` requires a recoverable execution failure. `should_fail_with`
-also requires the primary error message to contain its non-empty,
-case-sensitive substring. Syntax, type, import, and module initialization
-errors abort the module before any test runs.
+每个可独立诊断的契约导出一个 Test，使用表达行为的名称。同一契约内可以有多个
+相关断言，但不要把整个套件串成一个大 thunk。可恢复失败后，其他用例仍会执行。
+不要让用例依赖执行顺序或另一用例的成功结果。
 
-Export one Test per independently diagnosable contract. Do not hide a whole
-suite behind one exported Test: a failure would skip the remaining assertions.
-Tests are discovered among the entry module's direct Test exports (including
-explicit reexports), not ordinary imports or containers. Nested entries such
-as `test query/lowering` are supported; invoke each suite explicitly.
+## 区分返回错误与抛出错误
 
-## Results and diagnostics
-
-Use ordinary calls and then decide what to do with their results:
+下面是完整的 `tests/results.telora`：
 
 ```telora
-import "std/codec" as codec;
-import "std/value" { Value };
 import "std/test" as test;
 
-export def decodes = test.should_ok(fn() {
-    let value = codec.decode(Int.type, Value.Int(7)).unwrap!();
-    if value == 7 { True } else { fail!("wrong decoded value", value) }
+def positive: Fn(Int) -> Result(Int, String) = fn(value) {
+    if value > 0 { Ok(value) } else { Err("expected positive") }
+};
+
+export def accepts_positive: test.Test = test.should_ok(fn() {
+    let actual = positive(3).unwrap!();
+    if actual == 3 { True } else { fail!("wrong payload", actual) }
 });
 
-export def returns_error = test.should_ok(fn() {
-    match codec.decode(Int.type, Value.String("bad")) {
-        Err(_) => True,
-        Ok(value) => fail!("invalid input was accepted", value),
+export def returns_rejection: test.Test = test.should_ok(fn() {
+    match positive(0) {
+        Err(message) => if message == "expected positive" { True }
+            else { fail!("wrong rejection", message) },
+        Ok(value) => fail!("zero was accepted", value),
     }
 });
 
-export def raises_error = test.should_fail(fn() {
-    codec.decode(Int.type, Value.String("bad")).unwrap!()
-});
+export def raises_rejection: test.Test = test.should_fail_with(fn() {
+    positive(0).unwrap!()
+}, "expected positive");
 ```
 
-Match `Err` when testing a recoverable result contract; check its public error
-details where available. Use `should_fail_with` with a stable message fragment
-when the contract requires a particular execution failure. A Boolean probe
-rejecting input does not prove the actual lowering entry rejects it: test both
-when both are public contracts, with a nearby valid-input control.
+返回 `Err` 不产生失败诊断；`unwrap!` 在 Ok 时取出 payload，在 Err 时调用
+`raise!`。`should_fail_with` 检查可恢复失败的主消息是否包含给定的非空、区分大小写
+子串，不检查完整文本相等，也不自动验证来源位置。只关心是否拒绝时可用
+`should_fail`，关心拒绝原因时选择稳定且有区分度的消息片段。
 
-`unwrap!` returns the Ok payload or delegates Err to `raise!`. Accepted error
-types are String and BlameError. String supplies only a message, with no data
-references; BlameError supplies a message and explicit subjects. `raise!` adds
-the authored call-site rule, without implicitly attaching function arguments
-or the Result container. `fail!(message, subjects...)` remains supported and
-means `raise!(blame!(message, subjects...))` at that site. Keep subjects when
-they explain a failed assertion; do not replace sourced failures with bare
-strings. Other error types require an explicit adapter.
+预期失败应尽量只包含被测操作，避免前面的输入准备意外失败也让测试通过。为拒绝
+用例保留相邻的成功对照。若库同时公开 Boolean 探测器与真正的转换入口，分别测试：
+探测器返回 False 不能证明转换入口一定拒绝，也不能证明拒绝理由正确。
 
-`ok_or_warn!` returns Some on success and delegates errors to `warn!`, which
-returns None. It is not a success assertion: warnings do not make should_ok
-fail. Do not use it to hide failures in positive tests.
+不要为了方便测试而把所有领域函数改成 Result。只有调用者确实需要恢复或分支时才
+选择 Result；直接承诺成功类型并在非法输入上失败，同样是可测试的契约。
 
-The removed function macros `should_ok!` / `must_ok!`, `try_unwrap!`, and
-`std/result.unwrap` are not test idioms. The ordinary `test.should_ok` function
-is still the test constructor. Pass explicit type metadata to codec and
-reflection APIs (`Int.type`, `Value.type`); leave type annotations and enum
-constructors as types and constructors.
+## 保留诊断来源，不把 warning 当作断言
 
-## Fixtures
+`raise!` / `warn!` 接受的错误有明确边界：
 
-Use `with_fixtures` when the same test should run against sourced JSON, YAML,
-or TOML values:
+| 错误类型 | message | 数据引用 | rule |
+| --- | --- | --- | --- |
+| String | 字符串内容 | 空，不自动附加字符串来源 | 报告处的实际宏调用位置 |
+| BlameError | 错误提供 | 错误携带的显式 subjects | 报告处的实际宏调用位置 |
+
+`blame!` 构造错误数据，不报告；`raise!` 归一化错误、添加 rule 并产生失败，返回
+Never。`fail!(message, subjects...)` 仍是受支持的写法，等价于在该位置执行
+`raise!(blame!(message, subjects...))`。断言失败时，把能解释问题的实际值作为 subject
+传入；不要把已有 BlameError 改成字符串而丢掉数据引用。
+
+`.unwrap!()` 的报告位置属于用户的宏调用处，调用参数和 Result 容器不会被隐式
+加入数据引用。若 `.unwrap!()` 写在 helper 内，rule 就在 helper 内，不能假设它指向
+最外层调用者。`ParseError` 等其他错误类型需显式适配，不能仅因有 message 就直接解包。
+
+`.ok_or_warn!()` 在 Ok 时返回 Some，在 Err 时交给 `warn!` 并返回 None。warning
+不会使 `should_ok` 失败，不应用它吞掉成功用例中的错误。需要断言 warning 的数量、
+级别或 rule/数据引用时，应检查带诊断的公开观测接口或 Host 的结构化输出，单靠
+`should_fail_with` 不足以验证这些内容。
+
+旧的函数专用 `should_ok!` / `must_ok!`、`try_unwrap!` 和 `std/result.unwrap` 已删除。
+普通测试构造器 `test.should_ok` 仍然存在，与函数结果解包不是同一职责。
+
+## 类型约束与 codec 边界分别测试
+
+类型声明 `T` 与元数据 `T.type` 不可混用。codec 接收明确的类型见证，例如
+`codec.decode(T.type, input)`。对于带 `@check` 的类型，要分别验证合法构造、非法
+构造和解码失败：普通构造拒绝产生执行失败，codec 拒绝返回 `Err(BlameError)`。
+
+下面是完整的 `tests/checked.telora`：
 
 ```telora
 import "std/test" as test;
-import "std/value" {Value};
+import "std/blame" { BlameError };
+import "std/codec" as codec;
+import "std/value" { Value };
 
-export def inputs = test.with_fixtures(["fixtures/a.json"], fn(value) {
+def check_positive: Fn(Int) -> Result((), BlameError) = fn(value) {
+    if value > 0 { Ok(()) } else { Err(blame!("expected positive", value)) }
+};
+
+@check(check_positive)
+type Positive = struct(Int);
+
+export def constructs: test.Test = test.should_ok(fn() {
+    let value = Positive(2);
+    if value.0 == 2 { True } else { fail!("wrong positive value", value) }
+});
+
+export def rejects_construction: test.Test = test.should_fail_with(fn() {
+    Positive(0)
+}, "expected positive");
+
+export def rejects_decode: test.Test = test.should_ok(fn() {
+    match codec.decode(Positive.type, Value.Int(0)) {
+        Err(_) => True,
+        Ok(value) => fail!("decoder accepted zero", value),
+    }
+});
+```
+
+具名字段 struct 的 `@check` 参数是 `Unchecked(T)`，newtype 和带载荷 variant 的
+参数是载荷类型；返回 `Ok(())` 接受，`Err(BlameError)` 拒绝。根据真实契约覆盖边界值、
+嵌套构造和更新，不要只重复测试校验 helper 而绕过类型构造入口。
+
+编码解码测试除 roundtrip 外，还应检查外部表示和非法输入。两个方向同时出错也可能
+通过 roundtrip；预期输出必须独立于被测转换计算。跨模块名义类型和 property 的
+契约应通过真实 import 验证，而不是在测试里复制同形声明。
+
+## 用 fixtures 承载重复输入和来源
+
+同一契约需要一组外部数据时使用 `with_fixtures`。例如在 `tests/fixtures/one.json`
+和 `tests/fixtures/two.json` 中分别保存 `1` 与 `2`，然后创建 `tests/fixtures.telora`：
+
+```telora
+import "std/test" as test;
+import "std/codec" as codec;
+import "std/value" { Value };
+
+export def positive_integers: test.Test = test.with_fixtures([
+    "fixtures/one.json", "fixtures/two.json",
+], fn(input) {
     test.should_ok(fn() {
-        match value {
-            Value.Object(_) => True,
-            _ => fail!("expected object", value),
-        }
+        let value = codec.decode(Int.type, input).unwrap!();
+        if value > 0 { True } else { fail!("expected positive fixture", input) }
     })
 });
 ```
 
-Fixture paths are relative to the module that constructs the fixture Test and
-must stay within its crate. A factory receives a sourced Value and returns a
-Test, possibly another fixture group. Keep decoding, lowering, and assertions
-in the child thunk so failures are reported as cases, not factory failures.
-Missing or malformed fixtures and factory failures are setup errors; a child
-should_fail cannot consume them. Do not migrate every small inline example to
-a file: fixtures are useful for repeated data-driven contracts and provenance.
+fixture 由 Host 准备，factory 接收保留来源的 Value 并返回子 Test。解码、转换和
+断言放在子 thunk 中；factory 自身失败不能由子 `should_fail` 捕获。Host 在执行本组
+第一个 factory 前准备全部直接输入，缺失或格式错误的文件属于 fixture 准备失败。
 
-## Repository regression workflow
+路径相对实际构造 Test 的模块，不能越过声明 crate；导入或重导出不改变该基准。
+支持 JSON、YAML、TOML，不支持网络、stdin 或通配符。嵌套组可以表达多维输入组合，
+但应控制规模，避免无意义的组合膨胀。小型内联输入无需一律移到文件。
 
-From the lab-ontology root, use the same local `bin/telora` for all commands:
+fixture 不产生 import 边。验证静态数据模块的加载、可见性或模块身份时，仍应使用
+真实 import，而不是用 fixture 替代它。
+
+## 组织、执行与验收
+
+在已配置并锁定的 workspace 中运行：
 
 ```bash
-./bin/telora -C ontology check @src/query
-./bin/telora -C ontology check @src/ontology
-./bin/telora -C ontology test query
-./bin/telora -C ontology test ontology
-./bin/telora -C ontology test intent
-./bin/telora -C ontology test model-rules
-./bin/telora -C world-model test query
-./bin/telora -C spider-model test query
-./bin/telora -C dog-model test query
-python3 scripts/test-model-diagnostics.py
+telora check @test/arithmetic
+telora test arithmetic
+telora test results
+telora test checked
+telora test fixtures
 ```
 
-The diagnostic script consumes intentionally failing cases under
-`ontology/tests/diagnostics/rejections.telora` and asserts their public JSONL
-messages, rule modules and data sources. Run this entry through the script;
-its direct `telora test` exit status is intentionally nonzero.
+`NAME` 是 `tests/` 下不带后缀的入口路径，支持子目录；当前每次显式选择一个入口。
+Test 必须由入口直接公开导出，放在 Array、Dict 或 Dyn 中不会被发现。普通 import
+不会执行依赖的 Test；显式重导出会按公开别名执行，同一 Test 的两个别名计为两次。
 
-Also check each model's `@src/bin/make-query` and smoke-test the corresponding
-`bin/*-make-query` entry with valid and invalid inputs. A probe-only test is
-not a substitute for exercising the production lowering boundary.
+查看退出码与 `telora.test/v2` summary，确认有用例执行、没有失败且没有中止。
+`total == passed + failed`，成功的 fixture 组本身不额外计数。不要把准备阶段报错、
+零用例执行或只有一部分结果输出误判为通过。失败时先区分 discovery、fixture、
+factory、execution 阶段，再定位对应 export 和 fixture 索引。
 
-Read the process exit status and the `telora.test/v2` JSONL summary: require
-nonzero total, zero failed, and no abort. Case records identify individual
-exports and fixture indices. Do not compare failed preparation timings with
-successful runs; end-to-end test time includes loading, checking and module
-initialization, not just assertion execution.
-
-Keep deterministic success controls beside expected-failure cases. Domain APIs
-should return `Result` only when callers genuinely need recovery; testing a
-failure is not by itself a reason to change the domain error model.
+测量性能时固定 binary、输入和命令，分别记录 `check` 与 `test`。端到端时间包含
+加载、类型检查和初始化，不能用总时间除以用例数推断单次断言成本，也不能把提前
+失败的耗时与成功执行完整套件比较。
