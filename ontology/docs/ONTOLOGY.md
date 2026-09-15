@@ -436,6 +436,22 @@ type Customer = struct {
 
 ### 关系与安全路径
 
+关系图允许有环，不需要把实体声明按拓扑排序。例如，`Order` 可以在声明时通过
+`@edsl.relation(Package.type, edsl.RelationKind.FanOut, 0, 1)` 指向稍后声明的
+`Package`，后者再通过 `@edsl.relation(Order.type, edsl.RelationKind.Safe, 1, 0)`
+指回 `Order`。两个方向需要分别声明，不自动推导反向关系；这里假定 `Order` 的
+规范字段为 `id`，`Package` 的规范字段为 `id, order_id`。
+
+目标使用名义类型的身份，而不是字符串名称或另一套手工维护的关系 ID。
+类型骨架先完成闭合，再计算 property；记录目标的 `.type` 不需要求值目标的
+property。因此，关系图中的环不等于 property 求值的循环依赖，也不意味着允许
+普通值互相递归求值。跨模块导入后仍使用同一类型身份，prepare 再将关系转换为
+当前实体目录的索引；改变实体输入顺序可以改变索引，但不应改变路径分类。
+
+独立示例 `tests/cyclic_relations_model.telora` 与测试 `tests/cyclic_relations.telora`
+覆盖上述双向声明、跨模块 property 身份、Safe/FanOut-only/Missing 分类及实体重排。
+在 ontology crate 目录运行 `telora test cyclic_relations` 即可验证。
+
 `Safe` 关系不扩张当前 grain；`FanOut` 会扩张 grain。准备阶段对实体图按源实体运行
 有界广度优先遍历（单源一次遍历记录到所有可达实体的路径；深度上限 8，关系目录索引序
 确定性优先），只保存最短的确定性路径矩阵，不在热路径执行 BFS。多个目标按请求顺序
