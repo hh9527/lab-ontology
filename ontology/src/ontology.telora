@@ -247,6 +247,10 @@ type CanonicalValueSpec = struct { id: String, label: String, wires: Array(Filte
 @prelude::property(PropertyTarget::Field)
 type CanonicalValuesDef = struct { values: Array(CanonicalValueSpec) };
 
+type CanonicalAlias = struct { id: String, label: String };
+@prelude::property(PropertyTarget::Field)
+type CanonicalAliasesDef = struct { aliases: Array(CanonicalAlias) };
+
 # Type-level: explicitly declared correlated-existence route for this base
 # entity. Each route names the unique, grain-safe owner entity (`via`) and the
 # target entity whose related rows are tested by the existence filter. A route
@@ -662,10 +666,11 @@ type DimensionBrief = struct {
     input_kinds: Array(FilterInputKind),
     values: Array(EnumValueEntry),
     canonical_values: Array(CanonicalValueSpec),
+    canonical_aliases: Array(CanonicalAlias),
     scope: Array(DimensionScopeBrief),
 };
 
-type BusinessValueBrief = struct { id: String, label: String };
+type BusinessValueBrief = struct { id: String, label: String, aliases: Array(String) };
 type SubjectDimensionBrief = struct {
     id: String,
     label: String,
@@ -734,6 +739,7 @@ type DimensionEntry = struct {
     input_kinds: Array(FilterInputKind),
     values: Array(EnumValueEntry),
     canonical_values: Array(CanonicalValueSpec),
+    canonical_aliases: Array(CanonicalAlias),
     scope: Array(ScopePredicate),
 };
 
@@ -1092,6 +1098,16 @@ def canonical_values: Fn(Array(CanonicalValueSpec)) -> Fn(property::FieldPropert
         } else {
             { values }
         }
+    }
+};
+
+def canonical_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option(CanonicalAliasesDef)) -> CanonicalAliasesDef = fn(id, label) {
+    fn(ctx, previous) {
+        let aliases = match previous {
+            Some(p) => p.aliases,
+            None => [],
+        };
+        {aliases: array::push(aliases, {id, label})}
     }
 };
 
@@ -1785,6 +1801,21 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
     }
 };
 
+def canonical_alias_domain: Fn(Type, FieldEntry, Array(CanonicalValueSpec)) -> Array(CanonicalAlias) = fn(owner, field, values) {
+    match property::get_field_prop(owner, field.index, CanonicalAliasesDef.type) {
+        None => [],
+        Some(declared) => do {
+            let valid = array::all(declared.aliases, fn(alias) {
+                alias.label != "" && array::any(values, fn(value) { value.id == alias.id })
+                    && array::length(array::filter(declared.aliases, fn(other) { other.label == alias.label })) == 1
+                    && !array::any(values, fn(value) { value.label == alias.label || value.id == alias.label })
+            });
+            if !valid { fail!("invalid canonical value alias: requires an existing id and a distinct nonempty label", owner, field, declared) }
+            else { declared.aliases }
+        },
+    }
+};
+
 def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
     match property::get_field_prop(owner, index, ScopeDef.type) {
         Some(s) => s.predicates,
@@ -1795,7 +1826,8 @@ def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
 def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(entity) {
     let fields = entity.fields;
     let orphan = array::find(fields, fn(f) {
-        property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
+        (property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
+            || property::get_field_prop(entity.entity_type, f.index, CanonicalAliasesDef.type) != None)
             && property::get_field_prop(entity.entity_type, f.index, DimensionDef.type) == None
     });
     let declared: Bool = match orphan {
@@ -1807,6 +1839,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         match d {
             Some(dd) => do {
                 let mapped = canonical_domain(entity.entity_type, f);
+                let aliases = canonical_alias_domain(entity.entity_type, f, mapped);
                 let enumerated = value_domain(f.ty);
                 let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
                     Some(role) => role.encoding == TimeEncoding::LocalEpochMillis,
@@ -1839,7 +1872,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     || (valid_kind != FilterInputKind::Text && array::any(dd.ops, fn(op) { is_text_op(op) }))) {
                     fail!("plain dimension filter input or operation disagrees with field type", entity.id, f.name)
                 } else {
-                    [dimension_entry(entity.index, f.index, dd.id, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, field_scope(entity.entity_type, f.index))]
+                    [dimension_entry(entity.index, f.index, dd.id, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, aliases, field_scope(entity.entity_type, f.index))]
                 }
             },
             None => [],
@@ -1848,7 +1881,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     let computed = array::flat_map(fields, fn(f) {
         let d = property::get_field_prop(entity.entity_type, f.index, ComputedDimensionDef.type);
         match d {
-            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], field_scope(entity.entity_type, f.index))],
+            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))],
             None => [],
         }
     });
@@ -1856,7 +1889,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         let d = property::get_field_prop(entity.entity_type, f.index, JsonDimensionDef.type);
         match d {
             Some(dd) => array::map(dd.dimensions, fn(spec) {
-                dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], field_scope(entity.entity_type, f.index))
+                dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))
             }),
             None => [],
         }
@@ -1864,8 +1897,8 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     if declared { array::concat([plain, computed, json]) } else { [] }
 };
 
-def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb::Expr) -> qb::Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, scope) {
-    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, scope };
+def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb::Expr) -> qb::Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope) {
+    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope };
     result
 };
 
@@ -2876,7 +2909,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         dataset: entity.id, field: field.name, computed: entry.computed,
         authorized: entry.authorized, filterable: entry.filterable,
         ops: entry.ops, input_kinds: entry.input_kinds, values: entry.values,
-        canonical_values: entry.canonical_values, scope}
+        canonical_values: entry.canonical_values, canonical_aliases: entry.canonical_aliases, scope}
 };
 
 def dimension_detail: Fn(PreparedPayload, String) -> DimensionBrief = fn(payload, id) {
@@ -2894,9 +2927,10 @@ def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> Subject
         if !detail.authorized { fail!("dimension is not authorized for discovery", subject, id) }
         else {
             let values: Array(BusinessValueBrief) = if array::length(detail.canonical_values) > 0 {
-                array::map(detail.canonical_values, fn(value) { {id: value.id, label: value.label} })
+                array::map(detail.canonical_values, fn(value) { {id: value.id, label: value.label,
+                    aliases: array::map(array::filter(detail.canonical_aliases, fn(alias) { alias.id == value.id }), fn(alias) { alias.label })} })
             } else {
-                array::map(detail.values, fn(value) { {id: value.value, label: value.label} })
+                array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: []} })
             };
             {id: detail.id, label: detail.label, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
@@ -7842,6 +7876,7 @@ pub use self::{
     FieldEntry,
     EnumValueEntry,
     CanonicalValueSpec,
+    CanonicalAlias,
     EntityEntry,
     MeasureEntry,
     DimensionEntry,
@@ -7900,6 +7935,7 @@ pub use self::{
     named_relation_key,
     enum_value,
     canonical_values,
+    canonical_alias,
     scope,
     exists_route,
     route_build,

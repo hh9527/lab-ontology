@@ -192,6 +192,7 @@ def states: Array(edsl::CanonicalValueSpec) = [offline];
 @edsl::dimension("device_commu_state", True, True,
     [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
 @edsl::canonical_values(states)
+@edsl::canonical_alias("offline", "Disconnected")
 commu_state: String,
 ```
 
@@ -202,6 +203,12 @@ wire 降低为同一字段的括号化 OR 等值条件，动态 wire 按声明�
 拒绝空/重复业务 id、空/重复物理值、字段类型不匹配、缺少 Eq/If 能力，
 以及不能兑现多 wire OR 的 profile。普通筛选、`any_of`、scope、
 过滤指标、相关参与者筛选及比较内层筛选共用这一映射。
+
+同一业务值有其他俗称时，可以重复声明 `canonical_alias(id, label)`；
+`dimension_detail_for_subject` 的值条目公开 `aliases`，完整的
+`dimension_detail` 公开别名与稳定 id 的对应关系。别名仅供知识发现，
+不是新的 wire 或可提交的过滤值。准备阶段拒绝未知 id、空名称、重复名称，
+以及与任何规范值的 id 或主 label 冲突的名称。
 
 投影、分组和维度排序使用同一映射生成封闭的 `CASE WHEN` 表达式，
 等价 wire 返回同一个规范业务 id；未声明的物理 wire 返回 `NULL`，
