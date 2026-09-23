@@ -546,6 +546,8 @@ type Customer = struct {
 property。因此，关系图中的环不等于 property 求值的循环依赖，也不意味着允许
 普通值互相递归求值。跨模块导入后仍使用同一类型身份，prepare 再将关系转换为
 当前实体目录的索引；改变实体输入顺序可以改变索引，但不应改变路径分类。
+无论用具名字段对还是字段索引声明关系键，准备阶段都会检查两端字段存在且类型
+一致；`And`/`Or` 不允许空分支，不能发布一个直到查询时才失败的关系。
 
 独立示例 `tests/cyclic_relations_model.telora` 与测试 `tests/cyclic_relations.telora`
 覆盖上述双向声明、跨模块 property 身份、Safe/FanOut-only/Missing 分类及实体重排。
