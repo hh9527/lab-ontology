@@ -291,11 +291,14 @@ pub def dataset_grain_and_time_are_discoverable: test::Test = test::should_ok(fn
 
 pub def device_kpi_metric_contract_is_discoverable: test::Test = test::should_ok(fn() {
     let metrics = edsl::metric_domain(payload, "device_kpi");
-    match (array::get(metrics, 0), array::get(metrics, 1), array::get(metrics, 2)) {
-        (Some(cpu), Some(ports), Some(peak)) => if array::length(metrics) == 3
+    match (array::get(metrics, 0), array::get(metrics, 1), array::get(metrics, 2), array::get(metrics, 3)) {
+        (Some(cpu), Some(cpu_peak), Some(ports), Some(peak)) => if array::length(metrics) == 4
             && cpu.id == "cpu_usage" && cpu.field == "cpu_usage"
             && cpu.aggregate == qb::AggregateFunction::Avg && cpu.unit == Some("%")
             && cpu.role == edsl::MetricValueRole::DeclaredMetric
+            && cpu_peak.id == "cpu_peak" && cpu_peak.field == "cpu_usage"
+            && cpu_peak.aggregate == qb::AggregateFunction::Max && cpu_peak.unit == cpu.unit
+            && cpu_peak.role == edsl::MetricValueRole::SampleSummary
             && ports.id == "port_count" && ports.aggregate == qb::AggregateFunction::Sum
             && ports.role == edsl::MetricValueRole::DeclaredMetric
             && peak.id == "port_count_peak" && peak.field == "port_count"
@@ -338,6 +341,20 @@ pub def sample_peak_uses_original_physical_column: test::Test = test::should_ok(
     } else {
         fail!("sample peak must coexist with the original Sum over one physical column", q)
     }
+});
+
+def alarm_qualified_peak_intent: String = `{"op":"observe_qualified","measures":["cpu_peak"],"dimensions":["device_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"components":[{"relation":"device_current_alarm","target":"current_alarm","filters":[{"dimension":"alarm_severity","op":"eq","kind":"text","value":"critical"}],"min_matches":3}]}`;
+
+pub def event_count_qualification_does_not_amplify_metric_samples: test::Test = test::should_ok(fn() {
+    let q = lower_json(alarm_qualified_peak_intent);
+    if array::length(string::split(q.sql, "max(k.cpuUsage) AS cpu_peak")) == 2
+        && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM T_CURRENT_ALARM")) == 2
+        && array::length(string::split(q.sql, "a_component.SEVERITY = ?")) == 2
+        && array::length(string::split(q.sql, "d.tenant_id = a_component.TENANT_ID")) == 2
+        && array::length(string::split(q.sql, "JOIN T_CURRENT_ALARM")) == 1
+        && q.bindings == [qb::Val::String("2024-02-01T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z"), qb::Val::String("1"), qb::Val::Int(3)] {
+        True
+    } else { fail!("event count qualification must keep KPI sample grain and canonical severity", q) }
 });
 
 def sample_top_intent: String = `{"op":"sample_top","measures":[],"dimensions":["device_name","port_count_sample","device_kpi_ts_raw"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","rank":"port_count_sample","take":3,"window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"}}`;
@@ -493,7 +510,8 @@ pub def alarm_window_uses_authoritative_utc_field: test::Test = test::should_ok(
     if array::length(string::split(q.sql, "a.OCCUR_UTC >= ?")) > 1
         && array::length(string::split(q.sql, "a.OCCUR_UTC < ?")) > 1
         && array::length(string::split(q.sql, "OCCUR_TIME")) == 1
-        && q.bindings == [qb::Val::String("2024-02-29T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z")] {
+        && array::get(q.bindings, array::length(q.bindings) - 2) == Some(qb::Val::String("2024-02-29T00:00:00Z"))
+        && array::get(q.bindings, array::length(q.bindings) - 1) == Some(qb::Val::String("2024-03-01T00:00:00Z")) {
         True
     } else {
         fail!("alarm window must bind only the authoritative UTC field", q)

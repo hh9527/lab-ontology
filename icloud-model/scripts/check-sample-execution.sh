@@ -39,7 +39,12 @@ INSERT INTO NetworkDeviceInterfaceKPI VALUES
 INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
 INSERT INTO X_SITE_VIEW VALUES
  ('S1','Site-A','TA'),('S2','Site-A','TA'),
- ('S3','Site-A','TB'),('S4','Site-Other','TA');"
+ ('S3','Site-A','TB'),('S4','Site-Other','TA');
+CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANT_ID TEXT, SEVERITY TEXT);
+INSERT INTO T_CURRENT_ALARM VALUES
+ (1,'B','red','1'),(2,'B','red','1'),(3,'B','red','1'),
+ (4,'A','red','1'),(5,'A','red','1'),(6,'A','blue','1'),
+ (7,'C','red','2'),(8,'C','red','2'),(9,'C','red','2');"
 
 created_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:created_in_local_second)"
 jq -e '.bindings == [1718467200000,1718467201000]' <<< "${created_plan}" >/dev/null
@@ -71,6 +76,15 @@ interface_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter ini
     -cmd '.parameter set ?11 3' "${interface_sql}")"
 jq -e 'length == 3 and (map(."__q_2") == [9,8,7])
     and all(.[]; ."__q_0" == "B-red" and ."__q_1" == "SamePort")' <<< "${interface_result}" >/dev/null
+
+alarm_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:alarm_qualified_peak)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z","1",3]' <<< "${alarm_plan}" >/dev/null
+alarm_sql="$(jq -r '.sql' <<< "${alarm_plan}")"
+alarm_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 '1'" -cmd '.parameter set ?4 3' "${alarm_sql}")"
+jq -e 'length == 1 and .[0].name == "B-red" and .[0].cpu_peak == 50' <<< "${alarm_result}" >/dev/null
 
 count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_count)"
 jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",40,"2024-02-10T00:00:00Z","2024-03-01T00:00:00Z",8]' <<< "${count_plan}" >/dev/null
@@ -153,4 +167,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'local epoch-ms filter, owner-scoped sample tops, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'local epoch-ms filter, owner-scoped sample tops, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
