@@ -4931,6 +4931,27 @@ type LinkSiteScope = struct {
     tenant_filters: Array(FilterRequest),
 };
 
+def endpoint_grain_complete: Fn(EntityEntry, Array(RelationPair)) -> Bool = fn(device, pairs) {
+    match device.dataset {
+        None => False,
+        Some(dataset) => array::length(dataset.grain) > 0
+            && array::length(pairs) == array::length(dataset.grain)
+            && array::all(dataset.grain, fn(name) {
+                match array::find(device.fields, fn(field) { field.name == name }) {
+                    Some(field) => array::length(array::filter(pairs, fn(pair) { pair.to == field.index })) == 1,
+                    None => False,
+                }
+            }),
+    }
+};
+
+def endpoint_roles_distinct: Fn(EntityEntry, Array(Array(RelationPair))) -> Bool = fn(device, keys) {
+    let first = array::filter(get_index(keys, 0), fn(pair) { pair.to == device.key_field });
+    let second = array::filter(get_index(keys, 1), fn(pair) { pair.to == device.key_field });
+    array::length(first) == 1 && array::length(second) == 1
+        && get_index(first, 0).from != get_index(second, 0).from
+};
+
 # A and Z select the same Device role via two separately declared Safe keys.
 # Both endpoint alternatives and Device->Site alternatives remain inside one
 # EXISTS; the outer result never joins through either fan-out branch.
@@ -4957,6 +4978,8 @@ def lower_link_site: Fn(PreparedPayload, QueryRequest, LinkSiteScope) -> qb::Pla
         let lt = exists_pairs(link_tenant.key);
         let dt = exists_pairs(device_tenant.key);
         let endpoint_keys = [exists_pairs(a.key), exists_pairs(z.key)];
+        let complete = array::all(endpoint_keys, fn(branch) { endpoint_grain_complete(device, branch) })
+            && endpoint_roles_distinct(device, endpoint_keys);
         let aligned = array::length(lt) > 0 && array::length(lt) == array::length(dt)
             && array::all(lt, fn(left) {
                 array::any(dt, fn(right) { left.to == right.to
@@ -4964,8 +4987,8 @@ def lower_link_site: Fn(PreparedPayload, QueryRequest, LinkSiteScope) -> qb::Pla
                         array::any(branch, fn(pair) { pair.from == left.from && pair.to == right.from })
                     }) })
             });
-        if !aligned {
-            fail!("both link endpoint roles must include the declared tenant identity key")
+        if !complete || !aligned {
+            fail!("both link endpoint roles must cover complete device grain and aligned tenant identity keys")
         } else {
             let plan = lower(payload, request);
             if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None
@@ -5040,16 +5063,8 @@ def lower_link_device_site_rows: Fn(PreparedPayload, QueryRequest, LinkSiteScope
         let lt = exists_pairs(link_tenant.key);
         let dt = exists_pairs(device_tenant.key);
         let endpoint_keys = [exists_pairs(a.key), exists_pairs(z.key)];
-        let grain = dataset_domain(payload, device.id).grain;
-        let complete = array::length(grain) > 0 && array::all(endpoint_keys, fn(branch) {
-            array::length(branch) == array::length(grain)
-                && array::all(grain, fn(name) {
-                    match array::find(device.fields, fn(field) { field.name == name }) {
-                        Some(field) => array::length(array::filter(branch, fn(pair) { pair.to == field.index })) == 1,
-                        None => False,
-                    }
-                })
-        });
+        let complete = array::all(endpoint_keys, fn(branch) { endpoint_grain_complete(device, branch) })
+            && endpoint_roles_distinct(device, endpoint_keys);
         let aligned = array::length(lt) > 0 && array::length(lt) == array::length(dt)
             && array::all(lt, fn(left) {
                 array::any(dt, fn(right) { left.to == right.to
