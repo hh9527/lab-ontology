@@ -454,6 +454,16 @@ type ExistsRequest = struct {
 };
 
 type NamedExistsRequest = struct { relation: String, spec: ExistsRequest };
+type MetricQualification = struct {
+    relation: String,
+    dataset: String,
+    measure: String,
+    filters: Array(FilterRequest),
+    start: String,
+    end: String,
+    op: HavingOp,
+    threshold: FilterInput,
+};
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
@@ -4531,6 +4541,106 @@ def lower_named_exists: Fn(PreparedPayload, QueryRequest, Array(NamedExistsReque
     }
 };
 
+# Each qualification uses its own correlated aggregate. Independent KPI sample
+# sets never join one another and therefore cannot multiply each other's rows.
+def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQualification)) -> qb::Plan = fn(payload, request, specs) {
+    if array::length(specs) == 0 {
+        fail!("metric qualification requires at least one condition")
+    } else {
+        let base_plan = lower(payload, request);
+        if array::length(base_plan.sources) == 0 || base_plan.derived != None {
+            fail!("metric qualification requires a physical owner dataset")
+        } else {
+            let base_alias = get_index(base_plan.sources, 0).alias;
+            let base = match array::find(payload.entities, fn(e) { e.alias == base_alias }) {
+                Some(e) => e,
+                None => fail!("metric qualification owner is unknown", base_alias),
+            };
+            let count_ok = array::length(request.measures) == 0 ||
+                (array::length(request.measures) == 1 && array::length(request.dimensions) == 0
+                    && array::all(request.measures, fn(req) {
+                        let entry = resolve_measure_entry(payload, req).entry;
+                        entry.entity == base.index && entry.field == base.key_field
+                            && entry.aggregate == qb::AggregateFunction::Count
+                            && entry.predicate == None && entry.computed == None
+                            && array::length(entry.requires) == 0
+                    }));
+            if !count_ok {
+                fail!("metric qualification supports owner projection or owner key count only")
+            } else {
+            let clauses: Array(qb::Exists) = array::map(specs, fn(spec) {
+                let target = entity_by_id(payload, spec.dataset);
+                let target_entry = get_index(payload.entities, target);
+                let relation = match array::find(payload.relations, fn(r) { r.id == spec.relation && r.id != "" }) {
+                    Some(r) => r,
+                    None => fail!("unknown metric qualification relation", spec.relation),
+                };
+                if !(relation.from == target && relation.to == base.index) {
+                    fail!("metric qualification relation must map samples to owner", spec.relation, spec.dataset)
+                } else if !valid_utc_second(spec.start) || !valid_utc_second(spec.end) || spec.start >= spec.end {
+                    fail!("metric qualification requires ordered canonical UTC bounds", spec.start, spec.end)
+                } else {
+                    let domain = dataset_domain(payload, spec.dataset);
+                    let time_name = match domain.utc_time {
+                        Some(name) => name,
+                        None => fail!("metric qualification dataset lacks authoritative UTC time", spec.dataset),
+                    };
+                    if domain.kind != DatasetKind::Metric {
+                        fail!("metric qualification requires a metric dataset", spec.dataset)
+                    } else {
+                        let time_field = match array::find(target_entry.fields, fn(f) { f.name == time_name }) {
+                            Some(f) => f,
+                            None => fail!("metric qualification UTC field is missing", time_name),
+                        };
+                        let metric = match array::find(payload.measures, fn(m) { m.id == spec.measure && m.entity == target }) {
+                            Some(m) => m,
+                            None => fail!("metric qualification measure is not declared on dataset", spec.dataset, spec.measure),
+                        };
+                        if metric.predicate != None || metric.computed != None || array::length(metric.requires) != 0 {
+                            fail!("metric qualification requires a direct dataset measure", spec.measure)
+                        } else {
+                            let alias = private_exists_alias(base_plan.sources, `\{target_entry.alias}_qualification`);
+                            let inner_entry: EntityEntry = {...target_entry, alias};
+                            let pairs = array::map(exists_pairs(relation.key), fn(pair) {
+                                exists_col_eq(base, inner_entry, pair, True)
+                            });
+                            let filters = resolve_filters(payload, spec.filters);
+                            if !array::all(filters, fn(f) { f.entity == target }) {
+                                fail!("metric qualification filters must belong to sample dataset", spec.dataset)
+                            } else {
+                                let filter_terms = array::map(filters, fn(f) {
+                                    retarget_inner_expr(f.expr, target_entry.alias, alias)
+                                });
+                                let time_col = qb::column(alias, time_field.column);
+                                let bounds = qb::scalar(qb::ScalarFunction::And, [
+                                    qb::scalar(qb::ScalarFunction::Ge, [time_col, qb::bind_string(spec.start)]),
+                                    qb::scalar(qb::ScalarFunction::Lt, [time_col, qb::bind_string(spec.end)]),
+                                ]);
+                                let filter = append_filter_terms(Some(bounds), filter_terms);
+                                let grouping = array::map(pairs, fn(p) { qb::column(p.right.source, p.right.column) });
+                                let metric_field = get_index(inner_entry.fields, metric.field);
+                                let op: qb::HavingOp = match spec.op {
+                                    HavingOp::Eq => qb::HavingOp::Eq,
+                                    HavingOp::Ne => qb::HavingOp::Ne,
+                                    HavingOp::Gt => qb::HavingOp::Gt,
+                                    HavingOp::Ge => qb::HavingOp::Ge,
+                                    HavingOp::Lt => qb::HavingOp::Lt,
+                                    HavingOp::Le => qb::HavingOp::Le,
+                                };
+                                let having = [qb::having_call(op, metric.aggregate,
+                                    qb::column(alias, metric_field.column), False, to_val(spec.threshold))];
+                                qb::exists_grouped(qb::source(alias, inner_entry.table), pairs, filter, grouping, having)
+                            }
+                        }
+                    }
+                }
+            });
+            qb::validate({...base_plan, exists: array::concat([base_plan.exists, clauses])}, payload.profile)
+            }
+        }
+    }
+};
+
 # Canonical UTC-second text sorts in instant order under SQLite's binary text
 # ordering. Other encodings must not enter this path without an explicit model.
 def utc_second_pattern: regex::Regex = regex::compile("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
@@ -5962,6 +6072,7 @@ pub use self::{
     DimensionEntry,
     RelationEntry,
     NamedExistsRequest,
+    MetricQualification,
     UtcWindowRequest,
     UtcDaysWindowRequest,
     PathResult,
@@ -6055,6 +6166,7 @@ pub use self::{
     dataset_relations,
     knowledge_index,
     lower_named_exists,
+    lower_metric_qualifications,
     lower_via,
     RoleProjectionSpec,
     RoleFilterSpec,
