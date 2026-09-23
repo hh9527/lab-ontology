@@ -449,6 +449,58 @@ def sample_top_intent: String = `{"op":"sample_top","measures":[],"dimensions":[
 
 def latest_device_kpi_intent: String = `{"op":"latest_sample","dataset":"device_kpi","owner":"device","relation":"device_kpi_of_device","measures":[],"dimensions":["device_name","running_port_sample","admin_port_sample","device_kpi_ts_raw"],"filters":[{"dimension":"device_class","op":"eq","kind":"text","value":"firewall"}],"ordering":[],"limit":null,"offset":null,"site_scope":{"site_relation":"device_located_at_site","tenant_relation":"site_belongs_to_tenant","site_filters":[{"dimension":"site_name","op":"eq","kind":"text","value":"Site-A"}],"tenant_filters":[{"dimension":"tenant_name","op":"eq","kind":"text","value":"Tenant-A"}]}}`;
 
+def incomplete_sample_owner: Fn(edsl::PreparedPayload) -> edsl::PreparedPayload = fn(knowledge) {
+    let relations = array::map(knowledge.relations, fn(relation) {
+        if relation.id == "device_kpi_of_device" {
+            let key = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(first) => first,
+                    None => fail!("missing metric owner key"),
+                },
+                _ => fail!("expected compound metric owner key"),
+            };
+            {...relation, key}
+        } else { relation }
+    });
+    {...knowledge, relations}
+};
+
+def sample_row_request: edsl::QueryRequest = {
+    measures: [], dimensions: [{id: "port_count_sample", subject: "public", input: edsl::DimensionInput::None}],
+    filters: [], ordering: [], limit: None, offset: None, partition: None,
+};
+def sample_row_window: edsl::UtcWindowRequest = {
+    dataset: "device_kpi", start: "2024-02-01T00:00:00Z", end: "2024-03-01T00:00:00Z",
+};
+
+pub def sample_top_rejects_incomplete_owner_key: test::Test = test::should_fail_with(fn() {
+    edsl::lower_sample_top(incomplete_sample_owner(payload), sample_row_request,
+        "device", "device_kpi_of_device", sample_row_window, "port_count_sample", 3, None)
+}, "sample top relation must cover the owner's complete declared grain");
+
+pub def latest_sample_rejects_owner_grain_extension: test::Test = test::should_fail_with(fn() {
+    let entities = array::map(payload.entities, fn(entity) {
+        if entity.id == "device" {
+            let dataset = match entity.dataset {
+                Some(spec) => Some({...spec, grain: ["id", "tenant_id", "name"]}),
+                None => fail!("device must declare its grain"),
+            };
+            {...entity, dataset}
+        } else { entity }
+    });
+    edsl::lower_latest_sample({...payload, entities}, sample_row_request,
+        "device", "device_kpi_of_device", "device_kpi", None, None, None)
+}, "sample top relation must cover the owner's complete declared grain");
+
+pub def qualified_observation_rejects_incomplete_owner_key: test::Test = test::should_fail_with(fn() {
+    let qualification: edsl::SampleQualification = {
+        relation: "device_kpi_of_device", dataset: "device_kpi", filters: [],
+        start: "2024-02-01T00:00:00Z", end: "2024-03-01T00:00:00Z", min_matches: 1,
+    };
+    edsl::lower_qualified_observation(incomplete_sample_owner(payload), sample_row_request,
+        "device", "device_kpi_of_device", sample_row_window, [qualification], [], None)
+}, "observation relation must cover the owner's complete declared grain");
+
 pub def latest_device_sample_keeps_multiple_values_from_one_row: test::Test = test::should_ok(fn() {
     let q = lower_json(latest_device_kpi_intent);
     if array::length(string::split(q.sql, "row_number() OVER (PARTITION BY d.id, d.tenant_id ORDER BY k.ts DESC")) == 2
