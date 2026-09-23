@@ -295,6 +295,10 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 无法无歧义地指向它们。模型准备阶段会拒绝重复声明。
 数据集的最终业务 ID（显式 `entity_id` 或未声明时的源 alias）也必须非空且
 全局唯一；相同物理表可以作为不同业务角色出现，但应各有可区分的 ID。
+目录中的具名关系可用 `relation_detail_for_subject(payload, subject, id)` 追到
+关系标签/说明、起点和终点业务数据集、Safe/FanOut 类型及 Equality/All/Any
+键形态，便于区分不同端点角色和多候选站点。此概要不发布内部实体索引或物理字段
+映射；`relation_domain` 返回完整关系条目供受信任的 lowering/模型检查使用。
 
 ### 实体、指标与维度
 
