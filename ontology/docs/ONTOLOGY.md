@@ -473,7 +473,9 @@ type Trace = struct {
 
 实体角色不同于成员 scope：`entity_scope([{field: "classification", op: FilterOp.Eq,
 input: FilterInput.Text("onu")}])` 附在 `entity_source` 类型上；字段名在准备期
-解析为规范索引，值经该字段已声明、已授权且可筛选的维度及 canonical 值域验证。
+解析为规范索引，值经该字段已声明且可筛选的维度及 canonical 值域验证。
+实体行域可以引用 `authorized: False` 的内部维度；这不授权外部意图筛选或
+发现该维度，主体目录仍通过 dataset `scope` 说明不可省略的实体角色事实。
 它是实体的固定行域，根源、JOIN、EXISTS、角色私有别名和内层标量查询读取
 该实体时均生效；JOIN 的限制保留在各自的 source 中，不提升到外层 WHERE。
 固定值作为绑定参数输出。发现目录的 dataset `scope` 展示这些固定约束；

@@ -20,6 +20,13 @@ same-typed field before a key cannot silently redirect the join as numeric
 field indexes could. The existing `FieldEq` remains a preparation-validated
 name-based form; typed references add construction-time owner/scalar witnesses.
 
+The PON ONU/OLT roles carry a fixed canonical classification scope without
+publishing their role discriminator as a user-filterable dimension. Both
+classification dimensions are unauthorized for subject discovery and intent
+filters, while the dataset discovery index still describes each fixed scope.
+Model preparation checks their canonical values and allowed operators before
+any query is lowered; SQL and SQLite execution still constrain both roles.
+
 | Family | Representative questions | Model/lowering pressure and acceptance |
 | --- | --- | --- |
 | Native unordered endpoint pair | Q0174 | A physical link carries its own A/Z device names, which are not stable Device identities. The Model declares `link_ne_names` over two plain, compatible equality dimensions; lowering resolves only this named pair and keeps `(A=x AND Z=y) OR (A=y AND Z=x)` closed under the link-to-tenant relation. Count link IDs, reject undeclared pairs and unrelated tenant edges; the SQLite fixture exercises both orders, duplicate links, one-sided matches and a different tenant. |
