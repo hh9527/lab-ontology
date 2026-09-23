@@ -243,6 +243,9 @@ origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
 | `entity_scope(predicates)` | 类型 | 物理实体始终生效的行域（`Array(EntityScopePredicate)`，按字段名声明） |
 | `union_source(alias, branches)` | 类型 | 联合（多来源）实体：有序物理分支 UNION ALL（与 `entity_source` 互斥） |
 | `entity_id(id)` | 类型 | 实体的稳定业务 id（供存在性过滤/行级目标引用；缺省为 alias） |
+| `model_field(owner, scalar, name)` | 值 | 带实体与字段标量类型见证的字段引用，构造时核对规范字段名和声明类型 |
+| `typed_relation_pair(from, to)` | 值 | 来源/目标实体和标量类型对齐的字段对 |
+| `named_typed_relation_key(id, source, target, kind, pairs)` | 类型 | 带来源/目标类型见证的具名复合关系；准备时解析为闭合列等值条件 |
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
 | `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`Eq(RelationPair)`/`And`/`Or` 列等值组合 |
 | `exists_route(via, target)` | 类型 | 显式声明有界两跳相关存在路径：base → `via`（唯一、grain-safe owner）→ `target`（可组合 fold） |

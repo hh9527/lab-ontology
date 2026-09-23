@@ -11,6 +11,15 @@ of the target's declared dataset grain; without such a declaration, the target's
 marked key field is the identity contract. A key field within a composite
 dataset grain is not a substitute for the remaining grain fields.
 
+IC's physical-link A/Z device and tenant relations also probe authored key
+stability. `model_field(Owner.type, Scalar.type, "name")` verifies the field and
+type before `typed_relation_pair` fixes source/target orientation and equal
+scalar types. `named_typed_relation_key` verifies the annotated owner and
+resolves field names to the prepared index-based relation tree. Inserting a
+same-typed field before a key cannot silently redirect the join as numeric
+field indexes could. The existing `FieldEq` remains a preparation-validated
+name-based form; typed references add construction-time owner/scalar witnesses.
+
 | Family | Representative questions | Model/lowering pressure and acceptance |
 | --- | --- | --- |
 | Native unordered endpoint pair | Q0174 | A physical link carries its own A/Z device names, which are not stable Device identities. The Model declares `link_ne_names` over two plain, compatible equality dimensions; lowering resolves only this named pair and keeps `(A=x AND Z=y) OR (A=y AND Z=x)` closed under the link-to-tenant relation. Count link IDs, reject undeclared pairs and unrelated tenant edges; the SQLite fixture exercises both orders, duplicate links, one-sided matches and a different tenant. |
