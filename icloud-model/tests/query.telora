@@ -433,6 +433,44 @@ pub def sample_peak_uses_original_physical_column: test::Test = test::should_ok(
 
 def alarm_qualified_peak_intent: String = `{"op":"observe_qualified","measures":["cpu_peak"],"dimensions":["device_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"components":[{"relation":"device_current_alarm","target":"current_alarm","filters":[{"dimension":"alarm_severity","op":"eq","kind":"text","value":"critical"}],"min_matches":3}]}`;
 
+def alarm_component_qualification: edsl::NamedExistsRequest = {
+    relation: "device_current_alarm",
+    spec: {target: "current_alarm", subject: "public", filters: [], any_of: [], min_matches: Some(3)},
+};
+
+def alarm_component_plan: Fn(edsl::PreparedPayload) -> qb::Plan = fn(knowledge) {
+    edsl::lower_qualified_observation(knowledge,
+        {measures: [], dimensions: [{id: "port_count_sample", subject: "public", input: edsl::DimensionInput::None}],
+         filters: [], ordering: [], limit: None, offset: None, partition: None},
+        "device", "device_kpi_of_device",
+        {dataset: "device_kpi", start: "2024-02-01T00:00:00Z", end: "2024-03-01T00:00:00Z"},
+        [], [alarm_component_qualification], None)
+};
+
+pub def component_qualification_rejects_missing_owner_tenant_key: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "device_current_alarm" {
+            let key = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(first) => first,
+                    None => fail!("missing event owner key"),
+                },
+                _ => fail!("expected compound event owner key"),
+            };
+            {...relation, key}
+        } else { relation }
+    });
+    alarm_component_plan({...payload, relations})
+}, "event qualification relation must cover the owner's complete declared grain");
+
+pub def component_qualification_rejects_fanout_event_relation: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "device_current_alarm" { {...relation, kind: edsl::RelationKind::FanOut} }
+        else { relation }
+    });
+    alarm_component_plan({...payload, relations})
+}, "component qualification requires a named child-to-owner relation");
+
 pub def event_count_qualification_does_not_amplify_metric_samples: test::Test = test::should_ok(fn() {
     let q = lower_json(alarm_qualified_peak_intent);
     if array::length(string::split(q.sql, "max(k.cpuUsage) AS cpu_peak")) == 2
