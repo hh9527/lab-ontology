@@ -1636,3 +1636,5 @@ key_name, endpoint_name)` 以业务字段名定义固定方向的两个端点；
 声明 key 必须参加分组，筛选只能作用于 measure 行；可见输出只能取同一 owner
 的非 key 维度。隐藏 measure 的 HAVING 仍以结构化聚合调用表示，因此投影
 只返回所选 owner 维度。普通行级投影不因该能力而接受 FanOut 导航。
+同一 KPI 物理字段可分别声明采样行维度和经聚合校验的 metric measure：
+`utc_window` 的行级 ORDER BY 只允许维度，不能将汇总 measure 冒充样本值排序。

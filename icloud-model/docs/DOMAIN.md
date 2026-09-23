@@ -59,6 +59,14 @@ The inner join excludes sites with zero matching devices, as the corpus query
 does. This is not a unique site ownership assertion or a general safe route
 from storage devices to sites.
 
+Q0043 also pressures sample-grain Top-N: `port_count_sample` is the raw integer
+sample dimension on the same physical field as the separately declared
+`port_count` Sum metric. An explicit UTC window, Device alias/MAC/WAC filters,
+the full resource-plus-tenant ownership key, and stable sample ordering produce
+unaggregated top-five rows. The actual corpus request uses relative 30 days and
+`EntNetworkElement`, whereas this fixture uses supplied absolute bounds and
+`I_EntNetworkElement`; it does not claim those gaps are resolved.
+
 Physical-link A/Z endpoints now test simultaneous role projection: `list_roles`
 names each declared Safe relation, its target dimension, and a distinct output
 alias. The resulting plan joins Device twice with separate aliases and preserves
