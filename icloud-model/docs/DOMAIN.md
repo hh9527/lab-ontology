@@ -65,7 +65,13 @@ sample dimension on the same physical field as the separately declared
 the full resource-plus-tenant ownership key, and stable sample ordering produce
 unaggregated top-five rows. The actual corpus request uses relative 30 days and
 `EntNetworkElement`, whereas this fixture uses supplied absolute bounds and
-`I_EntNetworkElement`; it does not claim those gaps are resolved.
+`I_EntNetworkElement`; it does not claim the physical source mismatch is
+resolved. For relative N-day windows, the platform supplies a validated
+canonical UTC `as_of` instant and N; SQLite computes the lower bound using a
+closed, bound `-N days` modifier, and the same instant is the exclusive upper
+bound. The platform owns capturing that clock value; calendar-month windows
+and native timestamp storage remain separate requirements. Relative windows
+whose lower bound would cross before year 0001 are rejected at lowering time.
 
 Physical-link A/Z endpoints now test simultaneous role projection: `list_roles`
 names each declared Safe relation, its target dimension, and a distinct output

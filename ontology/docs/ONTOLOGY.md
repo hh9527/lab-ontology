@@ -1638,3 +1638,7 @@ key_name, endpoint_name)` 以业务字段名定义固定方向的两个端点；
 只返回所选 owner 维度。普通行级投影不因该能力而接受 FanOut 导航。
 同一 KPI 物理字段可分别声明采样行维度和经聚合校验的 metric measure：
 `utc_window` 的行级 ORDER BY 只允许维度，不能将汇总 measure 冒充样本值排序。
+`utc_days_window` 从外部提供的规范 UTC 秒 `as_of` 与 1..3650 天的整数跨度
+生成半开相对窗；Query AST 的 `UtcDaysAgo` 固定 SQLite strftime 模板，锚点和
+`-N days` 均为绑定值。没有隐式当前时间，也不将日历月等同于固定天数。
+如窗口会跨到规范 UTC 日期范围之外的 0000 年，lowering 在构造查询前拒绝。

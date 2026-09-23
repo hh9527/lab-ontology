@@ -455,6 +455,7 @@ type ExistsRequest = struct {
 
 type NamedExistsRequest = struct { relation: String, spec: ExistsRequest };
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
+type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
 # Aggregate-result (HAVING) predicate over a requested measure alias.
 type HavingOp = enum { Eq, Ne, Gt, Ge, Lt, Le };
@@ -4565,38 +4566,72 @@ def valid_utc_second: Fn(String) -> Bool = fn(value) {
     }
 };
 
-def lower_utc_window: Fn(PreparedPayload, QueryRequest, UtcWindowRequest) -> qb::Plan = fn(payload, request, window) {
-    let spec = dataset_domain(payload, window.dataset);
+def lower_utc_bounds: Fn(PreparedPayload, QueryRequest, String, qb::Expr, qb::Expr) -> qb::Plan = fn(payload, request, dataset, start, end) {
+    let spec = dataset_domain(payload, dataset);
     let time_name = match spec.utc_time {
         Some(name) => name,
-        None => fail!("dataset has no authoritative UTC time field", window.dataset),
+        None => fail!("dataset has no authoritative UTC time field", dataset),
     };
+    let plan = lower(payload, request);
+    let dataset_entry = get_index(payload.entities, entity_by_id(payload, dataset));
+    if array::length(plan.sources) == 0 || plan.derived != None
+        || get_index(plan.sources, 0).alias != dataset_entry.alias {
+        fail!("UTC window must target the query's base dataset", dataset)
+    } else {
+        let field = match array::find(dataset_entry.fields, fn(item) { item.name == time_name }) {
+            Some(item) => item,
+            None => fail!("prepared UTC field is missing", time_name),
+        };
+        let col = qb::column(dataset_entry.alias, field.column);
+        let start_term = qb::scalar(qb::ScalarFunction::Ge, [col, start]);
+        let end_term = qb::scalar(qb::ScalarFunction::Lt, [col, end]);
+        let bounds = qb::scalar(qb::ScalarFunction::And, [start_term, end_term]);
+        let filter = match plan.filter {
+            Some(existing) => Some(qb::scalar(qb::ScalarFunction::And, [existing, bounds])),
+            None => Some(bounds),
+        };
+        let updated: qb::Plan = {...plan, filter};
+        qb::validate(updated, payload.profile)
+    }
+};
+
+def lower_utc_window: Fn(PreparedPayload, QueryRequest, UtcWindowRequest) -> qb::Plan = fn(payload, request, window) {
     if !valid_utc_second(window.start) || !valid_utc_second(window.end) {
         fail!("UTC window requires valid YYYY-MM-DDTHH:MM:SSZ instants", window.start, window.end)
     } else if window.start >= window.end {
         fail!("UTC window start must precede end", window.start, window.end)
     } else {
-        let plan = lower(payload, request);
-        let dataset_entry = get_index(payload.entities, entity_by_id(payload, window.dataset));
-        if array::length(plan.sources) == 0 || plan.derived != None
-            || get_index(plan.sources, 0).alias != dataset_entry.alias {
-            fail!("UTC window must target the query's base dataset", window.dataset)
-        } else {
-            let field = match array::find(dataset_entry.fields, fn(item) { item.name == time_name }) {
-                Some(item) => item,
-                None => fail!("prepared UTC field is missing", time_name),
-            };
-            let col = qb::column(dataset_entry.alias, field.column);
-            let start_term = qb::scalar(qb::ScalarFunction::Ge, [col, qb::bind_string(window.start)]);
-            let end_term = qb::scalar(qb::ScalarFunction::Lt, [col, qb::bind_string(window.end)]);
-            let bounds = qb::scalar(qb::ScalarFunction::And, [start_term, end_term]);
-            let filter = match plan.filter {
-                Some(existing) => Some(qb::scalar(qb::ScalarFunction::And, [existing, bounds])),
-                None => Some(bounds),
-            };
-            let updated: qb::Plan = {...plan, filter};
-            qb::validate(updated, payload.profile)
-        }
+        lower_utc_bounds(payload, request, window.dataset, qb::bind_string(window.start), qb::bind_string(window.end))
+    }
+};
+
+# Only check the supported calendar boundary; SQLite computes the actual
+# shifted instant. The anchor has already passed valid_utc_second.
+def utc_days_since_year_one: Fn(String) -> Int = fn(anchor) {
+    let date = string::split(get_index(string::split(anchor, "T"), 0), "-");
+    let year = utc_number(get_index(date, 0));
+    let month = utc_number(get_index(date, 1));
+    let day = utc_number(get_index(date, 2));
+    let previous_year = year - 1;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_lengths: Array(Int) = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let previous_months = array::fold(int_range(month - 1), 0, fn(acc, index) {
+        acc + get_index(month_lengths, index)
+    });
+    previous_year * 365 + previous_year / 4 - previous_year / 100 + previous_year / 400
+        + previous_months + day - 1
+};
+
+def lower_utc_days_window: Fn(PreparedPayload, QueryRequest, UtcDaysWindowRequest) -> qb::Plan = fn(payload, request, window) {
+    if !valid_utc_second(window.as_of) {
+        fail!("UTC relative window requires a valid YYYY-MM-DDTHH:MM:SSZ anchor", window.as_of)
+    } else if window.days <= 0 || window.days > 3650 {
+        fail!("UTC relative days must be between 1 and 3650", window.days)
+    } else if window.days > utc_days_since_year_one(window.as_of) {
+        fail!("UTC relative window begins before supported year 0001", window.as_of, window.days)
+    } else {
+        lower_utc_bounds(payload, request, window.dataset,
+            qb::utc_days_ago(window.as_of, window.days), qb::bind_string(window.as_of))
     }
 };
 
@@ -5928,6 +5963,7 @@ pub use self::{
     RelationEntry,
     NamedExistsRequest,
     UtcWindowRequest,
+    UtcDaysWindowRequest,
     PathResult,
     PreparedPayload,
     PeerHubDef,
@@ -6024,6 +6060,7 @@ pub use self::{
     RoleFilterSpec,
     lower_roles,
     lower_utc_window,
+    lower_utc_days_window,
     to_bind,
     combine_filters,
     check_limit,
