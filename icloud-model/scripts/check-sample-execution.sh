@@ -16,7 +16,17 @@ INSERT INTO NetworkDeviceKPI VALUES
  ('B','red','2024-02-20T00:00:00Z',NULL,50),
  ('C','red','2024-02-10T00:00:00Z',0,1);
 INSERT INTO I_EnterpriseFrame VALUES
- ('B-frame-1','B','red','Duplicate',3),('B-frame-2','B','red','Duplicate',11),('A-frame','A','red','Other',2);"
+ ('B-frame-1','B','red','Duplicate',3),('B-frame-2','B','red','Duplicate',11),('A-frame','A','red','Other',2);
+ALTER TABLE I_EntNetworkElement ADD COLUMN createTime INTEGER;
+UPDATE I_EntNetworkElement SET createTime = 1718467200500 WHERE id = 'B' AND tenant_id = 'red';
+UPDATE I_EntNetworkElement SET createTime = 1718467201000 WHERE id = 'A';"
+
+created_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:created_in_local_second)"
+jq -e '.bindings == [1718467200000,1718467201000]' <<< "${created_plan}" >/dev/null
+created_sql="$(jq -r '.sql' <<< "${created_plan}")"
+created_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
+    -cmd '.parameter set ?1 1718467200000' -cmd '.parameter set ?2 1718467201000' "${created_sql}")"
+jq -e 'length == 1 and .[0].name == "B-red"' <<< "${created_result}" >/dev/null
 
 count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_count)"
 jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",40,"2024-02-10T00:00:00Z","2024-03-01T00:00:00Z",8]' <<< "${count_plan}" >/dev/null
@@ -99,4 +109,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'local epoch-ms filter, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

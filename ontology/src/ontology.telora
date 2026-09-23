@@ -141,7 +141,7 @@ type EntityId = struct { id: String };
 # fields identify one logical row; time names the authoritative UTC instant.
 type DatasetKind = enum { Entity, Event, Metric };
 type TimeSemantics = enum { Utc, Local };
-type TimeEncoding = enum { CanonicalUtcSecondText, LocalText };
+type TimeEncoding = enum { CanonicalUtcSecondText, LocalText, LocalEpochMillis };
 @prelude::property(PropertyTarget::Field)
 type TimeField = struct { semantics: TimeSemantics, encoding: TimeEncoding };
 @prelude::property(PropertyTarget::Type)
@@ -1043,6 +1043,16 @@ def int_range: Fn(Int) -> Array(Int) = fn(n) {
 };
 
 def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, name, field_ty) {
+    if let Some(role) = property::get_field_prop(owner, index, TimeField.type) {
+        let expected = match role.encoding {
+            TimeEncoding::CanonicalUtcSecondText => String.type,
+            TimeEncoding::LocalText => String.type,
+            TimeEncoding::LocalEpochMillis => Int.type,
+        };
+        if field_ty != expected {
+            fail!("time encoding disagrees with field type", name, role.encoding)
+        } else { () }
+    } else { () };
     let col = property::get_field_prop(owner, index, ColumnMap.type);
     let column = match col {
         Some(c) => c.column,
@@ -1523,7 +1533,15 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
             Some(dd) => do {
                 let mapped = canonical_domain(entity.entity_type, f);
                 let enumerated = value_domain(f.ty);
-                if array::length(mapped) > 0 && array::length(enumerated) > 0 {
+                let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    Some(role) => role.encoding == TimeEncoding::LocalEpochMillis,
+                    None => False,
+                };
+                if epoch && (dd.input_kinds != [FilterInputKind::Int]
+                    || array::any(dd.ops, fn(op) { is_text_op(op) })
+                    || array::length(mapped) > 0) {
+                    fail!("epoch-millisecond time dimension requires numeric filters", entity.id, f.name)
+                } else if array::length(mapped) > 0 && array::length(enumerated) > 0 {
                     fail!("dimension cannot combine enum and canonical wire domains", entity.id, f.name)
                 } else if array::length(mapped) > 0 && (!dd.filterable
                     || !array::any(dd.input_kinds, fn(kind) { kind == FilterInputKind::Text })
@@ -2432,6 +2450,22 @@ def dataset_domain: Fn(PreparedPayload, String) -> DatasetSpec = fn(payload, id)
     match entity.dataset {
         Some(spec) => spec,
         None => fail!("dataset has no declared grain and time roles", id),
+    }
+};
+
+# Field-level time roles are discoverable independently of a dataset's UTC clock.
+def time_domain: Fn(PreparedPayload, String, String) -> TimeField = fn(payload, id, name) {
+    let entity = match array::find(payload.entities, fn(entry) { entry.id == id }) {
+        Some(entry) => entry,
+        None => fail!("unknown time entity", id),
+    };
+    let field = match array::find(entity.fields, fn(entry) { entry.name == name }) {
+        Some(entry) => entry,
+        None => fail!("unknown time field", id, name),
+    };
+    match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+        Some(role) => role,
+        None => fail!("field has no declared time role", id, name),
     }
 };
 
@@ -6463,6 +6497,7 @@ pub use self::{
     dimension_domain,
     canonical_value_domain,
     dataset_domain,
+    time_domain,
     metric_domain,
     relation_domain,
     dataset_relations,
