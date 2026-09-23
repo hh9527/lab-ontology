@@ -117,3 +117,13 @@ sample summaries. Two independent related KPI Avg predicates qualify a device
 over externally supplied three-day UTC bounds, and `device_count` counts its
 identity once. The fixture includes router/firewall canonical class wires,
 same resource IDs in different tenants, and absent values on one side.
+
+Q0123-Q0131 combine site qualification and named current-alarm existence for
+device output or counts. The `alarm_name` dimension reads IC's `ALARMNAME`
+string without inventing a closed enum: the intent explicitly supplies a
+typed, nonempty OR group of accepted names. `site_scope` names the declared
+Device-to-Site FanOut OR and Site-to-Tenant Safe relations; site and tenant
+filters apply to the same site row. A separate event EXISTS correlates both
+resource and tenant. Two matching site rows and several matching alarms must
+still count one device, and a same-ID alarm from another tenant cannot qualify
+it. The Q0129 SQLite fixture exercises these distinctions.

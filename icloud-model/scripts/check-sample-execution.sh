@@ -56,6 +56,26 @@ INSERT INTO I_EnterpriseNetworkLTP VALUES ('P-E','red','B','ExtraPort'),('P-EMPT
 INSERT INTO NetworkDeviceInterfaceKPI (resId,tenantId,ts,ifOutErrors) VALUES
  ('P-E','red','2024-02-07T00:00:00Z',140),('P-E','red','2024-02-08T00:00:00Z',20);"
 
+site_alarm_schema="${schema}
+ALTER TABLE T_CURRENT_ALARM ADD COLUMN ALARMNAME TEXT;
+UPDATE T_CURRENT_ALARM SET ALARMNAME = 'linkDown' WHERE CSN IN (1,2,7);
+UPDATE T_CURRENT_ALARM SET ALARMNAME = 'deviceOffline' WHERE CSN = 3;
+UPDATE T_CURRENT_ALARM SET ALARMNAME = 'highCpuUsage' WHERE CSN = 6;
+UPDATE T_CURRENT_ALARM SET ALARMNAME = 'other' WHERE ALARMNAME IS NULL;
+INSERT INTO I_EntNetworkElement (id,tenant_id,name,classification,projectId,refParentSubnet)
+ VALUES ('D','red','NoOwnAlarm','LSW','S1','S2');
+INSERT INTO T_CURRENT_ALARM (CSN,MEDN,TENANT_ID,SEVERITY,ALARMNAME)
+ VALUES (10,'D','blue','1','linkDown');"
+site_alarm_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:site_alarm_count)"
+jq -e '.bindings == ["ne.category.switch","LSW","linkDown","deviceOffline","highCpuUsage","Site-A","Tenant-A"]' <<< "${site_alarm_plan}" >/dev/null
+site_alarm_sql="$(jq -r '.sql' <<< "${site_alarm_plan}")"
+site_alarm_result="$(sqlite3 -json :memory: -cmd "${site_alarm_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.switch'" -cmd ".parameter set ?2 'LSW'" \
+    -cmd ".parameter set ?3 'linkDown'" -cmd ".parameter set ?4 'deviceOffline'" \
+    -cmd ".parameter set ?5 'highCpuUsage'" -cmd ".parameter set ?6 'Site-A'" \
+    -cmd ".parameter set ?7 'Tenant-A'" "${site_alarm_sql}")"
+jq -e 'length == 1 and .[0].device_count == 1' <<< "${site_alarm_result}" >/dev/null
+
 qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
 qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
 qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
@@ -256,4 +276,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

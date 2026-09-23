@@ -496,6 +496,12 @@ type OwnerSiteScope = struct {
     site_filters: Array(FilterRequest),
     tenant_filters: Array(FilterRequest),
 };
+type SiteTenantScope = struct {
+    site_relation: String,
+    tenant_relation: String,
+    site_filters: Array(FilterRequest),
+    tenant_filters: Array(FilterRequest),
+};
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
@@ -4599,7 +4605,7 @@ def retarget_inner_expr: Fn(qb::Expr, String, String) -> qb::Expr = fn(expr, pre
 
 # Explicit one-hop business relation selection. Never falls back to a
 # different edge with the same endpoint types or to an inferred route.
-def lower_named_exists: Fn(PreparedPayload, QueryRequest, Array(NamedExistsRequest)) -> qb::Plan = fn(payload, request, specs) {
+def lower_named_exists: Fn(PreparedPayload, QueryRequest, Array(NamedExistsRequest), Option(SiteTenantScope)) -> qb::Plan = fn(payload, request, specs, scope) {
     let base_plan = lower(payload, request);
     if array::length(base_plan.sources) == 0 || base_plan.derived != None {
         fail!("named existence requires a physical base dataset")
@@ -4652,8 +4658,48 @@ def lower_named_exists: Fn(PreparedPayload, QueryRequest, Array(NamedExistsReque
                 }
             }
         });
-        let updated: qb::Plan = {...base_plan, exists: array::concat([base_plan.exists, resolved])};
+        let site_exists: Array(qb::Exists) = match scope {
+            None => [],
+            Some(site_scope) => [site_tenant_scope(payload, base, site_scope)],
+        };
+        let updated: qb::Plan = {...base_plan, exists: array::concat([base_plan.exists, resolved, site_exists])};
         qb::validate(updated, payload.profile)
+    }
+};
+
+def site_tenant_scope: Fn(PreparedPayload, EntityEntry, SiteTenantScope) -> qb::Exists = fn(payload, owner, scope) {
+    let site_relation = relation_domain(payload, scope.site_relation);
+    let tenant_relation = relation_domain(payload, scope.tenant_relation);
+    let site = get_index(payload.entities, site_relation.to);
+    let tenant = get_index(payload.entities, tenant_relation.to);
+    if site_relation.from != owner.index || site_relation.kind != RelationKind::FanOut
+        || tenant_relation.from != site.index || tenant_relation.kind != RelationKind::Safe {
+        fail!("site scope requires a declared owner-to-site fan-out and site-to-tenant chain")
+    } else {
+        let site_filters = resolve_filters(payload, scope.site_filters);
+        let tenant_filters = resolve_filters(payload, scope.tenant_filters);
+        if !array::all(site_filters, fn(f) { f.entity == site.index })
+            || !array::all(tenant_filters, fn(f) { f.entity == tenant.index }) {
+            fail!("site scope filters must belong to their declared relation roles")
+        } else {
+            let alternatives = match site_relation.key {
+                RelationKey::Or(keys) => array::map(keys, fn(key) {
+                    array::map(exists_pairs(key), fn(pair) { exists_col_eq(owner, site, pair, False) })
+                }),
+                _ => fail!("site scope requires explicit alternative keys", scope.site_relation),
+            };
+            let tenant_pairs = array::map(exists_pairs(tenant_relation.key), fn(pair) {
+                exists_col_eq(site, tenant, pair, False)
+            });
+            let filter_terms = array::concat([
+                array::map(site_filters, fn(f) { f.expr }),
+                array::map(tenant_filters, fn(f) { f.expr }),
+            ]);
+            qb::exists_two_hop_alternatives(
+                qb::source(site.alias, site.table), alternatives,
+                qb::source(tenant.alias, tenant.table), tenant_pairs,
+                combine_filters(filter_terms))
+        }
     }
 };
 
@@ -6621,6 +6667,7 @@ pub use self::{
     SampleQualification,
     SampleCountRange,
     OwnerSiteScope,
+    SiteTenantScope,
     ComponentContextSpec,
     UtcWindowRequest,
     UtcDaysWindowRequest,
