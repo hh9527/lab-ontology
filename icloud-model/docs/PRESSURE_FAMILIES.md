@@ -52,9 +52,14 @@ is now available through `qualify_samples`/`observe_qualified`, using one
 correlated aggregate EXISTS per qualification. A Max observation requires an
 explicitly declared Max measure in the Model; the current IC port_count
 declaration is Sum and cannot silently stand in for Max. A grouped observation
-must also retain the full owner identity as a hidden grouping key: grouping by
+also retains the full owner identity as a hidden grouping key: grouping by
 device name alone can merge distinct namesake devices across tenants. The
-current row-level trend probe does not prove that grouped-observation contract.
+device Model now declares `@dataset(Entity, ["id", "tenant_id"], None)`;
+`observe_qualified` adds those two fields to GROUP BY whenever a metric
+aggregate includes a visible owner dimension, leaving the projection unchanged.
+The generated grouped plan is executed over two devices with the same visible
+name but different sums, and their rows remain separate. Without declared
+entity grain this grouped shape fails rather than guessing identity from JOIN.
 Explicit bounds for both windows can be resolved
 from an externally supplied clock; the EDSL never silently treats a calendar
 month as a fixed number of days.
