@@ -240,6 +240,7 @@ origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
 | `json_dimension(id, authorized, filterable, ops, input_kinds, path)` | 字段 | 把被标注字段的物理 JSON 列按固定 path 声明为业务维度（可组合 fold） |
 | `scope(predicates)` | 字段 | 维度成员的固有行范围（`Array(ScopePredicate)`，可组合 fold） |
 | `entity_source(table, alias)` | 类型 | 实体的数据源和别名 |
+| `entity_scope(predicates)` | 类型 | 物理实体始终生效的行域（`Array(EntityScopePredicate)`，按字段名声明） |
 | `union_source(alias, branches)` | 类型 | 联合（多来源）实体：有序物理分支 UNION ALL（与 `entity_source` 互斥） |
 | `entity_id(id)` | 类型 | 实体的稳定业务 id（供存在性过滤/行级目标引用；缺省为 alias） |
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
@@ -466,6 +467,14 @@ type Trace = struct {
   之间取值不同）会使 lowering 原子失败；scope 引用未声明维度、未授权/不可筛选
   字段、不支持的操作或非法输入同样原子失败。
 - scope 只在成员被请求选中时生效。
+
+实体角色不同于成员 scope：`entity_scope([{field: "classification", op: FilterOp.Eq,
+input: FilterInput.Text("onu")}])` 附在 `entity_source` 类型上；字段名在准备期
+解析为规范索引，值经该字段已声明、已授权且可筛选的维度及 canonical 值域验证。
+它是实体的固定行域，根源、JOIN、EXISTS、角色私有别名和内层标量查询读取
+该实体时均生效；JOIN 的限制保留在各自的 source 中，不提升到外层 WHERE。
+固定值作为绑定参数输出。发现目录的 dataset `scope` 展示这些固定约束；
+`union_source` 尚不接受实体级 scope（分支自身可以声明固定过滤）。
 
 ### 条件指标与计算指标（filtered & computed measures）
 

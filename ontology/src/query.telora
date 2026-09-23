@@ -178,6 +178,7 @@ type Having = struct {
 type Source = struct {
     alias: String,
     table: String,
+    scope: Option(Expr),
 };
 
 type JoinKind = enum {
@@ -603,8 +604,15 @@ def ordering_operators: Fn(Array(OrderBy)) -> Array(Operator) = fn(ordering) {
 def joins_operators: Fn(Array(Join)) -> Array(Operator) = fn(joins) {
     let empty: Array(Operator) = [];
     array::fold(joins, empty, fn(acc, join) {
-        ops_union(ops_union(acc, [Operator::Join]), [Operator::Column])
+        ops_union(ops_union(ops_union(acc, [Operator::Join]), [Operator::Column]), source_operators(join.source))
     })
+};
+
+def source_operators: Fn(Source) -> Array(Operator) = fn(source_item) {
+    match source_item.scope {
+        Some(expr) => ops_union(expr_operators(expr), [Operator::Filter]),
+        None => [],
+    }
 };
 
 # Each correlated EXISTS consumes the `Exists` capability; an inner row
@@ -629,7 +637,7 @@ def exists_operators: Fn(Array(Exists)) -> Array(Operator) = fn(exists_list) {
                     Some(expr) => ops_union(with_origin, expr_operators(expr)),
                     None => with_origin,
                 };
-                ops_union(acc, with_peer)
+                ops_union(ops_union(ops_union(acc, with_peer), source_operators(corr.origin)), source_operators(corr.peer))
             },
             None => match ex.link {
                 # Bounded two-hop link body: one correlated EXISTS reading the B
@@ -640,7 +648,12 @@ def exists_operators: Fn(Array(Exists)) -> Array(Operator) = fn(exists_list) {
                         Some(expr) => ops_union(base, expr_operators(expr)),
                         None => base,
                     };
-                    ops_union(acc, with_filter)
+                    let with_sources = ops_union(ops_union(acc, with_filter), source_operators(ex.source));
+                    let with_link = ops_union(with_sources, source_operators(link.source));
+                    match link.tail {
+                        Some(tail) => ops_union(with_link, source_operators(tail.source)),
+                        None => with_link,
+                    }
                 },
                 None => do {
                     let with_exists = ops_union(acc, [Operator::Exists]);
@@ -653,7 +666,7 @@ def exists_operators: Fn(Array(Exists)) -> Array(Operator) = fn(exists_list) {
                     } else {
                         with_filter
                     };
-                    ops_union(with_group, having_operators(ex.having))
+                    ops_union(ops_union(with_group, having_operators(ex.having)), source_operators(ex.source))
                 },
             },
         }
@@ -686,7 +699,7 @@ def having_operators: Fn(Array(Having)) -> Array(Operator) = fn(having_list) {
 # plan-level operator set already includes).
 def union_branch_operators: Fn(UnionBranch) -> Array(Operator) = fn(branch) {
     let out_exprs = array::map(branch.outputs, fn(col) { col.expr });
-    let out_ops = exprs_operators(out_exprs);
+    let out_ops = ops_union(exprs_operators(out_exprs), source_operators(branch.source));
     match branch.filter {
         Some(expr) => ops_union(ops_union(out_ops, expr_operators(expr)), [Operator::Filter]),
         None => out_ops,
@@ -711,7 +724,7 @@ def scalar_comparison_operators: Fn(ScalarAggregateComparison) -> Array(Operator
     } else {
         with_source
     };
-    let with_agg = ops_union(ops_union(with_joins, expr_operators(cmp.inner.arg)), [Operator::Aggregate]);
+    let with_agg = ops_union(ops_union(ops_union(with_joins, source_operators(cmp.inner.source)), expr_operators(cmp.inner.arg)), [Operator::Aggregate]);
     let with_agg_filter = match cmp.inner.agg_filter {
         Some(expr) => ops_union(ops_union(with_agg, expr_operators(expr)), [Operator::Filter]),
         None => with_agg,
@@ -742,7 +755,7 @@ def ranked_key_comparison_operators: Fn(RankedKeyComparison) -> Array(Operator) 
     } else {
         with_column
     };
-    let with_key_scalars = array::fold(sq.keys, with_joins, fn(acc, key) {
+    let with_key_scalars = array::fold(sq.keys, ops_union(with_joins, source_operators(sq.source)), fn(acc, key) {
         ops_union(acc, expr_operators(key))
     });
     let with_order_arg = ops_union(with_key_scalars, expr_operators(sq.order.arg));
@@ -787,7 +800,7 @@ def operators: Fn(Plan) -> Array(Operator) = fn(plan) {
     let with_exists = ops_union(with_filter, exists_operators(plan.exists));
     let with_comparisons = ops_union(with_exists, scalar_comparisons_operators(plan.scalar_comparisons));
     let with_ranked = ops_union(with_comparisons, ranked_key_comparisons_operators(plan.ranked_key_comparisons));
-    let with_joins = ops_union(with_ranked, joins_operators(plan.joins));
+    let with_joins = ops_union(ops_union(with_ranked, joins_operators(plan.joins)), array::fold(plan.sources, base, fn(acc, source_item) { ops_union(acc, source_operators(source_item)) }));
     let with_group = if array::length(plan.grouping) > 0 {
         ops_union(ops_union(with_joins, exprs_operators(plan.grouping)), [Operator::Group])
     } else {
@@ -967,9 +980,16 @@ def join_on_condition_valid: Fn(JoinCondition, Array(String)) -> Bool = fn(condi
 };
 
 def join_identifiers_valid: Fn(Join) -> Bool = fn(join) {
-    is_sql_identifier(join.source.alias)
-    && is_sql_identifier(join.source.table)
+    source_valid(join.source)
     && join_on_identifiers_valid(join.condition)
+};
+
+def source_valid: Fn(Source) -> Bool = fn(source_item) {
+    is_sql_identifier(source_item.alias) && is_sql_identifier(source_item.table)
+        && (match source_item.scope {
+            Some(expr) => expr_valid(expr, [source_item.alias]),
+            None => True,
+        })
 };
 
 def join_condition_valid: Fn(Join, Array(String)) -> Bool = fn(join, aliases) {
@@ -1198,9 +1218,9 @@ def peer_side_eq_ok: Fn(ColumnEq, Array(String), String, ColumnRef) -> Bool = fn
 def peer_corr_ok: Fn(PeerCorr, Array(String)) -> Bool = fn(corr, main_aliases) {
     let origin_alias = corr.origin.alias;
     let peer_alias = corr.peer.alias;
-    let origin_id_ok = is_sql_identifier(origin_alias) && is_sql_identifier(corr.origin.table)
+    let origin_id_ok = source_valid(corr.origin)
         && !known_alias(main_aliases, origin_alias);
-    let peer_id_ok = is_sql_identifier(peer_alias) && is_sql_identifier(corr.peer.table)
+    let peer_id_ok = source_valid(corr.peer)
         && !known_alias(main_aliases, peer_alias)
         && peer_alias != origin_alias;
     let origin_key = corr.branch_a.origin.right;
@@ -1247,9 +1267,9 @@ def peer_corr_ok: Fn(PeerCorr, Array(String)) -> Bool = fn(corr, main_aliases) {
 #   - the other single-source modes are not combined with the link mode.
 def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, link, main_aliases) {
     let hop = ex.source.alias;
-    let hop_ok = is_sql_identifier(ex.source.alias) && is_sql_identifier(ex.source.table)
+    let hop_ok = source_valid(ex.source)
         && !known_alias(main_aliases, hop);
-    let link_source_ok = is_sql_identifier(link.source.alias) && is_sql_identifier(link.source.table)
+    let link_source_ok = source_valid(link.source)
         && link.source.alias != hop
         && !known_alias(main_aliases, link.source.alias);
     let hop_pairs_ok = match ex.alternatives {
@@ -1275,7 +1295,7 @@ def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, li
         && ex.peer == None;
     let tail_ok = match link.tail {
         None => True,
-        Some(tail) => is_sql_identifier(tail.source.alias) && is_sql_identifier(tail.source.table)
+        Some(tail) => source_valid(tail.source)
             && tail.source.alias != hop && tail.source.alias != link.source.alias
             && !known_alias(main_aliases, tail.source.alias)
             && array::length(tail.pairs) > 0 && array::all(tail.pairs, fn(p) {
@@ -1301,8 +1321,7 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
             Some(link) => link_structure_ok(ex, link, main_aliases),
             None => do {
                 let inner = ex.source.alias;
-                let id_ok = is_sql_identifier(ex.source.alias)
-                    && is_sql_identifier(ex.source.table)
+                let id_ok = source_valid(ex.source)
                     && !known_alias(main_aliases, inner);
                 let allowed = array::push(main_aliases, inner);
                 let filter_ok = match ex.filter {
@@ -1476,8 +1495,7 @@ def derived_structure_ok: Fn(DerivedSource) -> Bool = fn(ds) {
     } else {
         let expected = names_of(ds.branches);
         let branches_ok = array::all(ds.branches, fn(branch) {
-            let alias_ok = is_sql_identifier(branch.source.alias)
-                && is_sql_identifier(branch.source.table)
+            let alias_ok = source_valid(branch.source)
                 && branch.source.alias != ds.alias;
             let local: Array(String) = [branch.source.alias];
             let outputs_ok = array::length(branch.outputs) > 0
@@ -1576,7 +1594,7 @@ def structure_ok_tables: Fn(Plan) -> Bool = fn(plan) {
     let sources_nonempty = array::length(plan.sources) > 0;
     let projection_nonempty = array::length(plan.projection) > 0;
     let source_ids_ok = array::all(plan.sources, fn(source) {
-        is_sql_identifier(source.alias) && is_sql_identifier(source.table)
+        source_valid(source)
     });
     let join_ids_ok = array::all(plan.joins, join_identifiers_valid);
     let aliases = aliases_of(plan);
@@ -1649,7 +1667,7 @@ def scalar_subquery_inner_ok: Fn(ScalarSubquery) -> Bool = fn(sq) {
     let join_aliases: Array(String) = array::map(joins_local, fn(join_item) { join_item.source.alias });
     let main_names: Array(String) = [main_alias];
     let inner_aliases = array::concat([main_names, join_aliases]);
-    let source_id_ok = is_sql_identifier(sq.source.alias) && is_sql_identifier(sq.source.table);
+    let source_id_ok = source_valid(sq.source);
     let join_ids_ok = array::all(joins_local, join_identifiers_valid);
     let join_shape_ok = array::all(joins_local, fn(join_item) { join_on_shape_ok(join_item.condition) });
     let join_conds_ok = array::all(joins_local, fn(join_item) { join_condition_valid(join_item, inner_aliases) });
@@ -1717,7 +1735,7 @@ def ranked_inner_ok: Fn(RankedKeySubquery) -> Bool = fn(sq) {
         count_in(join_aliases, pair.1) == 1
     });
     let inner_aliases = array::concat([[main_alias], join_aliases]);
-    let source_id_ok = is_sql_identifier(sq.source.alias) && is_sql_identifier(sq.source.table);
+    let source_id_ok = source_valid(sq.source);
     let join_ids_ok = array::all(sq.joins, join_identifiers_valid);
     let join_shape_ok = array::all(sq.joins, fn(join_item) { join_on_shape_ok(join_item.condition) });
     let join_conds_ok = array::all(sq.joins, fn(join_item) { join_condition_valid(join_item, inner_aliases) });
@@ -1928,6 +1946,8 @@ def scalar_subquery_profiles_ok: Fn(Plan, PlanProfile) -> Bool = fn(plan, profil
             None => True,
         };
         agg_function_ok && distinct_ok && join_kinds_ok && agg_scalars_ok && row_scalars_ok
+            && source_scalars_ok(sq.source, profile.allowed_scalars)
+            && array::all(sq.joins, fn(join_item) { source_scalars_ok(join_item.source, profile.allowed_scalars) })
     })
 };
 
@@ -1961,6 +1981,8 @@ def ranked_subquery_profiles_ok: Fn(Plan, PlanProfile) -> Bool = fn(plan, profil
         };
         keys_scalars_ok && agg_function_ok && distinct_ok && join_kinds_ok
             && order_scalars_ok && row_scalars_ok
+            && source_scalars_ok(sq.source, profile.allowed_scalars)
+            && array::all(sq.joins, fn(join_item) { source_scalars_ok(join_item.source, profile.allowed_scalars) })
     })
 };
 
@@ -1980,7 +2002,7 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
         fail!("plan must declare at least one source", plan)
     } else if array::length(plan.projection) == 0 {
         fail!("plan must declare a non-empty projection", plan)
-    } else if !array::all(plan.sources, fn(source) { is_sql_identifier(source.alias) && is_sql_identifier(source.table) }) {
+    } else if !array::all(plan.sources, source_valid) {
         fail!("plan declares an invalid source identifier", plan)
     } else if !array::all(plan.joins, join_identifiers_valid) {
         fail!("plan declares an invalid join identifier", plan)
@@ -2104,6 +2126,19 @@ def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed)
     }
 };
 
+def source_scalars_ok: Fn(Source, Array(ScalarFunction)) -> Bool = fn(source_item, allowed) {
+    match source_item.scope {
+        Some(expr) => expr_scalars_ok(expr, allowed),
+        None => True,
+    }
+};
+
+def source_profile_accepts: Fn(Source, PlanProfile) -> Bool = fn(source_item, profile) {
+    source_valid(source_item)
+        && array::all(source_operators(source_item), fn(op) { operator_allowed(op, profile.allowed_operators) })
+        && source_scalars_ok(source_item, profile.allowed_scalars)
+};
+
 def select_scalars_ok: Fn(SelectItem, Array(ScalarFunction)) -> Bool = fn(item, allowed) {
     match item {
         SelectItem::Expr(expr) => expr_scalars_ok(expr, allowed),
@@ -2197,7 +2232,7 @@ def peer_corr_scalars_ok: Fn(PeerCorr, Array(ScalarFunction)) -> Bool = fn(corr,
         Some(expr) => expr_scalars_ok(expr, allowed),
         None => True,
     };
-    origin_ok && peer_ok
+    origin_ok && peer_ok && source_scalars_ok(corr.origin, allowed) && source_scalars_ok(corr.peer, allowed)
 };
 
 # Scalar/profile recursion into one correlated EXISTS aggregate body: the inner
@@ -2207,10 +2242,16 @@ def exists_body_scalars_ok: Fn(Exists, Array(ScalarFunction)) -> Bool = fn(ex, a
     match ex.peer {
         Some(corr) => peer_corr_scalars_ok(corr, allowed),
         None => match ex.link {
-            Some(link) => match link.filter {
-                Some(expr) => expr_scalars_ok(expr, allowed),
-                None => True,
-            },
+            Some(link) => source_scalars_ok(ex.source, allowed)
+                && source_scalars_ok(link.source, allowed)
+                && (match link.tail {
+                    Some(tail) => source_scalars_ok(tail.source, allowed),
+                    None => True,
+                })
+                && (match link.filter {
+                    Some(expr) => expr_scalars_ok(expr, allowed),
+                    None => True,
+                }),
             None => do {
                 let filter_ok = match ex.filter {
                     Some(expr) => expr_scalars_ok(expr, allowed),
@@ -2218,6 +2259,7 @@ def exists_body_scalars_ok: Fn(Exists, Array(ScalarFunction)) -> Bool = fn(ex, a
                 };
                 let group_ok = array::all(ex.grouping, fn(expr) { expr_scalars_ok(expr, allowed) });
                 filter_ok && group_ok && having_list_scalars_ok(ex.having, allowed)
+                    && source_scalars_ok(ex.source, allowed)
             },
         },
     }
@@ -2251,7 +2293,7 @@ def union_branch_scalars_ok: Fn(UnionBranch, Array(ScalarFunction)) -> Bool = fn
         Some(expr) => expr_scalars_ok(expr, allowed),
         None => True,
     };
-    output_ok && filter_ok
+    output_ok && filter_ok && source_scalars_ok(branch.source, allowed)
 };
 
 def derived_branches_scalars_ok: Fn(DerivedSource, Array(ScalarFunction)) -> Bool = fn(ds, allowed) {
@@ -2277,7 +2319,9 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
                 OrderKey::AggregateRef(_) => True,
             }
         });
-    let scalars_ok = array::all(plan.projection, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
+    let scalars_ok = array::all(plan.sources, fn(source_item) { source_scalars_ok(source_item, profile.allowed_scalars) })
+        && array::all(plan.joins, fn(join_item) { source_scalars_ok(join_item.source, profile.allowed_scalars) })
+        && array::all(plan.projection, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
         && (match plan.filter {
             Some(expr) => expr_scalars_ok(expr, profile.allowed_scalars),
             None => True,
@@ -2450,7 +2494,7 @@ def render_scalar_subquery: Fn(ScalarSubquery) -> Tuple([String, Array(Val)]) = 
         },
     };
     let agg_sql = `\{aggregate_name(sq.function)}(\{distinct_sql}\{rendered.0})\{agg_filter_part.0}`;
-    let from_sql = `\{sq.source.table} AS \{sq.source.alias}`;
+    let from = render_source(sq.source);
     let rendered_joins = array::map(sq.joins, render_join);
     let joins_text = string::join(array::map(rendered_joins, fn(pair) { pair.0 }), " ");
     let join_text = if array::length(sq.joins) > 0 {
@@ -2468,8 +2512,9 @@ def render_scalar_subquery: Fn(ScalarSubquery) -> Tuple([String, Array(Val)]) = 
             ("", empty)
         },
     };
-    let sql = `(SELECT \{agg_sql} FROM \{from_sql}\{join_text}\{filter_part.0})`;
-    let binds = array::concat([rendered.1, agg_filter_part.1, filter_part.1]);
+    let sql = `(SELECT \{agg_sql} FROM \{from.0}\{join_text}\{filter_part.0})`;
+    let binds = array::concat([rendered.1, agg_filter_part.1, from.1,
+        array::concat(array::map(rendered_joins, fn(pair) { pair.1 })), filter_part.1]);
     (sql, binds)
 };
 
@@ -2548,10 +2593,22 @@ def render_join_condition: Fn(JoinCondition) -> String = fn(condition) {
     }
 };
 
+def render_source: Fn(Source) -> Tuple([String, Array(Val)]) = fn(source_item) {
+    match source_item.scope {
+        None => {
+            let empty: Array(Val) = [];
+            (`\{source_item.table} AS \{source_item.alias}`, empty)
+        },
+        Some(scope) => {
+            let rendered = render_expr(scope);
+            (`(SELECT * FROM \{source_item.table} AS \{source_item.alias} WHERE \{rendered.0}) AS \{source_item.alias}`, rendered.1)
+        },
+    }
+};
+
 def render_join: Fn(Join) -> Tuple([String, Array(Val)]) = fn(join) {
-    let sql = `\{join_kind_sql(join.kind)} \{join.source.table} AS \{join.source.alias} ON \{render_join_condition(join.condition)}`;
-    let empty: Array(Val) = [];
-    (sql, empty)
+    let source_part = render_source(join.source);
+    (`\{join_kind_sql(join.kind)} \{source_part.0} ON \{render_join_condition(join.condition)}`, source_part.1)
 };
 
 def render_group_part: Fn(Array(Expr)) -> Tuple([String, Array(Val)]) = fn(grouping) {
@@ -2608,7 +2665,9 @@ def render_eq_sql: Fn(ColumnEq) -> String = fn(eq) {
 # Origin/peer filters and key binds belong to their own inner aliases.  No
 # participant table is ever outer-joined; the predicate only filters hub rows.
 def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
-    let from_sql = `\{corr.origin.table} AS \{corr.origin.alias}, \{corr.peer.table} AS \{corr.peer.alias}`;
+    let origin_source = render_source(corr.origin);
+    let peer_source = render_source(corr.peer);
+    let from_sql = `\{origin_source.0}, \{peer_source.0}`;
     let a_origin = render_eq_sql(corr.branch_a.origin);
     let a_peer = render_eq_sql(corr.branch_a.peer);
     let b_origin = render_eq_sql(corr.branch_b.origin);
@@ -2646,7 +2705,7 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
         },
     };
     let sql = `EXISTS (SELECT 1 FROM \{from_sql} WHERE \{exchange_sql}\{distinct_part.0}\{origin_part.0}\{peer_part.0})`;
-    let binds = array::concat([origin_part.1, peer_part.1]);
+    let binds = array::concat([origin_source.1, peer_source.1, origin_part.1, peer_part.1]);
     (sql, binds)
 };
 
@@ -2668,8 +2727,8 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                 # condition stays inside ONE correlated EXISTS.  B (`ex.source`)
                 # is INNER JOINed to C (`link.source`) inside the subquery, so a
                 # fan-out A -> B first hop never fans out the outer A rows.
-                let hop_from = `\{ex.source.table} AS \{ex.source.alias}`;
-                let link_from = `\{link.source.table} AS \{link.source.alias}`;
+                let hop_from = render_source(ex.source);
+                let link_from = render_source(link.source);
                 let on_sql = match link.alternatives {
                     None => string::join(array::map(link.pairs, fn(p) {
                         `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
@@ -2680,11 +2739,18 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                         }), " AND ")})`
                     }), " OR ")})`,
                 };
-                let tail_join = match link.tail {
-                    None => "",
-                    Some(tail) => ` INNER JOIN \{tail.source.table} AS \{tail.source.alias} ON \{string::join(array::map(tail.pairs, fn(p) {
-                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
-                    }), " AND ")}`,
+                let tail_join: Tuple([String, Array(Val)]) = match link.tail {
+                    None => {
+                        let empty: Array(Val) = [];
+                        ("", empty)
+                    },
+                    Some(tail) => {
+                        let tail_source = render_source(tail.source);
+                        let conditions = string::join(array::map(tail.pairs, fn(p) {
+                            `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                        }), " AND ");
+                        (` INNER JOIN \{tail_source.0} ON \{conditions}`, tail_source.1)
+                    },
                 };
                 let corr_sql = match ex.alternatives {
                     Some(alternatives) => do {
@@ -2711,10 +2777,11 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                         ("", empty)
                     },
                 };
-                let sql = `EXISTS (SELECT 1 FROM \{hop_from} INNER JOIN \{link_from} ON \{on_sql}\{tail_join} WHERE \{corr_sql}\{link_filter_part.0})`;
-                (sql, link_filter_part.1)
+                let sql = `EXISTS (SELECT 1 FROM \{hop_from.0} INNER JOIN \{link_from.0} ON \{on_sql}\{tail_join.0} WHERE \{corr_sql}\{link_filter_part.0})`;
+                (sql, array::concat([hop_from.1, link_from.1, tail_join.1, link_filter_part.1]))
             },
             None => do {
+                let source_part = render_source(ex.source);
                 let filter_part = match ex.filter {
                     Some(expr) => {
                         let rendered = render_expr(expr);
@@ -2735,16 +2802,16 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                             }), " AND ")
                         });
                         let union_sql = string::join(alternative_sqls, " OR ");
-                        let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE (\{union_sql})\{filter_part.0}\{group_part.0}\{having_part.0})`;
-                        let binds = array::concat([filter_part.1, group_part.1, having_part.1]);
+                        let sql = `EXISTS (SELECT 1 FROM \{source_part.0} WHERE (\{union_sql})\{filter_part.0}\{group_part.0}\{having_part.0})`;
+                        let binds = array::concat([source_part.1, filter_part.1, group_part.1, having_part.1]);
                         (sql, binds)
                     },
                     None => do {
                         let pairs_sql = string::join(array::map(ex.pairs, fn(p) {
                             `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
                         }), " AND ");
-                        let sql = `EXISTS (SELECT 1 FROM \{ex.source.table} AS \{ex.source.alias} WHERE \{pairs_sql}\{filter_part.0}\{group_part.0}\{having_part.0})`;
-                        let binds = array::concat([filter_part.1, group_part.1, having_part.1]);
+                        let sql = `EXISTS (SELECT 1 FROM \{source_part.0} WHERE \{pairs_sql}\{filter_part.0}\{group_part.0}\{having_part.0})`;
+                        let binds = array::concat([source_part.1, filter_part.1, group_part.1, having_part.1]);
                         (sql, binds)
                     },
                 }
@@ -2772,7 +2839,7 @@ def render_ranked_subquery: Fn(RankedKeySubquery) -> Tuple([String, Array(Val)])
     let key_parts = array::map(sq.keys, render_expr);
     let key_sql = string::join(array::map(key_parts, fn(p) { p.0 }), ", ");
     let key_binds = array::concat(array::map(key_parts, fn(p) { p.1 }));
-    let from_sql = `\{sq.source.table} AS \{sq.source.alias}`;
+    let from = render_source(sq.source);
     let rendered_joins = array::map(sq.joins, render_join);
     let joins_text = string::join(array::map(rendered_joins, fn(p) { p.0 }), " ");
     let join_text = if array::length(sq.joins) > 0 {
@@ -2791,8 +2858,8 @@ def render_ranked_subquery: Fn(RankedKeySubquery) -> Tuple([String, Array(Val)])
         },
     };
     let order_rendered = render_aggregate_call(sq.order);
-    let sql = `(SELECT \{key_sql} FROM \{from_sql}\{join_text}\{filter_part.0} GROUP BY \{key_sql} ORDER BY \{order_rendered.0} \{direction_sql(sq.direction)} LIMIT 1)`;
-    let binds = array::concat([key_binds, filter_part.1, key_binds, order_rendered.1]);
+    let sql = `(SELECT \{key_sql} FROM \{from.0}\{join_text}\{filter_part.0} GROUP BY \{key_sql} ORDER BY \{order_rendered.0} \{direction_sql(sq.direction)} LIMIT 1)`;
+    let binds = array::concat([key_binds, from.1, array::concat(array::map(rendered_joins, fn(p) { p.1 })), filter_part.1, key_binds, order_rendered.1]);
     (sql, binds)
 };
 
@@ -2944,8 +3011,9 @@ def render_union_branch: Fn(UnionBranch) -> Tuple([String, Array(Val)]) = fn(bra
             ("", empty)
         },
     };
-    let sql = `SELECT \{select_sql} FROM \{branch.source.table} AS \{branch.source.alias}\{filter_part.0}`;
-    (sql, array::concat([select_binds, filter_part.1]))
+    let from = render_source(branch.source);
+    let sql = `SELECT \{select_sql} FROM \{from.0}\{filter_part.0}`;
+    (sql, array::concat([select_binds, from.1, filter_part.1]))
 };
 
 # Renders the ordered branches merged with UNION ALL (text and merged bindings).
@@ -2965,9 +3033,7 @@ def render_from_clause: Fn(Plan) -> Tuple([String, Array(Val)]) = fn(plan) {
             (`(\{inner.0}) AS \{ds.alias}`, inner.1)
         },
         None => {
-            let primary = plan.sources[0];
-            let empty: Array(Val) = [];
-            (`\{primary.table} AS \{primary.alias}`, empty)
+            render_source(plan.sources[0])
         },
     }
 };
@@ -3628,8 +3694,12 @@ def computed_item: Fn(ComputedOp, String, String, String) -> SelectItem = fn(op,
 };
 
 def source: Fn(String, String) -> Source = fn(alias, table) {
-    let item: Source = {alias: alias, table: table};
+    let item: Source = {alias: alias, table: table, scope: None};
     item
+};
+
+def scoped_source: Fn(String, String, Expr) -> Source = fn(alias, table, scope) {
+    {alias, table, scope: Some(scope)}
 };
 
 # Equality atom between two source-qualified columns.
@@ -3981,6 +4051,7 @@ pub use self::{
     structure_ok,
     validate_structure,
     profile_accepts,
+    source_profile_accepts,
     validate,
     transform_sqlite,
     transform_sqlite_distinct,
@@ -4024,6 +4095,7 @@ pub use self::{
     computed_aggregate,
     computed_item,
     source,
+    scoped_source,
     column_eq,
     on_eq,
     on_and,

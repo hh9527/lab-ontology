@@ -142,6 +142,11 @@ type JsonDimensionSpec = struct {
 @prelude::property(PropertyTarget::Field)
 type ScopeDef = struct { predicates: Array(ScopePredicate) };
 
+@prelude::property(PropertyTarget::Type)
+type EntityScopeDef = struct { predicates: Array(EntityScopePredicate) };
+
+type EntityScopePredicate = struct { field: String, op: FilterOp, input: FilterInput };
+
 # Type-level: entity base data source.
 @prelude::property(PropertyTarget::Type)
 type EntitySource = struct { table: String, alias: String };
@@ -638,6 +643,7 @@ type EntityEntry = struct {
     dataset: Option(DatasetSpec),
     metrics: Array(MetricValueEntry),
     description: Option(DatasetDescription),
+    scope: Array(ScopePredicate),
 };
 
 type MetricValueEntry = struct {
@@ -720,6 +726,7 @@ type DatasetBrief = struct {
     metric_ids: Array(String),
     relation_ids: Array(String),
     time_roles: Array(TimeRoleBrief),
+    scope: Array(DimensionScopeBrief),
 };
 
 # Prepared dependency spec of a computed measure: operands are business measure
@@ -1167,6 +1174,16 @@ def scope: Fn(Array(ScopePredicate)) -> Fn(property::FieldPropertyCtx, Option(Sc
     }
 };
 
+def entity_scope: Fn(Array(EntityScopePredicate)) -> Fn(td::TypeDesc, Option(EntityScopeDef)) -> EntityScopeDef = fn(predicates) {
+    fn(ctx, previous) {
+        let all = match previous {
+            Some(p) => array::concat([p.predicates, predicates]),
+            None => predicates,
+        };
+        {predicates: all}
+    }
+};
+
 # Correlated-existence route declaration on the base entity type:
 # base -> `via` (unique grain-safe owner) -> `target` (existence end). Multiple
 # annotations fold by appending.
@@ -1416,6 +1433,16 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     let fields = array::map(enumerated, fn(pair) {
         build_field(ty, pair.1.index, pair.1.name, pair.1.ty)
     });
+    let entity_scopes: Array(ScopePredicate) = match property::get_type_prop(ty, EntityScopeDef.type) {
+        Some(declared) => array::map(declared.predicates, fn(p) {
+            let field = match array::find(fields, fn(f) { f.name == p.field }) {
+                Some(f) => f,
+                None => fail!("entity scope references an unknown field", ty, p.field),
+            };
+            {field: field.index, op: p.op, input: p.input}
+        }),
+        None => [],
+    };
     if let Some(field) = array::find(fields, fn(f) {
         f.column == "" && property::get_field_prop(ty, f.index, ColumnMap.type) == None && (f.is_key
             || property::get_field_prop(ty, f.index, TimeField.type) != None
@@ -1537,16 +1564,17 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 Some(e) => e.id,
                 None => source.alias,
             };
-            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, key_field, fields, union: None, dataset: validated_dataset, metrics, description };
+            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, key_field, fields, union: None, dataset: validated_dataset, metrics, description, scope: entity_scopes };
             result
         },
         (None, Some(union_def)) => do {
+            if array::length(entity_scopes) > 0 { fail!("entity scope requires a physical source", ty) } else { () };
             let union = build_union_entry(ty, fields, union_def);
             let id = match declared_id {
                 Some(e) => e.id,
                 None => union.alias,
             };
-            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, key_field, fields, union: Some(union), dataset: validated_dataset, metrics, description };
+            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, key_field, fields, union: Some(union), dataset: validated_dataset, metrics, description, scope: entity_scopes };
             result
         },
         _ => fail!("entity must declare exactly one of entity_source or union_source", ty),
@@ -2813,8 +2841,28 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
             True
         })
     });
+    let entity_scopes_validated = array::all(entities, fn(entity) {
+        let resolutions = array::map(entity.scope, fn(predicate) {
+            let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+                Some(f) => f,
+                None => fail!("entity scope references an unknown field", entity.id, predicate.field),
+            };
+            let dimension = match array::find(dimensions, fn(d) { d.entity == entity.index && d.field == field.index }) {
+                Some(d) => d,
+                None => fail!(`entity scope requires a declared dimension: \{entity.id} field \{field.name} index \{field.index}`),
+            };
+            resolve_scope(payload, dimension, predicate)
+        });
+        match find_internal_conflict(resolutions) {
+            Some(conflict) => fail!("entity scope has contradictory predicates", entity.id, conflict.field),
+            None => if array::length(entity.scope) > 0
+                && !qb::source_profile_accepts(entity_source_at(payload, entity, entity.alias), profile) {
+                fail!("entity scope uses capabilities not allowed by the query profile", entity.id)
+            } else { True },
+        }
+    });
     let aliases_ok = check_knowledge_aliases(payload);
-    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && aliases_ok { payload } else { payload }
+    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && entity_scopes_validated && aliases_ok { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -3032,7 +3080,9 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         None => None,
     };
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
-        {field: get_index(entity.fields, predicate.field).name, op: predicate.op, input: predicate.input}
+        {field: match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+            Some(f) => f.name, None => fail!("scope references an unknown field", entity.id, predicate.field),
+        }, op: predicate.op, input: predicate.input}
     });
     {id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
         aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
@@ -3235,6 +3285,11 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
                 rel.id != "" && (rel.from == entity.index || rel.to == entity.index)
             }), fn(rel) { rel.id }),
             time_roles,
+            scope: array::map(entity.scope, fn(predicate) {
+                {field: match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+                    Some(f) => f.name, None => fail!("entity scope references an unknown field", entity.id, predicate.field),
+                }, op: predicate.op, input: predicate.input}
+            }),
         };
         result
 };
@@ -3796,7 +3851,7 @@ def resolve_enum_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> F
 # member's own entity; unsupported ops or input kinds fail atomically.
 def resolve_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> FilterResolution = fn(payload, owner, predicate) {
     let entity = get_index(payload.entities, owner.entity);
-    let field = match array::get(entity.fields, predicate.field) {
+    let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
         Some(f) => f,
         None => fail!("scope references an unknown field", owner.id, predicate.field),
     };
@@ -3841,6 +3896,25 @@ def resolve_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> Filter
                 result
             }
         },
+    }
+};
+
+def entity_source_at: Fn(PreparedPayload, EntityEntry, String) -> qb::Source = fn(payload, entity, alias) {
+    let original_alias = get_index(payload.entities, entity.index).alias;
+    let expressions = array::map(entity.scope, fn(predicate) {
+        let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+            Some(f) => f,
+            None => fail!("entity scope references an unknown field", entity.id, predicate.field),
+        };
+        let dimension = match array::find(payload.dimensions, fn(d) { d.entity == entity.index && d.field == field.index }) {
+            Some(d) => d,
+            None => fail!("entity scope requires a declared dimension", entity.id, predicate.field, field.name, field.index),
+        };
+        retarget_inner_expr(resolve_scope(payload, dimension, predicate).expr, original_alias, alias)
+    });
+    match combine_filters(expressions) {
+        Some(expr) => qb::scoped_source(alias, entity.table, expr),
+        None => qb::source(alias, entity.table),
     }
 };
 
@@ -4278,7 +4352,7 @@ def select_joins: Fn(PreparedPayload, Int, Array(Int)) -> Array(qb::Join) = fn(p
         let kind: qb::JoinKind = match r.kind { RelationKind::Safe => qb::JoinKind::Inner, RelationKind::FanOut => qb::JoinKind::Left };
         qb::join_on(
             kind,
-            qb::source(to_entity.alias, to_entity.table),
+            entity_source_at(payload, to_entity, to_entity.alias),
             key_to_condition(payload, r.from, r.to, r.key),
         )
     })
@@ -4563,8 +4637,8 @@ def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb::Exists = fn(paylo
                         };
                         let origin_filter = append_filter_terms(peer_side_constraints(payload, origin_entity, origin_alias, spec.origin, origin_key_col), identity.0);
                         let peer_filter = append_filter_terms(peer_side_constraints(payload, peer_entity, peer_alias, spec.peer, peer_key_col), identity.1);
-                        let origin_source = qb::source(origin_alias, origin_entry.table);
-                        let peer_source = qb::source(peer_alias, peer_entry.table);
+                        let origin_source = entity_source_at(payload, origin_entry, origin_alias);
+                        let peer_source = entity_source_at(payload, peer_entry, peer_alias);
                         let corr = qb::peer_corr_roles(origin_source, peer_source, branch_a, branch_b, origin_filter, peer_filter, origin_entity == peer_entity, route.exchange);
                         qb::exists_peer(corr)
                     }
@@ -4689,7 +4763,7 @@ def build_correlated_exists: Fn(PreparedPayload, EntityEntry, Array(qb::ColumnEq
     } else {
         let inner_any = array::map(spec.any_of, fn(a) { any_of_on_target(payload, target, a) });
         let inner = append_filter_terms(combine_filters(array::map(inner_filters, fn(f) { f.expr })), inner_any);
-        let source = qb::source(target_entry.alias, target_entry.table);
+        let source = entity_source_at(payload, target_entry, target_entry.alias);
         match spec.min_matches {
             None => qb::exists(source, col_eqs, inner),
             Some(n) => do {
@@ -4753,7 +4827,7 @@ def build_hub_union_exists: Fn(PreparedPayload, HubRouteEntry, ExistsRequest) ->
     } else {
         let inner_any = array::map(spec.any_of, fn(a) { any_of_on_target(payload, route.participant, a) });
         let inner = append_filter_terms(combine_filters(array::map(inner_filters, fn(f) { f.expr })), inner_any);
-        let source = qb::source(participant_entry.alias, participant_entry.table);
+        let source = entity_source_at(payload, participant_entry, participant_entry.alias);
         qb::exists_union(source, alternatives, inner)
     }
 };
@@ -4809,9 +4883,9 @@ def resolve_exists: Fn(PreparedPayload, Int, ExistsRequest) -> ExistsResolution 
                             let inner_any = array::map(spec.any_of, fn(a) { any_of_on_target(payload, target, a) });
                             let inner = append_filter_terms(combine_filters(array::map(inner_filters, fn(f) { f.expr })), inner_any);
                             let exists = qb::exists_two_hop(
-                                qb::source(via_entry.alias, via_entry.table),
+                                entity_source_at(payload, via_entry, via_entry.alias),
                                 hop_pairs,
-                                qb::source(target_entry.alias, target_entry.table),
+                                entity_source_at(payload, target_entry, target_entry.alias),
                                 link_pairs,
                                 inner,
                             );
@@ -5029,7 +5103,7 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
                 let targets = array::concat([filtered_measure_targets, via_entities, dim_entities, scope_entities, filter_entities, any_entities, ordering_entities]);
                 let joins = select_joins(payload, base_entity, targets);
                 let join_sources = array::map(joins, fn(j) { j.source });
-                let sources = array::concat([[qb::source(base_entry.alias, base_entry.table)], join_sources]);
+                let sources = array::concat([[entity_source_at(payload, base_entry, base_entry.alias)], join_sources]);
                 let all_exists = array::concat([exists_plans, absence_plans, peer_exists_plans]);
                 let result: LoweredSources = { sources, derived: None, joins, exists: all_exists };
                 result
@@ -5190,7 +5264,7 @@ def lower_relation_rows: Fn(PreparedPayload, QueryRequest, String, String) -> qb
                     fail!("relation rows require one physical base dataset", base_id)
                 } else {
                     let target_entry = get_index(payload.entities, target);
-                    let join = qb::join_on(qb::JoinKind::Inner, qb::source(target_entry.alias, target_entry.table),
+                    let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, target_entry, target_entry.alias),
                         key_to_condition(payload, relation.from, relation.to, relation.key));
                     let target_filters = array::map(array::filter(filters, fn(f) { f.entity == target }), fn(f) { f.expr });
                     let projection = array::map(dimensions, fn(d) { qb::expr_item(dimension_output_expr(payload, d.entry)) });
@@ -5305,7 +5379,7 @@ def lower_roles: Fn(PreparedPayload, QueryRequest, Array(RoleProjectionSpec), Ar
                     if !dimension.authorized { fail!("role dimension is not authorized", role.dimension) } else {
                         let target = get_index(payload.entities, relation.to);
                         let alias = private_exists_alias(root.sources, `role_\{indexed.0}`);
-                        let join = qb::join_on(qb::JoinKind::Inner, qb::source(alias, target.table), role_key_condition(payload, base, relation.to, relation.key, alias));
+                        let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, target, alias), role_key_condition(payload, base, relation.to, relation.key, alias));
                         let item = qb::named_expr_item(retarget_inner_expr(dimension_output_expr(payload, dimension), target.alias, alias), role.output);
                         (join, item)
                     }
@@ -5413,7 +5487,7 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
                 };
                 qb::expr_item(dimension_output_expr(payload, dimension.entry))
             });
-            let join = qb::join_on(qb::JoinKind::Inner, qb::source(entity.alias, entity.table),
+            let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, entity, entity.alias),
                 key_to_condition(payload, relation.from, relation.to, relation.key));
             let grouping = array::map(dims, fn(d) { dimension_output_expr(payload, d.entry) });
             let result: qb::Plan = {...plan,
@@ -5540,8 +5614,8 @@ def site_tenant_scope: Fn(PreparedPayload, EntityEntry, SiteTenantScope) -> qb::
                 array::map(tenant_filters, fn(f) { f.expr }),
             ]);
             qb::exists_two_hop_alternatives(
-                qb::source(site.alias, site.table), alternatives,
-                qb::source(tenant.alias, tenant.table), tenant_pairs,
+                entity_source_at(payload, site, site.alias), alternatives,
+                entity_source_at(payload, tenant, tenant.alias), tenant_pairs,
                 combine_filters(filter_terms))
         }
     }
@@ -5649,9 +5723,9 @@ def lower_link_site: Fn(PreparedPayload, QueryRequest, LinkSiteScope) -> qb::Pla
                         array::map(tenant_filters, fn(f) { f.expr }),
                     ]));
                     let qualification = qb::exists_three_hop_double_alternatives(
-                        qb::source(device.alias, device.table), endpoints,
-                        qb::source(site.alias, site.table), sites,
-                        qb::source(tenant.alias, tenant.table), tenant_pairs, filter);
+                        entity_source_at(payload, device, device.alias), endpoints,
+                        entity_source_at(payload, site, site.alias), sites,
+                        entity_source_at(payload, tenant, tenant.alias), tenant_pairs, filter);
                     qb::validate({...plan, exists: array::push(plan.exists, qualification)}, payload.profile)
                 }
             }
@@ -5756,9 +5830,9 @@ def lower_link_device_site_rows: Fn(PreparedPayload, QueryRequest, LinkSiteScope
                             array::map(qualified_tenants, fn(f) { f.expr }),
                         ]));
                         let qualification = qb::exists_two_hop_alternatives(
-                            qb::source(site.alias, site.table), sites,
-                            qb::source(tenant.alias, tenant.table), tenant_pairs, site_filter);
-                        let join = qb::join_on(qb::JoinKind::Inner, qb::source(link.alias, link.table),
+                            entity_source_at(payload, site, site.alias), sites,
+                            entity_source_at(payload, tenant, tenant.alias), tenant_pairs, site_filter);
+                        let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, link, link.alias),
                             qb::on_or([
                                 key_to_condition(payload, a.from, a.to, a.key),
                                 key_to_condition(payload, z.from, z.to, z.key),
@@ -5861,9 +5935,9 @@ def lower_child_site_scope: Fn(PreparedPayload, QueryRequest, ChildSiteScope) ->
                             ])
                         }),
                     ]);
-                    let ex = qb::exists_three_hop_alternatives(qb::source(parent.alias, parent.table), child_pairs,
-                        qb::source(site.alias, site.table), site_alternatives,
-                        qb::source(tenant.alias, tenant.table), tenant_pairs, combine_filters(filters));
+                    let ex = qb::exists_three_hop_alternatives(entity_source_at(payload, parent, parent.alias), child_pairs,
+                        entity_source_at(payload, site, site.alias), site_alternatives,
+                        entity_source_at(payload, tenant, tenant.alias), tenant_pairs, combine_filters(filters));
                     qb::validate({...plan, exists: array::push(plan.exists, ex)}, payload.profile)
                 }
             }
@@ -5985,7 +6059,7 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
                                 };
                                 let having = [qb::having_call(op, metric.aggregate,
                                     qb::column(alias, metric_field.column), False, to_val(spec.threshold))];
-                                qb::exists_grouped(qb::source(alias, inner_entry.table), pairs, filter, grouping, having)
+                                qb::exists_grouped(entity_source_at(payload, inner_entry, alias), pairs, filter, grouping, having)
                             }
                         }
                     }
@@ -6043,7 +6117,7 @@ def sample_count_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, Sam
                 } else { get_index(pairs, 0).right.column };
                 let having = [qb::having_call(op, qb::AggregateFunction::Count,
                     qb::column(alias, count_column), False, qb::Val::Int(threshold))];
-                qb::exists_grouped(qb::source(alias, inner.table), pairs,
+                qb::exists_grouped(entity_source_at(payload, inner, alias), pairs,
                     append_filter_terms(Some(bounds), filters), grouping, having)
             }
         }
@@ -6191,12 +6265,12 @@ def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, S
                         || !array::all(component_resolved, fn(f) { f.entity == component.index }) {
                         fail!("event component filters must belong to their declared owner and component roles")
                     } else {
-                        let join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table),
+                        let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, owner, owner.alias),
                             key_to_condition(payload, event.index, owner.index, event_relation.key));
                         let parent = array::map(exists_pairs(component_relation.key), fn(pair) {
                             exists_col_eq(owner, component, pair, True)
                         });
-                        let qualification = qb::exists(qb::source(component.alias, component.table),
+                        let qualification = qb::exists(entity_source_at(payload, component, component.alias),
                             array::concat([parent, alignment]),
                             combine_filters(array::map(component_resolved, fn(f) { f.expr })));
                         let visible = array::map(owner_dims, fn(d) { dimension_output_expr(payload, d.entry) });
@@ -6257,7 +6331,7 @@ def owner_site_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, OwnerSiteSco
                 fail!("sample top scope filters must belong to their declared relation roles")
             } else {
                 let ancestor_join = qb::join_on(qb::JoinKind::Inner,
-                    qb::source(ancestor.alias, ancestor.table),
+                    entity_source_at(payload, ancestor, ancestor.alias),
                     key_to_condition(payload, ancestor_relation.from, ancestor_relation.to, ancestor_relation.key));
                 let alternatives = match site_relation.key {
                     RelationKey::Or(keys) => array::map(keys, fn(key) {
@@ -6273,8 +6347,8 @@ def owner_site_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, OwnerSiteSco
                     array::map(tenant_filters, fn(f) { f.expr }),
                 ]);
                 let qualification = qb::exists_two_hop_alternatives(
-                    qb::source(site.alias, site.table), alternatives,
-                    qb::source(tenant.alias, tenant.table), tenant_pairs,
+                    entity_source_at(payload, site, site.alias), alternatives,
+                    entity_source_at(payload, tenant, tenant.alias), tenant_pairs,
                     combine_filters(filter_terms));
                 (ancestor_join, combine_filters(array::map(ancestor_filters, fn(f) { f.expr })), qualification)
             }
@@ -6333,7 +6407,7 @@ def lower_sample_top_base: Fn(PreparedPayload, QueryRequest, String, String, Str
                     || array::length(plan.sources) > 3 {
                     fail!("sample top requires exactly the declared owner join without fan-out", relation_id)
                 } else {
-                    let owner_join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table), condition);
+                    let owner_join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, owner, owner.alias), condition);
                     let owner_sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
                     let owner_joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
                     let scoped = match scope {
@@ -6467,7 +6541,7 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                 let conflicting = array::any(plan.sources, fn(s) { s.alias == owner.alias }) && !joined;
                 if conflicting { fail!("observation owner is joined through a different relation", relation_id) }
                 else {
-                    let owner_join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table), condition);
+                    let owner_join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, owner, owner.alias), condition);
                     let sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
                     let joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
                     let clauses = array::map(specs, fn(spec) { sample_qualification_exists(payload, sources, owner, spec) });
@@ -6508,7 +6582,7 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                                     || !array::all(filters, fn(f) { f.entity == target }) {
                                     fail!("component context dimensions and filters must belong to the selected child", spec.target)
                                 } else {
-                                    let join = qb::join_on(qb::JoinKind::Inner, qb::source(child.alias, child.table),
+                                    let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, child, child.alias),
                                         key_to_condition(payload, component_relation.from, component_relation.to, component_relation.key));
                                     let child_items = array::map(dims, fn(d) {
                                         qb::named_expr_item(dimension_output_expr(payload, d.entry), d.entry.id)
@@ -6864,7 +6938,7 @@ def route_hop_join: Fn(PreparedPayload, Int, Int, Int) -> qb::Join = fn(payload,
     } else {
         qb::on_and(conds)
     };
-    qb::join_on(qb::JoinKind::Inner, qb::source(right_entry.alias, right_entry.table), condition)
+    qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, right_entry, right_entry.alias), condition)
 };
 
 type AggregateWalk = struct { current: Int, joins: Array(qb::Join) };
@@ -7067,7 +7141,7 @@ def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrde
                 });
                 let join_sources = array::map(joins, fn(j) { j.source });
                 let base_entry = get_index(payload.entities, base);
-                let sources = array::concat([[qb::source(base_entry.alias, base_entry.table)], join_sources]);
+                let sources = array::concat([[entity_source_at(payload, base_entry, base_entry.alias)], join_sources]);
                 let projection = array::map(dimensions, fn(d) { qb::expr_item(dimension_output_expr(payload, d.entry)) });
                 let grouping = array::map(dimensions, fn(d) { dimension_output_expr(payload, d.entry) });
                 let limit = request.limit;
@@ -7354,7 +7428,7 @@ def resolve_scalar_compare: Fn(PreparedPayload, Int, ScalarCompareRequest) -> qb
                 let inner_field = get_index(inner_entry.fields, inner.field);
                 let inner_filter = resolve_comparison_scope(payload, inner.entity, spec.scope_filters);
                 let inner_spec = qb::scalar_subquery_spec(
-                    qb::source(inner_entry.alias, inner_entry.table),
+                    entity_source_at(payload, inner_entry, inner_entry.alias),
                     [],
                     inner_filter,
                     inner.aggregate,
@@ -7549,7 +7623,7 @@ def resolve_ranked_key_compare: Fn(PreparedPayload, Int, RankedKeyCompareRequest
                     };
                     let inner_filter = resolve_comparison_scope(payload, population, spec.scope_filters);
                     let inner = qb::ranked_key_subquery_spec(
-                        qb::source(pop_entry.alias, pop_entry.table),
+                        entity_source_at(payload, pop_entry, pop_entry.alias),
                         [],
                         inner_filter,
                         [key_expr],
@@ -7613,7 +7687,7 @@ def ranked_outer_path_joins: Fn(PreparedPayload, Int, Int) -> Array(qb::Join) = 
             let kind: qb::JoinKind = match r.kind { RelationKind::Safe => qb::JoinKind::Inner, RelationKind::FanOut => qb::JoinKind::Left };
             qb::join_on(
                 kind,
-                qb::source(to_entity.alias, to_entity.table),
+                entity_source_at(payload, to_entity, to_entity.alias),
                 key_to_condition(payload, r.from, r.to, r.key),
             )
         }),
@@ -7991,6 +8065,8 @@ pub use self::{
     FilterInputKind,
     FilterInput,
     ScopePredicate,
+    EntityScopePredicate,
+    EntityScopeDef,
     OrderDirection,
     OrderTarget,
     MeasureInput,
@@ -8081,6 +8157,7 @@ pub use self::{
     canonical_values,
     canonical_alias,
     scope,
+    entity_scope,
     exists_route,
     route_build,
     resolve_route,

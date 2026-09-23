@@ -14,6 +14,83 @@ use std::json as json;
 use std::value::{ Value };
 use crate::query as qb;
 
+def role_scope: Fn(String, String) -> qb::Expr = fn(alias, value) {
+    qb::scalar(qb::ScalarFunction::Eq, [qb::column(alias, "classification"), qb::bind_string(value)])
+};
+
+pub def scoped_root_join_and_exists_bind_in_sql_order: test::Test = test::should_ok(fn() {
+    let base = simple_plan();
+    let plan: qb::Plan = {...base,
+        sources: [qb::scoped_source("orders", "orders", role_scope("orders", "root"))],
+        joins: [qb::join(qb::JoinKind::Left, qb::scoped_source("c", "customers", role_scope("c", "joined")),
+            qb::column_ref("orders", "customer_id"), qb::column_ref("c", "id"))],
+        exists: [qb::exists(qb::scoped_source("e", "events", role_scope("e", "related")),
+            [qb::column_eq(qb::column_ref("orders", "id"), qb::column_ref("e", "order_id"))], None)],
+    };
+    let q = qb::transform_sqlite(plan);
+    if string::contains(q.sql, "FROM (SELECT * FROM orders AS orders WHERE orders.classification = ?) AS orders")
+        && string::contains(q.sql, "LEFT JOIN (SELECT * FROM customers AS c WHERE c.classification = ?) AS c")
+        && string::contains(q.sql, "EXISTS (SELECT 1 FROM (SELECT * FROM events AS e WHERE e.classification = ?) AS e")
+        && q.bindings == [qb::Val::String("x"), qb::Val::String("root"), qb::Val::String("joined"), qb::Val::String("related")] {
+        True
+    } else { fail!("scoped sources must preserve local aliases and SQL binding order", q) }
+});
+
+pub def scoped_scalar_subquery_preserves_bind_order: test::Test = test::should_ok(fn() {
+    let base = simple_plan();
+    let inner = qb::scalar_subquery_spec(qb::scoped_source("i", "orders", role_scope("i", "inner")), [],
+        Some(role_scope("i", "filter")), qb::AggregateFunction::Max, qb::column("i", "amount"), False, None);
+    let plan: qb::Plan = {...base, scalar_comparisons: [qb::scalar_aggregate_comparison(
+        qb::column_ref("orders", "amount"), qb::ScalarFunction::Gt, inner)]};
+    let q = qb::transform_sqlite(plan);
+    if string::contains(q.sql, "FROM (SELECT * FROM orders AS i WHERE i.classification = ?) AS i")
+        && q.bindings == [qb::Val::String("x"), qb::Val::String("inner"), qb::Val::String("filter")] {
+        True
+    } else { fail!("scalar source scope binding order changed", q) }
+});
+
+pub def scoped_two_hop_sources_preserve_bind_order: test::Test = test::should_ok(fn() {
+    let base = two_hop_link_plan();
+    let ex = qb::exists_two_hop(
+        qb::scoped_source("b", "link_owner", role_scope("b", "hop")),
+        [qb::column_eq(qb::column_ref("s", "owner_id"), qb::column_ref("b", "id"))],
+        qb::scoped_source("c", "link_target", role_scope("c", "link")),
+        [qb::column_eq(qb::column_ref("b", "id"), qb::column_ref("c", "owner_id"))],
+        Some(role_scope("c", "filter")));
+    let q = qb::transform_sqlite({...base, exists: [ex]});
+    if string::contains(q.sql, "FROM (SELECT * FROM link_owner AS b WHERE b.classification = ?) AS b INNER JOIN (SELECT * FROM link_target AS c WHERE c.classification = ?) AS c")
+        && q.bindings == [qb::Val::String("hop"), qb::Val::String("link"), qb::Val::String("filter")] {
+        True
+    } else { fail!("two-hop source scopes must retain SQL binding order", q) }
+});
+
+pub def scoped_union_branch_preserves_bind_order: test::Test = test::should_ok(fn() {
+    let base = union_items_plan();
+    let branch = qb::union_branch(qb::scoped_source("a", "items_a", role_scope("a", "branch")), [
+        qb::union_column("owner_id", qb::column("a", "owner_id")),
+        qb::union_column("group_id", qb::column("a", "group_id")),
+        qb::union_column("item_id", qb::column("a", "item_id")),
+    ], Some(role_scope("a", "filter")));
+    let plan: qb::Plan = {...base, derived: Some(qb::derived_source("u", [branch, union_b_branch()]))};
+    let q = qb::transform_sqlite(plan);
+    if string::contains(q.sql, "FROM (SELECT * FROM items_a AS a WHERE a.classification = ?) AS a WHERE a.classification = ?")
+        && q.bindings == [qb::Val::String("branch"), qb::Val::String("filter"), qb::Val::Int(1)] {
+        True
+    } else { fail!("UNION source scope binding order changed", q) }
+});
+
+pub def scoped_source_rejects_outer_alias: test::Test = test::should_fail_with(fn() {
+    let base = simple_plan();
+    qb::transform_sqlite({...base, sources: [qb::scoped_source("orders", "orders", role_scope("elsewhere", "wrong"))]})
+}, "plan declares an invalid source identifier");
+
+pub def scoped_source_cannot_bypass_profile: test::Test = test::should_ok(fn() {
+    let base = simple_plan();
+    let plan: qb::Plan = {...base, sources: [qb::scoped_source("orders", "orders", role_scope("orders", "root"))]};
+    if !qb::profile_accepts(plan, restricted_profile()) { True }
+    else { fail!("scope must consume Filter and Eq capabilities") }
+});
+
 pub def validate_rejects_profile_case: test::Test = test::should_fail_with(fn() {
     qb::validate(demo_plan(), restricted_profile())
 }, "plan uses capabilities not allowed by the profile");

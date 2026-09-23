@@ -134,6 +134,21 @@ onu_trend_result="$(sqlite3 -json :memory: -cmd "${onu_trend_schema}" -cmd '.par
     -cmd '.parameter set ?7 1000' "${onu_trend_sql}")"
 jq -e 'length == 2 and .[0].name == "Sample ONU" and .[0].ts == "2024-06-01T00:00:00Z" and .[0].ifInBandRate == 0.2 and .[1].ts == "2024-06-15T00:00:00Z" and .[1].ifInBandRate == 0.7' <<< "${onu_trend_result}" >/dev/null
 
+pon_role_schema="CREATE TABLE I_EntPonElement (id TEXT, name TEXT, parentOltResId TEXT, classification TEXT);
+INSERT INTO I_EntPonElement VALUES
+ ('ONU-good','Child','OLT-good','ne.category.pon.onu'),
+ ('OLT-good','Parent',NULL,'ne.category.olt'),
+ ('ONU-wrong-parent','Other child','ONU-parent','ne.category.pon.onu'),
+ ('ONU-parent','Parent',NULL,'ne.category.pon.onu'),
+ ('OLT-wrong-child','Child','OLT-good','ne.category.olt'),
+ ('ONU-same-name','Parent',NULL,'ne.category.pon.onu');"
+pon_role_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:pon_parent_role_rows)"
+jq -e '.bindings == ["ne.category.pon.onu","ne.category.olt"]' <<< "${pon_role_plan}" >/dev/null
+pon_role_sql="$(jq -r '.sql' <<< "${pon_role_plan}")"
+pon_role_result="$(sqlite3 -json :memory: -cmd "${pon_role_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.pon.onu'" -cmd ".parameter set ?2 'ne.category.olt'" "${pon_role_sql}")"
+jq -e 'length == 1 and .[0].id == "ONU-good" and .[0].name == "Child" and .[0].parent_olt_name == "Parent"' <<< "${pon_role_result}" >/dev/null
+
 server_fan_alarm_schema="CREATE TABLE PhysicalServer (id TEXT, oriResId TEXT, tenantId TEXT, classification TEXT);
 CREATE TABLE PhysicalServerFan (id TEXT, parentResId TEXT, tenantId TEXT, manufacturer TEXT);
 CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, ALARMNAME TEXT, OCCURUTC TEXT);
