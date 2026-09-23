@@ -4718,9 +4718,36 @@ def lower_sample_qualifications: Fn(PreparedPayload, QueryRequest, Array(SampleQ
     }
 };
 
-def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification)) -> qb::Plan =
-    fn(payload, request, owner_id, relation_id, observation, specs) {
-        if array::length(specs) == 0 { fail!("qualified observation requires at least one sample qualification") }
+def component_qualification_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, NamedExistsRequest) -> qb::Exists =
+    fn(payload, outer_sources, owner, named) {
+        let spec = named.spec;
+        if !payload.authorize(spec.subject) {
+            fail!("component qualification subject is unauthorized", spec.subject)
+        } else {
+            let target = entity_by_id(payload, spec.target);
+            let component = get_index(payload.entities, target);
+            let relation = relation_domain(payload, named.relation);
+            if relation.from != target || relation.to != owner.index || relation.kind != RelationKind::Safe {
+                fail!("component qualification requires a named child-to-owner relation", named.relation, spec.target)
+            } else {
+                let alias = private_exists_alias(outer_sources, `\{component.alias}_component`);
+                let inner: EntityEntry = {...component, alias};
+                let pairs = array::map(exists_pairs(relation.key), fn(pair) { exists_col_eq(owner, inner, pair, True) });
+                let existing = build_correlated_exists(payload, inner, pairs, spec, target);
+                let filter = match existing.filter {
+                    Some(expr) => Some(retarget_inner_expr(expr, component.alias, alias)),
+                    None => None,
+                };
+                {...existing, filter}
+            }
+        }
+    };
+
+def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, observation, specs, components) {
+        if array::length(specs) == 0 && array::length(components) == 0 {
+            fail!("qualified observation requires a sample or component qualification")
+        }
         else {
             let root_id = entity_by_id(payload, observation.dataset);
             let sample_dimensions = array::filter(request.dimensions, fn(d) {
@@ -4763,6 +4790,9 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                     let sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
                     let joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
                     let clauses = array::map(specs, fn(spec) { sample_qualification_exists(payload, sources, owner, spec) });
+                    let component_clauses = array::map(components, fn(spec) {
+                        component_qualification_exists(payload, sources, owner, spec)
+                    });
                     let owner_dimension = array::any(request.dimensions, fn(d) {
                         match array::find(payload.dimensions, fn(entry) { entry.id == d.id }) {
                             Some(entry) => entry.entity == owner.index,
@@ -4788,7 +4818,7 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                     });
                     qb::validate({...plan, sources, joins,
                         grouping: array::concat([plan.grouping, hidden]),
-                        exists: array::concat([plan.exists, clauses])}, payload.profile)
+                        exists: array::concat([plan.exists, clauses, component_clauses])}, payload.profile)
                 }
             }
             }

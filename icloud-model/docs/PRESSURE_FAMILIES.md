@@ -11,7 +11,7 @@ intent, not an authoritative declaration of metric grain or physical mapping.
 | --- | --- | --- |
 | Two KPI thresholds on one device | Q0088-Q0093 | Two independent KPI aliases joined to a device multiply sample rows. For AVG this happens to leave each average unchanged when both sides are nonempty, but it must not be generalized to SUM, COUNT, or different time/sample filters. Declare each metric's sampling grain and aggregation, evaluate each threshold over its own eligible samples, then intersect qualified device identities. Check that an absent sample on either side excludes the device, and that duplicating one side cannot change a count/sum on the other. Q0091 asks for the number of *qualified devices*, not joined sample pairs. Q0091/Q0092 use `AVG(portCount)`/`AVG(operStatusCount)` while IC's device MetricSet declares both as `Sum`: this discrepancy requires explicit raw-sample aggregation semantics or rejection, never a silent override of the declared metric. |
 | Historical qualification, separate observation | Q0105-Q0110 | Count samples above a raw-value threshold in one window, then aggregate or list samples in another window for the *same qualified device*. `qualify_samples` selects owners by sample predicate and count; `observe_qualified` uses a second sample scope and window for the observation. The Q0108 trend probe supplies calendar-month bounds externally (it does not convert a month to 30 days). Both scopes follow the resource+tenant ownership relation; projection order cannot change the observation root. `scripts/check-sample-execution.sh` runs the generated SQL against distinct-tenant SQLite fixture rows. |
-| Component filter versus metric ownership | Q0165-Q0173 | A frame/interface/slot predicate can select a parent device; its KPI remains device-owned. Q0168/Q0170 require sample Top-N after an existential child filter without multiplying samples by multiple matching children. Q0171-Q0173 also project the selected component name: selecting multiple matching children may intentionally repeat a device trend per component, which needs an explicit result-grain contract. Q0165/Q0166 group the same device KPI by child identity; this must not imply a child-owned CPU/memory metric or silently allocate it. Reject when the intended allocation/result grain is undeclared. |
+| Component filter versus metric ownership | Q0165-Q0173 | A frame/interface/slot predicate can select a parent device; its KPI remains device-owned. `observe_qualified.components` now accepts a named Safe child-to-owner relation and filters only in a correlated EXISTS: Q0170-shaped Top-N cannot duplicate KPI rows when two frames match. The generated SQL runs against that exact fixture. Q0171-Q0173 also project the selected component name: repeating a device trend once per matching component needs an explicit result-grain contract. Q0165/Q0166 group a device KPI by child identity; that must not silently assert a child-owned CPU/memory metric or allocation. |
 | Calendar windows and encoded time | Q0044-Q0046, Q0090, Q0105-Q0110 | Distinguish calendar month from fixed N-day duration; distinguish the source's actual timestamp encoding from canonical UTC-second text. The existing `utc_days_window` covers only the latter plus externally supplied `as_of`. Positive/negative tests must cross month/year boundaries and reject unsupported storage encodings rather than pretending native timestamps are canonical text. |
 
 Prioritize the independent KPI qualification family first: it tests whether
@@ -20,6 +20,13 @@ executable target SQL. Follow it with two-window qualification and child-filter
 scoping; time encoding and calendar months are separate value-semantics work.
 Q0078/Q0079 remain a domain decision (copy, allocate, or reject device KPI at
 frame grain); their existing negative acceptance should stay in force.
+
+IC declares `NetworkDevice.id` as a PrimaryKey and the frame->device link on
+`refParentNE = id`; frame and device also carry tenant IDs. Therefore the
+single-column link is not automatically wrong merely because KPI ownership
+uses `(resId,tenantId)`: its safety depends on the declared PrimaryKey scope.
+The owner-key question is recorded in issue #9, without fabricating a tenant
+equality that is not present in IC's published link.
 
 ## First lowering boundary: independent KPI qualifications
 
