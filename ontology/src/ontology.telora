@@ -5193,6 +5193,71 @@ def component_qualification_exists: Fn(PreparedPayload, Array(qb::Source), Entit
         }
     };
 
+# A non-unique component-parent reference can qualify an owner, but it cannot
+# become a Safe row join. Both sides must independently resolve to the same
+# tenant identity before the component is admitted into the correlated EXISTS.
+def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, String, String, String, String, String, Array(FilterRequest), Array(FilterRequest)) -> qb::Plan =
+    fn(payload, request, window, owner_id, event_relation_id, component_relation_id,
+        owner_tenant_id, component_tenant_id, owner_filters, component_filters) {
+        let event = get_index(payload.entities, entity_by_id(payload, window.dataset));
+        let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
+        let event_relation = relation_domain(payload, event_relation_id);
+        let component_relation = relation_domain(payload, component_relation_id);
+        let component = get_index(payload.entities, component_relation.from);
+        let owner_tenant = relation_domain(payload, owner_tenant_id);
+        let component_tenant = relation_domain(payload, component_tenant_id);
+        if dataset_domain(payload, window.dataset).kind != DatasetKind::Event
+            || event_relation.from != event.index || event_relation.to != owner.index
+            || event_relation.kind != RelationKind::Safe {
+            fail!("event component observation requires a named safe event-to-owner relation", event_relation_id)
+        } else if component_relation.to != owner.index || component_relation.kind != RelationKind::FanOut
+            || owner_tenant.from != owner.index || component_tenant.from != component.index
+            || owner_tenant.to != component_tenant.to || owner_tenant.kind != RelationKind::Safe
+            || component_tenant.kind != RelationKind::Safe {
+            fail!("event component qualification requires fan-out parent and aligned tenant ownership relations")
+        } else {
+            let tenant_pairs = exists_pairs(owner_tenant.key);
+            let component_pairs = exists_pairs(component_tenant.key);
+            let alignment = array::map(tenant_pairs, fn(left) {
+                let right = match array::find(component_pairs, fn(pair) { pair.to == left.to }) {
+                    Some(pair) => pair,
+                    None => fail!("component tenant ownership keys do not align", owner_tenant_id, component_tenant_id),
+                };
+                qb::column_eq(
+                    qb::column_ref(owner.alias, get_index(owner.fields, left.from).column),
+                    qb::column_ref(component.alias, get_index(component.fields, right.from).column))
+            });
+            if array::length(alignment) == 0 || array::length(alignment) != array::length(component_pairs) {
+                fail!("component tenant ownership keys do not align", owner_tenant_id, component_tenant_id)
+            } else {
+                let plan = lower_utc_window(payload, request, window);
+                if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
+                    fail!("event component observation requires event-only projections and filters")
+                } else {
+                    let owner_resolved = resolve_filters(payload, owner_filters);
+                    let component_resolved = resolve_filters(payload, component_filters);
+                    if !array::all(owner_resolved, fn(f) { f.entity == owner.index })
+                        || !array::all(component_resolved, fn(f) { f.entity == component.index }) {
+                        fail!("event component filters must belong to their declared owner and component roles")
+                    } else {
+                        let join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table),
+                            key_to_condition(payload, event.index, owner.index, event_relation.key));
+                        let parent = array::map(exists_pairs(component_relation.key), fn(pair) {
+                            exists_col_eq(owner, component, pair, True)
+                        });
+                        let qualification = qb::exists(qb::source(component.alias, component.table),
+                            array::concat([parent, alignment]),
+                            combine_filters(array::map(component_resolved, fn(f) { f.expr })));
+                        qb::validate({...plan, sources: array::push(plan.sources, join.source),
+                            joins: array::push(plan.joins, join),
+                            filter: append_filter_terms(plan.filter, array::map(owner_resolved, fn(f) { f.expr })),
+                            exists: array::push(plan.exists, qualification)}, payload.profile)
+                    }
+                }
+            }
+        }
+    };
+
 def entity_grain_exprs: Fn(EntityEntry, String) -> Array(qb::Expr) = fn(entity, role) {
     let identity = match entity.dataset {
         Some(spec) => if spec.kind == DatasetKind::Entity { spec.grain }
@@ -7055,6 +7120,7 @@ pub use self::{
     lower_qualified_observation,
     lower_sample_top,
     lower_latest_sample,
+    lower_event_component,
     lower_via,
     lower_relation_rows,
     lower_endpoint_pair,

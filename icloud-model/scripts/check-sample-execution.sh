@@ -89,6 +89,45 @@ alarm_tenant_result="$(sqlite3 -json :memory: -cmd "${alarm_tenant_schema}" -cmd
     -cmd '.parameter set ?1 0' -cmd '.parameter set ?2 5' "${alarm_tenant_sql}")"
 jq -e 'length == 1 and (.[0] | to_entries[0].value) == 2' <<< "${alarm_tenant_result}" >/dev/null
 
+server_fan_alarm_schema="CREATE TABLE PhysicalServer (id TEXT, oriResId TEXT, tenantId TEXT, classification TEXT);
+CREATE TABLE PhysicalServerFan (id TEXT, parentResId TEXT, tenantId TEXT, manufacturer TEXT);
+CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, ALARMNAME TEXT, OCCURUTC TEXT);
+INSERT INTO PhysicalServer VALUES
+ ('SV1','O1','TA','ne.category.server.kunlun'),
+ ('SV2','O1','TA','ne.category.server.kunlun'),
+ ('SV1','O1','TB','ne.category.server.kunlun'),
+ ('SV3','O2','TA','ne.category.server.kunlun'),
+ ('SV4','O3','TA','ne.category.server.subrack');
+INSERT INTO PhysicalServerFan VALUES
+ ('F1','O1','TA','2011'),('F2','O1','TA','Huawei'),
+ ('F3','O1','TB','Other'),('F4','O2','TB','Huawei'),('F5','O3','TA','Huawei');
+INSERT INTO T_CURRENT_ALARM VALUES
+ (1,'SV1','TA','A1','2024-02-10T00:00:00Z'),
+ (2,'SV1','TA','A2','2024-02-11T00:00:00Z'),
+ (3,'SV2','TA','A3','2024-02-12T00:00:00Z'),
+ (4,'SV1','TB','CrossTenant','2024-02-13T00:00:00Z'),
+ (5,'SV3','TA','WrongFanTenant','2024-02-14T00:00:00Z'),
+ (6,'SV4','TA','WrongClass','2024-02-15T00:00:00Z'),
+ (7,'SV1','TA','Old','2024-01-31T23:59:59Z'),
+ (8,'SV1','TB','WrongAlarmTenant','2024-02-16T00:00:00Z');"
+server_fan_alarm_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_fan_alarms)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z","ne.category.server.kunlun","2011","Huawei","huawei technologies co., ltd"]' <<< "${server_fan_alarm_plan}" >/dev/null
+server_fan_alarm_sql="$(jq -r '.sql' <<< "${server_fan_alarm_plan}")"
+server_fan_alarm_result="$(sqlite3 -json :memory: -cmd "${server_fan_alarm_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 'ne.category.server.kunlun'" -cmd ".parameter set ?4 '2011'" \
+    -cmd ".parameter set ?5 'Huawei'" -cmd ".parameter set ?6 'huawei technologies co., ltd'" \
+    "${server_fan_alarm_sql}")"
+jq -e 'length == 3 and (map(.CSN) | sort == [1,2,3])' <<< "${server_fan_alarm_result}" >/dev/null
+server_fan_alarm_count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_fan_alarm_count)"
+server_fan_alarm_count_sql="$(jq -r '.sql' <<< "${server_fan_alarm_count_plan}")"
+server_fan_alarm_count_result="$(sqlite3 -json :memory: -cmd "${server_fan_alarm_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 'ne.category.server.kunlun'" -cmd ".parameter set ?4 '2011'" \
+    -cmd ".parameter set ?5 'Huawei'" -cmd ".parameter set ?6 'huawei technologies co., ltd'" \
+    "${server_fan_alarm_count_sql}")"
+jq -e 'length == 1 and .[0].alarm_count == 3' <<< "${server_fan_alarm_count_result}" >/dev/null
+
 site_device_schema="CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, SITE_TYPE TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, name TEXT, projectId TEXT, refParentSubnet TEXT);
 INSERT INTO X_SITE_VIEW VALUES
