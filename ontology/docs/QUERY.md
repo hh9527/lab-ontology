@@ -1,5 +1,12 @@
 # QueryBuilder
 
+`PeerCorr.exchange` distinguishes symmetric two-endpoint existence from a
+fixed-origin/fixed-peer route. Existing `peer_corr` and `peer_corr_distinct`
+constructors set it to `True`; `peer_corr_roles(..., distinct_keys, exchange)`
+allows a declared directed route to set it to `False`, rendering only the
+first validated endpoint branch. Both endpoint columns and participant
+identities remain structurally validated.
+
 本文档是 `ontology/query` 模块的使用指南与公共契约。QueryBuilder 接收结构化、
 后端无关的 `Plan`，验证其结构和能力范围，并确定性地生成参数化 SQLite `Query`。
 
@@ -212,6 +219,7 @@ type PeerCorr = struct {
     origin_filter: Option(Expr),
     peer_filter: Option(Expr),
     distinct_keys: Bool,
+    exchange: Bool,  # False: only branch_a participates in the predicate
 };
 
 type Exists = struct {

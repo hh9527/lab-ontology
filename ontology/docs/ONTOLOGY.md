@@ -177,6 +177,41 @@ bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允�
 
 ## 知识声明 API
 
+### 规范值与多物理值
+
+普通 `String` 或 `Int` 字段可以声明封闭的规范业务值域：
+
+```telora
+def offline: edsl::CanonicalValueSpec = {
+    id: "offline", label: "Offline",
+    wires: [edsl::FilterInput::Text("1"), edsl::FilterInput::Text("offline")],
+};
+def states: Array(edsl::CanonicalValueSpec) = [offline];
+
+@edsl::column("commu_state")
+@edsl::dimension("device_commu_state", True, True,
+    [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+@edsl::canonical_values(states)
+commu_state: String,
+```
+
+`Int` 字段的 `wires` 使用 `FilterInput::Int`；意图输入始终使用规范
+`id`（`kind: "text"`），绝不直接提交物理 wire 值。一个规范值的多条
+wire 降低为同一字段的括号化 OR 等值条件，动态 wire 按声明顺序绑定。
+`canonical_value_domain(payload, dimension_id)` 提供同源发现。准备阶段
+拒绝空/重复业务 id、空/重复物理值、字段类型不匹配、缺少仅有的 Eq 能力，
+以及不能兑现多 wire OR 的 profile。普通筛选、`any_of`、scope、
+过滤指标、相关参与者筛选及比较内层筛选共用这一映射。
+
+该能力仅规定过滤语义；投影仍返回物理字段值，并不自动转换成规范
+业务值。需要规范值投影的领域不能仅凭此声明视为完整支持。
+
+同一参与者类型的双端关系默认仍可交换端点（`peer_hub`）。如果两端
+具有固定业务角色，使用 `directed_peer_hub(participant, key_field,
+origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
+端点位置，只生成一个关联分支。同类型两侧仍须为不同参与者。该声明
+解决端点方向性，不代替关系名称、显示说明或一般数据链的建模。
+
 领域作者用具名 struct 表达实体，用 property decorator 就近声明事实：
 
 | provider | 位置 | 语义 |

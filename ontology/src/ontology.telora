@@ -192,6 +192,14 @@ type RelationDecl = struct {
 @prelude::property(PropertyTarget::Variant)
 type EnumValueDef = struct { value: String, label: String };
 
+# A closed value domain on a scalar field. A canonical business value may
+# represent several distinct physical scalar values. Unlike enum_value, this does
+# not require the stored field to have a Telora enum type.
+type CanonicalValueSpec = struct { id: String, label: String, wires: Array(FilterInput) };
+
+@prelude::property(PropertyTarget::Field)
+type CanonicalValuesDef = struct { values: Array(CanonicalValueSpec) };
+
 # Type-level: explicitly declared correlated-existence route for this base
 # entity. Each route names the unique, grain-safe owner entity (`via`) and the
 # target entity whose related rows are tested by the existence filter. A route
@@ -241,6 +249,7 @@ type PeerHubDecl = struct {
     peer_participant: Type,
     peer_key: Int,
     peer_field: Int,
+    directed: Bool,
 };
 
 # ---------------------------------------------------------------------------
@@ -523,6 +532,7 @@ type DimensionEntry = struct {
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
     values: Array(EnumValueEntry),
+    canonical_values: Array(CanonicalValueSpec),
     scope: Array(ScopePredicate),
 };
 
@@ -756,6 +766,16 @@ def enum_value: Fn(String, String) -> Fn(property::VariantPropertyCtx, Option(En
     }
 };
 
+def canonical_values: Fn(Array(CanonicalValueSpec)) -> Fn(property::FieldPropertyCtx, Option(CanonicalValuesDef)) -> CanonicalValuesDef = fn(values) {
+    fn(ctx, previous) {
+        if previous != None {
+            fail!("canonical value domain must be declared once per field", ctx)
+        } else {
+            { values }
+        }
+    }
+};
+
 def scope: Fn(Array(ScopePredicate)) -> Fn(property::FieldPropertyCtx, Option(ScopeDef)) -> ScopeDef = fn(predicates) {
     fn(ctx, previous) {
         let all = match previous {
@@ -805,13 +825,26 @@ def dual_hub: Fn(Type, Int, Int, Int) -> Fn(td::TypeDesc, Option(DualHubDef)) ->
 # Multiple annotations fold by appending.
 def peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
     fn(ctx, previous) {
-        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field };
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: False };
         let all = match previous {
             Some(p) => array::push(p.hubs, spec),
             None => [spec],
         };
         let result: PeerHubDef = { hubs: all };
         result
+    }
+};
+
+# Preserve the authored origin/peer roles even when both endpoints refer to
+# the same participant entity. No endpoint-exchange branch is generated.
+def directed_peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
+    fn(ctx, previous) {
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: True };
+        let all = match previous {
+            Some(p) => array::push(p.hubs, spec),
+            None => [spec],
+        };
+        { hubs: all }
     }
 };
 
@@ -1148,6 +1181,37 @@ def value_domain: Fn(Type) -> Array(EnumValueEntry) = fn(field_ty) {
     }
 };
 
+def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(owner, field) {
+    match property::get_field_prop(owner, field.index, CanonicalValuesDef.type) {
+        None => [],
+        Some(mapping) => do {
+            let valid_field = field.ty == String.type || field.ty == Int.type;
+            let nonempty = array::length(mapping.values) > 0;
+            let valid_entries = array::all(mapping.values, fn(v) {
+                v.id != "" && array::length(v.wires) > 0
+                    && array::all(v.wires, fn(w) {
+                        match w {
+                            FilterInput::Text(s) => field.ty == String.type && s != "",
+                            FilterInput::Int(_) => field.ty == Int.type,
+                            FilterInput::Number(_) => False,
+                        }
+                    })
+                    && array::length(array::filter(mapping.values, fn(other) { other.id == v.id })) == 1
+                    && array::all(v.wires, fn(w) {
+                        array::length(array::flat_map(mapping.values, fn(other) {
+                            array::filter(other.wires, fn(candidate) { candidate == w })
+                        })) == 1
+                    })
+            });
+            if !valid_field || !nonempty || !valid_entries {
+                fail!("invalid canonical value mapping: requires a String or Int field, distinct nonempty ids and disjoint typed wire sets", owner, field, mapping)
+            } else {
+                mapping.values
+            }
+        },
+    }
+};
+
 def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
     match property::get_field_prop(owner, index, ScopeDef.type) {
         Some(s) => s.predicates,
@@ -1157,17 +1221,37 @@ def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
 
 def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(entity) {
     let fields = entity.fields;
+    let orphan = array::find(fields, fn(f) {
+        property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
+            && property::get_field_prop(entity.entity_type, f.index, DimensionDef.type) == None
+    });
+    let declared: Bool = match orphan {
+        Some(f) => fail!("canonical value mapping requires a plain dimension on its field", entity.id, f.name),
+        None => True,
+    };
     let plain = array::flat_map(fields, fn(f) {
         let d = property::get_field_prop(entity.entity_type, f.index, DimensionDef.type);
         match d {
-            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, value_domain(f.ty), field_scope(entity.entity_type, f.index))],
+            Some(dd) => do {
+                let mapped = canonical_domain(entity.entity_type, f);
+                let enumerated = value_domain(f.ty);
+                if array::length(mapped) > 0 && array::length(enumerated) > 0 {
+                    fail!("dimension cannot combine enum and canonical wire domains", entity.id, f.name)
+                } else if array::length(mapped) > 0 && (!dd.filterable
+                    || !array::any(dd.input_kinds, fn(kind) { kind == FilterInputKind::Text })
+                    || array::length(dd.ops) != 1 || get_index(dd.ops, 0) != FilterOp::Eq) {
+                    fail!("canonical dimension must declare only filterable Eq with a text business input", entity.id, f.name)
+                } else {
+                    [dimension_entry(entity.index, f.index, dd.id, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, field_scope(entity.entity_type, f.index))]
+                }
+            },
             None => [],
         }
     });
     let computed = array::flat_map(fields, fn(f) {
         let d = property::get_field_prop(entity.entity_type, f.index, ComputedDimensionDef.type);
         match d {
-            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], field_scope(entity.entity_type, f.index))],
+            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], field_scope(entity.entity_type, f.index))],
             None => [],
         }
     });
@@ -1175,16 +1259,16 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         let d = property::get_field_prop(entity.entity_type, f.index, JsonDimensionDef.type);
         match d {
             Some(dd) => array::map(dd.dimensions, fn(spec) {
-                dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], field_scope(entity.entity_type, f.index))
+                dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], field_scope(entity.entity_type, f.index))
             }),
             None => [],
         }
     });
-    array::concat([plain, computed, json])
+    if declared { array::concat([plain, computed, json]) } else { [] }
 };
 
-def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb::Expr) -> qb::Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, scope) {
-    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values, scope };
+def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb::Expr) -> qb::Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, scope) {
+    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, scope };
     result
 };
 
@@ -1646,7 +1730,7 @@ def resolve_peer_decl: Fn(Array(EntityEntry), Int, PeerHubDecl) -> PeerResult = 
                 } else if declaration.origin_field == declaration.peer_field {
                     PeerResult::Err("peer hub origin and peer endpoints must be distinct fields")
                 } else {
-                    let exchange = origin_entity == peer_entity;
+                    let exchange = !declaration.directed;
                     let entry: PeerRouteEntry = {
                         hub,
                         origin_entity,
@@ -1722,6 +1806,19 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     let measures_raw = array::flat_map(entities, fn(e) { collect_entity_measures(entities, e) });
     let measures = check_measure_contract(measures_raw);
     let dimensions = array::flat_map(entities, fn(e) { collect_entity_dimensions(e) });
+    let requires_disjunction = array::any(dimensions, fn(d) {
+        array::any(d.canonical_values, fn(v) { array::length(v.wires) > 1 })
+    });
+    let uses_canonical = array::any(dimensions, fn(d) { array::length(d.canonical_values) > 0 });
+    let profile_ok = if uses_canonical && (!array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Eq })
+        || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Scalar })
+        || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Bind })
+        || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Filter })
+        || (requires_disjunction && !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Or }))) {
+        fail!("canonical value mapping requires Eq, Scalar, Bind, Filter and (for multi-wire values) Or in the query profile")
+    } else {
+        True
+    };
     let relations = collect_relations(entities);
     let routes_build = route_build(entities, relations);
     let routes = if array::length(routes_build.problems) > 0 {
@@ -1757,7 +1854,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         profile,
         authorize,
     };
-    payload
+    if profile_ok { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -1959,6 +2056,37 @@ def dimension_domain: Fn(PreparedPayload, String) -> Array(EnumValueEntry) = fn(
     }
 };
 
+def canonical_value_domain: Fn(PreparedPayload, String) -> Array(CanonicalValueSpec) = fn(payload, id) {
+    match array::find(payload.dimensions, fn(d) { d.id == id }) {
+        Some(entry) => entry.canonical_values,
+        None => fail!("unknown dimension", id),
+    }
+};
+
+def canonical_eq: Fn(DimensionEntry, qb::Expr, FilterInput) -> qb::Expr = fn(entry, base, input) {
+    let id = match input {
+        FilterInput::Text(value) => value,
+        _ => fail!("canonical dimension requires a text business value", entry.id, input),
+    };
+    let matched = match array::find(entry.canonical_values, fn(v) { v.id == id }) {
+        Some(value) => value,
+        None => fail!("unknown canonical value for dimension", entry.id, input),
+    };
+    let terms = array::map(matched.wires, fn(wire) {
+        qb::scalar(qb::ScalarFunction::Eq, [base, to_bind(wire)])
+    });
+    let combined: Option(qb::Expr) = array::fold(terms, None, fn(acc, term) {
+        match acc {
+            None => Some(term),
+            Some(prev) => Some(qb::scalar(qb::ScalarFunction::Or, [prev, term])),
+        }
+    });
+    match combined {
+        Some(expr) => expr,
+        None => fail!("canonical value has no physical wires", entry.id, id),
+    }
+};
+
 def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(kinds, input) {
     let kind: FilterInputKind = match input {
         FilterInput::Text(_) => FilterInputKind::Text,
@@ -2065,6 +2193,13 @@ def resolve_filters: Fn(PreparedPayload, Array(FilterRequest)) -> Array(FilterRe
                         fail!("dimension has no filter capability", req.subject, req.id)
                     } else if !array::any(entry.ops, fn(op) { op == req.op }) {
                         fail!("filter operation not supported for dimension", req.subject, req.id)
+                    } else if array::length(entry.canonical_values) > 0 {
+                        if req.op == FilterOp::Eq {
+                            let expr = canonical_eq(entry, dimension_expr(payload, entry), req.input);
+                            { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input }
+                        } else {
+                            fail!("canonical dimension filter supports only Eq", req.subject, req.id, req.op)
+                        }
                     } else if array::length(entry.values) > 0 {
                         resolve_enum_filter(payload, entry, req)
                     } else if is_text_op(req.op) {
@@ -2132,7 +2267,12 @@ def or_eq_terms: Fn(qb::Expr, Array(FilterInput)) -> qb::Expr = fn(base, values)
 # closed enum domains require a Text stable value; open dimensions require an
 # allowed input kind.
 def any_of_value_ok: Fn(DimensionEntry, FilterInput) -> Bool = fn(entry, value) {
-    if array::length(entry.values) > 0 {
+    if array::length(entry.canonical_values) > 0 {
+        match value {
+            FilterInput::Text(s) => array::any(entry.canonical_values, fn(v) { v.id == s }),
+            _ => False,
+        }
+    } else if array::length(entry.values) > 0 {
         match value {
             FilterInput::Text(s) => array::any(entry.values, fn(e) { e.value == s }),
             _ => False,
@@ -2156,7 +2296,21 @@ def build_any_of: Fn(PreparedPayload, DimensionEntry, AnyOfRequest) -> qb::Expr 
             fail!("any-of contains an unknown or invalid value for dimension", spec.id)
         } else {
             let base = dimension_expr(payload, entry);
-            or_eq_terms(base, spec.values)
+            if array::length(entry.canonical_values) > 0 {
+                let terms = array::map(spec.values, fn(value) { canonical_eq(entry, base, value) });
+                let combined: Option(qb::Expr) = array::fold(terms, None, fn(acc, term) {
+                    match acc {
+                        None => Some(term),
+                        Some(prev) => Some(qb::scalar(qb::ScalarFunction::Or, [prev, term])),
+                    }
+                });
+                match combined {
+                    Some(expr) => expr,
+                    None => fail!("any-of group must contain at least one value", spec.id),
+                }
+            } else {
+                or_eq_terms(base, spec.values)
+            }
         }
     }
 };
@@ -2240,7 +2394,7 @@ def field_compare_op: Fn(FilterOp) -> Bool = fn(op) {
 # Comparable category of a dimension: closed enums are "enum" (compared by the
 # stable value domain), open dimensions by their single comparable scalar kind.
 def comparable_kind: Fn(DimensionEntry) -> String = fn(entry) {
-    if array::length(entry.values) > 0 {
+    if array::length(entry.canonical_values) > 0 || array::length(entry.values) > 0 {
         "enum"
     } else if array::any(entry.input_kinds, fn(k) { k == FilterInputKind::Int }) {
         "int"
@@ -2257,7 +2411,10 @@ def comparable_kind: Fn(DimensionEntry) -> String = fn(entry) {
 # they publish the same stable value domain; open dimensions are compatible
 # only when they share the same comparable scalar kind.
 def field_domains_compatible: Fn(DimensionEntry, DimensionEntry) -> Bool = fn(left, right) {
-    if array::length(left.values) > 0 || array::length(right.values) > 0 {
+    if array::length(left.canonical_values) > 0 || array::length(right.canonical_values) > 0 {
+        array::length(left.canonical_values) > 0 && array::length(right.canonical_values) > 0
+            && left.canonical_values == right.canonical_values
+    } else if array::length(left.values) > 0 || array::length(right.values) > 0 {
         array::length(left.values) > 0 && array::length(right.values) > 0
             && left.values == right.values
     } else {
@@ -2441,6 +2598,13 @@ def resolve_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> Filter
                 fail!("scope references a dimension with no filter capability", d.id)
             } else if !array::any(d.ops, fn(op) { op == predicate.op }) {
                 fail!("scope uses an operation not supported by the dimension", d.id, predicate.op)
+            } else if array::length(d.canonical_values) > 0 {
+                if predicate.op == FilterOp::Eq {
+                    let expr = canonical_eq(d, dimension_expr(payload, d), predicate.input);
+                    { expr, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input }
+                } else {
+                    fail!("scope on canonical dimension supports only Eq", d.id, predicate.op)
+                }
             } else if array::length(d.values) > 0 {
                 resolve_enum_scope(payload, d, predicate)
             } else if is_text_op(predicate.op) {
@@ -2561,6 +2725,12 @@ def resolve_measure_predicate: Fn(PreparedPayload, MeasureEntry) -> qb::Expr = f
                         fail!("measure predicate references a dimension with no filter capability", d.id)
                     } else if !array::any(d.ops, fn(op) { op == pred.op }) {
                         fail!("measure predicate uses an operation not supported by the dimension", d.id, pred.op)
+                    } else if array::length(d.canonical_values) > 0 {
+                        if pred.op == FilterOp::Eq {
+                            canonical_eq(d, dimension_expr(payload, d), pred.input)
+                        } else {
+                            fail!("measure predicate on canonical dimension supports only Eq", d.id, pred.op)
+                        }
                     } else if array::length(d.values) > 0 {
                         match pred.op {
                             FilterOp::Eq => match pred.input {
@@ -3004,7 +3174,13 @@ def peer_attr_expr: Fn(PreparedPayload, DimensionEntry, FilterRequest, String) -
         fail!("filter operation not supported for dimension", req.subject, req.id)
     } else {
         let base = dimension_expr_on_alias(payload, entry, alias);
-        if array::length(entry.values) > 0 {
+        if array::length(entry.canonical_values) > 0 {
+            if req.op == FilterOp::Eq {
+                canonical_eq(entry, base, req.input)
+            } else {
+                fail!("participant filter on canonical dimension supports only Eq", req.id, req.op)
+            }
+        } else if array::length(entry.values) > 0 {
             match req.op {
                 FilterOp::Eq => match req.input {
                     FilterInput::Text(s) => if array::any(entry.values, fn(v) { v.value == s }) {
@@ -3120,7 +3296,7 @@ def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb::Exists = fn(paylo
                         let peer_filter = peer_side_constraints(payload, peer_entity, peer_alias, spec.peer, peer_key_col);
                         let origin_source = qb::source(origin_alias, origin_entry.table);
                         let peer_source = qb::source(peer_alias, peer_entry.table);
-                        let corr = qb::peer_corr_distinct(origin_source, peer_source, branch_a, branch_b, origin_filter, peer_filter, origin_entity == peer_entity);
+                        let corr = qb::peer_corr_roles(origin_source, peer_source, branch_a, branch_b, origin_filter, peer_filter, origin_entity == peer_entity, route.exchange);
                         qb::exists_peer(corr)
                     }
                 },
@@ -3145,6 +3321,11 @@ def peer_side_filter_ok: Fn(PreparedPayload, Int, FilterRequest) -> Bool = fn(pa
                     False
                 } else if !array::any(d.ops, fn(op) { op == req.op }) {
                     False
+                } else if array::length(d.canonical_values) > 0 {
+                    match (req.op, req.input) {
+                        (FilterOp::Eq, FilterInput::Text(s)) => array::any(d.canonical_values, fn(v) { v.id == s }),
+                        _ => False,
+                    }
                 } else if array::length(d.values) > 0 {
                     match (req.op, req.input) {
                         (FilterOp::Eq, FilterInput::Text(s)) => array::any(d.values, fn(v) { v.value == s }),
@@ -4175,7 +4356,12 @@ def compare_categories_compatible: Fn(PreparedPayload, Int, DimensionEntry, Meas
 # operators require a FilterInput.Text value and the dimension's declared input kinds; all
 # other operators require an allowed input kind.
 def scope_filter_value_ok: Fn(DimensionEntry, FilterOp, FilterInput) -> Bool = fn(d, op, input) {
-    if array::length(d.values) > 0 {
+    if array::length(d.canonical_values) > 0 {
+        match (op, input) {
+            (FilterOp::Eq, FilterInput::Text(s)) => array::any(d.canonical_values, fn(v) { v.id == s }),
+            _ => False,
+        }
+    } else if array::length(d.values) > 0 {
         match op {
             FilterOp::Eq => match input {
                 FilterInput::Text(s) => array::any(d.values, fn(v) { v.value == s }),
@@ -4231,6 +4417,12 @@ def resolve_inner_scope_filter: Fn(PreparedPayload, Int, FilterRequest) -> qb::E
                     fail!("comparison scope filter references a dimension with no filter capability", d.id)
                 } else if !array::any(d.ops, fn(op) { op == spec.op }) {
                     fail!("comparison scope filter uses an operation not supported by the dimension", d.id, spec.op)
+                } else if array::length(d.canonical_values) > 0 {
+                    if spec.op == FilterOp::Eq {
+                        canonical_eq(d, dimension_expr(payload, d), spec.input)
+                    } else {
+                        fail!("comparison scope filter on canonical dimension supports only Eq", d.id, spec.op)
+                    }
                 } else if array::length(d.values) > 0 {
                     if spec.op != FilterOp::Eq {
                         fail!("comparison scope filter on enum dimension supports only Eq", d.id, spec.op)
@@ -4957,6 +5149,7 @@ pub use self::{
     PeerRequest,
     FieldEntry,
     EnumValueEntry,
+    CanonicalValueSpec,
     EntityEntry,
     MeasureEntry,
     DimensionEntry,
@@ -4984,6 +5177,7 @@ pub use self::{
     relation,
     relation_key,
     enum_value,
+    canonical_values,
     scope,
     exists_route,
     route_build,
@@ -4992,6 +5186,7 @@ pub use self::{
     hub_build,
     resolve_hub_decl,
     peer_hub,
+    directed_peer_hub,
     peer_build,
     resolve_peer_decl,
     find_peer_route,
@@ -5035,6 +5230,7 @@ pub use self::{
     reorder_projection,
     dimension_expr,
     dimension_domain,
+    canonical_value_domain,
     to_bind,
     combine_filters,
     check_limit,

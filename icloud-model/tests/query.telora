@@ -1,0 +1,109 @@
+use crate::model::{ payload };
+use ontology::intent as intent;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+def yes: Bool = True;
+def eq_only: Array(edsl::FilterOp) = [edsl::FilterOp::Eq];
+def text_only: Array(edsl::FilterInputKind) = [edsl::FilterInputKind::Text];
+def invalid_value: edsl::CanonicalValueSpec = {
+    id: "bad", label: "Bad", wires: [edsl::FilterInput::Text("wrong-type")],
+};
+def invalid_values: Array(edsl::CanonicalValueSpec) = [invalid_value];
+
+@edsl::entity_source("invalid_sample", "iv")
+type InvalidMapping = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+    @edsl::column("state")
+    @edsl::dimension("invalid_state", yes, yes, eq_only, text_only)
+    @edsl::canonical_values(invalid_values)
+    state: Int,
+};
+
+pub def mismatched_wire_type_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("invalid-v1", [InvalidMapping.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "invalid canonical value mapping");
+
+def lower_json: Fn(String) -> qb::Query = fn(source) {
+    let value: Value = json::parse(source).unwrap!();
+    intent::query_intent_lower_factory(payload, "public")(value)
+};
+
+pub def alarm_grain_count: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"aggregate","measures":["alarm_count"],"dimensions":["device_id"],"filters":[],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "MEDN")) > 1
+        && array::length(string::split(q.sql, "TENANT_ID")) > 1 {
+        True
+    } else {
+        fail!("alarm-to-device composite link was not retained", q.sql)
+    }
+});
+
+pub def unknown_business_dimension: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list","measures":[],"dimensions":["alarm_occurrence_window"],"filters":[],"ordering":[],"limit":null,"offset":null}`)
+}, "unknown dimension");
+
+pub def offline_matches_both_wire_values: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["device_id"],"filters":[{"dimension":"device_commu_state","op":"eq","kind":"text","value":"offline"}],"ordering":[],"limit":null,"offset":null}`);
+    if q.bindings == [qb::Val::String("1"), qb::Val::String("offline")]
+        && array::length(string::split(q.sql, " OR ")) > 1 {
+        True
+    } else {
+        fail!("offline must match both physical values", q)
+    }
+});
+
+pub def unknown_canonical_value: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list","measures":[],"dimensions":["device_id"],"filters":[{"dimension":"device_commu_state","op":"eq","kind":"text","value":"disconnected"}],"ordering":[],"limit":null,"offset":null}`)
+}, "unknown canonical value for dimension");
+
+pub def fault_matches_both_integer_wires: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["physical_link_id"],"filters":[{"dimension":"physical_link_status","op":"eq","kind":"text","value":"fault"}],"ordering":[],"limit":null,"offset":null}`);
+    if q.bindings == [qb::Val::Int(2), qb::Val::Int(3)] {
+        True
+    } else {
+        fail!("fault must match both physical integers", q)
+    }
+});
+
+pub def canonical_domain_is_discoverable: test::Test = test::should_ok(fn() {
+    let values = edsl::canonical_value_domain(payload, "device_commu_state");
+    match array::get(values, 1) {
+        Some(value) => if array::length(values) == 3 && value.id == "offline"
+            && array::length(value.wires) == 2 { True }
+            else { fail!("canonical domain discovery lost an equivalent wire", values) },
+        None => fail!("canonical domain discovery lost the offline state", values),
+    }
+});
+
+pub def physical_link_endpoints_are_directional: test::Test = test::should_ok(fn() {
+    let request: edsl::QueryRequest = {
+        measures: [],
+        dimensions: [{ id: "physical_link_id", subject: "public", input: edsl::DimensionInput::None }],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    let peer: edsl::PeerRequest = {
+        subject: "public",
+        origin: { entity: "device", key: Some(edsl::FilterInput::Text("device-a")), filters: [] },
+        peer: { entity: "device", key: Some(edsl::FilterInput::Text("device-z")), filters: [] },
+    };
+    let q = qb::transform_sqlite(edsl::lower_peer(payload, request, [peer]));
+    if array::length(string::split(q.sql, "pl.a_ne_res_id = d_o.id")) > 1
+        && array::length(string::split(q.sql, "pl.z_ne_res_id = d_p.id")) > 1
+        && array::length(string::split(q.sql, " OR ")) == 1
+        && q.bindings == [qb::Val::String("device-a"), qb::Val::String("device-z")] {
+        True
+    } else {
+        fail!("physical link endpoints must not be exchanged", q)
+    }
+});
