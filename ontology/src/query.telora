@@ -1101,12 +1101,17 @@ def computed_items_ok: Fn(Plan) -> Bool = fn(plan) {
 #   - v1 does not combine partitioned Top N with global limit/offset/ordering.
 def partition_structure_ok: Fn(Plan, PartitionedTopN) -> Bool = fn(plan, pt) {
     let take_ok = pt.take > 0 && pt.take <= max_partition_take;
+    let row_plan = array::length(plan.grouping) == 0
+        && array::length(plan.having) == 0
+        && array::all(plan.projection, fn(item) { match item { SelectItem::Expr(_) => True, _ => False } });
+    let aliases = aliases_of(plan);
     let keys_ok = array::length(pt.partition_by) > 0
-        && exprs_subset(pt.partition_by, plan.grouping);
+        && (if row_plan { array::all(pt.partition_by, fn(expr) { expr_valid(expr, aliases) }) }
+            else { exprs_subset(pt.partition_by, plan.grouping) });
     let order_ok = array::length(pt.order_by) > 0
         && array::all(pt.order_by, fn(ob) {
             match ob.key {
-                OrderKey::Expr(expr) => expr_member(plan.grouping, expr),
+                OrderKey::Expr(expr) => if row_plan { expr_valid(expr, aliases) } else { expr_member(plan.grouping, expr) },
                 OrderKey::AggregateRef(ref) => is_sql_identifier(ref.alias)
                     && known_alias(projected_measure_aliases(plan), ref.alias),
                 # v1 partition ordering does not take a direct (unprojected)
@@ -1987,21 +1992,12 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
     } {
         fail!("partition take must be a positive integer within the cap", plan)
     } else if !match plan.partition {
-        Some(pt) => array::length(pt.partition_by) > 0
-            && exprs_subset(pt.partition_by, plan.grouping),
+        Some(pt) => partition_structure_ok(plan, pt),
         None => True,
     } {
         fail!("partition key must be a selected grouping expression", plan)
     } else if !match plan.partition {
-        Some(pt) => array::length(pt.order_by) > 0
-            && array::all(pt.order_by, fn(ob) {
-                match ob.key {
-                    OrderKey::Expr(expr) => expr_member(plan.grouping, expr),
-                    OrderKey::AggregateRef(ref) => is_sql_identifier(ref.alias)
-                        && known_alias(projected_measure_aliases(plan), ref.alias),
-                    OrderKey::Aggregate(_) => False,
-                }
-            }),
+        Some(pt) => partition_structure_ok(plan, pt),
         None => True,
     } {
         fail!("partition ordering must be non-empty with selected targets", plan)

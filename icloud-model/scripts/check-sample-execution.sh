@@ -28,6 +28,17 @@ created_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?1 1718467200000' -cmd '.parameter set ?2 1718467201000' "${created_sql}")"
 jq -e 'length == 1 and .[0].name == "B-red"' <<< "${created_result}" >/dev/null
 
+top_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:device_sample_top)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",3]' <<< "${top_plan}" >/dev/null
+top_sql="$(jq -r '.sql' <<< "${top_plan}")"
+top_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?3 3' "${top_sql}")"
+jq -e 'length == 9
+    and ([.[] | select(."__q_0" == "B-red") | ."__q_1"] | sort == [1,50,92,93])
+    and ([.[] | select(."__q_0" == "A-blue") | ."__q_2"] == ["2024-02-15T00:00:00Z","2024-02-16T00:00:00Z","2024-02-17T00:00:00Z"])' <<< "${top_result}" >/dev/null
+
 count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_count)"
 jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",40,"2024-02-10T00:00:00Z","2024-03-01T00:00:00Z",8]' <<< "${count_plan}" >/dev/null
 count_sql="$(jq -r '.sql' <<< "${count_plan}")"
@@ -109,4 +120,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'local epoch-ms filter, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'local epoch-ms filter, hidden-grain sample top, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

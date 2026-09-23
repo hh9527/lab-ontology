@@ -4853,6 +4853,77 @@ def entity_grain_exprs: Fn(EntityEntry, String) -> Array(qb::Expr) = fn(entity, 
     })
 };
 
+def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, window, rank_id, take) {
+        let sample = get_index(payload.entities, entity_by_id(payload, window.dataset));
+        let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
+        let relation = relation_domain(payload, relation_id);
+        let spec = dataset_domain(payload, window.dataset);
+        let rank = match array::find(payload.dimensions, fn(d) { d.id == rank_id }) {
+            Some(d) => d,
+            None => fail!("unknown sample ranking dimension", rank_id),
+        };
+        if spec.kind != DatasetKind::Metric || relation.from != sample.index
+            || relation.to != owner.index || relation.kind != RelationKind::Safe {
+            fail!("sample top requires a named grain-safe metric-to-owner relation", relation_id)
+        } else if array::length(request.measures) != 0 || array::length(request.ordering) != 0
+            || request.limit != None || request.offset != None || request.partition != None {
+            fail!("sample top controls ranking and cannot combine with other result stages")
+        } else if !rank.authorized || rank.entity != sample.index || rank.computed
+            || !array::any(request.dimensions, fn(d) { d.id == rank_id }) {
+            fail!("sample ranking requires a selected raw metric dimension", rank_id)
+        } else {
+            let sample_dimensions = array::filter(request.dimensions, fn(d) {
+                match array::find(payload.dimensions, fn(entry) { entry.id == d.id }) {
+                    Some(entry) => entry.entity == sample.index,
+                    None => False,
+                }
+            });
+            if array::length(sample_dimensions) == 0 {
+                fail!("sample top requires a metric sample dimension", window.dataset)
+            } else {
+                let remaining = array::filter(request.dimensions, fn(d) {
+                    !array::any(sample_dimensions, fn(s) { s.id == d.id })
+                });
+                let arranged: QueryRequest = {...request, dimensions: array::concat([sample_dimensions, remaining])};
+                let raw = lower_utc_window(payload, arranged, window);
+                let output = array::map(request.dimensions, fn(d) { ProjectionToken::Dimension(d.id) });
+                let plan = reorder_projection(payload, request, raw, output);
+                let condition = key_to_condition(payload, relation.from, relation.to, relation.key);
+                let joined = array::length(plan.sources) == 2 && array::length(plan.joins) == 1
+                    && array::any(plan.joins, fn(j) {
+                        j.source.alias == owner.alias && j.condition == condition && j.kind == qb::JoinKind::Inner
+                    });
+                let needs_owner = array::length(plan.sources) == 1 && array::length(plan.joins) == 0;
+                if !joined && !needs_owner {
+                    fail!("sample top requires exactly the declared owner join without fan-out", relation_id)
+                } else {
+                    let owner_join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table), condition);
+                    let sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
+                    let joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
+                    let owner_grain = entity_grain_exprs(owner, owner_id);
+                    let sample_grain = array::map(spec.grain, fn(name) {
+                        let field = match array::find(sample.fields, fn(f) { f.name == name }) {
+                            Some(f) => f,
+                            None => fail!("sample grain field is missing", name),
+                        };
+                        if !qb::is_sql_identifier(field.column) {
+                            fail!("sample grain requires a mapped physical column", name)
+                        } else { qb::column(sample.alias, field.column) }
+                    });
+                    let ordering = array::concat([
+                        [qb::order_by(qb::OrderKey::Expr(dimension_expr(payload, rank)), qb::Ordering::Desc)],
+                        array::map(sample_grain, fn(expr) {
+                            qb::order_by(qb::OrderKey::Expr(expr), qb::Ordering::Asc)
+                        }),
+                    ]);
+                    qb::validate({...plan, sources, joins,
+                        partition: Some(qb::partitioned_top_n(owner_grain, ordering, take))}, payload.profile)
+                }
+            }
+        }
+    };
+
 def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
         if array::length(specs) == 0 && array::length(components) == 0 && context == None {
@@ -6506,6 +6577,7 @@ pub use self::{
     lower_metric_qualifications,
     lower_sample_qualifications,
     lower_qualified_observation,
+    lower_sample_top,
     lower_via,
     RoleProjectionSpec,
     RoleFilterSpec,
