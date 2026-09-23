@@ -141,6 +141,44 @@ grouped_server_alarm_result="$(sqlite3 -json :memory: -cmd "${grouped_server_ala
     "${grouped_server_alarm_sql}")"
 jq -e 'length == 3 and (map(.alarm_count) | sort == [1,2,2]) and all(.[]; .name == "Same")' <<< "${grouped_server_alarm_result}" >/dev/null
 
+server_psu_schema="CREATE TABLE PhysicalServer (id TEXT, name TEXT, oriResId TEXT, tenantId TEXT, classification TEXT);
+CREATE TABLE PhysicalServerPSU (id TEXT, parentResId TEXT, tenantId TEXT, manufacturer TEXT, healthStatus INTEGER);
+CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, OCCURUTC TEXT);
+INSERT INTO PhysicalServer VALUES
+ ('SV1','Same','O1','TA','ne.category.server.enclosure'),
+ ('SV2','Same','O1','TA','ne.category.server.enclosure'),
+ ('SV1','Same','O1','TB','ne.category.server.enclosure'),
+ ('SV3','Same','O2','TA','ne.category.server.enclosure'),
+ ('SV4','Same','O3','TA','ne.category.server.enclosure'),
+ ('SV5','Same','O4','TA','ne.category.server.enclosure'),
+ ('SV6','Same','O5','TA','ne.category.server.subrack');
+INSERT INTO PhysicalServerPSU VALUES
+ ('P1','O1','TA','Huawei',-2),('P2','O1','TA','2011',-2),
+ ('P3','O1','TB','Huawei',1),('P4','O2','TB','Huawei',-2),
+ ('P5','O3','TA','Other',-2),('P6','O4','TA','Huawei',1),
+ ('P7','O5','TA','Huawei',-2);
+INSERT INTO T_CURRENT_ALARM VALUES
+ (1,'SV1','TA','2024-02-10T00:00:00Z'),(2,'SV1','TA','2024-02-11T00:00:00Z'),
+ (3,'SV2','TA','2024-02-12T00:00:00Z'),(4,'SV1','TB','2024-02-13T00:00:00Z'),
+ (5,'SV3','TA','2024-02-14T00:00:00Z'),(6,'SV4','TA','2024-02-15T00:00:00Z'),
+ (7,'SV5','TA','2024-02-16T00:00:00Z'),(8,'SV6','TA','2024-02-17T00:00:00Z'),
+ (9,'SV1','TA','2024-01-31T23:59:59Z');"
+server_psu_unknown_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_psu_unknown_alarm_counts)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z","ne.category.server.enclosure",-2]' <<< "${server_psu_unknown_plan}" >/dev/null
+server_psu_unknown_sql="$(jq -r '.sql' <<< "${server_psu_unknown_plan}")"
+server_psu_unknown_result="$(sqlite3 -json :memory: -cmd "${server_psu_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 'ne.category.server.enclosure'" -cmd '.parameter set ?4 -2' "${server_psu_unknown_sql}")"
+jq -e 'length == 3 and (map(.alarm_count) | sort == [1,1,2]) and all(.[]; .name == "Same")' <<< "${server_psu_unknown_result}" >/dev/null
+server_psu_vendor_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_psu_vendor_alarm_counts)"
+server_psu_vendor_sql="$(jq -r '.sql' <<< "${server_psu_vendor_plan}")"
+server_psu_vendor_result="$(sqlite3 -json :memory: -cmd "${server_psu_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 'ne.category.server.enclosure'" -cmd ".parameter set ?4 '2011'" \
+    -cmd ".parameter set ?5 'Huawei'" -cmd ".parameter set ?6 'huawei technologies co., ltd'" \
+    "${server_psu_vendor_sql}")"
+jq -e 'length == 4 and (map(.alarm_count) | sort == [1,1,1,2]) and all(.[]; .name == "Same")' <<< "${server_psu_vendor_result}" >/dev/null
+
 site_device_schema="CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, SITE_TYPE TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, name TEXT, projectId TEXT, refParentSubnet TEXT);
 INSERT INTO X_SITE_VIEW VALUES
@@ -513,4 +551,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
