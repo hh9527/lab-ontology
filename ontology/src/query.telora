@@ -299,17 +299,23 @@ type Exists = struct {
 # in turn has a related row C (`source`), joined inside the same subquery by
 # `pairs` (each equality connects a column of `Exists.source.alias` to a column
 # of `link.source.alias`).  `filter` optionally constrains C (and, if desired,
-# B / outer main columns).  Rendered as
+# B / outer main columns). An optional tail adds a third inner hop D; middle
+# alternatives are confined to the B->C join and the tail only joins C->D.
+# Rendered as
 #   EXISTS (SELECT 1 FROM <B> AS <ba>
 #             INNER JOIN <C> AS <ca> ON <link.pairs>
 #           WHERE <Exists.pairs (A -> B)> [AND link.filter])
-# The whole body is a predicate only: B and C never appear in the outer
+# The whole body is a predicate only: inner sources never appear in the outer
 # projection/grouping/joins, so a fan-out A -> B relation does not fan out A.
 type ExistsLink = struct {
     source: Source,
     pairs: Array(ColumnEq),
+    alternatives: Option(Array(Array(ColumnEq))),
+    tail: Option(ExistsTail),
     filter: Option(Expr),
 };
+
+type ExistsTail = struct { source: Source, pairs: Array(ColumnEq) };
 
 # One declared output column of a `UnionBranch`: an explicit stable name and
 # the expression (over that branch's own source alias) that produces it.
@@ -1235,8 +1241,9 @@ def peer_corr_ok: Fn(PeerCorr, Array(String)) -> Bool = fn(corr, main_aliases) {
 #     aliases;
 #   - the link source (`link.source`, C) is legal and distinct from both;
 #   - `ex.pairs` correlates an outer main alias column to a hop-source column;
-#   - `link.pairs` joins the hop-source alias to the link-source alias;
-#   - `link.filter` is a valid Expr over the main + hop + link aliases;
+#   - `link.pairs` or closed alternatives join hop to link;
+#   - optional tail pairs join link to a distinct third source;
+#   - `link.filter` is a valid Expr over main and declared inner aliases;
 #   - the other single-source modes are not combined with the link mode.
 def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, link, main_aliases) {
     let hop = ex.source.alias;
@@ -1255,20 +1262,36 @@ def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, li
                 && known_alias(main_aliases, p.left.source)
         }),
     };
-    let link_pairs_ok = array::length(link.pairs) > 0 && array::all(link.pairs, fn(p) {
-        column_ref_id_ok(p.left) && column_ref_id_ok(p.right)
-            && p.left.source == hop
-            && p.right.source == link.source.alias
-    });
+    let link_pairs_ok = match link.alternatives {
+        None => array::length(link.pairs) > 0 && array::all(link.pairs, fn(p) {
+            column_ref_id_ok(p.left) && column_ref_id_ok(p.right)
+                && p.left.source == hop && p.right.source == link.source.alias
+        }),
+        Some(alternatives) => array::length(link.pairs) == 0
+            && alternatives_ok(alternatives, link.source.alias, [hop]),
+    };
     let mode_ok = ex.filter == None
         && array::length(ex.grouping) == 0 && array::length(ex.having) == 0
         && ex.peer == None;
-    let allowed = array::concat([main_aliases, [hop, link.source.alias]]);
+    let tail_ok = match link.tail {
+        None => True,
+        Some(tail) => is_sql_identifier(tail.source.alias) && is_sql_identifier(tail.source.table)
+            && tail.source.alias != hop && tail.source.alias != link.source.alias
+            && !known_alias(main_aliases, tail.source.alias)
+            && array::length(tail.pairs) > 0 && array::all(tail.pairs, fn(p) {
+                column_ref_id_ok(p.left) && column_ref_id_ok(p.right)
+                    && p.left.source == link.source.alias && p.right.source == tail.source.alias
+            }),
+    };
+    let allowed = match link.tail {
+        None => array::concat([main_aliases, [hop, link.source.alias]]),
+        Some(tail) => array::concat([main_aliases, [hop, link.source.alias, tail.source.alias]]),
+    };
     let filter_ok = match link.filter {
         Some(expr) => expr_valid(expr, allowed),
         None => True,
     };
-    hop_ok && link_source_ok && hop_pairs_ok && link_pairs_ok && mode_ok && filter_ok
+    hop_ok && link_source_ok && hop_pairs_ok && link_pairs_ok && tail_ok && mode_ok && filter_ok
 };
 
 def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases) {
@@ -2647,9 +2670,22 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                 # fan-out A -> B first hop never fans out the outer A rows.
                 let hop_from = `\{ex.source.table} AS \{ex.source.alias}`;
                 let link_from = `\{link.source.table} AS \{link.source.alias}`;
-                let on_sql = string::join(array::map(link.pairs, fn(p) {
-                    `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
-                }), " AND ");
+                let on_sql = match link.alternatives {
+                    None => string::join(array::map(link.pairs, fn(p) {
+                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                    }), " AND "),
+                    Some(alternatives) => `(\{string::join(array::map(alternatives, fn(branch) {
+                        `(\{string::join(array::map(branch, fn(p) {
+                            `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                        }), " AND ")})`
+                    }), " OR ")})`,
+                };
+                let tail_join = match link.tail {
+                    None => "",
+                    Some(tail) => ` INNER JOIN \{tail.source.table} AS \{tail.source.alias} ON \{string::join(array::map(tail.pairs, fn(p) {
+                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                    }), " AND ")}`,
+                };
                 let corr_sql = match ex.alternatives {
                     Some(alternatives) => do {
                         let branches = array::map(alternatives, fn(branch) {
@@ -2675,7 +2711,7 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                         ("", empty)
                     },
                 };
-                let sql = `EXISTS (SELECT 1 FROM \{hop_from} INNER JOIN \{link_from} ON \{on_sql} WHERE \{corr_sql}\{link_filter_part.0})`;
+                let sql = `EXISTS (SELECT 1 FROM \{hop_from} INNER JOIN \{link_from} ON \{on_sql}\{tail_join} WHERE \{corr_sql}\{link_filter_part.0})`;
                 (sql, link_filter_part.1)
             },
             None => do {
@@ -3782,7 +3818,7 @@ def exists_not: Fn(Exists) -> Exists = fn(ex) {
 def exists_two_hop: Fn(Source, Array(ColumnEq), Source, Array(ColumnEq), Option(Expr)) -> Exists = fn(hop_source, hop_pairs, link_source, link_pairs, link_filter) {
     let empty_group: Array(Expr) = [];
     let empty_having: Array(Having) = [];
-    let link: ExistsLink = {source: link_source, pairs: link_pairs, filter: link_filter};
+    let link: ExistsLink = {source: link_source, pairs: link_pairs, alternatives: None, tail: None, filter: link_filter};
     let item: Exists = {
         source: hop_source,
         pairs: hop_pairs,
@@ -3802,6 +3838,14 @@ def exists_two_hop_alternatives: Fn(Source, Array(Array(ColumnEq)), Source, Arra
         let empty_pairs: Array(ColumnEq) = [];
         let base = exists_two_hop(hop_source, empty_pairs, link_source, link_pairs, link_filter);
         {...base, alternatives: Some(alternatives)}
+    };
+
+def exists_three_hop_alternatives: Fn(Source, Array(ColumnEq), Source, Array(Array(ColumnEq)), Source, Array(ColumnEq), Option(Expr)) -> Exists =
+    fn(hop_source, hop_pairs, site_source, site_alternatives, tenant_source, tenant_pairs, filter) {
+        let base = exists_two_hop(hop_source, hop_pairs, site_source, [], filter);
+        let link: ExistsLink = {source: site_source, pairs: [], alternatives: Some(site_alternatives),
+            tail: Some({source: tenant_source, pairs: tenant_pairs}), filter};
+        {...base, link: Some(link)}
     };
 
 # Aggregate-result predicate over a projected aggregate/computed measure alias:
@@ -3905,6 +3949,7 @@ pub use self::{
     Join,
     Exists,
     ExistsLink,
+    ExistsTail,
     PeerBranch,
     PeerCorr,
     UnionColumn,
@@ -3984,6 +4029,7 @@ pub use self::{
     exists_not,
     exists_two_hop,
     exists_two_hop_alternatives,
+    exists_three_hop_alternatives,
     peer_branch,
     peer_corr,
     peer_corr_distinct,

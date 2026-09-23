@@ -502,6 +502,16 @@ type SiteTenantScope = struct {
     site_filters: Array(FilterRequest),
     tenant_filters: Array(FilterRequest),
 };
+type ChildSiteScope = struct {
+    parent_relation: String,
+    site_relation: String,
+    tenant_relation: String,
+    child_tenant_relation: String,
+    parent_tenant_relation: String,
+    parent_filters: Array(FilterRequest),
+    site_filters: Array(FilterRequest),
+    tenant_filters: Array(FilterRequest),
+};
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
@@ -4750,6 +4760,96 @@ def site_tenant_scope: Fn(PreparedPayload, EntityEntry, SiteTenantScope) -> qb::
     }
 };
 
+# Child identity stays on the outer plan. A possibly non-unique contains key,
+# two candidate site keys, and three declared tenant ownership roles are all
+# checked inside one correlated existence condition.
+def lower_child_site_scope: Fn(PreparedPayload, QueryRequest, ChildSiteScope) -> qb::Plan = fn(payload, request, scope) {
+    let plan = lower(payload, request);
+    if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
+        fail!("child site scope requires a physical child root without implicit joins")
+    } else {
+        let child_alias = get_index(plan.sources, 0).alias;
+        let child = match array::find(payload.entities, fn(e) { e.alias == child_alias }) {
+            Some(e) => e, None => fail!("child site scope root is unknown", child_alias),
+        };
+        let count_ok = array::length(request.measures) == 0
+            || (array::length(request.measures) == 1 && array::length(request.dimensions) == 0
+                && array::all(request.measures, fn(req) {
+                    let entry = resolve_measure_entry(payload, req).entry;
+                    entry.entity == child.index && entry.field == child.key_field
+                        && entry.aggregate == qb::AggregateFunction::Count
+                        && entry.predicate == None && entry.computed == None
+                        && array::length(entry.requires) == 0
+                }));
+        if !count_ok {
+            fail!("child site scope supports child projection or child key count only")
+        } else {
+            let parent_relation = relation_domain(payload, scope.parent_relation);
+            let site_relation = relation_domain(payload, scope.site_relation);
+            let tenant_relation = relation_domain(payload, scope.tenant_relation);
+            let child_tenant_relation = relation_domain(payload, scope.child_tenant_relation);
+            let parent_tenant_relation = relation_domain(payload, scope.parent_tenant_relation);
+            let parent = get_index(payload.entities, parent_relation.to);
+            let site = get_index(payload.entities, site_relation.to);
+            let tenant = get_index(payload.entities, tenant_relation.to);
+            if parent_relation.from != child.index || parent_relation.kind != RelationKind::FanOut
+                || site_relation.from != parent.index || site_relation.kind != RelationKind::FanOut
+                || tenant_relation.from != site.index || tenant_relation.kind != RelationKind::Safe
+                || child_tenant_relation.from != child.index || child_tenant_relation.to != tenant.index
+                || child_tenant_relation.kind != RelationKind::Safe
+                || parent_tenant_relation.from != parent.index || parent_tenant_relation.to != tenant.index
+                || parent_tenant_relation.kind != RelationKind::Safe {
+                fail!("child site scope requires a declared child-parent-site-tenant chain and both tenant ownership relations")
+            } else {
+                let parent_filters = resolve_filters(payload, scope.parent_filters);
+                let site_filters = resolve_filters(payload, scope.site_filters);
+                let tenant_filters = resolve_filters(payload, scope.tenant_filters);
+                if !array::all(parent_filters, fn(f) { f.entity == parent.index })
+                    || !array::all(site_filters, fn(f) { f.entity == site.index })
+                    || !array::all(tenant_filters, fn(f) { f.entity == tenant.index }) {
+                    fail!("child site scope filters must belong to their declared relation roles")
+                } else {
+                    let child_pairs = array::map(exists_pairs(parent_relation.key), fn(pair) {
+                        exists_col_eq(child, parent, pair, False)
+                    });
+                    let site_alternatives = match site_relation.key {
+                        RelationKey::Or(keys) => array::map(keys, fn(key) {
+                            array::map(exists_pairs(key), fn(pair) { exists_col_eq(parent, site, pair, False) })
+                        }),
+                        _ => fail!("child site scope requires explicit site alternatives", scope.site_relation),
+                    };
+                    let tenant_pairs = array::map(exists_pairs(tenant_relation.key), fn(pair) {
+                        exists_col_eq(site, tenant, pair, False)
+                    });
+                    let alignments = array::concat([
+                        array::map(exists_pairs(child_tenant_relation.key), fn(pair) {
+                            exists_col_eq(child, tenant, pair, False)
+                        }),
+                        array::map(exists_pairs(parent_tenant_relation.key), fn(pair) {
+                            exists_col_eq(parent, tenant, pair, False)
+                        }),
+                    ]);
+                    let filters = array::concat([
+                        array::map(parent_filters, fn(f) { f.expr }),
+                        array::map(site_filters, fn(f) { f.expr }),
+                        array::map(tenant_filters, fn(f) { f.expr }),
+                        array::map(alignments, fn(pair) {
+                            qb::scalar(qb::ScalarFunction::Eq, [
+                                qb::column(pair.left.source, pair.left.column),
+                                qb::column(pair.right.source, pair.right.column),
+                            ])
+                        }),
+                    ]);
+                    let ex = qb::exists_three_hop_alternatives(qb::source(parent.alias, parent.table), child_pairs,
+                        qb::source(site.alias, site.table), site_alternatives,
+                        qb::source(tenant.alias, tenant.table), tenant_pairs, combine_filters(filters));
+                    qb::validate({...plan, exists: array::push(plan.exists, ex)}, payload.profile)
+                }
+            }
+        }
+    }
+};
+
 # Each qualification uses its own correlated aggregate. Independent KPI sample
 # sets never join one another and therefore cannot multiply each other's rows.
 def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQualification), Option(OwnerSiteScope)) -> qb::Plan = fn(payload, request, specs, scope) {
@@ -6715,6 +6815,7 @@ pub use self::{
     SampleCountRange,
     OwnerSiteScope,
     SiteTenantScope,
+    ChildSiteScope,
     ComponentContextSpec,
     UtcWindowRequest,
     UtcDaysWindowRequest,
@@ -6818,6 +6919,7 @@ pub use self::{
     lower_sample_top,
     lower_via,
     lower_relation_rows,
+    lower_child_site_scope,
     RoleProjectionSpec,
     RoleFilterSpec,
     lower_roles,

@@ -110,6 +110,42 @@ tenant_site_result="$(sqlite3 -json :memory: -cmd "${tenant_site_schema}" -cmd '
     -cmd ".parameter set ?1 'onlineSite'" "${tenant_site_sql}")"
 jq -e 'length == 1 and .[0].tenant_count == 2' <<< "${tenant_site_result}" >/dev/null
 
+fan_site_schema="CREATE TABLE PhysicalServer (id TEXT, oriResId TEXT, tenantId TEXT, refParentSubnet TEXT, projectId TEXT, classification TEXT, manufacturer TEXT);
+CREATE TABLE PhysicalServerFan (id TEXT, name TEXT, parentResId TEXT, tenantId TEXT);
+CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, TENANT_ID TEXT);
+CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
+INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B'),('TC','Tenant-C');
+INSERT INTO X_SITE_VIEW VALUES
+ ('S1','Site-A','TA'),('S2','Site-A','TA'),('S3','Site-A','TB'),('S4','Site-Other','TA');
+INSERT INTO PhysicalServer VALUES
+ ('SV1','O1','TA','S1','S2','ne.category.server.subrack','Huawei'),
+ ('SV2','O1','TA','S2','S1','ne.category.server.subrack','Huawei'),
+ ('SV3','O1','TB','S3','S1','ne.category.server.subrack','Huawei'),
+ ('SV4','O2','TA','S3','S4','ne.category.server.subrack','Huawei'),
+ ('SV5','O3','TA','S1','S1','ne.category.server.subrack','Other'),
+ ('SV6','O4','TA','S1','S1','other','Huawei');
+INSERT INTO PhysicalServerFan VALUES
+ ('F1','Same','O1','TA'),('F2','Same','O1','TA'),('F3','Another','O1','TA'),
+ ('F4','CrossTenant','O1','TB'),('F5','NoMatchingParentTenant','O1','TC'),
+ ('F6','SplitSite','O2','TA'),('F7','WrongVendor','O3','TA'),('F8','WrongClass','O4','TA');"
+fan_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_fan_names)"
+jq -e '.bindings == ["Huawei","ne.category.server.subrack","Site-A","Tenant-A",1000]' <<< "${fan_plan}" >/dev/null
+fan_sql="$(jq -r '.sql' <<< "${fan_plan}")"
+fan_result="$(sqlite3 -json :memory: -cmd "${fan_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'Huawei'" -cmd ".parameter set ?2 'ne.category.server.subrack'" \
+    -cmd ".parameter set ?3 'Site-A'" -cmd ".parameter set ?4 'Tenant-A'" \
+    -cmd '.parameter set ?5 1000' "${fan_sql}")"
+jq -e 'length == 3 and (map(.id) | sort == ["F1","F2","F3"])
+    and ([.[] | select(.name == "Same")] | length == 2)' <<< "${fan_result}" >/dev/null
+
+fan_count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_fan_count)"
+jq -e '.bindings == ["Huawei","ne.category.server.subrack","Site-A","Tenant-A"]' <<< "${fan_count_plan}" >/dev/null
+fan_count_sql="$(jq -r '.sql' <<< "${fan_count_plan}")"
+fan_count_result="$(sqlite3 -json :memory: -cmd "${fan_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'Huawei'" -cmd ".parameter set ?2 'ne.category.server.subrack'" \
+    -cmd ".parameter set ?3 'Site-A'" -cmd ".parameter set ?4 'Tenant-A'" "${fan_count_sql}")"
+jq -e 'length == 1 and .[0].server_fan_count == 3' <<< "${fan_count_result}" >/dev/null
+
 qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
 qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
 qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
@@ -310,4 +346,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

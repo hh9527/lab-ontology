@@ -143,3 +143,17 @@ Site EXISTS; neither two sites in one tenant nor duplicate site names change
 the count of tenant identities. The fixture also excludes offline-only and
 site-less tenants. The same route can project Tenant fields after filtering
 sites by name, type, or other Model-declared site dimensions.
+
+Q0190 selects fans of qualifying physical servers. IC publishes the
+ServerFan-to-ServerDevice contains key on `parent_res_id=ori_res_id`, without
+declaring `ori_res_id` unique; it also publishes separate Fan/Server/Site
+tenant ownership. The pressure model retains the non-unique relationship as
+FanOut and uses one three-hop correlated EXISTS for parent, site OR, and
+tenant, with both Fan and Server tenant IDs checked against that Site tenant.
+The outer fan `id` is the row/count identity: duplicate matching parents or
+sites cannot replicate a fan, and equal fan names do not merge identities.
+IC has not connected the PhysicalServer production SQL mapping; the SQLite
+tables here are acceptance fixtures based on the corpus, not a production
+mapping claim. Q0184's prose warning state maps to IC wire 1, while its SQL
+uses -1 (IC `error`) and counts distinct server names rather than fans;
+neither discrepancy is silently adopted as fan-count semantics.

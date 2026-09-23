@@ -4363,6 +4363,56 @@ def two_hop_or_link_plan: Fn() -> qb::Plan = fn() {
     {...base, exists: [ex]}
 };
 
+def three_hop_or_link_plan: Fn() -> qb::Plan = fn() {
+    let base = two_hop_link_plan();
+    let parent_pairs: Array(qb::ColumnEq) = [qb::column_eq(qb::column_ref("s", "parent_id"), qb::column_ref("b", "ori_id"))];
+    let alternatives: Array(Array(qb::ColumnEq)) = [
+        [qb::column_eq(qb::column_ref("b", "project_id"), qb::column_ref("c", "id"))],
+        [qb::column_eq(qb::column_ref("b", "parent_subnet"), qb::column_ref("c", "id"))],
+    ];
+    let tenant_pairs: Array(qb::ColumnEq) = [qb::column_eq(qb::column_ref("c", "tenant_id"), qb::column_ref("t", "id"))];
+    let parent_filter = qb::scalar(qb::ScalarFunction::Eq, [qb::column("b", "class"), qb::bind_string("server")]);
+    let site_filter = qb::scalar(qb::ScalarFunction::Eq, [qb::column("c", "name"), qb::bind_string("Site-A")]);
+    let tenant_filter = qb::scalar(qb::ScalarFunction::Eq, [qb::column("t", "name"), qb::bind_string("Tenant-A")]);
+    let filter = qb::scalar(qb::ScalarFunction::And, [parent_filter,
+        qb::scalar(qb::ScalarFunction::And, [site_filter, tenant_filter])]);
+    let ex = qb::exists_three_hop_alternatives(qb::source("b", "servers"), parent_pairs,
+        qb::source("c", "sites"), alternatives, qb::source("t", "tenants"), tenant_pairs, Some(filter));
+    {...base, exists: [ex]}
+};
+
+pub def three_hop_or_link_keeps_all_roles_in_one_exists: test::Test = test::should_ok(fn() {
+    let plan = three_hop_or_link_plan();
+    let q = qb::transform_sqlite(plan);
+    let sql = "SELECT count(s.id) AS subject_count FROM subjects AS s WHERE EXISTS (SELECT 1 FROM servers AS b INNER JOIN sites AS c ON ((b.project_id = c.id) OR (b.parent_subnet = c.id)) INNER JOIN tenants AS t ON c.tenant_id = t.id WHERE s.parent_id = b.ori_id AND (b.class = ? AND (c.name = ? AND t.name = ?)))";
+    if qb::structure_ok(plan) && qb::profile_accepts(plan, full_profile())
+        && q.sql == sql
+        && q.bindings == [qb::Val::String("server"), qb::Val::String("Site-A"), qb::Val::String("Tenant-A")] {
+        True
+    } else { fail!("three-hop OR must remain one correlated EXISTS with stable bindings", q) }
+});
+
+pub def three_hop_or_link_rejects_unrelated_tail_alias: test::Test = test::should_ok(fn() {
+    let valid = three_hop_or_link_plan();
+    let ex: qb::Exists = match array::get(valid.exists, 0) { Some(item) => item, None => fail!("missing existence") };
+    let link = match ex.link { Some(item) => item, None => fail!("missing three-hop link") };
+    let tail = match link.tail { Some(item) => item, None => fail!("missing third hop") };
+    let bad_tail: qb::ExistsTail = {...tail, pairs: [qb::column_eq(qb::column_ref("s", "tenant_id"), qb::column_ref("t", "id"))]};
+    if !qb::structure_ok({...valid, exists: [{...ex, link: Some({...link, tail: Some(bad_tail)})}]}) {
+        True
+    } else { fail!("third-hop equality bypassed the site role") }
+});
+
+pub def three_hop_or_link_rejects_outer_alias_in_middle_or: test::Test = test::should_ok(fn() {
+    let valid = three_hop_or_link_plan();
+    let ex: qb::Exists = match array::get(valid.exists, 0) { Some(item) => item, None => fail!("missing existence") };
+    let link = match ex.link { Some(item) => item, None => fail!("missing three-hop link") };
+    let wrong: Array(Array(qb::ColumnEq)) = [[qb::column_eq(qb::column_ref("s", "project_id"), qb::column_ref("c", "id"))]];
+    if !qb::structure_ok({...valid, exists: [{...ex, link: Some({...link, alternatives: Some(wrong)})}]}) {
+        True
+    } else { fail!("middle-hop OR reached the outer alias") }
+});
+
 pub def two_hop_or_link_keeps_site_and_tenant_in_one_exists: test::Test = test::should_ok(fn() {
     let plan = two_hop_or_link_plan();
     let q = qb::transform_sqlite(plan);
