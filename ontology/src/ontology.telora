@@ -5254,12 +5254,12 @@ def owner_site_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, OwnerSiteSco
         }
     };
 
-def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int, Option(OwnerSiteScope)) -> qb::Plan =
-    fn(payload, request, owner_id, relation_id, window, rank_id, take, scope) {
-        let sample = get_index(payload.entities, entity_by_id(payload, window.dataset));
+def lower_sample_top_base: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest), String, Int, Option(OwnerSiteScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window, rank_id, take, scope) {
+        let sample = get_index(payload.entities, entity_by_id(payload, dataset_id));
         let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
         let relation = relation_domain(payload, relation_id);
-        let spec = dataset_domain(payload, window.dataset);
+        let spec = dataset_domain(payload, dataset_id);
         let rank = match array::find(payload.dimensions, fn(d) { d.id == rank_id }) {
             Some(d) => d,
             None => fail!("unknown sample ranking dimension", rank_id),
@@ -5281,13 +5281,18 @@ def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindo
                 }
             });
             if array::length(sample_dimensions) == 0 {
-                fail!("sample top requires a metric sample dimension", window.dataset)
+                fail!("sample top requires a metric sample dimension", dataset_id)
             } else {
                 let remaining = array::filter(request.dimensions, fn(d) {
                     !array::any(sample_dimensions, fn(s) { s.id == d.id })
                 });
                 let arranged: QueryRequest = {...request, dimensions: array::concat([sample_dimensions, remaining])};
-                let raw = lower_utc_window(payload, arranged, window);
+                let raw = match window {
+                    Some(bounds) => if bounds.dataset == dataset_id {
+                        lower_utc_window(payload, arranged, bounds)
+                    } else { fail!("sample top window must use its sample dataset", dataset_id, bounds.dataset) },
+                    None => lower(payload, arranged),
+                };
                 let output = array::map(request.dimensions, fn(d) { ProjectionToken::Dimension(d.id) });
                 let plan = reorder_projection(payload, request, raw, output);
                 let condition = key_to_condition(payload, relation.from, relation.to, relation.key);
@@ -5343,6 +5348,45 @@ def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindo
                         filter: scoped.2, exists: scoped.3,
                         partition: Some(qb::partitioned_top_n(owner_grain, ordering, take))}, payload.profile)
                 }
+            }
+        }
+    };
+
+def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int, Option(OwnerSiteScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, window, rank_id, take, scope) {
+        lower_sample_top_base(payload, request, owner_id, relation_id, window.dataset, Some(window), rank_id, take, scope)
+    };
+
+def lower_latest_sample: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest), Option(OwnerSiteScope), Option(SiteTenantScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window, scope, site_scope) {
+        let sample = get_index(payload.entities, entity_by_id(payload, dataset_id));
+        let spec = dataset_domain(payload, dataset_id);
+        let clock = match spec.utc_time {
+            Some(name) => match array::find(sample.fields, fn(f) { f.name == name }) {
+                Some(field) => field, None => fail!("latest sample requires a mapped UTC clock", dataset_id),
+            },
+            None => fail!("latest sample requires an authoritative UTC clock", dataset_id),
+        };
+        let role = match property::get_field_prop(sample.entity_type, clock.index, TimeField.type) {
+            Some(value) => value, None => fail!("latest sample requires a declared UTC time role", dataset_id),
+        };
+        if scope != None && site_scope != None {
+            fail!("latest sample cannot combine ancestor and direct site scopes")
+        } else if role.semantics != TimeSemantics::Utc || role.encoding != TimeEncoding::CanonicalUtcSecondText {
+            fail!("latest sample requires a canonical UTC time role", dataset_id)
+        } else {
+            let rank = match array::find(payload.dimensions, fn(d) {
+                d.entity == sample.index && !d.computed && d.field == clock.index
+            }) {
+                Some(d) => d, None => fail!("latest sample clock must be an exposed raw dimension", dataset_id),
+            };
+            let plan = lower_sample_top_base(payload, request, owner_id, relation_id, dataset_id, window, rank.id, 1, scope);
+            match site_scope {
+                None => plan,
+                Some(qualifier) => do {
+                    let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
+                    qb::validate({...plan, exists: array::push(plan.exists, site_tenant_scope(payload, owner, qualifier))}, payload.profile)
+                },
             }
         }
     };
@@ -7010,6 +7054,7 @@ pub use self::{
     lower_sample_count_ranges,
     lower_qualified_observation,
     lower_sample_top,
+    lower_latest_sample,
     lower_via,
     lower_relation_rows,
     lower_endpoint_pair,

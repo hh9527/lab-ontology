@@ -165,6 +165,29 @@ link_pair_result="$(sqlite3 -json :memory: -cmd "${link_pair_schema}" -cmd '.par
     -cmd ".parameter set ?5 '光-OLT-7137'" "${link_pair_sql}")"
 jq -e 'length == 1 and .[0].physical_link_count == 3' <<< "${link_pair_result}" >/dev/null
 
+latest_sample_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
+CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, operStatusCount INTEGER, adminStatusCount INTEGER);
+CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, TENANT_ID TEXT);
+CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
+INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
+INSERT INTO X_SITE_VIEW VALUES ('S1','Site-A','TA'),('S2','Site-A','TA'),('S3','Site-A','TB'),('S4','Other','TA');
+INSERT INTO I_EntNetworkElement VALUES
+ ('D1','TA','Same','FW','S1','S2'),('D2','TA','Same','ne.category.firewall','S2','S2'),
+ ('D1','TB','Same','FW','S3','S3'),('D3','TA','Other','FW','S4','S4');
+INSERT INTO NetworkDeviceKPI VALUES
+ ('D1','TA','2024-01-01T00:00:00Z',100,1),('D1','TA','2024-03-01T00:00:00Z',7,70),
+ ('D2','TA','2024-02-01T00:00:00Z',5,50),('D2','TA','2024-04-01T00:00:00Z',8,80),
+ ('D1','TB','2024-06-01T00:00:00Z',99,999),('D3','TA','2024-07-01T00:00:00Z',88,888);"
+latest_sample_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:latest_device_kpi)"
+jq -e '.bindings == ["ne.category.firewall","FW","Site-A","Tenant-A",1]' <<< "${latest_sample_plan}" >/dev/null
+latest_sample_sql="$(jq -r '.sql' <<< "${latest_sample_plan}")"
+latest_sample_result="$(sqlite3 -json :memory: -cmd "${latest_sample_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.firewall'" -cmd ".parameter set ?2 'FW'" \
+    -cmd ".parameter set ?3 'Site-A'" -cmd ".parameter set ?4 'Tenant-A'" \
+    -cmd '.parameter set ?5 1' "${latest_sample_sql}")"
+jq -e 'length == 2 and (map([.__q_0,.__q_1,.__q_2,.__q_3]) | sort ==
+    [["Same",7,70,"2024-03-01T00:00:00Z"],["Same",8,80,"2024-04-01T00:00:00Z"]])' <<< "${latest_sample_result}" >/dev/null
+
 qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
 qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
 qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
