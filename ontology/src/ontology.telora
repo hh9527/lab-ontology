@@ -472,6 +472,12 @@ type SampleQualification = struct {
     end: String,
     min_matches: Int,
 };
+type ComponentContextSpec = struct {
+    relation: String,
+    target: String,
+    dimensions: Array(DimensionRequest),
+    filters: Array(FilterRequest),
+};
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
@@ -4743,10 +4749,27 @@ def component_qualification_exists: Fn(PreparedPayload, Array(qb::Source), Entit
         }
     };
 
-def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest)) -> qb::Plan =
-    fn(payload, request, owner_id, relation_id, observation, specs, components) {
-        if array::length(specs) == 0 && array::length(components) == 0 {
-            fail!("qualified observation requires a sample or component qualification")
+def entity_grain_exprs: Fn(EntityEntry, String) -> Array(qb::Expr) = fn(entity, role) {
+    let identity = match entity.dataset {
+        Some(spec) => if spec.kind == DatasetKind::Entity { spec.grain }
+            else { fail!("contextual observation requires declared entity grain", role) },
+        None => fail!("contextual observation requires declared entity grain", role),
+    };
+    array::map(identity, fn(name) {
+        let field = match array::find(entity.fields, fn(f) { f.name == name }) {
+            Some(f) => f,
+            None => fail!("prepared entity grain field is missing", role, name),
+        };
+        qb::column(entity.alias, field.column)
+    })
+};
+
+def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
+        if array::length(specs) == 0 && array::length(components) == 0 && context == None {
+            fail!("qualified observation requires a sample or component qualification or context")
+        } else if context != None && array::length(components) != 0 {
+            fail!("component context and component-only qualification require separate requests")
         }
         else {
             let root_id = entity_by_id(payload, observation.dataset);
@@ -4799,26 +4822,61 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                             None => False,
                         }
                     });
-                    let identity_grouping: Array(qb::Expr) = if array::length(request.measures) > 0 && owner_dimension {
-                        let identity = match owner.dataset {
-                            Some(spec) => if spec.kind == DatasetKind::Entity { spec.grain }
-                                else { fail!("grouped observation owner requires declared entity grain", owner_id) },
-                            None => fail!("grouped observation owner requires declared entity grain", owner_id),
-                        };
-                        array::map(identity, fn(name) {
-                            let field = match array::find(owner.fields, fn(f) { f.name == name }) {
-                                Some(f) => f,
-                                None => fail!("prepared owner grain field is missing", owner_id, name),
-                            };
-                            qb::column(owner.alias, field.column)
-                        })
+                    let identity_grouping: Array(qb::Expr) = if array::length(request.measures) > 0 && (owner_dimension || context != None) {
+                        entity_grain_exprs(owner, owner_id)
                     } else { [] };
                     let hidden = array::filter(identity_grouping, fn(expr) {
                         !array::any(plan.grouping, fn(group) { group == expr })
                     });
-                    qb::validate({...plan, sources, joins,
+                    let qualified: qb::Plan = {...plan, sources, joins,
                         grouping: array::concat([plan.grouping, hidden]),
-                        exists: array::concat([plan.exists, clauses, component_clauses])}, payload.profile)
+                        exists: array::concat([plan.exists, clauses, component_clauses])};
+                    match context {
+                        None => qb::validate(qualified, payload.profile),
+                        Some(spec) => do {
+                            let target = entity_by_id(payload, spec.target);
+                            let child = get_index(payload.entities, target);
+                            let component_relation = relation_domain(payload, spec.relation);
+                            if component_relation.from != target || component_relation.to != owner.index
+                                || component_relation.kind != RelationKind::Safe {
+                                fail!("component context requires a named child-to-owner relation", spec.relation, spec.target)
+                            } else if array::length(spec.dimensions) == 0 || array::any(sources, fn(s) { s.alias == child.alias }) {
+                                fail!("component context needs visible child dimensions and a distinct source", spec.target)
+                            } else {
+                                let child_grain = entity_grain_exprs(child, spec.target);
+                                let dims = resolve_dimensions(payload, spec.dimensions);
+                                let filters = resolve_filters(payload, spec.filters);
+                                if !array::all(dims, fn(d) { d.entry.entity == target && array::length(d.entry.scope) == 0 })
+                                    || !array::all(filters, fn(f) { f.entity == target }) {
+                                    fail!("component context dimensions and filters must belong to the selected child", spec.target)
+                                } else {
+                                    let join = qb::join_on(qb::JoinKind::Inner, qb::source(child.alias, child.table),
+                                        key_to_condition(payload, component_relation.from, component_relation.to, component_relation.key));
+                                    let child_items = array::map(dims, fn(d) {
+                                        qb::named_expr_item(dimension_output_expr(payload, d.entry), d.entry.id)
+                                    });
+                                    let child_grouping = array::map(dims, fn(d) { dimension_output_expr(payload, d.entry) });
+                                    let child_hidden = array::filter(child_grain, fn(expr) {
+                                        !array::any(child_grouping, fn(group) { group == expr })
+                                    });
+                                    let child_order = if array::length(qualified.ordering) == 0 { [] }
+                                        else { array::map(child_grain, fn(expr) {
+                                            qb::order_by(qb::OrderKey::Expr(expr), qb::Ordering::Asc)
+                                        }) };
+                                    qb::validate({...qualified,
+                                        sources: array::push(qualified.sources, join.source),
+                                        joins: array::push(qualified.joins, join),
+                                        projection: array::concat([qualified.projection, child_items]),
+                                        filter: append_filter_terms(qualified.filter, array::map(filters, fn(f) { f.expr })),
+                                        grouping: if array::length(request.measures) > 0 {
+                                            array::concat([qualified.grouping, child_grouping, child_hidden])
+                                        } else { qualified.grouping },
+                                        ordering: array::concat([qualified.ordering, child_order]),
+                                    }, payload.profile)
+                                }
+                            }
+                        },
+                    }
                 }
             }
             }
@@ -6258,6 +6316,7 @@ pub use self::{
     NamedExistsRequest,
     MetricQualification,
     SampleQualification,
+    ComponentContextSpec,
     UtcWindowRequest,
     UtcDaysWindowRequest,
     PathResult,

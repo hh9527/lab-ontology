@@ -5,7 +5,7 @@ fixture_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 telora_bin="${fixture_dir}/../../telora/target/release/telora"
 schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT);
 CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, cpuUsage REAL, portCount INTEGER);
-CREATE TABLE I_EnterpriseFrame (id TEXT, refParentNE TEXT, operState INTEGER);
+CREATE TABLE I_EnterpriseFrame (id TEXT, refParentNE TEXT, tenantId TEXT, name TEXT, operState INTEGER);
 INSERT INTO I_EntNetworkElement VALUES ('A','red','A-red'),('A','blue','A-blue'),('B','red','B-red'),('C','red','B-red');
 INSERT INTO NetworkDeviceKPI VALUES
  ('A','red','2024-02-05T00:00:00Z',50,0),('A','red','2024-02-06T00:00:00Z',50,0),
@@ -16,7 +16,7 @@ INSERT INTO NetworkDeviceKPI VALUES
  ('B','red','2024-02-20T00:00:00Z',NULL,50),
  ('C','red','2024-02-10T00:00:00Z',0,1);
 INSERT INTO I_EnterpriseFrame VALUES
- ('B-frame-1','B',3),('B-frame-2','B',11),('A-frame','A',2);"
+ ('B-frame-1','B','red','Duplicate',3),('B-frame-2','B','red','Duplicate',11),('A-frame','A','red','Other',2);"
 
 count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_count)"
 jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",40,"2024-02-10T00:00:00Z","2024-03-01T00:00:00Z",8]' <<< "${count_plan}" >/dev/null
@@ -66,4 +66,26 @@ component_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter ini
     -cmd '.parameter set ?7 16' -cmd '.parameter set ?8 2' "${component_sql}")"
 jq -e 'length == 2 and (map(.portCount) == [93,92]) and all(.[]; .name == "B-red")' <<< "${component_result}" >/dev/null
 
-printf 'metric count, qualified observation, namesake grouping, and component filtering execute correctly\n'
+trend_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:contextual_trend)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",3,11,13,15,16]' <<< "${trend_plan}" >/dev/null
+trend_sql="$(jq -r '.sql' <<< "${trend_plan}")"
+trend_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?3 3' -cmd '.parameter set ?4 11' \
+    -cmd '.parameter set ?5 13' -cmd '.parameter set ?6 15' \
+    -cmd '.parameter set ?7 16' "${trend_sql}")"
+jq -e 'length == 10 and (map(.portCount) == [92,92,93,93,3,3,3,3,50,50]) and all(.[]; .name == "B-red" and .frame_name == "Duplicate") and ([.[] | select(.frame_id == "B-frame-1")] | length == 5) and ([.[] | select(.frame_id == "B-frame-2")] | length == 5)' <<< "${trend_result}" >/dev/null
+
+context_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:contextual_group)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",3,11,13,15,16]' <<< "${context_plan}" >/dev/null
+context_sql="$(jq -r '.sql' <<< "${context_plan}")"
+context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?3 3' -cmd '.parameter set ?4 11' \
+    -cmd '.parameter set ?5 13' -cmd '.parameter set ?6 15' \
+    -cmd '.parameter set ?7 16' "${context_sql}")"
+jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
+
+printf 'metric count, qualified observation, and component filter/context execute correctly\n'

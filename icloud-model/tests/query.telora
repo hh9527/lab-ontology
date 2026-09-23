@@ -166,10 +166,12 @@ def lower_json: Fn(String) -> qb::Query = fn(source) {
 
 pub def dataset_grain_and_time_are_discoverable: test::Test = test::should_ok(fn() {
     let device = edsl::dataset_domain(payload, "device");
+    let frame = edsl::dataset_domain(payload, "frame");
     let alarm = edsl::dataset_domain(payload, "current_alarm");
     let kpi = edsl::dataset_domain(payload, "device_kpi");
     if device.kind == edsl::DatasetKind::Entity && device.grain == ["id", "tenant_id"]
         && device.utc_time == None
+        && frame.kind == edsl::DatasetKind::Entity && frame.grain == ["id", "tenant_id"]
         && alarm.kind == edsl::DatasetKind::Event && alarm.grain == ["csn"]
         && alarm.utc_time == Some("occur_utc")
         && kpi.kind == edsl::DatasetKind::Metric
@@ -283,6 +285,46 @@ pub def component_filter_keeps_kpi_sample_grain: test::Test = test::should_ok(fn
 pub def component_filter_rejects_unrelated_role: test::Test = test::should_fail_with(fn() {
     lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["port_count_sample"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"components":[{"relation":"device_current_alarm","target":"frame","filters":[],"min_matches":null}]}`)
 }, "component qualification requires a named child-to-owner relation");
+
+pub def component_context_repeats_owner_samples_per_declared_child: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["device_name","port_count_sample","device_kpi_ts_raw"],"filters":[],"ordering":[{"target":"Dimension","id":"device_kpi_ts_raw","direction":"Asc"}],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"context":{"target":"frame","relation":"frame_belongs_to_device","dimensions":["frame_id","frame_name"],"filters":[{"dimension":"frame_oper_state","op":"eq","kind":"text","value":"normal"}]}}`);
+    if array::length(string::split(q.sql, "INNER JOIN I_EnterpriseFrame AS f ON")) == 2
+        && array::length(string::split(q.sql, "f.refParentNE = d.id")) == 2
+        && array::length(string::split(q.sql, "f.id AS frame_id")) == 2
+        && array::length(string::split(q.sql, "f.name AS frame_name")) == 2
+        && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM I_EnterpriseFrame")) == 1
+        && array::length(string::split(q.sql, "ORDER BY k.ts ASC, f.id ASC, f.tenantId ASC")) == 2 {
+        True
+    } else { fail!("component context must retain child identity and explicit sample replication", q) }
+});
+
+pub def grouped_component_context_keeps_both_entity_grains: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_qualified","measures":["port_count"],"dimensions":["device_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"context":{"target":"frame","relation":"frame_belongs_to_device","dimensions":["frame_name"],"filters":[{"dimension":"frame_oper_state","op":"eq","kind":"text","value":"normal"}]}}`);
+    if array::length(string::split(q.sql, "sum(k.portCount) AS port_count")) == 2
+        && array::length(string::split(q.sql, "GROUP BY d.name, d.id, d.tenant_id, f.name, f.id, f.tenantId")) == 2
+        && array::length(string::split(q.sql, "f.name AS frame_name")) == 2
+        && array::length(string::split(q.sql, "f.id AS frame_id")) == 1 {
+        True
+    } else { fail!("contextual metric must group per child without projecting hidden identity", q) }
+});
+
+pub def component_context_semantics_are_discoverable: test::Test = test::should_ok(fn() {
+    let relation = edsl::relation_domain(payload, "frame_belongs_to_device");
+    let frame = edsl::dataset_domain(payload, "frame");
+    if frame.grain == ["id", "tenant_id"]
+        && array::length(string::split(relation.summary, "repeats parent-owned KPI values")) == 2
+        && array::length(string::split(relation.summary, "without allocating")) == 2 {
+        True
+    } else { fail!("component context and ownership must be discoverable from the same Model", relation, frame) }
+});
+
+pub def component_context_rejects_wrong_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["port_count_sample"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"context":{"target":"frame","relation":"device_current_alarm","dimensions":["frame_name"],"filters":[]}}`)
+}, "component context requires a named child-to-owner relation");
+
+pub def child_dimension_cannot_implicitly_change_observation_grain: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["port_count_sample","frame_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"context":{"target":"frame","relation":"frame_belongs_to_device","dimensions":["frame_name"],"filters":[]}}`)
+}, "metric sample grain has no declared allocation path to requested dimension");
 
 pub def sample_qualification_rejects_wrong_owner_relation: test::Test = test::should_fail_with(fn() {
     lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["port_count_sample"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_current_alarm","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[],"window":{"start":"2024-01-31T00:00:00Z","end":"2024-03-01T00:00:00Z"},"min_matches":3}]}`)
