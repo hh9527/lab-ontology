@@ -294,9 +294,11 @@ type PeerHubDecl = struct {
     peer_field: Int,
     directed: Bool,
     field_names: Option(PeerHubFieldNames),
+    relations: Option(PeerHubRelations),
 };
 
 type PeerHubFieldNames = struct { origin_key: String, origin_field: String, peer_key: String, peer_field: String };
+type PeerHubRelations = struct { origin: String, peer: String };
 
 # ---------------------------------------------------------------------------
 # Public request vocabulary.
@@ -721,6 +723,7 @@ type PeerRouteEntry = struct {
     peer_key: Int,
     peer_field: Int,
     exchange: Bool,
+    relations: Option(PeerHubRelations),
 };
 
 type PathResult = enum {
@@ -1044,7 +1047,7 @@ def dual_hub: Fn(Type, Int, Int, Int) -> Fn(td::TypeDesc, Option(DualHubDef)) ->
 # Multiple annotations fold by appending.
 def peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
     fn(ctx, previous) {
-        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: False, field_names: None };
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: False, field_names: None, relations: None };
         let all = match previous {
             Some(p) => array::push(p.hubs, spec),
             None => [spec],
@@ -1058,7 +1061,7 @@ def peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(Peer
 # the same participant entity. No endpoint-exchange branch is generated.
 def directed_peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
     fn(ctx, previous) {
-        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: True, field_names: None };
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: True, field_names: None, relations: None };
         let all = match previous {
             Some(p) => array::push(p.hubs, spec),
             None => [spec],
@@ -1070,7 +1073,17 @@ def directed_peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Op
 def directed_peer_hub_fields: Fn(Type, String, String, Type, String, String) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
     fn(ctx, previous) {
         let names: PeerHubFieldNames = { origin_key, origin_field, peer_key, peer_field };
-        let spec: PeerHubDecl = { origin_participant, origin_key: -1, origin_field: -1, peer_participant, peer_key: -1, peer_field: -1, directed: True, field_names: Some(names) };
+        let spec: PeerHubDecl = { origin_participant, origin_key: -1, origin_field: -1, peer_participant, peer_key: -1, peer_field: -1, directed: True, field_names: Some(names), relations: None };
+        let all = match previous { Some(p) => array::push(p.hubs, spec), None => [spec] };
+        { hubs: all }
+    }
+};
+
+def directed_peer_hub_relation_fields: Fn(Type, String, String, String, Type, String, String, String) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, origin_relation, peer_participant, peer_key, peer_field, peer_relation) {
+    fn(ctx, previous) {
+        let names: PeerHubFieldNames = { origin_key, origin_field, peer_key, peer_field };
+        let relations: PeerHubRelations = { origin: origin_relation, peer: peer_relation };
+        let spec: PeerHubDecl = { origin_participant, origin_key: -1, origin_field: -1, peer_participant, peer_key: -1, peer_field: -1, directed: True, field_names: Some(names), relations: Some(relations) };
         let all = match previous { Some(p) => array::push(p.hubs, spec), None => [spec] };
         { hubs: all }
     }
@@ -2162,6 +2175,7 @@ def resolve_peer_decl: Fn(Array(EntityEntry), Int, PeerHubDecl) -> PeerResult = 
                         peer_key: declaration.peer_key,
                         peer_field: declaration.peer_field,
                         exchange,
+                        relations: declaration.relations,
                     };
                     let ok: PeerResult = PeerResult::Ok(entry);
                     ok
@@ -2311,7 +2325,21 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         profile,
         authorize,
     };
-    if profile_ok { payload } else { payload }
+    let peer_identity_validated = array::all(peer_routes, fn(route) {
+        match route.relations {
+            None => True,
+            Some(role_relations) => do {
+                let origin = get_index(entities, route.origin_entity);
+                let peer = get_index(entities, route.peer_entity);
+                peer_role_identity(payload, role_relations.origin, route, route.origin_entity,
+                    route.origin_key, route.origin_field, peer_inner_alias(origin, "o"));
+                peer_role_identity(payload, role_relations.peer, route, route.peer_entity,
+                    route.peer_key, route.peer_field, peer_inner_alias(peer, "p"));
+                True
+            },
+        }
+    });
+    if profile_ok && peer_identity_validated { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -3802,6 +3830,37 @@ def peer_side_constraints: Fn(PreparedPayload, Int, String, PeerRef, String) -> 
     append_filter_terms(key_expr, attr_exprs)
 };
 
+# A role relation must prove every field of the participant's declared grain.
+# Its endpoint pair must be precisely the peer hub's authored role, and extra
+# identity pairs remain correlated to that participant inside the peer EXISTS.
+def peer_role_identity: Fn(PreparedPayload, String, PeerRouteEntry, Int, Int, Int, String) -> Array(qb::Expr) = fn(payload, relation_id, route, participant, key, endpoint, alias) {
+    let relation = relation_domain(payload, relation_id);
+    let hub = get_index(payload.entities, route.hub);
+    let entry = get_index(payload.entities, participant);
+    if relation.from != route.hub || relation.to != participant || relation.kind != RelationKind::Safe {
+        fail!("peer hub role requires its declared safe hub-to-participant relation", relation_id)
+    } else {
+        let pairs = exists_pairs(relation.key);
+        let endpoint_pairs = array::filter(pairs, fn(pair) { pair.from == endpoint && pair.to == key });
+        let grain = dataset_domain(payload, entry.id).grain;
+        let complete = array::length(grain) > 0 && array::all(grain, fn(field_name) {
+            match array::find(entry.fields, fn(field) { field.name == field_name }) {
+                None => False,
+                Some(field) => array::length(array::filter(pairs, fn(pair) { pair.to == field.index })) == 1,
+            }
+        });
+        if array::length(endpoint_pairs) != 1 || !complete || array::length(pairs) != array::length(grain) {
+            fail!("peer hub role relation must match its endpoint and full participant grain", relation_id, entry.id)
+        } else {
+            array::map(array::filter(pairs, fn(pair) { pair.to != key }), fn(pair) {
+                qb::scalar(qb::ScalarFunction::Eq, [
+                    qb::column(hub.alias, get_index(hub.fields, pair.from).column),
+                    qb::column(alias, get_index(entry.fields, pair.to).column)])
+            })
+        }
+    }
+};
+
 # Lower one paired-endpoint (peer) request on a hub base row.  The request names
 # two participant entities; each side carries an optional exact key and zero or
 # more attribute filters over its own entity.  Lowering builds a correlated
@@ -3840,8 +3899,11 @@ def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb::Exists = fn(paylo
                         fail!("paired-endpoint participants must be physical entities", spec.origin.entity, spec.peer.entity)
                     } else {
                         # The two hub role columns of the route.
-                        let hub_l = qb::column_ref(hub_entry.alias, get_index(hub_entry.fields, route.origin_field).column);
-                        let hub_r = qb::column_ref(hub_entry.alias, get_index(hub_entry.fields, route.peer_field).column);
+                        let request_reversed = !route.exchange && route.origin_entity != origin_entity;
+                        let origin_field = if request_reversed { route.peer_field } else { route.origin_field };
+                        let peer_field = if request_reversed { route.origin_field } else { route.peer_field };
+                        let hub_l = qb::column_ref(hub_entry.alias, get_index(hub_entry.fields, origin_field).column);
+                        let hub_r = qb::column_ref(hub_entry.alias, get_index(hub_entry.fields, peer_field).column);
                         # Each participant contributes its own inner alias and key.
                         let origin_alias = peer_inner_alias(origin_entry, "o");
                         let peer_alias = peer_inner_alias(peer_entry, "p");
@@ -3858,8 +3920,16 @@ def resolve_peer: Fn(PreparedPayload, Int, PeerRequest) -> qb::Exists = fn(paylo
                         let branch_b = qb::peer_branch(b_origin, b_peer);
                         # Participant constraints stay inside the same correlated
                         # EXISTS, each bound to its own inner alias.
-                        let origin_filter = peer_side_constraints(payload, origin_entity, origin_alias, spec.origin, origin_key_col);
-                        let peer_filter = peer_side_constraints(payload, peer_entity, peer_alias, spec.peer, peer_key_col);
+                        let identity = match route.relations {
+                            None => ([], []),
+                            Some(relations) => (
+                                peer_role_identity(payload, if request_reversed { relations.peer } else { relations.origin },
+                                    route, origin_entity, route_key_for(route, origin_entity), origin_field, origin_alias),
+                                peer_role_identity(payload, if request_reversed { relations.origin } else { relations.peer },
+                                    route, peer_entity, route_key_for(route, peer_entity), peer_field, peer_alias)),
+                        };
+                        let origin_filter = append_filter_terms(peer_side_constraints(payload, origin_entity, origin_alias, spec.origin, origin_key_col), identity.0);
+                        let peer_filter = append_filter_terms(peer_side_constraints(payload, peer_entity, peer_alias, spec.peer, peer_key_col), identity.1);
                         let origin_source = qb::source(origin_alias, origin_entry.table);
                         let peer_source = qb::source(peer_alias, peer_entry.table);
                         let corr = qb::peer_corr_roles(origin_source, peer_source, branch_a, branch_b, origin_filter, peer_filter, origin_entity == peer_entity, route.exchange);
@@ -7176,6 +7246,7 @@ pub use self::{
     peer_hub,
     directed_peer_hub,
     directed_peer_hub_fields,
+    directed_peer_hub_relation_fields,
     peer_build,
     resolve_peer_decl,
     find_peer_route,

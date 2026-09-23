@@ -230,6 +230,21 @@ link_pair_result="$(sqlite3 -json :memory: -cmd "${link_pair_schema}" -cmd '.par
     -cmd ".parameter set ?5 '光-OLT-7137'" "${link_pair_sql}")"
 jq -e 'length == 1 and .[0].physical_link_count == 3' <<< "${link_pair_result}" >/dev/null
 
+peer_identity_schema="CREATE TABLE EnterprisePhysicalLink (id TEXT, tenantId TEXT, a_ne_res_id TEXT, z_ne_res_id TEXT);
+CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT);
+INSERT INTO I_EntNetworkElement VALUES ('D1','TA'),('D2','TA'),('D1','TB'),('D2','TB');
+INSERT INTO EnterprisePhysicalLink VALUES
+ ('valid','TA','D1','D2'),('other_tenant','TB','D1','D2'),
+ ('wrong_tenant','TC','D1','D2'),('reversed','TA','D2','D1'),
+ ('wrong_origin','TA','D3','D2'),('wrong_peer','TA','D1','D4');
+INSERT INTO I_EntNetworkElement VALUES ('D3','TB'),('D4','TB');"
+peer_identity_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:physical_link_peer_identity)"
+jq -e '.bindings == ["D1","D2"] and (.sql | contains("pl.tenantId = d_o.tenant_id") and contains("pl.tenantId = d_p.tenant_id"))' <<< "${peer_identity_plan}" >/dev/null
+peer_identity_sql="$(jq -r '.sql' <<< "${peer_identity_plan}")"
+peer_identity_result="$(sqlite3 -json :memory: -cmd "${peer_identity_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'D1'" -cmd ".parameter set ?2 'D2'" "${peer_identity_sql}")"
+jq -e 'length == 2 and (map(.id) | sort == ["other_tenant","valid"])' <<< "${peer_identity_result}" >/dev/null
+
 link_site_schema="CREATE TABLE EnterprisePhysicalLink (id TEXT, name TEXT, tenantId TEXT, a_ne_res_id TEXT, z_ne_res_id TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
 CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_TYPE TEXT, TENANT_ID TEXT);
