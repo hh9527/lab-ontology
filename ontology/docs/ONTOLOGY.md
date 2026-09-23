@@ -298,6 +298,9 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 根实体的 SQL source alias 也必须非空且在完整 Model 内唯一：它既用于列引用，
 也用于定位实体与复用 JOIN。派生 UNION 内的分支 alias 仍只在其内部作用域
 校验，不与不参与同一外层 JOIN 的根实体 alias 混为一谈。
+普通实体的物理 source 表名、alias 和显式 `@column` 字段必须符合 query 的
+SQL 标识符规则，错误映射在准备阶段诊断；无关且未标注 `@column` 的字段不被
+强制映射。UNION 保持对其分支和输出列的独立完整校验。
 目录中的具名关系可用 `relation_detail_for_subject(payload, subject, id)` 追到
 关系标签/说明、起点和终点业务数据集、Safe/FanOut 类型及 Equality/All/Any
 键形态，便于区分不同端点角色和多候选站点。此概要不发布内部实体索引或物理字段
