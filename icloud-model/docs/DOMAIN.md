@@ -40,6 +40,9 @@ fields cannot advertise text operations. IC's alarm CSN, local epoch-ms and
 interface sample values retain their typed inputs; canonical dimensions remain
 distinct because an integer physical wire such as PSU health intentionally
 accepts a textual business value resolved by its declared canonical mapping.
+Closed canonical domains publish exactly the Text business-input kind and Eq;
+closed enum domains likewise cannot advertise non-Eq operations. In particular,
+PSU health's physical integer wire is not a second agent-facing filter input.
 
 The additional site/frame/KPI carriers are pressure probes, not a transcription
 of the full iCloud network graph. `device_kpi_ts_raw` deliberately names a raw
