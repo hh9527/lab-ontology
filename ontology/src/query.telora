@@ -1245,19 +1245,22 @@ def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, li
     let link_source_ok = is_sql_identifier(link.source.alias) && is_sql_identifier(link.source.table)
         && link.source.alias != hop
         && !known_alias(main_aliases, link.source.alias);
-    let hop_pairs_ok = array::length(ex.pairs) > 0 && array::all(ex.pairs, fn(p) {
-        column_ref_id_ok(p.left)
-            && is_sql_identifier(p.right.source)
-            && is_sql_identifier(p.right.column)
-            && p.right.source == hop
-            && known_alias(main_aliases, p.left.source)
-    });
+    let hop_pairs_ok = match ex.alternatives {
+        Some(alternatives) => array::length(ex.pairs) == 0 && alternatives_ok(alternatives, hop, main_aliases),
+        None => array::length(ex.pairs) > 0 && array::all(ex.pairs, fn(p) {
+            column_ref_id_ok(p.left)
+                && is_sql_identifier(p.right.source)
+                && is_sql_identifier(p.right.column)
+                && p.right.source == hop
+                && known_alias(main_aliases, p.left.source)
+        }),
+    };
     let link_pairs_ok = array::length(link.pairs) > 0 && array::all(link.pairs, fn(p) {
         column_ref_id_ok(p.left) && column_ref_id_ok(p.right)
             && p.left.source == hop
             && p.right.source == link.source.alias
     });
-    let mode_ok = ex.alternatives == None && ex.filter == None
+    let mode_ok = ex.filter == None
         && array::length(ex.grouping) == 0 && array::length(ex.having) == 0
         && ex.peer == None;
     let allowed = array::concat([main_aliases, [hop, link.source.alias]]);
@@ -2647,9 +2650,21 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                 let on_sql = string::join(array::map(link.pairs, fn(p) {
                     `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
                 }), " AND ");
-                let corr_sql = string::join(array::map(ex.pairs, fn(p) {
-                    `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
-                }), " AND ");
+                let corr_sql = match ex.alternatives {
+                    Some(alternatives) => do {
+                        let branches = array::map(alternatives, fn(branch) {
+                            let terms = array::map(branch, fn(p) {
+                                `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                            });
+                            `(\{string::join(terms, " AND ")})`
+                        });
+                        let joined = string::join(branches, " OR ");
+                        `(\{joined})`
+                    },
+                    None => string::join(array::map(ex.pairs, fn(p) {
+                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                    }), " AND "),
+                };
                 let link_filter_part = match link.filter {
                     Some(expr) => {
                         let rendered = render_expr(expr);
@@ -3782,6 +3797,13 @@ def exists_two_hop: Fn(Source, Array(ColumnEq), Source, Array(ColumnEq), Option(
     item
 };
 
+def exists_two_hop_alternatives: Fn(Source, Array(Array(ColumnEq)), Source, Array(ColumnEq), Option(Expr)) -> Exists =
+    fn(hop_source, alternatives, link_source, link_pairs, link_filter) {
+        let empty_pairs: Array(ColumnEq) = [];
+        let base = exists_two_hop(hop_source, empty_pairs, link_source, link_pairs, link_filter);
+        {...base, alternatives: Some(alternatives)}
+    };
+
 # Aggregate-result predicate over a projected aggregate/computed measure alias:
 # `<alias> <op> <threshold>`; `threshold` is a dynamic scalar (always bound).
 def having: Fn(HavingOp, String, Val) -> Having = fn(op, measure_alias, threshold) {
@@ -3961,6 +3983,7 @@ pub use self::{
     exists_union,
     exists_not,
     exists_two_hop,
+    exists_two_hop_alternatives,
     peer_branch,
     peer_corr,
     peer_corr_distinct,

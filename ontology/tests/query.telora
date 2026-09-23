@@ -4348,6 +4348,40 @@ def two_hop_link_deterministic: Fn() -> Bool = fn() {
     q1.sql == q2.sql && q1.bindings == q2.bindings
 };
 
+def two_hop_or_link_plan: Fn() -> qb::Plan = fn() {
+    let base = two_hop_link_plan();
+    let alternatives: Array(Array(qb::ColumnEq)) = [
+        [qb::column_eq(qb::column_ref("s", "project_id"), qb::column_ref("b", "id"))],
+        [qb::column_eq(qb::column_ref("s", "parent_subnet"), qb::column_ref("b", "id"))],
+    ];
+    let links: Array(qb::ColumnEq) = [qb::column_eq(qb::column_ref("b", "tenant_id"), qb::column_ref("c", "id"))];
+    let site_filter = qb::scalar(qb::ScalarFunction::Eq, [qb::column("b", "name"), qb::bind_string("Site-A")]);
+    let tenant_filter = qb::scalar(qb::ScalarFunction::Eq, [qb::column("c", "name"), qb::bind_string("Tenant-A")]);
+    let filter = qb::scalar(qb::ScalarFunction::And, [site_filter, tenant_filter]);
+    let ex = qb::exists_two_hop_alternatives(qb::source("b", "sites"), alternatives,
+        qb::source("c", "tenants"), links, Some(filter));
+    {...base, exists: [ex]}
+};
+
+pub def two_hop_or_link_keeps_site_and_tenant_in_one_exists: test::Test = test::should_ok(fn() {
+    let plan = two_hop_or_link_plan();
+    let q = qb::transform_sqlite(plan);
+    if qb::structure_ok(plan)
+        && q.sql == "SELECT count(s.id) AS subject_count FROM subjects AS s WHERE EXISTS (SELECT 1 FROM sites AS b INNER JOIN tenants AS c ON b.tenant_id = c.id WHERE ((s.project_id = b.id) OR (s.parent_subnet = b.id)) AND (b.name = ? AND c.name = ?))"
+        && q.bindings == [qb::Val::String("Site-A"), qb::Val::String("Tenant-A")] {
+        True
+    } else { fail!("two-hop OR correlation must keep both filters in one EXISTS", q) }
+});
+
+pub def two_hop_or_link_rejects_unknown_source: test::Test = test::should_ok(fn() {
+    let valid = two_hop_or_link_plan();
+    let wrong = qb::exists_two_hop_alternatives(qb::source("b", "sites"),
+        [[qb::column_eq(qb::column_ref("other", "id"), qb::column_ref("b", "id"))]],
+        qb::source("c", "tenants"), [qb::column_eq(qb::column_ref("b", "tenant_id"), qb::column_ref("c", "id"))], None);
+    let plan: qb::Plan = {...valid, exists: [wrong]};
+    if !qb::structure_ok(plan) { True } else { fail!("unknown outer alias in two-hop OR branch was accepted") }
+});
+
 # ---------------------------------------------------------------------------
 # Closed set operations (INTERSECT / EXCEPT / distinct UNION).
 # ---------------------------------------------------------------------------
