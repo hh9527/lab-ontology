@@ -5230,7 +5230,17 @@ def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, S
             if array::length(alignment) == 0 || array::length(alignment) != array::length(component_pairs) {
                 fail!("component tenant ownership keys do not align", owner_tenant_id, component_tenant_id)
             } else {
-                let plan = lower_utc_window(payload, request, window);
+                let dimensions = resolve_dimensions(payload, request.dimensions);
+                let event_dims = array::filter(request.dimensions, fn(d) {
+                    array::any(payload.dimensions, fn(entry) { entry.id == d.id && entry.entity == event.index })
+                });
+                let owner_dims = array::filter(dimensions, fn(d) { d.entry.entity == owner.index });
+                if array::length(event_dims) + array::length(owner_dims) != array::length(dimensions)
+                    || (array::length(owner_dims) > 0 && (array::length(request.measures) == 0 || array::length(event_dims) > 0)) {
+                    fail!("event component grouping requires owner dimensions with event measures only")
+                } else { () };
+                let event_request: QueryRequest = {...request, dimensions: event_dims};
+                let plan = lower_utc_window(payload, event_request, window);
                 if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
                     fail!("event component observation requires event-only projections and filters")
                 } else {
@@ -5248,8 +5258,17 @@ def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, S
                         let qualification = qb::exists(qb::source(component.alias, component.table),
                             array::concat([parent, alignment]),
                             combine_filters(array::map(component_resolved, fn(f) { f.expr })));
+                        let visible = array::map(owner_dims, fn(d) { dimension_output_expr(payload, d.entry) });
+                        let identity = if array::length(owner_dims) == 0 { [] }
+                            else { entity_grain_exprs(owner, owner_id) };
+                        let hidden = array::filter(identity, fn(expr) {
+                            !array::any(visible, fn(item) { item == expr })
+                                && !array::any(plan.grouping, fn(item) { item == expr })
+                        });
                         qb::validate({...plan, sources: array::push(plan.sources, join.source),
                             joins: array::push(plan.joins, join),
+                            projection: array::concat([plan.projection, array::map(visible, fn(expr) { qb::expr_item(expr) })]),
+                            grouping: array::concat([plan.grouping, visible, hidden]),
                             filter: append_filter_terms(plan.filter, array::map(owner_resolved, fn(f) { f.expr })),
                             exists: array::push(plan.exists, qualification)}, payload.profile)
                     }

@@ -128,6 +128,19 @@ server_fan_alarm_count_result="$(sqlite3 -json :memory: -cmd "${server_fan_alarm
     "${server_fan_alarm_count_sql}")"
 jq -e 'length == 1 and .[0].alarm_count == 3' <<< "${server_fan_alarm_count_result}" >/dev/null
 
+grouped_server_alarm_schema="${server_fan_alarm_schema}
+ALTER TABLE PhysicalServer ADD COLUMN name TEXT;
+UPDATE PhysicalServer SET name = 'Same';
+UPDATE PhysicalServerFan SET manufacturer = 'Huawei' WHERE id = 'F3';"
+grouped_server_alarm_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:server_fan_alarm_counts_by_owner)"
+grouped_server_alarm_sql="$(jq -r '.sql' <<< "${grouped_server_alarm_plan}")"
+grouped_server_alarm_result="$(sqlite3 -json :memory: -cmd "${grouped_server_alarm_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 'ne.category.server.kunlun'" -cmd ".parameter set ?4 '2011'" \
+    -cmd ".parameter set ?5 'Huawei'" -cmd ".parameter set ?6 'huawei technologies co., ltd'" \
+    "${grouped_server_alarm_sql}")"
+jq -e 'length == 3 and (map(.alarm_count) | sort == [1,2,2]) and all(.[]; .name == "Same")' <<< "${grouped_server_alarm_result}" >/dev/null
+
 site_device_schema="CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, SITE_TYPE TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, name TEXT, projectId TEXT, refParentSubnet TEXT);
 INSERT INTO X_SITE_VIEW VALUES
