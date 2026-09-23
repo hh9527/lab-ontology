@@ -464,6 +464,14 @@ type MetricQualification = struct {
     op: HavingOp,
     threshold: FilterInput,
 };
+type SampleQualification = struct {
+    relation: String,
+    dataset: String,
+    filters: Array(FilterRequest),
+    start: String,
+    end: String,
+    min_matches: Int,
+};
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
@@ -4641,6 +4649,127 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
     }
 };
 
+# A raw-sample predicate is evaluated before the sample count; qualification
+# and observation use separate scoped aliases even when they share a carrier.
+def sample_qualification_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, SampleQualification) -> qb::Exists = fn(payload, outer_sources, owner, spec) {
+    let target = entity_by_id(payload, spec.dataset);
+    let entry = get_index(payload.entities, target);
+    let relation = relation_domain(payload, spec.relation);
+    if relation.from != target || relation.to != owner.index {
+        fail!("sample qualification relation must map samples to owner", spec.relation, spec.dataset)
+    } else if spec.min_matches <= 0 {
+        fail!("sample qualification count must be positive", spec.min_matches)
+    } else if !valid_utc_second(spec.start) || !valid_utc_second(spec.end) || spec.start >= spec.end {
+        fail!("sample qualification requires ordered canonical UTC bounds", spec.start, spec.end)
+    } else {
+        let domain = dataset_domain(payload, spec.dataset);
+        if domain.kind != DatasetKind::Metric {
+            fail!("sample qualification requires a metric dataset", spec.dataset)
+        } else {
+            let time_name = match domain.utc_time {
+                Some(name) => name,
+                None => fail!("sample qualification dataset lacks authoritative UTC time", spec.dataset),
+            };
+            let time_field = match array::find(entry.fields, fn(f) { f.name == time_name }) {
+                Some(f) => f,
+                None => fail!("sample qualification UTC field is missing", time_name),
+            };
+            let alias = private_exists_alias(outer_sources, `\{entry.alias}_samples`);
+            let inner: EntityEntry = {...entry, alias};
+            let pairs = array::map(exists_pairs(relation.key), fn(pair) { exists_col_eq(owner, inner, pair, True) });
+            let resolved = resolve_filters(payload, spec.filters);
+            if !array::all(resolved, fn(f) { f.entity == target }) {
+                fail!("sample qualification filters must belong to sample dataset", spec.dataset)
+            } else {
+                let filters = array::map(resolved, fn(f) { retarget_inner_expr(f.expr, entry.alias, alias) });
+                let timestamp = qb::column(alias, time_field.column);
+                let bounds = qb::scalar(qb::ScalarFunction::And, [
+                    qb::scalar(qb::ScalarFunction::Ge, [timestamp, qb::bind_string(spec.start)]),
+                    qb::scalar(qb::ScalarFunction::Lt, [timestamp, qb::bind_string(spec.end)]),
+                ]);
+                let grouping = array::map(pairs, fn(p) { qb::column(p.right.source, p.right.column) });
+                let count_column = if inner.key_field >= 0 {
+                    get_index(inner.fields, inner.key_field).column
+                } else { get_index(pairs, 0).right.column };
+                let having = [qb::having_call(qb::HavingOp::Ge, qb::AggregateFunction::Count,
+                    qb::column(alias, count_column), False, qb::Val::Int(spec.min_matches))];
+                qb::exists_grouped(qb::source(alias, inner.table), pairs,
+                    append_filter_terms(Some(bounds), filters), grouping, having)
+            }
+        }
+    }
+};
+
+def lower_sample_qualifications: Fn(PreparedPayload, QueryRequest, Array(SampleQualification)) -> qb::Plan = fn(payload, request, specs) {
+    if array::length(specs) == 0 { fail!("sample qualification requires at least one condition") }
+    else {
+        let plan = lower(payload, request);
+        if array::length(plan.sources) == 0 || plan.derived != None {
+            fail!("sample qualification requires a physical owner dataset")
+        } else {
+            let alias = get_index(plan.sources, 0).alias;
+            let owner = match array::find(payload.entities, fn(e) { e.alias == alias }) {
+                Some(e) => e,
+                None => fail!("sample qualification owner is unknown", alias),
+            };
+            let clauses = array::map(specs, fn(spec) { sample_qualification_exists(payload, plan.sources, owner, spec) });
+            qb::validate({...plan, exists: array::concat([plan.exists, clauses])}, payload.profile)
+        }
+    }
+};
+
+def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, observation, specs) {
+        if array::length(specs) == 0 { fail!("qualified observation requires at least one sample qualification") }
+        else {
+            let root_id = entity_by_id(payload, observation.dataset);
+            let sample_dimensions = array::filter(request.dimensions, fn(d) {
+                match array::find(payload.dimensions, fn(entry) { entry.id == d.id }) {
+                    Some(entry) => entry.entity == root_id,
+                    None => False,
+                }
+            });
+            let owner_dimensions = array::filter(request.dimensions, fn(d) {
+                !array::any(sample_dimensions, fn(sample) { sample.id == d.id })
+            });
+            if array::length(request.measures) == 0 && array::length(sample_dimensions) == 0 {
+                fail!("observation without a measure requires a sample dimension", observation.dataset)
+            } else {
+            let arranged: QueryRequest = {...request, dimensions: array::concat([sample_dimensions, owner_dimensions])};
+            let raw_plan = lower_utc_window(payload, arranged, observation);
+            let output: Array(ProjectionToken) = array::concat([
+                array::map(request.measures, fn(m) { ProjectionToken::Measure(m.id) }),
+                array::map(request.dimensions, fn(d) { ProjectionToken::Dimension(d.id) }),
+            ]);
+            let plan = reorder_projection(payload, request, raw_plan, output);
+            let root_alias = get_index(plan.sources, 0).alias;
+            let root = match array::find(payload.entities, fn(e) { e.alias == root_alias }) {
+                Some(e) => e,
+                None => fail!("qualified observation root is unknown", root_alias),
+            };
+            let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
+            let relation = relation_domain(payload, relation_id);
+            if relation.from != root.index || relation.to != owner.index || relation.kind != RelationKind::Safe {
+                fail!("observation requires a named grain-safe sample-to-owner relation", relation_id)
+            } else if root.dataset == None || dataset_domain(payload, observation.dataset).kind != DatasetKind::Metric {
+                fail!("observation root must be a metric dataset", observation.dataset)
+            } else {
+                let condition = key_to_condition(payload, relation.from, relation.to, relation.key);
+                let joined = array::any(plan.joins, fn(j) { j.source.alias == owner.alias && j.condition == condition && j.kind == qb::JoinKind::Inner });
+                let conflicting = array::any(plan.sources, fn(s) { s.alias == owner.alias }) && !joined;
+                if conflicting { fail!("observation owner is joined through a different relation", relation_id) }
+                else {
+                    let owner_join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table), condition);
+                    let sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
+                    let joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
+                    let clauses = array::map(specs, fn(spec) { sample_qualification_exists(payload, sources, owner, spec) });
+                    qb::validate({...plan, sources, joins, exists: array::concat([plan.exists, clauses])}, payload.profile)
+                }
+            }
+            }
+        }
+    };
+
 # Canonical UTC-second text sorts in instant order under SQLite's binary text
 # ordering. Other encodings must not enter this path without an explicit model.
 def utc_second_pattern: regex::Regex = regex::compile("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
@@ -6073,6 +6202,7 @@ pub use self::{
     RelationEntry,
     NamedExistsRequest,
     MetricQualification,
+    SampleQualification,
     UtcWindowRequest,
     UtcDaysWindowRequest,
     PathResult,
@@ -6167,6 +6297,8 @@ pub use self::{
     knowledge_index,
     lower_named_exists,
     lower_metric_qualifications,
+    lower_sample_qualifications,
+    lower_qualified_observation,
     lower_via,
     RoleProjectionSpec,
     RoleFilterSpec,
