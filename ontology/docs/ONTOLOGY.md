@@ -258,7 +258,11 @@ JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不�
 权威 UTC 字段；Event 和 Metric 必须声明一个实际存在且带
 `time_field(TimeSemantics::Utc, TimeEncoding::CanonicalUtcSecondText)` 的文本时间字段。
 本地时间应标记为 `Local` / `LocalText`，不能冒充 UTC 权威字段。
-`dataset_domain(payload, id)` 发现这些声明。Metric 字段用
+`dataset_domain(payload, id)` 发现这些声明。
+数据集目录的 `time_roles` 从 Model 的字段时间角色派生逻辑字段名、UTC/Local、
+编码、权威时钟标志及可查询维度 ID；主体目录仅保留权威时钟或有授权维度的
+时间角色。比如本地 epoch-ms 维度需要外部时间上下文给出解析后的整数边界，
+不能把本地文本时间当成 UTC 时钟。Metric 字段用
 `metric_value(id, aggregate, unit)` 注明单位和聚合语义，并必须有同字段、
 同 ID、同聚合方式的 `measure`，否则准备失败；`metric_domain(payload, id)`
 发现指标。`utc_window` 意图目前只接受严格校验过日历日期的
