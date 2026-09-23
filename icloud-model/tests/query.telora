@@ -465,6 +465,7 @@ pub def time_roles_are_reachable_from_subject_knowledge_index: test::Test = test
     let created = array::find(device.time_roles, fn(role) { role.field == "create_time" });
     let sampled = array::find(kpi.time_roles, fn(role) { role.field == "ts" });
     let occurred = array::find(alarm.time_roles, fn(role) { role.field == "occur_utc" });
+    let arrived = array::find(alarm.time_roles, fn(role) { role.field == "arrive_utc" });
     let local_alarm = array::find(full_alarm.time_roles, fn(role) { role.field == "occur_time" });
     let local_ok = match created {
         Some(role) => role.semantics == edsl::TimeSemantics::Local
@@ -482,14 +483,20 @@ pub def time_roles_are_reachable_from_subject_knowledge_index: test::Test = test
         Some(role) => role.authoritative && role.dimension_ids == ["alarm_occur_utc_raw"],
         None => False,
     };
+    let arrival_ok = match arrived {
+        Some(role) => !role.authoritative && role.semantics == edsl::TimeSemantics::Utc
+            && role.encoding == edsl::TimeEncoding::CanonicalUtcSecondText
+            && array::length(role.dimension_ids) == 0,
+        None => False,
+    };
     let full_local_ok = match local_alarm {
         Some(role) => role.semantics == edsl::TimeSemantics::Local
             && role.encoding == edsl::TimeEncoding::LocalText
             && !role.authoritative && array::length(role.dimension_ids) == 0,
         None => False,
     };
-    if local_ok && kpi_ok && alarm_ok && full_local_ok
-        && array::length(alarm.time_roles) == 1 { True }
+    if local_ok && kpi_ok && alarm_ok && arrival_ok && full_local_ok
+        && array::length(alarm.time_roles) == 2 { True }
     else { fail!("time discovery lost role, authority, or queryability", device, kpi, alarm, full_alarm) }
 });
 
@@ -1177,6 +1184,46 @@ pub def alarm_window_uses_authoritative_utc_field: test::Test = test::should_ok(
         fail!("alarm window must bind only the authoritative UTC field", q)
     }
 });
+
+pub def alarm_arrival_window_uses_declared_secondary_clock: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"utc_field_window","measures":[],"dimensions":["alarm_csn"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","field":"arrive_utc","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`);
+    let catalog = edsl::knowledge_index_for_subject(payload, "public");
+    let alarms = array::find(catalog, fn(item) { item.id == "current_alarm" });
+    let discovered = match alarms {
+        Some(entry) => array::any(entry.time_roles, fn(role) {
+            role.field == "arrive_utc" && !role.authoritative
+                && role.semantics == edsl::TimeSemantics::Utc
+                && array::length(role.dimension_ids) == 0
+        }),
+        None => False,
+    };
+    if string::contains(q.sql, "a.ARRIVEUTC >= ?")
+        && string::contains(q.sql, "a.ARRIVEUTC < ?")
+        && !string::contains(q.sql, "a.OCCURUTC >= ?")
+        && q.bindings == [qb::Val::String("2024-02-29T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z")]
+        && discovered { True }
+    else { fail!("arrival window must select the declared secondary clock and remain discoverable", q, alarms) }
+});
+
+pub def alarm_local_time_cannot_be_a_utc_field_window: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_field_window","measures":[],"dimensions":["alarm_csn"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","field":"occur_time","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window requires a declared canonical UTC time field");
+
+pub def alarm_unknown_utc_field_window_is_rejected: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_field_window","measures":[],"dimensions":["alarm_csn"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","field":"missing_clock","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "unknown UTC window field");
+
+pub def alarm_unmarked_field_cannot_be_a_utc_window: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_field_window","measures":[],"dimensions":["alarm_csn"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","field":"alarm_name","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "field has no declared time role");
+
+pub def secondary_utc_window_rejects_wrong_base_dataset: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_field_window","measures":[],"dimensions":["device_name"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","field":"arrive_utc","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window must target the query's base dataset");
+
+pub def alarm_secondary_clock_rejects_invalid_bounds: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_field_window","measures":[],"dimensions":["alarm_csn"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","field":"arrive_utc","start":"2024-03-01T00:00:00Z","end":"2024-02-29T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window start must precede end");
 
 pub def device_cpu_aggregate_is_scoped_to_kpi_utc_window: test::Test = test::should_ok(fn() {
     let q = lower_json(`{"op":"utc_window","measures":["cpu_usage"],"dimensions":["device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"window":{"dataset":"device_kpi","start":"2024-01-01T00:00:00Z","end":"2024-02-01T00:00:00Z"},"limit":null,"offset":null}`);

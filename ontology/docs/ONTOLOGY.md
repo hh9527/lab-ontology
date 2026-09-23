@@ -260,13 +260,17 @@ JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不�
 本地时间应标记为 `Local` / `LocalText`，不能冒充 UTC 权威字段。
 `dataset_domain(payload, id)` 发现这些声明。
 数据集目录的 `time_roles` 从 Model 的字段时间角色派生逻辑字段名、UTC/Local、
-编码、权威时钟标志及可查询维度 ID；主体目录仅保留权威时钟或有授权维度的
-时间角色。比如本地 epoch-ms 维度需要外部时间上下文给出解析后的整数边界，
+编码、权威时钟标志及可查询维度 ID；主体目录保留全部可用于具名窗口的 UTC
+时间角色（包括没有普通维度的次级时钟），以及有授权维度的本地时间角色。
+比如本地 epoch-ms 维度需要外部时间上下文给出解析后的整数边界，
 不能把本地文本时间当成 UTC 时钟。Metric 字段用
 `metric_value(id, aggregate, unit)` 注明单位和聚合语义，并必须有同字段、
 同 ID、同聚合方式的 `measure`，否则准备失败；`metric_domain(payload, id)`
 发现指标。`utc_window` 意图目前只接受严格校验过日历日期的
 `YYYY-MM-DDTHH:MM:SSZ`，并在根数据集的权威字段上降低为绑定的半开区间；
+`utc_field_window` 另要求逻辑字段名，该字段必须有 UTC/CanonicalUtcSecondText
+时间角色，并属于同一根数据集；它可明确选取非权威的到达或更新时间，仍执行
+相同的 UTC 边界与先后校验。未声明时间角色或本地时间不能通过此入口查询。
 不支持偏移输入、亚秒精度或原生 timestamp 列。
 
 `dataset_description(label, summary)` 和 `relation_description(id, label, summary)`

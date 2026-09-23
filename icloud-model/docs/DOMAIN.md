@@ -11,7 +11,7 @@ and must not be presented as a complete interpretation of that domain.
 | Network device and current alarm are linked by device id = MEDN **and** tenant id = TENANTID | Named composite relation; event grain `csn`; `min_matches` groups by both keys | Treat this as a named subject-to-event data link, not just an entity relation; the alarm's physical column is `TENANTID`, never `TENANT_ID`. |
 | Server fan can qualify a server's alarm events without owning them | Alarm→Server uses `(MEDN,TENANTID)=(id,tenantId)`; Server grain includes `(id,tenant_id)`; Fan→Server retains a potentially non-unique `parentResId=oriResId` FanOut relation and Fan/Server each declare tenant ownership | `observe_event_component` uses correlated fan EXISTS with tenant alignment, keeping event identity and rejecting unrelated component roles; for grouped counts the Server name is visible but both Server identity keys remain in GROUP BY. Q0392/Q0396 fixtures use the physical `OCCURUTC` column with externally supplied bounds. |
 | Tenants with more than five uncleared alarms | Alarm `CLEARED` maps business `uncleared` to integer wire 0, and `alarm_tenant_id` identifies groups through `TENANTID` | `count_groups` filters events, groups by tenant identity with an alarm-count HAVING threshold, then counts groups; it does not count alarm rows or group by tenant display name. |
-| `occur_utc` is the alarm's authoritative UTC time field; `occur_time` is local | Event grain and UTC/Local field encoding are declared; `utc_window` validates canonical UTC seconds and lowers on `occur_utc` | Support richer instant encodings and time roles without accepting local values as UTC. |
+| `occur_utc` is the alarm's authoritative UTC time field; `arrive_utc` is a distinct UTC arrival clock; `occur_time` is local | Event grain and UTC/Local field encoding are declared; `utc_window` validates canonical UTC seconds and lowers on `occur_utc`, while `utc_field_window` explicitly targets a declared secondary UTC field such as `arrive_utc` | Support richer instant encodings without accepting local values as UTC. |
 | Physical link has A and Z device endpoints | `directed_peer_hub_relation_fields` binds the directed peer roles to the two described A/Z Safe relations | Query preserves A/Z positions and correlates each endpoint through the full `(id,tenant_id)` device identity. |
 | Link/site qualification must preserve link identity | A/Z Link→Device named Safe relations match both device ID and tenant ID; Device→Site is FanOut with two OR keys, then Site→Tenant and Link→Tenant align | `qualify_link_site` counts/lists links by a three-hop correlated EXISTS; matching both ends or multiple sites does not multiply the outer link. The peer hub now reuses the same A/Z identity relations. IC's original entity links mention only device ID, so production data still needs validation of the tenant-alignment assumption. |
 | Site-qualified device-link rows | A/Z Safe identity keys and Device→Site→Tenant with Device/Link tenant ownership | `list_link_device_site` exposes each qualifying `(Device,Link)` association; two ends may yield two rows, but site multiplicity and self-loops cannot duplicate an association. |
@@ -33,10 +33,16 @@ Canonical filtering, directed endpoints, explicit A/Z selection, composite-key
 event count, declared device KPI aggregation and canonical UTC-second windows
 pass. This does not close native timestamp/timezone handling, full
 EventSet/MetricSet, or runtime data-quality diagnostics for unknown wires.
+The source EventSet maps alarm `ARRIVEUTC` separately from `OCCURUTC`. The
+pressure model now publishes both roles and allows a half-open arrival-time
+window only when the intent names `arrive_utc`; the default `utc_window` keeps
+the authoritative occurrence clock. This SQLite fixture models both as
+canonical UTC-second text, not as a claim about PostgreSQL timestamp storage.
 
 Plain open-domain dimensions now validate their declared filter input type
-against the underlying String/Int/Float field at Model preparation, and numeric
-fields cannot advertise text operations. IC's alarm CSN, local epoch-ms and
+against the underlying String/Int/Float field at Model preparation: String
+accepts Text, ordinary numeric fields may accept Int/Number thresholds, and
+numeric fields cannot advertise text operations. IC's alarm CSN, local epoch-ms and
 interface sample values retain their typed inputs; canonical dimensions remain
 distinct because an integer physical wire such as PSU health intentionally
 accepts a textual business value resolved by its declared canonical mapping.

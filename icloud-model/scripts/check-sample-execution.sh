@@ -93,6 +93,23 @@ alarm_tenant_result="$(sqlite3 -json :memory: -cmd "${alarm_tenant_schema}" -cmd
     -cmd '.parameter set ?1 0' -cmd '.parameter set ?2 5' "${alarm_tenant_sql}")"
 jq -e 'length == 1 and (.[0] | to_entries[0].value) == 2' <<< "${alarm_tenant_result}" >/dev/null
 
+alarm_clock_schema="CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, OCCURUTC TEXT, ARRIVEUTC TEXT);
+INSERT INTO T_CURRENT_ALARM VALUES
+ (101,'2024-02-15T00:00:00Z','2024-03-02T00:00:00Z'),
+ (102,'2024-01-31T00:00:00Z','2024-02-16T00:00:00Z'),
+ (103,'2024-03-01T00:00:00Z','2024-03-01T00:00:00Z');"
+for clock_case in occurrence arrival; do
+    clock_plan="$("${telora_bin}" -C "${fixture_dir}" eval "icloud-model/sample_execution:alarm_${clock_case}_window")"
+    jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z"]' <<< "${clock_plan}" >/dev/null
+    clock_sql="$(jq -r '.sql' <<< "${clock_plan}")"
+    clock_result="$(sqlite3 -json :memory: -cmd "${alarm_clock_schema}" -cmd '.parameter init' \
+        -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" \
+        -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" "${clock_sql}")"
+    expected_csn=101
+    if [[ "${clock_case}" == arrival ]]; then expected_csn=102; fi
+    jq -e --argjson expected "${expected_csn}" 'length == 1 and .[0].CSN == $expected' <<< "${clock_result}" >/dev/null
+done
+
 server_fan_alarm_schema="CREATE TABLE PhysicalServer (id TEXT, oriResId TEXT, tenantId TEXT, classification TEXT);
 CREATE TABLE PhysicalServerFan (id TEXT, parentResId TEXT, tenantId TEXT, manufacturer TEXT);
 CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, ALARMNAME TEXT, OCCURUTC TEXT);
@@ -555,4 +572,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

@@ -535,6 +535,7 @@ type ChildSiteScope = struct {
     tenant_filters: Array(FilterRequest),
 };
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
+type UtcFieldWindowRequest = struct { dataset: String, field: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
 # Aggregate-result (HAVING) predicate over a requested measure alias.
@@ -1823,7 +1824,11 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     && (dd.input_kinds != [FilterInputKind::Text]
                         || array::any(dd.ops, fn(op) { op != FilterOp::Eq })) {
                     fail!("enum dimension supports only text business values and Eq filters", entity.id, f.name)
-                } else if array::length(mapped) == 0 && (array::any(dd.input_kinds, fn(kind) { kind != valid_kind })
+                } else if array::length(mapped) == 0 && (array::any(dd.input_kinds, fn(kind) {
+                    if f.ty == Int.type || f.ty == Float.type {
+                        kind != FilterInputKind::Int && kind != FilterInputKind::Number
+                    } else { kind != valid_kind }
+                })
                     || (valid_kind != FilterInputKind::Text && array::any(dd.ops, fn(op) { is_text_op(op) }))) {
                     fail!("plain dimension filter input or operation disagrees with field type", entity.id, f.name)
                 } else {
@@ -3027,7 +3032,8 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
                         d.entity == entity.index && d.field == field.index
                             && (!authorized_only || d.authorized)
                     }), fn(d) { d.id });
-                    if authorized_only && !authoritative && array::length(dimension_ids) == 0 { [] }
+                    if authorized_only && role.semantics != TimeSemantics::Utc
+                        && array::length(dimension_ids) == 0 { [] }
                     else {
                         let brief: TimeRoleBrief = {
                             field: field.name, semantics: role.semantics,
@@ -6389,12 +6395,8 @@ def valid_utc_second: Fn(String) -> Bool = fn(value) {
     }
 };
 
-def lower_utc_bounds: Fn(PreparedPayload, QueryRequest, String, qb::Expr, qb::Expr) -> qb::Plan = fn(payload, request, dataset, start, end) {
+def lower_utc_field_bounds: Fn(PreparedPayload, QueryRequest, String, String, qb::Expr, qb::Expr) -> qb::Plan = fn(payload, request, dataset, time_name, start, end) {
     let spec = dataset_domain(payload, dataset);
-    let time_name = match spec.utc_time {
-        Some(name) => name,
-        None => fail!("dataset has no authoritative UTC time field", dataset),
-    };
     let plan = lower(payload, request);
     let dataset_entry = get_index(payload.entities, entity_by_id(payload, dataset));
     if array::length(plan.sources) == 0 || plan.derived != None
@@ -6403,8 +6405,12 @@ def lower_utc_bounds: Fn(PreparedPayload, QueryRequest, String, qb::Expr, qb::Ex
     } else {
         let field = match array::find(dataset_entry.fields, fn(item) { item.name == time_name }) {
             Some(item) => item,
-            None => fail!("prepared UTC field is missing", time_name),
+            None => fail!("unknown UTC window field", dataset, time_name),
         };
+        let role = time_domain(payload, dataset, time_name);
+        if role.semantics != TimeSemantics::Utc || role.encoding != TimeEncoding::CanonicalUtcSecondText {
+            fail!("UTC window requires a declared canonical UTC time field", dataset, time_name)
+        } else { () };
         let col = qb::column(dataset_entry.alias, field.column);
         let start_term = qb::scalar(qb::ScalarFunction::Ge, [col, start]);
         let end_term = qb::scalar(qb::ScalarFunction::Lt, [col, end]);
@@ -6418,6 +6424,15 @@ def lower_utc_bounds: Fn(PreparedPayload, QueryRequest, String, qb::Expr, qb::Ex
     }
 };
 
+def lower_utc_bounds: Fn(PreparedPayload, QueryRequest, String, qb::Expr, qb::Expr) -> qb::Plan = fn(payload, request, dataset, start, end) {
+    let spec = dataset_domain(payload, dataset);
+    let time_name = match spec.utc_time {
+        Some(name) => name,
+        None => fail!("dataset has no authoritative UTC time field", dataset),
+    };
+    lower_utc_field_bounds(payload, request, dataset, time_name, start, end)
+};
+
 def lower_utc_window: Fn(PreparedPayload, QueryRequest, UtcWindowRequest) -> qb::Plan = fn(payload, request, window) {
     if !valid_utc_second(window.start) || !valid_utc_second(window.end) {
         fail!("UTC window requires valid YYYY-MM-DDTHH:MM:SSZ instants", window.start, window.end)
@@ -6425,6 +6440,17 @@ def lower_utc_window: Fn(PreparedPayload, QueryRequest, UtcWindowRequest) -> qb:
         fail!("UTC window start must precede end", window.start, window.end)
     } else {
         lower_utc_bounds(payload, request, window.dataset, qb::bind_string(window.start), qb::bind_string(window.end))
+    }
+};
+
+def lower_utc_field_window: Fn(PreparedPayload, QueryRequest, UtcFieldWindowRequest) -> qb::Plan = fn(payload, request, window) {
+    if !valid_utc_second(window.start) || !valid_utc_second(window.end) {
+        fail!("UTC window requires valid YYYY-MM-DDTHH:MM:SSZ instants", window.start, window.end)
+    } else if window.start >= window.end {
+        fail!("UTC window start must precede end", window.start, window.end)
+    } else {
+        lower_utc_field_bounds(payload, request, window.dataset, window.field,
+            qb::bind_string(window.start), qb::bind_string(window.end))
     }
 };
 
@@ -7804,6 +7830,7 @@ pub use self::{
     ChildSiteScope,
     ComponentContextSpec,
     UtcWindowRequest,
+    UtcFieldWindowRequest,
     UtcDaysWindowRequest,
     PathResult,
     PreparedPayload,
@@ -7926,6 +7953,7 @@ pub use self::{
     RoleFilterSpec,
     lower_roles,
     lower_utc_window,
+    lower_utc_field_window,
     lower_utc_days_window,
     to_bind,
     combine_filters,
