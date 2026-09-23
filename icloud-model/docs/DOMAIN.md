@@ -48,6 +48,9 @@ preparation time; unknown or mismatched fields fail before querying. Description
 and cross-references in `knowledge_index` (including ordinary measure IDs such
 as `alarm_count` as well as metric IDs) come from the same Prepared Model,
 not from a separately authored agent prompt.
+For agent-facing discovery, `knowledge_index_for_subject` checks the subject
+and omits dimensions that lowering would reject as unauthorized; privileged
+callers retaining the complete payload can still inspect the full model.
 
 Acceptance is two-sided: each row requires a successful intent with a correct
 plan **and** a nearby invalid intent rejected at its original Model/intent value.
