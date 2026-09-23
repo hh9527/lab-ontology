@@ -29,6 +29,13 @@ and must not be presented as a complete interpretation of that domain.
 | Showing a device KPI beside each matching frame does not transfer ownership of the metric | Frame declares entity grain `(id, tenant_id)`; explicit child context references its named Safe owner relation and selected child dimensions | Row observations repeat once per matching frame, while grouped observations retain hidden frame and device keys so same-name frames remain distinct. A foreign-tenant frame with the same parent ID cannot borrow another tenant's Device. Ordinary KPI-to-frame dimension navigation still rejects absent allocation semantics. |
 | Storage device may reference two different sites by `parentResId OR projectId` | Named `FanOut` relation, normal-status canonical wire `"1"`, subclass dimension, and `COUNT(name)` measure | Q0047-Q0049 group by declared site key and name, HAVING count below five, returning name only; ordinary row projection must not assume one site per device. |
 
+The prepared Model checks all Sum/Avg measure inputs, including filtered
+measures, against their Int/Float source fields. This prevents a String-backed
+"metric" from reaching IC's discovery/lowering path and depending on SQLite's
+text-to-number conversion; Count over a text field and lexical Min/Max remain
+valid separate meanings. The existing CPU, port and event count declarations
+exercise the three cases.
+
 Canonical filtering, directed endpoints, explicit A/Z selection, composite-key
 event count, declared device KPI aggregation and canonical UTC-second windows
 pass. This does not close native timestamp/timezone handling, full
