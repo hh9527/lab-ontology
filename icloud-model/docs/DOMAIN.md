@@ -136,3 +136,10 @@ filters. `rows` preserves each site/device identity pair; `distinct` is a
 separate visible-value-set request corresponding to the corpus SQL. A device
 matching a single site by both keys produces one pair, while a device related
 to two sites produces two, even when site or device names repeat.
+
+Q0138 counts tenants owning at least one online site. A reverse use of the
+declared Site-to-Tenant Safe relation qualifies each Tenant with a correlated
+Site EXISTS; neither two sites in one tenant nor duplicate site names change
+the count of tenant identities. The fixture also excludes offline-only and
+site-less tenants. The same route can project Tenant fields after filtering
+sites by name, type, or other Model-declared site dimensions.

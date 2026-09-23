@@ -97,6 +97,19 @@ site_device_distinct_result="$(sqlite3 -json :memory: -cmd "${site_device_schema
     -cmd ".parameter set ?1 'Site-A'" -cmd '.parameter set ?2 1000' "${site_device_distinct_sql}")"
 jq -e 'length == 1 and .[0].SITE_NAME == "Site-A" and .[0].name == "Same"' <<< "${site_device_distinct_result}" >/dev/null
 
+tenant_site_schema="CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
+CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_TYPE TEXT, TENANT_ID TEXT);
+INSERT INTO X_TENANT_VIEW VALUES ('T1','One'),('T2','Two'),('T3','Three'),('T4','None');
+INSERT INTO X_SITE_VIEW VALUES
+ ('S1','onlineSite','T1'),('S2','onlineSite','T1'),
+ ('S3','offlineSite','T2'),('S4','onlineSite','T3');"
+tenant_site_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:online_site_tenant_count)"
+jq -e '.bindings == ["onlineSite"]' <<< "${tenant_site_plan}" >/dev/null
+tenant_site_sql="$(jq -r '.sql' <<< "${tenant_site_plan}")"
+tenant_site_result="$(sqlite3 -json :memory: -cmd "${tenant_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'onlineSite'" "${tenant_site_sql}")"
+jq -e 'length == 1 and .[0].tenant_count == 2' <<< "${tenant_site_result}" >/dev/null
+
 qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
 qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
 qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
@@ -297,4 +310,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
