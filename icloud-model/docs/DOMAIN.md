@@ -25,8 +25,9 @@ The additional site/frame/KPI carriers are pressure probes, not a transcription
 of the full iCloud network graph. `device_kpi_ts_raw` deliberately names a raw
 string column; it is independently annotated as a canonical UTC-second source,
 but listing it does not by itself constitute a time-window query. The bounded
-`utc_window` intent covers `[start,end)` on the root dataset, not the full
-relative-time or top-N demand of Q0043. Similarly,
+`utc_window` covers an explicit `[start,end)` on the root dataset, while
+`utc_days_window` and the row-level sample Top-N cover Q0043's relative-day
+and raw-sample shapes with an externally supplied clock anchor. Similarly,
 joining a frame to device KPI does not establish a frame-owned CPU metric:
 Q0078/Q0079 require a semantic grain/aggregation decision in the Model, not
 just an executable SQL join. Named field pairs resolve to canonical indexes at
@@ -63,10 +64,10 @@ Q0043 also pressures sample-grain Top-N: `port_count_sample` is the raw integer
 sample dimension on the same physical field as the separately declared
 `port_count` Sum metric. An explicit UTC window, Device alias/MAC/WAC filters,
 the full resource-plus-tenant ownership key, and stable sample ordering produce
-unaggregated top-five rows. The actual corpus request uses relative 30 days and
-`EntNetworkElement`, whereas this fixture uses supplied absolute bounds and
-`I_EntNetworkElement`; it does not claim the physical source mismatch is
-resolved. For relative N-day windows, the platform supplies a validated
+unaggregated top-five rows. The corpus SQL uses `EntNetworkElement`, whereas
+the current IC source mapping names that logical source ID but declares
+`I_EntNetworkElement` as its SQL relation; the fixture follows the model
+mapping. For relative N-day windows, the platform supplies a validated
 canonical UTC `as_of` instant and N; SQLite computes the lower bound using a
 closed, bound `-N days` modifier, and the same instant is the exclusive upper
 bound. The platform owns capturing that clock value; calendar-month windows
