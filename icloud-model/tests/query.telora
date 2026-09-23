@@ -291,25 +291,60 @@ pub def dataset_grain_and_time_are_discoverable: test::Test = test::should_ok(fn
 
 pub def device_kpi_metric_contract_is_discoverable: test::Test = test::should_ok(fn() {
     let metrics = edsl::metric_domain(payload, "device_kpi");
-    match (array::get(metrics, 0), array::get(metrics, 1), array::get(metrics, 2), array::get(metrics, 3)) {
-        (Some(cpu), Some(cpu_peak), Some(ports), Some(peak)) => if array::length(metrics) == 4
+    match (array::find(metrics, fn(m) { m.id == "cpu_usage" }),
+        array::find(metrics, fn(m) { m.id == "cpu_peak" }),
+        array::find(metrics, fn(m) { m.id == "memory_usage" }),
+        array::find(metrics, fn(m) { m.id == "port_count" })) {
+        (Some(cpu), Some(cpu_peak), Some(memory), Some(ports)) => if array::length(metrics) == 10
             && cpu.id == "cpu_usage" && cpu.field == "cpu_usage"
             && cpu.aggregate == qb::AggregateFunction::Avg && cpu.unit == Some("%")
             && cpu.role == edsl::MetricValueRole::DeclaredMetric
             && cpu_peak.id == "cpu_peak" && cpu_peak.field == "cpu_usage"
             && cpu_peak.aggregate == qb::AggregateFunction::Max && cpu_peak.unit == cpu.unit
             && cpu_peak.role == edsl::MetricValueRole::SampleSummary
+            && memory.id == "memory_usage" && memory.aggregate == qb::AggregateFunction::Avg
             && ports.id == "port_count" && ports.aggregate == qb::AggregateFunction::Sum
             && ports.role == edsl::MetricValueRole::DeclaredMetric
-            && peak.id == "port_count_peak" && peak.field == "port_count"
-            && peak.aggregate == qb::AggregateFunction::Max && peak.unit == ports.unit
-            && peak.role == edsl::MetricValueRole::SampleSummary {
+            && array::any(metrics, fn(m) { m.id == "port_count_peak" && m.field == "port_count"
+                && m.aggregate == qb::AggregateFunction::Max && m.unit == ports.unit
+                && m.role == edsl::MetricValueRole::SampleSummary })
+            && array::any(metrics, fn(m) { m.id == "port_count_sample_avg" && m.field == "port_count"
+                && m.aggregate == qb::AggregateFunction::Avg && m.unit == ports.unit
+                && m.role == edsl::MetricValueRole::SampleSummary })
+            && array::any(metrics, fn(m) { m.id == "running_port_count"
+                && m.aggregate == qb::AggregateFunction::Sum && m.role == edsl::MetricValueRole::DeclaredMetric })
+            && array::any(metrics, fn(m) { m.id == "used_port_count"
+                && m.aggregate == qb::AggregateFunction::Sum && m.role == edsl::MetricValueRole::DeclaredMetric })
+            && array::any(metrics, fn(m) { m.id == "used_port_sample_avg"
+                && m.aggregate == qb::AggregateFunction::Avg && m.role == edsl::MetricValueRole::SampleSummary })
+            && array::any(metrics, fn(m) { m.id == "running_port_sample_avg"
+                && m.aggregate == qb::AggregateFunction::Avg && m.role == edsl::MetricValueRole::SampleSummary }) {
             True
         } else {
             fail!("device KPI metric metadata differs from iCloud", metrics)
         },
         _ => fail!("missing device KPI metric contract", metrics),
     }
+});
+
+pub def independent_average_sample_summaries_qualify_device_count: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"qualify_metrics","measures":["device_count"],"dimensions":[],"filters":[{"dimension":"device_class","op":"eq","kind":"text","value":"router"}],"ordering":[],"limit":null,"offset":null,"qualifications":[{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[],"window":{"start":"2024-02-26T00:00:00Z","end":"2024-02-29T00:00:00Z"},"having":{"measure":"memory_usage","op":"ge","kind":"number","value":47.5}},{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[],"window":{"start":"2024-02-26T00:00:00Z","end":"2024-02-29T00:00:00Z"},"having":{"measure":"port_count_sample_avg","op":"ge","kind":"int","value":48}}]}`);
+    if array::length(string::split(q.sql, "avg(k_qualification.memUsage) >= ?")) == 2
+        && array::length(string::split(q.sql, "avg(k_qualification.portCount) >= ?")) == 2
+        && array::length(string::split(q.sql, "d.tenant_id = k_qualification.tenantId")) == 3
+        && array::length(string::split(q.sql, "EXISTS (")) == 3
+        && array::length(string::split(q.sql, "JOIN NetworkDeviceKPI")) == 1 {
+        True
+    } else { fail!("Q0091 requires independent Avg samples, not the published Sum metric", q) }
+});
+
+pub def running_ports_sample_average_does_not_override_sum_metric: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"qualify_metrics","measures":["device_count"],"dimensions":[],"filters":[{"dimension":"device_class","op":"eq","kind":"text","value":"firewall"}],"ordering":[],"limit":null,"offset":null,"qualifications":[{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[],"window":{"start":"2024-02-26T00:00:00Z","end":"2024-02-29T00:00:00Z"},"having":{"measure":"used_port_sample_avg","op":"ge","kind":"int","value":24}},{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[],"window":{"start":"2024-02-26T00:00:00Z","end":"2024-02-29T00:00:00Z"},"having":{"measure":"running_port_sample_avg","op":"ge","kind":"int","value":1}}]}`);
+    if array::length(string::split(q.sql, "avg(k_qualification.portUsedCount) >= ?")) == 2
+        && array::length(string::split(q.sql, "avg(k_qualification.operStatusCount) >= ?")) == 2
+        && array::length(string::split(q.sql, "sum(k_qualification.operStatusCount)")) == 1 {
+        True
+    } else { fail!("Q0092 must distinguish the running-port sample average from its Sum metric", q) }
 });
 
 pub def device_cpu_metric_uses_declared_aggregation: test::Test = test::should_ok(fn() {

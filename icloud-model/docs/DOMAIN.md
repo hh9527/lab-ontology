@@ -108,3 +108,12 @@ pass HAVING. The SQLite fixture verifies these distinctions, a site with the
 right name in the wrong tenant, and two interfaces sharing a display name.
 IC declares `Port.id` as its primary key and maps KPI `resId` to it; this
 acceptance does not invent a tenant key on that relation.
+
+Q0091/Q0092 expose an aggregation ambiguity in corpus SQL. IC's total, used,
+and running port counts retain their declared Sum aggregation. Distinct
+`*_sample_avg` summaries on the same raw KPI columns are explicit Avg
+knowledge points with the same units; `metric_domain` identifies them as
+sample summaries. Two independent related KPI Avg predicates qualify a device
+over externally supplied three-day UTC bounds, and `device_count` counts its
+identity once. The fixture includes router/firewall canonical class wires,
+same resource IDs in different tenants, and absent values on one side.

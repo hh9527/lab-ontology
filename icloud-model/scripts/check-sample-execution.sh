@@ -73,6 +73,40 @@ qualified_raw_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_s
     -cmd '.parameter set ?5 58' -cmd '.parameter set ?6 58' "${qualified_raw_sql}")"
 jq -e 'map(.name) | sort == ["ExtraPort","SamePort"]' <<< "${qualified_raw_result}" >/dev/null
 
+average_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, classification TEXT);
+CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, memUsage REAL, portCount INTEGER, portUsedCount INTEGER, operStatusCount INTEGER);
+INSERT INTO I_EntNetworkElement VALUES
+ ('R1','red','AR'),('R1','blue','ne.category.router'),('R2','red','AR'),('R3','red','AR'),
+ ('F1','red','FW'),('F2','red','FW'),('F3','red','FW');
+INSERT INTO NetworkDeviceKPI VALUES
+ ('R1','red','2024-02-26T00:00:00Z',50,50,NULL,NULL),
+ ('R1','red','2024-02-27T00:00:00Z',50,50,NULL,NULL),
+ ('R1','blue','2024-02-26T00:00:00Z',80,1,NULL,NULL),
+ ('R2','red','2024-02-26T00:00:00Z',50,1,NULL,NULL),
+ ('R3','red','2024-02-26T00:00:00Z',NULL,60,NULL,NULL),
+ ('F1','red','2024-02-26T00:00:00Z',NULL,NULL,25,2),
+ ('F1','red','2024-02-27T00:00:00Z',NULL,NULL,25,2),
+ ('F2','red','2024-02-26T00:00:00Z',NULL,NULL,25,0),
+ ('F3','red','2024-02-26T00:00:00Z',NULL,NULL,NULL,2);"
+for average_case in qualified_router_average_count qualified_firewall_average_count; do
+    average_plan="$("${telora_bin}" -C "${fixture_dir}" eval "icloud-model/sample_execution:${average_case}")"
+    average_sql="$(jq -r '.sql' <<< "${average_plan}")"
+    if [[ "${average_case}" == qualified_router_average_count ]]; then
+        jq -e '.bindings == ["ne.category.router","AR","2024-02-26T00:00:00Z","2024-02-29T00:00:00Z",47.5,"2024-02-26T00:00:00Z","2024-02-29T00:00:00Z",48]' <<< "${average_plan}" >/dev/null
+        class_1='ne.category.router'; class_2='AR'; first_threshold=47.5; second_threshold=48
+    else
+        jq -e '.bindings == ["ne.category.firewall","FW","2024-02-26T00:00:00Z","2024-02-29T00:00:00Z",24,"2024-02-26T00:00:00Z","2024-02-29T00:00:00Z",1]' <<< "${average_plan}" >/dev/null
+        class_1='ne.category.firewall'; class_2='FW'; first_threshold=24; second_threshold=1
+    fi
+    average_result="$(sqlite3 -json :memory: -cmd "${average_schema}" -cmd '.parameter init' \
+        -cmd ".parameter set ?1 '${class_1}'" -cmd ".parameter set ?2 '${class_2}'" \
+        -cmd ".parameter set ?3 '2024-02-26T00:00:00Z'" -cmd ".parameter set ?4 '2024-02-29T00:00:00Z'" \
+        -cmd ".parameter set ?5 ${first_threshold}" \
+        -cmd ".parameter set ?6 '2024-02-26T00:00:00Z'" -cmd ".parameter set ?7 '2024-02-29T00:00:00Z'" \
+        -cmd ".parameter set ?8 ${second_threshold}" "${average_sql}")"
+    jq -e 'length == 1 and .[0].device_count == 1' <<< "${average_result}" >/dev/null
+done
+
 created_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:created_in_local_second)"
 jq -e '.bindings == [1718467200000,1718467201000]' <<< "${created_plan}" >/dev/null
 created_sql="$(jq -r '.sql' <<< "${created_plan}")"
@@ -222,4 +256,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
