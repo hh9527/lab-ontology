@@ -20,7 +20,10 @@ def communication_values: Array(edsl::CanonicalValueSpec) = [online_value, offli
 def storage_normal_value: edsl::CanonicalValueSpec = { id: "normal", label: "Normal", wires: [edsl::FilterInput::Text("1")] };
 def storage_running_values: Array(edsl::CanonicalValueSpec) = [storage_normal_value];
 def wac_value: edsl::CanonicalValueSpec = { id: "WAC", label: "Wireless access controller", wires: [edsl::FilterInput::Text("ne.category.ac"), edsl::FilterInput::Text("AC"), edsl::FilterInput::Text("WAC")] };
-def device_class_values: Array(edsl::CanonicalValueSpec) = [wac_value];
+def lsw_value: edsl::CanonicalValueSpec = { id: "LSW", label: "Network switch", wires: [edsl::FilterInput::Text("ne.category.switch"), edsl::FilterInput::Text("LSW")] };
+def device_class_values: Array(edsl::CanonicalValueSpec) = [wac_value, lsw_value];
+def huawei_value: edsl::CanonicalValueSpec = { id: "Huawei", label: "Huawei", wires: [edsl::FilterInput::Text("2011"), edsl::FilterInput::Text("Huawei"), edsl::FilterInput::Text("huawei technologies co., ltd")] };
+def manufacturer_values: Array(edsl::CanonicalValueSpec) = [huawei_value];
 def fault_value: edsl::CanonicalValueSpec = { id: "fault", label: "Fault", wires: [edsl::FilterInput::Int(2), edsl::FilterInput::Int(3)] };
 def physical_link_status_values: Array(edsl::CanonicalValueSpec) = [fault_value];
 def frame_normal_value: edsl::CanonicalValueSpec = { id: "normal", label: "Normal", wires: [edsl::FilterInput::Int(3), edsl::FilterInput::Int(11), edsl::FilterInput::Int(13), edsl::FilterInput::Int(15), edsl::FilterInput::Int(16)] };
@@ -36,6 +39,10 @@ def alarm_grain: Array(String) = ["csn"];
 def alarm_time: Option(String) = Some("occur_utc");
 def kpi_grain: Array(String) = ["res_id", "tenant_id", "ts"];
 def kpi_time: Option(String) = Some("ts");
+def port_grain: Array(String) = ["id"];
+def interface_kpi_grain: Array(String) = ["res_id", "tenant_id", "ts"];
+def packet_unit: Option(String) = Some("packets/s");
+def number_inputs: Array(edsl::FilterInputKind) = [edsl::FilterInputKind::Number];
 def avg_agg: qb::AggregateFunction = qb::AggregateFunction::Avg;
 def sum_agg: qb::AggregateFunction = qb::AggregateFunction::Sum;
 def percent_unit: Option(String) = Some("%");
@@ -51,7 +58,7 @@ def local_epoch_millis: edsl::TimeEncoding = edsl::TimeEncoding::LocalEpochMilli
 @edsl::dataset(entity_kind, device_grain, no_time)
 @edsl::dataset_description("Network device", "Network resource identified within its tenant")
 @edsl::relation_description("device_located_at_site", "Located at site", "Either project or parent subnet identifies the site")
-@edsl::named_relation_key("device_located_at_site", Site.type, edsl::RelationKind::Safe,
+@edsl::named_relation_key("device_located_at_site", Site.type, edsl::RelationKind::FanOut,
     edsl::RelationKey::Or([
         edsl::RelationKey::FieldEq({ from: "project_id", to: "site_id" }),
         edsl::RelationKey::FieldEq({ from: "ref_parent_subnet", to: "site_id" }),
@@ -89,11 +96,30 @@ type Device = struct {
     @edsl::column("mac")
     @edsl::dimension("device_mac", yes, yes, text_ops, text_inputs)
     mac: String,
+    @edsl::column("manufacturer")
+    @edsl::dimension("device_manufacturer", yes, yes, text_ops, text_inputs)
+    @edsl::canonical_values(manufacturer_values)
+    manufacturer: String,
+};
+
+@edsl::entity_id("tenant")
+@edsl::entity_source("X_TENANT_VIEW", "t")
+@edsl::dataset_description("Tenant", "Tenant identity and name")
+type Tenant = struct {
+    @edsl::column("TENANT_ID")
+    @edsl::key(yes)
+    id: String,
+    @edsl::column("TENANT_NAME")
+    @edsl::dimension("tenant_name", yes, yes, text_ops, text_inputs)
+    name: String,
 };
 
 @edsl::entity_id("site")
 @edsl::entity_source("X_SITE_VIEW", "s")
 @edsl::dataset_description("Site", "Governance site referenced by network devices")
+@edsl::relation_description("site_belongs_to_tenant", "Belongs to tenant", "Site and tenant share the tenant identity")
+@edsl::named_relation_key("site_belongs_to_tenant", Tenant.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "tenant_id", to: "id" }))
 type Site = struct {
     @edsl::column("SITE_ID")
     @edsl::key(yes)
@@ -102,6 +128,51 @@ type Site = struct {
     @edsl::column("SITE_NAME")
     @edsl::dimension("site_name", yes, yes, text_ops, text_inputs)
     site_name: String,
+    @edsl::column("TENANT_ID")
+    tenant_id: String,
+};
+
+@edsl::entity_id("port")
+@edsl::entity_source("I_EnterpriseNetworkLTP", "p")
+@edsl::dataset(entity_kind, port_grain, no_time)
+@edsl::dataset_description("Network interface", "Interface owned by a network device")
+@edsl::relation_description("port_belongs_to_device", "Belongs to device", "Declared parent device of the interface")
+@edsl::named_relation_key("port_belongs_to_device", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "ref_parent_ne", to: "id" }))
+type Port = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: String,
+    @edsl::column("tenantId")
+    tenant_id: String,
+    @edsl::column("refParentNE")
+    ref_parent_ne: String,
+    @edsl::column("name")
+    @edsl::dimension("port_name", yes, yes, text_ops, text_inputs)
+    name: String,
+};
+
+@edsl::entity_id("interface_kpi")
+@edsl::entity_source("NetworkDeviceInterfaceKPI", "ik")
+@edsl::dataset(metric_kind, interface_kpi_grain, kpi_time)
+@edsl::dataset_description("Interface KPI samples", "UTC samples of interface packet transmit rate")
+@edsl::relation_description("interface_kpi_of_port", "Samples for interface", "KPI resource ID identifies its interface")
+@edsl::named_relation_key("interface_kpi_of_port", Port.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "res_id", to: "id" }))
+type InterfaceKpi = struct {
+    @edsl::column("resId")
+    res_id: String,
+    @edsl::column("tenantId")
+    tenant_id: String,
+    @edsl::column("ts")
+    @edsl::time_field(utc_role, utc_seconds)
+    @edsl::dimension("interface_kpi_ts_raw", yes, yes, text_ops, text_inputs)
+    ts: String,
+    @edsl::column("ifOutPktSpeed")
+    @edsl::dimension("interface_tx_sample", yes, yes, [], number_inputs)
+    @edsl::measure("interface_tx", avg_agg, none_required)
+    @edsl::metric_value("interface_tx", avg_agg, packet_unit)
+    tx_speed: Float,
 };
 
 @edsl::entity_id("storage_device")
@@ -280,7 +351,7 @@ def profile: qb::PlanProfile = {
 };
 
 def payload: edsl::PreparedPayload = edsl::build_root(
-    "icloud-challenge-v2", [Device.type, Site.type, StorageDevice.type, Frame.type, DeviceKpi.type, CurrentAlarm.type, PhysicalLink.type],
+    "icloud-challenge-v2", [Device.type, Tenant.type, Site.type, Port.type, InterfaceKpi.type, StorageDevice.type, Frame.type, DeviceKpi.type, CurrentAlarm.type, PhysicalLink.type],
     profile, fn(subject) { subject == "public" });
 
-pub use self::{ Device, Site, StorageDevice, Frame, DeviceKpi, CurrentAlarm, PhysicalLink, payload };
+pub use self::{ Device, Tenant, Site, Port, InterfaceKpi, StorageDevice, Frame, DeviceKpi, CurrentAlarm, PhysicalLink, payload };

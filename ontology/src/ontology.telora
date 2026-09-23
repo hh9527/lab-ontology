@@ -483,6 +483,14 @@ type ComponentContextSpec = struct {
     dimensions: Array(DimensionRequest),
     filters: Array(FilterRequest),
 };
+type SampleTopScope = struct {
+    ancestor_relation: String,
+    site_relation: String,
+    tenant_relation: String,
+    ancestor_filters: Array(FilterRequest),
+    site_filters: Array(FilterRequest),
+    tenant_filters: Array(FilterRequest),
+};
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
@@ -4853,8 +4861,54 @@ def entity_grain_exprs: Fn(EntityEntry, String) -> Array(qb::Expr) = fn(entity, 
     })
 };
 
-def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int) -> qb::Plan =
-    fn(payload, request, owner_id, relation_id, window, rank_id, take) {
+def sample_top_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, SampleTopScope) -> Tuple([qb::Join, Option(qb::Expr), qb::Exists]) =
+    fn(payload, owner, ancestor, scope) {
+        let ancestor_relation = relation_domain(payload, scope.ancestor_relation);
+        let site_relation = relation_domain(payload, scope.site_relation);
+        let tenant_relation = relation_domain(payload, scope.tenant_relation);
+        let site = get_index(payload.entities, site_relation.to);
+        let tenant = get_index(payload.entities, tenant_relation.to);
+        if ancestor_relation.from != owner.index || ancestor_relation.to != ancestor.index
+            || ancestor_relation.kind != RelationKind::Safe
+            || site_relation.from != ancestor.index || site_relation.kind != RelationKind::FanOut
+            || tenant_relation.from != site.index || tenant_relation.kind != RelationKind::Safe {
+            fail!("sample top scope requires a safe ancestor and a declared site-to-tenant chain")
+        } else {
+            let ancestor_filters = resolve_filters(payload, scope.ancestor_filters);
+            let site_filters = resolve_filters(payload, scope.site_filters);
+            let tenant_filters = resolve_filters(payload, scope.tenant_filters);
+            if !array::all(ancestor_filters, fn(f) { f.entity == ancestor.index })
+                || !array::all(site_filters, fn(f) { f.entity == site.index })
+                || !array::all(tenant_filters, fn(f) { f.entity == tenant.index }) {
+                fail!("sample top scope filters must belong to their declared relation roles")
+            } else {
+                let ancestor_join = qb::join_on(qb::JoinKind::Inner,
+                    qb::source(ancestor.alias, ancestor.table),
+                    key_to_condition(payload, ancestor_relation.from, ancestor_relation.to, ancestor_relation.key));
+                let alternatives = match site_relation.key {
+                    RelationKey::Or(keys) => array::map(keys, fn(key) {
+                        array::map(exists_pairs(key), fn(pair) { exists_col_eq(ancestor, site, pair, False) })
+                    }),
+                    _ => fail!("sample top site scope requires explicit alternative keys", scope.site_relation),
+                };
+                let tenant_pairs = array::map(exists_pairs(tenant_relation.key), fn(pair) {
+                    exists_col_eq(site, tenant, pair, False)
+                });
+                let filter_terms = array::concat([
+                    array::map(site_filters, fn(f) { f.expr }),
+                    array::map(tenant_filters, fn(f) { f.expr }),
+                ]);
+                let qualification = qb::exists_two_hop_alternatives(
+                    qb::source(site.alias, site.table), alternatives,
+                    qb::source(tenant.alias, tenant.table), tenant_pairs,
+                    combine_filters(filter_terms));
+                (ancestor_join, combine_filters(array::map(ancestor_filters, fn(f) { f.expr })), qualification)
+            }
+        }
+    };
+
+def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int, Option(SampleTopScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, window, rank_id, take, scope) {
         let sample = get_index(payload.entities, entity_by_id(payload, window.dataset));
         let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
         let relation = relation_domain(payload, relation_id);
@@ -4890,17 +4944,38 @@ def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindo
                 let output = array::map(request.dimensions, fn(d) { ProjectionToken::Dimension(d.id) });
                 let plan = reorder_projection(payload, request, raw, output);
                 let condition = key_to_condition(payload, relation.from, relation.to, relation.key);
-                let joined = array::length(plan.sources) == 2 && array::length(plan.joins) == 1
-                    && array::any(plan.joins, fn(j) {
+                let joined = array::any(plan.joins, fn(j) {
                         j.source.alias == owner.alias && j.condition == condition && j.kind == qb::JoinKind::Inner
                     });
                 let needs_owner = array::length(plan.sources) == 1 && array::length(plan.joins) == 0;
-                if !joined && !needs_owner {
+                if (!joined && !needs_owner) || (scope == None && array::length(plan.sources) > 2)
+                    || array::length(plan.sources) > 3 {
                     fail!("sample top requires exactly the declared owner join without fan-out", relation_id)
                 } else {
                     let owner_join = qb::join_on(qb::JoinKind::Inner, qb::source(owner.alias, owner.table), condition);
-                    let sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
-                    let joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
+                    let owner_sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
+                    let owner_joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
+                    let scoped = match scope {
+                        None => (owner_sources, owner_joins, plan.filter, plan.exists),
+                        Some(qualifier) => do {
+                            let ancestor_relation = relation_domain(payload, qualifier.ancestor_relation);
+                            let ancestor = get_index(payload.entities, ancestor_relation.to);
+                            let (join, ancestor_filter, site_exists) = sample_top_scope(payload, owner, ancestor, qualifier);
+                            let ancestor_joined = array::any(owner_joins, fn(existing) {
+                                existing.source.alias == ancestor.alias && existing.condition == join.condition
+                                    && existing.kind == qb::JoinKind::Inner
+                            });
+                            if array::length(owner_sources) == 3 && !ancestor_joined {
+                                fail!("sample top scope ancestor must use the named safe relation", qualifier.ancestor_relation)
+                            } else { () };
+                            let filter = append_filter_terms(plan.filter, match ancestor_filter {
+                                Some(expr) => [expr], None => [],
+                            });
+                            (if ancestor_joined { owner_sources } else { array::push(owner_sources, join.source) },
+                                if ancestor_joined { owner_joins } else { array::push(owner_joins, join) },
+                                filter, array::push(plan.exists, site_exists))
+                        },
+                    };
                     let owner_grain = entity_grain_exprs(owner, owner_id);
                     let sample_grain = array::map(spec.grain, fn(name) {
                         let field = match array::find(sample.fields, fn(f) { f.name == name }) {
@@ -4917,7 +4992,8 @@ def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindo
                             qb::order_by(qb::OrderKey::Expr(expr), qb::Ordering::Asc)
                         }),
                     ]);
-                    qb::validate({...plan, sources, joins,
+                    qb::validate({...plan, sources: scoped.0, joins: scoped.1,
+                        filter: scoped.2, exists: scoped.3,
                         partition: Some(qb::partitioned_top_n(owner_grain, ordering, take))}, payload.profile)
                 }
             }
@@ -6478,6 +6554,7 @@ pub use self::{
     NamedExistsRequest,
     MetricQualification,
     SampleQualification,
+    SampleTopScope,
     ComponentContextSpec,
     UtcWindowRequest,
     UtcDaysWindowRequest,
