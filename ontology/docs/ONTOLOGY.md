@@ -285,11 +285,11 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 目录中的维度 ID 可用 `dimension_detail(payload, id)` 追到所属数据集、逻辑
 字段、计算/投影授权状态、过滤操作和输入类型、枚举或规范业务值，以及按字段名
 解释的固有 scope。`dimension_detail_for_subject(payload, subject, id)` 还会拒绝
-未授权主体和不可查询的维度，与主体目录保持一致；完整详情同样只应提供给持有
-完整模型权限的调用方。`dimension_description(id, label, summary)` 在对应字段
+未授权主体和不可查询的维度，并仅发布合法业务值 ID/标签，不返回规范值的物理
+`wires` 或 enum 的内部 variant；完整详情仍包含映射，只应提供给持有完整模型
+权限的调用方。`dimension_description(id, label, summary)` 在对应字段
 声明简要说明；准备期拒绝不存在、重复或放错字段的说明，以及无效固有 scope。
-规范值的 `wires` 是物理映射信息，向只需选择业务值的 agent 发布时应按调用方
-权限决定是否隐藏，不能把这个详情接口直接当作脱敏边界。
+业务详情仍可能包含模型说明、逻辑字段和固有 scope，不应把它当作通用脱敏边界。
 
 ### 实体、指标与维度
 
