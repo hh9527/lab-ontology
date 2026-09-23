@@ -253,6 +253,11 @@ type ExistsRouteSpec = struct {
     target: Type,
 };
 
+@prelude::property(PropertyTarget::Type)
+type NativePairDef = struct { pairs: Array(NativePairSpec) };
+type NativePairSpec = struct { id: String, first: String, second: String };
+type NativePairEntry = struct { id: String, entity: Int, first: String, second: String };
+
 # Type-level: dual-endpoint hub declaration, annotated on the hub entity (the
 # base grain of any request using the hub).  A hub row carries two role columns
 # (`left_field`, `right_field`) that both reference the participant entity's key
@@ -502,6 +507,12 @@ type SiteTenantScope = struct {
     site_filters: Array(FilterRequest),
     tenant_filters: Array(FilterRequest),
 };
+type EndpointPairRequest = struct {
+    pair: String,
+    first: FilterInput,
+    second: FilterInput,
+    subject: String,
+};
 type ChildSiteScope = struct {
     parent_relation: String,
     site_relation: String,
@@ -728,6 +739,7 @@ type PreparedPayload = struct {
     routes: Array(RouteEntry),
     hub_routes: Array(HubRouteEntry),
     peer_routes: Array(PeerRouteEntry),
+    native_pairs: Array(NativePairEntry),
     paths: Array(Array(PathResult)),
     # `ambiguous_paths[s][t]` is True when more than one distinct Safe path
     # connects entity s to entity t (parallel or otherwise ambiguous declared
@@ -998,6 +1010,14 @@ def exists_route: Fn(Type, Type) -> Fn(td::TypeDesc, Option(ExistsRouteDef)) -> 
         };
         let result: ExistsRouteDef = { routes: all };
         result
+    }
+};
+
+def native_pair: Fn(String, String, String) -> Fn(td::TypeDesc, Option(NativePairDef)) -> NativePairDef = fn(id, first, second) {
+    fn(ctx, previous) {
+        let spec: NativePairSpec = { id, first, second };
+        let pairs = match previous { Some(p) => array::push(p.pairs, spec), None => [spec] };
+        { pairs }
     }
 };
 
@@ -2208,6 +2228,34 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     let measures_raw = array::flat_map(entities, fn(e) { collect_entity_measures(entities, e) });
     let measures = check_measure_contract(measures_raw);
     let dimensions = array::flat_map(entities, fn(e) { collect_entity_dimensions(e) });
+    let native_pairs = array::flat_map(entities, fn(e) {
+        let declared = match property::get_type_prop(e.entity_type, NativePairDef.type) {
+            Some(definition) => definition.pairs, None => [],
+        };
+        array::map(declared, fn(spec) {
+            let first = match array::find(dimensions, fn(d) { d.id == spec.first && d.entity == e.index }) {
+                Some(d) => d, None => fail!("unknown native pair first dimension", e.id, spec),
+            };
+            let second = match array::find(dimensions, fn(d) { d.id == spec.second && d.entity == e.index }) {
+                Some(d) => d, None => fail!("unknown native pair second dimension", e.id, spec),
+            };
+            if spec.id == "" || spec.first == spec.second || first.computed || second.computed
+                || first.field == second.field || !first.filterable || !second.filterable
+                || !array::any(first.ops, fn(op) { op == FilterOp::Eq })
+                || !array::any(second.ops, fn(op) { op == FilterOp::Eq })
+                || array::length(first.canonical_values) != 0 || array::length(second.canonical_values) != 0
+                || get_index(e.fields, first.field).ty != get_index(e.fields, second.field).ty
+                || first.input_kinds != second.input_kinds {
+                fail!("native pair requires distinct compatible plain equality dimensions", e.id, spec)
+            } else {
+                let entry: NativePairEntry = { id: spec.id, entity: e.index, first: spec.first, second: spec.second };
+                entry
+            }
+        })
+    });
+    if let Some(duplicate) = array::find(native_pairs, fn(p) {
+        array::length(array::filter(native_pairs, fn(other) { other.id == p.id })) > 1
+    }) { fail!("duplicate native pair id", duplicate.id) } else { () };
     let requires_disjunction = array::any(dimensions, fn(d) {
         array::any(d.canonical_values, fn(v) { array::length(v.wires) > 1 })
     });
@@ -2257,6 +2305,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         routes,
         hub_routes,
         peer_routes,
+        native_pairs,
         paths,
         ambiguous_paths,
         profile,
@@ -2510,6 +2559,11 @@ def relation_domain: Fn(PreparedPayload, String) -> RelationEntry = fn(payload, 
         Some(entry) => entry,
         None => fail!("unknown named relation", id),
     }
+};
+
+def native_pair_domain: Fn(PreparedPayload, String) -> Array(NativePairEntry) = fn(payload, dataset_id) {
+    let entity = entity_by_id(payload, dataset_id);
+    array::filter(payload.native_pairs, fn(pair) { pair.entity == entity })
 };
 
 def knowledge_index: Fn(PreparedPayload) -> Array(DatasetBrief) = fn(payload) {
@@ -4452,6 +4506,41 @@ def lower_relation_rows: Fn(PreparedPayload, QueryRequest, String, String) -> qb
         }
     }
 };
+
+# A native A/Z pair is a property of its link row, not an inferred path to
+# endpoint entities. Keep each ordered pairing closed before ORing them.
+def lower_endpoint_pair: Fn(PreparedPayload, QueryRequest, String, EndpointPairRequest) -> qb::Plan =
+    fn(payload, request, tenant_relation_id, pair) {
+        let relation = relation_domain(payload, tenant_relation_id);
+        if relation.kind != RelationKind::Safe {
+            fail!("endpoint pair requires a named safe tenant relation", tenant_relation_id)
+        } else {
+            let entity = get_index(payload.entities, relation.from);
+            let declared = match array::find(payload.native_pairs, fn(entry) { entry.id == pair.pair && entry.entity == entity.index }) {
+                Some(entry) => entry, None => fail!("unknown native endpoint pair for link dataset", pair.pair, entity.id),
+            };
+            if get_index(payload.entities, relation.to).id != "tenant" {
+                fail!("endpoint pair requires a declared tenant ownership relation", tenant_relation_id)
+            } else {
+                let plan = lower_via(payload, request, tenant_relation_id);
+                if array::length(plan.sources) != 2 || array::length(plan.joins) != 1 || plan.derived != None
+                    || get_index(plan.sources, 0).alias != entity.alias {
+                    fail!("endpoint pair requires the declared link-to-tenant join")
+                } else {
+                    let filters = resolve_filters(payload, [
+                        {id: declared.first, subject: pair.subject, op: FilterOp::Eq, input: pair.first},
+                        {id: declared.second, subject: pair.subject, op: FilterOp::Eq, input: pair.second},
+                        {id: declared.first, subject: pair.subject, op: FilterOp::Eq, input: pair.second},
+                        {id: declared.second, subject: pair.subject, op: FilterOp::Eq, input: pair.first},
+                    ]);
+                    let forward = qb::scalar(qb::ScalarFunction::And, [get_index(filters, 0).expr, get_index(filters, 1).expr]);
+                    let reverse = qb::scalar(qb::ScalarFunction::And, [get_index(filters, 2).expr, get_index(filters, 3).expr]);
+                    qb::validate({...plan, filter: append_filter_terms(plan.filter,
+                        [qb::scalar(qb::ScalarFunction::Or, [forward, reverse])])}, payload.profile)
+                }
+            }
+        }
+    };
 
 type RoleProjectionSpec = struct { relation: String, dimension: String, output: String };
 type RoleFilterSpec = struct { role: String, filter: FilterRequest };
@@ -6815,6 +6904,8 @@ pub use self::{
     SampleCountRange,
     OwnerSiteScope,
     SiteTenantScope,
+    EndpointPairRequest,
+    NativePairEntry,
     ChildSiteScope,
     ComponentContextSpec,
     UtcWindowRequest,
@@ -6841,6 +6932,7 @@ pub use self::{
     dataset,
     metric_value,
     sample_aggregate,
+    native_pair,
     time_field,
     dataset_description,
     relation_description,
@@ -6872,6 +6964,7 @@ pub use self::{
     correlation_feasible,
     filters_on_entity,
     build_root,
+    native_pair_domain,
     lower,
     lower_full,
     lower_group_projection,
@@ -6919,6 +7012,7 @@ pub use self::{
     lower_sample_top,
     lower_via,
     lower_relation_rows,
+    lower_endpoint_pair,
     lower_child_site_scope,
     RoleProjectionSpec,
     RoleFilterSpec,

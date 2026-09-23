@@ -146,6 +146,25 @@ fan_count_result="$(sqlite3 -json :memory: -cmd "${fan_site_schema}" -cmd '.para
     -cmd ".parameter set ?3 'Site-A'" -cmd ".parameter set ?4 'Tenant-A'" "${fan_count_sql}")"
 jq -e 'length == 1 and .[0].server_fan_count == 3' <<< "${fan_count_result}" >/dev/null
 
+link_pair_schema="CREATE TABLE EnterprisePhysicalLink (id TEXT, tenantId TEXT, aNeName TEXT, zNeName TEXT);
+CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
+INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
+INSERT INTO EnterprisePhysicalLink VALUES
+ ('L1','TA','光-OLT-7137','存储-HUAWEISTORAGE-6534'),
+ ('L2','TA','存储-HUAWEISTORAGE-6534','光-OLT-7137'),
+ ('L3','TA','光-OLT-7137','存储-HUAWEISTORAGE-6534'),
+ ('L4','TA','光-OLT-7137','unrelated'),
+ ('L5','TA','unrelated','存储-HUAWEISTORAGE-6534'),
+ ('L6','TB','光-OLT-7137','存储-HUAWEISTORAGE-6534');"
+link_pair_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:physical_link_endpoint_pair)"
+jq -e '.bindings == ["Tenant-A","光-OLT-7137","存储-HUAWEISTORAGE-6534","存储-HUAWEISTORAGE-6534","光-OLT-7137"]' <<< "${link_pair_plan}" >/dev/null
+link_pair_sql="$(jq -r '.sql' <<< "${link_pair_plan}")"
+link_pair_result="$(sqlite3 -json :memory: -cmd "${link_pair_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'Tenant-A'" -cmd ".parameter set ?2 '光-OLT-7137'" \
+    -cmd ".parameter set ?3 '存储-HUAWEISTORAGE-6534'" -cmd ".parameter set ?4 '存储-HUAWEISTORAGE-6534'" \
+    -cmd ".parameter set ?5 '光-OLT-7137'" "${link_pair_sql}")"
+jq -e 'length == 1 and .[0].physical_link_count == 3' <<< "${link_pair_result}" >/dev/null
+
 qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
 qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
 qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
