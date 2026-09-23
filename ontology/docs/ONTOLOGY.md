@@ -413,6 +413,9 @@ type Trace = struct {
 `filtered_measure` 让领域模型作者在既有聚合语义上附加一个固有 predicate：只有满足
 predicate 的行计入该指标。predicate 复用 `ScopePredicate`（引用同一实体的已声明、
 已授权且可筛选维度），并复用 enum value、operation、input kind 与 scope 校验。
+准备 Model 时就解析每条固有 predicate；不存在的字段、未声明/不可筛选维度、
+无效操作或业务值会在知识发布前诊断。用户 filters 与有效固有 predicate
+之间的具体冲突仍在请求 lowering 时诊断。
 固有 predicate 与用户全局 filters 保持各自语义：全局 filters 限定整个事实集，
 固有 predicate 只通过查询的 `FILTER (WHERE ...)` 限定该指标自身，绝不展平成互相
 冲突的全局 AND。
