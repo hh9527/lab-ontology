@@ -86,6 +86,34 @@ alarm_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
     -cmd ".parameter set ?3 '1'" -cmd '.parameter set ?4 3' "${alarm_sql}")"
 jq -e 'length == 1 and .[0].name == "B-red" and .[0].cpu_peak == 50' <<< "${alarm_result}" >/dev/null
 
+range_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT);
+CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, portCount INTEGER);
+INSERT INTO I_EntNetworkElement VALUES ('D0','red','Zero'),('D1','red','One'),('D1','blue','Four'),('D5','red','Five');
+INSERT INTO NetworkDeviceKPI VALUES
+ ('D1','red','2024-02-01T00:00:00Z',91),
+ ('D1','blue','2024-02-01T00:00:00Z',91),('D1','blue','2024-02-02T00:00:00Z',92),
+ ('D1','blue','2024-02-03T00:00:00Z',93),('D1','blue','2024-02-04T00:00:00Z',94),
+ ('D5','red','2024-02-01T00:00:00Z',91),('D5','red','2024-02-02T00:00:00Z',92),
+ ('D5','red','2024-02-03T00:00:00Z',93),('D5','red','2024-02-04T00:00:00Z',94),
+ ('D5','red','2024-02-05T00:00:00Z',95);"
+zero_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:zero_to_four_samples)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",90,4]' <<< "${zero_plan}" >/dev/null
+zero_sql="$(jq -r '.sql' <<< "${zero_plan}")"
+zero_result="$(sqlite3 -json :memory: -cmd "${range_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?3 90' -cmd '.parameter set ?4 4' "${zero_sql}")"
+jq -e 'map(.name) | sort == ["Four","One","Zero"]' <<< "${zero_result}" >/dev/null
+
+positive_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:one_to_four_samples)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",90,1,"2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",90,4]' <<< "${positive_plan}" >/dev/null
+positive_sql="$(jq -r '.sql' <<< "${positive_plan}")"
+positive_result="$(sqlite3 -json :memory: -cmd "${range_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?3 90' -cmd '.parameter set ?4 1' \
+    -cmd ".parameter set ?5 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?6 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?7 90' -cmd '.parameter set ?8 4' "${positive_sql}")"
+jq -e 'map(.name) | sort == ["Four","One"]' <<< "${positive_result}" >/dev/null
+
 count_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_count)"
 jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",40,"2024-02-10T00:00:00Z","2024-03-01T00:00:00Z",8]' <<< "${count_plan}" >/dev/null
 count_sql="$(jq -r '.sql' <<< "${count_plan}")"
@@ -167,4 +195,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'local epoch-ms filter, owner-scoped sample tops, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
