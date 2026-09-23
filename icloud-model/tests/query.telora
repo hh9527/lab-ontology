@@ -992,6 +992,56 @@ def q0174_intent: String = `{"op":"filter_endpoint_pair","tenant_relation":"phys
 def q0374_link_site_scope: String = `"link_site":{"a_relation":"physical_link_a_device","z_relation":"physical_link_z_device","link_tenant_relation":"physical_link_belongs_to_tenant","device_tenant_relation":"device_belongs_to_tenant","site_relation":"device_located_at_site","tenant_relation":"site_belongs_to_tenant","device_filters":[{"dimension":"device_class","op":"eq","kind":"text","value":"LSW"},{"dimension":"device_name","op":"eq","kind":"text","value":"Same"}],"site_filters":[{"dimension":"site_type","op":"eq","kind":"text","value":"offline"}],"tenant_filters":[{"dimension":"tenant_name","op":"eq","kind":"text","value":"Tenant-A"}]}`;
 def q0374_link_site_intent: String = `{"op":"qualify_link_site","measures":["physical_link_count"],"dimensions":[],"filters":[],"ordering":[],"limit":null,"offset":null,\{q0374_link_site_scope}}`;
 
+def q0366_link_device_intent: String = `{"op":"list_link_device_site","measures":[],"dimensions":["device_name","physical_link_name","device_id","physical_link_id"],"filters":[],"ordering":[],"limit":1000,"offset":null,\{q0374_link_site_scope}}`;
+
+pub def q0366_link_device_rows_preserve_association_grain: test::Test = test::should_ok(fn() {
+    let q = lower_json(q0366_link_device_intent);
+    if array::length(string::split(q.sql, "d.name AS device_name, pl.name AS physical_link_name")) > 1
+        && array::length(string::split(q.sql, "pl.a_ne_res_id = d.id AND pl.tenantId = d.tenant_id")) > 1
+        && array::length(string::split(q.sql, "pl.z_ne_res_id = d.id AND pl.tenantId = d.tenant_id")) > 1
+        && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM X_SITE_VIEW AS s")) == 2
+        && array::length(string::split(q.sql, "d.tenant_id = t.TENANT_ID")) > 1
+        && array::length(string::split(q.sql, "pl.tenantId = t.TENANT_ID")) > 1 {
+        True
+    } else { fail!("Q0366 must retain device-link association rows without joining site candidates", q) }
+});
+
+pub def link_device_rows_reject_wrong_endpoint_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_link_device_site","measures":[],"dimensions":["device_name","physical_link_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"link_site":{"a_relation":"physical_link_a_device","z_relation":"device_current_alarm","link_tenant_relation":"physical_link_belongs_to_tenant","device_tenant_relation":"device_belongs_to_tenant","site_relation":"device_located_at_site","tenant_relation":"site_belongs_to_tenant","device_filters":[],"site_filters":[],"tenant_filters":[]}}`)
+}, "link-device rows require two endpoint roles");
+
+pub def link_device_rows_reject_wrong_filter_role: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_link_device_site","measures":[],"dimensions":["device_name","physical_link_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"link_site":{"a_relation":"physical_link_a_device","z_relation":"physical_link_z_device","link_tenant_relation":"physical_link_belongs_to_tenant","device_tenant_relation":"device_belongs_to_tenant","site_relation":"device_located_at_site","tenant_relation":"site_belongs_to_tenant","device_filters":[{"dimension":"site_name","op":"eq","kind":"text","value":"Site-A"}],"site_filters":[],"tenant_filters":[]}}`)
+}, "link-device site filters must belong to their declared roles");
+
+pub def link_device_rows_reject_incomplete_endpoint_grain: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "physical_link_a_device" {
+            let key = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(first) => first,
+                    None => fail!("missing A endpoint key"),
+                },
+                _ => fail!("expected compound A endpoint relation"),
+            };
+            {...relation, key}
+        } else { relation }
+    });
+    let broken = {...payload, relations};
+    let scope: edsl::LinkSiteScope = {
+        a_relation: "physical_link_a_device", z_relation: "physical_link_z_device",
+        link_tenant_relation: "physical_link_belongs_to_tenant",
+        device_tenant_relation: "device_belongs_to_tenant",
+        site_relation: "device_located_at_site", tenant_relation: "site_belongs_to_tenant",
+        device_filters: [], site_filters: [], tenant_filters: [],
+    };
+    edsl::lower_link_device_site_rows(broken,
+        {measures: [], dimensions: [
+            {id: "device_name", subject: "public", input: edsl::DimensionInput::None},
+            {id: "physical_link_name", subject: "public", input: edsl::DimensionInput::None}],
+         filters: [], ordering: [], limit: None, offset: None, partition: None}, scope)
+}, "link-device rows require complete endpoint grain and aligned tenant identity keys");
+
 pub def q0374_link_site_counts_each_qualified_link_once: test::Test = test::should_ok(fn() {
     let q = lower_json(q0374_link_site_intent);
     if array::length(string::split(q.sql, "count(pl.id)")) == 2

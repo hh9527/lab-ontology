@@ -247,12 +247,12 @@ jq -e 'length == 2 and (map(.id) | sort == ["other_tenant","valid"])' <<< "${pee
 
 link_site_schema="CREATE TABLE EnterprisePhysicalLink (id TEXT, name TEXT, tenantId TEXT, a_ne_res_id TEXT, z_ne_res_id TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
-CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_TYPE TEXT, TENANT_ID TEXT);
+CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, SITE_TYPE TEXT, TENANT_ID TEXT);
 CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
 INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
 INSERT INTO X_SITE_VIEW VALUES
- ('S1','offlineSite','TA'),('S2','offlineSite','TA'),
- ('S3','offlineSite','TB'),('S4','onlineSite','TA');
+ ('S1','Site-A','offlineSite','TA'),('S2','Site-A','offlineSite','TA'),
+ ('S3','Site-A','offlineSite','TB'),('S4','Other','onlineSite','TA');
 INSERT INTO I_EntNetworkElement VALUES
  ('D1','TA','Same','LSW','S1','S2'),('D2','TA','Same','ne.category.switch','S2','S2'),
  ('D1','TB','Same','LSW','S3','S3'),('D9','TB','Same','LSW','S3','S3'),
@@ -281,6 +281,14 @@ link_site_names_result="$(sqlite3 -json :memory: -cmd "${link_site_schema}" -cmd
     -cmd ".parameter set ?5 'Tenant-A'" "${link_site_names_sql}")"
 jq -e 'length == 5 and (map(.id) | sort == ["L1","L10","L2","L3","L4"])
     and ([.[] | select(.name == "Repeated")] | length == 2)' <<< "${link_site_names_result}" >/dev/null
+link_device_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:link_device_site_rows)"
+link_device_sql="$(jq -r '.sql' <<< "${link_device_plan}")"
+link_device_result="$(sqlite3 -json :memory: -cmd "${link_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.switch'" -cmd ".parameter set ?2 'LSW'" \
+    -cmd ".parameter set ?3 'Same'" -cmd ".parameter set ?4 'Site-A'" \
+    -cmd ".parameter set ?5 'Tenant-A'" -cmd '.parameter set ?6 1000' "${link_device_sql}")"
+jq -e 'length == 6 and (map([.device_id, .physical_link_id]) | sort == [["D1","L1"],["D1","L2"],["D1","L3"],["D2","L1"],["D2","L10"],["D2","L4"]])
+    and (all(.[]; .device_name == "Same")) and ([.[] | select(.physical_link_name == "Repeated")] | length == 3)' <<< "${link_device_result}" >/dev/null
 
 latest_sample_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
 CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, operStatusCount INTEGER, adminStatusCount INTEGER);
@@ -505,4 +513,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
