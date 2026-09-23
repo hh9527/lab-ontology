@@ -322,6 +322,12 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 权限或查询路径。准备期拒绝空名称、同一数据集的成员别名重复、与自身 ID/主 label
 冲突，以及指向未声明或其他字段/实体知识点的别名。不同实体可能共享通用名称，
 agent 必须结合目录中的数据集与关系 ID 定位，不可把显示名称当成全局键。
+`localized_dataset(locale, label, summary)`、`localized_relation(id, locale, label, summary)`
+及字段级 `localized_dimension(id, locale, label, summary)` / `localized_measure(id, locale, label, summary)`
+在同一知识点上追加各语言的说明。完整与主体发现的 `localized` 数组均保留
+`locale`、`label`、`summary`；调用方自行选择展示语言，不改变稳定 ID、别名、授权
+或 lowering。模型准备期拒绝空字段、同一知识点重复的 locale、未知关系及挂在
+错误字段的成员说明。业务值的翻译不属于此声明。
 业务详情仍可能包含模型说明、逻辑字段和固有 scope，不应把它当作通用脱敏边界。
 维度 ID 在完整 Model 内必须非空且全局唯一，包括普通、计算和 JSON 维度；
 不同数据集上同名的字段应声明各自的业务维度 ID，否则按 ID 发现和 lowering
