@@ -53,6 +53,11 @@ type DimensionNote = struct { id: String, label: String, summary: String };
 @prelude::property(PropertyTarget::Field)
 type DimensionDescriptions = struct { notes: Array(DimensionNote) };
 
+type MemberAliasKind = enum { Dimension, Measure };
+type KnowledgeAlias = struct { kind: MemberAliasKind, id: String, label: String };
+@prelude::property(PropertyTarget::Field)
+type MemberAliasesDef = struct { aliases: Array(KnowledgeAlias) };
+
 # Member-level: filtered measure declaration. Adds a domain-declared inherent
 # predicate to the aggregate: only rows matching the predicate count into this
 # measure. The predicate references a declared, authorized, filterable dimension
@@ -161,10 +166,15 @@ type DatasetSpec = struct {
 };
 @prelude::property(PropertyTarget::Type)
 type DatasetDescription = struct { label: String, summary: String };
+@prelude::property(PropertyTarget::Type)
+type DatasetAliasesDef = struct { labels: Array(String) };
 
 type RelationNote = struct { id: String, label: String, summary: String };
 @prelude::property(PropertyTarget::Type)
 type RelationDescriptions = struct { notes: Array(RelationNote) };
+type RelationAlias = struct { id: String, label: String };
+@prelude::property(PropertyTarget::Type)
+type RelationAliasesDef = struct { aliases: Array(RelationAlias) };
 
 @prelude::property(PropertyTarget::Field)
 type MetricValueSpec = struct {
@@ -642,6 +652,7 @@ type MeasurePredicateBrief = struct { field: String, op: FilterOp, input: Filter
 type MeasureBrief = struct {
     id: String,
     label: String,
+    aliases: Array(String),
     summary: String,
     dataset: String,
     field: Option(String),
@@ -657,6 +668,7 @@ type DimensionScopeBrief = struct { field: String, op: FilterOp, input: FilterIn
 type DimensionBrief = struct {
     id: String,
     label: String,
+    aliases: Array(String),
     summary: String,
     dataset: String,
     field: String,
@@ -675,6 +687,7 @@ type BusinessValueBrief = struct { id: String, label: String, aliases: Array(Str
 type SubjectDimensionBrief = struct {
     id: String,
     label: String,
+    aliases: Array(String),
     summary: String,
     dataset: String,
     field: String,
@@ -699,6 +712,7 @@ type TimeRoleBrief = struct {
 type DatasetBrief = struct {
     id: String,
     label: String,
+    aliases: Array(String),
     summary: String,
     kind: DatasetKind,
     dimension_ids: Array(String),
@@ -763,6 +777,7 @@ type RelationShape = enum {
 type RelationBrief = struct {
     id: String,
     label: String,
+    aliases: Array(String),
     summary: String,
     from_dataset: String,
     to_dataset: String,
@@ -890,6 +905,21 @@ def dimension_description: Fn(String, String, String) -> Fn(property::FieldPrope
         }
     };
 
+def member_alias: Fn(MemberAliasKind, String, String) -> Fn(property::FieldPropertyCtx, Option(MemberAliasesDef)) -> MemberAliasesDef = fn(kind, id, label) {
+    fn(ctx, previous) {
+        let aliases = match previous { Some(p) => p.aliases, None => [] };
+        { aliases: array::push(aliases, {kind, id, label}) }
+    }
+};
+
+def dimension_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option(MemberAliasesDef)) -> MemberAliasesDef = fn(id, label) {
+    member_alias(MemberAliasKind::Dimension, id, label)
+};
+
+def measure_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option(MemberAliasesDef)) -> MemberAliasesDef = fn(id, label) {
+    member_alias(MemberAliasKind::Measure, id, label)
+};
+
 # A measure whose stable vocabulary id denotes DISTINCT aggregate semantics.
 # The input mode is model knowledge, not a per-query caller choice.
 def distinct_measure: Fn(String, qb::AggregateFunction, Array(Type)) -> Fn(property::FieldPropertyCtx, Option(MeasureDef)) -> MeasureDef = fn(id, aggregate, requires) {
@@ -1016,6 +1046,13 @@ def dataset_description: Fn(String, String) -> Fn(td::TypeDesc, Option(DatasetDe
     }
 };
 
+def dataset_alias: Fn(String) -> Fn(td::TypeDesc, Option(DatasetAliasesDef)) -> DatasetAliasesDef = fn(label) {
+    fn(ctx, previous) {
+        let labels = match previous { Some(p) => p.labels, None => [] };
+        { labels: array::push(labels, label) }
+    }
+};
+
 def relation_description: Fn(String, String, String) -> Fn(td::TypeDesc, Option(RelationDescriptions)) -> RelationDescriptions = fn(id, label, summary) {
     fn(ctx, previous) {
         if id == "" || label == "" || summary == "" { fail!("relation description requires id, label and summary") }
@@ -1028,6 +1065,13 @@ def relation_description: Fn(String, String, String) -> Fn(td::TypeDesc, Option(
             let result: RelationDescriptions = { notes };
             result
         }
+    }
+};
+
+def relation_alias: Fn(String, String) -> Fn(td::TypeDesc, Option(RelationAliasesDef)) -> RelationAliasesDef = fn(id, label) {
+    fn(ctx, previous) {
+        let aliases = match previous { Some(p) => p.aliases, None => [] };
+        { aliases: array::push(aliases, {id, label}) }
     }
 };
 
@@ -1718,6 +1762,83 @@ def check_dimension_descriptions: Fn(Array(EntityEntry), Array(DimensionEntry)) 
             }) {
                 fail!("dimension description must name one dimension on its field", entity.id, field.name, bad.id)
             } else { True }
+        })
+    })
+};
+
+def member_aliases: Fn(Type, Int, MemberAliasKind, String) -> Array(String) = fn(owner, field, kind, id) {
+    match property::get_field_prop(owner, field, MemberAliasesDef.type) {
+        Some(declared) => array::map(array::filter(declared.aliases, fn(alias) { alias.kind == kind && alias.id == id }), fn(alias) { alias.label }),
+        None => [],
+    }
+};
+
+def relation_aliases: Fn(Type, String) -> Array(String) = fn(owner, id) {
+    match property::get_type_prop(owner, RelationAliasesDef.type) {
+        Some(declared) => array::map(array::filter(declared.aliases, fn(alias) { alias.id == id }), fn(alias) { alias.label }),
+        None => [],
+    }
+};
+
+def check_knowledge_aliases: Fn(PreparedPayload) -> Bool = fn(payload) {
+    array::all(payload.entities, fn(entity) {
+        let dataset_labels = match property::get_type_prop(entity.entity_type, DatasetAliasesDef.type) {
+            Some(declared) => declared.labels,
+            None => [],
+        };
+        let primary = match entity.description { Some(note) => note.label, None => entity.id };
+        if let Some(label) = array::find(dataset_labels, fn(label) {
+            label == "" || label == entity.id || label == primary
+                || array::length(array::filter(dataset_labels, fn(other) { other == label })) != 1
+        }) {
+            fail!("invalid dataset alias: requires a distinct nonempty name", entity.id, label)
+        } else { () };
+        let relations = array::filter(payload.relations, fn(rel) { rel.from == entity.index && rel.id != "" });
+        let relation_notes = match property::get_type_prop(entity.entity_type, RelationAliasesDef.type) {
+            Some(declared) => declared.aliases,
+            None => [],
+        };
+        if let Some(alias) = array::find(relation_notes, fn(alias) {
+            let target = array::find(relations, fn(rel) { rel.id == alias.id });
+            alias.label == "" || target == None
+                || array::any(relations, fn(rel) { rel.id == alias.label })
+                || array::length(array::filter(relation_notes, fn(other) { other.label == alias.label })) != 1
+                || match target { Some(rel) => alias.label == rel.label, None => False }
+        }) {
+            fail!("invalid relation alias: requires a declared relation and a distinct nonempty name", entity.id, alias)
+        } else { () };
+        let all_member_aliases = array::flat_map(entity.fields, fn(field) {
+            match property::get_field_prop(entity.entity_type, field.index, MemberAliasesDef.type) {
+                Some(definition) => definition.aliases, None => [],
+            }
+        });
+        array::all(entity.fields, fn(field) {
+            let declared = match property::get_field_prop(entity.entity_type, field.index, MemberAliasesDef.type) {
+                Some(definition) => definition.aliases,
+                None => [],
+            };
+            if array::length(declared) == 0 { True } else {
+                let dimensions = array::filter(payload.dimensions, fn(d) { d.entity == entity.index && d.field == field.index });
+                let measures = array::filter(payload.measures, fn(m) { m.entity == entity.index && m.field == field.index });
+                if let Some(alias) = array::find(declared, fn(alias) {
+                    let dimension = array::find(dimensions, fn(d) { d.id == alias.id });
+                    let measure = array::find(measures, fn(m) { m.id == alias.id });
+                    let target_exists = match alias.kind {
+                        MemberAliasKind::Dimension => dimension != None,
+                        MemberAliasKind::Measure => measure != None,
+                    };
+                    let primary_label = match alias.kind {
+                        MemberAliasKind::Dimension => if dimension == None { "" } else { dimension_detail(payload, alias.id).label },
+                        MemberAliasKind::Measure => if measure == None { "" } else { measure_domain(payload, alias.id).label },
+                    };
+                    alias.label == "" || !target_exists || alias.label == primary_label
+                        || array::any(dimensions, fn(d) { d.id == alias.label })
+                        || array::any(measures, fn(m) { m.id == alias.label })
+                        || array::length(array::filter(all_member_aliases, fn(other) { other.label == alias.label })) != 1
+                }) {
+                    fail!("invalid knowledge alias: requires one declared dimension or measure on its field and a distinct nonempty name", entity.id, field.name, alias)
+                } else { True }
+            }
         })
     })
 };
@@ -2692,7 +2813,8 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
             True
         })
     });
-    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated { payload } else { payload }
+    let aliases_ok = check_knowledge_aliases(payload);
+    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && aliases_ok { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -2913,6 +3035,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         {field: get_index(entity.fields, predicate.field).name, op: predicate.op, input: predicate.input}
     });
     {id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
+        aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
         summary: match note { Some(n) => n.summary, None => "" },
         dataset: entity.id, field: field.name, computed: entry.computed,
         authorized: entry.authorized, filterable: entry.filterable,
@@ -2940,7 +3063,7 @@ def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> Subject
             } else {
                 array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: []} })
             };
-            {id: detail.id, label: detail.label, summary: detail.summary,
+            {id: detail.id, label: detail.label, aliases: detail.aliases, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
                 filterable: detail.filterable, ops: detail.ops,
                 input_kinds: detail.input_kinds, values, scope: detail.scope}
@@ -3002,6 +3125,7 @@ def measure_domain: Fn(PreparedPayload, String) -> MeasureBrief = fn(payload, id
     let result: MeasureBrief = {
         id,
         label: match note { Some(declared) => declared.label, None => id },
+        aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Measure, id),
         summary: match note { Some(declared) => declared.summary, None => "" },
         dataset: entity.id,
         field: if computed == None { Some(field.name) } else { None },
@@ -3039,6 +3163,7 @@ def relation_shape: Fn(RelationKey) -> RelationShape = fn(key) {
 
 def relation_brief: Fn(PreparedPayload, RelationEntry) -> RelationBrief = fn(payload, entry) {
     {id: entry.id, label: entry.label, summary: entry.summary,
+        aliases: relation_aliases(get_index(payload.entities, entry.from).entity_type, entry.id),
         from_dataset: get_index(payload.entities, entry.from).id,
         to_dataset: get_index(payload.entities, entry.to).id,
         kind: entry.kind, shape: relation_shape(entry.key)}
@@ -3096,6 +3221,9 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
         let result: DatasetBrief = {
             id: entity.id,
             label: description.label,
+            aliases: match property::get_type_prop(entity.entity_type, DatasetAliasesDef.type) {
+                Some(declared) => declared.labels, None => [],
+            },
             summary: description.summary,
             kind,
             dimension_ids: array::map(array::filter(payload.dimensions, fn(d) {
@@ -7925,6 +8053,8 @@ pub use self::{
     measure,
     measure_description,
     dimension_description,
+    dimension_alias,
+    measure_alias,
     distinct_measure,
     filtered_measure,
     computed_measure,
@@ -7940,7 +8070,9 @@ pub use self::{
     native_pair,
     time_field,
     dataset_description,
+    dataset_alias,
     relation_description,
+    relation_alias,
     union_source,
     relation,
     relation_key,

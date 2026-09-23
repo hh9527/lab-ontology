@@ -312,6 +312,12 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 `wires` 或 enum 的内部 variant；完整详情仍包含映射，只应提供给持有完整模型
 权限的调用方。`dimension_description(id, label, summary)` 在对应字段
 声明简要说明；准备期拒绝不存在、重复或放错字段的说明，以及无效固有 scope。
+`dataset_alias(label)`、`relation_alias(id, label)` 和字段级
+`dimension_alias(id, label)` / `measure_alias(id, label)` 可重复声明数据集、具名关系及本字段的维度/度量
+其他名称；目录和详情用 `aliases` 把名称交叉引用到稳定 ID。别名不增加意图 ID、
+权限或查询路径。准备期拒绝空名称、同一数据集的成员别名重复、与自身 ID/主 label
+冲突，以及指向未声明或其他字段/实体知识点的别名。不同实体可能共享通用名称，
+agent 必须结合目录中的数据集与关系 ID 定位，不可把显示名称当成全局键。
 业务详情仍可能包含模型说明、逻辑字段和固有 scope，不应把它当作通用脱敏边界。
 维度 ID 在完整 Model 内必须非空且全局唯一，包括普通、计算和 JSON 维度；
 不同数据集上同名的字段应声明各自的业务维度 ID，否则按 ID 发现和 lowering
