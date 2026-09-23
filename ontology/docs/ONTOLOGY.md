@@ -301,6 +301,10 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 普通实体的物理 source 表名、alias 和显式 `@column` 字段必须符合 query 的
 SQL 标识符规则，错误映射在准备阶段诊断；无关且未标注 `@column` 的字段不被
 强制映射。UNION 保持对其分支和输出列的独立完整校验。
+对实际发布的普通/计算/JSON 维度、非计算 measure、关系键两端，以及实体
+身份、数据集 grain 和时间角色字段，还必须声明物理列；缺失映射在 Model 准备
+阶段诊断。计算 measure 的宿主字段不用另外映射，它只组合已验证的依赖
+measure；真正无关的未映射字段依旧可以留在实体类型里。
 目录中的具名关系可用 `relation_detail_for_subject(payload, subject, id)` 追到
 关系标签/说明、起点和终点业务数据集、Safe/FanOut 类型及 Equality/All/Any
 键形态，便于区分不同端点角色和多候选站点。此概要不发布内部实体索引或物理字段

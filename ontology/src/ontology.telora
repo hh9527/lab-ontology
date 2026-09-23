@@ -1326,6 +1326,17 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     let fields = array::map(enumerated, fn(pair) {
         build_field(ty, pair.1.index, pair.1.name, pair.1.ty)
     });
+    if let Some(field) = array::find(fields, fn(f) {
+        f.column == "" && property::get_field_prop(ty, f.index, ColumnMap.type) == None && (f.is_key
+            || property::get_field_prop(ty, f.index, TimeField.type) != None
+            || match dataset_spec {
+                Some(spec) => array::any(spec.grain, fn(name) { name == f.name })
+                    || spec.utc_time == Some(f.name),
+                None => False,
+            })
+    }) {
+        fail!("identity or time field requires a physical column", ty, field.name)
+    } else { () };
     let key_field = match array::find(fields, fn(f) { f.is_key }) {
         Some(f) => f.index,
         None => -1,
@@ -1828,7 +1839,9 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, RelationKey) -> RelationK
                 Some(field) => field,
                 None => fail!("unknown relation target field index", to_entity.id, pair.to),
             };
-            if from_field.ty != to_field.ty {
+            if from_field.column == "" || to_field.column == "" {
+                fail!("relation key fields require physical columns", from_entity.id, from_field.name, to_entity.id, to_field.name)
+            } else if from_field.ty != to_field.ty {
                 fail!("relation fields have different types", from_entity.id, from_field.name, to_entity.id, to_field.name)
             } else { RelationKey::Eq(pair) }
         },
@@ -1841,7 +1854,9 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, RelationKey) -> RelationK
                 Some(field) => field.index,
                 None => fail!("unknown relation target field", to_entity.id, pair.to),
             };
-            if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
+            if get_index(from_entity.fields, from_field).column == "" || get_index(to_entity.fields, to_field).column == "" {
+                fail!("relation key fields require physical columns", from_entity.id, pair.from, to_entity.id, pair.to)
+            } else if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
                 fail!("relation fields have different types", pair.from, pair.to)
             } else {
             RelationKey::Eq({ from: from_field, to: to_field })
@@ -2460,8 +2475,22 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     })));
     let measures_raw = array::flat_map(entities, fn(e) { collect_entity_measures(entities, e) });
     let measures = check_measure_contract(measures_raw);
+    let measure_columns_ok = array::all(measures, fn(measure) {
+        let entity = get_index(entities, measure.entity);
+        let field = get_index(entity.fields, measure.field);
+        if measure.computed == None && field.column == "" {
+            fail!("measure input requires a physical column", measure.id, entity.id, field.name)
+        } else { True }
+    });
     let descriptions_ok = check_measure_descriptions(entities, measures);
     let dimensions = check_dimension_ids(array::flat_map(entities, fn(e) { collect_entity_dimensions(e) }));
+    let dimension_columns_ok = array::all(dimensions, fn(dimension) {
+        let entity = get_index(entities, dimension.entity);
+        let field = get_index(entity.fields, dimension.field);
+        if field.column == "" {
+            fail!("dimension source requires a physical column", dimension.id, entity.id, field.name)
+        } else { True }
+    });
     let dimension_descriptions_ok = check_dimension_descriptions(entities, dimensions);
     let native_pairs = array::flat_map(entities, fn(e) {
         let declared = match property::get_type_prop(e.entity_type, NativePairDef.type) {
@@ -2572,7 +2601,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
             True
         })
     });
-    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && predicates_validated && dimension_scopes_validated { payload } else { payload }
+    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
