@@ -548,6 +548,8 @@ property。因此，关系图中的环不等于 property 求值的循环依赖�
 当前实体目录的索引；改变实体输入顺序可以改变索引，但不应改变路径分类。
 无论用具名字段对还是字段索引声明关系键，准备阶段都会检查两端字段存在且类型
 一致；`And`/`Or` 不允许空分支，不能发布一个直到查询时才失败的关系。
+Safe 身份证明和关联 EXISTS 会递归展开纯 AND 的相等键，嵌套方式不改变复合
+身份语义；任意层级的 OR 都不能靠汇总各分支的字段来证明完整目标身份。
 
 独立示例 `tests/cyclic_relations_model.telora` 与测试 `tests/cyclic_relations.telora`
 覆盖上述双向声明、跨模块 property 身份、Safe/FanOut-only/Missing 分类及实体重排。
