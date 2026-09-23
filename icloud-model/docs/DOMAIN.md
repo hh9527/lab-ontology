@@ -14,6 +14,7 @@ and must not be presented as a complete interpretation of that domain.
 | KPI metric sets have a sampling grain, aggregate meaning and unit | KPI carrier declares `(res_id, tenant_id, ts)` grain, UTC `ts`, `cpu_usage` Avg/% and `port_count` Sum; metadata is checked against lowerable measures | Enforce actual timestamp semantics and permissible grouping across grains; the carrier is not yet a full MetricSet contract. |
 | Site lookup admits either `projectId` or `refParentSubnet` as the site key | Named `RelationKey.Or` connects network device to governance site | A frame-root query reaches its device and site through the alternatives, without treating them as a composite AND. |
 | Frame belongs to a device; device KPI samples belong to a device through `(resId, tenantId)` | Frame and KPI rows have separate declared grains with upward safe paths | KPI aggregation by device is lowerable; frame-owned KPI semantics and cross-grain grouping remain unproven. |
+| Storage device may reference two different sites by `parentResId OR projectId` | Named `FanOut` relation, normal-status canonical wire `"1"`, subclass dimension, and `COUNT(name)` measure | Q0047-Q0049 group by declared site key and name, HAVING count below five, returning name only; ordinary row projection must not assume one site per device. |
 
 Canonical filtering, directed endpoints, explicit A/Z selection, composite-key
 event count, declared device KPI aggregation and canonical UTC-second windows
@@ -49,6 +50,14 @@ Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 JOIN. These are separate from the explicit Device A/Z relation test. The
 directed peer route uses `directed_peer_hub_fields` so adding native columns
 cannot silently change endpoint field indexes.
+
+For Q0047-Q0049, `qualify_group` explicitly names `storage_device_site`: an
+inner fan-out join lets each qualifying storage device count toward each
+matching site, as in the corpus SQL. Site ID remains in GROUP BY but not in
+the visible result; grouping by site name alone would merge distinct sites.
+The inner join excludes sites with zero matching devices, as the corpus query
+does. This is not a unique site ownership assertion or a general safe route
+from storage devices to sites.
 
 Physical-link A/Z endpoints now test simultaneous role projection: `list_roles`
 names each declared Safe relation, its target dimension, and a distinct output

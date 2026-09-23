@@ -1632,3 +1632,7 @@ measure、普通 filter 或 ordering 与此请求形状组合；`role_filters` �
 `directed_peer_hub_fields(participant, key_name, endpoint_name, participant,
 key_name, endpoint_name)` 以业务字段名定义固定方向的两个端点；准备期解析
 字段索引，拒绝不存在、非 key、相同端点或类型不一致的字段。
+`qualify_group` 要求具名 FanOut 关系从 measure 行指向分组 owner，owner 的
+声明 key 必须参加分组，筛选只能作用于 measure 行；可见输出只能取同一 owner
+的非 key 维度。隐藏 measure 的 HAVING 仍以结构化聚合调用表示，因此投影
+只返回所选 owner 维度。普通行级投影不因该能力而接受 FanOut 导航。

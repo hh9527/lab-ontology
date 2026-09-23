@@ -4373,6 +4373,83 @@ def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(Ha
     lower_core(payload, request, [], exists_specs, having_specs, [], [], [])
 };
 
+# Keep a declared identity key in GROUP BY while exposing only requested
+# attributes. A direct aggregate call retains HAVING after hiding the measure.
+def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Array(String)) -> qb::Plan = fn(payload, request, relation_id, having_specs, visible_dimensions) {
+    if array::length(request.measures) != 1 || array::length(request.dimensions) < 2
+        || array::length(visible_dimensions) == 0 || array::length(having_specs) == 0
+        || request.partition != None || array::length(request.ordering) != 0 || request.offset != None {
+        fail!("group projection requires one measure, an identity and visible dimensions, and HAVING without ordering")
+    } else {
+        let dims = resolve_dimensions(payload, request.dimensions);
+        let owner = get_index(dims, 0).entry.entity;
+        let grouped_on_owner = array::all(dims, fn(d) { d.entry.entity == owner });
+        let entity = get_index(payload.entities, owner);
+        let identity = array::any(dims, fn(d) {
+            d.entry.field == entity.key_field && !d.entry.computed
+                && array::length(d.entry.canonical_values) == 0
+        });
+        let no_omitted_scopes = array::all(dims, fn(d) { array::length(d.entry.scope) == 0 });
+        let visible_valid = array::all(visible_dimensions, fn(id) {
+            array::any(dims, fn(d) { d.entry.id == id && d.entry.field != entity.key_field })
+        });
+        let distinct_visible = array::all(array::enumerate(visible_dimensions), fn(indexed) {
+            !array::any(array::enumerate(visible_dimensions), fn(other) { other.0 < indexed.0 && other.1 == indexed.1 })
+        });
+        if !grouped_on_owner || !identity || !visible_valid || !distinct_visible || !no_omitted_scopes {
+            fail!("group projection requires one declared owner key and distinct visible owner dimensions", visible_dimensions)
+        } else {
+            let measure = match array::find(payload.measures, fn(m) { m.id == get_index(request.measures, 0).id }) {
+                Some(m) => m, None => fail!("unknown group projection measure", get_index(request.measures, 0).id),
+            };
+            let relation = match array::find(payload.relations, fn(r) { r.id == relation_id && r.id != "" }) {
+                Some(r) => r, None => fail!("unknown group projection relation", relation_id),
+            };
+            let base_filters = resolve_filters(payload, request.filters);
+            if relation.from != measure.entity || relation.to != owner || relation.kind != RelationKind::FanOut
+                || !array::all(base_filters, fn(f) { f.entity == measure.entity }) {
+                fail!("group projection requires a named fan-out relation from filtered measure rows to the grouped owner", relation_id)
+            } else {
+            let measure_request: QueryRequest = {...request, dimensions: []};
+            let plan = lower(payload, measure_request);
+            if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
+                fail!("group projection measure requires a single physical source", measure.id)
+            } else {
+            let measure_item = get_index(plan.projection, 0);
+            let aggregate = match measure_item {
+                qb::SelectItem::Aggregate(call) => call,
+                _ => fail!("hidden group measure must be a declared plain aggregate"),
+            };
+            let having = array::map(having_specs, fn(spec) {
+                let h = resolve_having(payload, request.measures, spec);
+                match h.measure {
+                    qb::HavingMeasure::Ref(ref) => if ref.alias == aggregate.alias {
+                        {...h, measure: qb::HavingMeasure::Call(aggregate)}
+                    } else { fail!("group projection HAVING must reference its declared measure", ref.alias) },
+                    qb::HavingMeasure::Call(_) => fail!("group projection requires a declared measure HAVING"),
+                }
+            });
+            let projection = array::map(visible_dimensions, fn(id) {
+                let dimension = match array::find(dims, fn(d) { d.entry.id == id }) {
+                    Some(d) => d,
+                    None => fail!("group projection references an unrequested dimension", id),
+                };
+                qb::expr_item(dimension_output_expr(payload, dimension.entry))
+            });
+            let join = qb::join_on(qb::JoinKind::Inner, qb::source(entity.alias, entity.table),
+                key_to_condition(payload, relation.from, relation.to, relation.key));
+            let grouping = array::map(dims, fn(d) { dimension_output_expr(payload, d.entry) });
+            let result: qb::Plan = {...plan,
+                sources: array::push(plan.sources, join.source),
+                joins: [join], projection, grouping, having,
+            };
+            qb::validate(result, payload.profile)
+            }
+            }
+        }
+    }
+};
+
 def private_exists_alias: Fn(Array(qb::Source), String) -> String = fn(sources, candidate) {
     if array::any(sources, fn(source) { source.alias == candidate }) {
         private_exists_alias(sources, `\{candidate}_x`)
@@ -5905,6 +5982,7 @@ pub use self::{
     build_root,
     lower,
     lower_full,
+    lower_group_projection,
     lower_any,
     lower_peer,
     lower_absence,
