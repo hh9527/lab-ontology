@@ -596,4 +596,15 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+slot_schema="CREATE TABLE I_EnterpriseSlot (id TEXT, name TEXT, isDaughterCard BOOLEAN);
+INSERT INTO I_EnterpriseSlot VALUES ('child','Daughter',1),('parent','Main',0);"
+daughter_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:daughter_card_rows)"
+regular_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:non_daughter_card_rows)"
+jq -e '.bindings == [true]' <<< "${daughter_plan}" >/dev/null
+jq -e '.bindings == [true]' <<< "${regular_plan}" >/dev/null
+daughter_result="$(sqlite3 -json :memory: -cmd "${slot_schema}" -cmd '.parameter init' -cmd '.parameter set ?1 1' "$(jq -r '.sql' <<< "${daughter_plan}")")"
+regular_result="$(sqlite3 -json :memory: -cmd "${slot_schema}" -cmd '.parameter init' -cmd '.parameter set ?1 1' "$(jq -r '.sql' <<< "${regular_plan}")")"
+jq -e 'length == 1 and .[0].id == "child" and .[0].name == "Daughter"' <<< "${daughter_result}" >/dev/null
+jq -e 'length == 1 and .[0].id == "parent" and .[0].name == "Main"' <<< "${regular_result}" >/dev/null
+
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

@@ -175,6 +175,11 @@ query 的封闭比较 scalar；文本算子 `Contains`/`StartsWith`/`EndsWith`�
 bindings，绝不进入 SQL 文本。维度通过 `ops`/`input_kinds` 声明允许的算子与输入类型；
 文本算子要求 `Text` 输入。封闭 enum 值域仍只支持 `Eq`。
 
+内建 `Bool` 字段是原生标量维度，不是领域枚举：声明 `Bool` 输入和 `Eq`/`Ne`
+算子；意图使用 `kind: "bool"` 与 JSON 布尔值，lowering 参数化绑定布尔值。
+`"true"`、`1`、大小比较和文本操作均不是合法的 Bool 条件。Bool 维度的
+类型、可用算子在同一知识目录中发现。
+
 ## 知识声明 API
 
 ### 规范值与多物理值

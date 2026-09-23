@@ -328,12 +328,13 @@ type FilterOp = enum {
     Contains, NotContains, StartsWith, EndsWith,
 };
 
-type FilterInputKind = enum { Text, Number, Int };
+type FilterInputKind = enum { Text, Number, Int, Bool };
 
 type FilterInput = enum {
     Text(String),
     Number(Float),
     Int(Int),
+    Bool(Bool),
 };
 
 # A member's inherent row-range scope predicate: a constraint on one field of
@@ -1296,6 +1297,7 @@ def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input
             || array::any(value_domain(field.ty), fn(entry) { entry.value == value }),
         FilterInput::Int(_) => field.ty == Int.type,
         FilterInput::Number(_) => field.ty == Float.type,
+        FilterInput::Bool(_) => field.ty == Bool.type,
     }
 };
 
@@ -1742,31 +1744,33 @@ def duplicate_value: Fn(Array(EnumValueEntry)) -> Option(String) = fn(entries) {
 # payload-free named enum. Non-enum field types yield the empty (open) domain;
 # payload-bearing enum shapes produce an explicit prepare-time diagnostic.
 def value_domain: Fn(Type) -> Array(EnumValueEntry) = fn(field_ty) {
-    let ref_ty = field_ty;
-    let resolved = match td::resolve(ref_ty) {
-        Ok(t) => t,
-        Err(_) => ref_ty,
-    };
-    match td::kind(resolved) {
-        td::TypeDescKind::Enum => do {
-            let vs = td::variants(ref_ty);
-            if array::any(vs, fn(v) { has_payload(v.payload) }) {
-                fail!("dimension field uses an enum with payload variants; only payload-free variants are supported", field_ty)
-            } else {
-                let entries = array::map(vs, fn(v) {
-                    let prop = property::get_variant_prop(ref_ty, v.index, EnumValueDef.type);
-                    match prop {
-                        Some(spec) => enum_value_entry(v.name, spec.value, spec.label),
-                        None => enum_value_entry(v.name, v.name, v.name),
+    if field_ty == Bool.type { [] } else {
+        let ref_ty = field_ty;
+        let resolved = match td::resolve(ref_ty) {
+            Ok(t) => t,
+            Err(_) => ref_ty,
+        };
+        match td::kind(resolved) {
+            td::TypeDescKind::Enum => do {
+                let vs = td::variants(ref_ty);
+                if array::any(vs, fn(v) { has_payload(v.payload) }) {
+                    fail!("dimension field uses an enum with payload variants; only payload-free variants are supported", field_ty)
+                } else {
+                    let entries = array::map(vs, fn(v) {
+                        let prop = property::get_variant_prop(ref_ty, v.index, EnumValueDef.type);
+                        match prop {
+                            Some(spec) => enum_value_entry(v.name, spec.value, spec.label),
+                            None => enum_value_entry(v.name, v.name, v.name),
+                        }
+                    });
+                    match duplicate_value(entries) {
+                        Some(value) => fail!("enum value domain contains duplicate stable values", field_ty, value),
+                        None => entries,
                     }
-                });
-                match duplicate_value(entries) {
-                    Some(value) => fail!("enum value domain contains duplicate stable values", field_ty, value),
-                    None => entries,
                 }
-            }
-        },
-        _ => [],
+            },
+            _ => [],
+        }
     }
 };
 
@@ -1783,6 +1787,7 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
                             FilterInput::Text(s) => field.ty == String.type && s != "",
                             FilterInput::Int(_) => field.ty == Int.type,
                             FilterInput::Number(_) => False,
+                            FilterInput::Bool(_) => False,
                         }
                     })
                     && array::length(array::filter(mapping.values, fn(other) { other.id == v.id })) == 1
@@ -1849,7 +1854,8 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     else if f.ty == String.type { FilterInputKind::Text }
                     else if f.ty == Int.type { FilterInputKind::Int }
                     else if f.ty == Float.type { FilterInputKind::Number }
-                    else { fail!("plain dimension requires a String, Int, Float or closed enum field", entity.id, f.name) };
+                    else if f.ty == Bool.type { FilterInputKind::Bool }
+                    else { fail!("plain dimension requires a String, Int, Float, Bool or closed enum field", entity.id, f.name) };
                 if epoch && (dd.input_kinds != [FilterInputKind::Int]
                     || array::any(dd.ops, fn(op) { is_text_op(op) })
                     || array::length(mapped) > 0) {
@@ -1869,6 +1875,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         kind != FilterInputKind::Int && kind != FilterInputKind::Number
                     } else { kind != valid_kind }
                 })
+                    || (valid_kind == FilterInputKind::Bool && array::any(dd.ops, fn(op) { op != FilterOp::Eq && op != FilterOp::Ne }))
                     || (valid_kind != FilterInputKind::Text && array::any(dd.ops, fn(op) { is_text_op(op) }))) {
                     fail!("plain dimension filter input or operation disagrees with field type", entity.id, f.name)
                 } else {
@@ -2766,6 +2773,7 @@ def to_bind: Fn(FilterInput) -> qb::Expr = fn(input) {
         FilterInput::Text(s) => qb::bind_string(s),
         FilterInput::Number(f) => qb::bind_float(f),
         FilterInput::Int(i) => qb::bind_int(i),
+        FilterInput::Bool(b) => qb::bind_bool(b),
     }
 };
 
@@ -3163,6 +3171,7 @@ def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(k
         FilterInput::Text(_) => FilterInputKind::Text,
         FilterInput::Number(_) => FilterInputKind::Number,
         FilterInput::Int(_) => FilterInputKind::Int,
+        FilterInput::Bool(_) => FilterInputKind::Bool,
     };
     array::any(kinds, fn(k) { k == kind })
 };
@@ -3219,6 +3228,7 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
         FilterInput::Text(s) => qb::Val::String(s),
         FilterInput::Number(f) => qb::Val::Float(f),
         FilterInput::Int(i) => qb::Val::Int(i),
+        FilterInput::Bool(b) => qb::Val::Bool(b),
     }
 };
 
@@ -3473,6 +3483,8 @@ def comparable_kind: Fn(DimensionEntry) -> String = fn(entry) {
         "number"
     } else if array::any(entry.input_kinds, fn(k) { k == FilterInputKind::Text }) {
         "text"
+    } else if array::any(entry.input_kinds, fn(k) { k == FilterInputKind::Bool }) {
+        "bool"
     } else {
         "none"
     }
