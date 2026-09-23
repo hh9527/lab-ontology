@@ -275,6 +275,13 @@ measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这�
 先核对主体授权，再从相同模型派生目录，过滤不可查询的维度 ID；它不改变
 `payload` 或绕过 lowering 的主体校验。直接持有完整 PreparedPayload、调用
 不带主体的详情函数仍可读取完整词表，因此主体目录不是访问控制边界。
+目录中的 `measure_ids` 可经 `measure_domain(payload, id)` 或带主体核验的
+`measure_domain_for_subject(payload, subject, id)` 追到所属数据集、源逻辑字段、
+聚合/去重输入、required dataset、内置谓词及计算 measure 的左右依赖；若
+对应 Metric 元数据存在，详情也交叉引用其单位和声明/样本摘要角色。
+`measure_description(id, label, summary)` 可以在 measure 所在字段给出短说明，
+准备期会拒绝不存在、重复或放错字段的说明。依赖描述不会自行选择连接方式：
+例如仅能经 FanOut 到达的 required dataset 仍需意图提供安全的存在性资格。
 
 ### 实体、指标与维度
 

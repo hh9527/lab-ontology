@@ -48,6 +48,9 @@ preparation time; unknown or mismatched fields fail before querying. Description
 and cross-references in `knowledge_index` (including ordinary measure IDs such
 as `alarm_count` as well as metric IDs) come from the same Prepared Model,
 not from a separately authored agent prompt.
+`measure_domain` resolves `alarm_count` to its event source and Count aggregate,
+and distinguishes the declared `port_count` Sum from `port_count_peak` Max;
+their labels and summaries are Model annotations validated during preparation.
 For agent-facing discovery, `knowledge_index_for_subject` checks the subject
 and omits dimensions that lowering would reject as unauthorized; privileged
 callers retaining the complete payload can still inspect the full model.
