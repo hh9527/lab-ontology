@@ -230,6 +230,43 @@ link_pair_result="$(sqlite3 -json :memory: -cmd "${link_pair_schema}" -cmd '.par
     -cmd ".parameter set ?5 '光-OLT-7137'" "${link_pair_sql}")"
 jq -e 'length == 1 and .[0].physical_link_count == 3' <<< "${link_pair_result}" >/dev/null
 
+link_site_schema="CREATE TABLE EnterprisePhysicalLink (id TEXT, name TEXT, tenantId TEXT, a_ne_res_id TEXT, z_ne_res_id TEXT);
+CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
+CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_TYPE TEXT, TENANT_ID TEXT);
+CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
+INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
+INSERT INTO X_SITE_VIEW VALUES
+ ('S1','offlineSite','TA'),('S2','offlineSite','TA'),
+ ('S3','offlineSite','TB'),('S4','onlineSite','TA');
+INSERT INTO I_EntNetworkElement VALUES
+ ('D1','TA','Same','LSW','S1','S2'),('D2','TA','Same','ne.category.switch','S2','S2'),
+ ('D1','TB','Same','LSW','S3','S3'),('D9','TB','Same','LSW','S3','S3'),
+ ('D3','TA','Other','LSW','S1','S1'),('D4','TA','Same','LSW','S4','S4'),
+ ('D5','TA','Same','other','S1','S1'),('D6','TA','Same','LSW','S3','S4');
+INSERT INTO EnterprisePhysicalLink VALUES
+ ('L1','Repeated','TA','D1','D2'),('L2','Repeated','TA','D1','D1'),
+ ('L3','Single','TA','D1','X'),('L4','Single','TA','X','D2'),
+ ('L5','WrongName','TA','D3','X'),('L6','Online','TA','D4','X'),
+ ('L7','OtherTenant','TB','D1','X'),('L8','CrossTenantId','TA','D9','X'),
+ ('L9','WrongClass','TA','D5','X'),('L10','OtherEndpoint','TA','D2','D3'),
+ ('L11','SplitSiteTenant','TA','D6','X');"
+link_site_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:link_site_count)"
+jq -e '.bindings == ["ne.category.switch","LSW","Same","offlineSite","Tenant-A"]' <<< "${link_site_plan}" >/dev/null
+link_site_sql="$(jq -r '.sql' <<< "${link_site_plan}")"
+link_site_result="$(sqlite3 -json :memory: -cmd "${link_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.switch'" -cmd ".parameter set ?2 'LSW'" \
+    -cmd ".parameter set ?3 'Same'" -cmd ".parameter set ?4 'offlineSite'" \
+    -cmd ".parameter set ?5 'Tenant-A'" "${link_site_sql}")"
+jq -e 'length == 1 and .[0].physical_link_count == 5' <<< "${link_site_result}" >/dev/null
+link_site_names_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:link_site_names)"
+link_site_names_sql="$(jq -r '.sql' <<< "${link_site_names_plan}")"
+link_site_names_result="$(sqlite3 -json :memory: -cmd "${link_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.switch'" -cmd ".parameter set ?2 'LSW'" \
+    -cmd ".parameter set ?3 'Same'" -cmd ".parameter set ?4 'offlineSite'" \
+    -cmd ".parameter set ?5 'Tenant-A'" "${link_site_names_sql}")"
+jq -e 'length == 5 and (map(.id) | sort == ["L1","L10","L2","L3","L4"])
+    and ([.[] | select(.name == "Repeated")] | length == 2)' <<< "${link_site_names_result}" >/dev/null
+
 latest_sample_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
 CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, operStatusCount INTEGER, adminStatusCount INTEGER);
 CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, TENANT_ID TEXT);

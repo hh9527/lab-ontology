@@ -4849,6 +4849,101 @@ def site_tenant_scope: Fn(PreparedPayload, EntityEntry, SiteTenantScope) -> qb::
     }
 };
 
+type LinkSiteScope = struct {
+    a_relation: String,
+    z_relation: String,
+    link_tenant_relation: String,
+    device_tenant_relation: String,
+    site_relation: String,
+    tenant_relation: String,
+    device_filters: Array(FilterRequest),
+    site_filters: Array(FilterRequest),
+    tenant_filters: Array(FilterRequest),
+};
+
+# A and Z select the same Device role via two separately declared Safe keys.
+# Both endpoint alternatives and Device->Site alternatives remain inside one
+# EXISTS; the outer result never joins through either fan-out branch.
+def lower_link_site: Fn(PreparedPayload, QueryRequest, LinkSiteScope) -> qb::Plan = fn(payload, request, scope) {
+    let a = relation_domain(payload, scope.a_relation);
+    let z = relation_domain(payload, scope.z_relation);
+    let link = get_index(payload.entities, a.from);
+    let device = get_index(payload.entities, a.to);
+    let site_relation = relation_domain(payload, scope.site_relation);
+    let site = get_index(payload.entities, site_relation.to);
+    let tenant_relation = relation_domain(payload, scope.tenant_relation);
+    let tenant = get_index(payload.entities, tenant_relation.to);
+    let link_tenant = relation_domain(payload, scope.link_tenant_relation);
+    let device_tenant = relation_domain(payload, scope.device_tenant_relation);
+    if a.id == z.id || a.kind != RelationKind::Safe || z.kind != RelationKind::Safe
+        || a.from != z.from || a.to != z.to || site_relation.from != device.index
+        || site_relation.kind != RelationKind::FanOut
+        || tenant_relation.from != site.index || tenant_relation.kind != RelationKind::Safe
+        || link_tenant.from != link.index || device_tenant.from != device.index
+        || link_tenant.to != tenant.index || device_tenant.to != tenant.index
+        || link_tenant.kind != RelationKind::Safe || device_tenant.kind != RelationKind::Safe {
+        fail!("link site scope requires two endpoint roles and aligned device-site-tenant relations")
+    } else {
+        let lt = exists_pairs(link_tenant.key);
+        let dt = exists_pairs(device_tenant.key);
+        let endpoint_keys = [exists_pairs(a.key), exists_pairs(z.key)];
+        let aligned = array::length(lt) > 0 && array::length(lt) == array::length(dt)
+            && array::all(lt, fn(left) {
+                array::any(dt, fn(right) { left.to == right.to
+                    && array::all(endpoint_keys, fn(branch) {
+                        array::any(branch, fn(pair) { pair.from == left.from && pair.to == right.from })
+                    }) })
+            });
+        if !aligned {
+            fail!("both link endpoint roles must include the declared tenant identity key")
+        } else {
+            let plan = lower(payload, request);
+            if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None
+                || get_index(plan.sources, 0).alias != link.alias {
+                fail!("link site scope requires link-only result dimensions and filters")
+            } else {
+                let device_filters = resolve_filters(payload, scope.device_filters);
+                let site_filters = resolve_filters(payload, scope.site_filters);
+                let tenant_filters = resolve_filters(payload, scope.tenant_filters);
+                if !array::all(device_filters, fn(f) { f.entity == device.index })
+                    || !array::all(site_filters, fn(f) { f.entity == site.index })
+                    || !array::all(tenant_filters, fn(f) { f.entity == tenant.index }) {
+                    fail!("link site filters must belong to their declared relation roles")
+                } else {
+                    let endpoints = array::map(endpoint_keys, fn(branch) {
+                        array::map(branch, fn(pair) { exists_col_eq(link, device, pair, False) })
+                    });
+                    let sites = match site_relation.key {
+                        RelationKey::Or(keys) => array::map(keys, fn(key) {
+                            array::map(exists_pairs(key), fn(pair) { exists_col_eq(device, site, pair, False) })
+                        }),
+                        _ => fail!("link site scope requires explicit site alternatives", scope.site_relation),
+                    };
+                    let tenant_pairs = array::map(exists_pairs(tenant_relation.key), fn(pair) {
+                        exists_col_eq(site, tenant, pair, False)
+                    });
+                    let link_tenant_checks = array::map(lt, fn(pair) {
+                        qb::scalar(qb::ScalarFunction::Eq, [
+                            qb::column(link.alias, get_index(link.fields, pair.from).column),
+                            qb::column(tenant.alias, get_index(tenant.fields, pair.to).column)])
+                    });
+                    let filter = combine_filters(array::concat([
+                        link_tenant_checks,
+                        array::map(device_filters, fn(f) { f.expr }),
+                        array::map(site_filters, fn(f) { f.expr }),
+                        array::map(tenant_filters, fn(f) { f.expr }),
+                    ]));
+                    let qualification = qb::exists_three_hop_double_alternatives(
+                        qb::source(device.alias, device.table), endpoints,
+                        qb::source(site.alias, site.table), sites,
+                        qb::source(tenant.alias, tenant.table), tenant_pairs, filter);
+                    qb::validate({...plan, exists: array::push(plan.exists, qualification)}, payload.profile)
+                }
+            }
+        }
+    }
+};
+
 # Child identity stays on the outer plan. A possibly non-unique contains key,
 # two candidate site keys, and three declared tenant ownership roles are all
 # checked inside one correlated existence condition.
@@ -7032,6 +7127,7 @@ pub use self::{
     SampleCountRange,
     OwnerSiteScope,
     SiteTenantScope,
+    LinkSiteScope,
     EndpointPairRequest,
     NativePairEntry,
     ChildSiteScope,
@@ -7140,6 +7236,7 @@ pub use self::{
     lower_sample_top,
     lower_latest_sample,
     lower_event_component,
+    lower_link_site,
     lower_via,
     lower_relation_rows,
     lower_endpoint_pair,
