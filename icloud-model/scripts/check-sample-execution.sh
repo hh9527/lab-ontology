@@ -55,6 +55,17 @@ grouped_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?6 1' "${grouped_sql}")"
 jq -e 'length == 3 and ([.[] | select(.name == "B-red") | .port_count] | sort == [1,241]) and ([.[] | select(.name == "A-blue") | .port_count] == [9])' <<< "${grouped_result}" >/dev/null
 
+peak_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:sample_peak)"
+jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z","2024-01-31T00:00:00Z","2024-03-01T00:00:00Z",90,3]' <<< "${peak_plan}" >/dev/null
+peak_sql="$(jq -r '.sql' <<< "${peak_plan}")"
+peak_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?2 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?3 '2024-01-31T00:00:00Z'" \
+    -cmd ".parameter set ?4 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?5 90' -cmd '.parameter set ?6 3' "${peak_sql}")"
+jq -e 'length == 1 and .[0].name == "B-red" and .[0].port_count == 241 and .[0].port_count_peak == 93' <<< "${peak_result}" >/dev/null
+
 component_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:component_observation)"
 jq -e '.bindings == ["2024-02-01T00:00:00Z","2024-03-01T00:00:00Z",3,11,13,15,16,2]' <<< "${component_plan}" >/dev/null
 component_sql="$(jq -r '.sql' <<< "${component_plan}")"
@@ -88,4 +99,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'metric count, qualified observation, and component filter/context execute correctly\n'
+printf 'metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

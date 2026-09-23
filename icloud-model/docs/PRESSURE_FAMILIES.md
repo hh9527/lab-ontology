@@ -57,8 +57,14 @@ observation returns only its five rows in the observation window. Qualification
 by a raw-sample predicate before COUNT (Q0105)
 is now available through `qualify_samples`/`observe_qualified`, using one
 correlated aggregate EXISTS per qualification. A Max observation requires an
-explicitly declared Max measure in the Model; the current IC port_count
-declaration is Sum and cannot silently stand in for Max. A grouped observation
+explicit sample summary in the Model: `port_count_peak` uses Max over the same
+physical `portCount` samples while the declared `port_count` metric remains Sum.
+Discovery distinguishes the declared metric from the sample summary; model
+preparation rejects missing primary metrics, mismatched units and duplicate IDs.
+The fixture executes both summaries after a distinct qualification window,
+yielding Sum 241 and Max 93 for the same qualified device. This demonstrates
+the Q0105/Q0106 modeling capability, not a completed ONU or server model.
+A grouped observation
 also retains the full owner identity as a hidden grouping key: grouping by
 device name alone can merge distinct namesake devices across tenants. The
 device Model now declares `@dataset(Entity, ["id", "tenant_id"], None)`;

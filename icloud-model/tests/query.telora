@@ -130,6 +130,62 @@ pub def inconsistent_metric_aggregation_is_model_error: test::Test = test::shoul
         fn(subject) { subject == "public" })
 }, "metric metadata disagrees with its lowerable measure");
 
+@edsl::entity_source("bad_summary_without_metric", "bs")
+type SummaryWithoutMetric = struct {
+    @edsl::column("value")
+    @edsl::sample_aggregate("peak", qb::AggregateFunction::Max, no_metric_unit)
+    value: Int,
+};
+
+pub def sample_summary_requires_metric: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-summary-v1", [SummaryWithoutMetric.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "sample aggregate requires a declared metric on the same field");
+
+def percent_unit: Option(String) = Some("%");
+
+@edsl::entity_source("bad_summary_unit", "bu")
+@edsl::dataset(bad_metric_kind, metric_grain, metric_time)
+type SummaryWrongUnit = struct {
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, utc_encoding_for_tests)
+    ts: String,
+    @edsl::column("value")
+    @edsl::measure("usage", qb::AggregateFunction::Avg, no_dependencies)
+    @edsl::metric_value("usage", qb::AggregateFunction::Avg, percent_unit)
+    @edsl::sample_aggregate("peak", qb::AggregateFunction::Max, no_metric_unit)
+    value: Int,
+};
+
+pub def sample_summary_cannot_change_unit: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-summary-unit-v1", [SummaryWrongUnit.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [qb::AggregateFunction::Avg], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "sample aggregate requires an id and the original metric unit");
+
+@edsl::entity_source("bad_summary_id", "bi")
+@edsl::dataset(bad_metric_kind, metric_grain, metric_time)
+type SummaryDuplicateId = struct {
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, utc_encoding_for_tests)
+    ts: String,
+    @edsl::column("value")
+    @edsl::measure("usage", qb::AggregateFunction::Avg, no_dependencies)
+    @edsl::metric_value("usage", qb::AggregateFunction::Avg, no_metric_unit)
+    @edsl::sample_aggregate("usage", qb::AggregateFunction::Max, no_metric_unit)
+    value: Int,
+};
+
+pub def sample_summary_id_must_be_unique: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-summary-id-v1", [SummaryDuplicateId.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [qb::AggregateFunction::Avg], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "duplicate metric value id");
+
 def event_kind_for_local: edsl::DatasetKind = edsl::DatasetKind::Event;
 def local_grain: Array(String) = ["id"];
 def local_as_utc: Option(String) = Some("occur_time");
@@ -185,11 +241,16 @@ pub def dataset_grain_and_time_are_discoverable: test::Test = test::should_ok(fn
 
 pub def device_kpi_metric_contract_is_discoverable: test::Test = test::should_ok(fn() {
     let metrics = edsl::metric_domain(payload, "device_kpi");
-    match (array::get(metrics, 0), array::get(metrics, 1)) {
-        (Some(cpu), Some(ports)) => if array::length(metrics) == 2
+    match (array::get(metrics, 0), array::get(metrics, 1), array::get(metrics, 2)) {
+        (Some(cpu), Some(ports), Some(peak)) => if array::length(metrics) == 3
             && cpu.id == "cpu_usage" && cpu.field == "cpu_usage"
             && cpu.aggregate == qb::AggregateFunction::Avg && cpu.unit == Some("%")
-            && ports.id == "port_count" && ports.aggregate == qb::AggregateFunction::Sum {
+            && cpu.role == edsl::MetricValueRole::DeclaredMetric
+            && ports.id == "port_count" && ports.aggregate == qb::AggregateFunction::Sum
+            && ports.role == edsl::MetricValueRole::DeclaredMetric
+            && peak.id == "port_count_peak" && peak.field == "port_count"
+            && peak.aggregate == qb::AggregateFunction::Max && peak.unit == ports.unit
+            && peak.role == edsl::MetricValueRole::SampleSummary {
             True
         } else {
             fail!("device KPI metric metadata differs from iCloud", metrics)
@@ -216,6 +277,16 @@ pub def device_port_count_uses_declared_sum: test::Test = test::should_ok(fn() {
         True
     } else {
         fail!("port_count must use its declared Sum aggregation", q)
+    }
+});
+
+pub def sample_peak_uses_original_physical_column: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_qualified","measures":["port_count","port_count_peak"],"dimensions":["device_name"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[{"dimension":"port_count_sample","op":"gt","kind":"int","value":90}],"window":{"start":"2024-01-31T00:00:00Z","end":"2024-03-01T00:00:00Z"},"min_matches":3}]}`);
+    if array::length(string::split(q.sql, "sum(k.portCount) AS port_count")) == 2
+        && array::length(string::split(q.sql, "max(k.portCount) AS port_count_peak")) == 2 {
+        True
+    } else {
+        fail!("sample peak must coexist with the original Sum over one physical column", q)
     }
 });
 

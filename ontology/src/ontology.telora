@@ -164,6 +164,11 @@ type MetricValueSpec = struct {
     unit: Option(String),
 };
 
+# Additional explicitly named summaries over raw samples of an existing metric
+# field. They do not change that field's declared primary metric aggregation.
+@prelude::property(PropertyTarget::Field)
+type SampleAggregateDef = struct { summaries: Array(MetricValueSpec) };
+
 # Union (multi-source) entity declaration. An entity declared only with
 # `union_source` (and no `entity_source`) is a logical entity whose rows are the
 # UNION ALL of an ordered list of physical branches. Every branch maps each
@@ -573,7 +578,10 @@ type MetricValueEntry = struct {
     field: String,
     aggregate: qb::AggregateFunction,
     unit: Option(String),
+    role: MetricValueRole,
 };
+
+type MetricValueRole = enum { DeclaredMetric, SampleSummary };
 
 type DatasetBrief = struct {
     id: String,
@@ -817,6 +825,17 @@ def metric_value: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(proper
     fn(ctx, previous) {
         let result: MetricValueSpec = { id, aggregate, unit };
         result
+    }
+};
+
+def sample_aggregate: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(property::FieldPropertyCtx, Option(SampleAggregateDef)) -> SampleAggregateDef = fn(id, aggregate, unit) {
+    fn(ctx, previous) {
+        let summary: MetricValueSpec = { id, aggregate, unit };
+        let summaries = match previous {
+            Some(existing) => array::push(existing.summaries, summary),
+            None => [summary],
+        };
+        { summaries }
     }
 };
 
@@ -1182,7 +1201,8 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
         },
     };
     let metrics: Array(MetricValueEntry) = array::flat_map(fields, fn(field) {
-        match property::get_field_prop(ty, field.index, MetricValueSpec.type) {
+        let declared = property::get_field_prop(ty, field.index, MetricValueSpec.type);
+        let primary: Array(MetricValueEntry) = match declared {
             None => [],
             Some(metric) => do {
                 let is_metric = match validated_dataset {
@@ -1204,11 +1224,29 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                         },
                         None => fail!("metric value requires a lowerable measure", metric.id),
                     };
-                    let result: MetricValueEntry = { id: metric.id, field: field.name, aggregate: metric.aggregate, unit: metric.unit };
+                    let result: MetricValueEntry = { id: metric.id, field: field.name, aggregate: metric.aggregate, unit: metric.unit, role: MetricValueRole::DeclaredMetric };
                     [result]
                 }
             },
-        }
+        };
+        let summaries: Array(MetricValueEntry) = match property::get_field_prop(ty, field.index, SampleAggregateDef.type) {
+            None => [],
+            Some(extra) => do {
+                let base = match declared {
+                    Some(metric) => metric,
+                    None => fail!("sample aggregate requires a declared metric on the same field", field.name),
+                };
+                array::map(extra.summaries, fn(spec) {
+                    if spec.id == "" || spec.unit != base.unit {
+                        fail!("sample aggregate requires an id and the original metric unit", field.name, spec.id)
+                    } else {
+                        let result: MetricValueEntry = { id: spec.id, field: field.name, aggregate: spec.aggregate, unit: spec.unit, role: MetricValueRole::SampleSummary };
+                        result
+                    }
+                })
+            },
+        };
+        array::concat([primary, summaries])
     });
     if let Some(duplicate) = array::find(metrics, fn(metric) {
         array::length(array::filter(metrics, fn(other) { other.id == metric.id })) > 1
@@ -1283,6 +1321,23 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
             }),
             None => [],
         };
+        let sample_summaries = match property::get_field_prop(entity.entity_type, f.index, SampleAggregateDef.type) {
+            Some(d) => array::map(d.summaries, fn(spec) {
+                let result: MeasureEntry = {
+                    id: spec.id,
+                    entity: entity.index,
+                    field: f.index,
+                    aggregate: spec.aggregate,
+                    input: MeasureInput::All,
+                    alias: spec.id,
+                    requires: [],
+                    predicate: None,
+                    computed: None,
+                };
+                result
+            }),
+            None => [],
+        };
         let computed = match property::get_field_prop(entity.entity_type, f.index, ComputedMeasureDef.type) {
             Some(d) => array::map(d.measures, fn(spec) {
                 let result: MeasureEntry = {
@@ -1300,7 +1355,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
             }),
             None => [],
         };
-        array::concat([plain, filtered, computed])
+        array::concat([plain, filtered, sample_summaries, computed])
     })
 };
 
@@ -6257,6 +6312,8 @@ pub use self::{
     DatasetSpec,
     MetricValueSpec,
     MetricValueEntry,
+    MetricValueRole,
+    SampleAggregateDef,
     DatasetDescription,
     RelationDescriptions,
     RelationNote,
@@ -6340,6 +6397,7 @@ pub use self::{
     entity_id,
     dataset,
     metric_value,
+    sample_aggregate,
     time_field,
     dataset_description,
     relation_description,
