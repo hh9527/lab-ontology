@@ -110,6 +110,30 @@ for clock_case in occurrence arrival; do
     jq -e --argjson expected "${expected_csn}" 'length == 1 and .[0].CSN == $expected' <<< "${clock_result}" >/dev/null
 done
 
+onu_trend_schema="CREATE TABLE I_EntPonElement (id TEXT, alias TEXT, name TEXT, classification TEXT, createTime INTEGER);
+CREATE TABLE PonDeviceOnuKPI (resId TEXT, tenantId TEXT, ts TEXT, ifInBandRate REAL);
+INSERT INTO I_EntPonElement VALUES
+ ('ONU-1','193.168.8.1/0/5/8','Sample ONU','ne.category.pon.onu',1718467200500),
+ ('ONU-2','193.168.8.1/0/5/8','Sample ONU','ne.category.pon.onu',1718467201000),
+ ('OLT-1','193.168.8.1/0/5/8','Sample ONU','ne.category.olt',1718467200500),
+ ('ONU-3','other-alias','Sample ONU','ne.category.pon.onu',1718467200500);
+INSERT INTO PonDeviceOnuKPI VALUES
+ ('ONU-1','red','2024-06-01T00:00:00Z',0.2),
+ ('ONU-1','red','2024-06-15T00:00:00Z',0.7),
+ ('ONU-1','red','2024-07-01T00:00:00Z',0.9),
+ ('ONU-2','red','2024-06-10T00:00:00Z',0.8),
+ ('OLT-1','red','2024-06-10T00:00:00Z',0.6),
+ ('ONU-3','red','2024-06-10T00:00:00Z',0.5);"
+onu_trend_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:onu_receive_trend)"
+jq -e '.bindings == ["193.168.8.1/0/5/8","ne.category.pon.onu",1718467200000,1718467201000,"2024-06-01T00:00:00Z","2024-07-01T00:00:00Z",1000]' <<< "${onu_trend_plan}" >/dev/null
+onu_trend_sql="$(jq -r '.sql' <<< "${onu_trend_plan}")"
+onu_trend_result="$(sqlite3 -json :memory: -cmd "${onu_trend_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '193.168.8.1/0/5/8'" -cmd ".parameter set ?2 'ne.category.pon.onu'" \
+    -cmd '.parameter set ?3 1718467200000' -cmd '.parameter set ?4 1718467201000' \
+    -cmd ".parameter set ?5 '2024-06-01T00:00:00Z'" -cmd ".parameter set ?6 '2024-07-01T00:00:00Z'" \
+    -cmd '.parameter set ?7 1000' "${onu_trend_sql}")"
+jq -e 'length == 2 and .[0].name == "Sample ONU" and .[0].ts == "2024-06-01T00:00:00Z" and .[0].ifInBandRate == 0.2 and .[1].ts == "2024-06-15T00:00:00Z" and .[1].ifInBandRate == 0.7' <<< "${onu_trend_result}" >/dev/null
+
 server_fan_alarm_schema="CREATE TABLE PhysicalServer (id TEXT, oriResId TEXT, tenantId TEXT, classification TEXT);
 CREATE TABLE PhysicalServerFan (id TEXT, parentResId TEXT, tenantId TEXT, manufacturer TEXT);
 CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, ALARMNAME TEXT, OCCURUTC TEXT);
@@ -572,4 +596,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

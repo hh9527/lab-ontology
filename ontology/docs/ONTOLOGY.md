@@ -271,6 +271,9 @@ JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不�
 `utc_field_window` 另要求逻辑字段名，该字段必须有 UTC/CanonicalUtcSecondText
 时间角色，并属于同一根数据集；它可明确选取非权威的到达或更新时间，仍执行
 相同的 UTC 边界与先后校验。未声明时间角色或本地时间不能通过此入口查询。
+窗口目标数据集在请求中有维度或第一个度量时，lowering 用该数据集固定查询根，
+不会因为另一数据集的展示维度排在前面而反转一对多的采样路径；最终 SELECT
+保持请求的字段顺序。仅提供其他数据集维度/度量、没有目标数据集入口时仍诊断。
 不支持偏移输入、亚秒精度或原生 timestamp 列。
 
 `dataset_description(label, summary)` 和 `relation_description(id, label, summary)`
