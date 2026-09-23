@@ -746,7 +746,58 @@ pub def qualified_device_count_counts_owners_not_sample_pairs: test::Test = test
 
 pub def qualification_rejects_unrelated_relation: test::Test = test::should_fail_with(fn() {
     lower_json(`{"op":"qualify_metrics","measures":[],"dimensions":["device_id"],"filters":[],"ordering":[],"limit":null,"offset":null,"qualifications":[{"relation":"device_current_alarm","dataset":"device_kpi","filters":[],"window":{"start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"having":{"measure":"cpu_usage","op":"ge","kind":"int","value":40}}]}`)
-}, "metric qualification relation must map samples to owner");
+}, "metric qualification requires a named safe sample-to-owner relation");
+
+def independent_metric_plan: Fn(edsl::PreparedPayload) -> qb::Plan = fn(knowledge) {
+    let average: edsl::MetricQualification = {
+        relation: "device_kpi_of_device", dataset: "device_kpi", measure: "memory_usage",
+        filters: [], start: "2024-02-26T00:00:00Z", end: "2024-02-29T00:00:00Z",
+        op: edsl::HavingOp::Ge, threshold: edsl::FilterInput::Number(47.5),
+    };
+    let ports: edsl::MetricQualification = {...average,
+        measure: "port_count_sample_avg", threshold: edsl::FilterInput::Int(48)};
+    edsl::lower_metric_qualifications(knowledge,
+        {measures: [{id: "device_count", subject: "public", input: edsl::MeasureInput::All}],
+         dimensions: [], filters: [], ordering: [], limit: None, offset: None, partition: None},
+        [average, ports], None)
+};
+
+pub def independent_metrics_reject_missing_owner_tenant_key: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "device_kpi_of_device" {
+            let key = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(first) => first,
+                    None => fail!("missing metric owner key"),
+                },
+                _ => fail!("expected compound metric owner key"),
+            };
+            {...relation, key}
+        } else { relation }
+    });
+    independent_metric_plan({...payload, relations})
+}, "metric qualification relation must cover the owner's complete declared grain");
+
+pub def independent_metrics_reject_fanout_owner_relation: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "device_kpi_of_device" { {...relation, kind: edsl::RelationKind::FanOut} }
+        else { relation }
+    });
+    independent_metric_plan({...payload, relations})
+}, "metric qualification requires a named safe sample-to-owner relation");
+
+pub def independent_metrics_reject_owner_grain_extension: test::Test = test::should_fail_with(fn() {
+    let entities = array::map(payload.entities, fn(entity) {
+        if entity.id == "device" {
+            let dataset = match entity.dataset {
+                Some(spec) => Some({...spec, grain: ["id", "tenant_id", "name"]}),
+                None => fail!("device must declare its grain"),
+            };
+            {...entity, dataset}
+        } else { entity }
+    });
+    independent_metric_plan({...payload, entities})
+}, "metric qualification relation must cover the owner's complete declared grain");
 
 pub def qualified_raw_samples_use_independent_observation_window: test::Test = test::should_ok(fn() {
     let q = lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["device_name","port_count_sample","device_kpi_ts_raw"],"filters":[],"ordering":[{"target":"Dimension","id":"device_kpi_ts_raw","direction":"Asc"}],"limit":1000,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[{"relation":"device_kpi_of_device","dataset":"device_kpi","filters":[{"dimension":"port_count_sample","op":"gt","kind":"int","value":90}],"window":{"start":"2024-01-31T00:00:00Z","end":"2024-03-01T00:00:00Z"},"min_matches":3}]}`);
