@@ -40,7 +40,7 @@ INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
 INSERT INTO X_SITE_VIEW VALUES
  ('S1','Site-A','TA'),('S2','Site-A','TA'),
  ('S3','Site-A','TB'),('S4','Site-Other','TA');
-CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANT_ID TEXT, SEVERITY TEXT);
+CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, SEVERITY TEXT);
 INSERT INTO T_CURRENT_ALARM VALUES
  (1,'B','red','1'),(2,'B','red','1'),(3,'B','red','1'),
  (4,'A','red','1'),(5,'A','red','1'),(6,'A','blue','1'),
@@ -64,7 +64,7 @@ UPDATE T_CURRENT_ALARM SET ALARMNAME = 'highCpuUsage' WHERE CSN = 6;
 UPDATE T_CURRENT_ALARM SET ALARMNAME = 'other' WHERE ALARMNAME IS NULL;
 INSERT INTO I_EntNetworkElement (id,tenant_id,name,classification,projectId,refParentSubnet)
  VALUES ('D','red','NoOwnAlarm','LSW','S1','S2');
-INSERT INTO T_CURRENT_ALARM (CSN,MEDN,TENANT_ID,SEVERITY,ALARMNAME)
+INSERT INTO T_CURRENT_ALARM (CSN,MEDN,TENANTID,SEVERITY,ALARMNAME)
  VALUES (10,'D','blue','1','linkDown');"
 site_alarm_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:site_alarm_count)"
 jq -e '.bindings == ["ne.category.switch","LSW","linkDown","deviceOffline","highCpuUsage","Site-A","Tenant-A"]' <<< "${site_alarm_plan}" >/dev/null
@@ -75,6 +75,19 @@ site_alarm_result="$(sqlite3 -json :memory: -cmd "${site_alarm_schema}" -cmd '.p
     -cmd ".parameter set ?5 'highCpuUsage'" -cmd ".parameter set ?6 'Site-A'" \
     -cmd ".parameter set ?7 'Tenant-A'" "${site_alarm_sql}")"
 jq -e 'length == 1 and .[0].device_count == 1' <<< "${site_alarm_result}" >/dev/null
+
+alarm_tenant_schema="CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, TENANTID TEXT, CLEARED INTEGER);
+INSERT INTO T_CURRENT_ALARM VALUES
+ (1,'TA',0),(2,'TA',0),(3,'TA',0),(4,'TA',0),(5,'TA',0),(6,'TA',0),
+ (7,'TA',1),(8,'TB',0),(9,'TB',0),(10,'TB',0),(11,'TB',0),(12,'TB',0),
+ (13,'TC',0),(14,'TC',0),(15,'TC',0),(16,'TC',0),(17,'TC',0),(18,'TC',0),
+ (19,'TD',1),(20,'TD',1),(21,'TD',1),(22,'TD',1),(23,'TD',1),(24,'TD',1);"
+alarm_tenant_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:uncleared_tenant_count)"
+jq -e '.bindings == [0,5]' <<< "${alarm_tenant_plan}" >/dev/null
+alarm_tenant_sql="$(jq -r '.sql' <<< "${alarm_tenant_plan}")"
+alarm_tenant_result="$(sqlite3 -json :memory: -cmd "${alarm_tenant_schema}" -cmd '.parameter init' \
+    -cmd '.parameter set ?1 0' -cmd '.parameter set ?2 5' "${alarm_tenant_sql}")"
+jq -e 'length == 1 and (.[0] | to_entries[0].value) == 2' <<< "${alarm_tenant_result}" >/dev/null
 
 site_device_schema="CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, SITE_TYPE TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, name TEXT, projectId TEXT, refParentSubnet TEXT);
