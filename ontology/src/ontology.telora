@@ -488,7 +488,7 @@ type ComponentContextSpec = struct {
     dimensions: Array(DimensionRequest),
     filters: Array(FilterRequest),
 };
-type SampleTopScope = struct {
+type OwnerSiteScope = struct {
     ancestor_relation: String,
     site_relation: String,
     tenant_relation: String,
@@ -4659,7 +4659,7 @@ def lower_named_exists: Fn(PreparedPayload, QueryRequest, Array(NamedExistsReque
 
 # Each qualification uses its own correlated aggregate. Independent KPI sample
 # sets never join one another and therefore cannot multiply each other's rows.
-def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQualification)) -> qb::Plan = fn(payload, request, specs) {
+def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQualification), Option(OwnerSiteScope)) -> qb::Plan = fn(payload, request, specs, scope) {
     if array::length(specs) == 0 {
         fail!("metric qualification requires at least one condition")
     } else {
@@ -4684,6 +4684,30 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
             if !count_ok {
                 fail!("metric qualification supports owner projection or owner key count only")
             } else {
+            let scoped_plan = match scope {
+                None => base_plan,
+                Some(qualifier) => do {
+                    let ancestor_relation = relation_domain(payload, qualifier.ancestor_relation);
+                    let ancestor = get_index(payload.entities, ancestor_relation.to);
+                    let (join, ancestor_filter, site_exists) = owner_site_scope(payload, base, ancestor, qualifier);
+                    let joined = array::any(base_plan.joins, fn(existing) {
+                        existing.source.alias == ancestor.alias && existing.condition == join.condition
+                            && existing.kind == qb::JoinKind::Inner
+                    });
+                    if array::length(base_plan.sources) > 2
+                        || (array::length(base_plan.sources) == 2 && !joined) {
+                        fail!("metric qualification scope requires only the declared safe ancestor join")
+                    } else {
+                        let filter = append_filter_terms(base_plan.filter, match ancestor_filter {
+                            Some(expr) => [expr], None => [],
+                        });
+                        qb::validate({...base_plan,
+                            sources: if joined { base_plan.sources } else { array::push(base_plan.sources, join.source) },
+                            joins: if joined { base_plan.joins } else { array::push(base_plan.joins, join) },
+                            filter, exists: array::push(base_plan.exists, site_exists)}, payload.profile)
+                    }
+                },
+            };
             let clauses: Array(qb::Exists) = array::map(specs, fn(spec) {
                 let target = entity_by_id(payload, spec.dataset);
                 let target_entry = get_index(payload.entities, target);
@@ -4715,7 +4739,7 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
                         if metric.predicate != None || metric.computed != None || array::length(metric.requires) != 0 {
                             fail!("metric qualification requires a direct dataset measure", spec.measure)
                         } else {
-                            let alias = private_exists_alias(base_plan.sources, `\{target_entry.alias}_qualification`);
+                            let alias = private_exists_alias(scoped_plan.sources, `\{target_entry.alias}_qualification`);
                             let inner_entry: EntityEntry = {...target_entry, alias};
                             let pairs = array::map(exists_pairs(relation.key), fn(pair) {
                                 exists_col_eq(base, inner_entry, pair, True)
@@ -4751,7 +4775,7 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
                     }
                 }
             });
-            qb::validate({...base_plan, exists: array::concat([base_plan.exists, clauses])}, payload.profile)
+            qb::validate({...scoped_plan, exists: array::concat([scoped_plan.exists, clauses])}, payload.profile)
             }
         }
     }
@@ -4902,7 +4926,7 @@ def entity_grain_exprs: Fn(EntityEntry, String) -> Array(qb::Expr) = fn(entity, 
     })
 };
 
-def sample_top_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, SampleTopScope) -> Tuple([qb::Join, Option(qb::Expr), qb::Exists]) =
+def owner_site_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, OwnerSiteScope) -> Tuple([qb::Join, Option(qb::Expr), qb::Exists]) =
     fn(payload, owner, ancestor, scope) {
         let ancestor_relation = relation_domain(payload, scope.ancestor_relation);
         let site_relation = relation_domain(payload, scope.site_relation);
@@ -4948,7 +4972,7 @@ def sample_top_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, SampleTopSco
         }
     };
 
-def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int, Option(SampleTopScope)) -> qb::Plan =
+def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int, Option(OwnerSiteScope)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, window, rank_id, take, scope) {
         let sample = get_index(payload.entities, entity_by_id(payload, window.dataset));
         let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
@@ -5001,7 +5025,7 @@ def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindo
                         Some(qualifier) => do {
                             let ancestor_relation = relation_domain(payload, qualifier.ancestor_relation);
                             let ancestor = get_index(payload.entities, ancestor_relation.to);
-                            let (join, ancestor_filter, site_exists) = sample_top_scope(payload, owner, ancestor, qualifier);
+                            let (join, ancestor_filter, site_exists) = owner_site_scope(payload, owner, ancestor, qualifier);
                             let ancestor_joined = array::any(owner_joins, fn(existing) {
                                 existing.source.alias == ancestor.alias && existing.condition == join.condition
                                     && existing.kind == qb::JoinKind::Inner
@@ -6596,7 +6620,7 @@ pub use self::{
     MetricQualification,
     SampleQualification,
     SampleCountRange,
-    SampleTopScope,
+    OwnerSiteScope,
     ComponentContextSpec,
     UtcWindowRequest,
     UtcDaysWindowRequest,

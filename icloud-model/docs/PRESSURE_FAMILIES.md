@@ -79,3 +79,14 @@ entity grain this grouped shape fails rather than guessing identity from JOIN.
 Explicit bounds for both windows can be resolved
 from an externally supplied clock; the EDSL never silently treats a calendar
 month as a fixed number of days.
+
+Q0111/Q0120 add a compositional pressure to `qualify_metrics`: a Safe owner
+ancestor supplies device filters, a two-hop site/tenant EXISTS supplies
+FanOut qualification, and each interface's KPI AVG/HAVING remains in its own
+EXISTS. `scope` names all three Model relations and filters by their respective
+roles; a mismatched relation or role fails at lowering. Q0120 additionally
+separates the raw `ifOutErrors < 58` WHERE predicate from `Avg < 58` HAVING.
+The executable fixture includes duplicate eligible sites, a wrong-tenant
+site, an interface without samples, and same-name interfaces. A plain site
+JOIN would turn one qualified interface into two counted rows; treating the
+pre-aggregate predicate as HAVING alone would change the qualifying set.

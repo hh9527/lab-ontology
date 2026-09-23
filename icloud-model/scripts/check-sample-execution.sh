@@ -46,6 +46,33 @@ INSERT INTO T_CURRENT_ALARM VALUES
  (4,'A','red','1'),(5,'A','red','1'),(6,'A','blue','1'),
  (7,'C','red','2'),(8,'C','red','2'),(9,'C','red','2');"
 
+interface_qualification_schema="${schema}
+ALTER TABLE NetworkDeviceInterfaceKPI ADD COLUMN ifOutErrors INTEGER;
+UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 40 WHERE resId = 'P-B' AND ts = '2024-02-01T00:00:00Z';
+UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 100 WHERE resId = 'P-B' AND ts = '2024-02-02T00:00:00Z';
+UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 60 WHERE resId = 'P-B' AND ts >= '2024-02-03T00:00:00Z';
+UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 10 WHERE resId = 'P-C';
+INSERT INTO I_EnterpriseNetworkLTP VALUES ('P-E','red','B','ExtraPort'),('P-EMPTY','red','B','EmptyPort');
+INSERT INTO NetworkDeviceInterfaceKPI (resId,tenantId,ts,ifOutErrors) VALUES
+ ('P-E','red','2024-02-07T00:00:00Z',140),('P-E','red','2024-02-08T00:00:00Z',20);"
+
+qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
+qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
+qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'LSW'" -cmd ".parameter set ?2 'ne.category.switch'" \
+    -cmd ".parameter set ?3 'Site-A'" -cmd ".parameter set ?4 'Tenant-A'" \
+    -cmd ".parameter set ?5 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?6 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?7 72' "${qualified_interface_sql}")"
+jq -e 'length == 1 and .[0].interface_count == 1' <<< "${qualified_interface_result}" >/dev/null
+
+qualified_raw_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_raw_avg)"
+qualified_raw_sql="$(jq -r '.sql' <<< "${qualified_raw_plan}")"
+qualified_raw_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'Site-A'" -cmd ".parameter set ?2 'Tenant-A'" \
+    -cmd ".parameter set ?3 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?4 '2024-03-01T00:00:00Z'" \
+    -cmd '.parameter set ?5 58' -cmd '.parameter set ?6 58' "${qualified_raw_sql}")"
+jq -e 'map(.name) | sort == ["ExtraPort","SamePort"]' <<< "${qualified_raw_result}" >/dev/null
+
 created_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:created_in_local_second)"
 jq -e '.bindings == [1718467200000,1718467201000]' <<< "${created_plan}" >/dev/null
 created_sql="$(jq -r '.sql' <<< "${created_plan}")"
@@ -195,4 +222,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
