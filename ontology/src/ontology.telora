@@ -49,6 +49,10 @@ type MeasureNote = struct { id: String, label: String, summary: String };
 @prelude::property(PropertyTarget::Field)
 type MeasureDescriptions = struct { notes: Array(MeasureNote) };
 
+type DimensionNote = struct { id: String, label: String, summary: String };
+@prelude::property(PropertyTarget::Field)
+type DimensionDescriptions = struct { notes: Array(DimensionNote) };
+
 # Member-level: filtered measure declaration. Adds a domain-declared inherent
 # predicate to the aggregate: only rows matching the predicate count into this
 # measure. The predicate references a declared, authorized, filterable dimension
@@ -643,6 +647,23 @@ type MeasureBrief = struct {
     metric: Option(MetricValueEntry),
 };
 
+type DimensionScopeBrief = struct { field: String, op: FilterOp, input: FilterInput };
+type DimensionBrief = struct {
+    id: String,
+    label: String,
+    summary: String,
+    dataset: String,
+    field: String,
+    computed: Bool,
+    authorized: Bool,
+    filterable: Bool,
+    ops: Array(FilterOp),
+    input_kinds: Array(FilterInputKind),
+    values: Array(EnumValueEntry),
+    canonical_values: Array(CanonicalValueSpec),
+    scope: Array(DimensionScopeBrief),
+};
+
 type MetricValueRole = enum { DeclaredMetric, SampleSummary };
 
 type DatasetBrief = struct {
@@ -803,6 +824,17 @@ def measure_description: Fn(String, String, String) -> Fn(property::FieldPropert
     fn(id, label, summary) {
         fn(ctx, previous) {
             let note: MeasureNote = { id, label, summary };
+            {notes: match previous {
+                Some(existing) => array::push(existing.notes, note),
+                None => [note],
+            }}
+        }
+    };
+
+def dimension_description: Fn(String, String, String) -> Fn(property::FieldPropertyCtx, Option(DimensionDescriptions)) -> DimensionDescriptions =
+    fn(id, label, summary) {
+        fn(ctx, previous) {
+            let note: DimensionNote = { id, label, summary };
             {notes: match previous {
                 Some(existing) => array::push(existing.notes, note),
                 None => [note],
@@ -1538,6 +1570,26 @@ def check_measure_descriptions: Fn(Array(EntityEntry), Array(MeasureEntry)) -> B
                     })
             }) {
                 fail!("measure description must name one measure on its field", entity.id, field.name, bad.id)
+            } else { True }
+        })
+    })
+};
+
+def check_dimension_descriptions: Fn(Array(EntityEntry), Array(DimensionEntry)) -> Bool = fn(entities, dimensions) {
+    array::all(entities, fn(entity) {
+        array::all(entity.fields, fn(field) {
+            let notes = match property::get_field_prop(entity.entity_type, field.index, DimensionDescriptions.type) {
+                Some(declared) => declared.notes,
+                None => [],
+            };
+            if let Some(bad) = array::find(notes, fn(note) {
+                note.id == "" || note.label == ""
+                    || array::length(array::filter(notes, fn(other) { other.id == note.id })) != 1
+                    || !array::any(dimensions, fn(d) {
+                        d.id == note.id && d.entity == entity.index && d.field == field.index
+                    })
+            }) {
+                fail!("dimension description must name one dimension on its field", entity.id, field.name, bad.id)
             } else { True }
         })
     })
@@ -2321,6 +2373,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     let measures = check_measure_contract(measures_raw);
     let descriptions_ok = check_measure_descriptions(entities, measures);
     let dimensions = array::flat_map(entities, fn(e) { collect_entity_dimensions(e) });
+    let dimension_descriptions_ok = check_dimension_descriptions(entities, dimensions);
     let native_pairs = array::flat_map(entities, fn(e) {
         let declared = match property::get_type_prop(e.entity_type, NativePairDef.type) {
             Some(definition) => definition.pairs, None => [],
@@ -2430,7 +2483,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
             True
         })
     });
-    if profile_ok && peer_identity_validated && descriptions_ok && predicates_validated && dimension_scopes_validated { payload } else { payload }
+    if profile_ok && peer_identity_validated && descriptions_ok && dimension_descriptions_ok && predicates_validated && dimension_scopes_validated { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -2636,6 +2689,40 @@ def canonical_value_domain: Fn(PreparedPayload, String) -> Array(CanonicalValueS
     match array::find(payload.dimensions, fn(d) { d.id == id }) {
         Some(entry) => entry.canonical_values,
         None => fail!("unknown dimension", id),
+    }
+};
+
+def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(payload, entry) {
+    let entity = get_index(payload.entities, entry.entity);
+    let field = get_index(entity.fields, entry.field);
+    let note = match property::get_field_prop(entity.entity_type, field.index, DimensionDescriptions.type) {
+        Some(declared) => array::find(declared.notes, fn(item) { item.id == entry.id }),
+        None => None,
+    };
+    let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
+        {field: get_index(entity.fields, predicate.field).name, op: predicate.op, input: predicate.input}
+    });
+    {id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
+        summary: match note { Some(n) => n.summary, None => "" },
+        dataset: entity.id, field: field.name, computed: entry.computed,
+        authorized: entry.authorized, filterable: entry.filterable,
+        ops: entry.ops, input_kinds: entry.input_kinds, values: entry.values,
+        canonical_values: entry.canonical_values, scope}
+};
+
+def dimension_detail: Fn(PreparedPayload, String) -> DimensionBrief = fn(payload, id) {
+    match array::find(payload.dimensions, fn(entry) { entry.id == id }) {
+        Some(entry) => dimension_brief(payload, entry),
+        None => fail!("unknown dimension knowledge point", id),
+    }
+};
+
+def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> DimensionBrief = fn(payload, subject, id) {
+    if !payload.authorize(subject) {
+        fail!("subject is not authorized for dimension discovery", subject, id)
+    } else {
+        let detail = dimension_detail(payload, id);
+        if detail.authorized { detail } else { fail!("dimension is not authorized for discovery", subject, id) }
     }
 };
 
@@ -7487,6 +7574,7 @@ pub use self::{
     EntityEntry,
     MeasureEntry,
     DimensionEntry,
+    DimensionBrief,
     RelationEntry,
     NamedExistsRequest,
     MetricQualification,
@@ -7512,6 +7600,7 @@ pub use self::{
     key,
     measure,
     measure_description,
+    dimension_description,
     distinct_measure,
     filtered_measure,
     computed_measure,
@@ -7591,6 +7680,8 @@ pub use self::{
     dimension_expr,
     dimension_domain,
     canonical_value_domain,
+    dimension_detail,
+    dimension_detail_for_subject,
     dataset_domain,
     time_domain,
     metric_domain,
