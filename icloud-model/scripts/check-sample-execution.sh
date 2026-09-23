@@ -16,7 +16,8 @@ INSERT INTO NetworkDeviceKPI VALUES
  ('B','red','2024-02-20T00:00:00Z',NULL,50),
  ('C','red','2024-02-10T00:00:00Z',0,1);
 INSERT INTO I_EnterpriseFrame VALUES
- ('B-frame-1','B','red','Duplicate',3),('B-frame-2','B','red','Duplicate',11),('A-frame','A','red','Other',2);
+ ('B-frame-1','B','red','Duplicate',3),('B-frame-2','B','red','Duplicate',11),
+ ('B-frame-foreign','B','green','Foreign',3),('A-frame','A','red','Other',2);
 ALTER TABLE I_EntNetworkElement ADD COLUMN createTime INTEGER;
 UPDATE I_EntNetworkElement SET createTime = 1718467200500 WHERE id = 'B' AND tenant_id = 'red';
 UPDATE I_EntNetworkElement SET createTime = 1718467201000 WHERE id = 'A';

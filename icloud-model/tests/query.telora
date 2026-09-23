@@ -32,7 +32,27 @@ type ValidTarget = struct {
     @edsl::column("id")
     @edsl::key(yes)
     id: Int,
+    @edsl::column("label")
+    label: Int,
 };
+
+@edsl::entity_source("non_key_safe_child", "nks")
+@edsl::named_relation_key("non_key_safe_owner", ValidTarget.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "owner_label", to: "label" }))
+type NonKeySafeChild = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+    @edsl::column("owner_label")
+    owner_label: Int,
+};
+
+pub def safe_relation_to_non_key_field_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("non-key-safe-v1", [ValidTarget.type, NonKeySafeChild.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "safe relation must cover the target's declared identity");
 
 @edsl::entity_source("bad_relation", "br")
 @edsl::relation_key(ValidTarget.type, edsl::RelationKind::Safe,
@@ -111,7 +131,49 @@ pub def incomplete_peer_identity_is_model_error: test::Test = test::should_fail_
         { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
           allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
         fn(subject) { subject == "public" })
-}, "peer hub role relation must match its endpoint and full participant grain");
+}, "safe relation must cover the target's declared identity");
+
+@edsl::entity_source("incomplete_safe_child", "isc")
+@edsl::named_relation_key("incomplete_safe_owner", IncompletePeerParticipant.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}))
+type IncompleteSafeChild = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+    @edsl::column("owner_id")
+    owner_id: Int,
+};
+
+pub def incomplete_safe_relation_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("incomplete-safe-v1", [IncompletePeerParticipant.type, IncompleteSafeChild.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "safe relation must cover the target's declared identity");
+
+@edsl::entity_source("complete_safe_child", "csc")
+@edsl::named_relation_key("complete_safe_owner", IncompletePeerParticipant.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "owner_tenant", to: "tenant_id"}),
+    ]))
+type CompleteSafeChild = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+    @edsl::column("owner_id")
+    owner_id: Int,
+    @edsl::column("owner_tenant")
+    owner_tenant: Int,
+};
+
+pub def complete_safe_relation_prepares: test::Test = test::should_ok(fn() {
+    let knowledge = edsl::build_root("complete-safe-v1", [IncompletePeerParticipant.type, CompleteSafeChild.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [qb::JoinKind::Inner],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" });
+    edsl::relation_domain(knowledge, "complete_safe_owner").kind == edsl::RelationKind::Safe
+});
 
 pub def unknown_relation_field_is_model_error: test::Test = test::should_fail_with(fn() {
     edsl::build_root("invalid-relation-v1", [ValidTarget.type, InvalidRelation.type],
@@ -933,6 +995,7 @@ pub def component_context_repeats_owner_samples_per_declared_child: test::Test =
     let q = lower_json(`{"op":"observe_qualified","measures":[],"dimensions":["device_name","port_count_sample","device_kpi_ts_raw"],"filters":[],"ordering":[{"target":"Dimension","id":"device_kpi_ts_raw","direction":"Asc"}],"limit":null,"offset":null,"owner":"device","relation":"device_kpi_of_device","window":{"dataset":"device_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"qualifications":[],"context":{"target":"frame","relation":"frame_belongs_to_device","dimensions":["frame_id","frame_name"],"filters":[{"dimension":"frame_oper_state","op":"eq","kind":"text","value":"normal"}]}}`);
     if array::length(string::split(q.sql, "INNER JOIN I_EnterpriseFrame AS f ON")) == 2
         && array::length(string::split(q.sql, "f.refParentNE = d.id")) == 2
+        && array::length(string::split(q.sql, "f.tenantId = d.tenant_id")) == 2
         && array::length(string::split(q.sql, "f.id AS frame_id")) == 2
         && array::length(string::split(q.sql, "f.name AS frame_name")) == 2
         && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM I_EnterpriseFrame")) == 1
@@ -1117,6 +1180,7 @@ pub def named_alarm_on_frame_root_keeps_owner_join: test::Test = test::should_ok
     let q = lower_json(`{"op":"exists_via","measures":[],"dimensions":["frame_name","device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"exists":[{"relation":"frame_belongs_to_device","target":"device","filters":[],"min_matches":null}],"limit":null,"offset":null}`);
     if array::length(string::split(q.sql, "I_EnterpriseFrame")) > 1
         && array::length(string::split(q.sql, "f.refParentNE = d.id")) > 1
+        && array::length(string::split(q.sql, "f.tenantId = d.tenant_id")) > 1
         && array::length(string::split(q.sql, "EXISTS")) == 1
         && q.bindings == [qb::Val::String("Device-A")] {
         True
@@ -1130,6 +1194,7 @@ pub def named_exists_filters_joined_target_under_private_alias: test::Test = tes
     if array::length(string::split(q.sql, "INNER JOIN I_EntNetworkElement AS d")) > 1
         && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM I_EntNetworkElement AS d_exists")) > 1
         && array::length(string::split(q.sql, "f.refParentNE = d_exists.id")) > 1
+        && array::length(string::split(q.sql, "f.tenantId = d_exists.tenant_id")) > 1
         && array::length(string::split(q.sql, "d_exists.name = ?")) > 1
         && q.bindings == [qb::Val::String("Device-A"), qb::Val::String("Device-A")] {
         True
