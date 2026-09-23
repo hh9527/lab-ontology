@@ -6,15 +6,32 @@ and must not be presented as a complete interpretation of that domain.
 
 | Source fact | Current representation | Acceptance requirement |
 | --- | --- | --- |
-| Network device and current alarm are linked by device id = MEDN **and** tenant id | Composite `relation_key` with alarm as a separate entity | Declare a named subject-to-event data link; distinguish alarm record grain from device grain. Count alarms for a device without amplifying device rows. |
-| `occur_utc` is the alarm's authoritative UTC time field; `occur_time` is local | `occur_utc` is only a String column here | A time-window intent must select the declared authoritative time role and preserve instant semantics; a local timestamp must not silently substitute for it. |
-| Physical link has A and Z device endpoints | `directed_peer_hub` preserves A as origin and Z as peer | Query keeps the declared A/Z positions without an exchange branch. Named relation identity and role descriptions are still missing. |
-| Network device communication state has canonical `offline` backed by both `"1"` and `"offline"` | `@canonical_values` on the device field | Filtering by `offline` binds both wires; unknown business values fail. Canonical projection is still missing. |
+| Network device and current alarm are linked by device id = MEDN **and** tenant id | Named composite relation; event grain `csn`; `min_matches` groups by both keys | Treat this as a named subject-to-event data link, not just an entity relation. |
+| `occur_utc` is the alarm's authoritative UTC time field; `occur_time` is local | Event grain and UTC/Local field encoding are declared; `utc_window` validates canonical UTC seconds and lowers on `occur_utc` | Support richer instant encodings and time roles without accepting local values as UTC. |
+| Physical link has A and Z device endpoints | `directed_peer_hub_fields` and two explicitly selectable, described A/Z relations | Query preserves the declared A/Z positions without an exchange branch. |
+| Network device communication state has canonical `offline` backed by both `"1"` and `"offline"` | `@canonical_values` on the device field | Filtering binds both wires, and projection/grouping returns the same business id; unexpected stored wires return NULL pending source-data validation. |
 | Network physical-link status maps integer wires 2 and 3 to `fault` | `@canonical_values` on an integer field | Filtering by `fault` binds both integers without changing the business-value contract. |
-| KPI metric sets have a sampling grain, aggregate meaning and unit | Not declared in this fixture | Bind a named metric set to its device subject and time role; aggregate only at declared grains, with metric unit and aggregation semantics available for discovery. |
+| KPI metric sets have a sampling grain, aggregate meaning and unit | KPI carrier declares `(res_id, tenant_id, ts)` grain, UTC `ts`, `cpu_usage` Avg/% and `port_count` Sum; metadata is checked against lowerable measures | Enforce actual timestamp semantics and permissible grouping across grains; the carrier is not yet a full MetricSet contract. |
+| Site lookup admits either `projectId` or `refParentSubnet` as the site key | Named `RelationKey.Or` connects network device to governance site | A frame-root query reaches its device and site through the alternatives, without treating them as a composite AND. |
+| Frame belongs to a device; device KPI samples belong to a device through `(resId, tenantId)` | Frame and KPI rows have separate declared grains with upward safe paths | KPI aggregation by device is lowerable; frame-owned KPI semantics and cross-grain grouping remain unproven. |
 
-The canonical-value and directed-endpoint cases pass; they do not close the
-event-set, time-window, named data-link, KPI, or canonical-projection requirements.
+Canonical filtering, directed endpoints, explicit A/Z selection, composite-key
+event count, declared device KPI aggregation and canonical UTC-second windows
+pass. This does not close native timestamp/timezone handling, full
+EventSet/MetricSet, or runtime data-quality diagnostics for unknown wires.
+
+The additional site/frame/KPI carriers are pressure probes, not a transcription
+of the full iCloud network graph. `device_kpi_ts_raw` deliberately names a raw
+string column; it is independently annotated as a canonical UTC-second source,
+but listing it does not by itself constitute a time-window query. The bounded
+`utc_window` intent covers `[start,end)` on the root dataset, not the full
+relative-time or top-N demand of Q0043. Similarly,
+joining a frame to device KPI does not establish a frame-owned CPU metric:
+Q0078/Q0079 require a semantic grain/aggregation decision in the Model, not
+just an executable SQL join. Named field pairs resolve to canonical indexes at
+preparation time; unknown or mismatched fields fail before querying. Descriptions
+and cross-references in `knowledge_index` come from the same Prepared Model,
+not from a separately authored agent prompt.
 
 Acceptance is two-sided: each row requires a successful intent with a correct
 plan **and** a nearby invalid intent rejected at its original Model/intent value.
@@ -26,3 +43,23 @@ Source references: `network/entity_sets/physical_link.telora`,
 `governance/event_sets/current_alarm.telora`,
 `network/data_links/cross/governance.telora`, and
 `network/entity_set_links/intra.telora` in the iCloud modeling tree.
+
+Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
+`zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device
+JOIN. These are separate from the explicit Device A/Z relation test. The
+directed peer route uses `directed_peer_hub_fields` so adding native columns
+cannot silently change endpoint field indexes.
+
+Physical-link A/Z endpoints now test simultaneous role projection: `list_roles`
+names each declared Safe relation, its target dimension, and a distinct output
+alias. The resulting plan joins Device twice with separate aliases and preserves
+the two endpoint keys. A target dimension on the wrong relation and duplicate
+output aliases, including aliases colliding with a base column, are rejected.
+This shape currently accepts base dimensions only; role sorting and aggregates
+need separate acceptance cases before being
+considered supported. `role_filters` reference a selected role output and
+reuse declared dimension operators and canonical values: Z-end device name
+Contains can select a link while A-end device name is projected. A filter
+dimension on the wrong endpoint is rejected. Role dimensions with canonical
+values use the same Model-defined wire-to-business mapping as ordinary
+dimension projection.

@@ -7,6 +7,8 @@ use ontology::query as qb;
 
 def yes: Bool = True;
 def text_ops: Array(edsl::FilterOp) = [edsl::FilterOp::Eq];
+def device_name_ops: Array(edsl::FilterOp) = [edsl::FilterOp::Eq, edsl::FilterOp::Contains];
+def link_text_ops: Array(edsl::FilterOp) = [edsl::FilterOp::Eq, edsl::FilterOp::Contains];
 def text_inputs: Array(edsl::FilterInputKind) = [edsl::FilterInputKind::Text];
 def int_ops: Array(edsl::FilterOp) = [edsl::FilterOp::Eq, edsl::FilterOp::Ge, edsl::FilterOp::Lt];
 def int_inputs: Array(edsl::FilterInputKind) = [edsl::FilterInputKind::Int];
@@ -17,9 +19,30 @@ def other_value: edsl::CanonicalValueSpec = { id: "other", label: "Other", wires
 def communication_values: Array(edsl::CanonicalValueSpec) = [online_value, offline_value, other_value];
 def fault_value: edsl::CanonicalValueSpec = { id: "fault", label: "Fault", wires: [edsl::FilterInput::Int(2), edsl::FilterInput::Int(3)] };
 def physical_link_status_values: Array(edsl::CanonicalValueSpec) = [fault_value];
+def event_kind: edsl::DatasetKind = edsl::DatasetKind::Event;
+def metric_kind: edsl::DatasetKind = edsl::DatasetKind::Metric;
+def alarm_grain: Array(String) = ["csn"];
+def alarm_time: Option(String) = Some("occur_utc");
+def kpi_grain: Array(String) = ["res_id", "tenant_id", "ts"];
+def kpi_time: Option(String) = Some("ts");
+def avg_agg: qb::AggregateFunction = qb::AggregateFunction::Avg;
+def sum_agg: qb::AggregateFunction = qb::AggregateFunction::Sum;
+def percent_unit: Option(String) = Some("%");
+def no_unit: Option(String) = None;
+def utc_role: edsl::TimeSemantics = edsl::TimeSemantics::Utc;
+def local_role: edsl::TimeSemantics = edsl::TimeSemantics::Local;
+def utc_seconds: edsl::TimeEncoding = edsl::TimeEncoding::CanonicalUtcSecondText;
+def local_text: edsl::TimeEncoding = edsl::TimeEncoding::LocalText;
 
 @edsl::entity_id("device")
 @edsl::entity_source("I_EntNetworkElement", "d")
+@edsl::dataset_description("Network device", "Network resource identified within its tenant")
+@edsl::relation_description("device_located_at_site", "Located at site", "Either project or parent subnet identifies the site")
+@edsl::named_relation_key("device_located_at_site", Site.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::Or([
+        edsl::RelationKey::FieldEq({ from: "project_id", to: "site_id" }),
+        edsl::RelationKey::FieldEq({ from: "ref_parent_subnet", to: "site_id" }),
+    ]))
 type Device = struct {
     @edsl::column("commu_state")
     @edsl::dimension("device_commu_state", yes, yes, text_ops, text_inputs)
@@ -32,6 +55,73 @@ type Device = struct {
     id: String,
     @edsl::column("tenant_id")
     tenant_id: String,
+    @edsl::column("projectId")
+    project_id: String,
+    @edsl::column("refParentSubnet")
+    ref_parent_subnet: String,
+    @edsl::column("name")
+    @edsl::dimension("device_name", yes, yes, device_name_ops, text_inputs)
+    name: String,
+};
+
+@edsl::entity_id("site")
+@edsl::entity_source("X_SITE_VIEW", "s")
+@edsl::dataset_description("Site", "Governance site referenced by network devices")
+type Site = struct {
+    @edsl::column("SITE_ID")
+    @edsl::key(yes)
+    site_id: String,
+    @edsl::column("SITE_NAME")
+    @edsl::dimension("site_name", yes, yes, text_ops, text_inputs)
+    site_name: String,
+};
+
+@edsl::entity_id("frame")
+@edsl::entity_source("I_EnterpriseFrame", "f")
+@edsl::dataset_description("Network frame", "Equipment frame belonging to a network device")
+@edsl::relation_description("frame_belongs_to_device", "Belongs to device", "Frame owner identified by parent device ID")
+@edsl::named_relation_key("frame_belongs_to_device", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "ref_parent_ne", to: "id" }))
+type Frame = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: String,
+    @edsl::column("name")
+    @edsl::dimension("frame_name", yes, yes, text_ops, text_inputs)
+    name: String,
+    @edsl::column("refParentNE")
+    ref_parent_ne: String,
+};
+
+# KPI rows have a separate sampling grain. This entity carrier does not yet
+# express MetricSet, authoritative time, aggregation policy, or metric units.
+@edsl::entity_id("device_kpi")
+@edsl::entity_source("NetworkDeviceKPI", "k")
+@edsl::dataset_description("Device KPI samples", "UTC samples of network device measurements")
+@edsl::relation_description("device_kpi_of_device", "Samples for device", "Resource and tenant identify the KPI owner")
+@edsl::dataset(metric_kind, kpi_grain, kpi_time)
+@edsl::named_relation_key("device_kpi_of_device", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({ from: "res_id", to: "id" }),
+        edsl::RelationKey::FieldEq({ from: "tenant_id", to: "tenant_id" }),
+    ]))
+type DeviceKpi = struct {
+    @edsl::column("resId")
+    res_id: String,
+    @edsl::column("tenantId")
+    tenant_id: String,
+    @edsl::column("ts")
+    @edsl::time_field(utc_role, utc_seconds)
+    @edsl::dimension("device_kpi_ts_raw", yes, yes, text_ops, text_inputs)
+    ts: String,
+    @edsl::column("cpuUsage")
+    @edsl::measure("cpu_usage", avg_agg, none_required)
+    @edsl::metric_value("cpu_usage", avg_agg, percent_unit)
+    cpu_usage: Float,
+    @edsl::column("portCount")
+    @edsl::measure("port_count", sum_agg, none_required)
+    @edsl::metric_value("port_count", sum_agg, no_unit)
+    port_count: Int,
 };
 
 # ic's GovernanceCurrentAlarm is an EventSet, not an entity. This carrier
@@ -39,10 +129,13 @@ type Device = struct {
 # Canonical field order: csn(0), occur_utc(1), res_id(2), severity(3), tenant_id(4).
 @edsl::entity_id("current_alarm")
 @edsl::entity_source("T_CURRENT_ALARM", "a")
-@edsl::relation_key(Device.type, edsl::RelationKind::Safe,
+@edsl::dataset_description("Current alarm", "One alarm event per serial number with UTC occurrence time")
+@edsl::relation_description("device_current_alarm", "Alarm of device", "MEDN and tenant identify the affected device")
+@edsl::dataset(event_kind, alarm_grain, alarm_time)
+@edsl::named_relation_key("device_current_alarm", Device.type, edsl::RelationKind::Safe,
     edsl::RelationKey::And([
-        edsl::RelationKey::Eq({ from: 2, to: 1 }),
-        edsl::RelationKey::Eq({ from: 4, to: 2 }),
+        edsl::RelationKey::FieldEq({ from: "res_id", to: "id" }),
+        edsl::RelationKey::FieldEq({ from: "tenant_id", to: "tenant_id" }),
     ]))
 type CurrentAlarm = struct {
     @edsl::column("CSN")
@@ -50,7 +143,11 @@ type CurrentAlarm = struct {
     @edsl::measure("alarm_count", qb::AggregateFunction::Count, none_required)
     csn: Int,
     @edsl::column("OCCUR_UTC")
+    @edsl::time_field(utc_role, utc_seconds)
     occur_utc: String,
+    @edsl::column("OCCUR_TIME")
+    @edsl::time_field(local_role, local_text)
+    occur_time: String,
     @edsl::column("MEDN")
     res_id: String,
     @edsl::column("SEVERITY")
@@ -62,16 +159,24 @@ type CurrentAlarm = struct {
 
 # The two endpoint roles are separate facts in ic. Here the hub-specific
 # peer declaration is representable, but no stable relation IDs are exposed.
-# Canonical field order: a_ne_res_id(0), id(1), link_status(2), z_ne_res_id(3).
+# Field names keep the endpoint roles stable as native link attributes evolve.
 @edsl::entity_id("physical_link")
 @edsl::entity_source("EnterprisePhysicalLink", "pl")
-@edsl::directed_peer_hub(Device.type, 1, 0, Device.type, 1, 3)
+@edsl::dataset_description("Physical link", "Physical connection with fixed A and Z device endpoints")
+@edsl::relation_description("physical_link_a_device", "A-end device", "Origin endpoint of the physical link")
+@edsl::relation_description("physical_link_z_device", "Z-end device", "Peer endpoint of the physical link")
+@edsl::directed_peer_hub_fields(Device.type, "id", "a_ne_res_id", Device.type, "id", "z_ne_res_id")
+@edsl::named_relation_key("physical_link_a_device", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "a_ne_res_id", to: "id" }))
+@edsl::named_relation_key("physical_link_z_device", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "z_ne_res_id", to: "id" }))
 type PhysicalLink = struct {
     @edsl::column("a_ne_res_id")
     a_ne_res_id: String,
     @edsl::column("id")
     @edsl::key(yes)
     @edsl::dimension("physical_link_id", yes, yes, text_ops, text_inputs)
+    @edsl::measure("physical_link_count", qb::AggregateFunction::Count, none_required)
     id: String,
     @edsl::column("link_status")
     @edsl::dimension("physical_link_status", yes, yes, text_ops, text_inputs)
@@ -79,6 +184,15 @@ type PhysicalLink = struct {
     link_status: Int,
     @edsl::column("z_ne_res_id")
     z_ne_res_id: String,
+    @edsl::column("aPortIp")
+    @edsl::dimension("physical_link_a_port_ip", yes, yes, text_ops, text_inputs)
+    a_port_ip: String,
+    @edsl::column("zPortName")
+    @edsl::dimension("physical_link_z_port_name", yes, yes, link_text_ops, text_inputs)
+    z_port_name: String,
+    @edsl::column("aNeIp")
+    @edsl::dimension("physical_link_a_ne_ip", yes, yes, link_text_ops, text_inputs)
+    a_ne_ip: String,
 };
 
 def profile: qb::PlanProfile = {
@@ -88,15 +202,16 @@ def profile: qb::PlanProfile = {
         qb::Operator::Group, qb::Operator::Having, qb::Operator::Order,
         qb::Operator::Limit, qb::Operator::Offset],
     allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
-    allowed_aggregates: [qb::AggregateFunction::Count],
+    allowed_aggregates: [qb::AggregateFunction::Count, qb::AggregateFunction::Avg, qb::AggregateFunction::Sum],
     allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne,
         qb::ScalarFunction::Lt, qb::ScalarFunction::Le, qb::ScalarFunction::Gt,
-        qb::ScalarFunction::Ge, qb::ScalarFunction::And, qb::ScalarFunction::Or],
+        qb::ScalarFunction::Ge, qb::ScalarFunction::If, qb::ScalarFunction::And, qb::ScalarFunction::Or,
+        qb::ScalarFunction::Lower, qb::ScalarFunction::Instr],
     allow_distinct: True,
 };
 
 def payload: edsl::PreparedPayload = edsl::build_root(
-    "icloud-challenge-v1", [Device.type, CurrentAlarm.type, PhysicalLink.type],
+    "icloud-challenge-v2", [Device.type, Site.type, Frame.type, DeviceKpi.type, CurrentAlarm.type, PhysicalLink.type],
     profile, fn(subject) { subject == "public" });
 
-pub use self::{ Device, CurrentAlarm, PhysicalLink, payload };
+pub use self::{ Device, Site, Frame, DeviceKpi, CurrentAlarm, PhysicalLink, payload };

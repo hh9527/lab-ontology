@@ -199,12 +199,14 @@ commu_state: String,
 `id`（`kind: "text"`），绝不直接提交物理 wire 值。一个规范值的多条
 wire 降低为同一字段的括号化 OR 等值条件，动态 wire 按声明顺序绑定。
 `canonical_value_domain(payload, dimension_id)` 提供同源发现。准备阶段
-拒绝空/重复业务 id、空/重复物理值、字段类型不匹配、缺少仅有的 Eq 能力，
+拒绝空/重复业务 id、空/重复物理值、字段类型不匹配、缺少 Eq/If 能力，
 以及不能兑现多 wire OR 的 profile。普通筛选、`any_of`、scope、
 过滤指标、相关参与者筛选及比较内层筛选共用这一映射。
 
-该能力仅规定过滤语义；投影仍返回物理字段值，并不自动转换成规范
-业务值。需要规范值投影的领域不能仅凭此声明视为完整支持。
+投影、分组和维度排序使用同一映射生成封闭的 `CASE WHEN` 表达式，
+等价 wire 返回同一个规范业务 id；未声明的物理 wire 返回 `NULL`，
+不可冒充合法业务值。模型应声明完整的值域并保障源数据遵守该约束；
+SQL 执行后发现未知 wire 还不能自动产生结构化模型诊断。
 
 同一参与者类型的双端关系默认仍可交换端点（`peer_hub`）。如果两端
 具有固定业务角色，使用 `directed_peer_hub(participant, key_field,
@@ -238,6 +240,35 @@ origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
 同一字段的同型 property 按 `Option(previous)` 顺序 fold：字段 property 取最后一项，
 relation 追加到关系数组。关系字段索引是编译器规范化后的字段顺序（字段名排序，
 从 0 开始），不是源码书写顺序。
+
+新模型可用 `RelationKey.FieldEq({from: "res_id", to: "id"})` 指向字段名，
+并在 `And` / `Or` 中组合；准备期解析到规范字段索引，拒绝未知字段和两侧类型
+不相同的字段。`named_relation_key(id, target, kind, key)` 在此基础上声明唯一业务
+关系 ID。`dataset_relations(payload, dataset_id)` 和 `relation_domain(payload, id)`
+从准备模型发现这些关系；`exists_via` 意图通过关系 ID 选择一跳存在路径，
+不会回退到自动选择的另一条路径。若目标已由外层 JOIN 引入，无附加条件且
+JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不同关系时，为目标
+创建独立私有别名，相关键、过滤和阈值分组一同指向该别名。
+带复合键的 `min_matches` 按全部关联列分组。
+普通投影遇到两条及以上安全路径时不再按声明顺序取第一条，而是诊断歧义。
+`list_via` 意图可指定一条从根数据集出发的具名 grain-safe 关系，
+仅将该目标的路径固定为指定一跳，其余目标仍按各自的歧义规则检查。
+
+`dataset(kind, grain_fields, utc_time)` 声明 Entity / Event / Metric 的行粒度与
+权威 UTC 字段；Event 和 Metric 必须声明一个实际存在且带
+`time_field(TimeSemantics::Utc, TimeEncoding::CanonicalUtcSecondText)` 的文本时间字段。
+本地时间应标记为 `Local` / `LocalText`，不能冒充 UTC 权威字段。
+`dataset_domain(payload, id)` 发现这些声明。Metric 字段用
+`metric_value(id, aggregate, unit)` 注明单位和聚合语义，并必须有同字段、
+同 ID、同聚合方式的 `measure`，否则准备失败；`metric_domain(payload, id)`
+发现指标。`utc_window` 意图目前只接受严格校验过日历日期的
+`YYYY-MM-DDTHH:MM:SSZ`，并在根数据集的权威字段上降低为绑定的半开区间；
+不支持偏移输入、亚秒精度或原生 timestamp 列。
+
+`dataset_description(label, summary)` 和 `relation_description(id, label, summary)`
+将简要说明附于模型声明；准备期校验关系说明确实引用了本实体的具名关系。
+`knowledge_index(payload)` 列出数据集标签/说明及维度、指标、关系的 ID，
+这些 ID 可交叉引用上述按 ID 查询的发现函数。
 
 ### 实体、指标与维度
 
@@ -1589,3 +1620,15 @@ SQL/bindings）、`org_related_exists` / `org_related_absence`（相关存在/NO
 `deterministic_knowledge` / `deterministic_org`（重复 lowering 逐字节一致）；拒绝侧
 经纯探针 `query_intent_ok` 覆盖未授权 subject、未知 op、malformed measures、非
 `list` 上的 field-to-field 谓词、未知 set kind，并保留合法 intent 的正控断言。
+
+具名安全边还支持 `list_roles`：根实体维度加上若干
+`{relation, dimension, output}`，每个角色生成独立 JOIN 别名和命名投影，
+因此同一个目标实体可在一行中按不同业务关系出现多次。目标维度必须属于
+关系目标，关系必须是根实体出发的 Safe 边，输出名必须唯一且不能与根投影的
+直接列名或显式别名冲突；当前不接受
+measure、普通 filter 或 ordering 与此请求形状组合；`role_filters` 指向已选角色的
+输出名，并复用目标维度声明的过滤能力与规范值，条件仅作用于该角色的别名。
+角色目标维度的投影复用规范值映射，且内部角色别名避开已有来源别名。
+`directed_peer_hub_fields(participant, key_name, endpoint_name, participant,
+key_name, endpoint_name)` 以业务字段名定义固定方向的两个端点；准备期解析
+字段索引，拒绝不存在、非 key、相同端点或类型不一致的字段。

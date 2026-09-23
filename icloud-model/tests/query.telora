@@ -27,6 +27,131 @@ type InvalidMapping = struct {
     state: Int,
 };
 
+@edsl::entity_source("valid_target", "vt")
+type ValidTarget = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+};
+
+@edsl::entity_source("bad_relation", "br")
+@edsl::relation_key(ValidTarget.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({ from: "missing", to: "id" }))
+type InvalidRelation = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+};
+
+@edsl::entity_source("bad_peer_hub", "bph")
+@edsl::directed_peer_hub_fields(ValidTarget.type, "id", "missing", ValidTarget.type, "id", "peer_id")
+type InvalidPeerHub = struct {
+    @edsl::column("id")
+    @edsl::key(yes)
+    id: Int,
+    @edsl::column("peer_id")
+    peer_id: Int,
+};
+
+pub def unknown_named_peer_hub_endpoint_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-peer-hub-v1", [ValidTarget.type, InvalidPeerHub.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "unknown peer hub origin endpoint field");
+
+pub def unknown_relation_field_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("invalid-relation-v1", [ValidTarget.type, InvalidRelation.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "unknown relation source field");
+
+def bad_metric_kind: edsl::DatasetKind = edsl::DatasetKind::Metric;
+def bad_grain: Array(String) = ["not_a_field"];
+def bad_time: Option(String) = Some("ts");
+
+@edsl::entity_source("broken_metric", "bm")
+@edsl::dataset(bad_metric_kind, bad_grain, bad_time)
+type BrokenMetric = struct {
+    @edsl::column("ts")
+    ts: String,
+};
+
+pub def unknown_grain_field_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-grain-v1", [BrokenMetric.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "unknown dataset grain field");
+
+def missing_time_grain: Array(String) = ["id"];
+def missing_time: Option(String) = None;
+
+@edsl::entity_source("broken_event", "be")
+@edsl::dataset(bad_metric_kind, missing_time_grain, missing_time)
+type MissingUtcMetric = struct {
+    @edsl::column("id")
+    id: String,
+};
+
+pub def metric_without_utc_time_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-time-v1", [MissingUtcMetric.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "event and metric datasets require an authoritative UTC field");
+
+def wrong_aggregate: qb::AggregateFunction = qb::AggregateFunction::Sum;
+def right_aggregate: qb::AggregateFunction = qb::AggregateFunction::Avg;
+def no_metric_unit: Option(String) = None;
+def metric_grain: Array(String) = ["ts"];
+def metric_time: Option(String) = Some("ts");
+def utc_encoding_for_tests: edsl::TimeEncoding = edsl::TimeEncoding::CanonicalUtcSecondText;
+def local_encoding_for_tests: edsl::TimeEncoding = edsl::TimeEncoding::LocalText;
+def no_dependencies: Array(Type) = [];
+
+@edsl::entity_source("broken_metric_aggregation", "bma")
+@edsl::dataset(bad_metric_kind, metric_grain, metric_time)
+type WrongAggregation = struct {
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, utc_encoding_for_tests)
+    ts: String,
+    @edsl::column("value")
+    @edsl::measure("usage", wrong_aggregate, no_dependencies)
+    @edsl::metric_value("usage", right_aggregate, no_metric_unit)
+    value: Float,
+};
+
+pub def inconsistent_metric_aggregation_is_model_error: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-metric-v1", [WrongAggregation.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "metric metadata disagrees with its lowerable measure");
+
+def event_kind_for_local: edsl::DatasetKind = edsl::DatasetKind::Event;
+def local_grain: Array(String) = ["id"];
+def local_as_utc: Option(String) = Some("occur_time");
+def local_semantics: edsl::TimeSemantics = edsl::TimeSemantics::Local;
+
+@edsl::entity_source("bad_local_event", "ble")
+@edsl::dataset(event_kind_for_local, local_grain, local_as_utc)
+type LocalEvent = struct {
+    @edsl::column("id")
+    id: String,
+    @edsl::column("occur_time")
+    @edsl::time_field(local_semantics, local_encoding_for_tests)
+    occur_time: String,
+};
+
+pub def local_time_cannot_be_the_utc_role: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-local-v1", [LocalEvent.type],
+        { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
+          allowed_aggregates: [], allowed_scalars: [], allow_distinct: False },
+        fn(subject) { subject == "public" })
+}, "dataset UTC field must have the UTC time role");
+
 pub def mismatched_wire_type_is_model_error: test::Test = test::should_fail_with(fn() {
     edsl::build_root("invalid-v1", [InvalidMapping.type],
         { allowed_operators: [qb::Operator::Source], allowed_join_kinds: [],
@@ -39,13 +164,306 @@ def lower_json: Fn(String) -> qb::Query = fn(source) {
     intent::query_intent_lower_factory(payload, "public")(value)
 };
 
+pub def dataset_grain_and_time_are_discoverable: test::Test = test::should_ok(fn() {
+    let alarm = edsl::dataset_domain(payload, "current_alarm");
+    let kpi = edsl::dataset_domain(payload, "device_kpi");
+    if alarm.kind == edsl::DatasetKind::Event && alarm.grain == ["csn"]
+        && alarm.utc_time == Some("occur_utc")
+        && kpi.kind == edsl::DatasetKind::Metric
+        && kpi.grain == ["res_id", "tenant_id", "ts"]
+        && kpi.utc_time == Some("ts") {
+        True
+    } else {
+        fail!("event and KPI dataset roles must be discoverable", alarm, kpi)
+    }
+});
+
+pub def device_kpi_metric_contract_is_discoverable: test::Test = test::should_ok(fn() {
+    let metrics = edsl::metric_domain(payload, "device_kpi");
+    match (array::get(metrics, 0), array::get(metrics, 1)) {
+        (Some(cpu), Some(ports)) => if array::length(metrics) == 2
+            && cpu.id == "cpu_usage" && cpu.field == "cpu_usage"
+            && cpu.aggregate == qb::AggregateFunction::Avg && cpu.unit == Some("%")
+            && ports.id == "port_count" && ports.aggregate == qb::AggregateFunction::Sum {
+            True
+        } else {
+            fail!("device KPI metric metadata differs from iCloud", metrics)
+        },
+        _ => fail!("missing device KPI metric contract", metrics),
+    }
+});
+
+pub def device_cpu_metric_uses_declared_aggregation: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"aggregate","measures":["cpu_usage"],"dimensions":["device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "avg(k.cpuUsage)")) > 1
+        && array::length(string::split(q.sql, "GROUP BY d.name")) > 1
+        && array::length(string::split(q.sql, "k.tenantId = d.tenant_id")) > 1
+        && q.bindings == [qb::Val::String("Device-A")] {
+        True
+    } else {
+        fail!("CPU aggregation must use KPI-owned Avg over the device key", q)
+    }
+});
+
+pub def device_port_count_uses_declared_sum: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"aggregate","measures":["port_count"],"dimensions":["device_name"],"filters":[],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "sum(k.portCount)")) > 1 {
+        True
+    } else {
+        fail!("port_count must use its declared Sum aggregation", q)
+    }
+});
+
+pub def alarm_window_uses_authoritative_utc_field: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"utc_window","measures":[],"dimensions":["alarm_severity"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "a.OCCUR_UTC >= ?")) > 1
+        && array::length(string::split(q.sql, "a.OCCUR_UTC < ?")) > 1
+        && array::length(string::split(q.sql, "OCCUR_TIME")) == 1
+        && q.bindings == [qb::Val::String("2024-02-29T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z")] {
+        True
+    } else {
+        fail!("alarm window must bind only the authoritative UTC field", q)
+    }
+});
+
+pub def device_cpu_aggregate_is_scoped_to_kpi_utc_window: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"utc_window","measures":["cpu_usage"],"dimensions":["device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"window":{"dataset":"device_kpi","start":"2024-01-01T00:00:00Z","end":"2024-02-01T00:00:00Z"},"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "avg(k.cpuUsage)")) > 1
+        && array::length(string::split(q.sql, "k.ts >= ?")) > 1
+        && array::length(string::split(q.sql, "k.ts < ?")) > 1
+        && array::length(string::split(q.sql, "k.tenantId = d.tenant_id")) > 1
+        && q.bindings == [qb::Val::String("Device-A"), qb::Val::String("2024-01-01T00:00:00Z"), qb::Val::String("2024-02-01T00:00:00Z")] {
+        True
+    } else {
+        fail!("device CPU metric must respect its own UTC sample window", q)
+    }
+});
+
+pub def device_metric_cannot_be_attributed_to_frame_without_allocation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"aggregate","measures":["cpu_usage"],"dimensions":["frame_name"],"filters":[],"ordering":[],"limit":null,"offset":null}`)
+}, "metric sample grain has no declared allocation path to requested dimension");
+
+pub def offset_datetime_is_not_canonical_utc_text: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_window","measures":[],"dimensions":["alarm_severity"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","start":"2024-02-29T08:00:00+08:00","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window requires valid YYYY-MM-DDTHH:MM:SSZ instants");
+
+pub def invalid_calendar_day_is_not_a_window: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_window","measures":[],"dimensions":["alarm_severity"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","start":"2025-02-29T00:00:00Z","end":"2025-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window requires valid YYYY-MM-DDTHH:MM:SSZ instants");
+
+pub def reversed_utc_window_is_rejected: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_window","measures":[],"dimensions":["alarm_severity"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","start":"2024-03-01T00:00:00Z","end":"2024-02-29T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window start must precede end");
+
+pub def utc_window_rejects_wrong_base_dataset: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"utc_window","measures":[],"dimensions":["device_name"],"filters":[],"ordering":[],"window":{"dataset":"current_alarm","start":"2024-02-29T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`)
+}, "UTC window must target the query's base dataset");
+
 pub def alarm_grain_count: test::Test = test::should_ok(fn() {
     let q = lower_json(`{"op":"aggregate","measures":["alarm_count"],"dimensions":["device_id"],"filters":[],"ordering":[],"limit":null,"offset":null}`);
-    if array::length(string::split(q.sql, "MEDN")) > 1
-        && array::length(string::split(q.sql, "TENANT_ID")) > 1 {
+    if array::length(string::split(q.sql, "a.MEDN = d.id")) > 1
+        && array::length(string::split(q.sql, "a.TENANT_ID = d.tenant_id")) > 1 {
         True
     } else {
         fail!("alarm-to-device composite link was not retained", q.sql)
+    }
+});
+
+pub def device_with_multiple_alarms_keeps_tenant_grain: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"exists","measures":[],"dimensions":["device_id"],"filters":[],"ordering":[],"exists":[{"target":"current_alarm","filters":[],"min_matches":2}],"having":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "a.MEDN")) > 2
+        && array::length(string::split(q.sql, "a.TENANT_ID")) > 2
+        && array::length(string::split(q.sql, "GROUP BY")) > 1
+        && q.bindings == [qb::Val::Int(2)] {
+        True
+    } else {
+        fail!("alarm threshold must group by both device and tenant keys", q)
+    }
+});
+
+pub def named_alarm_relation_uses_exact_business_path: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"exists_via","measures":[],"dimensions":["device_id"],"filters":[],"ordering":[],"exists":[{"relation":"device_current_alarm","target":"current_alarm","filters":[],"min_matches":2}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "d.id = a.MEDN")) > 1
+        && array::length(string::split(q.sql, "d.tenant_id = a.TENANT_ID")) > 1
+        && array::length(string::split(q.sql, "GROUP BY a.MEDN, a.TENANT_ID")) > 1 {
+        True
+    } else {
+        fail!("named alarm path must preserve both owner roles", q)
+    }
+});
+
+pub def named_alarm_on_frame_root_keeps_owner_join: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"exists_via","measures":[],"dimensions":["frame_name","device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"exists":[{"relation":"frame_belongs_to_device","target":"device","filters":[],"min_matches":null}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "I_EnterpriseFrame")) > 1
+        && array::length(string::split(q.sql, "f.refParentNE = d.id")) > 1
+        && array::length(string::split(q.sql, "EXISTS")) == 1
+        && q.bindings == [qb::Val::String("Device-A")] {
+        True
+    } else {
+        fail!("named relation on a joined root must retain the owner path", q)
+    }
+});
+
+pub def named_exists_filters_joined_target_under_private_alias: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"exists_via","measures":[],"dimensions":["frame_name","device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"exists":[{"relation":"frame_belongs_to_device","target":"device","filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"min_matches":null}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "INNER JOIN I_EntNetworkElement AS d")) > 1
+        && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM I_EntNetworkElement AS d_exists")) > 1
+        && array::length(string::split(q.sql, "f.refParentNE = d_exists.id")) > 1
+        && array::length(string::split(q.sql, "d_exists.name = ?")) > 1
+        && q.bindings == [qb::Val::String("Device-A"), qb::Val::String("Device-A")] {
+        True
+    } else {
+        fail!("named existence must keep an isolated filtered participant", q)
+    }
+});
+
+pub def named_relation_rejects_wrong_endpoint: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"exists_via","measures":[],"dimensions":["device_id"],"filters":[],"ordering":[],"exists":[{"relation":"frame_belongs_to_device","target":"current_alarm","filters":[],"min_matches":null}],"limit":null,"offset":null}`)
+}, "named relation does not connect requested datasets");
+
+pub def named_relation_rejects_unknown_id: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"exists_via","measures":[],"dimensions":["device_id"],"filters":[],"ordering":[],"exists":[{"relation":"made_up","target":"current_alarm","filters":[],"min_matches":null}],"limit":null,"offset":null}`)
+}, "unknown named relation");
+
+pub def physical_link_endpoints_are_distinct_named_relations: test::Test = test::should_ok(fn() {
+    let prefix = `{"op":"exists_via","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"exists":[{"relation":"`;
+    let suffix = `","target":"device","filters":[],"min_matches":null}],"limit":null,"offset":null}`;
+    let a = lower_json(`\{prefix}physical_link_a_device\{suffix}`);
+    let z = lower_json(`\{prefix}physical_link_z_device\{suffix}`);
+    let known = edsl::dataset_relations(payload, "physical_link");
+    let a_rel = edsl::relation_domain(payload, "physical_link_a_device");
+    if array::length(known) == 2
+        && a_rel.id == "physical_link_a_device"
+        && array::length(string::split(a.sql, "pl.a_ne_res_id = d.id")) > 1
+        && array::length(string::split(a.sql, "pl.z_ne_res_id")) == 1
+        && array::length(string::split(z.sql, "pl.z_ne_res_id = d.id")) > 1
+        && array::length(string::split(z.sql, "pl.a_ne_res_id")) == 1 {
+        True
+    } else {
+        fail!("explicit relation must select exactly one endpoint", a.sql, z.sql)
+    }
+});
+
+pub def physical_link_device_name_requires_a_role: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list","measures":[],"dimensions":["physical_link_id","device_name"],"filters":[],"ordering":[],"limit":null,"offset":null}`)
+}, "ambiguous safe path to requested entity");
+
+pub def physical_link_endpoint_projection_uses_selected_role: test::Test = test::should_ok(fn() {
+    let prefix = `{"op":"list_via","measures":[],"dimensions":["physical_link_id","device_name"],"filters":[],"ordering":[],"relation":"`;
+    let suffix = `","limit":null,"offset":null}`;
+    let a = lower_json(`\{prefix}physical_link_a_device\{suffix}`);
+    let z = lower_json(`\{prefix}physical_link_z_device\{suffix}`);
+    if array::length(string::split(a.sql, "pl.a_ne_res_id = d.id")) > 1
+        && array::length(string::split(a.sql, "pl.z_ne_res_id")) == 1
+        && array::length(string::split(z.sql, "pl.z_ne_res_id = d.id")) > 1
+        && array::length(string::split(z.sql, "pl.a_ne_res_id")) == 1 {
+        True
+    } else {
+        fail!("role-qualified endpoint projection must choose the declared edge", a.sql, z.sql)
+    }
+});
+
+pub def physical_link_projects_both_endpoint_roles: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_name","output":"a_device_name"},{"relation":"physical_link_z_device","dimension":"device_name","output":"z_device_name"}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "pl.a_ne_res_id = role_0.id")) > 1
+        && array::length(string::split(q.sql, "pl.z_ne_res_id = role_1.id")) > 1
+        && array::length(string::split(q.sql, "role_0.name AS a_device_name")) > 1
+        && array::length(string::split(q.sql, "role_1.name AS z_device_name")) > 1 {
+        True
+    } else { fail!("endpoint roles must project independently", q.sql) }
+});
+
+pub def physical_link_roles_reject_wrong_target: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"physical_link_id","output":"wrong"}],"limit":null,"offset":null}`)
+}, "role dimension does not belong to relation target");
+
+pub def physical_link_roles_canonicalize_each_endpoint: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_commu_state","output":"a_state"},{"relation":"physical_link_z_device","dimension":"device_commu_state","output":"z_state"}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "role_0.commu_state")) > 1
+        && array::length(string::split(q.sql, "role_1.commu_state")) > 1
+        && array::length(string::split(q.sql, "AS a_state")) > 1
+        && array::length(string::split(q.sql, "AS z_state")) > 1
+        && array::length(string::split(q.sql, "CASE WHEN")) > 2 {
+        True
+    } else { fail!("both endpoint states must use canonical mapping", q.sql, q.bindings) }
+});
+
+pub def physical_link_z_filter_projects_a_endpoint: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_name","output":"a_device_name"},{"relation":"physical_link_z_device","dimension":"device_name","output":"z_device_name"}],"role_filters":[{"role":"z_device_name","dimension":"device_name","op":"contains","kind":"text","value":"ISTO"}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "pl.a_ne_res_id = role_0.id")) > 1
+        && array::length(string::split(q.sql, "pl.z_ne_res_id = role_1.id")) > 1
+        && array::length(string::split(q.sql, "role_1.name")) > 2
+        && array::length(string::split(q.sql, "role_0.name")) == 2
+        && q.bindings == [qb::Val::String("ISTO"), qb::Val::Int(0)] {
+        True
+    } else { fail!("Z filter must not target A projection", q.sql, q.bindings) }
+});
+
+pub def q0268_link_native_z_port_filter_projects_a_port_ip: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["physical_link_a_port_ip"],"filters":[{"dimension":"physical_link_z_port_name","op":"contains","kind":"text","value":"ON0/"}],"ordering":[],"limit":1000,"offset":null}`);
+    if array::length(string::split(q.sql, "SELECT pl.aPortIp FROM EnterprisePhysicalLink AS pl")) > 1
+        && array::length(string::split(q.sql, "pl.zPortName")) > 1
+        && array::length(string::split(q.sql, "JOIN")) == 1
+        && q.bindings == [qb::Val::String("ON0/"), qb::Val::Int(0), qb::Val::Int(1000)] {
+        True
+    } else { fail!("Q0268 must query native link columns without device JOIN", q.sql, q.bindings) }
+});
+
+pub def q0270_link_native_a_ip_filter_counts_links: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"count","measures":["physical_link_count"],"dimensions":[],"filters":[{"dimension":"physical_link_a_ne_ip","op":"contains","kind":"text","value":".0.0"}],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "count(pl.id)")) > 1
+        && array::length(string::split(q.sql, "pl.aNeIp")) > 1
+        && array::length(string::split(q.sql, "JOIN")) == 1
+        && q.bindings == [qb::Val::String(".0.0"), qb::Val::Int(0)] {
+        True
+    } else { fail!("Q0270 must count filtered native link rows", q.sql, q.bindings) }
+});
+
+pub def physical_link_role_filter_rejects_unknown_role: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_name","output":"a_name"}],"role_filters":[{"role":"z_name","dimension":"device_name","op":"eq","kind":"text","value":"x"}],"limit":null,"offset":null}`)
+}, "role filter references an unselected role");
+
+pub def physical_link_role_filter_rejects_wrong_target: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_name","output":"a_name"}],"role_filters":[{"role":"a_name","dimension":"physical_link_id","op":"eq","kind":"text","value":"x"}],"limit":null,"offset":null}`)
+}, "role filter dimension does not belong to relation target");
+
+pub def physical_link_roles_reject_duplicate_outputs: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_name","output":"endpoint"},{"relation":"physical_link_z_device","dimension":"device_name","output":"endpoint"}],"limit":null,"offset":null}`)
+}, "duplicate");
+
+pub def physical_link_roles_reject_base_column_name: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_roles","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"roles":[{"relation":"physical_link_a_device","dimension":"device_name","output":"id"}],"limit":null,"offset":null}`)
+}, "role projection output conflicts with base projection");
+
+pub def named_projection_rejects_unrelated_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_via","measures":[],"dimensions":["physical_link_id","device_name"],"filters":[],"ordering":[],"relation":"device_current_alarm","limit":null,"offset":null}`)
+}, "named projection relation must be a grain-safe forward edge from the base dataset");
+
+pub def named_projection_rejects_unused_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"list_via","measures":[],"dimensions":["physical_link_id"],"filters":[],"ordering":[],"relation":"physical_link_a_device","limit":null,"offset":null}`)
+}, "named projection relation does not serve a requested dimension or filter");
+
+pub def knowledge_index_cross_references_are_model_derived: test::Test = test::should_ok(fn() {
+    let catalog = edsl::knowledge_index(payload);
+    let kpi = match array::find(catalog, fn(item) { item.id == "device_kpi" }) {
+        Some(item) => item,
+        None => fail!("device KPI missing from discovery index"),
+    };
+    let device = match array::find(catalog, fn(item) { item.id == "device" }) {
+        Some(item) => item,
+        None => fail!("device missing from discovery index"),
+    };
+    let link = edsl::relation_domain(payload, "device_kpi_of_device");
+    if kpi.kind == edsl::DatasetKind::Metric
+        && kpi.label == "Device KPI samples"
+        && array::any(kpi.metric_ids, fn(id) { id == "cpu_usage" })
+        && array::any(kpi.relation_ids, fn(id) { id == "device_kpi_of_device" })
+        && array::any(device.relation_ids, fn(id) { id == "device_kpi_of_device" })
+        && link.label == "Samples for device"
+        && link.summary == "Resource and tenant identify the KPI owner" {
+        True
+    } else {
+        fail!("discovery index lost its model cross references", kpi, device, link)
     }
 });
 
@@ -60,6 +478,37 @@ pub def offline_matches_both_wire_values: test::Test = test::should_ok(fn() {
         True
     } else {
         fail!("offline must match both physical values", q)
+    }
+});
+
+pub def canonical_projection_returns_business_ids: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["device_commu_state"],"filters":[],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "CASE WHEN")) > 1
+        && array::length(string::split(q.sql, "d.commu_state = ?")) > 1
+        && array::any(q.bindings, fn(value) { value == qb::Val::String("offline") })
+        && array::any(q.bindings, fn(value) { value == qb::Val::String("1") }) {
+        True
+    } else {
+        fail!("canonical projection must produce business IDs", q)
+    }
+});
+
+pub def canonical_grouping_merges_equivalent_wires: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"aggregate","measures":["device_count"],"dimensions":["device_commu_state"],"filters":[],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "GROUP BY CASE WHEN")) > 1
+        && array::any(q.bindings, fn(value) { value == qb::Val::String("offline") }) {
+        True
+    } else {
+        fail!("canonical grouping must merge the two offline wires", q)
+    }
+});
+
+pub def canonical_projection_respects_output_order: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["device_commu_state","device_id"],"filters":[],"ordering":[],"output_order":[{"kind":"dimension","id":"device_id"},{"kind":"dimension","id":"device_commu_state"}],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "SELECT d.id, CASE WHEN")) > 1 {
+        True
+    } else {
+        fail!("explicit output order must keep canonical projection", q)
     }
 });
 
@@ -105,5 +554,31 @@ pub def physical_link_endpoints_are_directional: test::Test = test::should_ok(fn
         True
     } else {
         fail!("physical link endpoints must not be exchanged", q)
+    }
+});
+
+pub def site_to_device_to_frame: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["frame_name","device_name","site_name"],"filters":[{"dimension":"site_name","op":"eq","kind":"text","value":"Site-A"}],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "X_SITE_VIEW")) > 1
+        && array::length(string::split(q.sql, "I_EnterpriseFrame")) > 1
+        && array::length(string::split(q.sql, "d.projectId = s.SITE_ID")) > 1
+        && array::length(string::split(q.sql, "d.refParentSubnet = s.SITE_ID")) > 1
+        && array::length(string::split(q.sql, " OR ")) > 1
+        && q.bindings == [qb::Val::String("Site-A")] {
+        True
+    } else {
+        fail!("site alternatives and frame ownership must survive lowering", q)
+    }
+});
+
+pub def device_to_kpi_preserves_tenant_key: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"list","measures":[],"dimensions":["device_kpi_ts_raw","device_name"],"filters":[{"dimension":"device_name","op":"eq","kind":"text","value":"Device-A"}],"ordering":[],"limit":null,"offset":null}`);
+    if array::length(string::split(q.sql, "NetworkDeviceKPI")) > 1
+        && array::length(string::split(q.sql, "k.resId = d.id")) > 1
+        && array::length(string::split(q.sql, "k.tenantId = d.tenant_id")) > 1
+        && q.bindings == [qb::Val::String("Device-A")] {
+        True
+    } else {
+        fail!("KPI access must retain both owner keys", q)
     }
 });

@@ -134,9 +134,12 @@ type ComputedAggregate = struct {
 
 type SelectItem = enum {
     Expr(Expr),
+    NamedExpr(NamedExprItem),
     Aggregate(AggregateCall),
     Computed(ComputedAggregate),
 };
+
+type NamedExprItem = struct { expr: Expr, alias: String };
 
 # Comparison operators for aggregate-result (HAVING) predicates.
 type HavingOp = enum {
@@ -562,6 +565,7 @@ def aggregate_operators: Fn(AggregateCall) -> Array(Operator) = fn(call) {
 def select_item_operators: Fn(SelectItem) -> Array(Operator) = fn(item) {
     match item {
         SelectItem::Expr(expr) => expr_operators(expr),
+        SelectItem::NamedExpr(named) => expr_operators(named.expr),
         SelectItem::Aggregate(call) => aggregate_operators(call),
         # A computed aggregate consumes the Scalar capability (the restricted
         # Add/Sub arithmetic over aggregates); the operand aggregate items are
@@ -884,6 +888,7 @@ def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
 def select_item_valid: Fn(SelectItem, Array(String)) -> Bool = fn(item, aliases) {
     match item {
         SelectItem::Expr(expr) => expr_valid(expr, aliases),
+        SelectItem::NamedExpr(named) => is_sql_identifier(named.alias) && expr_valid(named.expr, aliases),
         SelectItem::Aggregate(call) => is_sql_identifier(call.alias) && expr_valid(call.arg, aliases)
             && (match call.filter {
                 Some(expr) => expr_valid(expr, aliases),
@@ -969,6 +974,7 @@ def projected_measure_aliases: Fn(Plan) -> Array(String) = fn(plan) {
     array::fold(plan.projection, empty, fn(acc, item) {
         match item {
             SelectItem::Expr(_) => acc,
+            SelectItem::NamedExpr(_) => acc,
             SelectItem::Aggregate(call) => array::push(acc, call.alias),
             SelectItem::Computed(ca) => array::push(acc, ca.alias),
         }
@@ -1005,6 +1011,7 @@ def find_item_by_alias: Fn(Plan, String) -> Option(SelectItem) = fn(plan, alias)
     array::find(plan.projection, fn(item) {
         match item {
             SelectItem::Expr(_) => False,
+            SelectItem::NamedExpr(_) => False,
             SelectItem::Aggregate(call) => call.alias == alias,
             SelectItem::Computed(ca) => ca.alias == alias,
         }
@@ -1348,6 +1355,7 @@ def aggregate_call_derived_cols_ok: Fn(AggregateCall, String, Array(String)) -> 
 def select_item_derived_cols_ok: Fn(SelectItem, String, Array(String)) -> Bool = fn(item, alias, names) {
     match item {
         SelectItem::Expr(expr) => expr_derived_cols_ok(expr, alias, names),
+        SelectItem::NamedExpr(named) => expr_derived_cols_ok(named.expr, alias, names),
         SelectItem::Aggregate(call) => aggregate_call_derived_cols_ok(call, alias, names),
         SelectItem::Computed(_) => True,
     }
@@ -1729,6 +1737,7 @@ def aggregate_call_subqueries: Fn(AggregateCall) -> Array(ScalarSubquery) = fn(c
 def select_item_subqueries: Fn(SelectItem) -> Array(ScalarSubquery) = fn(item) {
     match item {
         SelectItem::Expr(expr) => expr_subqueries(expr),
+        SelectItem::NamedExpr(named) => expr_subqueries(named.expr),
         SelectItem::Aggregate(call) => aggregate_call_subqueries(call),
         SelectItem::Computed(_) => {
             let empty: Array(ScalarSubquery) = [];
@@ -2061,6 +2070,7 @@ def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed)
 def select_scalars_ok: Fn(SelectItem, Array(ScalarFunction)) -> Bool = fn(item, allowed) {
     match item {
         SelectItem::Expr(expr) => expr_scalars_ok(expr, allowed),
+        SelectItem::NamedExpr(named) => expr_scalars_ok(named.expr, allowed),
         SelectItem::Aggregate(call) => expr_scalars_ok(call.arg, allowed)
             && (match call.filter {
                 Some(expr) => expr_scalars_ok(expr, allowed),
@@ -2093,6 +2103,7 @@ def order_key_scalars_ok: Fn(OrderKey, Array(ScalarFunction)) -> Bool = fn(key, 
 def select_aggregate_ok: Fn(SelectItem, Array(AggregateFunction)) -> Bool = fn(item, allowed) {
     match item {
         SelectItem::Expr(_) => True,
+        SelectItem::NamedExpr(_) => True,
         SelectItem::Aggregate(call) => array::any(allowed, fn(candidate) { candidate == call.function }),
         SelectItem::Computed(_) => True,
     }
@@ -2248,6 +2259,7 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
         array::all(plan.projection, fn(item) {
             match item {
                 SelectItem::Expr(_) => True,
+                SelectItem::NamedExpr(_) => True,
                 SelectItem::Aggregate(call) => call.distinct == False,
                 SelectItem::Computed(_) => True,
             }
@@ -2463,6 +2475,10 @@ def render_measure_ref: Fn(Plan, String) -> Tuple([String, Array(Val)]) = fn(pla
 def render_select_item: Fn(SelectItem, Plan) -> Tuple([String, Array(Val)]) = fn(item, plan) {
     match item {
         SelectItem::Expr(expr) => render_expr(expr),
+        SelectItem::NamedExpr(named) => do {
+            let rendered = render_expr(named.expr);
+            (`\{rendered.0} AS \{named.alias}`, rendered.1)
+        },
         SelectItem::Aggregate(call) => {
             let rendered = render_aggregate_call(call);
             let sql = `\{rendered.0} AS \{call.alias}`;
@@ -2992,6 +3008,7 @@ def expr_projection_ref: Fn(Expr, Array(SelectItem)) -> Option(String) = fn(expr
     let found = array::find(array::enumerate(projection), fn(pair) {
         match pair.1 {
             SelectItem::Expr(item_expr) => item_expr == expr,
+            SelectItem::NamedExpr(named) => named.expr == expr,
             SelectItem::Aggregate(_) => False,
             SelectItem::Computed(_) => False,
         }
@@ -3011,6 +3028,10 @@ def render_partition_item: Fn(SelectItem, Int, Plan) -> Tuple([String, String, A
         SelectItem::Expr(expr) => {
             let rendered = render_expr(expr);
             (`\{rendered.0} AS __q_\{index}`, `__q_\{index}`, rendered.1)
+        },
+        SelectItem::NamedExpr(named) => {
+            let rendered = render_expr(named.expr);
+            (`\{rendered.0} AS \{named.alias}`, named.alias, rendered.1)
         },
         SelectItem::Aggregate(call) => {
             let rendered = render_aggregate_call(call);
@@ -3223,6 +3244,7 @@ def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
     } else if !array::all(structured.projection, fn(item) {
         match item {
             SelectItem::Expr(_) => True,
+            SelectItem::NamedExpr(_) => True,
             SelectItem::Aggregate(_) => False,
             SelectItem::Computed(_) => False,
         }
@@ -3232,6 +3254,7 @@ def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
         let projected: Array(Expr) = array::map(structured.projection, fn(item) {
             match item {
                 SelectItem::Expr(expr) => expr,
+                SelectItem::NamedExpr(named) => named.expr,
                 _ => fail!("distinct row projection is not expression-only", plan),
             }
         });
@@ -3267,6 +3290,7 @@ def set_op_sql: Fn(SetOpKind) -> String = fn(kind) {
 def set_item_category: Fn(SelectItem) -> String = fn(item) {
     match item {
         SelectItem::Expr(_) => "expr",
+        SelectItem::NamedExpr(_) => "expr",
         SelectItem::Aggregate(_) => "agg",
         SelectItem::Computed(_) => "computed",
     }
@@ -3503,6 +3527,11 @@ def json_valid: Fn(Expr) -> Expr = fn(document) {
 };
 
 def expr_item: Fn(Expr) -> SelectItem = fn(expr) { SelectItem::Expr(expr) };
+
+def named_expr_item: Fn(Expr, String) -> SelectItem = fn(expr, alias) {
+    let item: NamedExprItem = { expr, alias };
+    SelectItem::NamedExpr(item)
+};
 
 def aggregate: Fn(AggregateFunction, Expr, Bool, String) -> SelectItem = fn(function, arg, distinct, alias) {
     let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: None, alias: alias};
@@ -3823,6 +3852,7 @@ pub use self::{
     ComputedOp,
     ComputedAggregate,
     SelectItem,
+    NamedExprItem,
     HavingOp,
     HavingMeasure,
     Having,
@@ -3892,6 +3922,7 @@ pub use self::{
     json_type,
     json_valid,
     expr_item,
+    named_expr_item,
     aggregate,
     aggregate_filtered,
     computed_aggregate,

@@ -16,6 +16,8 @@ use std::array as array;
 use std::type_desc as td;
 use std::type_property as property;
 use std::prelude as prelude;
+use std::regex as regex;
+use std::string as string;
 
 # ---------------------------------------------------------------------------
 # Property carriers (declared on entity structs and their fields).
@@ -135,6 +137,33 @@ type EntitySource = struct { table: String, alias: String };
 @prelude::property(PropertyTarget::Type)
 type EntityId = struct { id: String };
 
+# Dataset semantics are declared independently of the physical source. Grain
+# fields identify one logical row; time names the authoritative UTC instant.
+type DatasetKind = enum { Entity, Event, Metric };
+type TimeSemantics = enum { Utc, Local };
+type TimeEncoding = enum { CanonicalUtcSecondText, LocalText };
+@prelude::property(PropertyTarget::Field)
+type TimeField = struct { semantics: TimeSemantics, encoding: TimeEncoding };
+@prelude::property(PropertyTarget::Type)
+type DatasetSpec = struct {
+    kind: DatasetKind,
+    grain: Array(String),
+    utc_time: Option(String),
+};
+@prelude::property(PropertyTarget::Type)
+type DatasetDescription = struct { label: String, summary: String };
+
+type RelationNote = struct { id: String, label: String, summary: String };
+@prelude::property(PropertyTarget::Type)
+type RelationDescriptions = struct { notes: Array(RelationNote) };
+
+@prelude::property(PropertyTarget::Field)
+type MetricValueSpec = struct {
+    id: String,
+    aggregate: qb::AggregateFunction,
+    unit: Option(String),
+};
+
 # Union (multi-source) entity declaration. An entity declared only with
 # `union_source` (and no `entity_source`) is a logical entity whose rows are the
 # UNION ALL of an ordered list of physical branches. Every branch maps each
@@ -173,11 +202,15 @@ type RelationPair = struct { from: Int, to: Int };
 # JoinCondition tree via `join_on`/`on_eq`/`on_and`/`on_or`; no raw SQL.
 type RelationKey = enum {
     Eq(RelationPair),
+    FieldEq(RelationFieldPair),
     And(Array(RelationKey)),
     Or(Array(RelationKey)),
 };
 
+type RelationFieldPair = struct { from: String, to: String };
+
 type RelationDecl = struct {
+    id: String,
     target: Type,
     kind: RelationKind,
     key: RelationKey,
@@ -250,7 +283,10 @@ type PeerHubDecl = struct {
     peer_key: Int,
     peer_field: Int,
     directed: Bool,
+    field_names: Option(PeerHubFieldNames),
 };
+
+type PeerHubFieldNames = struct { origin_key: String, origin_field: String, peer_key: String, peer_field: String };
 
 # ---------------------------------------------------------------------------
 # Public request vocabulary.
@@ -417,6 +453,9 @@ type ExistsRequest = struct {
     min_matches: Option(Int),
 };
 
+type NamedExistsRequest = struct { relation: String, spec: ExistsRequest };
+type UtcWindowRequest = struct { dataset: String, start: String, end: String };
+
 # Aggregate-result (HAVING) predicate over a requested measure alias.
 type HavingOp = enum { Eq, Ne, Gt, Ge, Lt, Le };
 
@@ -499,6 +538,26 @@ type EntityEntry = struct {
     key_field: Int,
     fields: Array(FieldEntry),
     union: Option(UnionEntry),
+    dataset: Option(DatasetSpec),
+    metrics: Array(MetricValueEntry),
+    description: Option(DatasetDescription),
+};
+
+type MetricValueEntry = struct {
+    id: String,
+    field: String,
+    aggregate: qb::AggregateFunction,
+    unit: Option(String),
+};
+
+type DatasetBrief = struct {
+    id: String,
+    label: String,
+    summary: String,
+    kind: DatasetKind,
+    dimension_ids: Array(String),
+    metric_ids: Array(String),
+    relation_ids: Array(String),
 };
 
 # Prepared dependency spec of a computed measure: operands are business measure
@@ -537,6 +596,9 @@ type DimensionEntry = struct {
 };
 
 type RelationEntry = struct {
+    id: String,
+    label: String,
+    summary: String,
     from: Int,
     to: Int,
     kind: RelationKind,
@@ -719,6 +781,56 @@ def entity_id: Fn(String) -> Fn(td::TypeDesc, Option(EntityId)) -> EntityId = fn
     }
 };
 
+def dataset: Fn(DatasetKind, Array(String), Option(String)) -> Fn(td::TypeDesc, Option(DatasetSpec)) -> DatasetSpec = fn(kind, grain, utc_time) {
+    fn(ctx, previous) {
+        let result: DatasetSpec = { kind, grain, utc_time };
+        result
+    }
+};
+
+def metric_value: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(property::FieldPropertyCtx, Option(MetricValueSpec)) -> MetricValueSpec = fn(id, aggregate, unit) {
+    fn(ctx, previous) {
+        let result: MetricValueSpec = { id, aggregate, unit };
+        result
+    }
+};
+
+def time_field: Fn(TimeSemantics, TimeEncoding) -> Fn(property::FieldPropertyCtx, Option(TimeField)) -> TimeField = fn(semantics, encoding) {
+    fn(ctx, previous) {
+        if (semantics == TimeSemantics::Utc) != (encoding == TimeEncoding::CanonicalUtcSecondText) {
+            fail!("UTC time semantics require canonical UTC second text encoding", ctx)
+        } else {
+        let result: TimeField = { semantics, encoding };
+        result
+        }
+    }
+};
+
+def dataset_description: Fn(String, String) -> Fn(td::TypeDesc, Option(DatasetDescription)) -> DatasetDescription = fn(label, summary) {
+    fn(ctx, previous) {
+        if label == "" || summary == "" { fail!("dataset description requires a label and summary") }
+        else {
+            let result: DatasetDescription = { label, summary };
+            result
+        }
+    }
+};
+
+def relation_description: Fn(String, String, String) -> Fn(td::TypeDesc, Option(RelationDescriptions)) -> RelationDescriptions = fn(id, label, summary) {
+    fn(ctx, previous) {
+        if id == "" || label == "" || summary == "" { fail!("relation description requires id, label and summary") }
+        else {
+            let note: RelationNote = { id, label, summary };
+            let notes = match previous {
+                Some(p) => array::push(p.notes, note),
+                None => [note],
+            };
+            let result: RelationDescriptions = { notes };
+            result
+        }
+    }
+};
+
 # Union (multi-source) entity provider: marks the annotated type as a logical
 # entity backed by an ordered UNION ALL of physical branches. Mutually exclusive
 # with `entity_source`; branch aliases must not collide with the union alias.
@@ -734,7 +846,7 @@ def union_source: Fn(String, Array(UnionBranchDecl)) -> Fn(td::TypeDesc, Option(
 def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, from_field, to_field) {
     fn(ctx, previous) {
         let pair: RelationPair = { from: from_field, to: to_field };
-        let entry: RelationDecl = { target, kind, key: RelationKey::Eq(pair) };
+        let entry: RelationDecl = { id: "", target, kind, key: RelationKey::Eq(pair) };
         let relations = match previous {
             Some(p) => array::push(p.relations, entry),
             None => [entry],
@@ -749,13 +861,27 @@ def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td::TypeDesc, Option(Relati
 # fold by appending.
 def relation_key: Fn(Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, key) {
     fn(ctx, previous) {
-        let entry: RelationDecl = { target, kind, key };
+        let entry: RelationDecl = { id: "", target, kind, key };
         let relations = match previous {
             Some(p) => array::push(p.relations, entry),
             None => [entry],
         };
         let result: RelationDef = { relations };
         result
+    }
+};
+
+def named_relation_key: Fn(String, Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key) {
+    fn(ctx, previous) {
+        if id == "" { fail!("named relation requires a nonempty id") } else {
+            let entry: RelationDecl = { id, target, kind, key };
+            let relations = match previous {
+                Some(p) => array::push(p.relations, entry),
+                None => [entry],
+            };
+            let result: RelationDef = { relations };
+            result
+        }
     }
 };
 
@@ -825,7 +951,7 @@ def dual_hub: Fn(Type, Int, Int, Int) -> Fn(td::TypeDesc, Option(DualHubDef)) ->
 # Multiple annotations fold by appending.
 def peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
     fn(ctx, previous) {
-        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: False };
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: False, field_names: None };
         let all = match previous {
             Some(p) => array::push(p.hubs, spec),
             None => [spec],
@@ -839,11 +965,20 @@ def peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(Peer
 # the same participant entity. No endpoint-exchange branch is generated.
 def directed_peer_hub: Fn(Type, Int, Int, Type, Int, Int) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
     fn(ctx, previous) {
-        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: True };
+        let spec: PeerHubDecl = { origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field, directed: True, field_names: None };
         let all = match previous {
             Some(p) => array::push(p.hubs, spec),
             None => [spec],
         };
+        { hubs: all }
+    }
+};
+
+def directed_peer_hub_fields: Fn(Type, String, String, Type, String, String) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field) {
+    fn(ctx, previous) {
+        let names: PeerHubFieldNames = { origin_key, origin_field, peer_key, peer_field };
+        let spec: PeerHubDecl = { origin_participant, origin_key: -1, origin_field: -1, peer_participant, peer_key: -1, peer_field: -1, directed: True, field_names: Some(names) };
+        let all = match previous { Some(p) => array::push(p.hubs, spec), None => [spec] };
         { hubs: all }
     }
 };
@@ -973,6 +1108,8 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     let src = property::get_type_prop(ty, EntitySource.type);
     let union_prop = property::get_type_prop(ty, UnionSourceDef.type);
     let declared_id = property::get_type_prop(ty, EntityId.type);
+    let dataset_spec = property::get_type_prop(ty, DatasetSpec.type);
+    let description = property::get_type_prop(ty, DatasetDescription.type);
     let field_descs = td::fields(ty);
     let enumerated = array::enumerate(field_descs);
     let fields = array::map(enumerated, fn(pair) {
@@ -982,13 +1119,84 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
         Some(f) => f.index,
         None => -1,
     };
+    let validated_dataset = match dataset_spec {
+        None => None,
+        Some(spec) => do {
+            if array::length(spec.grain) == 0 {
+                fail!("dataset grain must name at least one field", ty)
+            } else {
+                array::fold(spec.grain, [], fn(seen, name) {
+                    if array::any(seen, fn(existing) { existing == name }) {
+                        fail!("duplicate dataset grain field", name)
+                    } else if !array::any(fields, fn(field) { field.name == name }) {
+                        fail!("unknown dataset grain field", name)
+                    } else {
+                        array::push(seen, name)
+                    }
+                });
+                match spec.utc_time {
+                    None => match spec.kind {
+                        DatasetKind::Entity => (),
+                        _ => fail!("event and metric datasets require an authoritative UTC field", ty),
+                    },
+                    Some(time_name) => if array::any(fields, fn(field) {
+                        field.name == time_name && field.ty == String.type
+                            && match property::get_field_prop(ty, field.index, TimeField.type) {
+                                Some(role) => role.semantics == TimeSemantics::Utc
+                                    && role.encoding == TimeEncoding::CanonicalUtcSecondText,
+                                None => False,
+                            }
+                    }) {
+                        ()
+                    } else {
+                        fail!("dataset UTC field must have the UTC time role", time_name)
+                    },
+                };
+                Some(spec)
+            }
+        },
+    };
+    let metrics: Array(MetricValueEntry) = array::flat_map(fields, fn(field) {
+        match property::get_field_prop(ty, field.index, MetricValueSpec.type) {
+            None => [],
+            Some(metric) => do {
+                let is_metric = match validated_dataset {
+                    Some(spec) => spec.kind == DatasetKind::Metric,
+                    None => False,
+                };
+                if !is_metric {
+                    fail!("metric value requires a metric dataset", field.name)
+                } else if metric.id == "" || (field.ty != Int.type && field.ty != Float.type) {
+                    fail!("metric value requires an id and numeric field", field.name)
+                } else {
+                    let measure = property::get_field_prop(ty, field.index, MeasureDef.type);
+                    match measure {
+                        Some(declared) => if declared.id == metric.id && declared.aggregate == metric.aggregate
+                            && declared.input == MeasureInput::All {
+                            ()
+                        } else {
+                            fail!("metric metadata disagrees with its lowerable measure", metric.id)
+                        },
+                        None => fail!("metric value requires a lowerable measure", metric.id),
+                    };
+                    let result: MetricValueEntry = { id: metric.id, field: field.name, aggregate: metric.aggregate, unit: metric.unit };
+                    [result]
+                }
+            },
+        }
+    });
+    if let Some(duplicate) = array::find(metrics, fn(metric) {
+        array::length(array::filter(metrics, fn(other) { other.id == metric.id })) > 1
+    }) {
+        fail!("duplicate metric value id", duplicate.id)
+    } else { () };
     match (src, union_prop) {
         (Some(source), None) => do {
             let id = match declared_id {
                 Some(e) => e.id,
                 None => source.alias,
             };
-            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, key_field, fields, union: None };
+            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, key_field, fields, union: None, dataset: validated_dataset, metrics, description };
             result
         },
         (None, Some(union_def)) => do {
@@ -997,7 +1205,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 Some(e) => e.id,
                 None => union.alias,
             };
-            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, key_field, fields, union: Some(union) };
+            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, key_field, fields, union: Some(union), dataset: validated_dataset, metrics, description };
             result
         },
         _ => fail!("entity must declare exactly one of entity_source or union_source", ty),
@@ -1272,6 +1480,29 @@ def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb::Expr) -> qb::Expr, Bool, 
     result
 };
 
+def resolve_relation_key: Fn(EntityEntry, EntityEntry, RelationKey) -> RelationKey = fn(from_entity, to_entity, key) {
+    match key {
+        RelationKey::Eq(pair) => RelationKey::Eq(pair),
+        RelationKey::FieldEq(pair) => do {
+            let from_field = match array::find(from_entity.fields, fn(field) { field.name == pair.from }) {
+                Some(field) => field.index,
+                None => fail!("unknown relation source field", from_entity.id, pair.from),
+            };
+            let to_field = match array::find(to_entity.fields, fn(field) { field.name == pair.to }) {
+                Some(field) => field.index,
+                None => fail!("unknown relation target field", to_entity.id, pair.to),
+            };
+            if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
+                fail!("relation fields have different types", pair.from, pair.to)
+            } else {
+            RelationKey::Eq({ from: from_field, to: to_field })
+            }
+        },
+        RelationKey::And(keys) => RelationKey::And(array::map(keys, fn(k) { resolve_relation_key(from_entity, to_entity, k) })),
+        RelationKey::Or(keys) => RelationKey::Or(array::map(keys, fn(k) { resolve_relation_key(from_entity, to_entity, k) })),
+    }
+};
+
 def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entities) {
     array::flat_map(entities, fn(entity) {
         let rd = property::get_type_prop(entity.entity_type, RelationDef.type);
@@ -1279,16 +1510,35 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
             Some(d) => d.relations,
             None => [],
         };
+        let descriptions = match property::get_type_prop(entity.entity_type, RelationDescriptions.type) {
+            Some(d) => d.notes,
+            None => [],
+        };
+        if let Some(bad) = array::find(descriptions, fn(note) {
+            array::length(array::filter(descriptions, fn(other) { other.id == note.id })) > 1
+                || !array::any(decls, fn(rel) { rel.id == note.id && rel.id != "" })
+        }) {
+            fail!("relation description must name one declared relation", entity.id, bad.id)
+        } else { () };
         array::map(decls, fn(rel) {
             let to_index = match array::find(entities, fn(e) { e.entity_type == rel.target }) {
                 Some(e) => e.index,
                 None => fail!("relation target is not part of this knowledge", rel.target),
             };
             let result: RelationEntry = {
+                id: rel.id,
+                label: match array::find(descriptions, fn(note) { note.id == rel.id && rel.id != "" }) {
+                    Some(note) => note.label,
+                    None => "",
+                },
+                summary: match array::find(descriptions, fn(note) { note.id == rel.id && rel.id != "" }) {
+                    Some(note) => note.summary,
+                    None => "",
+                },
                 from: entity.index,
                 to: to_index,
                 kind: rel.kind,
-                key: rel.key,
+                key: resolve_relation_key(entity, get_index(entities, to_index), rel.key),
             };
             result
         })
@@ -1706,6 +1956,28 @@ def resolve_peer_decl: Fn(Array(EntityEntry), Int, PeerHubDecl) -> PeerResult = 
         (None, _) => PeerResult::Err("peer hub origin participant entity is not part of this knowledge"),
         (_, None) => PeerResult::Err("peer hub peer participant entity is not part of this knowledge"),
         (Some(origin_entity), Some(peer_entity)) => do {
+            let resolved_declaration = match declaration.field_names {
+                None => declaration,
+                Some(names) => do {
+                    let origin = get_index(entities, origin_entity);
+                    let peer = get_index(entities, peer_entity);
+                    let hub_entry = get_index(entities, hub);
+                    let origin_key = match array::find(origin.fields, fn(f) { f.name == names.origin_key }) {
+                        Some(f) => f.index, None => fail!("unknown peer hub origin participant key field", names.origin_key),
+                    };
+                    let origin_field = match array::find(hub_entry.fields, fn(f) { f.name == names.origin_field }) {
+                        Some(f) => f.index, None => fail!("unknown peer hub origin endpoint field", names.origin_field),
+                    };
+                    let peer_key = match array::find(peer.fields, fn(f) { f.name == names.peer_key }) {
+                        Some(f) => f.index, None => fail!("unknown peer hub peer participant key field", names.peer_key),
+                    };
+                    let peer_field = match array::find(hub_entry.fields, fn(f) { f.name == names.peer_field }) {
+                        Some(f) => f.index, None => fail!("unknown peer hub peer endpoint field", names.peer_field),
+                    };
+                    {...declaration, origin_key, origin_field, peer_key, peer_field, field_names: None}
+                },
+            };
+            let declaration = resolved_declaration;
             if origin_entity == hub {
                 PeerResult::Err("peer hub origin participant must differ from the hub entity")
             } else if peer_entity == hub {
@@ -1729,6 +2001,9 @@ def resolve_peer_decl: Fn(Array(EntityEntry), Int, PeerHubDecl) -> PeerResult = 
                     PeerResult::Err("peer hub peer endpoint field is out of range")
                 } else if declaration.origin_field == declaration.peer_field {
                     PeerResult::Err("peer hub origin and peer endpoints must be distinct fields")
+                } else if get_index(origin_entity_entry.fields, declaration.origin_key).ty != get_index(hub_entity.fields, declaration.origin_field).ty
+                    || get_index(peer_entity_entry.fields, declaration.peer_key).ty != get_index(hub_entity.fields, declaration.peer_field).ty {
+                    PeerResult::Err("peer hub participant key and endpoint field types differ")
                 } else {
                     let exchange = !declaration.directed;
                     let entry: PeerRouteEntry = {
@@ -1811,15 +2086,21 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     });
     let uses_canonical = array::any(dimensions, fn(d) { array::length(d.canonical_values) > 0 });
     let profile_ok = if uses_canonical && (!array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Eq })
+        || !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::If })
         || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Scalar })
         || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Bind })
         || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Filter })
         || (requires_disjunction && !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Or }))) {
-        fail!("canonical value mapping requires Eq, Scalar, Bind, Filter and (for multi-wire values) Or in the query profile")
+        fail!("canonical value mapping requires Eq, If, Scalar, Bind, Filter and (for multi-wire values) Or in the query profile")
     } else {
         True
     };
     let relations = collect_relations(entities);
+    if let Some(duplicate) = array::find(relations, fn(rel) {
+        rel.id != "" && array::length(array::filter(relations, fn(other) { other.id == rel.id })) > 1
+    }) {
+        fail!("duplicate named relation id", duplicate.id)
+    } else { () };
     let routes_build = route_build(entities, relations);
     let routes = if array::length(routes_build.problems) > 0 {
         fail!("invalid correlated-existence route declaration", get_index(routes_build.problems, 0))
@@ -2063,6 +2344,66 @@ def canonical_value_domain: Fn(PreparedPayload, String) -> Array(CanonicalValueS
     }
 };
 
+def dataset_domain: Fn(PreparedPayload, String) -> DatasetSpec = fn(payload, id) {
+    let entity = match array::find(payload.entities, fn(entry) { entry.id == id }) {
+        Some(entry) => entry,
+        None => fail!("unknown dataset", id),
+    };
+    match entity.dataset {
+        Some(spec) => spec,
+        None => fail!("dataset has no declared grain and time roles", id),
+    }
+};
+
+def metric_domain: Fn(PreparedPayload, String) -> Array(MetricValueEntry) = fn(payload, id) {
+    match array::find(payload.entities, fn(entry) { entry.id == id }) {
+        Some(entry) => entry.metrics,
+        None => fail!("unknown dataset", id),
+    }
+};
+
+def relation_domain: Fn(PreparedPayload, String) -> RelationEntry = fn(payload, id) {
+    match array::find(payload.relations, fn(entry) { entry.id == id && entry.id != "" }) {
+        Some(entry) => entry,
+        None => fail!("unknown named relation", id),
+    }
+};
+
+def knowledge_index: Fn(PreparedPayload) -> Array(DatasetBrief) = fn(payload) {
+    array::map(payload.entities, fn(entity) {
+        let kind = match entity.dataset {
+            Some(spec) => spec.kind,
+            None => DatasetKind::Entity,
+        };
+        let description = match entity.description {
+            Some(note) => note,
+            None => do {
+                let note: DatasetDescription = { label: entity.id, summary: "" };
+                note
+            },
+        };
+        let result: DatasetBrief = {
+            id: entity.id,
+            label: description.label,
+            summary: description.summary,
+            kind,
+            dimension_ids: array::map(array::filter(payload.dimensions, fn(d) { d.entity == entity.index }), fn(d) { d.id }),
+            metric_ids: array::map(entity.metrics, fn(metric) { metric.id }),
+            relation_ids: array::map(array::filter(payload.relations, fn(rel) {
+                rel.id != "" && (rel.from == entity.index || rel.to == entity.index)
+            }), fn(rel) { rel.id }),
+        };
+        result
+    })
+};
+
+def dataset_relations: Fn(PreparedPayload, String) -> Array(RelationEntry) = fn(payload, id) {
+    let dataset_index = entity_by_id(payload, id);
+    array::filter(payload.relations, fn(rel) {
+        rel.id != "" && (rel.from == dataset_index || rel.to == dataset_index)
+    })
+};
+
 def canonical_eq: Fn(DimensionEntry, qb::Expr, FilterInput) -> qb::Expr = fn(entry, base, input) {
     let id = match input {
         FilterInput::Text(value) => value,
@@ -2084,6 +2425,18 @@ def canonical_eq: Fn(DimensionEntry, qb::Expr, FilterInput) -> qb::Expr = fn(ent
     match combined {
         Some(expr) => expr,
         None => fail!("canonical value has no physical wires", entry.id, id),
+    }
+};
+
+def dimension_output_expr: Fn(PreparedPayload, DimensionEntry) -> qb::Expr = fn(payload, entry) {
+    let physical = dimension_expr(payload, entry);
+    if array::length(entry.canonical_values) == 0 {
+        physical
+    } else {
+        let unknown: qb::Expr = qb::Expr::Bind(qb::Val::None);
+        array::fold(entry.canonical_values, unknown, fn(next, value) {
+            qb::scalar_if(canonical_eq(entry, physical, FilterInput::Text(value.id)), qb::bind_string(value.id), next)
+        })
     }
 };
 
@@ -2807,7 +3160,7 @@ def resolve_ordering: Fn(PreparedPayload, Array(OrderRequest), Array(String), Ar
                             if !entry.authorized {
                                 fail!("dimension is not authorized", id)
                             } else {
-                                let expr = dimension_expr(payload, entry);
+                                let expr = dimension_output_expr(payload, entry);
                                 match req.direction {
                                     OrderDirection::Asc => qb::asc(expr),
                                     OrderDirection::Desc => qb::desc(expr),
@@ -2844,8 +3197,8 @@ def resolve_row_ordering: Fn(PreparedPayload, Array(OrderRequest)) -> Tuple([Arr
                             fail!("dimension is not authorized", id)
                         } else {
                             let ob = match req.direction {
-                                OrderDirection::Asc => qb::asc(dimension_expr(payload, entry)),
-                                OrderDirection::Desc => qb::desc(dimension_expr(payload, entry)),
+                                OrderDirection::Asc => qb::asc(dimension_output_expr(payload, entry)),
+                                OrderDirection::Desc => qb::desc(dimension_output_expr(payload, entry)),
                             };
                             let extra = if array::any(acc.1, fn(e) { e == entry.entity }) {
                                 acc.1
@@ -2876,7 +3229,7 @@ def resolve_grouped_dim_orders: Fn(PreparedPayload, QueryRequest) -> Array(qb::O
                         Some(entry) => if !entry.authorized {
                             fail!("dimension is not authorized", id)
                         } else {
-                            let expr = dimension_expr(payload, entry);
+                            let expr = dimension_output_expr(payload, entry);
                             match req.direction { OrderDirection::Asc => qb::asc(expr), OrderDirection::Desc => qb::desc(expr) }
                         },
                         None => fail!("grouped dimension ordering references an unknown dimension", id),
@@ -3025,6 +3378,7 @@ def pair_to_condition: Fn(PreparedPayload, Int, Int, RelationPair) -> qb::JoinCo
 def key_to_condition: Fn(PreparedPayload, Int, Int, RelationKey) -> qb::JoinCondition = fn(payload, from_entity, to_entity, key) {
     match key {
         RelationKey::Eq(pair) => pair_to_condition(payload, from_entity, to_entity, pair),
+        RelationKey::FieldEq(_) => fail!("unresolved relation field key"),
         RelationKey::And(keys) => qb::on_and(array::map(keys, fn(k) { key_to_condition(payload, from_entity, to_entity, k) })),
         RelationKey::Or(keys) => qb::on_or(array::map(keys, fn(k) { key_to_condition(payload, from_entity, to_entity, k) })),
     }
@@ -3038,9 +3392,24 @@ def select_joins: Fn(PreparedPayload, Int, Array(Int)) -> Array(qb::Join) = fn(p
             let row = get_index(payload.paths, base);
             let pr = get_index(row, target);
             match pr {
-                PathResult::Safe(seq) => merge_edges(acc, seq),
+                PathResult::Safe(seq) => if get_index(get_index(payload.ambiguous_paths, base), target) {
+                    fail!("ambiguous safe path to requested entity; select a named relation", get_index(payload.entities, base).id, get_index(payload.entities, target).id)
+                } else {
+                    merge_edges(acc, seq)
+                },
                 PathResult::FanOut(_) => fail!("path to requested entity requires a fan-out relation; use an existence filter", target),
-                PathResult::Missing => fail!("no safe path to requested entity", target),
+                PathResult::Missing => do {
+                    let base_entry = get_index(payload.entities, base);
+                    let is_metric = match base_entry.dataset {
+                        Some(spec) => spec.kind == DatasetKind::Metric,
+                        None => False,
+                    };
+                    if is_metric {
+                        fail!("metric sample grain has no declared allocation path to requested dimension", base_entry.id, get_index(payload.entities, target).id)
+                    } else {
+                        fail!("no safe path to requested entity", target)
+                    }
+                },
                 PathResult::Truncated => fail!("path search was truncated", target),
             }
         }
@@ -3402,6 +3771,7 @@ def exists_col_eq: Fn(EntityEntry, EntityEntry, RelationPair, Bool) -> qb::Colum
 def exists_pairs: Fn(RelationKey) -> Array(RelationPair) = fn(key) {
     match key {
         RelationKey::Eq(pair) => [pair],
+        RelationKey::FieldEq(_) => fail!("unresolved relation field key"),
         RelationKey::And(keys) => array::flat_map(keys, fn(k) {
             match k {
                 RelationKey::Eq(pair) => [pair],
@@ -3430,12 +3800,15 @@ def build_correlated_exists: Fn(PreparedPayload, EntityEntry, Array(qb::ColumnEq
             Some(n) => do {
                 if n <= 0 {
                     fail!("exists minimum matches must be a positive integer", spec.target, n)
-                } else if array::length(col_eqs) != 1 {
-                    fail!("grouped existence requires a single-pair relation key", spec.target)
+                } else if array::length(col_eqs) == 0 {
+                    fail!("grouped existence requires a relation key", spec.target)
                 } else {
-                    # the inner correlation column identifies the related subject's group
+                    # Every inner correlation column identifies the related group.
+                    # Grouping only one column would merge different tenants.
                     let corr = get_index(col_eqs, 0);
-                    let grouping: Array(qb::Expr) = [qb::column(corr.right.source, corr.right.column)];
+                    let grouping: Array(qb::Expr) = array::map(col_eqs, fn(pair) {
+                        qb::column(pair.right.source, pair.right.column)
+                    });
                     let count_column = if target_entry.key_field >= 0 {
                         get_index(target_entry.fields, target_entry.key_field).column
                     } else {
@@ -3800,12 +4173,12 @@ def lower_core: Fn(PreparedPayload, QueryRequest, Array(AnyOfRequest), Array(Exi
             }
         });
         let dimension_items = array::map(dimensions, fn(d) {
-            qb::expr_item(dimension_expr(payload, d.entry))
+            qb::expr_item(dimension_output_expr(payload, d.entry))
         });
         let projection = array::concat([measure_items, dimension_items]);
         let none_grouping: Array(qb::Expr) = [];
         let grouping = if measure_count > 0 || internal_group {
-            array::map(dimensions, fn(d) { dimension_expr(payload, d.entry) })
+            array::map(dimensions, fn(d) { dimension_output_expr(payload, d.entry) })
         } else {
             none_grouping
         };
@@ -3836,10 +4209,318 @@ def lower: Fn(PreparedPayload, QueryRequest) -> qb::Plan = fn(payload, request) 
     lower_core(payload, request, [], [], [], [], [], [])
 };
 
+# Override precisely one ambiguous Safe hop by its declared business identity.
+# All other route cells retain their original ambiguity checks.
+def lower_via: Fn(PreparedPayload, QueryRequest, String) -> qb::Plan = fn(payload, request, relation_id) {
+    let base = if array::length(request.measures) > 0 {
+        match array::find(payload.measures, fn(entry) { entry.id == get_index(request.measures, 0).id }) {
+            Some(entry) => entry.entity,
+            None => fail!("unknown measure", get_index(request.measures, 0).id),
+        }
+    } else if array::length(request.dimensions) > 0 {
+        match array::find(payload.dimensions, fn(entry) { entry.id == get_index(request.dimensions, 0).id }) {
+            Some(entry) => entry.entity,
+            None => fail!("unknown dimension", get_index(request.dimensions, 0).id),
+        }
+    } else {
+        fail!("named join requires a projected base dimension or measure")
+    };
+    let indexed = array::enumerate(payload.relations);
+    let selected = match array::find(indexed, fn(pair) { pair.1.id == relation_id && pair.1.id != "" }) {
+        Some(pair) => pair,
+        None => fail!("unknown named relation", relation_id),
+    };
+    let rel = selected.1;
+    if rel.from != base || rel.kind != RelationKind::Safe {
+        fail!("named projection relation must be a grain-safe forward edge from the base dataset", relation_id)
+    } else {
+        let target = rel.to;
+        let referenced = array::any(request.dimensions, fn(req) {
+            array::any(payload.dimensions, fn(d) { d.id == req.id && d.entity == target })
+        }) || array::any(request.filters, fn(req) {
+            array::any(payload.dimensions, fn(d) { d.id == req.id && d.entity == target })
+        });
+        if !referenced {
+            fail!("named projection relation does not serve a requested dimension or filter", relation_id)
+        } else {
+            let paths = array::map(array::enumerate(payload.paths), fn(source_row) {
+                if source_row.0 == base {
+                    array::map(array::enumerate(source_row.1), fn(cell) {
+                        if cell.0 == target { PathResult::Safe([selected.0]) } else { cell.1 }
+                    })
+                } else { source_row.1 }
+            });
+            let ambiguous_paths = array::map(array::enumerate(payload.ambiguous_paths), fn(source_row) {
+                if source_row.0 == base {
+                    array::map(array::enumerate(source_row.1), fn(cell) {
+                        if cell.0 == target { False } else { cell.1 }
+                    })
+                } else { source_row.1 }
+            });
+            let selected_payload: PreparedPayload = {...payload, paths, ambiguous_paths};
+            lower(selected_payload, request)
+        }
+    }
+};
+
+type RoleProjectionSpec = struct { relation: String, dimension: String, output: String };
+type RoleFilterSpec = struct { role: String, filter: FilterRequest };
+
+def role_key_condition: Fn(PreparedPayload, Int, Int, RelationKey, String) -> qb::JoinCondition = fn(payload, from_entity, to_entity, key, alias) {
+    match key {
+        RelationKey::Eq(pair) => do {
+            let source = get_index(payload.entities, from_entity);
+            let target = get_index(payload.entities, to_entity);
+            let left = get_index(source.fields, pair.from);
+            let right = get_index(target.fields, pair.to);
+            qb::on_eq(qb::column_ref(source.alias, left.column), qb::column_ref(alias, right.column))
+        },
+        RelationKey::And(keys) => qb::on_and(array::map(keys, fn(k) { role_key_condition(payload, from_entity, to_entity, k, alias) })),
+        RelationKey::Or(keys) => qb::on_or(array::map(keys, fn(k) { role_key_condition(payload, from_entity, to_entity, k, alias) })),
+        RelationKey::FieldEq(_) => fail!("unresolved role relation key"),
+    }
+};
+
+def lower_roles: Fn(PreparedPayload, QueryRequest, Array(RoleProjectionSpec), Array(RoleFilterSpec)) -> qb::Plan = fn(payload, request, roles, role_filters) {
+    if array::length(roles) == 0 || array::length(request.dimensions) == 0 || array::length(request.measures) != 0
+        || array::length(request.filters) != 0 || array::length(request.ordering) != 0 {
+        fail!("role projection requires base dimensions and roles without measures, filters or ordering")
+    } else {
+        let base = match array::find(payload.dimensions, fn(d) { d.id == get_index(request.dimensions, 0).id }) {
+            Some(d) => d.entity,
+            None => fail!("unknown base dimension", get_index(request.dimensions, 0).id),
+        };
+        let base_only = array::all(request.dimensions, fn(req) {
+            array::any(payload.dimensions, fn(d) { d.id == req.id && d.entity == base })
+        });
+        if !base_only { fail!("role projection base dimensions must belong to one dataset") } else {
+            let outputs = array::map(roles, fn(role) { role.output });
+            let unique_outputs = array::all(array::enumerate(outputs), fn(indexed) {
+                !array::any(array::enumerate(outputs), fn(other) { other.0 < indexed.0 && other.1 == indexed.1 })
+            });
+            if !unique_outputs { fail!("duplicate role projection output alias", outputs) } else {
+            let root = lower(payload, request);
+            let root_names = array::flat_map(root.projection, fn(item) {
+                match item {
+                    qb::SelectItem::Expr(qb::Expr::Column(column)) => [column.column],
+                    qb::SelectItem::NamedExpr(named) => [named.alias],
+                    qb::SelectItem::Aggregate(call) => [call.alias],
+                    qb::SelectItem::Computed(call) => [call.alias],
+                    qb::SelectItem::Expr(_) => [],
+                }
+            });
+            if array::any(outputs, fn(output) { array::any(root_names, fn(name) { name == output }) }) {
+                fail!("role projection output conflicts with base projection", outputs, root_names)
+            } else {
+            let additions = array::map(array::enumerate(roles), fn(indexed) {
+                let role = indexed.1;
+                let relation = match array::find(payload.relations, fn(r) { r.id == role.relation && r.id != "" }) {
+                    Some(r) => r,
+                    None => fail!("unknown role relation", role.relation),
+                };
+                if relation.from != base || relation.kind != RelationKind::Safe {
+                    fail!("role relation must be a grain-safe forward edge from the base dataset", role.relation)
+                } else {
+                    let dimension = match array::find(payload.dimensions, fn(d) { d.id == role.dimension && d.entity == relation.to }) {
+                        Some(d) => d,
+                        None => fail!("role dimension does not belong to relation target", role.relation, role.dimension),
+                    };
+                    if !dimension.authorized { fail!("role dimension is not authorized", role.dimension) } else {
+                        let target = get_index(payload.entities, relation.to);
+                        let alias = private_exists_alias(root.sources, `role_\{indexed.0}`);
+                        let join = qb::join_on(qb::JoinKind::Inner, qb::source(alias, target.table), role_key_condition(payload, base, relation.to, relation.key, alias));
+                        let item = qb::named_expr_item(retarget_inner_expr(dimension_output_expr(payload, dimension), target.alias, alias), role.output);
+                        (join, item)
+                    }
+                }
+            });
+            let joins = array::map(additions, fn(pair) { pair.0 });
+            let items = array::map(additions, fn(pair) { pair.1 });
+            let role_conditions = array::map(role_filters, fn(spec) {
+                let indexed = match array::find(array::enumerate(roles), fn(pair) { pair.1.output == spec.role }) {
+                    Some(pair) => pair,
+                    None => fail!("role filter references an unselected role", spec.role),
+                };
+                let relation = match array::find(payload.relations, fn(r) { r.id == indexed.1.relation }) {
+                    Some(r) => r,
+                    None => fail!("unknown role relation", indexed.1.relation),
+                };
+                let resolved = get_index(resolve_filters(payload, [spec.filter]), 0);
+                if resolved.entity != relation.to {
+                    fail!("role filter dimension does not belong to relation target", spec.role, spec.filter.id)
+                } else {
+                    let target = get_index(payload.entities, relation.to);
+                    let role_join = get_index(joins, indexed.0);
+                    retarget_inner_expr(resolved.expr, target.alias, role_join.source.alias)
+                }
+            });
+            let extended: qb::Plan = {...root,
+                sources: array::concat([root.sources, array::map(joins, fn(j) { j.source })]),
+                joins: array::concat([root.joins, joins]),
+                projection: array::concat([root.projection, items]),
+                filter: combine_filters(array::concat([match root.filter { Some(expr) => [expr], None => [] }, role_conditions])),
+            };
+            qb::validate(extended, payload.profile)
+            }
+            }
+        }
+    }
+};
+
 # Additive entry: the base QueryRequest plus typed existence filters and
 # aggregate-result (HAVING) predicates.
 def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(HavingRequest)) -> qb::Plan = fn(payload, request, exists_specs, having_specs) {
     lower_core(payload, request, [], exists_specs, having_specs, [], [], [])
+};
+
+def private_exists_alias: Fn(Array(qb::Source), String) -> String = fn(sources, candidate) {
+    if array::any(sources, fn(source) { source.alias == candidate }) {
+        private_exists_alias(sources, `\{candidate}_x`)
+    } else {
+        candidate
+    }
+};
+
+def retarget_inner_expr: Fn(qb::Expr, String, String) -> qb::Expr = fn(expr, previous, fresh) {
+    match expr {
+        qb::Expr::Column(column) => qb::Expr::Column(if column.source == previous {
+            {...column, source: fresh}
+        } else { column }),
+        qb::Expr::Bind(_) => expr,
+        qb::Expr::Scalar(call) => qb::Expr::Scalar({...call,
+            args: array::map(call.args, fn(arg) { retarget_inner_expr(arg, previous, fresh) })
+        }),
+    }
+};
+
+# Explicit one-hop business relation selection. Never falls back to a
+# different edge with the same endpoint types or to an inferred route.
+def lower_named_exists: Fn(PreparedPayload, QueryRequest, Array(NamedExistsRequest)) -> qb::Plan = fn(payload, request, specs) {
+    let base_plan = lower(payload, request);
+    if array::length(base_plan.sources) == 0 || base_plan.derived != None {
+        fail!("named existence requires a physical base dataset")
+    } else {
+        let base_alias = get_index(base_plan.sources, 0).alias;
+        let base = match array::find(payload.entities, fn(entity) { entity.alias == base_alias }) {
+            Some(entity) => entity,
+            None => fail!("named existence base dataset is unknown", base_alias),
+        };
+        let resolved = array::flat_map(specs, fn(item) {
+            if !payload.authorize(item.spec.subject) {
+                fail!("named existence subject is unauthorized", item.spec.subject)
+            } else {
+                let target = entity_by_id(payload, item.spec.target);
+                let rel = match array::find(payload.relations, fn(candidate) { candidate.id == item.relation && candidate.id != "" }) {
+                    Some(candidate) => candidate,
+                    None => fail!("unknown named relation", item.relation),
+                };
+                let reversed = rel.to == base.index && rel.from == target;
+                if !(reversed || (rel.from == base.index && rel.to == target)) {
+                    fail!("named relation does not connect requested datasets", item.relation, item.spec.target)
+                } else {
+                    let target_entry = get_index(payload.entities, target);
+                    let already_joined = array::any(base_plan.joins, fn(join) { join.source.alias == target_entry.alias });
+                    if already_joined {
+                        let selected_join = array::any(base_plan.joins, fn(join) {
+                            join.source.alias == target_entry.alias && join.kind == qb::JoinKind::Inner
+                                && !reversed && join.condition == key_to_condition(payload, rel.from, rel.to, rel.key)
+                        });
+                        if selected_join && array::length(item.spec.filters) == 0
+                            && array::length(item.spec.any_of) == 0 && item.spec.min_matches == None {
+                            []
+                        } else {
+                            let fresh = private_exists_alias(base_plan.sources, `\{target_entry.alias}_exists`);
+                            let inner_entry: EntityEntry = {...target_entry, alias: fresh};
+                            let pairs = exists_pairs(rel.key);
+                            let col_eqs = array::map(pairs, fn(pair) { exists_col_eq(base, inner_entry, pair, reversed) });
+                            let existing = build_correlated_exists(payload, inner_entry, col_eqs, item.spec, target);
+                            let filter = match existing.filter {
+                                Some(expr) => Some(retarget_inner_expr(expr, target_entry.alias, fresh)),
+                                None => None,
+                            };
+                            [{...existing, filter}]
+                        }
+                    } else {
+                        let pairs = exists_pairs(rel.key);
+                        let col_eqs = array::map(pairs, fn(pair) { exists_col_eq(base, target_entry, pair, reversed) });
+                        [build_correlated_exists(payload, target_entry, col_eqs, item.spec, target)]
+                    }
+                }
+            }
+        });
+        let updated: qb::Plan = {...base_plan, exists: array::concat([base_plan.exists, resolved])};
+        qb::validate(updated, payload.profile)
+    }
+};
+
+# Canonical UTC-second text sorts in instant order under SQLite's binary text
+# ordering. Other encodings must not enter this path without an explicit model.
+def utc_second_pattern: regex::Regex = regex::compile("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+
+def utc_number: Fn(String) -> Int = fn(value) {
+    match string::parse@[Int](value) {
+        Ok(number) => number,
+        Err(_) => fail!("invalid UTC numeric component", value),
+    }
+};
+
+def valid_utc_second: Fn(String) -> Bool = fn(value) {
+    if !regex::is_match(utc_second_pattern, value) {
+        False
+    } else {
+        let date_time = string::split(value, "T");
+        let date = string::split(get_index(date_time, 0), "-");
+        let clock = string::split(get_index(date_time, 1), ":");
+        let year = utc_number(get_index(date, 0));
+        let month = utc_number(get_index(date, 1));
+        let day = utc_number(get_index(date, 2));
+        let hour = utc_number(get_index(clock, 0));
+        let minute = utc_number(get_index(clock, 1));
+        let seconds = string::split(get_index(clock, 2), "Z");
+        let second = utc_number(get_index(seconds, 0));
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let max_day = if month == 2 { if leap { 29 } else { 28 } }
+            else if month == 4 || month == 6 || month == 9 || month == 11 { 30 }
+            else { 31 };
+        year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= max_day
+            && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+            && second >= 0 && second <= 59
+    }
+};
+
+def lower_utc_window: Fn(PreparedPayload, QueryRequest, UtcWindowRequest) -> qb::Plan = fn(payload, request, window) {
+    let spec = dataset_domain(payload, window.dataset);
+    let time_name = match spec.utc_time {
+        Some(name) => name,
+        None => fail!("dataset has no authoritative UTC time field", window.dataset),
+    };
+    if !valid_utc_second(window.start) || !valid_utc_second(window.end) {
+        fail!("UTC window requires valid YYYY-MM-DDTHH:MM:SSZ instants", window.start, window.end)
+    } else if window.start >= window.end {
+        fail!("UTC window start must precede end", window.start, window.end)
+    } else {
+        let plan = lower(payload, request);
+        let dataset_entry = get_index(payload.entities, entity_by_id(payload, window.dataset));
+        if array::length(plan.sources) == 0 || plan.derived != None
+            || get_index(plan.sources, 0).alias != dataset_entry.alias {
+            fail!("UTC window must target the query's base dataset", window.dataset)
+        } else {
+            let field = match array::find(dataset_entry.fields, fn(item) { item.name == time_name }) {
+                Some(item) => item,
+                None => fail!("prepared UTC field is missing", time_name),
+            };
+            let col = qb::column(dataset_entry.alias, field.column);
+            let start_term = qb::scalar(qb::ScalarFunction::Ge, [col, qb::bind_string(window.start)]);
+            let end_term = qb::scalar(qb::ScalarFunction::Lt, [col, qb::bind_string(window.end)]);
+            let bounds = qb::scalar(qb::ScalarFunction::And, [start_term, end_term]);
+            let filter = match plan.filter {
+                Some(existing) => Some(qb::scalar(qb::ScalarFunction::And, [existing, bounds])),
+                None => Some(bounds),
+            };
+            let updated: qb::Plan = {...plan, filter};
+            qb::validate(updated, payload.profile)
+        }
+    }
 };
 
 # Additive entry with closed OR-groups on the subject filters (AnyOf), combined
@@ -4218,8 +4899,8 @@ def lower_internal_related: Fn(PreparedPayload, QueryRequest, Array(InternalOrde
                 let join_sources = array::map(joins, fn(j) { j.source });
                 let base_entry = get_index(payload.entities, base);
                 let sources = array::concat([[qb::source(base_entry.alias, base_entry.table)], join_sources]);
-                let projection = array::map(dimensions, fn(d) { qb::expr_item(dimension_expr(payload, d.entry)) });
-                let grouping = array::map(dimensions, fn(d) { dimension_expr(payload, d.entry) });
+                let projection = array::map(dimensions, fn(d) { qb::expr_item(dimension_output_expr(payload, d.entry)) });
+                let grouping = array::map(dimensions, fn(d) { dimension_output_expr(payload, d.entry) });
                 let limit = request.limit;
                 let offset = check_offset(request.offset, array::length(request.ordering));
                 let plan: qb::Plan = {
@@ -4993,6 +5674,7 @@ def reorder_projection: Fn(PreparedPayload, QueryRequest, qb::Plan, Array(Projec
                         qb::SelectItem::Aggregate(call) => call.alias == id,
                         qb::SelectItem::Computed(ca) => ca.alias == id,
                         qb::SelectItem::Expr(_) => False,
+                        qb::SelectItem::NamedExpr(_) => False,
                     }
                 }) {
                     Some(item) => item,
@@ -5003,7 +5685,7 @@ def reorder_projection: Fn(PreparedPayload, QueryRequest, qb::Plan, Array(Projec
                         Some(d) => d,
                         None => fail!("explicit projection order references an unknown dimension", id),
                     };
-                    let expected = dimension_expr(payload, entry);
+                    let expected = dimension_output_expr(payload, entry);
                     match array::find(plan.projection, fn(item) {
                         match item {
                             qb::SelectItem::Expr(expr) => expr == expected,
@@ -5024,10 +5706,11 @@ def reorder_projection: Fn(PreparedPayload, QueryRequest, qb::Plan, Array(Projec
                 qb::SelectItem::Computed(ca) => !array::any(order_measure_ids, fn(id) { id == ca.alias }),
                 qb::SelectItem::Expr(expr) => !array::any(dimension_ids, fn(id) {
                     match array::find(payload.dimensions, fn(d) { d.id == id }) {
-                        Some(d) => dimension_expr(payload, d) == expr,
+                        Some(d) => dimension_output_expr(payload, d) == expr,
                         None => False,
                     }
                 }),
+                qb::SelectItem::NamedExpr(_) => True,
             }
         });
         let projection = array::concat([ordered_items, leftover]);
@@ -5103,12 +5786,24 @@ pub use self::{
     JsonDimensionDef,
     EntitySource,
     EntityId,
+    DatasetKind,
+    TimeSemantics,
+    TimeEncoding,
+    TimeField,
+    DatasetSpec,
+    MetricValueSpec,
+    MetricValueEntry,
+    DatasetDescription,
+    RelationDescriptions,
+    RelationNote,
+    DatasetBrief,
     UnionSourceDef,
     UnionBranchDecl,
     UnionColumnDecl,
     RelationDef,
     RelationDecl,
     RelationPair,
+    RelationFieldPair,
     RelationKey,
     EnumValueDef,
     ExistsRouteDef,
@@ -5154,6 +5849,8 @@ pub use self::{
     MeasureEntry,
     DimensionEntry,
     RelationEntry,
+    NamedExistsRequest,
+    UtcWindowRequest,
     PathResult,
     PreparedPayload,
     PeerHubDef,
@@ -5173,9 +5870,15 @@ pub use self::{
     json_builder,
     entity_source,
     entity_id,
+    dataset,
+    metric_value,
+    time_field,
+    dataset_description,
+    relation_description,
     union_source,
     relation,
     relation_key,
+    named_relation_key,
     enum_value,
     canonical_values,
     scope,
@@ -5187,6 +5890,7 @@ pub use self::{
     resolve_hub_decl,
     peer_hub,
     directed_peer_hub,
+    directed_peer_hub_fields,
     peer_build,
     resolve_peer_decl,
     find_peer_route,
@@ -5231,6 +5935,17 @@ pub use self::{
     dimension_expr,
     dimension_domain,
     canonical_value_domain,
+    dataset_domain,
+    metric_domain,
+    relation_domain,
+    dataset_relations,
+    knowledge_index,
+    lower_named_exists,
+    lower_via,
+    RoleProjectionSpec,
+    RoleFilterSpec,
+    lower_roles,
+    lower_utc_window,
     to_bind,
     combine_filters,
     check_limit,
