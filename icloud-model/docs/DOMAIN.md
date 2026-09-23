@@ -34,6 +34,13 @@ event count, declared device KPI aggregation and canonical UTC-second windows
 pass. This does not close native timestamp/timezone handling, full
 EventSet/MetricSet, or runtime data-quality diagnostics for unknown wires.
 
+Plain open-domain dimensions now validate their declared filter input type
+against the underlying String/Int/Float field at Model preparation, and numeric
+fields cannot advertise text operations. IC's alarm CSN, local epoch-ms and
+interface sample values retain their typed inputs; canonical dimensions remain
+distinct because an integer physical wire such as PSU health intentionally
+accepts a textual business value resolved by its declared canonical mapping.
+
 The additional site/frame/KPI carriers are pressure probes, not a transcription
 of the full iCloud network graph. `device_kpi_ts_raw` deliberately names a raw
 string column; it is independently annotated as a canonical UTC-second source,
