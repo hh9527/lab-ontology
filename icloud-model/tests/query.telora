@@ -1736,6 +1736,7 @@ pub def server_fan_site_scope_rejects_substituted_tenant_relation: test::Test = 
 pub def qualified_interface_count_keeps_site_existence_separate_from_sample_avg: test::Test = test::should_ok(fn() {
     let q = lower_json(qualified_interface_intent);
     if array::length(string::split(q.sql, "count(p.id)")) == 2
+        && array::length(string::split(q.sql, "p.tenantId = d.tenant_id")) == 2
         && array::length(string::split(q.sql, "avg(ik_qualification.ifOutErrors) < ?")) == 2
         && array::length(string::split(q.sql, "JOIN X_SITE_VIEW")) == 1
         && array::length(string::split(q.sql, "EXISTS (")) == 3
@@ -1760,6 +1761,7 @@ pub def qualified_interface_rejects_unrelated_site_chain: test::Test = test::sho
 pub def interface_sample_top_scopes_site_and_tenant_without_sample_fanout: test::Test = test::should_ok(fn() {
     let q = lower_json(interface_sample_top_intent);
     if array::length(string::split(q.sql, "PARTITION BY p.id")) == 2
+        && array::length(string::split(q.sql, "p.tenantId = d.tenant_id")) == 2
         && array::length(string::split(q.sql, "ORDER BY ik.ifOutPktSpeed DESC, ik.resId ASC, ik.tenantId ASC, ik.ts ASC")) == 2
         && array::length(string::split(q.sql, "EXISTS (SELECT 1 FROM X_SITE_VIEW AS s INNER JOIN X_TENANT_VIEW AS t")) == 2
         && array::length(string::split(q.sql, "((d.projectId = s.SITE_ID) OR (d.refParentSubnet = s.SITE_ID))")) == 2
@@ -1768,6 +1770,49 @@ pub def interface_sample_top_scopes_site_and_tenant_without_sample_fanout: test:
         True
     } else { fail!("interface samples must be ranked before any fan-out site relationship", q) }
 });
+
+def interface_site_scope: edsl::OwnerSiteScope = {
+    ancestor_relation: "port_belongs_to_device", site_relation: "device_located_at_site",
+    tenant_relation: "site_belongs_to_tenant", ancestor_filters: [], site_filters: [], tenant_filters: [],
+};
+
+def scoped_interface_plan: Fn(edsl::PreparedPayload) -> qb::Plan = fn(knowledge) {
+    edsl::lower_sample_top(knowledge,
+        {measures: [], dimensions: [{id: "interface_tx_sample", subject: "public", input: edsl::DimensionInput::None}],
+         filters: [], ordering: [], limit: None, offset: None, partition: None},
+        "port", "interface_kpi_of_port",
+        {dataset: "interface_kpi", start: "2024-02-01T00:00:00Z", end: "2024-03-01T00:00:00Z"},
+        "interface_tx_sample", 3, Some(interface_site_scope))
+};
+
+pub def interface_scope_rejects_missing_device_tenant_key: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "port_belongs_to_device" {
+            let key = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(first) => first,
+                    None => fail!("missing port ancestor key"),
+                },
+                _ => fail!("expected compound port ancestor key"),
+            };
+            {...relation, key}
+        } else { relation }
+    });
+    scoped_interface_plan({...payload, relations})
+}, "sample scope ancestor relation must cover its complete declared grain");
+
+pub def interface_scope_rejects_device_grain_extension: test::Test = test::should_fail_with(fn() {
+    let entities = array::map(payload.entities, fn(entity) {
+        if entity.id == "device" {
+            let dataset = match entity.dataset {
+                Some(spec) => Some({...spec, grain: ["id", "tenant_id", "name"]}),
+                None => fail!("device must declare its grain"),
+            };
+            {...entity, dataset}
+        } else { entity }
+    });
+    scoped_interface_plan({...payload, entities})
+}, "sample scope ancestor relation must cover its complete declared grain");
 
 pub def interface_sample_top_rejects_unrelated_site_relation: test::Test = test::should_fail_with(fn() {
     lower_json(`{"op":"sample_top","measures":[],"dimensions":["port_name","interface_tx_sample"],"filters":[],"ordering":[],"limit":null,"offset":null,"owner":"port","relation":"interface_kpi_of_port","rank":"interface_tx_sample","take":3,"window":{"dataset":"interface_kpi","start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"scope":{"ancestor_relation":"port_belongs_to_device","site_relation":"storage_device_site","tenant_relation":"site_belongs_to_tenant","ancestor_filters":[],"site_filters":[],"tenant_filters":[]}}`)

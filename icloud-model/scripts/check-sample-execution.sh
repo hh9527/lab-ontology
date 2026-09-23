@@ -27,15 +27,17 @@ ALTER TABLE I_EntNetworkElement ADD COLUMN projectId TEXT;
 ALTER TABLE I_EntNetworkElement ADD COLUMN refParentSubnet TEXT;
 UPDATE I_EntNetworkElement SET mac = '00:1A:2B:00:00:00', classification = 'LSW', manufacturer = '2011', projectId = 'S1', refParentSubnet = 'S2' WHERE id = 'B';
 UPDATE I_EntNetworkElement SET mac = '00:1A:2B:00:00:00', classification = 'LSW', manufacturer = '2011', projectId = 'S3', refParentSubnet = 'S4' WHERE id = 'C';
+UPDATE I_EntNetworkElement SET projectId = 'S3', refParentSubnet = 'S4' WHERE id = 'B' AND tenant_id = 'blue';
 CREATE TABLE I_EnterpriseNetworkLTP (id TEXT, tenantId TEXT, refParentNE TEXT, name TEXT);
 CREATE TABLE NetworkDeviceInterfaceKPI (resId TEXT, tenantId TEXT, ts TEXT, ifOutPktSpeed REAL);
 CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, TENANT_ID TEXT);
 CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT, TENANT_NAME TEXT);
-INSERT INTO I_EnterpriseNetworkLTP VALUES ('P-B','red','B','SamePort'),('P-C','red','C','SamePort');
+INSERT INTO I_EnterpriseNetworkLTP VALUES ('P-B','red','B','SamePort'),('P-C','red','C','SamePort'),('P-X','blue','B','CrossTenantPort');
 INSERT INTO NetworkDeviceInterfaceKPI VALUES
  ('P-B','red','2024-02-01T00:00:00Z',9),('P-B','red','2024-02-02T00:00:00Z',8),
  ('P-B','red','2024-02-03T00:00:00Z',7),('P-B','red','2024-02-04T00:00:00Z',6),
- ('P-C','red','2024-02-05T00:00:00Z',100);
+ ('P-C','red','2024-02-05T00:00:00Z',100),
+ ('P-X','blue','2024-02-05T00:00:00Z',200);
 INSERT INTO X_TENANT_VIEW VALUES ('TA','Tenant-A'),('TB','Tenant-B');
 INSERT INTO X_SITE_VIEW VALUES
  ('S1','Site-A','TA'),('S2','Site-A','TA'),
@@ -52,6 +54,7 @@ UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 40 WHERE resId = 'P-B' AND ts
 UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 100 WHERE resId = 'P-B' AND ts = '2024-02-02T00:00:00Z';
 UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 60 WHERE resId = 'P-B' AND ts >= '2024-02-03T00:00:00Z';
 UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 10 WHERE resId = 'P-C';
+UPDATE NetworkDeviceInterfaceKPI SET ifOutErrors = 20 WHERE resId = 'P-X';
 INSERT INTO I_EnterpriseNetworkLTP VALUES ('P-E','red','B','ExtraPort'),('P-EMPTY','red','B','EmptyPort');
 INSERT INTO NetworkDeviceInterfaceKPI (resId,tenantId,ts,ifOutErrors) VALUES
  ('P-E','red','2024-02-07T00:00:00Z',140),('P-E','red','2024-02-08T00:00:00Z',20);"

@@ -105,14 +105,19 @@ Q0111/Q0120 qualify an interface by its own UTC `ifOutErrors` samples while
 constraining its parent device, site, and tenant. `interface_count` counts the
 declared interface identity `Port.id`; `interface_out_errors` is Avg, while
 `interface_out_errors_sample` filters individual integer samples before Avg.
-The Port-to-Device Safe relation remains a join, but the Device-to-Site OR
-FanOut and Site-to-Tenant chain form one correlated EXISTS. Thus multiple
+The Port-to-Device Safe relation joins both `refParentNE=id` and
+`tenantId=tenant_id`, covering the Device's declared composite grain; the
+Device-to-Site OR FanOut and Site-to-Tenant chain form one correlated EXISTS. Thus multiple
 matching sites never multiply interfaces or KPI rows. The KPI qualification
 uses a separate correlated grouped EXISTS, and a missing sample group does not
 pass HAVING. The SQLite fixture verifies these distinctions, a site with the
-right name in the wrong tenant, and two interfaces sharing a display name.
+right name in the wrong tenant, two interfaces sharing a display name, and a
+blue-tenant interface whose parent ID matches a red-tenant device. IC's
+original Port-to-Device link publishes only `refParentNE=id`, so the additional
+tenant equality is an explicit pressure-model contract requiring production
+mapping confirmation, not a property already proved by IC's declaration.
 IC declares `Port.id` as its primary key and maps KPI `resId` to it; this
-acceptance does not invent a tenant key on that relation.
+acceptance does not invent a tenant key on the separate KPI-to-Port relation.
 
 Q0091/Q0092 expose an aggregation ambiguity in corpus SQL. IC's total, used,
 and running port counts retain their declared Sum aggregation. Distinct
