@@ -127,3 +127,12 @@ filters apply to the same site row. A separate event EXISTS correlates both
 resource and tenant. Two matching site rows and several matching alarms must
 still count one device, and a same-ID alarm from another tenant cannot qualify
 it. The Q0129 SQLite fixture exercises these distinctions.
+
+Q0147-Q0149 require visible site/device pairs. `list_relation` starts from
+Site and explicitly names the reverse `device_located_at_site` FanOut OR;
+ordinary `list` still rejects that traversal. Site `SITE_TYPE` carries the
+model wires `onlineSite` and `offlineSite`, exposed as canonical online/offline
+filters. `rows` preserves each site/device identity pair; `distinct` is a
+separate visible-value-set request corresponding to the corpus SQL. A device
+matching a single site by both keys produces one pair, while a device related
+to two sites produces two, even when site or device names repeat.

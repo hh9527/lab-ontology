@@ -4396,6 +4396,53 @@ def lower_via: Fn(PreparedPayload, QueryRequest, String) -> qb::Plan = fn(payloa
     }
 };
 
+# A named reverse fan-out is an explicit row relationship, not a Safe path.
+# A single owner/target pair joins once even if multiple OR keys match it.
+def lower_relation_rows: Fn(PreparedPayload, QueryRequest, String, String) -> qb::Plan = fn(payload, request, base_id, relation_id) {
+    if array::length(request.measures) != 0 || array::length(request.dimensions) < 2
+        || array::length(request.ordering) != 0 || request.offset != None || request.partition != None {
+        fail!("relation rows require owner and target dimensions without measures, ordering or partition")
+    } else {
+        let base = entity_by_id(payload, base_id);
+        let relation = relation_domain(payload, relation_id);
+        if relation.to != base || relation.kind != RelationKind::FanOut {
+            fail!("relation rows require a named reverse fan-out to the base dataset", relation_id, base_id)
+        } else {
+            let target = relation.from;
+            let dimensions = resolve_dimensions(payload, request.dimensions);
+            let filters = resolve_filters(payload, request.filters);
+            let base_dimensions = array::filter(request.dimensions, fn(req) {
+                array::any(payload.dimensions, fn(d) { d.id == req.id && d.entity == base })
+            });
+            let base_filters = array::filter(request.filters, fn(req) {
+                array::any(payload.dimensions, fn(d) { d.id == req.id && d.entity == base })
+            });
+            if !array::all(dimensions, fn(d) { d.entry.entity == base || d.entry.entity == target })
+                || !array::all(filters, fn(f) { f.entity == base || f.entity == target })
+                || !array::any(dimensions, fn(d) { d.entry.entity == base })
+                || !array::any(dimensions, fn(d) { d.entry.entity == target }) {
+                fail!("relation rows require projected dimensions from both declared endpoints only", relation_id)
+            } else {
+                let root = lower(payload, {...request, dimensions: base_dimensions, filters: base_filters});
+                if array::length(root.sources) != 1 || array::length(root.joins) != 0 || root.derived != None {
+                    fail!("relation rows require one physical base dataset", base_id)
+                } else {
+                    let target_entry = get_index(payload.entities, target);
+                    let join = qb::join_on(qb::JoinKind::Inner, qb::source(target_entry.alias, target_entry.table),
+                        key_to_condition(payload, relation.from, relation.to, relation.key));
+                    let target_filters = array::map(array::filter(filters, fn(f) { f.entity == target }), fn(f) { f.expr });
+                    let projection = array::map(dimensions, fn(d) { qb::expr_item(dimension_output_expr(payload, d.entry)) });
+                    qb::validate({...root,
+                        sources: array::push(root.sources, join.source),
+                        joins: [join], projection,
+                        filter: append_filter_terms(root.filter, target_filters),
+                    }, payload.profile)
+                }
+            }
+        }
+    }
+};
+
 type RoleProjectionSpec = struct { relation: String, dimension: String, output: String };
 type RoleFilterSpec = struct { role: String, filter: FilterRequest };
 
@@ -6770,6 +6817,7 @@ pub use self::{
     lower_qualified_observation,
     lower_sample_top,
     lower_via,
+    lower_relation_rows,
     RoleProjectionSpec,
     RoleFilterSpec,
     lower_roles,

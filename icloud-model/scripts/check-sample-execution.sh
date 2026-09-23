@@ -76,6 +76,27 @@ site_alarm_result="$(sqlite3 -json :memory: -cmd "${site_alarm_schema}" -cmd '.p
     -cmd ".parameter set ?7 'Tenant-A'" "${site_alarm_sql}")"
 jq -e 'length == 1 and .[0].device_count == 1' <<< "${site_alarm_result}" >/dev/null
 
+site_device_schema="CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT, SITE_TYPE TEXT);
+CREATE TABLE I_EntNetworkElement (id TEXT, name TEXT, projectId TEXT, refParentSubnet TEXT);
+INSERT INTO X_SITE_VIEW VALUES
+ ('S1','Site-A','offlineSite'),('S2','Site-A','offlineSite'),
+ ('S3','Site-B','onlineSite'),('S4','Site-B','offlineSite');
+INSERT INTO I_EntNetworkElement VALUES
+ ('D1','Same','S1','S1'),('D2','Same','S2','S1'),
+ ('D3','Other','S3','S4'),('D4','NoSite','S9','S10');"
+site_device_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:site_device_rows)"
+jq -e '.bindings == ["offlineSite",1000]' <<< "${site_device_plan}" >/dev/null
+site_device_sql="$(jq -r '.sql' <<< "${site_device_plan}")"
+site_device_result="$(sqlite3 -json :memory: -cmd "${site_device_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'offlineSite'" -cmd '.parameter set ?2 1000' "${site_device_sql}")"
+jq -e 'length == 4 and (map([.SITE_ID,.id]) | sort == [["S1","D1"],["S1","D2"],["S2","D2"],["S4","D3"]])' <<< "${site_device_result}" >/dev/null
+
+site_device_distinct_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:site_device_distinct)"
+site_device_distinct_sql="$(jq -r '.sql' <<< "${site_device_distinct_plan}")"
+site_device_distinct_result="$(sqlite3 -json :memory: -cmd "${site_device_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'Site-A'" -cmd '.parameter set ?2 1000' "${site_device_distinct_sql}")"
+jq -e 'length == 1 and .[0].SITE_NAME == "Site-A" and .[0].name == "Same"' <<< "${site_device_distinct_result}" >/dev/null
+
 qualified_interface_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:qualified_interface_count)"
 qualified_interface_sql="$(jq -r '.sql' <<< "${qualified_interface_plan}")"
 qualified_interface_result="$(sqlite3 -json :memory: -cmd "${interface_qualification_schema}" -cmd '.parameter init' \
@@ -276,4 +297,4 @@ context_result="$(sqlite3 -json :memory: -cmd "${schema}" -cmd '.parameter init'
     -cmd '.parameter set ?7 16' "${context_sql}")"
 jq -e 'length == 2 and all(.[]; .name == "B-red" and .frame_name == "Duplicate" and .port_count == 241)' <<< "${context_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
