@@ -267,8 +267,11 @@ JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不�
 
 `dataset_description(label, summary)` 和 `relation_description(id, label, summary)`
 将简要说明附于模型声明；准备期校验关系说明确实引用了本实体的具名关系。
-`knowledge_index(payload)` 列出数据集标签/说明及维度、指标、关系的 ID，
-这些 ID 可交叉引用上述按 ID 查询的发现函数。
+`knowledge_index(payload)` 列出数据集标签/说明，以及维度、可 lowering 的
+measure、带单位/聚合角色说明的指标、关系的 ID；`measure_ids` 来自准备后的
+measure 表，`metric_ids` 只指向指标元数据，两者不应混同。这些 ID 可交叉引用
+上述按 ID 查询的发现函数。此索引是未按主体过滤的完整模型目录，不应直接作为
+授权用户的可用知识列表发布。
 
 ### 实体、指标与维度
 

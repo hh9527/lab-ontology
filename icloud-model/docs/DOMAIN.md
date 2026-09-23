@@ -45,7 +45,8 @@ joining a frame to device KPI does not establish a frame-owned CPU metric:
 Q0078/Q0079 require a semantic grain/aggregation decision in the Model, not
 just an executable SQL join. Named field pairs resolve to canonical indexes at
 preparation time; unknown or mismatched fields fail before querying. Descriptions
-and cross-references in `knowledge_index` come from the same Prepared Model,
+and cross-references in `knowledge_index` (including ordinary measure IDs such
+as `alarm_count` as well as metric IDs) come from the same Prepared Model,
 not from a separately authored agent prompt.
 
 Acceptance is two-sided: each row requires a successful intent with a correct
