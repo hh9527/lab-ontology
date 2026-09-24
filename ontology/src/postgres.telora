@@ -409,14 +409,49 @@ def render_exists: Fn(qb::Exists, RenderCtx) -> Emitted = fn(ex, ctx) {
     }
 };
 
+def comparison_op: Fn(qb::ScalarFunction) -> String = fn(op) {
+    match op {
+        qb::ScalarFunction::Eq => "=", qb::ScalarFunction::Ne => "!=",
+        qb::ScalarFunction::Lt => "<", qb::ScalarFunction::Le => "<=",
+        qb::ScalarFunction::Gt => ">", qb::ScalarFunction::Ge => ">=",
+        _ => fail!("invalid scalar comparison operator", op),
+    }
+};
+
+def render_scalar_comparison: Fn(qb::ScalarAggregateComparison, RenderCtx) -> Emitted = fn(cmp, ctx) {
+    let sq = cmp.inner;
+    let call: qb::AggregateCall = {
+        function: sq.function, arg: sq.arg, distinct: sq.distinct,
+        filter: sq.agg_filter, alias: "__scalar_value",
+    };
+    let value = aggregate(call, ctx);
+    let source = render_source(sq.source, value.ctx);
+    let initial: Arguments = {sql: [], ctx: source.ctx};
+    let joins = array::fold(sq.joins, initial, fn(state, join) {
+        let emitted = render_join(join, state.ctx);
+        {sql: array::push(state.sql, emitted.sql), ctx: emitted.ctx}
+    });
+    let filtered: Emitted = match sq.filter {
+        Some(expr) => emit_expr(expr, joins.ctx), None => {sql: "", ctx: joins.ctx},
+    };
+    let join_sql = if array::length(sq.joins) > 0 { ` \{string::join(joins.sql, " ")}` } else { "" };
+    let filter_sql = if sq.filter != None { ` WHERE \{filtered.sql}` } else { "" };
+    {sql: `\{column_sql(cmp.outer)} \{comparison_op(cmp.op)} (SELECT \{value.sql} FROM \{source.sql}\{join_sql}\{filter_sql})`,
+        ctx: filtered.ctx}
+};
+
 def render_where: Fn(qb::Plan, RenderCtx) -> Emitted = fn(plan, ctx) {
     let filtered: Emitted = match plan.filter {
         Some(expr) => emit_expr(expr, ctx),
         None => {sql: "", ctx},
     };
     let initial: Arguments = {sql: if plan.filter != None { [filtered.sql] } else { [] }, ctx: filtered.ctx};
-    let terms = array::fold(plan.exists, initial, fn(state, ex) {
+    let exists_terms = array::fold(plan.exists, initial, fn(state, ex) {
         let value = render_exists(ex, state.ctx);
+        {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+    });
+    let terms = array::fold(plan.scalar_comparisons, exists_terms, fn(state, cmp) {
+        let value = render_scalar_comparison(cmp, state.ctx);
         {sql: array::push(state.sql, value.sql), ctx: value.ctx}
     });
     let sql = if array::length(terms.sql) > 0 { ` WHERE \{string::join(terms.sql, " AND ")}` } else { "" };
@@ -433,6 +468,10 @@ def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
         array::map(plan.sources, fn(source) { source.alias }),
         array::map(plan.joins, fn(join) { join.source.alias }),
         array::map(plan.exists, fn(ex) { ex.source.alias }),
+        array::concat(array::map(plan.scalar_comparisons, fn(cmp) {
+            array::concat([[cmp.inner.source.alias],
+                array::map(cmp.inner.joins, fn(join) { join.source.alias })])
+        })),
         array::concat(array::map(plan.exists, fn(ex) {
             match ex.peer {
                 Some(corr) => [corr.peer.alias],
@@ -455,8 +494,7 @@ def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
 
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
     let plan = if distinct { qb::validate_distinct_plan(raw) } else { qb::validate_structure(raw) };
-    if plan.partition != None
-        || array::length(plan.scalar_comparisons) > 0 || array::length(plan.ranked_key_comparisons) > 0 {
+    if plan.partition != None || array::length(plan.ranked_key_comparisons) > 0 {
         fail!("PostgreSQL query shape is not yet implemented", plan)
     } else {
         let select_initial: Arguments = {sql: [], ctx};

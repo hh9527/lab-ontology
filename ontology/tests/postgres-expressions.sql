@@ -96,6 +96,19 @@ AND EXISTS (SELECT 1 FROM
         OR ("o"."right_id" = "a"."id" AND "o"."left_id" = "b"."id"))
     AND "a"."id" <> "b"."id" AND "a"."role" = $4 AND "b"."role" = $5);
 
+PREPARE ontology_scalar(integer, text, text, text, text) AS
+WITH "Orders"("id", "total") AS (VALUES (1, 10), (2, 100)),
+     "Events"("id", "scope", "status", "kind", "amount") AS
+         (VALUES (10, 'private', 'active', 'sale', 10),
+                 (11, 'private', 'active', 'sale', 2)),
+     "Tags"("event_id", "kind") AS (VALUES (10, 'primary'), (11, 'primary'))
+SELECT "o"."id" FROM "Orders" AS "o"
+WHERE "o"."total" > (SELECT sum("e"."amount" + $1)
+    FILTER (WHERE "e"."kind" = $2)
+    FROM (SELECT * FROM "Events" AS "e" WHERE "e"."scope" = $3) AS "e"
+    INNER JOIN "Tags" AS "t" ON ("e"."id" = "t"."event_id" AND "t"."kind" = $4)
+    WHERE "e"."status" = $5);
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -151,6 +164,11 @@ BEGIN
     IF selected_id IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'paired endpoint identity or binding order differs';
     END IF;
+    EXECUTE 'EXECUTE ontology_scalar(2, ''sale'', ''private'', ''primary'', ''active'')'
+        INTO selected_id;
+    IF selected_id IS DISTINCT FROM 2 THEN
+        RAISE EXCEPTION 'scalar aggregate subquery or clause binding order differs';
+    END IF;
 
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
@@ -172,4 +190,5 @@ DEALLOCATE ontology_set_count;
 DEALLOCATE ontology_exists;
 DEALLOCATE ontology_linked;
 DEALLOCATE ontology_peer;
+DEALLOCATE ontology_scalar;
 COMMIT;
