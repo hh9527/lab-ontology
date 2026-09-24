@@ -400,7 +400,7 @@ jq -e '.bindings == ["D1","D2"] and (.sql | contains("pl.tenantId = d_o.tenant_i
 peer_identity_sql="$(jq -r '.sql' <<< "${peer_identity_plan}")"
 peer_identity_result="$(sqlite3 -json :memory: -cmd "${peer_identity_schema}" -cmd '.parameter init' \
     -cmd ".parameter set ?1 'D1'" -cmd ".parameter set ?2 'D2'" "${peer_identity_sql}")"
-jq -e 'length == 2 and (map(.id) | sort == ["other_tenant","valid"])' <<< "${peer_identity_result}" >/dev/null
+jq -e 'length == 3 and (map(.id) | sort == ["other_tenant","reversed","valid"])' <<< "${peer_identity_result}" >/dev/null
 
 link_site_schema="CREATE TABLE EnterprisePhysicalLink (id TEXT, name TEXT, tenantId TEXT, a_ne_res_id TEXT, z_ne_res_id TEXT);
 CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT, projectId TEXT, refParentSubnet TEXT);
@@ -716,6 +716,33 @@ pon_port_result="$(sqlite3 -json :memory: -cmd "${pon_port_schema}" -cmd '.param
     "$(jq -r '.sql' <<< "${pon_port_plan}")")"
 jq -e 'length == 7 and all(.[]; .name == "Twin") and (map(.pon_port_receive_sample_max) | sort) == [10,20,30,40,50,60,85]' <<< "${pon_port_result}" >/dev/null
 
+peer_trend_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, alias TEXT, classification TEXT);
+CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, portCount INTEGER);
+CREATE TABLE EnterprisePhysicalLink (a_ne_res_id TEXT, z_ne_res_id TEXT, tenantId TEXT);
+INSERT INTO I_EntNetworkElement VALUES
+ ('O','red','Origin','Origin','LSW'),('O','blue','Origin','Other','LSW'),
+ ('B','red','Twin','Other','LSW'),('C','red','Twin','Other','LSW'),
+ ('D','blue','Twin','Other','LSW'),('X','red','Twin','Other','LSW');
+INSERT INTO EnterprisePhysicalLink VALUES
+ ('O','B','red'),('O','B','red'),('C','O','red'),
+ ('O','O','red'),('O','D','blue'),('B','X','red'),('B','C','red');
+INSERT INTO NetworkDeviceKPI VALUES
+ ('B','red','2024-02-01T00:00:00Z',10),('B','red','2024-02-05T00:00:00Z',20),
+ ('B','red','2024-03-01T00:00:00Z',99),
+ ('C','red','2024-02-05T00:00:00Z',35),('C','red','2024-02-06T00:00:00Z',30),
+ ('O','red','2024-02-05T00:00:00Z',40),
+ ('D','blue','2024-02-05T00:00:00Z',50),('X','red','2024-02-05T00:00:00Z',60);"
+peer_trend_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:peer_device_raw_trend)"
+jq -e '.bindings == ["ne.category.switch","LSW","2024-02-01T00:00:00Z","2024-03-01T00:00:00Z","Origin"]' <<< "${peer_trend_plan}" >/dev/null
+peer_trend_result="$(sqlite3 -json :memory: -cmd "${peer_trend_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.switch'" -cmd ".parameter set ?2 'LSW'" \
+    -cmd ".parameter set ?3 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?4 '2024-03-01T00:00:00Z'" \
+    -cmd ".parameter set ?5 'Origin'" "$(jq -r '.sql' <<< "${peer_trend_plan}")")"
+jq -e 'length == 4 and all(.[]; .name == "Twin")
+    and (map(.portCount) | sort) == [10,20,30,35]
+    and .[0].ts == "2024-02-01T00:00:00Z" and .[3].ts == "2024-02-06T00:00:00Z"' <<< "${peer_trend_result}" >/dev/null
+
 ap_ssid_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT);
 CREATE TABLE NetworkApRadioSsidKPI (resId TEXT, parentId TEXT, tenantId TEXT, ts TEXT, connectedTerminals INTEGER);
 INSERT INTO I_EntNetworkElement VALUES
@@ -742,4 +769,4 @@ jq -e '.bindings == []' <<< "${ap_ssid_all_plan}" >/dev/null
 ap_ssid_all_result="$(sqlite3 -json :memory: -cmd "${ap_ssid_schema}" "$(jq -r '.sql' <<< "${ap_ssid_all_plan}")")"
 jq -e 'length == 3 and (map(.ap_ssid_connected_terminals_sample_avg) | sort) == [5,38,70]' <<< "${ap_ssid_all_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, PON port sample peaks, and AP SSID pooled means execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, PON port sample peaks, bidirectional peer-qualified raw trends, and AP SSID pooled means execute correctly\n'

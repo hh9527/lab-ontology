@@ -678,6 +678,13 @@ type PeerRequest = struct {
     peer: PeerRef,
 };
 
+type PeerObservationScope = struct {
+    hub: String,
+    origin_relation: String,
+    owner_relation: String,
+    origin_filters: Array(FilterRequest),
+};
+
 # ---------------------------------------------------------------------------
 # Prepared payload types.
 # ---------------------------------------------------------------------------
@@ -1414,6 +1421,18 @@ def directed_peer_hub_relation_fields: Fn(Type, String, String, String, Type, St
         let names: PeerHubFieldNames = { origin_key, origin_field, peer_key, peer_field };
         let relations: PeerHubRelations = { origin: origin_relation, peer: peer_relation };
         let spec: PeerHubDecl = { origin_participant, origin_key: -1, origin_field: -1, peer_participant, peer_key: -1, peer_field: -1, directed: True, field_names: Some(names), relations: Some(relations) };
+        let all = match previous { Some(p) => array::push(p.hubs, spec), None => [spec] };
+        { hubs: all }
+    }
+};
+
+# A/Z are physical storage positions; either participant can occupy either end
+# when the declared business connection is bidirectional.
+def peer_hub_relation_fields: Fn(Type, String, String, String, Type, String, String, String) -> Fn(td::TypeDesc, Option(PeerHubDef)) -> PeerHubDef = fn(origin_participant, origin_key, origin_field, origin_relation, peer_participant, peer_key, peer_field, peer_relation) {
+    fn(ctx, previous) {
+        let names: PeerHubFieldNames = { origin_key, origin_field, peer_key, peer_field };
+        let relations: PeerHubRelations = { origin: origin_relation, peer: peer_relation };
+        let spec: PeerHubDecl = { origin_participant, origin_key: -1, origin_field: -1, peer_participant, peer_key: -1, peer_field: -1, directed: False, field_names: Some(names), relations: Some(relations) };
         let all = match previous { Some(p) => array::push(p.hubs, spec), None => [spec] };
         { hubs: all }
     }
@@ -7069,6 +7088,94 @@ def lower_related_observation: Fn(PreparedPayload, QueryRequest, String, String,
             match window { Some(bounds) => Some(SampleWindow::Text(bounds)), None => None }, [], [], None, False)
     };
 
+def peer_pair_condition: Fn(Array(qb::ColumnEq)) -> qb::Expr = fn(pairs) {
+    match combine_filters(array::map(pairs, fn(pair) {
+        qb::scalar(qb::ScalarFunction::Eq, [
+            qb::column(pair.left.source, pair.left.column),
+            qb::column(pair.right.source, pair.right.column)])
+    })) {
+        Some(expr) => expr,
+        None => fail!("peer observation endpoint relation cannot be empty"),
+    }
+};
+
+# A single correlated EXISTS keeps link multiplicity out of the metric samples.
+# The exchange predicate ties BOTH endpoint matches to the same orientation;
+# independently OR-ing owner and origin endpoint conditions is not equivalent.
+def lower_peer_related_observation: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest), PeerObservationScope) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window, scope) {
+        let plan = lower_related_observation(payload, request, owner_id, relation_id, dataset_id, window);
+        let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
+        let hub = get_index(payload.entities, entity_by_id(payload, scope.hub));
+        let origin_rel = relation_domain(payload, scope.origin_relation);
+        let owner_rel = relation_domain(payload, scope.owner_relation);
+        let origin = get_index(payload.entities, origin_rel.to);
+        let route = match find_peer_route(payload, hub.index, origin.index, owner.index) {
+            Some(value) => value,
+            None => fail!("peer observation requires a declared endpoint route", scope.hub, owner_id),
+        };
+        let declared = match route.relations {
+            Some(value) => value,
+            None => fail!("peer observation requires named endpoint relations", scope.hub),
+        };
+        if route.origin_entity != origin.index || route.peer_entity != owner.index
+            || declared.origin != scope.origin_relation || declared.peer != scope.owner_relation
+            || origin_rel.from != hub.index || owner_rel.from != hub.index
+            || origin_rel.kind != RelationKind::Safe || owner_rel.kind != RelationKind::Safe
+            || (route.exchange && origin.index != owner.index)
+            || !relation_covers_target_grain(origin, exists_pairs(origin_rel.key))
+            || !relation_covers_target_grain(owner, exists_pairs(owner_rel.key)) {
+            fail!("peer observation requires ordered grain-safe endpoint relations", scope.hub, scope.origin_relation, scope.owner_relation)
+        } else {
+            let origin_alias = peer_inner_alias(origin, "o");
+            let origin_source = entity_source_at(payload, origin, origin_alias);
+            let origin_a = array::map(exists_pairs(origin_rel.key), fn(pair) {
+                qb::column_eq(
+                    qb::column_ref(hub.alias, get_index(hub.fields, pair.from).column),
+                    qb::column_ref(origin_alias, get_index(origin.fields, pair.to).column))
+            });
+            let origin_z = array::map(exists_pairs(owner_rel.key), fn(pair) {
+                qb::column_eq(
+                    qb::column_ref(hub.alias, get_index(hub.fields, pair.from).column),
+                    qb::column_ref(origin_alias, get_index(origin.fields, pair.to).column))
+            });
+            let owner_z = array::map(exists_pairs(owner_rel.key), fn(pair) {
+                exists_col_eq(owner, hub, pair, True)
+            });
+            let owner_a = array::map(exists_pairs(origin_rel.key), fn(pair) {
+                exists_col_eq(owner, hub, pair, True)
+            });
+            let filters = array::map(scope.origin_filters, fn(req) {
+                let dim = peer_filter_dimension(payload, origin.index, req);
+                peer_attr_expr(payload, dim, req, origin_alias)
+            });
+            let distinct = if owner.index == origin.index {
+                [qb::scalar(qb::ScalarFunction::Ne, [
+                    qb::column(owner.alias, get_index(owner.fields, route.peer_key).column),
+                    qb::column(origin_alias, get_index(origin.fields, route.origin_key).column)])]
+            } else { [] };
+            let orientation = if route.exchange {
+                [qb::scalar(qb::ScalarFunction::Or, [
+                    peer_pair_condition(array::concat([owner_z, origin_a])),
+                    peer_pair_condition(array::concat([owner_a, origin_z]))])]
+            } else { [] };
+            let link_filter = combine_filters(array::concat([orientation, filters, distinct]));
+            let hub_source = entity_source_at(payload, hub, hub.alias);
+            let exists = if route.exchange {
+                let base = qb::exists_two_hop_alternatives(hub_source, [owner_z, owner_a],
+                    origin_source, origin_a, link_filter);
+                let link = match base.link {
+                    Some(value) => {...value, pairs: [], alternatives: Some([origin_a, origin_z])},
+                    None => fail!("peer observation requires a correlated link body"),
+                };
+                {...base, link: Some(link)}
+            } else {
+                qb::exists_two_hop(hub_source, owner_z, origin_source, origin_a, link_filter)
+            };
+            qb::validate({...plan, exists: array::push(plan.exists, exists)}, payload.profile)
+        }
+    };
+
 def lower_related_epoch_observation: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcEpochWindowRequest)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, dataset_id, window) {
         let spec = dataset_domain(payload, dataset_id);
@@ -8572,6 +8679,7 @@ pub use self::{
     HavingRequest,
     PeerRef,
     PeerRequest,
+    PeerObservationScope,
     FieldEntry,
     EnumValueEntry,
     CanonicalValueSpec,
@@ -8663,6 +8771,7 @@ pub use self::{
     directed_peer_hub,
     directed_peer_hub_fields,
     directed_peer_hub_relation_fields,
+    peer_hub_relation_fields,
     peer_build,
     resolve_peer_decl,
     find_peer_route,
@@ -8731,6 +8840,7 @@ pub use self::{
     lower_qualified_observation,
     lower_epoch_qualified_observation,
     lower_related_observation,
+    lower_peer_related_observation,
     lower_related_epoch_observation,
     lower_sample_top,
     lower_sample_epoch_top,

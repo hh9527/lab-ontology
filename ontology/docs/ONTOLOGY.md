@@ -230,6 +230,11 @@ SQL 执行后发现未知 wire 还不能自动产生结构化模型诊断。
 origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
 端点位置，只生成一个关联分支。同类型两侧仍须为不同参与者。该声明
 解决端点方向性，不代替关系名称、显示说明或一般数据链的建模。
+若两端有各自具名的完整身份关系而业务连接仍是双向的，使用
+`peer_hub_relation_fields` 绑定这两条关系并保留端点交换；
+`directed_peer_hub_relation_fields` 仅用于业务本身确实单向的连接。
+`observe_peer_related` 将双向邻接作为样本 owner 的相关存在条件，
+两种方向必须各自在同一 hub 行内匹配，不把重复连接 JOIN 到样本行。
 
 领域作者用具名 struct 表达实体，用 property decorator 就近声明事实：
 

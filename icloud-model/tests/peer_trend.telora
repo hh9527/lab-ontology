@@ -1,0 +1,52 @@
+use crate::model::{ payload };
+use ontology::intent as intent;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+def lower_json: Fn(String) -> qb::Query = fn(value) {
+    intent::query_intent_lower_factory(payload, "public")(json::parse(value).unwrap!())
+};
+
+pub def raw_trend_keeps_one_correlated_link: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_peer_related","dataset":"device_kpi","owner":"device","relation":"device_kpi_of_device","measures":[],"dimensions":["device_name","port_count_sample","device_kpi_ts_raw"],"filters":[{"dimension":"device_class","op":"eq","kind":"text","value":"LSW"}],"ordering":[{"target":"Dimension","id":"device_kpi_ts_raw","direction":"Asc"}],"window":{"start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null,"peer_scope":{"hub":"physical_link","origin_relation":"physical_link_a_device","owner_relation":"physical_link_z_device","origin_filters":[{"dimension":"device_alias","op":"eq","kind":"text","value":"Origin"}]}}`);
+    if string::contains(q.sql, "EXISTS (SELECT 1 FROM EnterprisePhysicalLink AS pl INNER JOIN I_EntNetworkElement AS d_o")
+        && string::contains(q.sql, "d.tenant_id = pl.tenantId")
+        && string::contains(q.sql, "pl.tenantId = d_o.tenant_id")
+        && string::contains(q.sql, "d.id != d_o.id")
+        && string::contains(q.sql, "ORDER BY k.ts ASC")
+        && q.bindings == [qb::Val::String("ne.category.switch"), qb::Val::String("LSW"),
+            qb::Val::String("2024-02-01T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z"),
+            qb::Val::String("Origin")] { True }
+    else { fail!("peer observation must keep raw samples and one paired link EXISTS", q) }
+});
+
+pub def raw_trend_rejects_swapped_role_names: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"observe_peer_related","dataset":"device_kpi","owner":"device","relation":"device_kpi_of_device","measures":[],"dimensions":["device_name","port_count_sample","device_kpi_ts_raw"],"filters":[],"ordering":[],"window":null,"limit":null,"offset":null,"peer_scope":{"hub":"physical_link","origin_relation":"physical_link_z_device","owner_relation":"physical_link_a_device","origin_filters":[]}}`)
+}, "peer observation requires ordered grain-safe endpoint relations");
+
+pub def raw_trend_rejects_missing_owner_identity: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "physical_link_z_device" {
+            let first = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(value) => value, None => fail!("missing endpoint key"),
+                },
+                _ => fail!("expected complete endpoint relation"),
+            };
+            {...relation, key: first}
+        } else { relation }
+    });
+    let request: edsl::QueryRequest = {
+        measures: [], dimensions: [{id: "port_count_sample", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    let scope: edsl::PeerObservationScope = {
+        hub: "physical_link", origin_relation: "physical_link_a_device",
+        owner_relation: "physical_link_z_device", origin_filters: [],
+    };
+    edsl::lower_peer_related_observation({...payload, relations}, request, "device", "device_kpi_of_device", "device_kpi", None, scope)
+}, "peer observation requires ordered grain-safe endpoint relations");
