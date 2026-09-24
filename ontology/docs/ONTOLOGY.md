@@ -32,6 +32,11 @@ def lower_intent: Fn(Value) -> qb.Query =
 授权主体，不是领域查询规则。返回函数只接受使用稳定 measure、dimension、entity id 的
 业务 Intent，并依据本体中的 source、column、grain、relation、capability 和授权信息生成
 参数化 `Query`。领域不需要另写关系选择、聚合规划、投影整理或 SQL 生成代码。
+如需在方言边界之前取得计划，`query_intent_plan_factory(payload, subject)` 返回
+`Fn(Value) -> qb::QueryPlan`：普通行、去重、集合运算和分组计数的顶层形状
+均保留在封闭 AST 中。现有 `query_intent_lower_factory` 将同一计划交给
+`transform_sqlite_query_plan`，只在最后一步物化 SQLite Query；
+意图解析与知识验证本身不调用 SQLite renderer。
 
 当前封闭 Intent 协议覆盖 `list`、`count`、`aggregate`、`top`、`distinct`、`exists`、
 `absence`、`set`、`compare` 与 `ranked`。未知操作、非法组合、未知或未授权 vocabulary、

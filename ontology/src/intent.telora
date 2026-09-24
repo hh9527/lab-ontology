@@ -574,7 +574,7 @@ def build_request: Fn(edsl::PreparedPayload, String, Dict(Value)) -> edsl::Query
 # Public lowering entry: intent Value -> Query
 # ---------------------------------------------------------------------------
 
-def lower_set_query: Fn(edsl::PreparedPayload, String, qb::SetOpKind, Value) -> qb::Query =
+def lower_set_query: Fn(edsl::PreparedPayload, String, qb::SetOpKind, Value) -> qb::QueryPlan =
     fn(payload, subject, kind, intent) {
         let obj = as_object(intent);
         let branches = as_array(field(obj, "branches"));
@@ -583,17 +583,18 @@ def lower_set_query: Fn(edsl::PreparedPayload, String, qb::SetOpKind, Value) -> 
             let left = build_set_branch(payload, subject, branches[0]);
             let right = build_set_branch(payload, subject, branches[1]);
             let op = as_string(field(obj, "op"));
+            let set: qb::SetPlan = {kind, left, right};
             if op == "set" {
-                qb::transform_sqlite_set(kind, left, right)
+                qb::QueryPlan::SetRows(set)
             } else {
-                qb::transform_sqlite_set_count(kind, left, right)
+                qb::QueryPlan::SetCount(set)
             }
         } else {
             fail!("set intent requires exactly two branches", branch_count)
         }
     };
 
-def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(payload, subject, intent) {
+def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan = fn(payload, subject, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "set" || op == "set_count" {
@@ -617,7 +618,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     } else {
                         lower_list_with_order(payload, request, output)
                     };
-                    qb::transform_sqlite(plan)
+                    qb::QueryPlan::Rows(plan)
                 },
                 "count" => {
                     let exists: Array(edsl::ExistsRequest) =
@@ -625,7 +626,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                     let plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
-                    qb::transform_sqlite(plan)
+                    qb::QueryPlan::Rows(plan)
                 },
                 "qualify_group" => {
                     let having: Array(edsl::HavingRequest) =
@@ -637,7 +638,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         Some(Value::False) => False,
                         Some(value) => fail!("show_measure requires a boolean", value),
                     };
-                    qb::transform_sqlite(edsl::lower_group_projection(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_group_projection(payload, request,
                         as_string(field(obj, "relation")), having, output, show_measure))
                 },
                 "exists_via" => {
@@ -646,7 +647,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     if array::length(specs) == 0 {
                         fail!("exists_via requires a named relation")
                     } else {
-                        qb::transform_sqlite(edsl::lower_named_exists(payload, request, specs, parse_site_tenant_scope(subject, obj)))
+                        qb::QueryPlan::Rows(edsl::lower_named_exists(payload, request, specs, parse_site_tenant_scope(subject, obj)))
                     }
                 },
                 "qualify_metrics" => {
@@ -665,7 +666,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                               threshold: parse_input(as_string(field(having, "kind")), field(having, "value")) }
                         });
                     let scope = parse_owner_site_scope(subject, obj);
-                    qb::transform_sqlite(edsl::lower_metric_qualifications(payload, request, specs, scope))
+                    qb::QueryPlan::Rows(edsl::lower_metric_qualifications(payload, request, specs, scope))
                 },
                 "qualify_epoch_metrics" => {
                     let specs: Array(edsl::EpochMetricQualification) = array::map(
@@ -683,20 +684,20 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                               op: parse_having_op(as_string(field(having, "op"))),
                               threshold: parse_input(as_string(field(having, "kind")), field(having, "value")) }
                         });
-                    qb::transform_sqlite(edsl::lower_epoch_metric_qualifications(payload, request, specs,
+                    qb::QueryPlan::Rows(edsl::lower_epoch_metric_qualifications(payload, request, specs,
                         parse_owner_site_scope(subject, obj)))
                 },
                 "qualify_samples" => {
                     let specs = array::map(as_array(field(obj, "qualifications")), fn(value) {
                         parse_sample_qualification(subject, value)
                     });
-                    qb::transform_sqlite(edsl::lower_sample_qualifications(payload, request, specs))
+                    qb::QueryPlan::Rows(edsl::lower_sample_qualifications(payload, request, specs))
                 },
                 "qualify_epoch_samples" => {
                     let specs = array::map(as_array(field(obj, "qualifications")), fn(value) {
                         parse_epoch_sample_qualification(subject, value)
                     });
-                    qb::transform_sqlite(edsl::lower_sample_epoch_qualifications(payload, request, specs))
+                    qb::QueryPlan::Rows(edsl::lower_sample_epoch_qualifications(payload, request, specs))
                 },
                 "qualify_sample_count" => {
                     let ranges: Array(edsl::SampleCountRange) = array::map(
@@ -714,7 +715,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                             };
                             { qualification, min_matches: minimum, max_matches: as_int(field(item, "max_matches")) }
                         });
-                    qb::transform_sqlite(edsl::lower_sample_count_ranges(payload, request, ranges))
+                    qb::QueryPlan::Rows(edsl::lower_sample_count_ranges(payload, request, ranges))
                 },
                 "qualify_epoch_sample_count" => {
                     let ranges: Array(edsl::EpochSampleCountRange) = array::map(
@@ -724,7 +725,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                             let spec = parse_epoch_sample_qualification(subject, value);
                             { qualification: spec, min_matches: minimum, max_matches: as_int(field(item, "max_matches")) }
                         });
-                    qb::transform_sqlite(edsl::lower_sample_epoch_count_ranges(payload, request, ranges))
+                    qb::QueryPlan::Rows(edsl::lower_sample_epoch_count_ranges(payload, request, ranges))
                 },
                 "observe_qualified" => {
                     let specs = array::map(as_array(field(obj, "qualifications")), fn(value) {
@@ -738,7 +739,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_string(field(window, "start")),
                         end: as_string(field(window, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_qualified_observation(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_qualified_observation(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), observation, specs, components, context))
                 },
                 "observe_epoch_qualified" => {
@@ -752,7 +753,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_int(field(bounds, "start")),
                         end: as_int(field(bounds, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_epoch_qualified_observation(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_epoch_qualified_observation(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), observation, specs,
                         parse_observation_components(subject, obj), parse_observation_context(subject, obj)))
                 },
@@ -771,7 +772,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                             Some(result)
                         },
                     };
-                    qb::transform_sqlite(edsl::lower_related_observation(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_related_observation(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), dataset_id, window))
                 },
                 "observe_peer_related" => {
@@ -796,7 +797,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         owner_relation: as_string(field(peer, "owner_relation")),
                         origin_filters: array::map(array_opt(peer, "origin_filters"), fn(v) { parse_filter(subject, v) }),
                     };
-                    qb::transform_sqlite(edsl::lower_peer_related_observation(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_peer_related_observation(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), dataset_id, window, scope))
                 },
                 "observe_related_epoch" => {
@@ -815,19 +816,19 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                             Some(result)
                         },
                     };
-                    qb::transform_sqlite(edsl::lower_related_epoch_observation(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_related_epoch_observation(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), dataset_id, window))
                 },
                 "list_via" => {
                     let relation_id = as_string(field(obj, "relation"));
-                    qb::transform_sqlite(edsl::lower_via(payload, request, relation_id))
+                    qb::QueryPlan::Rows(edsl::lower_via(payload, request, relation_id))
                 },
                 "list_relation" => {
                     let plan = edsl::lower_relation_rows(payload, request,
                         as_string(field(obj, "base")), as_string(field(obj, "relation")));
                     match as_string(field(obj, "mode")) {
-                        "rows" => qb::transform_sqlite(plan),
-                        "distinct" => qb::transform_sqlite_distinct(plan),
+                        "rows" => qb::QueryPlan::Rows(plan),
+                        "distinct" => qb::QueryPlan::DistinctRows(plan),
                         _ => fail!("relation rows require rows or distinct mode"),
                     }
                 },
@@ -840,7 +841,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         second: parse_input(kind, field(endpoints, "second")),
                         subject,
                     };
-                    qb::transform_sqlite(edsl::lower_endpoint_pair(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_endpoint_pair(payload, request,
                         as_string(field(obj, "tenant_relation")), pair))
                 },
                 "qualify_child_site" => {
@@ -854,7 +855,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         site_filters: array::map(as_array(field(obj, "site_filters")), fn(v) { parse_filter(subject, v) }),
                         tenant_filters: array::map(as_array(field(obj, "tenant_filters")), fn(v) { parse_filter(subject, v) }),
                     };
-                    qb::transform_sqlite(edsl::lower_child_site_scope(payload, request, scope))
+                    qb::QueryPlan::Rows(edsl::lower_child_site_scope(payload, request, scope))
                 },
                 "list_roles" => {
                     let roles: Array(edsl::RoleProjectionSpec) = array::map(as_array(field(obj, "roles")), fn(value) {
@@ -867,7 +868,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         let item = as_object(value);
                         { role: as_string(field(item, "role")), filter: parse_filter(subject, value) }
                     });
-                    qb::transform_sqlite(edsl::lower_roles(payload, request, roles, role_filters))
+                    qb::QueryPlan::Rows(edsl::lower_roles(payload, request, roles, role_filters))
                 },
                 "utc_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -876,7 +877,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_string(field(window_obj, "start")),
                         end: as_string(field(window_obj, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_utc_window(payload, request, window))
+                    qb::QueryPlan::Rows(edsl::lower_utc_window(payload, request, window))
                 },
                 "utc_field_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -886,7 +887,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_string(field(window_obj, "start")),
                         end: as_string(field(window_obj, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_utc_field_window(payload, request, window))
+                    qb::QueryPlan::Rows(edsl::lower_utc_field_window(payload, request, window))
                 },
                 "utc_epoch_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -896,7 +897,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_int(field(window_obj, "start")),
                         end: as_int(field(window_obj, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_utc_epoch_window(payload, request, window))
+                    qb::QueryPlan::Rows(edsl::lower_utc_epoch_window(payload, request, window))
                 },
                 "sample_top" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -906,7 +907,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         end: as_string(field(window_obj, "end")),
                     };
                     let scope = parse_owner_site_scope(subject, obj);
-                    qb::transform_sqlite(edsl::lower_sample_top(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_sample_top(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         window, as_string(field(obj, "rank")), as_int(field(obj, "take")), scope))
                 },
@@ -918,7 +919,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_int(field(bounds, "start")),
                         end: as_int(field(bounds, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_sample_epoch_top(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_sample_epoch_top(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         window, as_string(field(obj, "rank")), as_int(field(obj, "take")),
                         parse_owner_site_scope(subject, obj)))
@@ -938,7 +939,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         },
                         None => None,
                     };
-                    qb::transform_sqlite(edsl::lower_latest_sample(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_latest_sample(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         dataset_id, window, parse_owner_site_scope(subject, obj), parse_site_tenant_scope(subject, obj)))
                 },
@@ -958,7 +959,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         },
                         None => None,
                     };
-                    qb::transform_sqlite(edsl::lower_latest_epoch_sample(payload, request,
+                    qb::QueryPlan::Rows(edsl::lower_latest_epoch_sample(payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         dataset_id, window, parse_owner_site_scope(subject, obj), parse_site_tenant_scope(subject, obj)))
                 },
@@ -969,7 +970,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_string(field(bounds, "start")),
                         end: as_string(field(bounds, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_event_component(payload, request, window,
+                    qb::QueryPlan::Rows(edsl::lower_event_component(payload, request, window,
                         as_string(field(obj, "owner")), as_string(field(obj, "event_relation")),
                         as_string(field(obj, "component_relation")),
                         as_string(field(obj, "owner_tenant_relation")), as_string(field(obj, "component_tenant_relation")),
@@ -984,7 +985,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         start: as_int(field(bounds, "start")),
                         end: as_int(field(bounds, "end")),
                     };
-                    qb::transform_sqlite(edsl::lower_epoch_event_component(payload, request, window,
+                    qb::QueryPlan::Rows(edsl::lower_epoch_event_component(payload, request, window,
                         as_string(field(obj, "owner")), as_string(field(obj, "event_relation")),
                         as_string(field(obj, "component_relation")),
                         as_string(field(obj, "owner_tenant_relation")), as_string(field(obj, "component_tenant_relation")),
@@ -993,11 +994,11 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                 },
                 "qualify_link_site" => {
                     let scope = parse_link_site_scope(subject, field(obj, "link_site"));
-                    qb::transform_sqlite(edsl::lower_link_site(payload, request, scope))
+                    qb::QueryPlan::Rows(edsl::lower_link_site(payload, request, scope))
                 },
                 "list_link_device_site" => {
                     let scope = parse_link_site_scope(subject, field(obj, "link_site"));
-                    qb::transform_sqlite(edsl::lower_link_device_site_rows(payload, request, scope))
+                    qb::QueryPlan::Rows(edsl::lower_link_device_site_rows(payload, request, scope))
                 },
                 "utc_days_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -1006,7 +1007,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                         as_of: as_string(field(window_obj, "as_of")),
                         days: as_int(field(window_obj, "days")),
                     };
-                    qb::transform_sqlite(edsl::lower_utc_days_window(payload, request, window))
+                    qb::QueryPlan::Rows(edsl::lower_utc_days_window(payload, request, window))
                 },
                 "aggregate" => {
                     if array::length(request.measures) == 0 {
@@ -1027,7 +1028,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                                     array::map(hidden_values, fn(item) { parse_internal_having(subject, item) });
                                 let base_plan: qb::Plan = edsl::lower_hidden_having(payload, request, hidden);
                                 let plan = reorder_if_requested(payload, request, base_plan, output);
-                                qb::transform_sqlite(plan)
+                                qb::QueryPlan::Rows(plan)
                             }
                         } else {
                             let exists: Array(edsl::ExistsRequest) =
@@ -1036,14 +1037,14 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                                 array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                             let base_plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
                             let plan = reorder_if_requested(payload, request, base_plan, output);
-                            qb::transform_sqlite(plan)
+                            qb::QueryPlan::Rows(plan)
                         }
                     }
                 },
                 "count_groups" => {
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                    edsl::lower_group_count(payload, request, having)
+                    qb::QueryPlan::GroupCount(edsl::lower_group_count_plan(payload, request, having))
                 },
                 "count_related_groups" => {
                     let population = as_string(field(obj, "population"));
@@ -1052,8 +1053,8 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     } else {
                         let having: Array(edsl::HavingRequest) =
                             array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                        edsl::lower_related_group_count(payload, request,
-                            as_string(field(obj, "relation")), having, population == "all")
+                        qb::QueryPlan::GroupCount(edsl::lower_related_group_count_plan(payload, request,
+                            as_string(field(obj, "relation")), having, population == "all"))
                     }
                 },
                 "top" => {
@@ -1072,12 +1073,12 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                             internal_orders,
                             internal_having,
                         );
-                        qb::transform_sqlite(plan)
+                        qb::QueryPlan::Rows(plan)
                     }
                 },
                 "distinct" => {
                     let plan: qb::Plan = edsl::lower(payload, request);
-                    qb::transform_sqlite_distinct(plan)
+                    qb::QueryPlan::DistinctRows(plan)
                 },
                 "exists" => {
                     let exists: Array(edsl::ExistsRequest) =
@@ -1085,7 +1086,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                     let plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
-                    qb::transform_sqlite(plan)
+                    qb::QueryPlan::Rows(plan)
                 },
                 "absence" => {
                     let absence: Array(edsl::ExistsRequest) =
@@ -1093,7 +1094,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
                     let plan: qb::Plan = edsl::lower_absence(payload, request, absence, having);
-                    qb::transform_sqlite(plan)
+                    qb::QueryPlan::Rows(plan)
                 },
                 "compare" => {
                     let comparisons: Array(edsl::ScalarCompareRequest) =
@@ -1103,7 +1104,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     let output_values = array_opt(obj, "output_order");
                     let output: Array(edsl::ProjectionToken) = array::map(output_values, parse_projection_token);
                     let plan = reorder_if_requested(payload, request, base_plan, output);
-                    qb::transform_sqlite(plan)
+                    qb::QueryPlan::Rows(plan)
                 },
                 "ranked" => {
                     let comparisons: Array(edsl::RankedKeyCompareRequest) =
@@ -1113,7 +1114,7 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
                     let output_values = array_opt(obj, "output_order");
                     let output: Array(edsl::ProjectionToken) = array::map(output_values, parse_projection_token);
                     let plan = reorder_if_requested(payload, request, base_plan, output);
-                    qb::transform_sqlite(plan)
+                    qb::QueryPlan::Rows(plan)
                 },
                 _ => fail!("unsupported intent op", op),
             }
@@ -1122,7 +1123,11 @@ def lower_intent: Fn(edsl::PreparedPayload, String, Value) -> qb::Query = fn(pay
 };
 
 def query_intent_lower_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::Query = fn(payload, subject) {
-    fn(intent) { lower_intent(payload, subject, intent) }
+    fn(intent) { qb::transform_sqlite_query_plan(lower_intent_plan(payload, subject, intent)) }
+};
+
+def query_intent_plan_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::QueryPlan = fn(payload, subject) {
+    fn(intent) { qb::validate_query_plan(lower_intent_plan(payload, subject, intent)) }
 };
 
 # ---------------------------------------------------------------------------
@@ -1286,4 +1291,4 @@ def query_intent_ok: Fn(edsl::PreparedPayload, String, Value) -> Bool = fn(paylo
     }
 };
 
-pub use self::{ query_intent_lower_factory, query_intent_ok };
+pub use self::{ query_intent_lower_factory, query_intent_plan_factory, query_intent_ok };

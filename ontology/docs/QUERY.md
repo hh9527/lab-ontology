@@ -290,6 +290,7 @@ type Plan = struct {
 type SetPlan = struct { kind: SetOpKind, left: Plan, right: Plan };
 type QueryPlan = enum {
     Rows(Plan), DistinctRows(Plan), SetRows(SetPlan), SetCount(SetPlan),
+    GroupCount(Plan),
 };
 
 type PartitionedTopN = struct {
@@ -309,10 +310,10 @@ type PartitionedTopN = struct {
 `exists` 是保持 base grain 的相关存在性过滤（见下文“存在性过滤 (EXISTS)”）。
 `having` 是聚合结果谓词（见下文“HAVING”），其阈值永远作为 `?` 绑定。
 `partition` 是受限的分组内 Top N 阶段（见下文“分组内 Top N”）。
-`QueryPlan` 进一步规定顶层结果形状：普通行、去重行、集合结果或集合计数。
+`QueryPlan` 进一步规定顶层结果形状：普通行、去重行、集合结果、集合计数或分组计数。
 `validate_query_plan` 在任何 SQL 物化前校验该形状；SQLite 的
-`transform_sqlite_query_plan` 消费同一封闭 AST。它目前不涵盖需要额外
-`PlanProfile` 的 `count_groups`；这项剩余边界仍需统一。
+`transform_sqlite_query_plan` 消费同一封闭 AST。分组计数的内层 Plan
+须先由 ontology 按 `PlanProfile` 验证，然后才能构造成顶层结果形状。
 
 ### 能力 Profile
 
