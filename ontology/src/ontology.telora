@@ -549,8 +549,34 @@ type SampleQualification = struct {
     end: String,
     min_matches: Int,
 };
+type EpochSampleQualification = struct {
+    relation: String,
+    dataset: String,
+    field: String,
+    filters: Array(FilterRequest),
+    start: Int,
+    end: Int,
+    min_matches: Int,
+};
+type TimedSampleQualification = struct {
+    relation: String,
+    dataset: String,
+    filters: Array(FilterRequest),
+    window: SampleWindow,
+    min_matches: Int,
+};
 type SampleCountRange = struct {
     qualification: SampleQualification,
+    min_matches: Int,
+    max_matches: Int,
+};
+type EpochSampleCountRange = struct {
+    qualification: EpochSampleQualification,
+    min_matches: Int,
+    max_matches: Int,
+};
+type TimedSampleCountRange = struct {
+    qualification: TimedSampleQualification,
     min_matches: Int,
     max_matches: Int,
 };
@@ -6295,7 +6321,19 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
 
 # A raw-sample predicate is evaluated before the sample count; qualification
 # and observation use separate scoped aliases even when they share a carrier.
-def sample_count_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, SampleQualification, Int, qb::HavingOp) -> qb::Exists = fn(payload, outer_sources, owner, spec, threshold, op) {
+def timed_sample: Fn(SampleQualification) -> TimedSampleQualification = fn(spec) {
+    {relation: spec.relation, dataset: spec.dataset, filters: spec.filters,
+        window: SampleWindow::Text({dataset: spec.dataset, start: spec.start, end: spec.end}),
+        min_matches: spec.min_matches}
+};
+
+def timed_epoch_sample: Fn(EpochSampleQualification) -> TimedSampleQualification = fn(spec) {
+    {relation: spec.relation, dataset: spec.dataset, filters: spec.filters,
+        window: SampleWindow::Epoch({dataset: spec.dataset, field: spec.field, start: spec.start, end: spec.end}),
+        min_matches: spec.min_matches}
+};
+
+def sample_count_timed_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, TimedSampleQualification, Int, qb::HavingOp) -> qb::Exists = fn(payload, outer_sources, owner, spec, threshold, op) {
     let target = entity_by_id(payload, spec.dataset);
     let entry = get_index(payload.entities, target);
     let relation = relation_domain(payload, spec.relation);
@@ -6305,8 +6343,6 @@ def sample_count_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, Sam
         fail!("sample-to-owner relation must cover the owner's complete declared grain", spec.relation, owner.id)
     } else if threshold < 0 || (op == qb::HavingOp::Ge && threshold == 0) {
         fail!("sample qualification count must be positive", threshold)
-    } else if !valid_utc_second(spec.start) || !valid_utc_second(spec.end) || spec.start >= spec.end {
-        fail!("sample qualification requires ordered canonical UTC bounds", spec.start, spec.end)
     } else {
         let domain = dataset_domain(payload, spec.dataset);
         if domain.kind != DatasetKind::Metric {
@@ -6329,9 +6365,24 @@ def sample_count_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, Sam
             } else {
                 let filters = array::map(resolved, fn(f) { retarget_inner_expr(f.expr, entry.alias, alias) });
                 let timestamp = qb::column(alias, time_field.column);
+                let (start, end) = match spec.window {
+                    SampleWindow::Text(bounds) => if !valid_utc_second(bounds.start)
+                        || !valid_utc_second(bounds.end) || bounds.start >= bounds.end {
+                        fail!("sample qualification requires ordered canonical UTC bounds", bounds.start, bounds.end)
+                    } else if bounds.dataset != spec.dataset
+                        || time_domain(payload, spec.dataset, time_name).encoding != TimeEncoding::CanonicalUtcSecondText {
+                        fail!("sample qualification requires a canonical UTC sample clock", spec.dataset)
+                    } else { (qb::bind_string(bounds.start), qb::bind_string(bounds.end)) },
+                    SampleWindow::Epoch(bounds) => if bounds.start >= bounds.end {
+                        fail!("sample qualification requires ordered UTC epoch-millisecond bounds", bounds.start, bounds.end)
+                    } else if bounds.dataset != spec.dataset || bounds.field != time_name
+                        || time_domain(payload, spec.dataset, time_name).encoding != TimeEncoding::UtcEpochMillis {
+                        fail!("sample qualification requires the authoritative UTC epoch-millisecond clock", spec.dataset)
+                    } else { (qb::bind_int(bounds.start), qb::bind_int(bounds.end)) },
+                };
                 let bounds = qb::scalar(qb::ScalarFunction::And, [
-                    qb::scalar(qb::ScalarFunction::Ge, [timestamp, qb::bind_string(spec.start)]),
-                    qb::scalar(qb::ScalarFunction::Lt, [timestamp, qb::bind_string(spec.end)]),
+                    qb::scalar(qb::ScalarFunction::Ge, [timestamp, start]),
+                    qb::scalar(qb::ScalarFunction::Lt, [timestamp, end]),
                 ]);
                 let grouping = array::map(pairs, fn(p) { qb::column(p.right.source, p.right.column) });
                 let count_column = if inner.key_field >= 0 {
@@ -6346,12 +6397,16 @@ def sample_count_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, Sam
     }
 };
 
+def sample_count_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, SampleQualification, Int, qb::HavingOp) -> qb::Exists = fn(payload, outer_sources, owner, spec, threshold, op) {
+    sample_count_timed_exists(payload, outer_sources, owner, timed_sample(spec), threshold, op)
+};
+
 def sample_qualification_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, SampleQualification) -> qb::Exists =
     fn(payload, outer_sources, owner, spec) {
         sample_count_exists(payload, outer_sources, owner, spec, spec.min_matches, qb::HavingOp::Ge)
     };
 
-def lower_sample_count_ranges: Fn(PreparedPayload, QueryRequest, Array(SampleCountRange)) -> qb::Plan = fn(payload, request, ranges) {
+def lower_sample_timed_count_ranges: Fn(PreparedPayload, QueryRequest, Array(TimedSampleCountRange)) -> qb::Plan = fn(payload, request, ranges) {
     if array::length(ranges) == 0 { fail!("sample count range requires at least one condition") }
     else {
         let plan = lower(payload, request);
@@ -6367,11 +6422,11 @@ def lower_sample_count_ranges: Fn(PreparedPayload, QueryRequest, Array(SampleCou
                 if range.min_matches < 0 || range.max_matches < 0 || range.min_matches > range.max_matches {
                     fail!("sample count range requires ordered nonnegative bounds", range.min_matches, range.max_matches)
                 } else {
-                    let upper = qb::exists_not(sample_count_exists(payload, plan.sources, owner,
+                    let upper = qb::exists_not(sample_count_timed_exists(payload, plan.sources, owner,
                         range.qualification, range.max_matches, qb::HavingOp::Gt));
                     if range.min_matches == 0 { [upper] }
                     else {
-                        let lower = sample_count_exists(payload, plan.sources, owner,
+                        let lower = sample_count_timed_exists(payload, plan.sources, owner,
                             range.qualification, range.min_matches, qb::HavingOp::Ge);
                         [lower, upper]
                     }
@@ -6382,7 +6437,19 @@ def lower_sample_count_ranges: Fn(PreparedPayload, QueryRequest, Array(SampleCou
     }
 };
 
-def lower_sample_qualifications: Fn(PreparedPayload, QueryRequest, Array(SampleQualification)) -> qb::Plan = fn(payload, request, specs) {
+def lower_sample_count_ranges: Fn(PreparedPayload, QueryRequest, Array(SampleCountRange)) -> qb::Plan = fn(payload, request, ranges) {
+    lower_sample_timed_count_ranges(payload, request, array::map(ranges, fn(range) {
+        {qualification: timed_sample(range.qualification), min_matches: range.min_matches, max_matches: range.max_matches}
+    }))
+};
+
+def lower_sample_epoch_count_ranges: Fn(PreparedPayload, QueryRequest, Array(EpochSampleCountRange)) -> qb::Plan = fn(payload, request, ranges) {
+    lower_sample_timed_count_ranges(payload, request, array::map(ranges, fn(range) {
+        {qualification: timed_epoch_sample(range.qualification), min_matches: range.min_matches, max_matches: range.max_matches}
+    }))
+};
+
+def lower_sample_timed_qualifications: Fn(PreparedPayload, QueryRequest, Array(TimedSampleQualification)) -> qb::Plan = fn(payload, request, specs) {
     if array::length(specs) == 0 { fail!("sample qualification requires at least one condition") }
     else {
         let plan = lower(payload, request);
@@ -6394,10 +6461,20 @@ def lower_sample_qualifications: Fn(PreparedPayload, QueryRequest, Array(SampleQ
                 Some(e) => e,
                 None => fail!("sample qualification owner is unknown", alias),
             };
-            let clauses = array::map(specs, fn(spec) { sample_qualification_exists(payload, plan.sources, owner, spec) });
+            let clauses = array::map(specs, fn(spec) {
+                sample_count_timed_exists(payload, plan.sources, owner, spec, spec.min_matches, qb::HavingOp::Ge)
+            });
             qb::validate({...plan, exists: array::concat([plan.exists, clauses])}, payload.profile)
         }
     }
+};
+
+def lower_sample_qualifications: Fn(PreparedPayload, QueryRequest, Array(SampleQualification)) -> qb::Plan = fn(payload, request, specs) {
+    lower_sample_timed_qualifications(payload, request, array::map(specs, fn(spec) { timed_sample(spec) }))
+};
+
+def lower_sample_epoch_qualifications: Fn(PreparedPayload, QueryRequest, Array(EpochSampleQualification)) -> qb::Plan = fn(payload, request, specs) {
+    lower_sample_timed_qualifications(payload, request, array::map(specs, fn(spec) { timed_epoch_sample(spec) }))
 };
 
 def component_qualification_exists: Fn(PreparedPayload, Array(qb::Source), EntityEntry, NamedExistsRequest) -> qb::Exists =
@@ -8376,7 +8453,9 @@ pub use self::{
     NamedExistsRequest,
     MetricQualification,
     SampleQualification,
+    EpochSampleQualification,
     SampleCountRange,
+    EpochSampleCountRange,
     OwnerSiteScope,
     SiteTenantScope,
     LinkSiteScope,
@@ -8508,7 +8587,9 @@ pub use self::{
     lower_named_exists,
     lower_metric_qualifications,
     lower_sample_qualifications,
+    lower_sample_epoch_qualifications,
     lower_sample_count_ranges,
+    lower_sample_epoch_count_ranges,
     lower_qualified_observation,
     lower_sample_top,
     lower_sample_epoch_top,

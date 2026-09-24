@@ -99,6 +99,11 @@ optional all-history latest window and rejection of a secondary clock in the
 latest-sample window. This does not resolve whether IC's alarm or KPI physical
 clock columns are actually epoch milliseconds; the IC source mapping remains
 the authority to verify before adopting that encoding in a production model.
+The same independent acceptance model now exercises two epoch-window sample
+qualifications with separate correlated counts and a zero-inclusive maximum
+count range. Both require the authoritative clock and all owner identity keys;
+the IC production KPI/Alarm carriers remain on their previously declared text
+clock fixture until their physical time encoding is verified.
 
 Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 `zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device
