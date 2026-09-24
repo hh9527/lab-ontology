@@ -124,6 +124,7 @@ pub def graph_rejects_ignored_filter_constraint: test::Test = test::should_fail_
     edsl::RelationKey::Eq({from: 1, to: 0}))
 type Reading = struct {
     @edsl::column("reading_id")
+    @edsl::dimension("reading_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
     reading_id: String,
     @edsl::column("tenant_id")
     tenant_id: String,
@@ -159,7 +160,7 @@ type PartialReadingChild = struct {
 pub def composite_target_requires_full_identity: test::Test = test::should_fail_with(fn() {
     edsl::build_root("partial-composite-join", [Tenant.type, Reading.type, PartialReadingChild.type],
         payload.profile, fn(subject) { subject == "resolver" })
-}, "safe relation must cover the target's declared identity");
+}, "partial_child_reading from partial_reading_child to reading lacks target identity field tenant_id; add its declared equality to the relation key");
 
 @edsl::entity_id("partial_device_endpoint")
 @edsl::entity_source("partial_device_endpoints", "partial_endpoint")
@@ -173,7 +174,43 @@ type PartialDeviceEndpoint = struct {
 pub def tenant_scoped_device_rejects_id_only_safe_relation: test::Test = test::should_fail_with(fn() {
     edsl::build_root("partial-device-identity", [Tenant.type, Site.type, Device.type, PartialDeviceEndpoint.type],
         payload.profile, fn(subject) { subject == "resolver" })
-}, "safe relation must cover the target's declared identity");
+}, "partial_endpoint_device from partial_device_endpoint to device lacks target identity field tenant_id; add its declared equality to the relation key");
+
+@edsl::entity_id("duplicate_reading_child")
+@edsl::entity_source("duplicate_reading_children", "duplicate_child")
+@edsl::named_relation_key("duplicate_child_reading", Reading.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::Eq({from: 0, to: 0}),
+        edsl::RelationKey::Eq({from: 1, to: 0}),
+        edsl::RelationKey::Eq({from: 2, to: 1}),
+    ]))
+type DuplicateReadingChild = struct {
+    @edsl::column("reading_id")
+    reading_id: String,
+    @edsl::column("second_reading_id")
+    second_reading_id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+};
+
+pub def conjunctive_identity_constraints_preserve_both_equalities: test::Test = test::should_ok(fn() {
+    let model = edsl::build_root("conjunctive-identity-match", [Tenant.type, Reading.type, DuplicateReadingChild.type],
+        payload.profile, fn(subject) { subject == "resolver" });
+    let ast = query_intent_ast_factory(model, "resolver")(json::parse(r#"{
+        "op":"graph", "root":"child",
+        "nodes":[{"id":"child","entity":"duplicate_reading_child"},{"id":"reading","entity":"reading"}],
+        "edges":[{"relation":"duplicate_child_reading","from":"child","to":"reading"}],
+        "select":[{"node":"reading","dimension":"reading_id"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast).sql;
+    let pg = postgres::build_query(ast).sql;
+    if string::contains(sq, "child.reading_id = reading.reading_id")
+        && string::contains(sq, "child.second_reading_id = reading.reading_id")
+        && string::contains(sq, "child.tenant_id = reading.tenant_id")
+        && string::contains(pg, "\"child\".\"second_reading_id\" = \"reading\".\"reading_id\"") {
+        True
+    } else { fail!("conjunctive identity proof dropped a declared constraint", sq, pg) }
+});
 
 pub def composite_target_full_identity_is_lowerable: test::Test = test::should_ok(fn() {
     let model = edsl::build_root("composite-join", [Tenant.type, Reading.type, ReadingChild.type],
@@ -260,6 +297,20 @@ type Unidentified = struct {
     @edsl::column("tenant_id")
     tenant_id: String,
 };
+
+@edsl::entity_id("child_of_unidentified")
+@edsl::entity_source("children_of_unidentified", "child_u")
+@edsl::named_relation_key("child_unidentified", Unidentified.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::Eq({from: 0, to: 0}))
+type ChildOfUnidentified = struct {
+    @edsl::column("label")
+    label: String,
+};
+
+pub def safe_relation_requires_target_identity_declaration: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("missing-target-identity", [Tenant.type, Unidentified.type, ChildOfUnidentified.type],
+        payload.profile, fn(subject) { subject == "resolver" })
+}, "unidentified has no declared key or dataset grain; declare its identity before marking child_unidentified Safe");
 
 @edsl::entity_id("scoped_reading")
 @edsl::entity_source("scoped_readings", "sr")
