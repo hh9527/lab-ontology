@@ -43,6 +43,7 @@ type GroupCompositeMember = struct {
     @edsl::column("id")
     @edsl::key(True)
     @edsl::measure("group_member_count", qb::AggregateFunction::Count, [])
+    @edsl::dimension("group_member_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
     id: String,
     @edsl::column("ownerId")
     owner_id: String,
@@ -74,6 +75,30 @@ pub def hidden_group_preserves_full_owner_grain: test::Test = test::should_ok(fn
     let query = qb::transform_sqlite(plan);
     array::length(plan.grouping) == 3 && array::length(plan.projection) == 2
         && string::contains(query.sql, "GROUP BY gco.id, gco.tenantId, gco.name")
+});
+
+pub def related_group_count_keeps_owner_filter_outside_child_join: test::Test = test::should_ok(fn() {
+    let payload = edsl::build_root("group-composite-filters", [GroupCompositeOwner.type, GroupCompositeMember.type], knowledge::profile, fn(subject) { True });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "group_member_count", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [{id: "group_owner_id", subject: "public", input: edsl::DimensionInput::None},
+            {id: "group_owner_tenant", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [
+            {id: "group_owner_name", subject: "public", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("Twin")},
+            {id: "group_member_id", subject: "public", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("one")},
+        ],
+        ordering: [], limit: None, offset: None, partition: None,
+    };
+    let matched = edsl::lower_related_group_count(payload, request, "group_member_owner", [], False);
+    let all_owners = edsl::lower_related_group_count(payload, request, "group_member_owner", [], True);
+    let bindings: Array(qb::Val) = [qb::Val::String("one"), qb::Val::String("Twin")];
+    if string::contains(matched.sql, "INNER JOIN group_composite_owner AS gco ON")
+        && string::contains(matched.sql, "WHERE (gcm.id = ? AND gco.name = ?)")
+        && string::contains(all_owners.sql, "LEFT JOIN group_composite_member AS gcm ON")
+        && string::contains(all_owners.sql, "gcm.id = ?)")
+        && string::contains(all_owners.sql, " WHERE gco.name = ?")
+        && matched.bindings == bindings && all_owners.bindings == bindings { True }
+    else { fail!("owner filter belongs in WHERE; child filter belongs in ON only for all-owner population", matched, all_owners) }
 });
 
 def localized_value_domain: Array(edsl::CanonicalValueSpec) = [
