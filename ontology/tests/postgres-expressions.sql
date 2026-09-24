@@ -43,6 +43,22 @@ SELECT count(1) FROM (
     GROUP BY "__q_0"."category"
 ) AS "__q_1";
 
+PREPARE ontology_set(text, text) AS
+WITH "Events"("id", "status") AS
+    (VALUES (1, 'left'), (2, 'left'), (1, 'right'), (3, 'right'))
+SELECT "__q_0"."id" FROM "Events" AS "__q_0" WHERE "__q_0"."status" = $1
+INTERSECT
+SELECT "__q_0"."id" FROM "Events" AS "__q_0" WHERE "__q_0"."status" = $2;
+
+PREPARE ontology_set_count(text, text) AS
+WITH "Events"("id", "status") AS
+    (VALUES (1, 'left'), (2, 'left'), (1, 'right'), (3, 'right'))
+SELECT count(1) FROM (
+    SELECT "__q_0"."id" FROM "Events" AS "__q_0" WHERE "__q_0"."status" = $1
+    INTERSECT
+    SELECT "__q_0"."id" FROM "Events" AS "__q_0" WHERE "__q_0"."status" = $2
+) AS "__q_1";
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -76,6 +92,15 @@ BEGIN
         RAISE EXCEPTION 'group count or internal alias allocation differs';
     END IF;
 
+    EXECUTE 'EXECUTE ontology_set(''left'', ''right'')' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'set operand binding order differs';
+    END IF;
+    EXECUTE 'EXECUTE ontology_set_count(''left'', ''right'')' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'set-count wrapper differs';
+    END IF;
+
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
         OR pg_input_is_valid('{bad}', 'json')
@@ -91,4 +116,6 @@ DEALLOCATE ontology_rows;
 DEALLOCATE ontology_grouped;
 DEALLOCATE ontology_derived;
 DEALLOCATE ontology_group_count;
+DEALLOCATE ontology_set;
+DEALLOCATE ontology_set_count;
 COMMIT;

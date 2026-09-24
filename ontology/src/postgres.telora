@@ -297,18 +297,21 @@ def having_item: Fn(qb::Having, qb::Plan, RenderCtx) -> Emitted = fn(item, plan,
     {sql: `\{value.sql} \{op} \{threshold.sql}`, ctx: threshold.ctx}
 };
 
-def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
+def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
     let derived_aliases = match plan.derived {
         Some(derived) => array::concat([[derived.alias],
             array::map(derived.branches, fn(branch) { branch.source.alias })]),
         None => [],
     };
-    let reserved = array::concat([
+    array::concat([
         array::map(plan.sources, fn(source) { source.alias }),
         array::map(plan.joins, fn(join) { join.source.alias }),
         derived_aliases,
-    ]);
-    context(1, reserved)
+    ])
+};
+
+def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
+    context(1, plan_aliases(plan))
 };
 
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
@@ -385,5 +388,25 @@ pub def render_group_count_candidate: Fn(qb::Plan) -> qb::Query = fn(plan) {
                 bindings: alias.1.bindings}
         },
         _ => fail!("unexpected PostgreSQL group-count plan", plan),
+    }
+};
+
+def emit_set: Fn(qb::SetPlan) -> Emitted = fn(set) {
+    let operands = qb::validate_set_operands(set.kind, set.left, set.right);
+    let reserved = array::concat([plan_aliases(operands.0), plan_aliases(operands.1)]);
+    let left = emit_rows(operands.0, False, context(1, reserved));
+    let right = emit_rows(operands.1, False, left.ctx);
+    let op = qb::set_op_sql(set.kind);
+    {sql: `\{left.sql} \{op} \{right.sql}`, ctx: right.ctx}
+};
+
+pub def render_set_candidate: Fn(qb::SetPlan, Bool) -> qb::Query = fn(set, count) {
+    let inner = emit_set(set);
+    if count {
+        let alias = internal_alias(inner.ctx);
+        {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`,
+            bindings: alias.1.bindings}
+    } else {
+        {sql: inner.sql, bindings: inner.ctx.bindings}
     }
 };

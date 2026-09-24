@@ -6,12 +6,16 @@ The materializer is responsible for turning that same plan into a parameterized
 supported dialect. Adding it means passing the execution checks below, not
 simply producing syntactically plausible SQL.
 
-`ontology/postgres` has expression, Rows/DistinctRows and GroupCount candidate
+`ontology/postgres` has expression, Rows/DistinctRows, GroupCount and set candidate
 renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
 paging and derived UNION ALL sources. Every rendering stage takes and returns
 an immutable context that allocates numbered bindings and collision-free
 internal aliases. Unsupported shapes still fail explicitly; there is no
 complete `QueryPlan` materializer yet, so PostgreSQL is not an admitted dialect.
+The shared set validator currently compares projection *shapes*, not SQL
+value types: a SQLite set can contain unlike scalar types while PostgreSQL
+may reject them. Type equivalence must be resolved before set operations can
+be admitted as supported PostgreSQL queries.
 
 ## Common contract
 
