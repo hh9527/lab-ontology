@@ -681,6 +681,41 @@ regular_result="$(sqlite3 -json :memory: -cmd "${slot_schema}" -cmd '.parameter 
 jq -e 'length == 1 and .[0].id == "child" and .[0].name == "Daughter"' <<< "${daughter_result}" >/dev/null
 jq -e 'length == 1 and .[0].id == "parent" and .[0].name == "Main"' <<< "${regular_result}" >/dev/null
 
+pon_port_schema="CREATE TABLE I_EntPonElement (id TEXT, name TEXT, classification TEXT, commuState TEXT);
+CREATE TABLE PonDevicePonPortKPI (resId TEXT, tenantId TEXT, parentId TEXT, portName TEXT, ts TEXT, ifInBandRate REAL);
+INSERT INTO I_EntPonElement VALUES
+ ('D0','Twin','ne.category.pon.spl','0'),('D2','Twin','ne.category.pon.spl','2'),
+ ('D3','Twin','ne.category.pon.spl','3'),('D4','Twin','ne.category.pon.spl','4'),
+ ('D14','Twin','ne.category.pon.spl','14'),('D15','Twin','ne.category.pon.spl','15'),
+ ('D-MULTI','Twin','ne.category.pon.spl','0'),
+ ('D-ON','Twin','ne.category.pon.spl','1'),('D-UNKNOWN','Twin','ne.category.pon.spl','unknown'),
+ ('D-ONU','Twin','ne.category.pon.onu','0');
+INSERT INTO PonDevicePonPortKPI VALUES
+ ('p0','red','D0','port-0','2024-02-05T00:00:00Z',10),
+ ('p2','red','D2','port-2','2024-02-05T00:00:00Z',20),
+ ('p3','red','D3','port-3','2024-02-05T00:00:00Z',30),
+ ('p4','red','D4','port-4','2024-02-05T00:00:00Z',40),
+ ('p14','red','D14','port-14','2024-02-05T00:00:00Z',50),
+ ('p15','red','D15','port-15','2024-02-05T00:00:00Z',60),
+ ('p-m1','red','D-MULTI','port-1','2024-02-01T00:00:00Z',5),
+ ('p-m1','red','D-MULTI','port-1','2024-02-10T00:00:00Z',35),
+ ('p-m2','red','D-MULTI','port-2','2024-02-15T00:00:00Z',85),
+ ('p-m2','red','D-MULTI','port-2','2024-03-01T00:00:00Z',100),
+ ('p-on','red','D-ON','port','2024-02-05T00:00:00Z',90),
+ ('p-unknown','red','D-UNKNOWN','port','2024-02-05T00:00:00Z',91),
+ ('p-onu','red','D-ONU','port','2024-02-05T00:00:00Z',92);"
+pon_port_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:pon_port_peak_window)"
+jq -e '.bindings == ["ne.category.pon.spl","0","2","3","4","14","15","2024-02-01T00:00:00Z","2024-03-01T00:00:00Z"]' <<< "${pon_port_plan}" >/dev/null
+pon_port_result="$(sqlite3 -json :memory: -cmd "${pon_port_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.pon.spl'" \
+    -cmd ".parameter set ?2 '0'" -cmd ".parameter set ?3 '2'" \
+    -cmd ".parameter set ?4 '3'" -cmd ".parameter set ?5 '4'" \
+    -cmd ".parameter set ?6 '14'" -cmd ".parameter set ?7 '15'" \
+    -cmd ".parameter set ?8 '2024-02-01T00:00:00Z'" \
+    -cmd ".parameter set ?9 '2024-03-01T00:00:00Z'" \
+    "$(jq -r '.sql' <<< "${pon_port_plan}")")"
+jq -e 'length == 7 and all(.[]; .name == "Twin") and (map(.pon_port_receive_sample_max) | sort) == [10,20,30,40,50,60,85]' <<< "${pon_port_result}" >/dev/null
+
 ap_ssid_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT);
 CREATE TABLE NetworkApRadioSsidKPI (resId TEXT, parentId TEXT, tenantId TEXT, ts TEXT, connectedTerminals INTEGER);
 INSERT INTO I_EntNetworkElement VALUES
@@ -707,4 +742,4 @@ jq -e '.bindings == []' <<< "${ap_ssid_all_plan}" >/dev/null
 ap_ssid_all_result="$(sqlite3 -json :memory: -cmd "${ap_ssid_schema}" "$(jq -r '.sql' <<< "${ap_ssid_all_plan}")")"
 jq -e 'length == 3 and (map(.ap_ssid_connected_terminals_sample_avg) | sort) == [5,38,70]' <<< "${ap_ssid_all_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, and AP SSID pooled means execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, PON port sample peaks, and AP SSID pooled means execute correctly\n'

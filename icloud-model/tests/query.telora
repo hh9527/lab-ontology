@@ -2009,7 +2009,7 @@ pub def onu_alias_is_discoverable_without_changing_business_value: test::Test = 
     match onu {
         Some(value) => if value.label == "ONU" && value.aliases == ["光猫"]
             && array::length(internal.canonical_aliases) == 1
-            && array::length(internal.canonical_values) == 1 { True }
+            && array::any(internal.canonical_values, fn(v) { v.id == "spl" && v.label == "GPON" }) { True }
             else { fail!("ONU alias must point to the same stable business value", detail, internal) },
         None => fail!("ONU alias has no business value", detail),
     }
@@ -2399,6 +2399,44 @@ pub def device_to_kpi_preserves_tenant_key: test::Test = test::should_ok(fn() {
         fail!("KPI access must retain both owner keys", q)
     }
 });
+
+pub def pon_port_peak_is_distinct_from_published_average: test::Test = test::should_ok(fn() {
+    let metrics = edsl::metric_domain(payload, "pon_port_kpi");
+    let avg = array::any(metrics, fn(m) { m.id == "pon_port_receive_usage" && m.aggregate == qb::AggregateFunction::Avg });
+    let peak = array::any(metrics, fn(m) { m.id == "pon_port_receive_sample_max" && m.aggregate == qb::AggregateFunction::Max });
+    if avg && peak { True } else { fail!("PON port Avg and raw-sample Max must remain separate", metrics) }
+});
+
+pub def pon_port_peak_uses_device_identity_and_utc_bounds: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_related","dataset":"pon_port_kpi","owner":"pon_device","relation":"pon_port_kpi_of_device","measures":["pon_port_receive_sample_max"],"dimensions":["pon_name"],"filters":[{"dimension":"pon_class","op":"eq","kind":"text","value":"spl"},{"dimension":"pon_commu_state","op":"eq","kind":"text","value":"offline"}],"ordering":[],"window":{"start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`);
+    if string::contains(q.sql, "max(ppk.ifInBandRate)")
+        && string::contains(q.sql, "ppk.parentId = pd.id")
+        && string::contains(q.sql, "GROUP BY pd.name, pd.id")
+        && q.bindings == [qb::Val::String("ne.category.pon.spl"), qb::Val::String("0"), qb::Val::String("2"), qb::Val::String("3"), qb::Val::String("4"), qb::Val::String("14"), qb::Val::String("15"), qb::Val::String("2024-02-01T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z")] { True }
+    else { fail!("PON peak must use the published device link and the complete device ID", q) }
+});
+
+pub def pon_port_peak_rejects_wrong_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"observe_related","dataset":"pon_port_kpi","owner":"pon_device","relation":"onu_kpi_of_pon_device","measures":["pon_port_receive_sample_max"],"dimensions":["pon_name"],"filters":[],"ordering":[],"window":null,"limit":null}`)
+}, "observation requires a named grain-safe sample-to-owner relation");
+
+pub def pon_port_peak_rejects_incomplete_device_key: test::Test = test::should_fail_with(fn() {
+    let entities = array::map(payload.entities, fn(entity) {
+        if entity.id == "pon_device" {
+            let dataset = match entity.dataset {
+                Some(spec) => Some({...spec, grain: ["id", "name"]}),
+                None => fail!("PON device must declare its grain"),
+            };
+            {...entity, dataset}
+        } else { entity }
+    });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "pon_port_receive_sample_max", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [{id: "pon_name", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    edsl::lower_related_observation({...payload, entities}, request, "pon_device", "pon_port_kpi_of_device", "pon_port_kpi", None)
+}, "observation relation must cover the owner's complete declared grain");
 
 pub def ap_ssid_sample_mean_is_distinct_from_published_sum: test::Test = test::should_ok(fn() {
     let metrics = edsl::metric_domain(payload, "ap_radio_ssid_kpi");
