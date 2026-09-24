@@ -297,6 +297,76 @@ def having_item: Fn(qb::Having, qb::Plan, RenderCtx) -> Emitted = fn(item, plan,
     {sql: `\{value.sql} \{op} \{threshold.sql}`, ctx: threshold.ctx}
 };
 
+def pair_sql: Fn(qb::ColumnEq) -> String = fn(pair) {
+    `\{column_sql(pair.left)} = \{column_sql(pair.right)}`
+};
+
+def correlations: Fn(qb::Exists) -> String = fn(ex) {
+    match ex.alternatives {
+        Some(branches) => {
+            let sql = array::map(branches, fn(branch) {
+                `(\{string::join(array::map(branch, pair_sql), " AND ")})`
+            });
+            `(\{string::join(sql, " OR ")})`
+        },
+        None => string::join(array::map(ex.pairs, pair_sql), " AND "),
+    }
+};
+
+def exists_having: Fn(qb::Having, RenderCtx) -> Emitted = fn(item, ctx) {
+    match item.measure {
+        qb::HavingMeasure::Call(call) => {
+            let value = aggregate(call, ctx);
+            let op = match item.op {
+                qb::HavingOp::Eq => "=", qb::HavingOp::Ne => "!=",
+                qb::HavingOp::Lt => "<", qb::HavingOp::Le => "<=",
+                qb::HavingOp::Gt => ">", qb::HavingOp::Ge => ">=",
+            };
+            let threshold = bind(value.ctx, item.threshold);
+            {sql: `\{value.sql} \{op} \{threshold.sql}`, ctx: threshold.ctx}
+        },
+        qb::HavingMeasure::Ref(_) => fail!("EXISTS HAVING requires a direct aggregate", item),
+    }
+};
+
+def render_exists: Fn(qb::Exists, RenderCtx) -> Emitted = fn(ex, ctx) {
+    if ex.peer != None || ex.link != None {
+        fail!("PostgreSQL linked or peer EXISTS is not yet implemented", ex)
+    } else {
+        let source = render_source(ex.source, ctx);
+        let filter: Emitted = match ex.filter {
+            Some(expr) => emit_expr(expr, source.ctx),
+            None => {sql: "", ctx: source.ctx},
+        };
+        let grouping = render_exprs(ex.grouping, filter.ctx);
+        let initial: Arguments = {sql: [], ctx: grouping.ctx};
+        let having = array::fold(ex.having, initial, fn(state, item) {
+            let value = exists_having(item, state.ctx);
+            {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+        });
+        let filter_sql = if ex.filter != None { ` AND \{filter.sql}` } else { "" };
+        let group_sql = if array::length(ex.grouping) > 0 { ` GROUP BY \{grouping.sql}` } else { "" };
+        let having_sql = if array::length(ex.having) > 0 { ` HAVING \{string::join(having.sql, " AND ")}` } else { "" };
+        let prefix = if ex.negated { "NOT EXISTS" } else { "EXISTS" };
+        {sql: `\{prefix} (SELECT 1 FROM \{source.sql} WHERE \{correlations(ex)}\{filter_sql}\{group_sql}\{having_sql})`,
+            ctx: having.ctx}
+    }
+};
+
+def render_where: Fn(qb::Plan, RenderCtx) -> Emitted = fn(plan, ctx) {
+    let filtered: Emitted = match plan.filter {
+        Some(expr) => emit_expr(expr, ctx),
+        None => {sql: "", ctx},
+    };
+    let initial: Arguments = {sql: if plan.filter != None { [filtered.sql] } else { [] }, ctx: filtered.ctx};
+    let terms = array::fold(plan.exists, initial, fn(state, ex) {
+        let value = render_exists(ex, state.ctx);
+        {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+    });
+    let sql = if array::length(terms.sql) > 0 { ` WHERE \{string::join(terms.sql, " AND ")}` } else { "" };
+    {sql, ctx: terms.ctx}
+};
+
 def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
     let derived_aliases = match plan.derived {
         Some(derived) => array::concat([[derived.alias],
@@ -306,6 +376,7 @@ def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
     array::concat([
         array::map(plan.sources, fn(source) { source.alias }),
         array::map(plan.joins, fn(join) { join.source.alias }),
+        array::map(plan.exists, fn(ex) { ex.source.alias }),
         derived_aliases,
     ])
 };
@@ -316,7 +387,7 @@ def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
 
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
     let plan = if distinct { qb::validate_distinct_plan(raw) } else { qb::validate_structure(raw) };
-    if plan.partition != None || array::length(plan.exists) > 0
+    if plan.partition != None
         || array::length(plan.scalar_comparisons) > 0 || array::length(plan.ranked_key_comparisons) > 0 {
         fail!("PostgreSQL query shape is not yet implemented", plan)
     } else {
@@ -331,11 +402,8 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
             let value = render_join(join, state.ctx);
             {sql: array::push(state.sql, value.sql), ctx: value.ctx}
         });
-        let filter = match plan.filter {
-            Some(expr) => emit_expr(expr, joins.ctx),
-            None => {sql: "", ctx: joins.ctx},
-        };
-        let grouping = render_exprs(plan.grouping, filter.ctx);
+        let where_clause = render_where(plan, joins.ctx);
+        let grouping = render_exprs(plan.grouping, where_clause.ctx);
         let having_initial: Arguments = {sql: [], ctx: grouping.ctx};
         let having = array::fold(plan.having, having_initial, fn(state, item) {
             let value = having_item(item, plan, state.ctx);
@@ -362,7 +430,7 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
         };
         let prefix = if distinct { "SELECT DISTINCT" } else { "SELECT" };
         let join_sql = if array::length(plan.joins) > 0 { ` \{string::join(joins.sql, " ")}` } else { "" };
-        let where_sql = if plan.filter != None { ` WHERE \{filter.sql}` } else { "" };
+        let where_sql = where_clause.sql;
         let group_sql = if array::length(plan.grouping) > 0 { ` GROUP BY \{grouping.sql}` } else { "" };
         let having_sql = if array::length(plan.having) > 0 { ` HAVING \{string::join(having.sql, " AND ")}` } else { "" };
         let order_sql = if array::length(plan.ordering) > 0 { ` ORDER BY \{string::join(ordering.sql, ", ")}` } else { "" };

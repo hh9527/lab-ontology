@@ -190,3 +190,48 @@ pub def set_branches_share_binding_and_alias_context: test::Test = test::should_
         True
     } else { fail!("set branches and outer count must share one immutable context", rows, count) }
 });
+
+def exists_outer: Fn(qb::Exists) -> qb::Plan = fn(ex) {
+    {
+        revision: "pg-exists", sources: [qb::source("o", "Orders")],
+        projection: [qb::expr_item(qb::column("o", "id"))],
+        filter: Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("o", "role"), qb::bind_string("root")])),
+        exists: [ex], joins: [], grouping: [], having: [],
+        ordering: [qb::asc(qb::column("o", "id"))],
+        limit: None, offset: None, derived: None, partition: None,
+        scalar_comparisons: [], ranked_key_comparisons: [],
+    }
+};
+
+pub def grouped_exists_threads_source_and_having_bindings: test::Test = test::should_ok(fn() {
+    let ex = qb::exists_grouped(qb::scoped_source("e", "Events",
+        qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("e", "scope"), qb::bind_string("private")])),
+        [qb::column_eq(qb::column_ref("o", "id"), qb::column_ref("e", "owner_id"))],
+        Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("e", "kind"), qb::bind_string("alert")])),
+        [qb::column("e", "owner_id")],
+        [qb::having_call(qb::HavingOp::Gt, qb::AggregateFunction::Count,
+            qb::column("e", "id"), False, qb::Val::Int(1))]);
+    let query = pg::render_rows_candidate(exists_outer(ex), False);
+    if query.bindings == [qb::Val::String("root"), qb::Val::String("private"),
+        qb::Val::String("alert"), qb::Val::Int(1)]
+        && string::contains(query.sql, "WHERE \"o\".\"role\" = $1 AND EXISTS (SELECT 1 FROM (SELECT * FROM \"Events\" AS \"e\" WHERE \"e\".\"scope\" = $2) AS \"e\"")
+        && string::contains(query.sql, "WHERE \"o\".\"id\" = \"e\".\"owner_id\" AND \"e\".\"kind\" = $3 GROUP BY \"e\".\"owner_id\" HAVING count(\"e\".\"id\") > $4)") {
+        True
+    } else { fail!("correlated grouped EXISTS must thread the shared context", query) }
+});
+
+pub def negated_or_exists_preserves_predicate: test::Test = test::should_ok(fn() {
+    let ex = qb::exists_not(qb::exists_union(qb::source("e", "Events"), [
+        [qb::column_eq(qb::column_ref("o", "left_id"), qb::column_ref("e", "owner_id"))],
+        [qb::column_eq(qb::column_ref("o", "right_id"), qb::column_ref("e", "owner_id"))],
+    ], Some(qb::scalar(qb::ScalarFunction::Eq,
+        [qb::column("e", "kind"), qb::bind_string("blocked")]))));
+    let query = pg::render_rows_candidate(exists_outer(ex), False);
+    if query.bindings == [qb::Val::String("root"), qb::Val::String("blocked")]
+        && string::contains(query.sql, "NOT EXISTS (SELECT 1 FROM \"Events\" AS \"e\" WHERE ((\"o\".\"left_id\" = \"e\".\"owner_id\") OR (\"o\".\"right_id\" = \"e\".\"owner_id\")) AND \"e\".\"kind\" = $2)") {
+        True
+    } else { fail!("NOT EXISTS must keep OR correlation and inner binding", query) }
+});

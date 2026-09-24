@@ -59,6 +59,17 @@ SELECT count(1) FROM (
     SELECT "__q_0"."id" FROM "Events" AS "__q_0" WHERE "__q_0"."status" = $2
 ) AS "__q_1";
 
+PREPARE ontology_exists(text, text, text, integer) AS
+WITH "Orders"("id", "role") AS (VALUES (1, 'root'), (2, 'root')),
+     "Events"("id", "owner_id", "scope", "kind") AS
+         (VALUES (10, 1, 'private', 'alert'), (11, 1, 'private', 'alert'),
+                 (12, 2, 'private', 'alert'))
+SELECT "o"."id" FROM "Orders" AS "o"
+WHERE "o"."role" = $1 AND EXISTS (
+    SELECT 1 FROM (SELECT * FROM "Events" AS "e" WHERE "e"."scope" = $2) AS "e"
+    WHERE "o"."id" = "e"."owner_id" AND "e"."kind" = $3
+    GROUP BY "e"."owner_id" HAVING count("e"."id") > $4);
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -101,6 +112,11 @@ BEGIN
         RAISE EXCEPTION 'set-count wrapper differs';
     END IF;
 
+    EXECUTE 'EXECUTE ontology_exists(''root'', ''private'', ''alert'', 1)' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'correlated grouped EXISTS or binding order differs';
+    END IF;
+
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
         OR pg_input_is_valid('{bad}', 'json')
@@ -118,4 +134,5 @@ DEALLOCATE ontology_derived;
 DEALLOCATE ontology_group_count;
 DEALLOCATE ontology_set;
 DEALLOCATE ontology_set_count;
+DEALLOCATE ontology_exists;
 COMMIT;
