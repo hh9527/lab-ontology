@@ -328,6 +328,12 @@ agent 必须结合目录中的数据集与关系 ID 定位，不可把显示名�
 `locale`、`label`、`summary`；调用方自行选择展示语言，不改变稳定 ID、别名、授权
 或 lowering。模型准备期拒绝空字段、同一知识点重复的 locale、未知关系及挂在
 错误字段的成员说明。业务值的翻译不属于此声明。
+若字段已声明 `canonical_values`，可用字段级
+`localized_canonical_value(value_id, locale, label)` 为该字段的稳定业务值声明
+不同语言的显示名。完整 `dimension_detail` 在 `localized_values` 中返回按值 ID
+交叉引用的标签，主体 `dimension_detail_for_subject` 则把 `localized` 放在每个
+`BusinessValueBrief` 内，不返回对应的物理 `wires`。准备期拒绝空 ID/locale/label、
+未知或错挂字段的值以及同一值重复 locale。显示名和无语言别名都不能当作过滤 ID。
 业务详情仍可能包含模型说明、逻辑字段和固有 scope，不应把它当作通用脱敏边界。
 维度 ID 在完整 Model 内必须非空且全局唯一，包括普通、计算和 JSON 维度；
 不同数据集上同名的字段应声明各自的业务维度 ID，否则按 ID 发现和 lowering

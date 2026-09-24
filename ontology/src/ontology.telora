@@ -297,6 +297,11 @@ type CanonicalAlias = struct { id: String, label: String };
 @prelude::property(PropertyTarget::Field)
 type CanonicalAliasesDef = struct { aliases: Array(CanonicalAlias) };
 
+type LocalizedValueLabel = struct { locale: String, label: String };
+type LocalizedCanonicalValue = struct { id: String, locale: String, label: String };
+@prelude::property(PropertyTarget::Field)
+type LocalizedCanonicalValuesDef = struct { labels: Array(LocalizedCanonicalValue) };
+
 # Type-level: explicitly declared correlated-existence route for this base
 # entity. Each route names the unique, grain-safe owner entity (`via`) and the
 # target entity whose related rows are tested by the existence filter. A route
@@ -719,10 +724,11 @@ type DimensionBrief = struct {
     values: Array(EnumValueEntry),
     canonical_values: Array(CanonicalValueSpec),
     canonical_aliases: Array(CanonicalAlias),
+    localized_values: Array(LocalizedCanonicalValue),
     scope: Array(DimensionScopeBrief),
 };
 
-type BusinessValueBrief = struct { id: String, label: String, aliases: Array(String) };
+type BusinessValueBrief = struct { id: String, label: String, aliases: Array(String), localized: Array(LocalizedValueLabel) };
 type SubjectDimensionBrief = struct {
     id: String,
     label: String,
@@ -1246,6 +1252,13 @@ def canonical_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option
             None => [],
         };
         {aliases: array::push(aliases, {id, label})}
+    }
+};
+
+def localized_canonical_value: Fn(String, String, String) -> Fn(property::FieldPropertyCtx, Option(LocalizedCanonicalValuesDef)) -> LocalizedCanonicalValuesDef = fn(id, locale, label) {
+    fn(ctx, previous) {
+        let labels = match previous { Some(p) => p.labels, None => [] };
+        {labels: array::push(labels, {id, locale, label})}
     }
 };
 
@@ -1908,6 +1921,12 @@ def localized_relation_texts: Fn(Type, String) -> Array(LocalizedKnowledgeText) 
     }
 };
 
+def localized_value_labels: Fn(Type, Int) -> Array(LocalizedCanonicalValue) = fn(owner, field) {
+    match property::get_field_prop(owner, field, LocalizedCanonicalValuesDef.type) {
+        Some(declared) => declared.labels, None => [],
+    }
+};
+
 def localized_text_valid: Fn(LocalizedKnowledgeText) -> Bool = fn(text) {
     text.locale != "" && text.label != "" && text.summary != ""
 };
@@ -1932,6 +1951,18 @@ def check_localized_knowledge: Fn(PreparedPayload) -> Bool = fn(payload) {
         }) { fail!("invalid localized relation text: requires a declared relation and unique locale", entity.id, bad) }
         else { () };
         array::all(entity.fields, fn(field) {
+            let value_labels = localized_value_labels(entity.entity_type, field.index);
+            if let Some(bad) = array::find(value_labels, fn(label) {
+                label.id == "" || label.locale == "" || label.label == ""
+                    || !array::any(payload.dimensions, fn(d) {
+                        d.entity == entity.index && d.field == field.index
+                            && array::any(d.canonical_values, fn(value) { value.id == label.id })
+                    })
+                    || array::length(array::filter(value_labels, fn(other) {
+                        other.id == label.id && other.locale == label.locale
+                    })) != 1
+            }) { fail!("invalid localized canonical value: requires a value on its field and unique nonempty locale and label", entity.id, field.name, bad) }
+            else { () };
             let notes = match property::get_field_prop(entity.entity_type, field.index, LocalizedMemberTexts.type) {
                 Some(declared) => declared.notes, None => [],
             };
@@ -3234,7 +3265,8 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         dataset: entity.id, field: field.name, computed: entry.computed,
         authorized: entry.authorized, filterable: entry.filterable,
         ops: entry.ops, input_kinds: entry.input_kinds, values: entry.values,
-        canonical_values: entry.canonical_values, canonical_aliases: entry.canonical_aliases, scope}
+        canonical_values: entry.canonical_values, canonical_aliases: entry.canonical_aliases,
+        localized_values: localized_value_labels(entity.entity_type, field.index), scope}
 };
 
 def dimension_detail: Fn(PreparedPayload, String) -> DimensionBrief = fn(payload, id) {
@@ -3253,9 +3285,13 @@ def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> Subject
         else {
             let values: Array(BusinessValueBrief) = if array::length(detail.canonical_values) > 0 {
                 array::map(detail.canonical_values, fn(value) { {id: value.id, label: value.label,
-                    aliases: array::map(array::filter(detail.canonical_aliases, fn(alias) { alias.id == value.id }), fn(alias) { alias.label })} })
+                    aliases: array::map(array::filter(detail.canonical_aliases, fn(alias) { alias.id == value.id }), fn(alias) { alias.label }),
+                    localized: array::map(array::filter(detail.localized_values, fn(item) { item.id == value.id }), fn(item) {
+                        let result: LocalizedValueLabel = {locale: item.locale, label: item.label};
+                        result
+                    })} })
             } else {
-                array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: []} })
+                array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: [], localized: []} })
             };
             {id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
@@ -8192,6 +8228,8 @@ pub use self::{
     SampleAggregateDef,
     DatasetDescription,
     LocalizedKnowledgeText,
+    LocalizedValueLabel,
+    LocalizedCanonicalValue,
     RelationDescriptions,
     RelationNote,
     DatasetBrief,
@@ -8318,6 +8356,7 @@ pub use self::{
     enum_value,
     canonical_values,
     canonical_alias,
+    localized_canonical_value,
     scope,
     entity_scope,
     exists_route,
