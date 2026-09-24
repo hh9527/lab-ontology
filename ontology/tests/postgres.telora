@@ -59,6 +59,39 @@ pub def allocated_binding_reuses_physical_placeholder: test::Test = test::should
     } else { fail!("binding handles must retain their physical placeholder across reuse", query) }
 });
 
+pub def constructed_rows_preserve_binding_handles: test::Test = test::should_ok(fn() {
+    let root = qb::source_with_hint(qb::build_context(), "events", "e");
+    let bound = qb::bind(root.0, qb::Val::Int(7));
+    let predicate = qb::scalar(qb::ScalarFunction::Eq, [
+        qb::source_column(root.1, "kind"), bound.1,
+    ]);
+    let plan: qb::Plan = {
+        revision: "constructed-rows", sources: [root.1], joins: [],
+        projection: [qb::expr_item(bound.1)], filter: Some(predicate),
+        grouping: [], having: [], ordering: [], limit: None, offset: None,
+        exists: [], derived: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    let query = pg::render_query_plan_with_context(qb::QueryPlan::Rows(plan), bound.0);
+    let set: qb::SetPlan = {kind: qb::SetOpKind::Union, left: plan, right: plan};
+    let union = pg::render_query_plan_with_context(qb::QueryPlan::SetRows(set), bound.0);
+    if query.sql == "SELECT $1 FROM \"events\" AS \"e\" WHERE \"e\".\"kind\" = $1"
+        && query.bindings == [qb::Val::Int(7)]
+        && string::contains(union.sql, "WHERE \"e\".\"kind\" = $1 UNION SELECT $1")
+        && union.bindings == [qb::Val::Int(7)] { True }
+    else { fail!("full AST materialization must keep construction-time bindings", query, union) }
+});
+
+pub def constructed_query_rejects_unregistered_binding: test::Test = test::should_fail_with(fn() {
+    let allocated = qb::bind(qb::build_context(), qb::Val::Int(7));
+    let plan: qb::Plan = {
+        revision: "missing-binding", sources: [qb::source("e", "events")], joins: [],
+        projection: [qb::expr_item(allocated.1)], filter: None,
+        grouping: [], having: [], ordering: [], limit: None, offset: None,
+        exists: [], derived: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    pg::render_query_plan_with_context(qb::QueryPlan::Rows(plan), qb::build_context())
+}, "binding handle is not registered in builder context");
+
 pub def nested_json_bind_order: test::Test = test::should_ok(fn() {
     let path = qb::json_path([qb::JsonPathSegment::Key("a.b"), qb::JsonPathSegment::FromEnd(1)]);
     let predicate = qb::scalar(qb::ScalarFunction::Eq, [

@@ -741,10 +741,9 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
     }
 };
 
-def emit_set: Fn(qb::SetPlan) -> Emitted = fn(set) {
+def emit_set: Fn(qb::SetPlan, RenderCtx) -> Emitted = fn(set, ctx) {
     let operands = qb::validate_set_operands(set.kind, set.left, set.right);
-    let reserved = array::concat([plan_aliases(operands.0), plan_aliases(operands.1)]);
-    let left = emit_rows(operands.0, False, context(1, reserved));
+    let left = emit_rows(operands.0, False, ctx);
     let right = emit_rows(operands.1, False, left.ctx);
     let op = qb::set_op_sql(set.kind);
     {sql: `\{left.sql} \{op} \{right.sql}`, ctx: right.ctx}
@@ -769,16 +768,49 @@ pub def render_query_plan_candidate: Fn(qb::QueryPlan) -> qb::Query = fn(raw) {
                 bindings: alias.1.bindings}
         },
         qb::QueryPlan::SetRows(set) => {
-            let rows = emit_set(set);
+            let reserved = array::concat([plan_aliases(set.left), plan_aliases(set.right)]);
+            let rows = emit_set(set, context(1, reserved));
             {sql: rows.sql, bindings: rows.ctx.bindings}
         },
         qb::QueryPlan::SetCount(set) => {
-            let rows = emit_set(set);
+            let reserved = array::concat([plan_aliases(set.left), plan_aliases(set.right)]);
+            let rows = emit_set(set, context(1, reserved));
             let alias = internal_alias(rows.ctx);
             {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
                 bindings: alias.1.bindings}
         },
     }
+};
+
+pub def render_query_plan_with_context: Fn(qb::QueryPlan, qb::BuildCtx) -> qb::Query = fn(raw, builder) {
+    let plan = qb::validate_query_plan(raw);
+    let reserved = match plan {
+        qb::QueryPlan::Rows(rows) => plan_aliases(rows),
+        qb::QueryPlan::DistinctRows(rows) => plan_aliases(rows),
+        qb::QueryPlan::GroupCount(rows) => plan_aliases(rows),
+        qb::QueryPlan::SetRows(set) => array::concat([plan_aliases(set.left), plan_aliases(set.right)]),
+        qb::QueryPlan::SetCount(set) => array::concat([plan_aliases(set.left), plan_aliases(set.right)]),
+    };
+    let ctx: RenderCtx = {...context(builder.next_binding, reserved),
+        bindings: builder.bindings, builder_bindings: builder.bindings};
+    let rendered = match plan {
+        qb::QueryPlan::Rows(rows) => emit_rows(rows, False, ctx),
+        qb::QueryPlan::DistinctRows(rows) => emit_rows(rows, True, ctx),
+        qb::QueryPlan::GroupCount(rows) => {
+            let inner = emit_rows(rows, False, ctx);
+            let alias = internal_alias(inner.ctx);
+            {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}
+        },
+        qb::QueryPlan::SetRows(set) => emit_set(set, ctx),
+        qb::QueryPlan::SetCount(set) => {
+            let inner = emit_set(set, ctx);
+            let alias = internal_alias(inner.ctx);
+            {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}
+        },
+    };
+    if array::length(rendered.ctx.bindings) != array::length(builder.bindings) {
+        fail!("constructed query plan contains values not allocated by qb", plan)
+    } else { {sql: rendered.sql, bindings: builder.bindings} }
 };
 
 pub def render_rows_candidate: Fn(qb::Plan, Bool) -> qb::Query = fn(plan, distinct) {

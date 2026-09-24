@@ -2632,17 +2632,19 @@ def sqlite_json_path: Fn(JsonPath) -> String = fn(path) {
     `$\{string::join(parts, "")}`
 };
 
-def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
+def render_expr: Fn(Expr, BuildCtx) -> Tuple([String, Array(Val)]) = fn(expr, ctx) {
     match expr {
         Expr::Column(ref) => {
             let empty: Array(Val) = [];
             (`\{ref.source}.\{ref.column}`, empty)
         },
         Expr::Bind(val) => ("?", [val]),
-        Expr::AllocatedBind(binding) => fail!("SQLite numbered binding rendering requires a build context", binding),
+        Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(ctx.bindings) {
+            (`?\{binding.index}`, [])
+        } else { fail!("binding handle is not registered in builder context", binding) },
         Expr::JsonPath(path) => ("?", [Val::String(sqlite_json_path(path))]),
         Expr::Scalar(call) => {
-            let rendered_args = array::map(call.args, render_expr);
+            let rendered_args = array::map(call.args, fn(arg) { render_expr(arg, ctx) });
             let sql_parts = array::map(rendered_args, fn(pair) { pair.0 });
             let bind_parts = array::map(rendered_args, fn(pair) { pair.1 });
             let bindings = array::concat(bind_parts);
@@ -2651,34 +2653,22 @@ def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
     }
 };
 
-def render_numbered_expr: Fn(Expr, BuildCtx) -> String = fn(expr, ctx) {
-    match expr {
-        Expr::Column(ref) => if is_sql_identifier(ref.source) && is_sql_identifier(ref.column) {
-            `"\{ref.source}"."\{ref.column}"`
-        } else { fail!("invalid column symbol", ref) },
-        Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(ctx.bindings) {
-            `?\{binding.index}`
-        } else { fail!("binding handle is not registered in builder context", binding) },
-        Expr::Scalar(call) => render_scalar_sql(call.function,
-            array::map(call.args, fn(arg) { render_numbered_expr(arg, ctx) })),
-        Expr::Bind(_) => fail!("context-bound expression cannot mix legacy bindings", expr),
-        Expr::JsonPath(_) => fail!("context-bound expression requires an allocated JSON path", expr),
-    }
-};
-
 def render_sqlite_expr_with_context: Fn(Expr, BuildCtx) -> Query = fn(expr, ctx) {
-    {sql: render_numbered_expr(expr, ctx), bindings: ctx.bindings}
+    let rendered = render_expr(expr, ctx);
+    if array::length(rendered.1) != 0 {
+        fail!("context-bound expression cannot mix legacy bindings", expr)
+    } else { {sql: rendered.0, bindings: ctx.bindings} }
 };
 
 # Renders a scalar-subquery payload to `(<sql>)` plus its bindings.  Bindings
 # follow placeholder order inside the subquery text: the aggregate argument,
 # aggregate-local filter, then the row filter (joins carry no bindings).
-def render_scalar_subquery: Fn(ScalarSubquery) -> Tuple([String, Array(Val)]) = fn(sq) {
-    let rendered = render_expr(sq.arg);
+def render_scalar_subquery: Fn(ScalarSubquery, BuildCtx) -> Tuple([String, Array(Val)]) = fn(sq, ctx) {
+    let rendered = render_expr(sq.arg, ctx);
     let distinct_sql = if sq.distinct { "DISTINCT " } else { "" };
     let agg_filter_part = match sq.agg_filter {
         Some(expr) => {
-            let filtered = render_expr(expr);
+            let filtered = render_expr(expr, ctx);
             (` FILTER (WHERE \{filtered.0})`, filtered.1)
         },
         None => {
@@ -2687,8 +2677,8 @@ def render_scalar_subquery: Fn(ScalarSubquery) -> Tuple([String, Array(Val)]) = 
         },
     };
     let agg_sql = `\{aggregate_name(sq.function)}(\{distinct_sql}\{rendered.0})\{agg_filter_part.0}`;
-    let from = render_source(sq.source);
-    let rendered_joins = array::map(sq.joins, render_join);
+    let from = render_source(sq.source, ctx);
+    let rendered_joins = array::map(sq.joins, fn(join) { render_join(join, ctx) });
     let joins_text = string::join(array::map(rendered_joins, fn(pair) { pair.0 }), " ");
     let join_text = if array::length(sq.joins) > 0 {
         ` \{joins_text}`
@@ -2697,7 +2687,7 @@ def render_scalar_subquery: Fn(ScalarSubquery) -> Tuple([String, Array(Val)]) = 
     };
     let filter_part = match sq.filter {
         Some(expr) => {
-            let filtered = render_expr(expr);
+            let filtered = render_expr(expr, ctx);
             (` WHERE \{filtered.0}`, filtered.1)
         },
         None => {
@@ -2711,12 +2701,12 @@ def render_scalar_subquery: Fn(ScalarSubquery) -> Tuple([String, Array(Val)]) = 
     (sql, binds)
 };
 
-def render_aggregate_call: Fn(AggregateCall) -> Tuple([String, Array(Val)]) = fn(call) {
-    let rendered = render_expr(call.arg);
+def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> Tuple([String, Array(Val)]) = fn(call, ctx) {
+    let rendered = render_expr(call.arg, ctx);
     let distinct_sql = if call.distinct { "DISTINCT " } else { "" };
     let filter_part = match call.filter {
         Some(expr) => {
-            let filtered = render_expr(expr);
+            let filtered = render_expr(expr, ctx);
             (` FILTER (WHERE \{filtered.0})`, filtered.1)
         },
         None => {
@@ -2731,9 +2721,9 @@ def render_aggregate_call: Fn(AggregateCall) -> Tuple([String, Array(Val)]) = fn
 # Renders the full expression of a measure alias (aggregate or computed) by
 # re-expanding its declaration.  A computed aggregate may reference another
 # computed aggregate; acyclicity is enforced by structural validation.
-def render_computed_aggregate: Fn(Plan, ComputedAggregate) -> Tuple([String, Array(Val)]) = fn(plan, ca) {
-    let left = render_measure_ref(plan, ca.left);
-    let right = render_measure_ref(plan, ca.right);
+def render_computed_aggregate: Fn(Plan, ComputedAggregate, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, ca, ctx) {
+    let left = render_measure_ref(plan, ca.left, ctx);
+    let right = render_measure_ref(plan, ca.right, ctx);
     let op = match ca.op {
         ComputedOp::Add => "+",
         ComputedOp::Sub => "-",
@@ -2741,28 +2731,28 @@ def render_computed_aggregate: Fn(Plan, ComputedAggregate) -> Tuple([String, Arr
     (`(\{left.0} \{op} \{right.0})`, array::concat([left.1, right.1]))
 };
 
-def render_measure_ref: Fn(Plan, String) -> Tuple([String, Array(Val)]) = fn(plan, alias) {
+def render_measure_ref: Fn(Plan, String, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, alias, ctx) {
     match find_item_by_alias(plan, alias) {
-        Some(SelectItem::Aggregate(call)) => render_aggregate_call(call),
-        Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca),
+        Some(SelectItem::Aggregate(call)) => render_aggregate_call(call, ctx),
+        Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca, ctx),
         _ => fail!("measure reference is not a declared aggregate or computed aggregate", plan, alias),
     }
 };
 
-def render_select_item: Fn(SelectItem, Plan) -> Tuple([String, Array(Val)]) = fn(item, plan) {
+def render_select_item: Fn(SelectItem, Plan, BuildCtx) -> Tuple([String, Array(Val)]) = fn(item, plan, ctx) {
     match item {
-        SelectItem::Expr(expr) => render_expr(expr),
+        SelectItem::Expr(expr) => render_expr(expr, ctx),
         SelectItem::NamedExpr(named) => do {
-            let rendered = render_expr(named.expr);
+            let rendered = render_expr(named.expr, ctx);
             (`\{rendered.0} AS \{named.alias}`, rendered.1)
         },
         SelectItem::Aggregate(call) => {
-            let rendered = render_aggregate_call(call);
+            let rendered = render_aggregate_call(call, ctx);
             let sql = `\{rendered.0} AS \{call.alias}`;
             (sql, rendered.1)
         },
         SelectItem::Computed(ca) => {
-            let rendered = render_computed_aggregate(plan, ca);
+            let rendered = render_computed_aggregate(plan, ca, ctx);
             let sql = `\{rendered.0} AS \{ca.alias}`;
             (sql, rendered.1)
         },
@@ -2772,45 +2762,45 @@ def render_select_item: Fn(SelectItem, Plan) -> Tuple([String, Array(Val)]) = fn
 # Renders an ON-condition tree to SQL text.  A single `ScalarFunction.Eq` atom renders
 # without parentheses so simple equality joins keep the documented shape;
 # `ScalarFunction.And`/`ScalarFunction.Or` render parenthesized so nested precedence is deterministic.
-def render_join_condition: Fn(JoinCondition) -> Tuple([String, Array(Val)]) = fn(condition) {
+def render_join_condition: Fn(JoinCondition, BuildCtx) -> Tuple([String, Array(Val)]) = fn(condition, ctx) {
     match condition {
         JoinCondition::Eq(eq) => (`\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`, []),
-        JoinCondition::Predicate(expr) => render_expr(expr),
+        JoinCondition::Predicate(expr) => render_expr(expr, ctx),
         JoinCondition::And(items) => {
-            let parts = array::map(items, render_join_condition);
+            let parts = array::map(items, fn(item) { render_join_condition(item, ctx) });
             (`(\{string::join(array::map(parts, fn(part) { part.0 }), " AND ")})`,
                 array::concat(array::map(parts, fn(part) { part.1 })))
         },
         JoinCondition::Or(items) => {
-            let parts = array::map(items, render_join_condition);
+            let parts = array::map(items, fn(item) { render_join_condition(item, ctx) });
             (`(\{string::join(array::map(parts, fn(part) { part.0 }), " OR ")})`,
                 array::concat(array::map(parts, fn(part) { part.1 })))
         },
     }
 };
 
-def render_source: Fn(Source) -> Tuple([String, Array(Val)]) = fn(source_item) {
+def render_source: Fn(Source, BuildCtx) -> Tuple([String, Array(Val)]) = fn(source_item, ctx) {
     match source_item.scope {
         None => {
             let empty: Array(Val) = [];
             (`\{source_item.table} AS \{source_item.alias}`, empty)
         },
         Some(scope) => {
-            let rendered = render_expr(scope);
+            let rendered = render_expr(scope, ctx);
             (`(SELECT * FROM \{source_item.table} AS \{source_item.alias} WHERE \{rendered.0}) AS \{source_item.alias}`, rendered.1)
         },
     }
 };
 
-def render_join: Fn(Join) -> Tuple([String, Array(Val)]) = fn(join) {
-    let source_part = render_source(join.source);
-    let condition = render_join_condition(join.condition);
+def render_join: Fn(Join, BuildCtx) -> Tuple([String, Array(Val)]) = fn(join, ctx) {
+    let source_part = render_source(join.source, ctx);
+    let condition = render_join_condition(join.condition, ctx);
     (`\{join_kind_sql(join.kind)} \{source_part.0} ON \{condition.0}`, array::concat([source_part.1, condition.1]))
 };
 
-def render_group_part: Fn(Array(Expr)) -> Tuple([String, Array(Val)]) = fn(grouping) {
+def render_group_part: Fn(Array(Expr), BuildCtx) -> Tuple([String, Array(Val)]) = fn(grouping, ctx) {
     if array::length(grouping) > 0 {
-        let rendered_group = array::map(grouping, render_expr);
+        let rendered_group = array::map(grouping, fn(expr) { render_expr(expr, ctx) });
         let group_sql = string::join(array::map(rendered_group, fn(pair) { pair.0 }), ", ");
         let group_bindings = array::concat(array::map(rendered_group, fn(pair) { pair.1 }));
         (` GROUP BY \{group_sql}`, group_bindings)
@@ -2823,11 +2813,11 @@ def render_group_part: Fn(Array(Expr)) -> Tuple([String, Array(Val)]) = fn(group
 # Renders the HAVING clause of a correlated EXISTS aggregate body.  Only
 # direct `HavingMeasure.Call` aggregate measures are allowed there (validated up front), so
 # no outer Plan is needed.
-def render_exists_having_clause: Fn(Array(Having)) -> Tuple([String, Array(Val)]) = fn(having_list) {
+def render_exists_having_clause: Fn(Array(Having), BuildCtx) -> Tuple([String, Array(Val)]) = fn(having_list, ctx) {
     let parts = array::map(having_list, fn(h) {
         match h.measure {
             HavingMeasure::Call(call) => {
-                let rendered = render_aggregate_call(call);
+                let rendered = render_aggregate_call(call, ctx);
                 let values: Array(Val) = [h.threshold];
                 (`\{rendered.0} \{having_op_sql(h.op)} ?`, array::concat([rendered.1, values]))
             },
@@ -2861,9 +2851,9 @@ def render_eq_sql: Fn(ColumnEq) -> String = fn(eq) {
 #           [AND <origin_filter>][AND <peer_filter>])
 # Origin/peer filters and key binds belong to their own inner aliases.  No
 # participant table is ever outer-joined; the predicate only filters hub rows.
-def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
-    let origin_source = render_source(corr.origin);
-    let peer_source = render_source(corr.peer);
+def render_peer_corr: Fn(PeerCorr, BuildCtx) -> Tuple([String, Array(Val)]) = fn(corr, ctx) {
+    let origin_source = render_source(corr.origin, ctx);
+    let peer_source = render_source(corr.peer, ctx);
     let from_sql = `\{origin_source.0}, \{peer_source.0}`;
     let a_origin = render_eq_sql(corr.branch_a.origin);
     let a_peer = render_eq_sql(corr.branch_a.peer);
@@ -2883,7 +2873,7 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
     };
     let origin_part = match corr.origin_filter {
         Some(expr) => {
-            let rendered = render_expr(expr);
+            let rendered = render_expr(expr, ctx);
             (` AND \{rendered.0}`, rendered.1)
         },
         None => {
@@ -2893,7 +2883,7 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
     };
     let peer_part = match corr.peer_filter {
         Some(expr) => {
-            let rendered = render_expr(expr);
+            let rendered = render_expr(expr, ctx);
             (` AND \{rendered.0}`, rendered.1)
         },
         None => {
@@ -2915,17 +2905,17 @@ def render_peer_corr: Fn(PeerCorr) -> Tuple([String, Array(Val)]) = fn(corr) {
 # closed OR of ANDed equalities `(a1 AND a2) OR (b1 ...)`; otherwise it is the
 # ANDed `pairs` equalities.  With `peer` set it is the two-participant paired
 # correlation (see `render_peer_corr`).
-def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
+def render_exists: Fn(Exists, BuildCtx) -> Tuple([String, Array(Val)]) = fn(ex, ctx) {
     match ex.peer {
-        Some(corr) => render_peer_corr(corr),
+        Some(corr) => render_peer_corr(corr, ctx),
         None => match ex.link {
             Some(link) => do {
                 # Bounded correlated two-hop link body: the whole A -> B -> C
                 # condition stays inside ONE correlated EXISTS.  B (`ex.source`)
                 # is INNER JOINed to C (`link.source`) inside the subquery, so a
                 # fan-out A -> B first hop never fans out the outer A rows.
-                let hop_from = render_source(ex.source);
-                let link_from = render_source(link.source);
+                let hop_from = render_source(ex.source, ctx);
+                let link_from = render_source(link.source, ctx);
                 let on_sql = match link.alternatives {
                     None => string::join(array::map(link.pairs, fn(p) {
                         `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
@@ -2942,7 +2932,7 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                         ("", empty)
                     },
                     Some(tail) => {
-                        let tail_source = render_source(tail.source);
+                        let tail_source = render_source(tail.source, ctx);
                         let conditions = string::join(array::map(tail.pairs, fn(p) {
                             `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
                         }), " AND ");
@@ -2966,7 +2956,7 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                 };
                 let link_filter_part = match link.filter {
                     Some(expr) => {
-                        let rendered = render_expr(expr);
+                        let rendered = render_expr(expr, ctx);
                         (` AND \{rendered.0}`, rendered.1)
                     },
                     None => {
@@ -2978,10 +2968,10 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                 (sql, array::concat([hop_from.1, link_from.1, tail_join.1, link_filter_part.1]))
             },
             None => do {
-                let source_part = render_source(ex.source);
+                let source_part = render_source(ex.source, ctx);
                 let filter_part = match ex.filter {
                     Some(expr) => {
-                        let rendered = render_expr(expr);
+                        let rendered = render_expr(expr, ctx);
                         (` AND \{rendered.0}`, rendered.1)
                     },
                     None => {
@@ -2989,8 +2979,8 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
                         ("", empty)
                     },
                 };
-                let group_part = render_group_part(ex.grouping);
-                let having_part = render_exists_having_clause(ex.having);
+                let group_part = render_group_part(ex.grouping, ctx);
+                let having_part = render_exists_having_clause(ex.having, ctx);
                 match ex.alternatives {
                     Some(alternatives) => do {
                         let alternative_sqls = array::map(alternatives, fn(alt) {
@@ -3021,8 +3011,8 @@ def render_exists: Fn(Exists) -> Tuple([String, Array(Val)]) = fn(ex) {
 # `<outer.column> <op> <(scalar subquery)>`.  Bindings follow the scalar
 # subquery's own placeholder order (aggregate argument, aggregate-local filter,
 # then inner row filter).
-def render_scalar_comparison: Fn(ScalarAggregateComparison) -> Tuple([String, Array(Val)]) = fn(cmp) {
-    let rendered = render_scalar_subquery(cmp.inner);
+def render_scalar_comparison: Fn(ScalarAggregateComparison, BuildCtx) -> Tuple([String, Array(Val)]) = fn(cmp, ctx) {
+    let rendered = render_scalar_subquery(cmp.inner, ctx);
     let sql = `\{cmp.outer.source}.\{cmp.outer.column} \{scalar_name(cmp.op)} \{rendered.0}`;
     (sql, rendered.1)
 };
@@ -3032,12 +3022,12 @@ def render_scalar_comparison: Fn(ScalarAggregateComparison) -> Tuple([String, Ar
 # row filter, GROUP BY <key>, ORDER BY <order-aggregate> <direction>, LIMIT 1.
 # Bindings follow placeholder order: key (SELECT), row filter, key (GROUP BY),
 # then the ordering aggregate expression.
-def render_ranked_subquery: Fn(RankedKeySubquery) -> Tuple([String, Array(Val)]) = fn(sq) {
-    let key_parts = array::map(sq.keys, render_expr);
+def render_ranked_subquery: Fn(RankedKeySubquery, BuildCtx) -> Tuple([String, Array(Val)]) = fn(sq, ctx) {
+    let key_parts = array::map(sq.keys, fn(expr) { render_expr(expr, ctx) });
     let key_sql = string::join(array::map(key_parts, fn(p) { p.0 }), ", ");
     let key_binds = array::concat(array::map(key_parts, fn(p) { p.1 }));
-    let from = render_source(sq.source);
-    let rendered_joins = array::map(sq.joins, render_join);
+    let from = render_source(sq.source, ctx);
+    let rendered_joins = array::map(sq.joins, fn(join) { render_join(join, ctx) });
     let joins_text = string::join(array::map(rendered_joins, fn(p) { p.0 }), " ");
     let join_text = if array::length(sq.joins) > 0 {
         ` \{joins_text}`
@@ -3046,7 +3036,7 @@ def render_ranked_subquery: Fn(RankedKeySubquery) -> Tuple([String, Array(Val)])
     };
     let filter_part = match sq.filter {
         Some(expr) => {
-            let filtered = render_expr(expr);
+            let filtered = render_expr(expr, ctx);
             (` WHERE \{filtered.0}`, filtered.1)
         },
         None => {
@@ -3054,7 +3044,7 @@ def render_ranked_subquery: Fn(RankedKeySubquery) -> Tuple([String, Array(Val)])
             ("", empty)
         },
     };
-    let order_rendered = render_aggregate_call(sq.order);
+    let order_rendered = render_aggregate_call(sq.order, ctx);
     let sql = `(SELECT \{key_sql} FROM \{from.0}\{join_text}\{filter_part.0} GROUP BY \{key_sql} ORDER BY \{order_rendered.0} \{direction_sql(sq.direction)} LIMIT 1)`;
     let binds = array::concat([key_binds, from.1, array::concat(array::map(rendered_joins, fn(p) { p.1 })), filter_part.1, key_binds, order_rendered.1]);
     (sql, binds)
@@ -3063,8 +3053,8 @@ def render_ranked_subquery: Fn(RankedKeySubquery) -> Tuple([String, Array(Val)])
 # Renders one ranked grouped-key comparison predicate as
 # `<outer.column> <op> <(grouped-key scalar subquery)>`.  Bindings follow the
 # subquery's own placeholder order.
-def render_ranked_comparison: Fn(RankedKeyComparison) -> Tuple([String, Array(Val)]) = fn(cmp) {
-    let rendered = render_ranked_subquery(cmp.inner);
+def render_ranked_comparison: Fn(RankedKeyComparison, BuildCtx) -> Tuple([String, Array(Val)]) = fn(cmp, ctx) {
+    let rendered = render_ranked_subquery(cmp.inner, ctx);
     let sql = `\{cmp.outer.source}.\{cmp.outer.column} \{scalar_name(cmp.op)} \{rendered.0}`;
     (sql, rendered.1)
 };
@@ -3075,9 +3065,9 @@ def render_ranked_comparison: Fn(RankedKeyComparison) -> Tuple([String, Array(Va
 # order: the row filter first, then each EXISTS subquery's own bindings, then
 # each scalar comparison's inner bindings and each ranked comparison's inner
 # bindings in deterministic predicate order.
-def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateComparison), Array(RankedKeyComparison)) -> Tuple([String, Array(Val)]) = fn(filter, exists_list, comparisons, ranked_comparisons) {
+def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateComparison), Array(RankedKeyComparison), BuildCtx) -> Tuple([String, Array(Val)]) = fn(filter, exists_list, comparisons, ranked_comparisons, ctx) {
     let filter_part = match filter {
-        Some(expr) => render_expr(expr),
+        Some(expr) => render_expr(expr, ctx),
         None => {
             let empty: Array(Val) = [];
             ("", empty)
@@ -3091,7 +3081,7 @@ def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateCo
     # correlated body, source, bindings and grain semantics are unchanged; only
     # the SQL keyword prefix differs.
     let exists_parts = array::map(exists_list, fn(ex) {
-        let rendered = render_exists(ex);
+        let rendered = render_exists(ex, ctx);
         if ex.negated {
             (`NOT \{rendered.0}`, rendered.1)
         } else {
@@ -3100,10 +3090,10 @@ def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateCo
     });
     let exists_sqls = array::map(exists_parts, fn(p) { p.0 });
     let exists_binds = array::concat(array::map(exists_parts, fn(p) { p.1 }));
-    let comparison_parts = array::map(comparisons, render_scalar_comparison);
+    let comparison_parts = array::map(comparisons, fn(cmp) { render_scalar_comparison(cmp, ctx) });
     let comparison_sqls = array::map(comparison_parts, fn(p) { p.0 });
     let comparison_binds = array::concat(array::map(comparison_parts, fn(p) { p.1 }));
-    let ranked_parts = array::map(ranked_comparisons, render_ranked_comparison);
+    let ranked_parts = array::map(ranked_comparisons, fn(cmp) { render_ranked_comparison(cmp, ctx) });
     let ranked_sqls = array::map(ranked_parts, fn(p) { p.0 });
     let ranked_binds = array::concat(array::map(ranked_parts, fn(p) { p.1 }));
     let where_body: Array(String) = [];
@@ -3150,17 +3140,17 @@ def having_op_sql: Fn(HavingOp) -> String = fn(op) {
 # Renders one aggregate-result predicate.  A `HavingMeasure.Ref` measure is re-expanded to
 # its full aggregate/computed SQL; a `HavingMeasure.Call` measure renders its own aggregate
 # expression.  Measure bindings stay before the trailing threshold `?` binding.
-def render_having: Fn(Plan, Having) -> Tuple([String, Array(Val)]) = fn(plan, h) {
+def render_having: Fn(Plan, Having, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, h, ctx) {
     let rendered = match h.measure {
-        HavingMeasure::Ref(ref) => render_measure_ref(plan, ref.alias),
-        HavingMeasure::Call(call) => render_aggregate_call(call),
+        HavingMeasure::Ref(ref) => render_measure_ref(plan, ref.alias, ctx),
+        HavingMeasure::Call(call) => render_aggregate_call(call, ctx),
     };
     let values: Array(Val) = [h.threshold];
     (`\{rendered.0} \{having_op_sql(h.op)} ?`, array::concat([rendered.1, values]))
 };
 
-def render_having_clause: Fn(Plan, Array(Having)) -> Tuple([String, Array(Val)]) = fn(plan, having_list) {
-    let parts = array::map(having_list, fn(h) { render_having(plan, h) });
+def render_having_clause: Fn(Plan, Array(Having), BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, having_list, ctx) {
+    let parts = array::map(having_list, fn(h) { render_having(plan, h, ctx) });
     let sql = if array::length(having_list) > 0 {
         ` HAVING \{string::join(array::map(parts, fn(p) { p.0 }), " AND ")}`
     } else {
@@ -3173,34 +3163,34 @@ def render_having_clause: Fn(Plan, Array(Having)) -> Tuple([String, Array(Val)])
 # Renders an ordering key.  An AggregateRef renders the full aggregate or
 # computed aggregate expression of the projected measure (never a
 # source-qualified alias), so the generated SQL is executable and unambiguous.
-def render_order_key: Fn(OrderKey, Plan) -> Tuple([String, Array(Val)]) = fn(key, plan) {
+def render_order_key: Fn(OrderKey, Plan, BuildCtx) -> Tuple([String, Array(Val)]) = fn(key, plan, ctx) {
     match key {
-        OrderKey::Expr(expr) => render_expr(expr),
+        OrderKey::Expr(expr) => render_expr(expr, ctx),
         OrderKey::AggregateRef(ref) => {
             match find_item_by_alias(plan, ref.alias) {
-                Some(SelectItem::Aggregate(call)) => render_aggregate_call(call),
-                Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca),
+                Some(SelectItem::Aggregate(call)) => render_aggregate_call(call, ctx),
+                Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca, ctx),
                 _ => fail!("ordering references an unprojected measure", plan, ref),
             }
         },
         # A direct ordering aggregate renders its own aggregate expression (the
         # internal value used only to order the groups is never projected).
-        OrderKey::Aggregate(call) => render_aggregate_call(call),
+        OrderKey::Aggregate(call) => render_aggregate_call(call, ctx),
     }
 };
 
 # Renders one UNION ALL branch as `SELECT <name> AS <col>, ... FROM <table> AS
 # <alias> [WHERE ...]`.  Bindings follow the branch's own placeholder order.
-def render_union_branch: Fn(UnionBranch) -> Tuple([String, Array(Val)]) = fn(branch) {
+def render_union_branch: Fn(UnionBranch, BuildCtx) -> Tuple([String, Array(Val)]) = fn(branch, ctx) {
     let items = array::map(branch.outputs, fn(col) {
-        let rendered = render_expr(col.expr);
+        let rendered = render_expr(col.expr, ctx);
         (`\{rendered.0} AS \{col.name}`, rendered.1)
     });
     let select_sql = string::join(array::map(items, fn(pair) { pair.0 }), ", ");
     let select_binds = array::concat(array::map(items, fn(pair) { pair.1 }));
     let filter_part = match branch.filter {
         Some(expr) => {
-            let rendered = render_expr(expr);
+            let rendered = render_expr(expr, ctx);
             (` WHERE \{rendered.0}`, rendered.1)
         },
         None => {
@@ -3208,14 +3198,14 @@ def render_union_branch: Fn(UnionBranch) -> Tuple([String, Array(Val)]) = fn(bra
             ("", empty)
         },
     };
-    let from = render_source(branch.source);
+    let from = render_source(branch.source, ctx);
     let sql = `SELECT \{select_sql} FROM \{from.0}\{filter_part.0}`;
     (sql, array::concat([select_binds, from.1, filter_part.1]))
 };
 
 # Renders the ordered branches merged with UNION ALL (text and merged bindings).
-def render_union: Fn(DerivedSource) -> Tuple([String, Array(Val)]) = fn(ds) {
-    let parts = array::map(ds.branches, render_union_branch);
+def render_union: Fn(DerivedSource, BuildCtx) -> Tuple([String, Array(Val)]) = fn(ds, ctx) {
+    let parts = array::map(ds.branches, fn(branch) { render_union_branch(branch, ctx) });
     let sql = string::join(array::map(parts, fn(pair) { pair.0 }), " UNION ALL ");
     let binds = array::concat(array::map(parts, fn(pair) { pair.1 }));
     (sql, binds)
@@ -3223,28 +3213,28 @@ def render_union: Fn(DerivedSource) -> Tuple([String, Array(Val)]) = fn(ds) {
 
 # Renders the FROM item of a plan: either the physical primary source or the
 # derived UNION ALL relation `(<union>) AS <alias>`.
-def render_from_clause: Fn(Plan) -> Tuple([String, Array(Val)]) = fn(plan) {
+def render_from_clause: Fn(Plan, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, ctx) {
     match plan.derived {
         Some(ds) => {
-            let inner = render_union(ds);
+            let inner = render_union(ds, ctx);
             (`(\{inner.0}) AS \{ds.alias}`, inner.1)
         },
         None => {
-            render_source(plan.sources[0])
+            render_source(plan.sources[0], ctx)
         },
     }
 };
 
-def render_unpartitioned: Fn(Plan, Bool) -> Query = fn(plan, distinct) {
-    let rendered_items = array::map(plan.projection, fn(item) { render_select_item(item, plan) });
+def render_unpartitioned: Fn(Plan, Bool, BuildCtx) -> Query = fn(plan, distinct, ctx) {
+    let rendered_items = array::map(plan.projection, fn(item) { render_select_item(item, plan, ctx) });
     let select_sql = string::join(array::map(rendered_items, fn(pair) { pair.0 }), ", ");
     let select_bindings = array::concat(array::map(rendered_items, fn(pair) { pair.1 }));
 
-    let from_clause = render_from_clause(plan);
+    let from_clause = render_from_clause(plan, ctx);
     let from_sql = from_clause.0;
     let from_bindings = from_clause.1;
 
-    let rendered_joins = array::map(plan.joins, render_join);
+    let rendered_joins = array::map(plan.joins, fn(join) { render_join(join, ctx) });
     let joins_text = string::join(array::map(rendered_joins, fn(pair) { pair.0 }), " ");
     let joins_bindings = array::concat(array::map(rendered_joins, fn(pair) { pair.1 }));
     let join_text = if array::length(plan.joins) > 0 {
@@ -3253,10 +3243,10 @@ def render_unpartitioned: Fn(Plan, Bool) -> Query = fn(plan, distinct) {
         ""
     };
 
-    let where_clause = render_where_clause(plan.filter, plan.exists, plan.scalar_comparisons, plan.ranked_key_comparisons);
+    let where_clause = render_where_clause(plan.filter, plan.exists, plan.scalar_comparisons, plan.ranked_key_comparisons, ctx);
 
     let group_part = if array::length(plan.grouping) > 0 {
-        let rendered_group = array::map(plan.grouping, render_expr);
+        let rendered_group = array::map(plan.grouping, fn(expr) { render_expr(expr, ctx) });
         let group_sql = string::join(array::map(rendered_group, fn(pair) { pair.0 }), ", ");
         let group_bindings = array::concat(array::map(rendered_group, fn(pair) { pair.1 }));
         (` GROUP BY \{group_sql}`, group_bindings)
@@ -3265,11 +3255,11 @@ def render_unpartitioned: Fn(Plan, Bool) -> Query = fn(plan, distinct) {
         ("", empty)
     };
 
-    let having_part = render_having_clause(plan, plan.having);
+    let having_part = render_having_clause(plan, plan.having, ctx);
 
     let order_part = if array::length(plan.ordering) > 0 {
         let rendered_order = array::map(plan.ordering, fn(ob) {
-            let rendered = render_order_key(ob.key, plan);
+            let rendered = render_order_key(ob.key, plan, ctx);
             (`\{rendered.0} \{direction_sql(ob.direction)}`, rendered.1)
         });
         let order_sql = string::join(array::map(rendered_order, fn(pair) { pair.0 }), ", ");
@@ -3350,22 +3340,22 @@ def expr_projection_ref: Fn(Expr, Array(SelectItem)) -> Option(String) = fn(expr
 # bindings).  Expression items get a stable `__q_<index>` alias; aggregate and
 # computed aggregates keep their public alias.  Everything is referenced by
 # name from the outer query.
-def render_partition_item: Fn(SelectItem, Int, Plan) -> Tuple([String, String, Array(Val)]) = fn(item, index, plan) {
+def render_partition_item: Fn(SelectItem, Int, Plan, BuildCtx) -> Tuple([String, String, Array(Val)]) = fn(item, index, plan, ctx) {
     match item {
         SelectItem::Expr(expr) => {
-            let rendered = render_expr(expr);
+            let rendered = render_expr(expr, ctx);
             (`\{rendered.0} AS __q_\{index}`, `__q_\{index}`, rendered.1)
         },
         SelectItem::NamedExpr(named) => {
-            let rendered = render_expr(named.expr);
+            let rendered = render_expr(named.expr, ctx);
             (`\{rendered.0} AS \{named.alias}`, named.alias, rendered.1)
         },
         SelectItem::Aggregate(call) => {
-            let rendered = render_aggregate_call(call);
+            let rendered = render_aggregate_call(call, ctx);
             (`\{rendered.0} AS \{call.alias}`, call.alias, rendered.1)
         },
         SelectItem::Computed(ca) => {
-            let rendered = render_computed_aggregate(plan, ca);
+            let rendered = render_computed_aggregate(plan, ca, ctx);
             (`\{rendered.0} AS \{ca.alias}`, ca.alias, rendered.1)
         },
     }
@@ -3381,9 +3371,9 @@ def render_partition_item: Fn(SelectItem, Int, Plan) -> Tuple([String, String, A
 # expression inside the SELECT list, so bindings follow the real placeholder
 # order: projection, hidden columns, window partition, window ordering, join,
 # global filter, grouping, then the outer take value.
-def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
+def render_partitioned: Fn(Plan, PartitionedTopN, BuildCtx) -> Query = fn(plan, pt, ctx) {
     let item_parts = array::map(array::enumerate(plan.projection), fn(pair) {
-        render_partition_item(pair.1, pair.0, plan)
+        render_partition_item(pair.1, pair.0, plan, ctx)
     });
     let inner_select_parts = array::map(item_parts, fn(part) { part.0 });
     let outer_refs = array::map(item_parts, fn(part) { part.1 });
@@ -3406,7 +3396,7 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
         }
     });
     let pk_hidden = array::map(pk_hidden_parts, fn(pair) {
-        let rendered = render_expr(pair.1);
+        let rendered = render_expr(pair.1, ctx);
         (`\{rendered.0} AS __q_pk_\{pair.0}`, rendered.1)
     });
 
@@ -3439,7 +3429,7 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
     let ok_hidden = array::map(ok_hidden_parts, fn(pair) {
         match pair.1.key {
             OrderKey::Expr(expr) => {
-                let rendered = render_expr(expr);
+                let rendered = render_expr(expr, ctx);
                 (`\{rendered.0} AS __q_ok_\{pair.0}`, rendered.1)
             },
             OrderKey::AggregateRef(_) => {
@@ -3455,21 +3445,21 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
 
     # Window clause: PARTITION BY the partition keys, ORDER BY the partition
     # ordering (aggregate keys render the full aggregate expression).
-    let partition_parts = array::map(pt.partition_by, render_expr);
+    let partition_parts = array::map(pt.partition_by, fn(expr) { render_expr(expr, ctx) });
     let partition_sql = string::join(array::map(partition_parts, fn(p) { p.0 }), ", ");
     let partition_bindings = array::concat(array::map(partition_parts, fn(p) { p.1 }));
     let window_order_parts = array::map(pt.order_by, fn(ob) {
-        let rendered = render_order_key(ob.key, plan);
+        let rendered = render_order_key(ob.key, plan, ctx);
         (`\{rendered.0} \{direction_sql(ob.direction)}`, rendered.1)
     });
     let window_order_sql = string::join(array::map(window_order_parts, fn(p) { p.0 }), ", ");
     let window_order_bindings = array::concat(array::map(window_order_parts, fn(p) { p.1 }));
 
     # FROM / JOIN / WHERE / GROUP BY (identical to the plain path).
-    let from_clause = render_from_clause(plan);
+    let from_clause = render_from_clause(plan, ctx);
     let from_sql = from_clause.0;
     let from_bindings = from_clause.1;
-    let rendered_joins = array::map(plan.joins, render_join);
+    let rendered_joins = array::map(plan.joins, fn(join) { render_join(join, ctx) });
     let joins_text = string::join(array::map(rendered_joins, fn(pair) { pair.0 }), " ");
     let joins_bindings = array::concat(array::map(rendered_joins, fn(pair) { pair.1 }));
     let join_text = if array::length(plan.joins) > 0 {
@@ -3477,9 +3467,9 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
     } else {
         ""
     };
-    let where_clause = render_where_clause(plan.filter, plan.exists, plan.scalar_comparisons, plan.ranked_key_comparisons);
+    let where_clause = render_where_clause(plan.filter, plan.exists, plan.scalar_comparisons, plan.ranked_key_comparisons, ctx);
     let group_part = if array::length(plan.grouping) > 0 {
-        let rendered_group = array::map(plan.grouping, render_expr);
+        let rendered_group = array::map(plan.grouping, fn(expr) { render_expr(expr, ctx) });
         let group_sql = string::join(array::map(rendered_group, fn(pair) { pair.0 }), ", ");
         let group_bindings = array::concat(array::map(rendered_group, fn(pair) { pair.1 }));
         (` GROUP BY \{group_sql}`, group_bindings)
@@ -3487,7 +3477,7 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
         let empty: Array(Val) = [];
         ("", empty)
     };
-    let having_part = render_having_clause(plan, plan.having);
+    let having_part = render_having_clause(plan, plan.having, ctx);
 
     let hidden_sqls = array::concat([
         array::map(pk_hidden, fn(p) { p.0 }),
@@ -3535,10 +3525,10 @@ def render_partitioned: Fn(Plan, PartitionedTopN) -> Query = fn(plan, pt) {
     result
 };
 
-def render_plan: Fn(Plan) -> Query = fn(plan) {
+def render_plan: Fn(Plan, BuildCtx) -> Query = fn(plan, ctx) {
     match plan.partition {
-        Some(pt) => render_partitioned(plan, pt),
-        None => render_unpartitioned(plan, False),
+        Some(pt) => render_partitioned(plan, pt, ctx),
+        None => render_unpartitioned(plan, False, ctx),
     }
 };
 
@@ -3548,7 +3538,7 @@ def render_plan: Fn(Plan) -> Query = fn(plan) {
 # with a Host diagnostic and never publish a partial Query.
 def transform_sqlite: Fn(Plan) -> Query = fn(plan) {
     let structured = validate_structure(plan);
-    render_plan(structured)
+    render_plan(structured, build_context())
 };
 
 def validate_distinct_plan: Fn(Plan) -> Plan = fn(plan) {
@@ -3594,7 +3584,7 @@ def validate_distinct_plan: Fn(Plan) -> Plan = fn(plan) {
 # DISTINCT is a plan shape, not a SQLite-specific permission.  All renderers
 # receive the same validated ungrouped projection and projected ordering.
 def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
-    render_unpartitioned(validate_distinct_plan(plan), True)
+    render_unpartitioned(validate_distinct_plan(plan), True, build_context())
 };
 
 # ---------------------------------------------------------------------------
@@ -3704,8 +3694,8 @@ def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
 
 def transform_sqlite_set: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, left, right) {
     let operands = validate_set_operands(kind, left, right);
-    let lq = render_plan(operands.0);
-    let rq = render_plan(operands.1);
+    let lq = render_plan(operands.0, build_context());
+    let rq = render_plan(operands.1, build_context());
     let sql = `\{lq.sql} \{set_op_sql(kind)} \{rq.sql}`;
     let result: Query = {sql: sql, bindings: array::concat([lq.bindings, rq.bindings])};
     result
@@ -3723,17 +3713,38 @@ def transform_sqlite_set_count: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, le
 
 # The dialect boundary consumes one validated top-level AST shape.  Legacy
 # shape-specific entry points delegate to the same validators and renderer.
-def transform_sqlite_query_plan: Fn(QueryPlan) -> Query = fn(query_plan) {
+def render_sqlite_plan: Fn(QueryPlan, BuildCtx) -> Query = fn(query_plan, ctx) {
     match validate_query_plan(query_plan) {
-        QueryPlan::Rows(plan) => render_plan(plan),
-        QueryPlan::DistinctRows(plan) => render_unpartitioned(plan, True),
-        QueryPlan::SetRows(set) => transform_sqlite_set(set.kind, set.left, set.right),
-        QueryPlan::SetCount(set) => transform_sqlite_set_count(set.kind, set.left, set.right),
+        QueryPlan::Rows(plan) => render_plan(plan, ctx),
+        QueryPlan::DistinctRows(plan) => render_unpartitioned(plan, True, ctx),
+        QueryPlan::SetRows(set) => {
+            let left = render_plan(set.left, ctx);
+            let right = render_plan(set.right, ctx);
+            {sql: `\{left.sql} \{set_op_sql(set.kind)} \{right.sql}`,
+                bindings: array::concat([left.bindings, right.bindings])}
+        },
+        QueryPlan::SetCount(set) => {
+            let left = render_plan(set.left, ctx);
+            let right = render_plan(set.right, ctx);
+            {sql: `SELECT count(1) FROM (\{left.sql} \{set_op_sql(set.kind)} \{right.sql}) AS __q_set`,
+                bindings: array::concat([left.bindings, right.bindings])}
+        },
         QueryPlan::GroupCount(plan) => {
-            let inner = render_plan(plan);
+            let inner = render_plan(plan, ctx);
             {sql: `SELECT count(1) FROM (\{inner.sql}) AS __q_count`, bindings: inner.bindings}
         },
     }
+};
+
+def transform_sqlite_query_plan: Fn(QueryPlan) -> Query = fn(query_plan) {
+    render_sqlite_plan(query_plan, build_context())
+};
+
+def render_query_plan_with_context: Fn(QueryPlan, BuildCtx) -> Query = fn(query_plan, ctx) {
+    let rendered = render_sqlite_plan(query_plan, ctx);
+    if array::length(rendered.bindings) != 0 {
+        fail!("constructed query plan contains values not allocated by qb", query_plan)
+    } else { {sql: rendered.sql, bindings: ctx.bindings} }
 };
 
 # Nested aggregate primitive (shape 1): count the rows produced by a grouped
@@ -3744,7 +3755,7 @@ def transform_sqlite_query_plan: Fn(QueryPlan) -> Query = fn(query_plan) {
 # For the same Plan/PlanProfile the SQL and bindings are byte-identical.
 def count_groups: Fn(Plan, PlanProfile) -> Query = fn(plan, profile) {
     let validated = validate(plan, profile);
-    let inner = render_plan(validated);
+    let inner = render_plan(validated, build_context());
     let sql = `SELECT count(1) FROM (\{inner.sql}) AS __q_count`;
     let result: Query = {sql: sql, bindings: inner.bindings};
     result
@@ -4321,6 +4332,7 @@ pub use self::{
     transform_sqlite_set,
     transform_sqlite_set_count,
     transform_sqlite_query_plan,
+    render_query_plan_with_context,
     render_sqlite_expr_with_context,
     set_ok,
     set_op_sql,
