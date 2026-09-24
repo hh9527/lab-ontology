@@ -1127,6 +1127,7 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
 | `list` | 行级维度投影（可筛选/排序）；支持 field-to-field 谓词与 `output_order` | measureless；隐藏行排序允许 |
 | `count` | 标量聚合摘要 + 筛选/existence/selected HAVING | `measures` 单/多个聚合无分组 |
 | `aggregate` | 分组聚合 + 可选 ordering/limit/selected HAVING/existence | 可选 `hidden_having`（同源隐藏聚合 HAVING） |
+| `qualify_group` | 按关联 owner 的完整 grain 隐藏分组；可选 HAVING/度量输出 | `relation`、`visible_dimensions`、`show_measure` |
 | `top` | 分组 Top-N，按隐藏相关聚合排序（只返回组列） | 可选 `hidden_having`（related 隐藏 HAVING） |
 | `distinct` | 互不重复的行级维度投影（SELECT DISTINCT） | |
 | `exists` / `absence` | 保留 base 行/组存在（不存在）相关关联记录 | related existence/absence |
@@ -1742,10 +1743,12 @@ measure、普通 filter 或 ordering 与此请求形状组合；`role_filters` �
 `directed_peer_hub_fields(participant, key_name, endpoint_name, participant,
 key_name, endpoint_name)` 以业务字段名定义固定方向的两个端点；准备期解析
 字段索引，拒绝不存在、非 key、相同端点或类型不一致的字段。
-`qualify_group` 要求具名 FanOut 关系从 measure 行指向分组 owner，owner 的
-声明 key 必须参加分组，筛选只能作用于 measure 行；可见输出只能取同一 owner
-的非 key 维度。隐藏 measure 的 HAVING 仍以结构化聚合调用表示，因此投影
-只返回所选 owner 维度。普通行级投影不因该能力而接受 FanOut 导航。
+`qualify_group` 要求具名 Safe 或 FanOut 关系从 measure 行指向分组 owner，
+owner 的完整声明 grain（未声明 dataset 时为标记的 key）必须参加分组。
+筛选可作用于 measure 行或关系指向的 owner，第三方实体被拒绝；两端的固有
+行域仍各自生效。可见维度只能取 owner 的非 key 字段，`show_measure: true`
+在其后输出唯一请求的聚合，缺省为隐藏度量；`having` 可省略或引用该聚合。
+普通行级投影不因该能力而接受 FanOut 导航。
 同一 KPI 物理字段可分别声明采样行维度和经聚合校验的 metric measure：
 `utc_window` 的行级 ORDER BY 只允许维度，不能将汇总 measure 冒充样本值排序。
 `utc_days_window` 从外部提供的规范 UTC 秒 `as_of` 与 1..3650 天的整数跨度

@@ -18,6 +18,64 @@ use std::test as test;
 use crate::ontology as edsl;
 use crate::test_models::test_knowledge as knowledge;
 
+@edsl::entity_source("group_composite_owner", "gco")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+type GroupCompositeOwner = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    @edsl::dimension("group_owner_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    id: String,
+    @edsl::column("tenantId")
+    @edsl::dimension("group_owner_tenant", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    tenant_id: String,
+    @edsl::column("name")
+    @edsl::dimension("group_owner_name", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    name: String,
+};
+
+@edsl::entity_source("group_composite_member", "gcm")
+@edsl::named_relation_key("group_member_owner", GroupCompositeOwner.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "owner_tenant", to: "tenant_id"}),
+    ]))
+type GroupCompositeMember = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    @edsl::measure("group_member_count", qb::AggregateFunction::Count, [])
+    id: String,
+    @edsl::column("ownerId")
+    owner_id: String,
+    @edsl::column("ownerTenant")
+    owner_tenant: String,
+};
+
+pub def hidden_group_rejects_incomplete_owner_grain: test::Test = test::should_fail_with(fn() {
+    let payload = edsl::build_root("group-composite", [GroupCompositeOwner.type, GroupCompositeMember.type], knowledge::profile, fn(subject) { True });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "group_member_count", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [{id: "group_owner_id", subject: "public", input: edsl::DimensionInput::None},
+            {id: "group_owner_name", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    edsl::lower_group_projection(payload, request, "group_member_owner", [], ["group_owner_name"], True)
+}, "group projection requires the owner's full declared grain");
+
+pub def hidden_group_preserves_full_owner_grain: test::Test = test::should_ok(fn() {
+    let payload = edsl::build_root("group-composite-valid", [GroupCompositeOwner.type, GroupCompositeMember.type], knowledge::profile, fn(subject) { True });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "group_member_count", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [{id: "group_owner_id", subject: "public", input: edsl::DimensionInput::None},
+            {id: "group_owner_tenant", subject: "public", input: edsl::DimensionInput::None},
+            {id: "group_owner_name", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    let plan = edsl::lower_group_projection(payload, request, "group_member_owner", [], ["group_owner_name"], True);
+    let query = qb::transform_sqlite(plan);
+    array::length(plan.grouping) == 3 && array::length(plan.projection) == 2
+        && string::contains(query.sql, "GROUP BY gco.id, gco.tenantId, gco.name")
+});
+
 def localized_value_domain: Array(edsl::CanonicalValueSpec) = [
     {id: "offline", label: "Offline", wires: [edsl::FilterInput::Text("0"), edsl::FilterInput::Text("2")]},
 ];

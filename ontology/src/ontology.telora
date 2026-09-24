@@ -5629,20 +5629,29 @@ def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(Ha
 
 # Keep a declared identity key in GROUP BY while exposing only requested
 # attributes. A direct aggregate call retains HAVING after hiding the measure.
-def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Array(String)) -> qb::Plan = fn(payload, request, relation_id, having_specs, visible_dimensions) {
+def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Array(String), Bool) -> qb::Plan = fn(payload, request, relation_id, having_specs, visible_dimensions, show_measure) {
     if array::length(request.measures) != 1 || array::length(request.dimensions) < 2
-        || array::length(visible_dimensions) == 0 || array::length(having_specs) == 0
+        || array::length(visible_dimensions) == 0
         || request.partition != None || array::length(request.ordering) != 0 || request.offset != None {
-        fail!("group projection requires one measure, an identity and visible dimensions, and HAVING without ordering")
+        fail!("group projection requires one measure, an identity and visible dimensions without ordering")
     } else {
         let dims = resolve_dimensions(payload, request.dimensions);
         let owner = get_index(dims, 0).entry.entity;
         let grouped_on_owner = array::all(dims, fn(d) { d.entry.entity == owner });
         let entity = get_index(payload.entities, owner);
-        let identity = array::any(dims, fn(d) {
-            d.entry.field == entity.key_field && !d.entry.computed
-                && array::length(d.entry.canonical_values) == 0
-        });
+        let identity = match entity.dataset {
+            Some(spec) => array::all(spec.grain, fn(name) {
+                array::any(entity.fields, fn(field) { field.name == name && array::any(dims, fn(d) {
+                    d.entry.field == field.index && !d.entry.computed
+                        && array::length(d.entry.canonical_values) == 0
+                })
+                })
+            }),
+            None => array::any(dims, fn(d) {
+                d.entry.field == entity.key_field && !d.entry.computed
+                    && array::length(d.entry.canonical_values) == 0
+            }),
+        };
         let no_omitted_scopes = array::all(dims, fn(d) { array::length(d.entry.scope) == 0 });
         let visible_valid = array::all(visible_dimensions, fn(id) {
             array::any(dims, fn(d) { d.entry.id == id && d.entry.field != entity.key_field })
@@ -5651,7 +5660,7 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
             !array::any(array::enumerate(visible_dimensions), fn(other) { other.0 < indexed.0 && other.1 == indexed.1 })
         });
         if !grouped_on_owner || !identity || !visible_valid || !distinct_visible || !no_omitted_scopes {
-            fail!("group projection requires one declared owner key and distinct visible owner dimensions", visible_dimensions)
+            fail!("group projection requires the owner's full declared grain and distinct visible owner dimensions", visible_dimensions)
         } else {
             let measure = match array::find(payload.measures, fn(m) { m.id == get_index(request.measures, 0).id }) {
                 Some(m) => m, None => fail!("unknown group projection measure", get_index(request.measures, 0).id),
@@ -5660,11 +5669,15 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
                 Some(r) => r, None => fail!("unknown group projection relation", relation_id),
             };
             let base_filters = resolve_filters(payload, request.filters);
-            if relation.from != measure.entity || relation.to != owner || relation.kind != RelationKind::FanOut
-                || !array::all(base_filters, fn(f) { f.entity == measure.entity }) {
-                fail!("group projection requires a named fan-out relation from filtered measure rows to the grouped owner", relation_id)
+            if relation.from != measure.entity || relation.to != owner
+                || !array::all(base_filters, fn(f) { f.entity == measure.entity || f.entity == owner }) {
+                fail!("group projection requires a named relation from filtered measure rows to the grouped owner and endpoint filters", relation_id)
             } else {
-            let measure_request: QueryRequest = {...request, dimensions: []};
+            let child_filters = array::filter(request.filters, fn(spec) {
+                array::any(payload.dimensions, fn(d) { d.id == spec.id && d.entity == measure.entity })
+            });
+            let owner_filters = array::map(array::filter(base_filters, fn(f) { f.entity == owner }), fn(f) { f.expr });
+            let measure_request: QueryRequest = {...request, dimensions: [], filters: child_filters};
             let plan = lower(payload, measure_request);
             if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
                 fail!("group projection measure requires a single physical source", measure.id)
@@ -5683,19 +5696,21 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
                     qb::HavingMeasure::Call(_) => fail!("group projection requires a declared measure HAVING"),
                 }
             });
-            let projection = array::map(visible_dimensions, fn(id) {
+            let visible_projection = array::map(visible_dimensions, fn(id) {
                 let dimension = match array::find(dims, fn(d) { d.entry.id == id }) {
                     Some(d) => d,
                     None => fail!("group projection references an unrequested dimension", id),
                 };
                 qb::expr_item(dimension_output_expr(payload, dimension.entry))
             });
+            let projection = if show_measure { array::push(visible_projection, measure_item) } else { visible_projection };
             let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, entity, entity.alias),
                 key_to_condition(payload, relation.from, relation.to, relation.key));
             let grouping = array::map(dims, fn(d) { dimension_output_expr(payload, d.entry) });
             let result: qb::Plan = {...plan,
                 sources: array::push(plan.sources, join.source),
                 joins: [join], projection, grouping, having,
+                filter: append_filter_terms(plan.filter, owner_filters),
             };
             qb::validate(result, payload.profile)
             }
