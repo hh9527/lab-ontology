@@ -5698,9 +5698,10 @@ def lower_full: Fn(PreparedPayload, QueryRequest, Array(ExistsRequest), Array(Ha
 
 # Keep a declared identity key in GROUP BY while exposing only requested
 # attributes. A direct aggregate call retains HAVING after hiding the measure.
-def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Array(String), Bool) -> qb::Plan = fn(payload, request, relation_id, having_specs, visible_dimensions, show_measure) {
-    if array::length(request.measures) != 1 || array::length(request.dimensions) < 2
-        || array::length(visible_dimensions) == 0
+def lower_group_projection_base: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Array(String), Bool, Bool, Bool) -> qb::Plan = fn(payload, request, relation_id, having_specs, visible_dimensions, show_measure, hidden_count, all_owners) {
+    if array::length(request.measures) != 1 || array::length(request.dimensions) < (if hidden_count { 1 } else { 2 })
+        || (array::length(visible_dimensions) == 0 && !hidden_count)
+        || (hidden_count && (!show_measure || array::length(visible_dimensions) != 0))
         || request.partition != None || array::length(request.ordering) != 0 || request.offset != None {
         fail!("group projection requires one measure, an identity and visible dimensions without ordering")
     } else {
@@ -5746,7 +5747,7 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
                 array::any(payload.dimensions, fn(d) { d.id == spec.id && d.entity == measure.entity })
             });
             let owner_filters = array::map(array::filter(base_filters, fn(f) { f.entity == owner }), fn(f) { f.expr });
-            let measure_request: QueryRequest = {...request, dimensions: [], filters: child_filters};
+            let measure_request: QueryRequest = {...request, dimensions: [], filters: if all_owners { [] } else { child_filters }};
             let plan = lower(payload, measure_request);
             if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
                 fail!("group projection measure requires a single physical source", measure.id)
@@ -5773,11 +5774,22 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
                 qb::expr_item(dimension_output_expr(payload, dimension.entry))
             });
             let projection = if show_measure { array::push(visible_projection, measure_item) } else { visible_projection };
-            let join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, entity, entity.alias),
-                key_to_condition(payload, relation.from, relation.to, relation.key));
+            let join = if all_owners {
+                let child_terms = array::map(resolve_filters(payload, child_filters), fn(f) { f.expr });
+                let relation_condition = key_to_condition(payload, relation.from, relation.to, relation.key);
+                let condition = if array::length(child_terms) == 0 { relation_condition }
+                    else { qb::on_and(array::concat([
+                        [relation_condition], array::map(child_terms, fn(expr) { qb::on_predicate(expr) })
+                    ])) };
+                qb::join_on(qb::JoinKind::Left, get_index(plan.sources, 0), condition)
+            } else {
+                qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, entity, entity.alias),
+                    key_to_condition(payload, relation.from, relation.to, relation.key))
+            };
             let grouping = array::map(dims, fn(d) { dimension_output_expr(payload, d.entry) });
             let result: qb::Plan = {...plan,
-                sources: array::push(plan.sources, join.source),
+                sources: if all_owners { [entity_source_at(payload, entity, entity.alias), join.source] }
+                    else { array::push(plan.sources, join.source) },
                 joins: [join], projection, grouping, having,
                 filter: append_filter_terms(plan.filter, owner_filters),
             };
@@ -5785,6 +5797,23 @@ def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(Havi
             }
             }
         }
+    }
+};
+
+def lower_group_projection: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Array(String), Bool) -> qb::Plan = fn(payload, request, relation_id, having_specs, visible_dimensions, show_measure) {
+    lower_group_projection_base(payload, request, relation_id, having_specs, visible_dimensions, show_measure, False, False)
+};
+
+# The grouped child measure is an internal witness only. Count owner identities
+# whose related rows form a nonempty group satisfying the aggregate predicates.
+# A zero-match owner needs a distinct all-owner/anti-existence semantics.
+def lower_related_group_count: Fn(PreparedPayload, QueryRequest, String, Array(HavingRequest), Bool) -> qb::Query = fn(payload, request, relation_id, having_specs, all_owners) {
+    if request.limit != None || request.offset != None || request.partition != None
+        || array::length(request.ordering) != 0 {
+        fail!("related group count cannot be ordered, paginated or partitioned")
+    } else {
+        let inner = lower_group_projection_base(payload, request, relation_id, having_specs, [], True, True, all_owners);
+        qb::count_groups(inner, payload.profile)
     }
 };
 
@@ -8788,6 +8817,7 @@ pub use self::{
     lower,
     lower_full,
     lower_group_projection,
+    lower_related_group_count,
     lower_any,
     lower_peer,
     lower_absence,

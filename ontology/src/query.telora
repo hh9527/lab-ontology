@@ -201,6 +201,7 @@ type ColumnEq = struct {
 # fragment, no open function name and no identifier escape.
 type JoinCondition = enum {
     Eq(ColumnEq),
+    Predicate(Expr),
     And(Array(JoinCondition)),
     Or(Array(JoinCondition)),
 };
@@ -953,6 +954,7 @@ def column_eq_known: Fn(ColumnEq, Array(String)) -> Bool = fn(eq, aliases) {
 def join_on_identifiers_valid: Fn(JoinCondition) -> Bool = fn(condition) {
     match condition {
         JoinCondition::Eq(eq) => column_eq_id_ok(eq),
+        JoinCondition::Predicate(_) => True,
         JoinCondition::And(items) => array::all(items, join_on_identifiers_valid),
         JoinCondition::Or(items) => array::all(items, join_on_identifiers_valid),
     }
@@ -963,6 +965,7 @@ def join_on_identifiers_valid: Fn(JoinCondition) -> Bool = fn(condition) {
 def join_on_shape_ok: Fn(JoinCondition) -> Bool = fn(condition) {
     match condition {
         JoinCondition::Eq(_) => True,
+        JoinCondition::Predicate(_) => True,
         JoinCondition::And(items) => array::length(items) > 0 && array::all(items, join_on_shape_ok),
         JoinCondition::Or(items) => array::length(items) > 0 && array::all(items, join_on_shape_ok),
     }
@@ -972,6 +975,7 @@ def join_on_shape_ok: Fn(JoinCondition) -> Bool = fn(condition) {
 def join_on_condition_valid: Fn(JoinCondition, Array(String)) -> Bool = fn(condition, aliases) {
     match condition {
         JoinCondition::Eq(eq) => column_eq_known(eq, aliases),
+        JoinCondition::Predicate(expr) => expr_valid(expr, aliases),
         JoinCondition::And(items) => array::length(items) > 0
             && array::all(items, fn(child) { join_on_condition_valid(child, aliases) }),
         JoinCondition::Or(items) => array::length(items) > 0
@@ -2133,6 +2137,15 @@ def source_scalars_ok: Fn(Source, Array(ScalarFunction)) -> Bool = fn(source_ite
     }
 };
 
+def join_condition_scalars_ok: Fn(JoinCondition, Array(ScalarFunction)) -> Bool = fn(condition, allowed) {
+    match condition {
+        JoinCondition::Eq(_) => True,
+        JoinCondition::Predicate(expr) => expr_scalars_ok(expr, allowed),
+        JoinCondition::And(items) => array::all(items, fn(item) { join_condition_scalars_ok(item, allowed) }),
+        JoinCondition::Or(items) => array::all(items, fn(item) { join_condition_scalars_ok(item, allowed) }),
+    }
+};
+
 def source_profile_accepts: Fn(Source, PlanProfile) -> Bool = fn(source_item, profile) {
     source_valid(source_item)
         && array::all(source_operators(source_item), fn(op) { operator_allowed(op, profile.allowed_operators) })
@@ -2320,7 +2333,10 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
             }
         });
     let scalars_ok = array::all(plan.sources, fn(source_item) { source_scalars_ok(source_item, profile.allowed_scalars) })
-        && array::all(plan.joins, fn(join_item) { source_scalars_ok(join_item.source, profile.allowed_scalars) })
+        && array::all(plan.joins, fn(join_item) {
+            source_scalars_ok(join_item.source, profile.allowed_scalars)
+                && join_condition_scalars_ok(join_item.condition, profile.allowed_scalars)
+        })
         && array::all(plan.projection, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
         && (match plan.filter {
             Some(expr) => expr_scalars_ok(expr, profile.allowed_scalars),
@@ -2579,16 +2595,19 @@ def render_select_item: Fn(SelectItem, Plan) -> Tuple([String, Array(Val)]) = fn
 # Renders an ON-condition tree to SQL text.  A single `ScalarFunction.Eq` atom renders
 # without parentheses so simple equality joins keep the documented shape;
 # `ScalarFunction.And`/`ScalarFunction.Or` render parenthesized so nested precedence is deterministic.
-def render_join_condition: Fn(JoinCondition) -> String = fn(condition) {
+def render_join_condition: Fn(JoinCondition) -> Tuple([String, Array(Val)]) = fn(condition) {
     match condition {
-        JoinCondition::Eq(eq) => `\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`,
+        JoinCondition::Eq(eq) => (`\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`, []),
+        JoinCondition::Predicate(expr) => render_expr(expr),
         JoinCondition::And(items) => {
             let parts = array::map(items, render_join_condition);
-            `(\{string::join(parts, " AND ")})`
+            (`(\{string::join(array::map(parts, fn(part) { part.0 }), " AND ")})`,
+                array::concat(array::map(parts, fn(part) { part.1 })))
         },
         JoinCondition::Or(items) => {
             let parts = array::map(items, render_join_condition);
-            `(\{string::join(parts, " OR ")})`
+            (`(\{string::join(array::map(parts, fn(part) { part.0 }), " OR ")})`,
+                array::concat(array::map(parts, fn(part) { part.1 })))
         },
     }
 };
@@ -2608,7 +2627,8 @@ def render_source: Fn(Source) -> Tuple([String, Array(Val)]) = fn(source_item) {
 
 def render_join: Fn(Join) -> Tuple([String, Array(Val)]) = fn(join) {
     let source_part = render_source(join.source);
-    (`\{join_kind_sql(join.kind)} \{source_part.0} ON \{render_join_condition(join.condition)}`, source_part.1)
+    let condition = render_join_condition(join.condition);
+    (`\{join_kind_sql(join.kind)} \{source_part.0} ON \{condition.0}`, array::concat([source_part.1, condition.1]))
 };
 
 def render_group_part: Fn(Array(Expr)) -> Tuple([String, Array(Val)]) = fn(grouping) {
@@ -3713,6 +3733,8 @@ def on_eq: Fn(ColumnRef, ColumnRef) -> JoinCondition = fn(left, right) {
     JoinCondition::Eq(column_eq(left, right))
 };
 
+def on_predicate: Fn(Expr) -> JoinCondition = fn(expr) { JoinCondition::Predicate(expr) };
+
 # AND/OR combination of ON-clause conditions over a non-empty list.
 def on_and: Fn(Array(JoinCondition)) -> JoinCondition = fn(items) { JoinCondition::And(items) };
 
@@ -4098,6 +4120,7 @@ pub use self::{
     scoped_source,
     column_eq,
     on_eq,
+    on_predicate,
     on_and,
     on_or,
     join,

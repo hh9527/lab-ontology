@@ -235,6 +235,12 @@ origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
 `directed_peer_hub_relation_fields` 仅用于业务本身确实单向的连接。
 `observe_peer_related` 将双向邻接作为样本 owner 的相关存在条件，
 两种方向必须各自在同一 hub 行内匹配，不把重复连接 JOIN 到样本行。
+`count_related_groups` 则在已声明的相关实体关系上先分组/HAVING 再计数；
+意图必须明确总体：`population:"matched"` 从匹配的子行出发，不包括
+零条匹配子行的 owner；`population:"all"` 从 owner 出发 LEFT JOIN，
+把子行谓词限制在 ON 条件内，因此 COUNT(child) 可以等于零。
+JOIN 的 ON 谓词是受 profile、别名和绑定校验的封闭表达式，不能把
+INNER JOIN 得到的 1..N 结果误称为 0..N。
 
 领域作者用具名 struct 表达实体，用 property decorator 就近声明事实：
 

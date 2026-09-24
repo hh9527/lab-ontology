@@ -1,0 +1,54 @@
+use crate::model::{ payload };
+use ontology::intent as intent;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+def lower_json: Fn(String) -> qb::Query = fn(value) {
+    intent::query_intent_lower_factory(payload, "public")(json::parse(value).unwrap!())
+};
+
+pub def counts_matching_site_id_groups_not_device_rows: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"count_related_groups","population":"matched","relation":"storage_device_site","measures":["storage_device_named_count"],"dimensions":["site_id"],"filters":[{"dimension":"storage_running_status","op":"eq","kind":"text","value":"normal"},{"dimension":"storage_device_subclass","op":"eq","kind":"text","value":"vsp_storage_device"}],"having":[{"measure":"storage_device_named_count","op":"lt","kind":"int","value":5}],"ordering":[],"limit":null,"offset":null}`);
+    if string::contains(q.sql, "SELECT count(1) FROM (SELECT count(sd.name)")
+        && string::contains(q.sql, "sd.parentResId = s.SITE_ID OR sd.projectId = s.SITE_ID")
+        && string::contains(q.sql, "GROUP BY s.SITE_ID HAVING count(sd.name) < ?")
+        && q.bindings == [qb::Val::String("1"), qb::Val::String("VSPStorageDevice"), qb::Val::Int(5)] { True }
+    else { fail!("related group count must group by site identity before counting groups", q) }
+});
+
+pub def all_sites_include_zero_matches_without_filtering_left_join: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"count_related_groups","population":"all","relation":"storage_device_site","measures":["storage_device_named_count"],"dimensions":["site_id"],"filters":[{"dimension":"storage_running_status","op":"eq","kind":"text","value":"normal"},{"dimension":"storage_device_subclass","op":"eq","kind":"text","value":"vsp_storage_device"}],"having":[{"measure":"storage_device_named_count","op":"lt","kind":"int","value":5}],"ordering":[],"limit":null,"offset":null}`);
+    if string::contains(q.sql, "FROM X_SITE_VIEW AS s LEFT JOIN HuaweiStorageDevice AS sd ON")
+        && string::contains(q.sql, "sd.runningStatus = ? AND sd.subClassName = ?)")
+        && !string::contains(q.sql, " WHERE sd.runningStatus")
+        && string::contains(q.sql, "GROUP BY s.SITE_ID HAVING count(sd.name) < ?")
+        && q.bindings == [qb::Val::String("1"), qb::Val::String("VSPStorageDevice"), qb::Val::Int(5)] { True }
+    else { fail!("all-owner count must retain zero-match sites through ON-local filters", q) }
+});
+
+pub def rejects_unknown_population: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"count_related_groups","population":"unknown","relation":"storage_device_site","measures":["storage_device_named_count"],"dimensions":["site_id"],"filters":[],"having":[],"ordering":[],"limit":null,"offset":null}`)
+}, "related group count population must be matched or all");
+
+pub def rejects_unrelated_site_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"count_related_groups","population":"matched","relation":"device_located_at_site","measures":["storage_device_named_count"],"dimensions":["site_id"],"filters":[],"having":[],"ordering":[],"limit":null,"offset":null}`)
+}, "group projection requires a named relation from filtered measure rows");
+
+pub def rejects_incomplete_site_grain: test::Test = test::should_fail_with(fn() {
+    let entities = array::map(payload.entities, fn(entity) {
+        if entity.id == "site" {
+            let spec: edsl::DatasetSpec = {kind: edsl::DatasetKind::Entity, grain: ["site_id", "tenant_id"], utc_time: None};
+            {...entity, dataset: Some(spec)}
+        } else { entity }
+    });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "storage_device_named_count", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [{id: "site_id", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    edsl::lower_related_group_count({...payload, entities}, request, "storage_device_site", [], False)
+}, "group projection requires the owner's full declared grain");

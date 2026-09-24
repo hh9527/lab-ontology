@@ -716,6 +716,38 @@ pon_port_result="$(sqlite3 -json :memory: -cmd "${pon_port_schema}" -cmd '.param
     "$(jq -r '.sql' <<< "${pon_port_plan}")")"
 jq -e 'length == 7 and all(.[]; .name == "Twin") and (map(.pon_port_receive_sample_max) | sort) == [10,20,30,40,50,60,85]' <<< "${pon_port_result}" >/dev/null
 
+related_site_schema="CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT);
+CREATE TABLE HuaweiStorageDevice (id TEXT, name TEXT, parentResId TEXT, projectId TEXT, runningStatus TEXT, subClassName TEXT);
+INSERT INTO X_SITE_VIEW VALUES
+ ('S1','Twin'),('S4','Twin'),('S5','Five'),('S0','Empty'),('S-BLUE','Twin');
+INSERT INTO HuaweiStorageDevice VALUES
+ ('one','One','S1','S1','1','VSPStorageDevice'),
+ ('four-1','One','S4',NULL,'1','VSPStorageDevice'),
+ ('four-2','Two',NULL,'S4','1','VSPStorageDevice'),
+ ('four-3','Three','S4','S4','1','VSPStorageDevice'),
+ ('four-4','Four','S4',NULL,'1','VSPStorageDevice'),
+ ('five-1','One','S5',NULL,'1','VSPStorageDevice'),
+ ('five-2','Two','S5',NULL,'1','VSPStorageDevice'),
+ ('five-3','Three','S5',NULL,'1','VSPStorageDevice'),
+ ('five-4','Four','S5',NULL,'1','VSPStorageDevice'),
+ ('five-5','Five','S5',NULL,'1','VSPStorageDevice'),
+ ('blue','One','S-BLUE',NULL,'1','VSPStorageDevice'),
+ ('abnormal','One','S0',NULL,'0','VSPStorageDevice'),
+ ('other-class','One','S0',NULL,'1','EnterpriseStorage');"
+related_site_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:matched_vsp_site_count)"
+jq -e '.bindings == ["1","VSPStorageDevice",5]' <<< "${related_site_plan}" >/dev/null
+related_site_result="$(sqlite3 -json :memory: -cmd "${related_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '1'" -cmd ".parameter set ?2 'VSPStorageDevice'" \
+    -cmd '.parameter set ?3 5' "$(jq -r '.sql' <<< "${related_site_plan}")")"
+jq -e 'length == 1 and (.[0] | to_entries[0].value) == 3' <<< "${related_site_result}" >/dev/null
+all_site_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:all_vsp_site_count)"
+jq -e '.bindings == ["1","VSPStorageDevice",5]
+    and (.sql | contains("FROM X_SITE_VIEW AS s LEFT JOIN HuaweiStorageDevice AS sd ON"))' <<< "${all_site_plan}" >/dev/null
+all_site_result="$(sqlite3 -json :memory: -cmd "${related_site_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '1'" -cmd ".parameter set ?2 'VSPStorageDevice'" \
+    -cmd '.parameter set ?3 5' "$(jq -r '.sql' <<< "${all_site_plan}")")"
+jq -e 'length == 1 and (.[0] | to_entries[0].value) == 4' <<< "${all_site_result}" >/dev/null
+
 peer_trend_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, alias TEXT, classification TEXT);
 CREATE TABLE NetworkDeviceKPI (resId TEXT, tenantId TEXT, ts TEXT, portCount INTEGER);
 CREATE TABLE EnterprisePhysicalLink (a_ne_res_id TEXT, z_ne_res_id TEXT, tenantId TEXT);
@@ -769,4 +801,4 @@ jq -e '.bindings == []' <<< "${ap_ssid_all_plan}" >/dev/null
 ap_ssid_all_result="$(sqlite3 -json :memory: -cmd "${ap_ssid_schema}" "$(jq -r '.sql' <<< "${ap_ssid_all_plan}")")"
 jq -e 'length == 3 and (map(.ap_ssid_connected_terminals_sample_avg) | sort) == [5,38,70]' <<< "${ap_ssid_all_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, PON port sample peaks, bidirectional peer-qualified raw trends, and AP SSID pooled means execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, PON port sample peaks, matched/all related-site group counts, bidirectional peer-qualified raw trends, and AP SSID pooled means execute correctly\n'
