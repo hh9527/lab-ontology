@@ -329,10 +329,65 @@ def exists_having: Fn(qb::Having, RenderCtx) -> Emitted = fn(item, ctx) {
     }
 };
 
+def render_peer: Fn(qb::PeerCorr, RenderCtx) -> Emitted = fn(corr, ctx) {
+    let origin = render_source(corr.origin, ctx);
+    let peer = render_source(corr.peer, origin.ctx);
+    let first = `(\{pair_sql(corr.branch_a.origin)} AND \{pair_sql(corr.branch_a.peer)})`;
+    let second = `(\{pair_sql(corr.branch_b.origin)} AND \{pair_sql(corr.branch_b.peer)})`;
+    let exchange = if corr.exchange { `(\{first} OR \{second})` } else { first };
+    let distinct = if corr.distinct_keys {
+        ` AND \{column_sql(corr.branch_a.origin.right)} <> \{column_sql(corr.branch_a.peer.right)}`
+    } else { "" };
+    let origin_filter: Emitted = match corr.origin_filter {
+        Some(expr) => emit_expr(expr, peer.ctx), None => {sql: "", ctx: peer.ctx},
+    };
+    let peer_filter: Emitted = match corr.peer_filter {
+        Some(expr) => emit_expr(expr, origin_filter.ctx), None => {sql: "", ctx: origin_filter.ctx},
+    };
+    let origin_sql = if corr.origin_filter != None { ` AND \{origin_filter.sql}` } else { "" };
+    let peer_sql = if corr.peer_filter != None { ` AND \{peer_filter.sql}` } else { "" };
+    {sql: `SELECT 1 FROM \{origin.sql}, \{peer.sql} WHERE \{exchange}\{distinct}\{origin_sql}\{peer_sql}`,
+        ctx: peer_filter.ctx}
+};
+
+def render_link: Fn(qb::Exists, qb::ExistsLink, RenderCtx) -> Emitted = fn(ex, link, ctx) {
+    let hop = render_source(ex.source, ctx);
+    let next = render_source(link.source, hop.ctx);
+    let tail: Emitted = match link.tail {
+        Some(item) => {
+            let source = render_source(item.source, next.ctx);
+            {sql: ` INNER JOIN \{source.sql} ON \{string::join(array::map(item.pairs, pair_sql), " AND ")}`,
+                ctx: source.ctx}
+        },
+        None => {sql: "", ctx: next.ctx},
+    };
+    let filtered: Emitted = match link.filter {
+        Some(expr) => emit_expr(expr, tail.ctx), None => {sql: "", ctx: tail.ctx},
+    };
+    let on = match link.alternatives {
+        Some(branches) => `(\{string::join(array::map(branches, fn(branch) {
+            `(\{string::join(array::map(branch, pair_sql), " AND ")})`
+        }), " OR ")})`,
+        None => string::join(array::map(link.pairs, pair_sql), " AND "),
+    };
+    let where_filter = if link.filter != None { ` AND \{filtered.sql}` } else { "" };
+    {sql: `SELECT 1 FROM \{hop.sql} INNER JOIN \{next.sql} ON \{on}\{tail.sql} WHERE \{correlations(ex)}\{where_filter}`,
+        ctx: filtered.ctx}
+};
+
 def render_exists: Fn(qb::Exists, RenderCtx) -> Emitted = fn(ex, ctx) {
-    if ex.peer != None || ex.link != None {
-        fail!("PostgreSQL linked or peer EXISTS is not yet implemented", ex)
-    } else {
+    let prefix = if ex.negated { "NOT EXISTS" } else { "EXISTS" };
+    match ex.peer {
+        Some(corr) => {
+            let body = render_peer(corr, ctx);
+            {sql: `\{prefix} (\{body.sql})`, ctx: body.ctx}
+        },
+        None => match ex.link {
+            Some(link) => {
+                let body = render_link(ex, link, ctx);
+                {sql: `\{prefix} (\{body.sql})`, ctx: body.ctx}
+            },
+            None => {
         let source = render_source(ex.source, ctx);
         let filter: Emitted = match ex.filter {
             Some(expr) => emit_expr(expr, source.ctx),
@@ -347,9 +402,10 @@ def render_exists: Fn(qb::Exists, RenderCtx) -> Emitted = fn(ex, ctx) {
         let filter_sql = if ex.filter != None { ` AND \{filter.sql}` } else { "" };
         let group_sql = if array::length(ex.grouping) > 0 { ` GROUP BY \{grouping.sql}` } else { "" };
         let having_sql = if array::length(ex.having) > 0 { ` HAVING \{string::join(having.sql, " AND ")}` } else { "" };
-        let prefix = if ex.negated { "NOT EXISTS" } else { "EXISTS" };
         {sql: `\{prefix} (SELECT 1 FROM \{source.sql} WHERE \{correlations(ex)}\{filter_sql}\{group_sql}\{having_sql})`,
             ctx: having.ctx}
+            },
+        },
     }
 };
 
@@ -377,6 +433,18 @@ def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
         array::map(plan.sources, fn(source) { source.alias }),
         array::map(plan.joins, fn(join) { join.source.alias }),
         array::map(plan.exists, fn(ex) { ex.source.alias }),
+        array::concat(array::map(plan.exists, fn(ex) {
+            match ex.peer {
+                Some(corr) => [corr.peer.alias],
+                None => match ex.link {
+                    Some(link) => match link.tail {
+                        Some(tail) => [link.source.alias, tail.source.alias],
+                        None => [link.source.alias],
+                    },
+                    None => [],
+                },
+            }
+        })),
         derived_aliases,
     ])
 };

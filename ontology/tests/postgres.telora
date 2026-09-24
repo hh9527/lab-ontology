@@ -235,3 +235,51 @@ pub def negated_or_exists_preserves_predicate: test::Test = test::should_ok(fn()
         True
     } else { fail!("NOT EXISTS must keep OR correlation and inner binding", query) }
 });
+
+pub def linked_exists_threads_all_inner_sources: test::Test = test::should_ok(fn() {
+    let ex = qb::exists_two_hop(
+        qb::scoped_source("h", "Hops", qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("h", "kind"), qb::bind_string("first")])),
+        [qb::column_eq(qb::column_ref("o", "id"), qb::column_ref("h", "owner_id"))],
+        qb::scoped_source("l", "Links", qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("l", "kind"), qb::bind_string("second")])),
+        [qb::column_eq(qb::column_ref("h", "id"), qb::column_ref("l", "hop_id"))],
+        Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("l", "state"), qb::bind_string("active")])));
+    let query = pg::render_rows_candidate(exists_outer(ex), False);
+    if query.bindings == [qb::Val::String("root"), qb::Val::String("first"),
+        qb::Val::String("second"), qb::Val::String("active")]
+        && string::contains(query.sql, "INNER JOIN (SELECT * FROM \"Links\" AS \"l\" WHERE \"l\".\"kind\" = $3) AS \"l\" ON \"h\".\"id\" = \"l\".\"hop_id\"")
+        && string::contains(query.sql, "WHERE \"o\".\"id\" = \"h\".\"owner_id\" AND \"l\".\"state\" = $4") {
+        True
+    } else { fail!("linked EXISTS must retain one correlated body and binding order", query) }
+});
+
+pub def peer_exists_threads_sources_and_filters: test::Test = test::should_ok(fn() {
+    let origin_key = qb::column_ref("a", "id");
+    let peer_key = qb::column_ref("b", "id");
+    let first = qb::peer_branch(
+        qb::column_eq(qb::column_ref("o", "left_id"), origin_key),
+        qb::column_eq(qb::column_ref("o", "right_id"), peer_key));
+    let second = qb::peer_branch(
+        qb::column_eq(qb::column_ref("o", "right_id"), origin_key),
+        qb::column_eq(qb::column_ref("o", "left_id"), peer_key));
+    let corr = qb::peer_corr_roles(
+        qb::scoped_source("a", "People", qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("a", "scope"), qb::bind_string("a-scope")])),
+        qb::scoped_source("b", "People", qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("b", "scope"), qb::bind_string("b-scope")])),
+        first, second,
+        Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("a", "role"), qb::bind_string("origin")])),
+        Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("b", "role"), qb::bind_string("peer")])), True, True);
+    let query = pg::render_rows_candidate(exists_outer(qb::exists_not(qb::exists_peer(corr))), False);
+    if query.bindings == [qb::Val::String("root"), qb::Val::String("a-scope"),
+        qb::Val::String("b-scope"), qb::Val::String("origin"), qb::Val::String("peer")]
+        && string::contains(query.sql, "NOT EXISTS (SELECT 1 FROM")
+        && string::contains(query.sql, "\"a\".\"id\" <> \"b\".\"id\"")
+        && string::contains(query.sql, "\"a\".\"role\" = $4 AND \"b\".\"role\" = $5") {
+        True
+    } else { fail!("peer EXISTS must retain identity and ordered source/filter bindings", query) }
+});

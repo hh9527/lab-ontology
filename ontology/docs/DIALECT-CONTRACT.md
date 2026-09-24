@@ -8,8 +8,8 @@ simply producing syntactically plausible SQL.
 
 `ontology/postgres` has expression, Rows/DistinctRows, GroupCount and set candidate
 renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
-paging, derived UNION ALL sources and basic correlated EXISTS. Linked and peer
-EXISTS remain unsupported. Every rendering stage takes and returns
+paging, derived UNION ALL sources and correlated EXISTS, including bounded
+linked and paired-endpoint bodies. Every rendering stage takes and returns
 an immutable context that allocates numbered bindings and collision-free
 internal aliases. Unsupported shapes still fail explicitly; there is no
 complete `QueryPlan` materializer yet, so PostgreSQL is not an admitted dialect.

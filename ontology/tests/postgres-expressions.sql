@@ -70,6 +70,32 @@ WHERE "o"."role" = $1 AND EXISTS (
     WHERE "o"."id" = "e"."owner_id" AND "e"."kind" = $3
     GROUP BY "e"."owner_id" HAVING count("e"."id") > $4);
 
+PREPARE ontology_linked(text, text, text, text) AS
+WITH "Orders"("id", "role") AS (VALUES (1, 'root'), (2, 'root')),
+     "Hops"("id", "owner_id", "kind") AS
+         (VALUES (10, 1, 'first'), (11, 1, 'first'), (12, 2, 'first')),
+     "Links"("hop_id", "kind", "state") AS
+         (VALUES (10, 'second', 'active'), (11, 'second', 'active'), (12, 'second', 'idle'))
+SELECT "o"."id" FROM "Orders" AS "o" WHERE "o"."role" = $1
+AND EXISTS (SELECT 1 FROM
+    (SELECT * FROM "Hops" AS "h" WHERE "h"."kind" = $2) AS "h"
+    INNER JOIN (SELECT * FROM "Links" AS "l" WHERE "l"."kind" = $3) AS "l"
+        ON "h"."id" = "l"."hop_id"
+    WHERE "o"."id" = "h"."owner_id" AND "l"."state" = $4);
+
+PREPARE ontology_peer(text, text, text, text, text) AS
+WITH "Orders"("id", "role", "left_id", "right_id") AS
+         (VALUES (1, 'root', 10, 20), (2, 'root', 10, 10)),
+     "People"("id", "scope", "role") AS
+         (VALUES (10, 'a-scope', 'origin'), (20, 'b-scope', 'peer'))
+SELECT "o"."id" FROM "Orders" AS "o" WHERE "o"."role" = $1
+AND EXISTS (SELECT 1 FROM
+    (SELECT * FROM "People" AS "a" WHERE "a"."scope" = $2) AS "a",
+    (SELECT * FROM "People" AS "b" WHERE "b"."scope" = $3) AS "b"
+    WHERE (("o"."left_id" = "a"."id" AND "o"."right_id" = "b"."id")
+        OR ("o"."right_id" = "a"."id" AND "o"."left_id" = "b"."id"))
+    AND "a"."id" <> "b"."id" AND "a"."role" = $4 AND "b"."role" = $5);
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -117,6 +143,15 @@ BEGIN
         RAISE EXCEPTION 'correlated grouped EXISTS or binding order differs';
     END IF;
 
+    EXECUTE 'EXECUTE ontology_linked(''root'', ''first'', ''second'', ''active'')' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'two-hop correlated EXISTS or binding order differs';
+    END IF;
+    EXECUTE 'EXECUTE ontology_peer(''root'', ''a-scope'', ''b-scope'', ''origin'', ''peer'')' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'paired endpoint identity or binding order differs';
+    END IF;
+
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
         OR pg_input_is_valid('{bad}', 'json')
@@ -135,4 +170,6 @@ DEALLOCATE ontology_group_count;
 DEALLOCATE ontology_set;
 DEALLOCATE ontology_set_count;
 DEALLOCATE ontology_exists;
+DEALLOCATE ontology_linked;
+DEALLOCATE ontology_peer;
 COMMIT;
