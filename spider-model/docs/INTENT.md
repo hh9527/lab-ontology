@@ -67,8 +67,8 @@ modeling 数据猜测替代值；未知或疑似拼写问题仍按原值查询�
 { "target": "<entity id>", "filters": [ Filter, ... ] }
 ```
 `exists` 的 `op`：返回“存在相关行”的主体行/数；`absence` 的 `op`：返回“不存在相关行”的
-主体行/数。target 沿模型声明的可达直接关系到达（两跳 link 由模型 `exists_route` 显式声明），
-主体粒度保持去重。
+主体行/数。此旧形式仅用于可达的直接关系，主体粒度不被 JOIN 放大。
+两跳链使用 `graph` 的具名边和相关 `exists`，不依赖专用路径声明。
 
 ### Having（可见聚合的 HAVING）
 ```jsonc
@@ -119,7 +119,7 @@ modeling 数据猜测替代值；未知或疑似拼写问题仍按原值查询�
 
 确定性 `unsupported:`/拒绝，不做普通 measure/EXISTS/自连接/结果后处理或手写 SQL 旁路：
 
-- 多跳或无 `exists_route`/无法唯一证明直接关系的关联聚合、存在路由；
+- 无法唯一证明关系的关联聚合；图中未声明的关系路径；
 - `top`/`hidden_having` 的目标 measure 位于多跳或无法唯一证明直接关系的实体；
 - `output_order` 用在不支持的形状；distinct 计数（当前 spider 模型没有发布固定为
   Distinct input 的独立 measure id）；

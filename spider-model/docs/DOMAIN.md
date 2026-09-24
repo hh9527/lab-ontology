@@ -142,8 +142,8 @@ Join 路径；物理映射属于 `spider-model/src/model.telora` 的私有实现
 ## 边界
 
 - 支持：列表/去重列表、过滤、计数、分组、按已选/未选维度排序、跨关系隐藏聚合（related
-  aggregate：沿一条已声明直接关系或显式 `exists_route` 的隐藏 Top-N 与隐藏 HAVING，聚合
-  不进投影、HAVING threshold 参数化）、正反相关存在（含两跳 link 存在）、同主体属性
+  aggregate：沿已声明直接关系的隐藏 Top-N 与隐藏 HAVING，聚合不进投影、HAVING
+  threshold 参数化）、正反相关存在（两跳链使用 `graph` 具名边）、同主体属性
   比较、Top-N 与分页。
 - 不支持（确定性 `unsupported:` 诊断，不做近似替代）：请求已含返回聚合时再按不返回
   聚合排序/HAVING（同源 `hidden_having` 与可见 `having`/`exists` 混用）；多跳或无法唯一
