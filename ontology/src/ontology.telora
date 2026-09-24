@@ -541,6 +541,26 @@ type MetricQualification = struct {
     op: HavingOp,
     threshold: FilterInput,
 };
+type EpochMetricQualification = struct {
+    relation: String,
+    dataset: String,
+    measure: String,
+    filters: Array(FilterRequest),
+    field: String,
+    start: Int,
+    end: Int,
+    op: HavingOp,
+    threshold: FilterInput,
+};
+type TimedMetricQualification = struct {
+    relation: String,
+    dataset: String,
+    measure: String,
+    filters: Array(FilterRequest),
+    window: SampleWindow,
+    op: HavingOp,
+    threshold: FilterInput,
+};
 type SampleQualification = struct {
     relation: String,
     dataset: String,
@@ -6195,7 +6215,7 @@ def lower_child_site_scope: Fn(PreparedPayload, QueryRequest, ChildSiteScope) ->
 
 # Each qualification uses its own correlated aggregate. Independent KPI sample
 # sets never join one another and therefore cannot multiply each other's rows.
-def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQualification), Option(OwnerSiteScope)) -> qb::Plan = fn(payload, request, specs, scope) {
+def lower_timed_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(TimedMetricQualification), Option(OwnerSiteScope)) -> qb::Plan = fn(payload, request, specs, scope) {
     if array::length(specs) == 0 {
         fail!("metric qualification requires at least one condition")
     } else {
@@ -6255,8 +6275,6 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
                     fail!("metric qualification requires a named safe sample-to-owner relation", spec.relation, spec.dataset)
                 } else if !relation_covers_target_grain(base, exists_pairs(relation.key)) {
                     fail!("metric qualification relation must cover the owner's complete declared grain", spec.relation, base.id)
-                } else if !valid_utc_second(spec.start) || !valid_utc_second(spec.end) || spec.start >= spec.end {
-                    fail!("metric qualification requires ordered canonical UTC bounds", spec.start, spec.end)
                 } else {
                     let domain = dataset_domain(payload, spec.dataset);
                     let time_name = match domain.utc_time {
@@ -6290,9 +6308,24 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
                                     retarget_inner_expr(f.expr, target_entry.alias, alias)
                                 });
                                 let time_col = qb::column(alias, time_field.column);
+                                let (start, end) = match spec.window {
+                                    SampleWindow::Text(bounds) => if !valid_utc_second(bounds.start)
+                                        || !valid_utc_second(bounds.end) || bounds.start >= bounds.end {
+                                        fail!("metric qualification requires ordered canonical UTC bounds", bounds.start, bounds.end)
+                                    } else if bounds.dataset != spec.dataset
+                                        || time_domain(payload, spec.dataset, time_name).encoding != TimeEncoding::CanonicalUtcSecondText {
+                                        fail!("metric qualification requires a canonical UTC sample clock", spec.dataset)
+                                    } else { (qb::bind_string(bounds.start), qb::bind_string(bounds.end)) },
+                                    SampleWindow::Epoch(bounds) => if bounds.start >= bounds.end {
+                                        fail!("metric qualification requires ordered UTC epoch-millisecond bounds", bounds.start, bounds.end)
+                                    } else if bounds.dataset != spec.dataset || bounds.field != time_name
+                                        || time_domain(payload, spec.dataset, time_name).encoding != TimeEncoding::UtcEpochMillis {
+                                        fail!("metric qualification requires the authoritative UTC epoch-millisecond clock", spec.dataset)
+                                    } else { (qb::bind_int(bounds.start), qb::bind_int(bounds.end)) },
+                                };
                                 let bounds = qb::scalar(qb::ScalarFunction::And, [
-                                    qb::scalar(qb::ScalarFunction::Ge, [time_col, qb::bind_string(spec.start)]),
-                                    qb::scalar(qb::ScalarFunction::Lt, [time_col, qb::bind_string(spec.end)]),
+                                    qb::scalar(qb::ScalarFunction::Ge, [time_col, start]),
+                                    qb::scalar(qb::ScalarFunction::Lt, [time_col, end]),
                                 ]);
                                 let filter = append_filter_terms(Some(bounds), filter_terms);
                                 let grouping = array::map(pairs, fn(p) { qb::column(p.right.source, p.right.column) });
@@ -6317,6 +6350,22 @@ def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQ
             }
         }
     }
+};
+
+def lower_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(MetricQualification), Option(OwnerSiteScope)) -> qb::Plan = fn(payload, request, specs, scope) {
+    lower_timed_metric_qualifications(payload, request, array::map(specs, fn(spec) {
+        {relation: spec.relation, dataset: spec.dataset, measure: spec.measure, filters: spec.filters,
+            window: SampleWindow::Text({dataset: spec.dataset, start: spec.start, end: spec.end}),
+            op: spec.op, threshold: spec.threshold}
+    }), scope)
+};
+
+def lower_epoch_metric_qualifications: Fn(PreparedPayload, QueryRequest, Array(EpochMetricQualification), Option(OwnerSiteScope)) -> qb::Plan = fn(payload, request, specs, scope) {
+    lower_timed_metric_qualifications(payload, request, array::map(specs, fn(spec) {
+        {relation: spec.relation, dataset: spec.dataset, measure: spec.measure, filters: spec.filters,
+            window: SampleWindow::Epoch({dataset: spec.dataset, field: spec.field, start: spec.start, end: spec.end}),
+            op: spec.op, threshold: spec.threshold}
+    }), scope)
 };
 
 # A raw-sample predicate is evaluated before the sample count; qualification
@@ -8452,6 +8501,7 @@ pub use self::{
     RelationBrief,
     NamedExistsRequest,
     MetricQualification,
+    EpochMetricQualification,
     SampleQualification,
     EpochSampleQualification,
     SampleCountRange,
@@ -8586,6 +8636,7 @@ pub use self::{
     knowledge_index_for_subject,
     lower_named_exists,
     lower_metric_qualifications,
+    lower_epoch_metric_qualifications,
     lower_sample_qualifications,
     lower_sample_epoch_qualifications,
     lower_sample_count_ranges,

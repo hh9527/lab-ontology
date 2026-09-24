@@ -104,6 +104,11 @@ qualifications with separate correlated counts and a zero-inclusive maximum
 count range. Both require the authoritative clock and all owner identity keys;
 the IC production KPI/Alarm carriers remain on their previously declared text
 clock fixture until their physical time encoding is verified.
+The same synthetic epoch sample carrier additionally tests independent
+Model-declared Sum/HAVING qualification in two windows, a pre-aggregate raw
+sample filter and full owner identity. This exercises the capability needed by
+IC's independent-KPI family without claiming that its production KPI table is
+stored as epoch milliseconds.
 
 Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 `zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device
