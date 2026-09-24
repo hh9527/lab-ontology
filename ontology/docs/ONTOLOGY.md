@@ -797,8 +797,9 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
   EXISTS；`min_matches: Some(n)`（正整数）时是相关聚合 EXISTS：内层按相关性分组并
   `HAVING count(关联 id) >= n`，仍保持主体 grain（Parent 计数 + `exists child`/
   `child count >= n` 不被 Child 行放大；普通 fan-out join 仍原子拒绝）。
-- 关系键必须是列等值合取（`Eq` 或 `And`）；析取键在 EXISTS 中原子拒绝；分组存在性
-  要求单列合取键（一个 ColumnEq）。
+- 关系键必须是列等值合取（`Eq` 或 `And`）；析取键在此 EXISTS 入口原子拒绝。
+  `min_matches` 对复合键按全部内层关联列分组，避免把相同资源 ID、不同租户的
+  相关行合并；不要求关系键只有一列。
 - 内层 `filters` 只能引用目标实体维度，动态值进入 bindings；任何引用路径终点之外实体
   的内层筛选都原子失败。
 - 当 measure 的 `requires` 实体恰好是 exists 目标时，该必需实体由相关存在谓词满足，
