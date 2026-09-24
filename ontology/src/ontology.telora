@@ -19,6 +19,10 @@ use std::prelude as prelude;
 use std::regex as regex;
 use std::string as string;
 
+# SQL-facing scalar result of a declared Model projection. This knowledge is
+# checked before ontology lowering emits a set QueryPlan.
+type OutputType = enum { Text, Integer, Number, Boolean };
+
 # ---------------------------------------------------------------------------
 # Property carriers (declared on entity structs and their fields).
 # ---------------------------------------------------------------------------
@@ -116,6 +120,7 @@ type DimensionDef = struct {
 @prelude::property(PropertyTarget::Field)
 type ComputedDimensionDef = struct {
     id: String,
+    output_type: OutputType,
     authorized: Bool,
     filterable: Bool,
     ops: Array(FilterOp),
@@ -850,6 +855,7 @@ type DimensionEntry = struct {
     id: String,
     entity: Int,
     field: Int,
+    output_type: OutputType,
     computed: Bool,
     build: Fn(qb::Expr) -> qb::Expr,
     authorized: Bool,
@@ -1080,9 +1086,9 @@ def dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind)) -
     }
 };
 
-def computed_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Fn(qb::Expr) -> qb::Expr) -> Fn(property::FieldPropertyCtx, Option(ComputedDimensionDef)) -> ComputedDimensionDef = fn(id, authorized, filterable, ops, input_kinds, build) {
+def computed_dimension: Fn(String, OutputType, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Fn(qb::Expr) -> qb::Expr) -> Fn(property::FieldPropertyCtx, Option(ComputedDimensionDef)) -> ComputedDimensionDef = fn(id, output_type, authorized, filterable, ops, input_kinds, build) {
     fn(ctx, previous) {
-        let result: ComputedDimensionDef = { id, authorized, filterable, ops, input_kinds, build };
+        let result: ComputedDimensionDef = { id, output_type, authorized, filterable, ops, input_kinds, build };
         result
     }
 };
@@ -1862,6 +1868,56 @@ def measure_by_id: Fn(Array(MeasureEntry), String) -> MeasureEntry = fn(measures
     }
 };
 
+def field_output_type: Fn(Type) -> OutputType = fn(ty) {
+    if ty == Int.type { OutputType::Integer }
+    else if ty == Float.type { OutputType::Number }
+    else if ty == Bool.type { OutputType::Boolean }
+    else { OutputType::Text }
+};
+
+def measure_value_type: Fn(Array(EntityEntry), Array(MeasureEntry), String) -> OutputType =
+    fn(entities, measures, id) {
+        let entry = measure_by_id(measures, id);
+        match entry.computed {
+            Some(spec) => {
+                let left = measure_value_type(entities, measures, spec.left);
+                let right = measure_value_type(entities, measures, spec.right);
+                if left == OutputType::Number || right == OutputType::Number {
+                    OutputType::Number
+                } else if left == OutputType::Integer && right == OutputType::Integer {
+                    OutputType::Integer
+                } else { fail!("computed measure requires numeric output operands", id, left, right) }
+            },
+            None => match entry.aggregate {
+                qb::AggregateFunction::Count => OutputType::Integer,
+                qb::AggregateFunction::Avg => OutputType::Number,
+                qb::AggregateFunction::Sum => {
+                    let entity = get_index(entities, entry.entity);
+                    field_output_type(get_index(entity.fields, entry.field).ty)
+                },
+                qb::AggregateFunction::Min => {
+                    let entity = get_index(entities, entry.entity);
+                    field_output_type(get_index(entity.fields, entry.field).ty)
+                },
+                qb::AggregateFunction::Max => {
+                    let entity = get_index(entities, entry.entity);
+                    field_output_type(get_index(entity.fields, entry.field).ty)
+                },
+            },
+        }
+    };
+
+def measure_output_type: Fn(PreparedPayload, String) -> OutputType = fn(payload, id) {
+    measure_value_type(payload.entities, payload.measures, id)
+};
+
+def dimension_output_type: Fn(PreparedPayload, String) -> OutputType = fn(payload, id) {
+    match array::find(payload.dimensions, fn(entry) { entry.id == id }) {
+        Some(entry) => entry.output_type,
+        None => fail!("unknown dimension output type", id),
+    }
+};
+
 # Follow the computed-measure dependency graph; a revisit means a cycle.
 def has_dep_cycle: Fn(Array(MeasureEntry), String, Array(String)) -> Bool = fn(measures, id, visited) {
     if array::any(visited, fn(v) { v == id }) {
@@ -2271,7 +2327,13 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     || (valid_kind != FilterInputKind::Text && array::any(dd.ops, fn(op) { is_text_op(op) }))) {
                     fail!("plain dimension filter input or operation disagrees with field type", entity.id, f.name)
                 } else {
-                    [dimension_entry(entity.index, f.index, dd.id, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, aliases, field_scope(entity.entity_type, f.index))]
+                    let output_type = match valid_kind {
+                        FilterInputKind::Text => OutputType::Text,
+                        FilterInputKind::Int => OutputType::Integer,
+                        FilterInputKind::Number => OutputType::Number,
+                        FilterInputKind::Bool => OutputType::Boolean,
+                    };
+                    [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, aliases, field_scope(entity.entity_type, f.index))]
                 }
             },
             None => [],
@@ -2280,7 +2342,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     let computed = array::flat_map(fields, fn(f) {
         let d = property::get_field_prop(entity.entity_type, f.index, ComputedDimensionDef.type);
         match d {
-            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))],
+            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, dd.output_type, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))],
             None => [],
         }
     });
@@ -2299,7 +2361,12 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     && array::any(spec.ops, fn(op) { is_text_op(op) })) {
                     fail!("JSON dimension filter input or operation disagrees with declared value type", entity.id, f.name, spec.id)
                 } else {
-                    dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path, spec.value_kind), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))
+                    let output_type = match spec.value_kind {
+                        qb::JsonScalarKind::Text => OutputType::Text,
+                        qb::JsonScalarKind::Int => OutputType::Integer,
+                        qb::JsonScalarKind::Number => OutputType::Number,
+                    };
+                    dimension_entry(entity.index, f.index, spec.id, output_type, True, json_builder(spec.path, spec.value_kind), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))
                 }
             }),
             None => [],
@@ -2308,8 +2375,8 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     if declared { array::concat([plain, computed, json]) } else { [] }
 };
 
-def dimension_entry: Fn(Int, Int, String, Bool, Fn(qb::Expr) -> qb::Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope) {
-    let result: DimensionEntry = { id, entity, field, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope };
+def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::Expr) -> qb::Expr, Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope) {
+    let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope };
     result
 };
 
@@ -8614,10 +8681,47 @@ def lower_ordered: Fn(PreparedPayload, QueryRequest, Array(ProjectionToken)) -> 
 # positionally compatible projection shapes, and must carry no local
 # ordering/limit/offset/partition.  The result is a closed set Query
 # (INTERSECT / EXCEPT / distinct UNION).
+def projection_output_types: Fn(PreparedPayload, qb::Plan) -> Array(OutputType) = fn(payload, plan) {
+    array::map(plan.projection, fn(item) {
+        match item {
+            qb::SelectItem::Expr(expr) => {
+                let dimension = array::find(payload.dimensions, fn(entry) {
+                    dimension_output_expr(payload, entry) == expr
+                });
+                match dimension {
+                    Some(entry) => entry.output_type,
+                    None => fail!("set projection expression has no declared Model output type", expr),
+                }
+            },
+            qb::SelectItem::NamedExpr(named) => {
+                let dimension = array::find(payload.dimensions, fn(entry) {
+                    dimension_output_expr(payload, entry) == named.expr
+                });
+                match dimension {
+                    Some(entry) => entry.output_type,
+                    None => fail!("set named projection has no declared Model output type", named),
+                }
+            },
+            qb::SelectItem::Aggregate(call) => measure_output_type(payload, call.alias),
+            qb::SelectItem::Computed(ca) => measure_output_type(payload, ca.alias),
+        }
+    })
+};
+
+def validate_set_projection_types: Fn(PreparedPayload, qb::Plan, qb::Plan) -> Bool = fn(payload, left, right) {
+    let left_types = projection_output_types(payload, left);
+    let right_types = projection_output_types(payload, right);
+    if left_types != right_types {
+        fail!("set branches have incompatible projected Model output types", left_types, right_types)
+    } else { True }
+};
+
 def lower_set: Fn(qb::SetOpKind, PreparedPayload, QueryRequest, QueryRequest) -> qb::Query = fn(kind, payload, left_req, right_req) {
     let left = lower_core(payload, left_req, [], [], [], [], [], []);
     let right = lower_core(payload, right_req, [], [], [], [], [], []);
-    qb::transform_sqlite_set(kind, left, right)
+    if validate_set_projection_types(payload, left, right) {
+        qb::transform_sqlite_set(kind, left, right)
+    } else { fail!("invalid set projection types") }
 };
 
 # Outer count over a closed set operation: the derived set is wrapped by
@@ -8626,7 +8730,9 @@ def lower_set: Fn(qb::SetOpKind, PreparedPayload, QueryRequest, QueryRequest) ->
 def lower_set_count: Fn(qb::SetOpKind, PreparedPayload, QueryRequest, QueryRequest) -> qb::Query = fn(kind, payload, left_req, right_req) {
     let left = lower_core(payload, left_req, [], [], [], [], [], []);
     let right = lower_core(payload, right_req, [], [], [], [], [], []);
-    qb::transform_sqlite_set_count(kind, left, right)
+    if validate_set_projection_types(payload, left, right) {
+        qb::transform_sqlite_set_count(kind, left, right)
+    } else { fail!("invalid set projection types") }
 };
 
 # Count the number of groups of a grouped request that satisfy the given
@@ -8656,6 +8762,7 @@ def lower_group_count: Fn(PreparedPayload, QueryRequest, Array(HavingRequest)) -
 # ---------------------------------------------------------------------------
 
 pub use self::{
+    OutputType,
     ColumnMap,
     KeyFlag,
     MeasureDef,
@@ -8852,6 +8959,8 @@ pub use self::{
     lower_field_filtered,
     lower_set,
     lower_set_count,
+    projection_output_types,
+    validate_set_projection_types,
     lower_hidden_having,
     lower_group_count,
     lower_group_count_plan,
@@ -8871,6 +8980,8 @@ pub use self::{
     request_subject_entity,
     reorder_projection,
     dimension_expr,
+    dimension_output_type,
+    measure_output_type,
     dimension_domain,
     canonical_value_domain,
     dimension_detail,

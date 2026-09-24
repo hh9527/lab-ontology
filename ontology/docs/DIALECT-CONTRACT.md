@@ -13,36 +13,36 @@ linked and paired-endpoint bodies, scalar aggregate comparisons, ranked-key
 comparisons, and initial partitioned Top-N. Its candidate `QueryPlan` entry
 dispatches the same five validated result shapes as SQLite. Every rendering stage takes and returns
 an immutable context that allocates numbered bindings and collision-free
-internal aliases. The entry is not yet an admitted PostgreSQL dialect: shared
-set projection types and full cross-dialect execution semantics remain unproven.
-The shared set validator currently compares projection *shapes*, not SQL
-value types: a SQLite set can contain unlike scalar types while PostgreSQL
-may reject them. Type equivalence must be resolved before set operations can
-be admitted as supported PostgreSQL queries.
+internal aliases. The entry is not yet an admitted PostgreSQL dialect: Model
+set output types are checked at ontology lowering, but full cross-dialect
+execution semantics remain unproven.
+The query AST validates set projection *shapes*, not Model output types.
+Ontology lowering checks the prepared Model output types positionally before
+emitting a set AST; a bare AST caller is responsible for its physical schema.
+SQLite can execute mixed-type sets that PostgreSQL rejects, so a model-derived
+set must never reach either renderer with mismatched output types.
 
 ### Set projection type contract to complete
 
-`SetPlan` must carry a validated positional *output* type for each operand,
-and the shared validator must reject different types before either renderer
-runs. Shapes (`Expr`, `Aggregate`, `Computed`) are not types. The type witness
-must originate in the Model's prepared knowledge when ontology lowers an
-intent, but remain on the public AST so direct AST callers cannot bypass the
-same validation. In particular:
+Ontology must derive a positional *output* type for each model-derived set
+operand and reject different types before constructing `SetPlan`. Shapes
+(`Expr`, `Aggregate`, `Computed`) are not types. The query AST remains a closed
+structural vocabulary and does not inspect Model metadata or physical schema.
+In particular:
 
 - A plain dimension uses its declared physical scalar type; a closed enum's
   physical text representation is not its Telora enum type.
 - A JSON dimension uses its declared extracted scalar kind, not the containing
-  JSON document field's type. A computed dimension must declare its output
-  type; its input field type and filter input kinds cannot prove the builder's
-  result type.
+  JSON document field's type. A computed dimension declares its output type;
+  its input field type and filter input kinds cannot prove the builder's result.
 - Aggregate output typing depends on the aggregate (for example Count vs
-  Avg), and computed measures depend on their typed operands. Bound literals
-  and derived UNION ALL columns must be checked against their declared type,
-  not used as a partial special case that ignores ordinary columns.
+  Avg), and computed measures depend on their typed operands. Model-derived
+  projections must be checked in actual SELECT order, including derived
+  outputs rather than just inspecting bound literals.
 
-Both SQLite and PostgreSQL must consume this common validated set shape. Do
-not use PG casts to make mismatched projections executable: casting changes
-set equality and therefore business semantics, even if both queries run.
+Both SQLite and PostgreSQL consume the same structurally validated AST. Do
+not use PG casts to make mismatched model projections executable: casting
+changes set equality and therefore business semantics, even if both run.
 Partitioned Top-N now reuses the original numbered placeholders for the same
 structural grouping expression across SELECT, window clauses and GROUP BY.
 This is an explicit AST-expression reference, not a SQL-text rewrite. Its

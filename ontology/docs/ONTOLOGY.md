@@ -517,7 +517,7 @@ def head_scope: Array(edsl.ScopePredicate) = [{field: 1, op: edsl.FilterOp.Eq, i
 
 type Trace = struct {
     @edsl.column("label")
-    @edsl.computed_dimension("TraceHead", flag_true, flag_true, eq_ops, text_kinds, head_builder)
+    @edsl.computed_dimension("TraceHead", edsl.OutputType.Text, flag_true, flag_true, eq_ops, text_kinds, head_builder)
     @edsl.scope(head_scope)
     label: String,
     # ...
