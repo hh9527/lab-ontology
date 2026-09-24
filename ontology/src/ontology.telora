@@ -4813,7 +4813,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
         }) {
             Some(link) => graph_link_existence(ctx, payload, anchor, spec, link),
             None => do {
-        let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq))) = (ctx, [anchor], []);
+        let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq)), Array(qb::Join)) = (ctx, [anchor], [], []);
         let built = array::fold(spec.edges, initial, fn(state, edge) {
             let forward = array::any(state.1, fn(item) { item.id == edge.from });
             let backward = array::any(state.1, fn(item) { item.id == edge.to });
@@ -4821,42 +4821,50 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
             let previous_id = if forward { edge.from } else { edge.to };
             if forward == backward {
                 fail!("graph existence edge must introduce one node connected to the root", edge.relation)
-            } else if array::any(payload.business_links, fn(link) { link.id == edge.relation }) {
-                fail!("unsupported business link after a physical existence edge", edge.relation)
             } else {
                 let previous = graph_instance(state.1, previous_id);
                 let next_node = match array::find(spec.nodes, fn(node) { node.id == next_id }) {
                     Some(node) => node,
                     None => fail!("graph existence edge references an unknown inner node", edge.relation, next_id),
                 };
-                let relation = relation_domain(payload, edge.relation);
                 let next_entity = entity_by_id(payload, next_node.entity);
-                let valid = if forward {
-                    relation.from == previous.entity && relation.to == next_entity
-                } else { relation.to == previous.entity && relation.from == next_entity };
-                if !valid { fail!("graph existence edge role or target does not match declared relation", edge.relation, next_node.entity) }
-                else {
-                    let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, next_entity), next_id);
-                    let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
-                    let instance: GraphInstance = {id: next_id, entity: next_entity, source: source.1};
-                    (source.0, array::push(state.1, instance), array::push(state.2, pairs))
+                match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
+                    Some(link) => do {
+                        if previous.entity != link.participant || next_entity != link.participant {
+                            fail!("graph business link endpoints must both be its declared participant", edge.relation)
+                        } else if !forward && link.direction == LinkDirection::Directed {
+                            fail!("directed business link cannot be traversed from Z to A", edge.relation)
+                        } else {
+                            let joined = graph_link_joins(state.0, payload, link, previous.source, next_id);
+                            let instance: GraphInstance = {id: next_id, entity: next_entity, source: joined.1};
+                            (joined.0, array::push(state.1, instance), state.2, array::concat([state.3, joined.2]))
+                        }
+                    },
+                    None => do {
+                        let relation = relation_domain(payload, edge.relation);
+                        let valid = if forward {
+                            relation.from == previous.entity && relation.to == next_entity
+                        } else { relation.to == previous.entity && relation.from == next_entity };
+                        if !valid { fail!("graph existence edge role or target does not match declared relation", edge.relation, next_node.entity) }
+                        else {
+                            let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, next_entity), next_id);
+                            let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
+                            let instance: GraphInstance = {id: next_id, entity: next_entity, source: source.1};
+                            let join = if array::length(state.2) == 0 { [] } else {
+                                [qb::join_on(qb::JoinKind::Inner, source.1, qb::on_and(array::map(pairs, fn(pair) {
+                                    qb::on_eq(pair.left, pair.right)
+                                })))]
+                            };
+                            (source.0, array::push(state.1, instance), array::push(state.2, pairs), array::concat([state.3, join]))
+                        }
+                    },
                 }
             }
         });
         let first = get_index(built.1, 1).source;
         let first_pairs = get_index(built.2, 0);
-        let joins = array::map(array::enumerate(built.2), fn(indexed) {
-            if indexed.0 == 0 { None }
-            else {
-                let source = get_index(built.1, indexed.0 + 1).source;
-                Some(qb::join_on(qb::JoinKind::Inner, source, qb::on_and(array::map(indexed.1, fn(pair) {
-                    qb::on_eq(pair.left, pair.right)
-                }))))
-            }
-        });
-        let path = array::flat_map(joins, fn(item) { match item { Some(join) => [join], None => [] } });
         let filtered = graph_filters(built.0, payload, built.1, spec.filters);
-        let exists = qb::exists_path(first, first_pairs, path);
+        let exists = qb::exists_path(first, first_pairs, built.3);
         let exists = {...exists, filter: filtered.1};
         (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },
