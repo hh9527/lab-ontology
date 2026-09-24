@@ -1987,10 +1987,13 @@ def computed_aggregate_rejects_missing_scalar_operator: Fn() -> Bool = fn() {
 # ---------------------------------------------------------------------------
 # SQLite JSON1 v1 (JsonExtract / JsonType / JsonValid).
 #
-# The JSON path is always a literal string Bind, so it enters `?`/bindings and
-# never the SQL text.  Arity is fixed (Extract/Type = 2, Valid = 1); the second
-# argument of Extract/Type must be a string Bind in structural validation.
+# The JSON path is a structured AST value; SQLite turns it into a bound JSON1
+# string at rendering time. Extract/Type require a JsonPath second argument.
 # ---------------------------------------------------------------------------
+
+def json_key: Fn(String) -> qb::JsonPath = fn(key) {
+    qb::json_path([qb::JsonPathSegment::Key(key)])
+};
 
 def json_plan: Fn() -> qb::Plan = fn() {
     let plan: qb::Plan = {
@@ -1998,18 +2001,18 @@ def json_plan: Fn() -> qb::Plan = fn() {
         sources: [qb::source("e", "events")],
         projection: [
             qb::expr_item(qb::column("e", "id")),
-            qb::expr_item(qb::json_extract(qb::column("e", "payload"), "$.attempt_id", qb::JsonScalarKind::Int)),
-            qb::expr_item(qb::json_extract(qb::column("e", "payload"), "$.status", qb::JsonScalarKind::Text)),
-            qb::expr_item(qb::json_type(qb::column("e", "payload"), "$.amount")),
+            qb::expr_item(qb::json_extract(qb::column("e", "payload"), json_key("attempt_id"), qb::JsonScalarKind::Int)),
+            qb::expr_item(qb::json_extract(qb::column("e", "payload"), json_key("status"), qb::JsonScalarKind::Text)),
+            qb::expr_item(qb::json_type(qb::column("e", "payload"), json_key("amount"))),
             qb::expr_item(qb::json_valid(qb::column("e", "payload"))),
         ],
         filter: Some(qb::scalar(qb::ScalarFunction::Eq, [
-            qb::json_extract(qb::column("e", "payload"), "$.status", qb::JsonScalarKind::Text),
+            qb::json_extract(qb::column("e", "payload"), json_key("status"), qb::JsonScalarKind::Text),
             qb::bind_string("ok"),
         ])),
         joins: [],
-        grouping: [qb::json_extract(qb::column("e", "payload"), "$.attempt_id", qb::JsonScalarKind::Int)],
-        ordering: [qb::asc(qb::json_extract(qb::column("e", "payload"), "$.attempt_id", qb::JsonScalarKind::Int))],
+        grouping: [qb::json_extract(qb::column("e", "payload"), json_key("attempt_id"), qb::JsonScalarKind::Int)],
+        ordering: [qb::asc(qb::json_extract(qb::column("e", "payload"), json_key("attempt_id"), qb::JsonScalarKind::Int))],
         limit: None,
         offset: None,
         exists: [],
@@ -2031,7 +2034,7 @@ def expected_json_bindings: Array(qb::Val) = [
 ];
 
 def json_partition_plan: Fn() -> qb::Plan = fn() {
-    let attempt = qb::json_extract(qb::column("e", "payload"), "$.attempt_id", qb::JsonScalarKind::Int);
+    let attempt = qb::json_extract(qb::column("e", "payload"), json_key("attempt_id"), qb::JsonScalarKind::Int);
     let plan: qb::Plan = {
         revision: "test-json-partition",
         sources: [qb::source("e", "events")],
@@ -2211,16 +2214,49 @@ def json_rejects_expression_path: Fn() -> Bool = fn() {
 };
 
 def json_rejects_path_without_root: Fn() -> Bool = fn() {
-    !qb::structure_ok(json_probe_plan(qb::json_extract(qb::column("e", "payload"), "attempt_id", qb::JsonScalarKind::Int)))
+    !qb::structure_ok(json_probe_plan(qb::scalar(qb::ScalarFunction::JsonExtractInt, [
+        qb::column("e", "payload"), qb::bind_string("attempt_id"),
+    ])))
 };
 
 def json_rejects_empty_path: Fn() -> Bool = fn() {
-    !qb::structure_ok(json_probe_plan(qb::json_type(qb::column("e", "payload"), "")))
+    !qb::structure_ok(json_probe_plan(qb::scalar(qb::ScalarFunction::JsonType, [
+        qb::column("e", "payload"), qb::bind_string(""),
+    ])))
 };
 
 def json_accepts_root_path: Fn() -> Bool = fn() {
-    qb::structure_ok(json_probe_plan(qb::json_type(qb::column("e", "payload"), "$")))
+    qb::structure_ok(json_probe_plan(qb::json_type(qb::column("e", "payload"), qb::json_path([]))))
 };
+
+pub def json_structured_path_renders_bound_json1: test::Test = test::should_ok(fn() {
+    let path = qb::json_path([qb::JsonPathSegment::Key("a.b"), qb::JsonPathSegment::Index(0),
+        qb::JsonPathSegment::FromEnd(1)]);
+    let plan = json_probe_plan(qb::json_extract(qb::column("e", "payload"), path, qb::JsonScalarKind::Int));
+    let query = qb::transform_sqlite(plan);
+    if query.bindings == [qb::Val::String("$.\"a.b\"[0][#-1]")]
+        && string::contains(query.sql, "json_extract(e.payload, ?)") { True }
+    else { fail!("structured JSON path must become one bound JSON1 path", query) }
+});
+
+pub def json_rejects_unrepresentable_key: test::Test = test::should_fail_with(fn() {
+    qb::json_path([qb::JsonPathSegment::Key("a.\"b")])
+}, "JSON path contains an unrepresentable key or index");
+
+pub def json_rejects_negative_index: test::Test = test::should_fail_with(fn() {
+    qb::json_path([qb::JsonPathSegment::Index(-1)])
+}, "JSON path contains an unrepresentable key or index");
+
+pub def json_path_is_not_a_standalone_expression: test::Test = test::should_ok(fn() {
+    let path = qb::Expr::JsonPath(qb::json_path([qb::JsonPathSegment::Key("status")]));
+    if !qb::structure_ok(json_probe_plan(path)) { True }
+    else { fail!("JSON path must only occur inside JSON scalar calls") }
+});
+
+pub def json_path_cannot_enter_other_scalars: test::Test = test::should_fail_with(fn() {
+    qb::scalar(qb::ScalarFunction::Eq, [qb::column("e", "payload"),
+        qb::Expr::JsonPath(qb::json_path([qb::JsonPathSegment::Key("status")]))])
+}, "invalid scalar call arity or JSON path argument");
 
 # ---------------------------------------------------------------------------
 # JSON codec boundary (Val <-> untagged scalar JSON).

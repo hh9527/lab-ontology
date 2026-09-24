@@ -50,7 +50,7 @@ type ColumnRef = struct {
 # A-Z only, so `lower(a) = lower(b)` is the closed way to do case-insensitive
 # comparison; `Length` (`length(value)`) is the character count of a text
 # value; `JsonExtract`/`JsonType`/`JsonValid` are the closed SQLite JSON1
-# v1 vocabulary (the JSON path is always a string `Bind`, never SQL text).
+# v1 vocabulary (the JSON path is a structural value, never SQL text).
 # The remaining variants are operator-style scalar predicates/logic rendered
 # with SQLite operator syntax.  The AST is closed: no raw SQL fragment, no
 # arbitrary function name/operator and no identifier can escape through this
@@ -96,9 +96,29 @@ type ScalarCall = struct {
 
 type JsonScalarKind = enum { Text, Int, Number };
 
+type JsonPathSegment = enum {
+    Key(String),
+    Index(Int),
+    FromEnd(Int),
+};
+
+@check(fn(path) {
+    if array::all(path.segments, fn(segment) {
+        match segment {
+            JsonPathSegment::Key(key) => string::length(key) > 0
+                && !(string::contains(key, "\"") && (string::contains(key, ".")
+                    || string::contains(key, "[") || string::contains(key, "]"))),
+            JsonPathSegment::Index(index) => index >= 0,
+            JsonPathSegment::FromEnd(index) => index > 0,
+        }
+    }) { Ok(()) } else { Err(blame!("JSON path contains an unrepresentable key or index", path.segments)) }
+})
+type JsonPath = struct { segments: Array(JsonPathSegment) };
+
 type Expr = enum {
     Column(ColumnRef),
     Bind(Val),
+    JsonPath(JsonPath),
     Scalar(ScalarCall),
 };
 
@@ -564,6 +584,7 @@ def expr_operators: Fn(Expr) -> Array(Operator) = fn(expr) {
     match expr {
         Expr::Column(_) => [Operator::Column],
         Expr::Bind(_) => [Operator::Bind],
+        Expr::JsonPath(_) => [Operator::Bind],
         Expr::Scalar(call) => {
             let empty: Array(Operator) = [];
             let child = array::fold(call.args, empty, fn(acc, arg) {
@@ -911,16 +932,16 @@ def known_alias: Fn(Array(String), String) -> Bool = fn(aliases, alias) {
     array::any(aliases, fn(candidate) { candidate == alias })
 };
 
-def json_path_root_pattern: regex::Regex = regex::compile(r"^\$(?:\.|\[|$)");
-
-# JsonExtract/JsonType require a bound JSON1 path beginning at the document
-# root. This is only the root check; segment validation is still required
-# before a second dialect can consume the path.
+# A JSON path is an AST value, not a dialect-specific string binding.
 def json_path_ok: Fn(Expr) -> Bool = fn(expr) {
     match expr {
-        Expr::Bind(Val::String(path)) => regex::is_match(json_path_root_pattern, path),
+        Expr::JsonPath(_) => True,
         _ => False,
     }
+};
+
+def has_json_path: Fn(Array(Expr)) -> Bool = fn(args) {
+    array::any(args, fn(arg) { match arg { Expr::JsonPath(_) => True, _ => False } })
 };
 
 def utc_days_args_ok: Fn(Array(Expr)) -> Bool = fn(args) {
@@ -937,13 +958,13 @@ def utc_days_args_ok: Fn(Array(Expr)) -> Bool = fn(args) {
 def json_call_valid: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args) {
     let arity_ok = scalar_arity_ok(function, args);
     match function {
-        ScalarFunction::JsonExtractText => arity_ok && json_path_ok(args[1]),
-        ScalarFunction::JsonExtractInt => arity_ok && json_path_ok(args[1]),
-        ScalarFunction::JsonExtractNumber => arity_ok && json_path_ok(args[1]),
-        ScalarFunction::JsonType => arity_ok && json_path_ok(args[1]),
-        ScalarFunction::JsonValid => arity_ok,
-        ScalarFunction::UtcDaysAgo => arity_ok && utc_days_args_ok(args),
-        _ => arity_ok,
+        ScalarFunction::JsonExtractText => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
+        ScalarFunction::JsonExtractInt => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
+        ScalarFunction::JsonExtractNumber => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
+        ScalarFunction::JsonType => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
+        ScalarFunction::JsonValid => arity_ok && !has_json_path(args),
+        ScalarFunction::UtcDaysAgo => arity_ok && !has_json_path(args) && utc_days_args_ok(args),
+        _ => arity_ok && !has_json_path(args),
     }
 };
 
@@ -951,8 +972,9 @@ def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
     match expr {
         Expr::Column(ref) => is_sql_identifier(ref.column) && known_alias(aliases, ref.source),
         Expr::Bind(_) => True,
+        Expr::JsonPath(_) => False,
         Expr::Scalar(call) => {
-            array::all(call.args, fn(arg) { expr_valid(arg, aliases) })
+            array::all(call.args, fn(arg) { json_path_ok(arg) || expr_valid(arg, aliases) })
         },
     }
 };
@@ -1454,6 +1476,7 @@ def expr_derived_cols_ok: Fn(Expr, String, Array(String)) -> Bool = fn(expr, ali
             True
         },
         Expr::Bind(_) => True,
+        Expr::JsonPath(_) => True,
         Expr::Scalar(call) => array::all(call.args, fn(arg) { expr_derived_cols_ok(arg, alias, names) }),
     }
 };
@@ -1836,6 +1859,10 @@ def expr_subqueries: Fn(Expr) -> Array(ScalarSubquery) = fn(expr) {
             let empty: Array(ScalarSubquery) = [];
             empty
         },
+        Expr::JsonPath(_) => {
+            let empty: Array(ScalarSubquery) = [];
+            empty
+        },
     }
 };
 
@@ -2174,6 +2201,7 @@ def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed)
     match expr {
         Expr::Column(_) => True,
         Expr::Bind(_) => True,
+        Expr::JsonPath(_) => True,
         Expr::Scalar(call) => {
             let self_ok = array::any(allowed, fn(candidate) { candidate == call.function });
             self_ok && array::all(call.args, fn(arg) { expr_scalars_ok(arg, allowed) })
@@ -2531,6 +2559,19 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
 
 # Renders an expression to (sql_fragment, bindings).  Dynamic values always
 # become `?` placeholders and are collected into bindings in placeholder order.
+def sqlite_json_path: Fn(JsonPath) -> String = fn(path) {
+    let parts = array::map(path.segments, fn(segment) {
+        match segment {
+            JsonPathSegment::Key(key) => if string::contains(key, ".") || string::contains(key, "[") || string::contains(key, "]") {
+                `."\{key}"`
+            } else { `.\{key}` },
+            JsonPathSegment::Index(index) => `[\{index}]`,
+            JsonPathSegment::FromEnd(index) => `[#-\{index}]`,
+        }
+    });
+    `$\{string::join(parts, "")}`
+};
+
 def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
     match expr {
         Expr::Column(ref) => {
@@ -2538,6 +2579,7 @@ def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
             (`\{ref.source}.\{ref.column}`, empty)
         },
         Expr::Bind(val) => ("?", [val]),
+        Expr::JsonPath(path) => ("?", [Val::String(sqlite_json_path(path))]),
         Expr::Scalar(call) => {
             let rendered_args = array::map(call.args, render_expr);
             let sql_parts = array::map(rendered_args, fn(pair) { pair.0 });
@@ -3754,20 +3796,24 @@ def length: Fn(Expr) -> Expr = fn(value) {
     Expr::Scalar(call)
 };
 
-# SQLite JSON1 v1: the JSON path is always converted to a string Bind, so it
-# enters `?`/bindings and never the SQL text.
-def json_extract: Fn(Expr, String, JsonScalarKind) -> Expr = fn(document, path, kind) {
+# Paths are structural AST values. SQLite serializes them into JSON1 Bind
+# values only during rendering; other dialects consume the same segments.
+def json_path: Fn(Array(JsonPathSegment)) -> JsonPath = fn(segments) {
+    {segments}
+};
+
+def json_extract: Fn(Expr, JsonPath, JsonScalarKind) -> Expr = fn(document, path, kind) {
     let function = match kind {
         JsonScalarKind::Text => ScalarFunction::JsonExtractText,
         JsonScalarKind::Int => ScalarFunction::JsonExtractInt,
         JsonScalarKind::Number => ScalarFunction::JsonExtractNumber,
     };
-    let call: ScalarCall = {function, args: [document, bind_string(path)]};
+    let call: ScalarCall = {function, args: [document, Expr::JsonPath(path)]};
     Expr::Scalar(call)
 };
 
-def json_type: Fn(Expr, String) -> Expr = fn(document, path) {
-    let call: ScalarCall = {function: ScalarFunction::JsonType, args: [document, bind_string(path)]};
+def json_type: Fn(Expr, JsonPath) -> Expr = fn(document, path) {
+    let call: ScalarCall = {function: ScalarFunction::JsonType, args: [document, Expr::JsonPath(path)]};
     Expr::Scalar(call)
 };
 
@@ -4132,6 +4178,8 @@ pub use self::{
     ScalarFunction,
     ScalarCall,
     JsonScalarKind,
+    JsonPathSegment,
+    JsonPath,
     Expr,
     AggregateFunction,
     AggregateCall,
@@ -4212,6 +4260,7 @@ pub use self::{
     sub,
     lower,
     length,
+    json_path,
     json_extract,
     json_type,
     json_valid,

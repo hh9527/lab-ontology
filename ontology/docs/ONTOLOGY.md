@@ -479,14 +479,14 @@ Dimension id，不得携带 path、raw predicate、SQLite 函数名或 JSON 表�
 @edsl.entity_source("devices", "d")
 type Device = struct {
     @edsl.column("attributes_json")
-    @edsl.json_dimension("DeviceChannel", flag_true, flag_true, eq_ops, text_kinds, "$.channel", qb.JsonScalarKind.Text)
-    @edsl.json_dimension("DeviceRetryCount", flag_true, flag_true, eq_ops, int_kinds, "$.retry.count", qb.JsonScalarKind.Int)
+    @edsl.json_dimension("DeviceChannel", flag_true, flag_true, eq_ops, text_kinds, qb.json_path([qb.JsonPathSegment.Key("channel")]), qb.JsonScalarKind.Text)
+    @edsl.json_dimension("DeviceRetryCount", flag_true, flag_true, eq_ops, int_kinds, qb.json_path([qb.JsonPathSegment.Key("retry"), qb.JsonPathSegment.Key("count")]), qb.JsonScalarKind.Int)
     attributes_json: String,
     # ...
 };
 ```
 
-- path 通过 Query 的有类型 `JsonExtractText/Int/Number` 构造器成为 String binding（`?`），绝不成为
+- path 在 Model 和 Query AST 中保留为键/索引序列；SQLite 渲染器才把它变为 String binding（`?`），绝不成为
   SQL literal 或 identifier；JSON Dimension 复用现有 authorization、filterable、
   ops、input kinds、enum domain、scope、grain、relation path、grouping、ordering
   与 Top Per Group 检查。

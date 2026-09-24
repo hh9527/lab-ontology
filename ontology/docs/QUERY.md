@@ -157,8 +157,8 @@ alias 做 `Add`/`Sub` 算术组合。
 | `Add` / `Sub` | 2 | 整数算术，渲染为 `(a + b)` / `(a - b)` |
 | `Lower` | 1 | `lower(value)`：大小写归一；默认 SQLite build 只折叠 ASCII A-Z |
 | `Length` | 1 | `length(value)`：文本按字符计数的长度 |
-| `JsonExtract` | 2 | `json_extract(document, path)`；path 必须是字符串 Bind |
-| `JsonType` | 2 | `json_type(document, path)`；path 必须是字符串 Bind |
+| `JsonExtract` | 2 | `json_extract(document, path)`；path 是结构化 `JsonPath` |
+| `JsonType` | 2 | `json_type(document, path)`；path 是结构化 `JsonPath` |
 | `JsonValid` | 1 | `json_valid(document)` |
 | `Eq/Ne/Lt/Le/Gt/Ge` | 2 | 比较运算 |
 | `And` / `Or` | 2 | 逻辑运算 |
@@ -180,8 +180,8 @@ operator 必须被允许；profile 只保留部分能力时，调用方只能引
 
 SQLite JSON1 v1 词汇（`JsonExtract`/`JsonType`/`JsonValid`）同样属于
 `allowed_scalars` 并消耗 `Scalar` operator。`JsonExtract`/`JsonType` 的第二个参数
-（JSON path）在结构校验中必须确认为字符串 `Bind`：列、计算表达式、Int/Float Bind
-或缺失参数均原子失败；path 经 `?` 进入 bindings，绝不插入 SQL 文本。arity 固定
+（JSON path）在结构校验中必须确认为 `JsonPath`：列、计算表达式、普通 Bind
+或缺失参数均原子失败；SQLite 渲染时将路径段序列化后经 `?` 进入 bindings，绝不插入 SQL 文本。arity 固定
 （Extract/Type 为 2，Valid 为 1）。
 
 ### Plan
@@ -775,7 +775,8 @@ bindings 严格按占位符出现顺序：两个 FILTER 的 `?`、全局 WHERE�
 ## SQLite JSON v1
 
 从 `payload_json` 风格列提取字段，并用于 projection、filter、grouping 与
-ordering。JSON path 始终是字符串 `Bind`，进入 `?`/bindings，绝不进入 SQL 文本。
+ordering。公共 AST 保存结构化 `JsonPath`；SQLite 渲染器生成字符串 `Bind`，
+进入 `?`/bindings，绝不进入 SQL 文本。
 
 ```telora
 def attempts: qb.Plan = {
@@ -783,18 +784,18 @@ def attempts: qb.Plan = {
     sources: [qb.source("e", "events")],
     projection: [
         qb.expr_item(qb.column("e", "id")),
-        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.attempt_id", qb.JsonScalarKind.Int)),
-        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.status", qb.JsonScalarKind.Text)),
-        qb.expr_item(qb.json_type(qb.column("e", "payload"), "$.amount")),
+        qb.expr_item(qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("attempt_id")]), qb.JsonScalarKind.Int)),
+        qb.expr_item(qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("status")]), qb.JsonScalarKind.Text)),
+        qb.expr_item(qb.json_type(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("amount")]))),
         qb.expr_item(qb.json_valid(qb.column("e", "payload"))),
     ],
     filter: Some(qb.scalar(qb.ScalarFunction.Eq, [
-        qb.json_extract(qb.column("e", "payload"), "$.status", qb.JsonScalarKind.Text),
+        qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("status")]), qb.JsonScalarKind.Text),
         qb.bind_string("ok"),
     ])),
     joins: [],
-    grouping: [qb.json_extract(qb.column("e", "payload"), "$.attempt_id", qb.JsonScalarKind.Int)],
-    ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id", qb.JsonScalarKind.Int))],
+    grouping: [qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("attempt_id")]), qb.JsonScalarKind.Int)],
+    ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("attempt_id")]), qb.JsonScalarKind.Int))],
     limit: None,
     offset: None,
     exists: [],
@@ -1521,7 +1522,7 @@ JSON 文本不能保留整数值 Float 的身份：`Float(3.0)` 紧凑编码可�
 | count_groups：内层 HAVING 引用未知列/别名 | `count_groups` 失败（`validate` 前），或 `structure_ok == False` |
 | 派生 UNION ALL：derived 与物理 sources/joins/EXISTS 并存、空分支、列数为空/不一致、别名顺序不一致、重复/非法输出别名、派生 alias 遮蔽分支、外层引用未投影列 | `validate_structure` 失败，或 `structure_ok == False` |
 | Join ON：条件引用未知 alias、`And`/`Or` 为空 | `validate_structure` 失败，或 `structure_ok == False` |
-| JSON：Extract/Type arity 非 2、Valid arity 非 1、path 非字符串 Bind（列/计算表达式/Int/Float Bind/缺失） | `validate_structure` 失败，或 `structure_ok == False` |
+| JSON：Extract/Type arity 非 2、Valid arity 非 1、path 非结构化 `JsonPath`（列/计算表达式/普通 Bind/缺失） | `validate_structure` 失败，或 `structure_ok == False` |
 | FILTER predicate 使用 profile 未允许的表达式 | `validate` 失败，或 `profile_accepts == False` |
 | Profile 缺 JsonExtract / JsonType / JsonValid / Lower / Length | `validate` 失败，或 `profile_accepts == False` |
 | Profile 缺 `Exists` / `Having` | `validate` 失败，或 `profile_accepts == False` |

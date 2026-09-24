@@ -39,15 +39,14 @@ simply producing syntactically plausible SQL.
 
 ### JSON path and representation checkpoint
 
-The current AST stores a JSON1 path as a bound string and checks its root
-marker, but does not yet validate individual segments. PostgreSQL's
-`json_extract_path` accepts separate text path
-segments, not the JSON1 path syntax. Before admitting PostgreSQL, parse and
-validate the path once in the shared layer, including quoted object keys,
-array indices and JSON1's reverse-index forms; reject unsupported paths at
-plan preparation with a path-specific diagnostic. A renderer must consume the
-parsed segments, never interpolate the path into SQL. The present root-only
-check does **not** establish cross-dialect path equivalence.
+The AST now stores `JsonPath` as typed key, zero-based index and from-end
+index segments. Models declare those segments directly; PostgreSQL does not
+need to parse SQLite JSON1 strings. SQLite serializes the segments into one
+bound JSON1 path at rendering time; PostgreSQL must consume the same segments
+without interpolating keys into SQL. Invalid indices and keys which SQLite
+cannot represent unambiguously are rejected while building the path.
+Actual cross-dialect execution equivalence still requires tests of keys,
+indices, reverse indices, missing paths and JSON null.
 
 Use PostgreSQL's original `json` representation for `JsonType` when numeric
 lexical form matters: SQLite distinguishes `json_type('1e0', '$') = 'real'`
