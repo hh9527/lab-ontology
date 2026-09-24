@@ -9,14 +9,14 @@ been declared; the ontology must not infer either from the two endpoint keys.
 The following cases specify the intended relation-based Intent contract. The
 `graph` row-query shape now supports rooted, explicitly named instance trees,
 projection of authorized plain dimensions, forward and reverse navigation of
-declared edges, and one- or two-edge correlated existence/absence paths. It
+declared edges, and ordered correlated existence/absence paths of arbitrary
+length. It
 also accepts `count: "<root instance>"` instead of `select` when every outer
 JOIN follows a forward Safe edge; otherwise counting the root requires EXISTS
 so that matching children cannot multiply its rows. It counts the root key
 without reducing a composite grain to one guessed DISTINCT column. It
-rejects missing edges, role mismatches and disconnected nodes. Longer existence
-paths report unsupported (the current QueryAst bounds this shape at two edges),
-not invalid domain semantics. Reverse navigation reads the same edge from its other endpoint; it does
+rejects missing edges, role mismatches and disconnected nodes. Reverse
+navigation reads the same edge from its other endpoint; it does
 not establish any business-level peer direction or symmetry. `tests/graph.telora`
 exercises these cases against QueryAst and both SQL materializers.
 
@@ -38,5 +38,5 @@ role, or missing proof.
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The current Model only establishes
 the endpoint and tenant identity facts; symmetric/directed peer semantics,
-longer graph-level existence and grouped or non-root grain-aware aggregates
+branching graph-level existence and grouped or non-root grain-aware aggregates
 remain pending.

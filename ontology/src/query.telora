@@ -355,6 +355,9 @@ type PeerCorr = struct {
 # bounded correlated two-hop body (see `ExistsLink`): the whole A -> B -> C
 # condition stays inside ONE correlated EXISTS, so a fan-out first hop never
 # amplifies the outer A grain.
+# `path` is an ordered sequence of inner JOINs for a correlated relation path.
+# Its aliases and equality conditions are validated in construction order; it
+# is exclusive with the specialized `link` and `peer` bodies.
 type Exists = struct {
     source: Source,
     pairs: Array(ColumnEq),
@@ -365,6 +368,7 @@ type Exists = struct {
     peer: Option(PeerCorr),
     negated: Bool,
     link: Option(ExistsLink),
+    path: Array(Join),
 };
 
 # Bounded correlated two-hop existence body.  A base row A is kept when it has
@@ -772,7 +776,10 @@ def exists_operators: Fn(Array(Exists)) -> Array(Operator) = fn(exists_list) {
                     } else {
                         with_filter
                     };
-                    ops_union(ops_union(with_group, having_operators(ex.having)), source_operators(ex.source))
+                    let with_path = array::fold(ex.path, with_group, fn(used, join) {
+                        ops_union(used, joins_operators([join]))
+                    });
+                    ops_union(ops_union(with_path, having_operators(ex.having)), source_operators(ex.source))
                 },
             },
         }
@@ -1382,7 +1389,7 @@ def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, li
         Some(alternatives) => array::length(link.pairs) == 0
             && alternatives_ok(alternatives, link.source.alias, [hop]),
     };
-    let mode_ok = ex.filter == None
+    let mode_ok = array::length(ex.path) == 0 && ex.filter == None
         && array::length(ex.grouping) == 0 && array::length(ex.having) == 0
         && ex.peer == None;
     let tail_ok = match link.tail {
@@ -1406,9 +1413,35 @@ def link_structure_ok: Fn(Exists, ExistsLink, Array(String)) -> Bool = fn(ex, li
     hop_ok && link_source_ok && hop_pairs_ok && link_pairs_ok && tail_ok && mode_ok && filter_ok
 };
 
+def path_condition_ok: Fn(JoinCondition, Array(String), String) -> Bool = fn(condition, visible, next) {
+    match condition {
+        JoinCondition::Eq(pair) => column_ref_id_ok(pair.left) && column_ref_id_ok(pair.right)
+            && ((known_alias(visible, pair.left.source) && pair.right.source == next)
+                || (known_alias(visible, pair.right.source) && pair.left.source == next)),
+        JoinCondition::And(parts) => array::length(parts) > 0
+            && array::all(parts, fn(part) { path_condition_ok(part, visible, next) }),
+        _ => False,
+    }
+};
+
+def path_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases) {
+    let first = ex.source.alias;
+    let initial: (Array(String), Bool) = ([first], True);
+    let checked = array::fold(ex.path, initial, fn(state, join) {
+        let alias = join.source.alias;
+        (array::push(state.0, alias), state.1 && join.kind == JoinKind::Inner
+            && source_valid(join.source) && !known_alias(main_aliases, alias)
+            && !known_alias(state.0, alias)
+            && path_condition_ok(join.condition, state.0, alias))
+    });
+    checked.1 && ex.peer == None && ex.link == None
+        && ex.alternatives == None && ex.filter == None
+        && array::length(ex.grouping) == 0 && array::length(ex.having) == 0
+};
+
 def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases) {
     match ex.peer {
-        Some(corr) => peer_corr_ok(corr, main_aliases),
+        Some(corr) => array::length(ex.path) == 0 && peer_corr_ok(corr, main_aliases),
         None => match ex.link {
             Some(link) => link_structure_ok(ex, link, main_aliases),
             None => do {
@@ -1435,7 +1468,7 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
                         _ => False,
                     }
                 });
-                match ex.alternatives {
+                let body_ok = match ex.alternatives {
                     Some(alternatives) => {
                         let alt_ok_result = array::length(ex.pairs) == 0 && alternatives_ok(alternatives, inner, main_aliases);
                         id_ok && alt_ok_result && filter_ok && group_ok && having_ok
@@ -1450,7 +1483,8 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
                         });
                         id_ok && array::length(ex.pairs) > 0 && pairs_ok && filter_ok && group_ok && having_ok
                     },
-                }
+                };
+                body_ok && (if array::length(ex.path) > 0 { path_structure_ok(ex, main_aliases) } else { True })
             },
         },
     }
@@ -2404,6 +2438,9 @@ def exists_body_scalars_ok: Fn(Exists, Array(ScalarFunction)) -> Bool = fn(ex, a
                 let group_ok = array::all(ex.grouping, fn(expr) { expr_scalars_ok(expr, allowed) });
                 filter_ok && group_ok && having_list_scalars_ok(ex.having, allowed)
                     && source_scalars_ok(ex.source, allowed)
+                    && array::all(ex.path, fn(join) {
+                        source_scalars_ok(join.source, allowed)
+                    })
             },
         },
     }
@@ -2874,6 +2911,7 @@ def exists: Fn(Source, Array(ColumnEq), Option(Expr)) -> Exists = fn(ex_source, 
         peer: None,
         negated: False,
         link: None,
+        path: [],
     };
     item
 };
@@ -2892,6 +2930,7 @@ def exists_grouped: Fn(Source, Array(ColumnEq), Option(Expr), Array(Expr), Array
         peer: None,
         negated: False,
         link: None,
+        path: [],
     };
     item
 };
@@ -2916,6 +2955,7 @@ def exists_union: Fn(Source, Array(Array(ColumnEq)), Option(Expr)) -> Exists = f
         peer: None,
         negated: False,
         link: None,
+        path: [],
     };
     item
 };
@@ -2985,6 +3025,7 @@ def exists_peer: Fn(PeerCorr) -> Exists = fn(corr) {
         peer: Some(corr),
         negated: False,
         link: None,
+        path: [],
     };
     item
 };
@@ -3005,6 +3046,7 @@ def exists_not: Fn(Exists) -> Exists = fn(ex) {
         peer: ex.peer,
         negated: True,
         link: ex.link,
+        path: ex.path,
     };
     item
 };
@@ -3028,8 +3070,14 @@ def exists_two_hop: Fn(Source, Array(ColumnEq), Source, Array(ColumnEq), Option(
         peer: None,
         negated: False,
         link: Some(link),
+        path: [],
     };
     item
+};
+
+# Arbitrarily long, ordered inner join path rooted at a correlated source.
+def exists_path: Fn(Source, Array(ColumnEq), Array(Join)) -> Exists = fn(source, pairs, path) {
+    {...exists(source, pairs, None), path}
 };
 
 def exists_two_hop_alternatives: Fn(Source, Array(Array(ColumnEq)), Source, Array(ColumnEq), Option(Expr)) -> Exists =
@@ -3231,6 +3279,7 @@ pub use self::{
     exists_union,
     exists_not,
     exists_two_hop,
+    exists_path,
     exists_two_hop_alternatives,
     exists_three_hop_alternatives,
     exists_three_hop_double_alternatives,
