@@ -14,7 +14,7 @@
 
 use crate::ontology as edsl;
 use std::test as test;
-use crate::intent::{ query_intent_lower_factory, query_intent_plan_factory, query_intent_ok };
+use crate::intent::{ query_intent_lower_factory, query_intent_ast_factory, query_intent_ok };
 pub mod test_knowledge;
 use self::test_knowledge::{ payload, profile };
 use crate::query as qb;
@@ -25,10 +25,10 @@ use std::json as json;
 use std::value::{ Value };
 use std::string as string;
 
-pub def intent_plan_factory_keeps_distinct_before_sql: test::Test = test::should_ok(fn() {
-    let lower_plan = query_intent_plan_factory(payload, "analyst");
+pub def intent_ast_factory_keeps_distinct_before_sql: test::Test = test::should_ok(fn() {
+    let lower_ast = query_intent_ast_factory(payload, "analyst");
     let input = parse(r#"{"op":"distinct","measures":[],"dimensions":["MemberKind"],"filters":[],"ordering":[],"limit":null,"offset":null}"#);
-    match lower_plan(input) {
+    match lower_ast(input).plan {
         qb::QueryPlan::DistinctRows(_) => True,
         _ => fail!("distinct intent must remain a distinct AST shape", input),
     }
@@ -36,8 +36,8 @@ pub def intent_plan_factory_keeps_distinct_before_sql: test::Test = test::should
 
 pub def backend_is_bound_at_factory_creation: test::Test = test::should_ok(fn() {
     let input = parse(r#"{"op":"list","measures":[],"dimensions":["OrderRegion"],"filters":[{"dimension":"OrderRegion","op":"eq","kind":"text","value":"east"}],"ordering":[],"limit":null,"offset":null}"#);
-    let sqlite_query = query_intent_lower_factory(payload, "analyst", sqlite::render_query_plan_with_context)(input);
-    let postgres_query = query_intent_lower_factory(payload, "analyst", postgres::render_query_plan_with_context)(input);
+    let sqlite_query = query_intent_lower_factory(payload, "analyst", sqlite::build_query)(input);
+    let postgres_query = query_intent_lower_factory(payload, "analyst", postgres::build_query)(input);
     if sqlite_query.bindings == [qb::Val::String("east")]
         && postgres_query.bindings == sqlite_query.bindings
         && string::contains(sqlite_query.sql, "?1")
@@ -47,8 +47,8 @@ pub def backend_is_bound_at_factory_creation: test::Test = test::should_ok(fn() 
 });
 
 pub def set_intent_rejects_different_model_output_types: test::Test = test::should_fail_with(fn() {
-    let lower_plan = query_intent_plan_factory(payload, "analyst");
-    lower_plan(parse(r#"{
+    let lower_ast = query_intent_ast_factory(payload, "analyst");
+    lower_ast(parse(r#"{
         "op": "set", "kind": "union", "branches": [
             {"shape": "row", "measures": [], "dimensions": ["OrderId"],
              "filters": [], "ordering": [], "limit": null, "offset": null},
@@ -59,8 +59,8 @@ pub def set_intent_rejects_different_model_output_types: test::Test = test::shou
 }, "set branches have incompatible projected Model output types");
 
 pub def set_count_intent_rejects_different_model_output_types: test::Test = test::should_fail_with(fn() {
-    let lower_plan = query_intent_plan_factory(payload, "analyst");
-    lower_plan(parse(r#"{
+    let lower_ast = query_intent_ast_factory(payload, "analyst");
+    lower_ast(parse(r#"{
         "op": "set_count", "kind": "intersect", "branches": [
             {"shape": "row", "measures": [], "dimensions": ["OrderRegion"],
              "filters": [], "ordering": [], "limit": null, "offset": null},
@@ -90,7 +90,7 @@ type EpochEvent = struct {
 };
 
 def lower_epoch: Fn(Value) -> qb::Query = query_intent_lower_factory(
-    edsl::build_root("epoch-clock-test", [EpochEvent.type], profile, fn(subject) { True }), "analyst", sqlite::render_query_plan_with_context);
+    edsl::build_root("epoch-clock-test", [EpochEvent.type], profile, fn(subject) { True }), "analyst", sqlite::build_query);
 
 pub def epoch_window_uses_declared_clock_and_integer_bounds: test::Test = test::should_ok(fn() {
     let query = lower_epoch(parse(r#"{"op":"utc_epoch_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","field":"occurred_ms","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
@@ -188,7 +188,7 @@ type EpochSample = struct {
 };
 
 def lower_epoch_sample: Fn(Value) -> qb::Query = query_intent_lower_factory(
-    edsl::build_root("epoch-sample-test", [EpochTenant.type, EpochOwner.type, EpochSample.type], profile, fn(subject) { True }), "analyst", sqlite::render_query_plan_with_context);
+    edsl::build_root("epoch-sample-test", [EpochTenant.type, EpochOwner.type, EpochSample.type], profile, fn(subject) { True }), "analyst", sqlite::build_query);
 
 @edsl::entity_id("epoch_component")
 @edsl::entity_source("epoch_component", "ec")
@@ -235,7 +235,7 @@ type EpochAlarm = struct {
 
 def lower_epoch_alarm: Fn(Value) -> qb::Query = query_intent_lower_factory(
     edsl::build_root("epoch-event-component-test", [EpochTenant.type, EpochOwner.type, EpochComponent.type, EpochAlarm.type],
-        profile, fn(subject) { True }), "analyst", sqlite::render_query_plan_with_context);
+        profile, fn(subject) { True }), "analyst", sqlite::build_query);
 
 pub def epoch_sample_top_preserves_owner_grain: test::Test = test::should_ok(fn() {
     let query = lower_epoch_sample(parse(r#"{"op":"sample_epoch_top","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"owner":"epoch_owner","relation":"epoch_sample_owner","rank":"EpochSampleValue","take":2,"window":{"dataset":"epoch_samples","field":"ts","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
@@ -457,8 +457,8 @@ def org_payload: Fn() -> edsl::PreparedPayload = fn() {
 # Factories and helpers.
 # ---------------------------------------------------------------------------
 
-def lower_knowledge: Fn(Value) -> qb::Query = query_intent_lower_factory(payload, "analyst", sqlite::render_query_plan_with_context);
-def lower_org: Fn(Value) -> qb::Query = query_intent_lower_factory(org_payload(), "analyst", sqlite::render_query_plan_with_context);
+def lower_knowledge: Fn(Value) -> qb::Query = query_intent_lower_factory(payload, "analyst", sqlite::build_query);
+def lower_org: Fn(Value) -> qb::Query = query_intent_lower_factory(org_payload(), "analyst", sqlite::build_query);
 
 def parse: Fn(String) -> Value = fn(source) {
     json::parse(source).unwrap!()
