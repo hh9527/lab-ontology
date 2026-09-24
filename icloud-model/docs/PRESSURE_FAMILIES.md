@@ -54,6 +54,20 @@ any query is lowered; SQL and SQLite execution still constrain both roles.
 | Tenant qualification by site | Q0138-Q0143 | Tenant is the counted/projected owner, and a named reverse Site-to-Tenant Safe relation supplies the site filter in correlated EXISTS. Two qualifying sites in one tenant must still count one tenant; tenants with no qualifying site are excluded. Site type is a declared canonical wire, not an ad hoc SQL literal. Existing `exists_via` is sufficient; no new shared operator is needed. |
 | Server components under a site and tenant | Q0184-Q0192 | Q0190 selects ServerFan identities through possibly non-unique `parentResId=oriResId`, ServerDevice's FanOut OR site alternatives, and Site's Safe tenant relation. Three-hop correlated EXISTS keeps the fan as the outer row and checks the independently declared Fan/Server tenant ownership against the same Site tenant. Named relation and filter roles are mandatory; duplicate parents/sites cannot replicate a fan. The corpus Q0184 text says count fans with warning servers, but its SQL counts distinct server names with health wire -1 (`error` in IC, not `warning`=1), so it cannot define the fan-count semantics. |
 
+Q0328 needs a separate PON-port acceptance carrier. The published PON data link
+contains only `PonDevice.id = MetricPonPort.parent_id`; `PonDevice.id` is marked
+PrimaryKey, but the scope of that key across tenants is not independently
+verified. Unlike AP-SSID, the product does not publish a tenant equality for
+this link, so a pressure fixture must state its global-ID assumption rather
+than silently add a tenant join. The logical KPI metadata calls `resId`
+"Device ID" and marks it `isPK: Y`, while the product metric set calls it
+"Resource ID" and also supplies `port_name`; neither source establishes a
+unique port identity or sampling grain. Q0328 asks for Max over all eligible
+raw port samples per offline GPON within externally resolved UTC bounds; IC
+publishes `if_in_band_rate` as Avg/%, so the Max must be a distinct knowledge
+point. Until the identity and grain contracts are checked against real data,
+the resulting SQL can validate a conditional model, not production safety.
+
 Prioritize the independent KPI qualification family first: it tests whether
 the Model and lowering preserve aggregation grain despite an apparently
 executable target SQL. Follow it with two-window qualification and child-filter
