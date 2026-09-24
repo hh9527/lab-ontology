@@ -2495,6 +2495,33 @@ def business_link_pairs: Fn(RelationKey, String) -> Array(RelationPair) = fn(key
     }
 };
 
+def conjunctive_identity_key: Fn(RelationKey) -> Bool = fn(key) {
+    match key {
+        RelationKey::Eq(_) => True,
+        RelationKey::And(parts) => array::length(parts) > 0
+            && array::all(parts, conjunctive_identity_key),
+        _ => False,
+    }
+};
+
+def relation_covers_source_identity: Fn(EntityEntry, RelationKey) -> Bool = fn(source, key) {
+    if !conjunctive_identity_key(key) { False }
+    else {
+        let pairs = exists_pairs(key);
+        match source.dataset {
+            Some(dataset) => array::length(dataset.grain) > 0
+                && array::all(dataset.grain, fn(name) {
+                    match array::find(source.fields, fn(field) { field.name == name }) {
+                        Some(field) => array::length(array::filter(pairs, fn(pair) { pair.from == field.index })) == 1,
+                        None => False,
+                    }
+                }),
+            None => source.key_field >= 0
+                && array::length(array::filter(pairs, fn(pair) { pair.from == source.key_field })) == 1,
+        }
+    }
+};
+
 def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Array(BusinessLinkEntry) = fn(entities, relations) {
     let links = array::flat_map(entities, fn(hub) {
         let declarations = match property::get_type_prop(hub.entity_type, BusinessLinkDef.type) {
@@ -4926,9 +4953,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let projection = match request.count {
                 None => row_projection,
                 Some(subject_id) => {
-                    if subject_id != request.root || array::length(request.select) != 0 {
-                        fail!("graph count subject must be the root and cannot combine with row projections", subject_id)
-                    } else if !array::fold(request.edges, ([request.root], True), fn(state, edge) {
+                    if array::any(request.select, fn(item) { item.node != request.root }) {
+                        fail!("graph count grouping dimensions must belong to the root", subject_id)
+                    } else if subject_id == request.root && !array::fold(request.edges, ([request.root], True), fn(state, edge) {
                         let safe = match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
                             Some(_) => False,
                             None => relation_domain(payload, edge.relation).kind == RelationKind::Safe,
@@ -4937,12 +4964,41 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                             && array::any(state.0, fn(id) { id == edge.from }))
                     }).1 {
                         fail!("graph count requires grain-safe forward joins; use existence for fan-out edges", subject_id)
+                    } else if subject_id != request.root && !(
+                        array::length(request.edges) == 1
+                        && array::any(request.edges, fn(edge) {
+                            if array::any(payload.business_links, fn(link) { link.id == edge.relation }) { False }
+                            else {
+                                let relation = relation_domain(payload, edge.relation);
+                                let instance = graph_instance(built.1, subject_id);
+                                (edge.from == subject_id && edge.to == request.root
+                                    && relation.kind == RelationKind::Safe
+                                    && relation.from == instance.entity && relation.to == root_entity)
+                                || (edge.from == request.root && edge.to == subject_id
+                                    && relation.kind == RelationKind::FanOut
+                                    && relation.from == root_entity && relation.to == instance.entity
+                                    && relation_covers_source_identity(get_index(payload.entities, root_entity), relation.key))
+                            }
+                        })
+                    ) {
+                        fail!("graph cannot prove the non-root count subject has one row per root relationship", subject_id)
                     } else {
-                        let entity = get_index(payload.entities, root_entity);
+                        let instance = graph_instance(built.1, subject_id);
+                        let entity = get_index(payload.entities, instance.entity);
                         let key = get_index(entity.fields, entity.key_field);
-                        [qb::aggregate(qb::AggregateFunction::Count, qb::column(root.1, key.column), False, `\{subject_id}_count`)]
+                        array::concat([row_projection, [qb::aggregate(qb::AggregateFunction::Count,
+                            qb::column(instance.source, key.column), False, `\{subject_id}_count`)]])
                     }
                 },
+            };
+            let grouping = match request.count {
+                None => [],
+                Some(_) => array::map(row_projection, fn(item) {
+                    match item {
+                        qb::SelectItem::NamedExpr(named) => named.expr,
+                        _ => fail!("graph grouping requires a plain dimension"),
+                    }
+                }),
             };
             let filtered = graph_filters(built.0, payload, built.1, request.filters);
             let existential = array::fold(request.exists, (filtered.0, []), fn(state, spec) {
@@ -4952,7 +5008,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let sources = array::concat([[root.1], array::map(built.2, fn(join) { join.source })]);
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: filtered.1,
-                exists: existential.1, joins: built.2, grouping: [], having: [], ordering: [],
+                exists: existential.1, joins: built.2, grouping, having: [], ordering: [],
                 limit: None, offset: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
             };
             (existential.0, qb::validate(plan, payload.profile))
