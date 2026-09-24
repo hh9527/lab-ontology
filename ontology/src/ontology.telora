@@ -6557,17 +6557,21 @@ def component_qualification_exists: Fn(PreparedPayload, Array(qb::Source), Entit
 # A non-unique component-parent reference can qualify an owner, but it cannot
 # become a Safe row join. Both sides must independently resolve to the same
 # tenant identity before the component is admitted into the correlated EXISTS.
-def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, String, String, String, String, String, Array(FilterRequest), Array(FilterRequest)) -> qb::Plan =
+def lower_timed_event_component: Fn(PreparedPayload, QueryRequest, SampleWindow, String, String, String, String, String, Array(FilterRequest), Array(FilterRequest)) -> qb::Plan =
     fn(payload, request, window, owner_id, event_relation_id, component_relation_id,
         owner_tenant_id, component_tenant_id, owner_filters, component_filters) {
-        let event = get_index(payload.entities, entity_by_id(payload, window.dataset));
+        let dataset_id = match window {
+            SampleWindow::Text(bounds) => bounds.dataset,
+            SampleWindow::Epoch(bounds) => bounds.dataset,
+        };
+        let event = get_index(payload.entities, entity_by_id(payload, dataset_id));
         let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
         let event_relation = relation_domain(payload, event_relation_id);
         let component_relation = relation_domain(payload, component_relation_id);
         let component = get_index(payload.entities, component_relation.from);
         let owner_tenant = relation_domain(payload, owner_tenant_id);
         let component_tenant = relation_domain(payload, component_tenant_id);
-        if dataset_domain(payload, window.dataset).kind != DatasetKind::Event
+        if dataset_domain(payload, dataset_id).kind != DatasetKind::Event
             || event_relation.from != event.index || event_relation.to != owner.index
             || event_relation.kind != RelationKind::Safe {
             fail!("event component observation requires a named safe event-to-owner relation", event_relation_id)
@@ -6603,7 +6607,18 @@ def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, S
                     fail!("event component grouping requires owner dimensions with event measures only")
                 } else { () };
                 let event_request: QueryRequest = {...request, dimensions: event_dims};
-                let plan = lower_utc_window(payload, event_request, window);
+                let plan = match window {
+                    SampleWindow::Text(bounds) => lower_utc_window(payload, event_request, bounds),
+                    SampleWindow::Epoch(bounds) => do {
+                        let clock = match dataset_domain(payload, dataset_id).utc_time {
+                            Some(name) => name,
+                            None => fail!("event component dataset lacks authoritative UTC time", dataset_id),
+                        };
+                        if bounds.field != clock {
+                            fail!("event component window must use the authoritative UTC clock", dataset_id, bounds.field)
+                        } else { lower_utc_epoch_window(payload, event_request, bounds) }
+                    },
+                };
                 if array::length(plan.sources) != 1 || array::length(plan.joins) != 0 || plan.derived != None {
                     fail!("event component observation requires event-only projections and filters")
                 } else {
@@ -6638,6 +6653,20 @@ def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, S
                 }
             }
         }
+    };
+
+def lower_event_component: Fn(PreparedPayload, QueryRequest, UtcWindowRequest, String, String, String, String, String, Array(FilterRequest), Array(FilterRequest)) -> qb::Plan =
+    fn(payload, request, window, owner_id, event_relation_id, component_relation_id,
+        owner_tenant_id, component_tenant_id, owner_filters, component_filters) {
+        lower_timed_event_component(payload, request, SampleWindow::Text(window), owner_id, event_relation_id,
+            component_relation_id, owner_tenant_id, component_tenant_id, owner_filters, component_filters)
+    };
+
+def lower_epoch_event_component: Fn(PreparedPayload, QueryRequest, UtcEpochWindowRequest, String, String, String, String, String, Array(FilterRequest), Array(FilterRequest)) -> qb::Plan =
+    fn(payload, request, window, owner_id, event_relation_id, component_relation_id,
+        owner_tenant_id, component_tenant_id, owner_filters, component_filters) {
+        lower_timed_event_component(payload, request, SampleWindow::Epoch(window), owner_id, event_relation_id,
+            component_relation_id, owner_tenant_id, component_tenant_id, owner_filters, component_filters)
     };
 
 def entity_grain_exprs: Fn(EntityEntry, String) -> Array(qb::Expr) = fn(entity, role) {
@@ -8677,6 +8706,7 @@ pub use self::{
     lower_latest_sample,
     lower_latest_epoch_sample,
     lower_event_component,
+    lower_epoch_event_component,
     lower_link_site,
     lower_link_device_site_rows,
     lower_via,

@@ -114,6 +114,13 @@ independent: a qualifying count in one window can select raw rows or a declared
 Sum from another, grouped by hidden complete owner identity. A secondary UTC
 clock cannot silently replace the authoritative observation clock. IC's
 production timestamp encoding remains an explicit unresolved mapping question.
+An independent UTC epoch-ms event/owner/component model now exercises the IC
+server-fan alarm shape as well: the event joins its owner on resource and tenant,
+the potentially non-unique component parent link remains FanOut inside EXISTS,
+and independent owner/component tenant relations align. Row observation and
+per-owner event count use integer bounds; wrong tenant roles and secondary UTC
+clocks are diagnosed. This does not assert that `T_CURRENT_ALARM.OCCURUTC` has
+an established epoch-ms production mapping.
 
 Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 `zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device

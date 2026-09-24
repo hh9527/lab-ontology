@@ -87,9 +87,20 @@ pub def text_window_rejects_epoch_clock: test::Test = test::should_fail_with(fn(
     lower_epoch(parse(r#"{"op":"utc_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","start":"2024-01-01T00:00:00Z","end":"2024-02-01T00:00:00Z"},"limit":null,"offset":null}"#))
 }, "UTC window requires a declared canonical UTC time field");
 
+@edsl::entity_id("epoch_tenant")
+@edsl::entity_source("epoch_tenant", "et")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id"], None)
+type EpochTenant = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+};
+
 @edsl::entity_id("epoch_owner")
 @edsl::entity_source("epoch_owner", "eo")
 @edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+@edsl::named_relation_key("epoch_owner_tenant", EpochTenant.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({from: "tenant_id", to: "id"}))
 type EpochOwner = struct {
     @edsl::column("id")
     @edsl::key(True)
@@ -129,7 +140,54 @@ type EpochSample = struct {
 };
 
 def lower_epoch_sample: Fn(Value) -> qb::Query = query_intent_lower_factory(
-    edsl::build_root("epoch-sample-test", [EpochOwner.type, EpochSample.type], profile, fn(subject) { True }), "analyst");
+    edsl::build_root("epoch-sample-test", [EpochTenant.type, EpochOwner.type, EpochSample.type], profile, fn(subject) { True }), "analyst");
+
+@edsl::entity_id("epoch_component")
+@edsl::entity_source("epoch_component", "ec")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id"], None)
+@edsl::named_relation_key("epoch_component_parent", EpochOwner.type, edsl::RelationKind::FanOut,
+    edsl::RelationKey::FieldEq({from: "parent_id", to: "id"}))
+@edsl::named_relation_key("epoch_component_tenant", EpochTenant.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::FieldEq({from: "tenant_id", to: "id"}))
+type EpochComponent = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+    @edsl::column("parentId")
+    parent_id: String,
+    @edsl::column("tenantId")
+    tenant_id: String,
+};
+
+@edsl::entity_id("epoch_alarm")
+@edsl::entity_source("epoch_alarm", "ea")
+@edsl::dataset(edsl::DatasetKind::Event, ["csn"], Some("occurred_ms"))
+@edsl::named_relation_key("epoch_alarm_owner", EpochOwner.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "tenant_id", to: "tenant_id"}),
+    ]))
+type EpochAlarm = struct {
+    @edsl::column("csn")
+    @edsl::key(True)
+    @edsl::dimension("EpochAlarmCsn", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Int])
+    @edsl::measure("EpochAlarmCount", qb::AggregateFunction::Count, [])
+    csn: Int,
+    @edsl::column("ownerId")
+    owner_id: String,
+    @edsl::column("tenantId")
+    tenant_id: String,
+    @edsl::column("occurredMs")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    occurred_ms: Int,
+    @edsl::column("receivedMs")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    received_ms: Int,
+};
+
+def lower_epoch_alarm: Fn(Value) -> qb::Query = query_intent_lower_factory(
+    edsl::build_root("epoch-event-component-test", [EpochTenant.type, EpochOwner.type, EpochComponent.type, EpochAlarm.type],
+        profile, fn(subject) { True }), "analyst");
 
 pub def epoch_sample_top_preserves_owner_grain: test::Test = test::should_ok(fn() {
     let query = lower_epoch_sample(parse(r#"{"op":"sample_epoch_top","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"owner":"epoch_owner","relation":"epoch_sample_owner","rank":"EpochSampleValue","take":2,"window":{"dataset":"epoch_samples","field":"ts","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
@@ -231,6 +289,34 @@ pub def epoch_qualified_observation_keeps_raw_rows: test::Test = test::should_ok
 pub def epoch_observation_rejects_secondary_clock: test::Test = test::should_fail_with(fn() {
     lower_epoch_sample(parse(r#"{"op":"observe_epoch_qualified","measures":["EpochSampleSum"],"dimensions":["EpochOwnerId"],"filters":[],"ordering":[],"owner":"epoch_owner","relation":"epoch_sample_owner","window":{"dataset":"epoch_samples","field":"received_ms","start":3000,"end":4000},"qualifications":[{"relation":"epoch_sample_owner","dataset":"epoch_samples","filters":[],"window":{"field":"ts","start":1000,"end":2000},"min_matches":1}],"limit":null,"offset":null}"#))
 }, "observation window must use the authoritative UTC clock");
+
+pub def epoch_event_component_preserves_event_rows: test::Test = test::should_ok(fn() {
+    let query = lower_epoch_alarm(parse(r#"{"op":"observe_epoch_event_component","measures":[],"dimensions":["EpochAlarmCsn"],"filters":[],"ordering":[],"owner":"epoch_owner","event_relation":"epoch_alarm_owner","component_relation":"epoch_component_parent","owner_tenant_relation":"epoch_owner_tenant","component_tenant_relation":"epoch_component_tenant","owner_filters":[],"component_filters":[],"window":{"dataset":"epoch_alarm","field":"occurred_ms","start":1000,"end":2000},"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "ea.occurredMs >= ?")
+        && string::contains(query.sql, "ea.ownerId")
+        && string::contains(query.sql, "ea.tenantId")
+        && string::contains(query.sql, "EXISTS (")
+        && string::contains(query.sql, "ec.tenantId")
+        && string::contains(query.sql, "eo.tenantId")
+        && query.bindings == [qb::Val::Int(1000), qb::Val::Int(2000)] { True }
+    else { fail!("epoch event rows require independent component existence and aligned tenant identity", query) }
+});
+
+pub def epoch_event_component_groups_by_complete_owner: test::Test = test::should_ok(fn() {
+    let query = lower_epoch_alarm(parse(r#"{"op":"observe_epoch_event_component","measures":["EpochAlarmCount"],"dimensions":["EpochOwnerId"],"filters":[],"ordering":[],"owner":"epoch_owner","event_relation":"epoch_alarm_owner","component_relation":"epoch_component_parent","owner_tenant_relation":"epoch_owner_tenant","component_tenant_relation":"epoch_component_tenant","owner_filters":[],"component_filters":[],"window":{"dataset":"epoch_alarm","field":"occurred_ms","start":1000,"end":2000},"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "GROUP BY eo.id, eo.tenantId")
+        && string::contains(query.sql, "EXISTS (")
+        && query.bindings == [qb::Val::Int(1000), qb::Val::Int(2000)] { True }
+    else { fail!("event counts must keep complete owner grain and one component EXISTS", query) }
+});
+
+pub def epoch_event_component_rejects_secondary_clock: test::Test = test::should_fail_with(fn() {
+    lower_epoch_alarm(parse(r#"{"op":"observe_epoch_event_component","measures":[],"dimensions":["EpochAlarmCsn"],"filters":[],"ordering":[],"owner":"epoch_owner","event_relation":"epoch_alarm_owner","component_relation":"epoch_component_parent","owner_tenant_relation":"epoch_owner_tenant","component_tenant_relation":"epoch_component_tenant","owner_filters":[],"component_filters":[],"window":{"dataset":"epoch_alarm","field":"received_ms","start":1000,"end":2000},"limit":null,"offset":null}"#))
+}, "event component window must use the authoritative UTC clock");
+
+pub def epoch_event_component_rejects_wrong_tenant_role: test::Test = test::should_fail_with(fn() {
+    lower_epoch_alarm(parse(r#"{"op":"observe_epoch_event_component","measures":[],"dimensions":["EpochAlarmCsn"],"filters":[],"ordering":[],"owner":"epoch_owner","event_relation":"epoch_alarm_owner","component_relation":"epoch_component_parent","owner_tenant_relation":"epoch_owner_tenant","component_tenant_relation":"epoch_owner_tenant","owner_filters":[],"component_filters":[],"window":{"dataset":"epoch_alarm","field":"occurred_ms","start":1000,"end":2000},"limit":null,"offset":null}"#))
+}, "event component qualification requires fan-out parent and aligned tenant ownership relations");
 
 pub def lowering_rejects_non_object_case: test::Test = test::should_fail_with(fn() {
     lower_knowledge(Value::Int(7))
