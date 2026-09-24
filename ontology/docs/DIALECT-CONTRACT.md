@@ -19,6 +19,30 @@ The shared set validator currently compares projection *shapes*, not SQL
 value types: a SQLite set can contain unlike scalar types while PostgreSQL
 may reject them. Type equivalence must be resolved before set operations can
 be admitted as supported PostgreSQL queries.
+
+### Set projection type contract to complete
+
+`SetPlan` must carry a validated positional *output* type for each operand,
+and the shared validator must reject different types before either renderer
+runs. Shapes (`Expr`, `Aggregate`, `Computed`) are not types. The type witness
+must originate in the Model's prepared knowledge when ontology lowers an
+intent, but remain on the public AST so direct AST callers cannot bypass the
+same validation. In particular:
+
+- A plain dimension uses its declared physical scalar type; a closed enum's
+  physical text representation is not its Telora enum type.
+- A JSON dimension uses its declared extracted scalar kind, not the containing
+  JSON document field's type. A computed dimension must declare its output
+  type; its input field type and filter input kinds cannot prove the builder's
+  result type.
+- Aggregate output typing depends on the aggregate (for example Count vs
+  Avg), and computed measures depend on their typed operands. Bound literals
+  and derived UNION ALL columns must be checked against their declared type,
+  not used as a partial special case that ignores ordinary columns.
+
+Both SQLite and PostgreSQL must consume this common validated set shape. Do
+not use PG casts to make mismatched projections executable: casting changes
+set equality and therefore business semantics, even if both queries run.
 Partitioned Top-N now reuses the original numbered placeholders for the same
 structural grouping expression across SELECT, window clauses and GROUP BY.
 This is an explicit AST-expression reference, not a SQL-text rewrite. Its
