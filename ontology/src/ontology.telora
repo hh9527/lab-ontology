@@ -3918,6 +3918,30 @@ def open_condition_with_context: Fn(qb::BuildCtx, qb::Expr, FilterOp, qb::Expr) 
     } else { (ctx, open_condition_expr(base, op, bound)) }
 };
 
+def filter_value_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry, FilterOp, FilterInput) -> Tuple([qb::BuildCtx, qb::Expr]) = fn(ctx, payload, entry, op, input) {
+    let base = dimension_expr(payload, entry);
+    if array::length(entry.canonical_values) > 0 {
+        canonical_compare_with_context(ctx, entry, base, op, input)
+    } else if array::length(entry.values) > 0 {
+        match input {
+            FilterInput::Text(s) => if op != FilterOp::Eq {
+                fail!("enum dimension filter supports only Eq", entry.id, op)
+            } else if array::any(entry.values, fn(v) { v.value == s }) {
+                let bound = qb::bind(ctx, qb::Val::String(s));
+                (bound.0, qb::scalar(qb::ScalarFunction::Eq, [base, bound.1]))
+            } else { fail!("unknown enum value for dimension", entry.id, s) },
+            _ => fail!("invalid enum filter value for dimension", entry.id, input),
+        }
+    } else if is_text_op(op) && match input { FilterInput::Text(_) => False, _ => True } {
+        fail!("text filter operation requires a text input value", entry.id)
+    } else if !filter_input_allowed(entry.input_kinds, input) {
+        fail!("invalid filter value for dimension", entry.id)
+    } else {
+        let bound = qb::bind(ctx, to_val(input));
+        open_condition_with_context(bound.0, base, op, bound.1)
+    }
+};
+
 def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(FilterRequest)) -> Tuple([qb::BuildCtx, Array(FilterResolution)]) = fn(ctx, payload, requests) {
     let initial: Tuple([qb::BuildCtx, Array(FilterResolution)]) = (ctx, []);
     array::fold(requests, initial, fn(state, req) {
@@ -4361,6 +4385,48 @@ def resolve_scope_with_visibility: Fn(PreparedPayload, DimensionEntry, ScopePred
 
 def resolve_scope: Fn(PreparedPayload, DimensionEntry, ScopePredicate) -> FilterResolution = fn(payload, owner, predicate) {
     resolve_scope_with_visibility(payload, owner, predicate, True)
+};
+
+def resolve_scope_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry, ScopePredicate, Bool) -> Tuple([qb::BuildCtx, FilterResolution]) = fn(ctx, payload, owner, predicate, require_authorized) {
+    let entity = get_index(payload.entities, owner.entity);
+    let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+        Some(f) => f,
+        None => fail!("scope references an unknown field", owner.id, predicate.field),
+    };
+    let d = match array::find(payload.dimensions, fn(candidate) { candidate.entity == owner.entity && candidate.field == field.index }) {
+        Some(entry) => entry,
+        None => fail!("scope references a field with no dimension declaration", owner.id, field.name),
+    };
+    if require_authorized && !d.authorized {
+        fail!("scope references a dimension that is not authorized", d.id)
+    } else if !d.filterable {
+        fail!("scope references a dimension with no filter capability", d.id)
+    } else if !array::any(d.ops, fn(op) { op == predicate.op }) {
+        fail!("scope uses an operation not supported by the dimension", d.id, predicate.op)
+    } else if array::length(d.values) > 0 && predicate.op != FilterOp::Eq {
+        fail!("scope on enum dimension supports only Eq", d.id, predicate.op)
+    } else if is_text_op(predicate.op) && match predicate.input { FilterInput::Text(_) => False, _ => True } {
+        fail!("scope text operation requires a text input value", d.id)
+    } else if array::length(d.canonical_values) == 0 && array::length(d.values) == 0
+        && !filter_input_allowed(d.input_kinds, predicate.input) {
+        fail!("scope uses an invalid value for the dimension", d.id, predicate.input)
+    } else {
+        let resolved = filter_value_with_context(ctx, payload, d, predicate.op, predicate.input);
+        let item: FilterResolution = {expr: resolved.1, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input};
+        (resolved.0, item)
+    }
+};
+
+def resolve_request_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(DimensionEntry), Array(FilterRequest)) -> Tuple([qb::BuildCtx, Array(FilterResolution)]) = fn(ctx, payload, dimensions, requests) {
+    let initial: Tuple([qb::BuildCtx, Array(FilterResolution)]) = (ctx, []);
+    let scoped = array::fold(dimensions, initial, fn(state, dimension) {
+        array::fold(dimension.scope, state, fn(inner, predicate) {
+            let resolved = resolve_scope_with_context(inner.0, payload, dimension, predicate, True);
+            (resolved.0, array::push(inner.1, resolved.1))
+        })
+    });
+    let requested = resolve_filters_with_context(scoped.0, payload, requests);
+    (requested.0, array::concat([scoped.1, requested.1]))
 };
 
 def entity_source_at: Fn(PreparedPayload, EntityEntry, String) -> qb::Source = fn(payload, entity, alias) {
@@ -8941,6 +9007,8 @@ pub use self::{
     FilterRequest,
     FilterResolution,
     resolve_filters_with_context,
+    resolve_scope_with_context,
+    resolve_request_filters_with_context,
     FieldFilterRequest,
     OrderRequest,
     PartitionRequest,
