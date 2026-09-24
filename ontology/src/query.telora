@@ -273,6 +273,7 @@ type ColumnEq = struct {
 type JoinCondition = enum {
     Eq(ColumnEq),
     Predicate(Expr),
+    Exists(Exists),
     And(Array(JoinCondition)),
     Or(Array(JoinCondition)),
 };
@@ -700,6 +701,7 @@ def join_condition_operators: Fn(JoinCondition) -> Array(Operator) = fn(conditio
     match condition {
         JoinCondition::Eq(_) => [Operator::Column],
         JoinCondition::Predicate(expr) => ops_union(expr_operators(expr), [Operator::Filter]),
+        JoinCondition::Exists(ex) => exists_operators([ex]),
         JoinCondition::And(items) => {
             let empty: Array(Operator) = [];
             array::fold(items, empty, fn(acc, item) { ops_union(acc, join_condition_operators(item)) })
@@ -1042,6 +1044,7 @@ def join_on_identifiers_valid: Fn(JoinCondition) -> Bool = fn(condition) {
     match condition {
         JoinCondition::Eq(eq) => column_eq_id_ok(eq),
         JoinCondition::Predicate(_) => True,
+        JoinCondition::Exists(_) => True,
         JoinCondition::And(items) => array::all(items, join_on_identifiers_valid),
         JoinCondition::Or(items) => array::all(items, join_on_identifiers_valid),
     }
@@ -1053,6 +1056,7 @@ def join_on_shape_ok: Fn(JoinCondition) -> Bool = fn(condition) {
     match condition {
         JoinCondition::Eq(_) => True,
         JoinCondition::Predicate(_) => True,
+        JoinCondition::Exists(_) => True,
         JoinCondition::And(items) => array::length(items) > 0 && array::all(items, join_on_shape_ok),
         JoinCondition::Or(items) => array::length(items) > 0 && array::all(items, join_on_shape_ok),
     }
@@ -1063,6 +1067,7 @@ def join_on_condition_valid: Fn(JoinCondition, Array(String)) -> Bool = fn(condi
     match condition {
         JoinCondition::Eq(eq) => column_eq_known(eq, aliases),
         JoinCondition::Predicate(expr) => expr_valid(expr, aliases),
+        JoinCondition::Exists(ex) => exists_structure_ok(ex, aliases),
         JoinCondition::And(items) => array::length(items) > 0
             && array::all(items, fn(child) { join_on_condition_valid(child, aliases) }),
         JoinCondition::Or(items) => array::length(items) > 0
@@ -2324,6 +2329,7 @@ def join_condition_scalars_ok: Fn(JoinCondition, Array(ScalarFunction)) -> Bool 
     match condition {
         JoinCondition::Eq(_) => True,
         JoinCondition::Predicate(expr) => expr_scalars_ok(expr, allowed),
+        JoinCondition::Exists(ex) => exists_body_scalars_ok(ex, allowed),
         JoinCondition::And(items) => array::all(items, fn(item) { join_condition_scalars_ok(item, allowed) }),
         JoinCondition::Or(items) => array::all(items, fn(item) { join_condition_scalars_ok(item, allowed) }),
     }
@@ -2484,6 +2490,16 @@ def exists_body_distinct_ok: Fn(Exists) -> Bool = fn(ex) {
     }
 };
 
+def join_condition_exists_profile_ok: Fn(JoinCondition, PlanProfile) -> Bool = fn(condition, profile) {
+    match condition {
+        JoinCondition::Exists(ex) => exists_body_aggregates_ok(ex, profile.allowed_aggregates)
+            && (profile.allow_distinct || exists_body_distinct_ok(ex)),
+        JoinCondition::And(items) => array::all(items, fn(item) { join_condition_exists_profile_ok(item, profile) }),
+        JoinCondition::Or(items) => array::all(items, fn(item) { join_condition_exists_profile_ok(item, profile) }),
+        _ => True,
+    }
+};
+
 # Scalar recursion into one UNION ALL branch: its output expressions and row
 # filter are narrowed by the same profile as the outer plan.
 def union_branch_scalars_ok: Fn(UnionBranch, Array(ScalarFunction)) -> Bool = fn(branch, allowed) {
@@ -2565,6 +2581,7 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
         None => True,
     };
     ops_ok && joins_ok && aggregates_ok && scalars_ok && distinct_ok
+        && array::all(plan.joins, fn(join) { join_condition_exists_profile_ok(join.condition, profile) })
         && partition_ok
         && scalar_subquery_profiles_ok(plan, profile)
         && ranked_subquery_profiles_ok(plan, profile)
@@ -2896,6 +2913,8 @@ def on_eq: Fn(ColumnRef, ColumnRef) -> JoinCondition = fn(left, right) {
 };
 
 def on_predicate: Fn(Expr) -> JoinCondition = fn(expr) { JoinCondition::Predicate(expr) };
+
+def on_exists: Fn(Exists) -> JoinCondition = fn(ex) { JoinCondition::Exists(ex) };
 
 # AND/OR combination of ON-clause conditions over a non-empty list.
 def on_and: Fn(Array(JoinCondition)) -> JoinCondition = fn(items) { JoinCondition::And(items) };
@@ -3292,6 +3311,7 @@ pub use self::{
     column_eq,
     on_eq,
     on_predicate,
+    on_exists,
     on_and,
     on_or,
     join,
