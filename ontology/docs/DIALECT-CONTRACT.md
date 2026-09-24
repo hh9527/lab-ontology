@@ -6,6 +6,11 @@ The materializer is responsible for turning that same plan into a parameterized
 supported dialect. Adding it means passing the execution checks below, not
 simply producing syntactically plausible SQL.
 
+`ontology/postgres` now has an expression renderer for the closed scalar
+vocabulary, including numbered bindings, quoted identifiers and structural
+JSON paths. It is not a `QueryPlan` materializer and is not yet an admitted
+dialect: complete query shapes and scalar edge cases still need verification.
+
 ## Common contract
 
 - A query shape (`Rows`, `DistinctRows`, `SetRows`, `SetCount`, `GroupCount`)
@@ -57,6 +62,14 @@ numeric array segment selects its element. These observations establish a
 possible implementation route, not complete equivalence. In particular,
 text extraction, JSON type classification and invalid-document behavior each
 need independent execution tests.
+
+The initial PostgreSQL expression renderer uses `VARIADIC text[]` with one
+numbered, typed parameter per path segment. PostgreSQL 16 execution confirmed
+negative array indices, `1e0` lexical preservation, JSON null, invalid JSON
+detection, ASCII-only `translate`, and explicit UTC day subtraction.
+Binding-order tests cover nested JSON extraction and repeated references to
+one placeholder. These expression-level checks do not establish full-query
+equivalence.
 
 Some entries may require tightening the shared semantics or changing the SQLite
 renderer before PostgreSQL can be admitted. Until these checks are executable
