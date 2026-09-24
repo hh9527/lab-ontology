@@ -1098,6 +1098,118 @@ type WrongCanonicalInput = struct {
     health: Int,
 };
 
+def negated_canonical_values: Array(edsl::CanonicalValueSpec) = [
+    {id: "offline", label: "Offline", wires: [edsl::FilterInput::Text("0"), edsl::FilterInput::Text("2")]},
+];
+
+def two_single_wire_values: Array(edsl::CanonicalValueSpec) = [
+    {id: "offline", label: "Offline", wires: [edsl::FilterInput::Text("0")]},
+    {id: "online", label: "Online", wires: [edsl::FilterInput::Text("1")]},
+];
+
+@edsl::entity_source("canonical_ne_two_values", "cntv")
+type CanonicalNeTwoValues = struct {
+    @edsl::column("state")
+    @edsl::dimension("canonical_ne_two_values_state", True, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(two_single_wire_values)
+    state: String,
+};
+
+def canonical_ne_predicate: edsl::ScopePredicate = {
+    field: 1, op: edsl::FilterOp::Ne, input: edsl::FilterInput::Text("offline"),
+};
+
+@edsl::entity_source("canonical_ne_measure", "cnm")
+type CanonicalNeMeasure = struct {
+    @edsl::column("state")
+    @edsl::dimension("canonical_ne_measure_state", True, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(two_single_wire_values)
+    state: String,
+    @edsl::column("id")
+    @edsl::key(True)
+    @edsl::filtered_measure("canonical_not_offline_count", qb::AggregateFunction::Count, [], canonical_ne_predicate)
+    id: Int,
+};
+
+pub def canonical_ne_lowers_inside_filtered_measure: test::Test = test::should_ok(fn() {
+    let payload = edsl::build_root("canonical-ne-measure", [CanonicalNeMeasure.type], knowledge::profile, fn(subject) { subject == "public" });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "canonical_not_offline_count", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [], filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    let query = qb::transform_sqlite(edsl::lower(payload, request));
+    string::contains(query.sql, "FILTER (WHERE")
+        && query.bindings == [qb::Val::String("0"), qb::Val::String("0"), qb::Val::String("1")]
+});
+
+@edsl::entity_source("canonical_ne_scope", "cns")
+@edsl::entity_scope([{field: "state", op: edsl::FilterOp::Ne, input: edsl::FilterInput::Text("offline")}])
+type CanonicalNeScope = struct {
+    @edsl::column("state")
+    @edsl::dimension("canonical_ne_scope_state", False, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(negated_canonical_values)
+    state: String,
+};
+
+@edsl::entity_source("bad_canonical_ne_value", "bcnv")
+@edsl::entity_scope([{field: "state", op: edsl::FilterOp::Ne, input: edsl::FilterInput::Text("not_declared")}])
+type BadCanonicalNeValue = struct {
+    @edsl::column("state")
+    @edsl::dimension("bad_canonical_ne_value_state", False, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(negated_canonical_values)
+    state: String,
+};
+
+@edsl::entity_source("bad_canonical_ne_op", "bcno")
+type BadCanonicalNeOperation = struct {
+    @edsl::column("state")
+    @edsl::dimension("bad_canonical_ne_op_state", True, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne, edsl::FilterOp::Contains], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(negated_canonical_values)
+    state: String,
+};
+
+pub def canonical_ne_allows_private_inherent_scope: test::Test = test::should_ok(fn() {
+    let payload = edsl::build_root("canonical-ne-scope", [CanonicalNeScope.type], knowledge::profile, fn(subject) { subject == "public" });
+    let catalog = edsl::knowledge_index_for_subject(payload, "public");
+    match array::get(catalog, 0) {
+        Some(item) => array::length(catalog) == 1 && array::length(item.scope) == 1
+            && array::length(item.dimension_ids) == 0,
+        None => False,
+    }
+});
+
+pub def canonical_ne_rejects_unknown_inherent_value: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-canonical-ne-value", [BadCanonicalNeValue.type], knowledge::profile, fn(subject) { True })
+}, "unknown canonical value for dimension");
+
+pub def canonical_ne_rejects_unrelated_operation: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-canonical-ne-op", [BadCanonicalNeOperation.type], knowledge::profile, fn(subject) { True })
+}, "canonical dimension must declare filterable Eq and optionally Ne");
+
+pub def canonical_ne_rejects_profile_without_ne: test::Test = test::should_fail_with(fn() {
+    let profile: qb::PlanProfile = {...knowledge::profile,
+        allowed_scalars: array::filter(knowledge::profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::Ne })};
+    edsl::build_root("canonical-ne-no-ne", [CanonicalNeScope.type], profile, fn(subject) { True })
+}, "canonical value mapping requires");
+
+pub def canonical_ne_rejects_profile_without_and_for_multiple_wires: test::Test = test::should_fail_with(fn() {
+    let profile: qb::PlanProfile = {...knowledge::profile,
+        allowed_scalars: array::filter(knowledge::profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::And })};
+    edsl::build_root("canonical-ne-no-and", [CanonicalNeScope.type], profile, fn(subject) { True })
+}, "canonical value mapping requires");
+
+pub def canonical_ne_rejects_profile_without_and_for_single_wire: test::Test = test::should_fail_with(fn() {
+    let profile: qb::PlanProfile = {...knowledge::profile,
+        allowed_scalars: array::filter(knowledge::profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::And })};
+    edsl::build_root("canonical-ne-single-no-and", [CanonicalNeTwoValues.type], profile, fn(subject) { True })
+}, "canonical value mapping requires");
+
+pub def canonical_ne_rejects_profile_without_or_for_multiple_values: test::Test = test::should_fail_with(fn() {
+    let profile: qb::PlanProfile = {...knowledge::profile,
+        allowed_scalars: array::filter(knowledge::profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::Or })};
+    edsl::build_root("canonical-ne-two-values-no-or", [CanonicalNeTwoValues.type], profile, fn(subject) { True })
+}, "canonical value mapping requires");
+
 type ClosedStatus = enum {
     @edsl::enum_value("healthy", "Healthy")
     Healthy,
@@ -1112,7 +1224,7 @@ type WrongEnumOperation = struct {
 
 pub def canonical_dimension_cannot_advertise_physical_wire_input: test::Test = test::should_fail_with(fn() {
     edsl::build_root("closed-canonical-v1", [WrongCanonicalInput.type], knowledge::profile, fn(subject) { True })
-}, "canonical dimension must declare only filterable Eq with a text business input");
+}, "canonical dimension must declare filterable Eq and optionally Ne with a text business input");
 
 pub def enum_dimension_cannot_advertise_unsupported_operation: test::Test = test::should_fail_with(fn() {
     edsl::build_root("closed-enum-v1", [WrongEnumOperation.type], knowledge::profile, fn(subject) { True })

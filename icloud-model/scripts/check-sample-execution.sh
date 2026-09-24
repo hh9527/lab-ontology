@@ -136,7 +136,7 @@ jq -e 'length == 2 and .[0].name == "Sample ONU" and .[0].ts == "2024-06-01T00:0
 
 pon_status_schema="CREATE TABLE I_EntPonElement (id TEXT, commuState TEXT);
 INSERT INTO I_EntPonElement VALUES
- ('P0','0'),('P2','2'),('P3','3'),('P4','4'),('P14','14'),('P15','15'),('P1','1');"
+ ('P0','0'),('P2','2'),('P3','3'),('P4','4'),('P14','14'),('P15','15'),('P1','1'),('P-UNKNOWN','not-mapped');"
 pon_status_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:pon_offline_rows)"
 jq -e '.bindings == ["0","2","3","4","14","15"]' <<< "${pon_status_plan}" >/dev/null
 pon_status_result="$(sqlite3 -json :memory: -cmd "${pon_status_schema}" -cmd '.parameter init' \
@@ -145,6 +145,32 @@ pon_status_result="$(sqlite3 -json :memory: -cmd "${pon_status_schema}" -cmd '.p
     -cmd ".parameter set ?5 '14'" -cmd ".parameter set ?6 '15'" \
     "$(jq -r '.sql' <<< "${pon_status_plan}")")"
 jq -e 'map(.id) | sort == ["P0","P14","P15","P2","P3","P4"]' <<< "${pon_status_result}" >/dev/null
+pon_not_offline_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:pon_not_offline_rows)"
+jq -e '.bindings == ["0","2","3","4","14","15","1","0","2","3","4","14","15"]' <<< "${pon_not_offline_plan}" >/dev/null
+pon_not_offline_result="$(sqlite3 -json :memory: -cmd "${pon_status_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 '0'" -cmd ".parameter set ?2 '2'" \
+    -cmd ".parameter set ?3 '3'" -cmd ".parameter set ?4 '4'" \
+    -cmd ".parameter set ?5 '14'" -cmd ".parameter set ?6 '15'" \
+    -cmd ".parameter set ?7 '1'" -cmd ".parameter set ?8 '0'" \
+    -cmd ".parameter set ?9 '2'" -cmd ".parameter set ?10 '3'" \
+    -cmd ".parameter set ?11 '4'" -cmd ".parameter set ?12 '14'" -cmd ".parameter set ?13 '15'" \
+    "$(jq -r '.sql' <<< "${pon_not_offline_plan}")")"
+jq -e 'map(.id) == ["P1"]' <<< "${pon_not_offline_result}" >/dev/null
+
+storage_subtype_schema="CREATE TABLE HuaweiStorageDevice (id TEXT, subClassName TEXT);
+INSERT INTO HuaweiStorageDevice VALUES
+ ('FC','FCSwitchDevice'),('ARRAY','EnterpriseStorage'),('DISTRIBUTED','FusionStorageDevice'),
+ ('OTHER','unmapped-subtype'),('NULL',NULL);"
+storage_non_fc_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:storage_non_fc_rows)"
+jq -e '.bindings == ["FCSwitchDevice","EnterpriseStorage","FusionStorageDevice","SmisStorageDevice","HuaweiSmisStorageDevice","SYS_ProtectDevice","DsmStorageDevice","HPEStorageDevice","VSPStorageDevice","FCSwitchDevice"]' <<< "${storage_non_fc_plan}" >/dev/null
+storage_non_fc_result="$(sqlite3 -json :memory: -cmd "${storage_subtype_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'FCSwitchDevice'" -cmd ".parameter set ?2 'EnterpriseStorage'" \
+    -cmd ".parameter set ?3 'FusionStorageDevice'" -cmd ".parameter set ?4 'SmisStorageDevice'" \
+    -cmd ".parameter set ?5 'HuaweiSmisStorageDevice'" -cmd ".parameter set ?6 'SYS_ProtectDevice'" \
+    -cmd ".parameter set ?7 'DsmStorageDevice'" -cmd ".parameter set ?8 'HPEStorageDevice'" \
+    -cmd ".parameter set ?9 'VSPStorageDevice'" -cmd ".parameter set ?10 'FCSwitchDevice'" \
+    "$(jq -r '.sql' <<< "${storage_non_fc_plan}")")"
+jq -e 'map(.id) | sort == ["ARRAY","DISTRIBUTED"]' <<< "${storage_non_fc_result}" >/dev/null
 
 pon_role_schema="CREATE TABLE I_EntPonElement (id TEXT, name TEXT, parentOltResId TEXT, classification TEXT);
 INSERT INTO I_EntPonElement VALUES
@@ -634,4 +660,4 @@ regular_result="$(sqlite3 -json :memory: -cmd "${slot_schema}" -cmd '.parameter 
 jq -e 'length == 1 and .[0].id == "child" and .[0].name == "Daughter"' <<< "${daughter_result}" >/dev/null
 jq -e 'length == 1 and .[0].id == "parent" and .[0].name == "Main"' <<< "${regular_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, PON communication codes, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'

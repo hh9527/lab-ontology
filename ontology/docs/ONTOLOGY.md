@@ -204,6 +204,11 @@ commu_state: String,
 `Int` 字段的 `wires` 使用 `FilterInput::Int`；意图输入始终使用规范
 `id`（`kind: "text"`），绝不直接提交物理 wire 值。一个规范值的多条
 wire 降低为同一字段的括号化 OR 等值条件，动态 wire 按声明顺序绑定。
+规范值维度可额外声明 `FilterOp::Ne`；一个业务值的多条 wire 降低为
+括号化 AND 不等条件，不能只排除第一条 wire。排除条件还与已声明
+值域的 OR 等值条件相交，未映射物理码和 SQL `NULL` 均不能冒充已知的
+其他业务值。声明 Ne 时 profile 还需允许 Ne 和 And；多值域或多 wire
+还需允许 Or。
 `canonical_value_domain(payload, dimension_id)` 提供同源发现。准备阶段
 拒绝空/重复业务 id、空/重复物理值、字段类型不匹配、缺少 Eq/If 能力，
 以及不能兑现多 wire OR 的 profile。普通筛选、`any_of`、scope、

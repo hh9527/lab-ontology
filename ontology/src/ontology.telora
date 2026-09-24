@@ -2186,8 +2186,9 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     fail!("dimension cannot combine enum and canonical wire domains", entity.id, f.name)
                 } else if array::length(mapped) > 0 && (!dd.filterable
                     || dd.input_kinds != [FilterInputKind::Text]
-                    || array::length(dd.ops) != 1 || get_index(dd.ops, 0) != FilterOp::Eq) {
-                    fail!("canonical dimension must declare only filterable Eq with a text business input", entity.id, f.name)
+                    || !array::any(dd.ops, fn(op) { op == FilterOp::Eq })
+                    || array::any(dd.ops, fn(op) { op != FilterOp::Eq && op != FilterOp::Ne })) {
+                    fail!("canonical dimension must declare filterable Eq and optionally Ne with a text business input", entity.id, f.name)
                 } else if array::length(enumerated) > 0
                     && (dd.input_kinds != [FilterInputKind::Text]
                         || array::any(dd.ops, fn(op) { op != FilterOp::Eq })) {
@@ -2935,15 +2936,21 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     }) { fail!("duplicate native pair id", duplicate.id) } else { () };
     let requires_disjunction = array::any(dimensions, fn(d) {
         array::any(d.canonical_values, fn(v) { array::length(v.wires) > 1 })
+            || (array::length(d.canonical_values) > 1 && array::any(d.ops, fn(op) { op == FilterOp::Ne }))
     });
     let uses_canonical = array::any(dimensions, fn(d) { array::length(d.canonical_values) > 0 });
+    let uses_canonical_ne = array::any(dimensions, fn(d) {
+        array::length(d.canonical_values) > 0 && array::any(d.ops, fn(op) { op == FilterOp::Ne })
+    });
     let profile_ok = if uses_canonical && (!array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Eq })
         || !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::If })
         || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Scalar })
         || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Bind })
         || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Filter })
-        || (requires_disjunction && !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Or }))) {
-        fail!("canonical value mapping requires Eq, If, Scalar, Bind, Filter and (for multi-wire values) Or in the query profile")
+        || (requires_disjunction && !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Or }))
+        || (uses_canonical_ne && !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Ne }))
+        || (uses_canonical_ne && !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::And }))) {
+        fail!("canonical value mapping requires Eq, If, Scalar, Bind, Filter and the declared multi-wire Or/Ne/And operations in the query profile")
     } else {
         True
     };
@@ -3498,7 +3505,12 @@ def dataset_relations: Fn(PreparedPayload, String) -> Array(RelationEntry) = fn(
     })
 };
 
-def canonical_eq: Fn(DimensionEntry, qb::Expr, FilterInput) -> qb::Expr = fn(entry, base, input) {
+def canonical_compare: Fn(DimensionEntry, qb::Expr, FilterOp, FilterInput) -> qb::Expr = fn(entry, base, op, input) {
+    let scalar = match op {
+        FilterOp::Eq => qb::ScalarFunction::Eq,
+        FilterOp::Ne => qb::ScalarFunction::Ne,
+        _ => fail!("canonical dimension supports only Eq or Ne", entry.id, op),
+    };
     let id = match input {
         FilterInput::Text(value) => value,
         _ => fail!("canonical dimension requires a text business value", entry.id, input),
@@ -3508,18 +3520,36 @@ def canonical_eq: Fn(DimensionEntry, qb::Expr, FilterInput) -> qb::Expr = fn(ent
         None => fail!("unknown canonical value for dimension", entry.id, input),
     };
     let terms = array::map(matched.wires, fn(wire) {
-        qb::scalar(qb::ScalarFunction::Eq, [base, to_bind(wire)])
+        qb::scalar(scalar, [base, to_bind(wire)])
     });
     let combined: Option(qb::Expr) = array::fold(terms, None, fn(acc, term) {
         match acc {
             None => Some(term),
-            Some(prev) => Some(qb::scalar(qb::ScalarFunction::Or, [prev, term])),
+            Some(prev) => Some(qb::scalar(if op == FilterOp::Eq { qb::ScalarFunction::Or } else { qb::ScalarFunction::And }, [prev, term])),
         }
     });
-    match combined {
+    let excluded = match combined {
         Some(expr) => expr,
         None => fail!("canonical value has no physical wires", entry.id, id),
+    };
+    if op == FilterOp::Eq { excluded }
+    else {
+        let known: Option(qb::Expr) = array::fold(entry.canonical_values, None, fn(acc, value) {
+            let term = canonical_eq(entry, base, FilterInput::Text(value.id));
+            match acc {
+                None => Some(term),
+                Some(prev) => Some(qb::scalar(qb::ScalarFunction::Or, [prev, term])),
+            }
+        });
+        match known {
+            Some(domain) => qb::scalar(qb::ScalarFunction::And, [excluded, domain]),
+            None => fail!("canonical dimension has no declared business values", entry.id),
+        }
     }
+};
+
+def canonical_eq: Fn(DimensionEntry, qb::Expr, FilterInput) -> qb::Expr = fn(entry, base, input) {
+    canonical_compare(entry, base, FilterOp::Eq, input)
 };
 
 def dimension_output_expr: Fn(PreparedPayload, DimensionEntry) -> qb::Expr = fn(payload, entry) {
@@ -3643,12 +3673,8 @@ def resolve_filters: Fn(PreparedPayload, Array(FilterRequest)) -> Array(FilterRe
                     } else if !array::any(entry.ops, fn(op) { op == req.op }) {
                         fail!("filter operation not supported for dimension", req.subject, req.id)
                     } else if array::length(entry.canonical_values) > 0 {
-                        if req.op == FilterOp::Eq {
-                            let expr = canonical_eq(entry, dimension_expr(payload, entry), req.input);
-                            { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input }
-                        } else {
-                            fail!("canonical dimension filter supports only Eq", req.subject, req.id, req.op)
-                        }
+                        let expr = canonical_compare(entry, dimension_expr(payload, entry), req.op, req.input);
+                        { expr, entity: entry.entity, field: entry.field, op: req.op, input: req.input }
                     } else if array::length(entry.values) > 0 {
                         resolve_enum_filter(payload, entry, req)
                     } else if is_text_op(req.op) {
@@ -4049,12 +4075,8 @@ def resolve_scope_with_visibility: Fn(PreparedPayload, DimensionEntry, ScopePred
             } else if !array::any(d.ops, fn(op) { op == predicate.op }) {
                 fail!("scope uses an operation not supported by the dimension", d.id, predicate.op)
             } else if array::length(d.canonical_values) > 0 {
-                if predicate.op == FilterOp::Eq {
-                    let expr = canonical_eq(d, dimension_expr(payload, d), predicate.input);
-                    { expr, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input }
-                } else {
-                    fail!("scope on canonical dimension supports only Eq", d.id, predicate.op)
-                }
+                let expr = canonical_compare(d, dimension_expr(payload, d), predicate.op, predicate.input);
+                { expr, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input }
             } else if array::length(d.values) > 0 {
                 resolve_enum_scope(payload, d, predicate)
             } else if is_text_op(predicate.op) {
@@ -4199,11 +4221,7 @@ def resolve_measure_predicate: Fn(PreparedPayload, MeasureEntry) -> qb::Expr = f
                     } else if !array::any(d.ops, fn(op) { op == pred.op }) {
                         fail!("measure predicate uses an operation not supported by the dimension", d.id, pred.op)
                     } else if array::length(d.canonical_values) > 0 {
-                        if pred.op == FilterOp::Eq {
-                            canonical_eq(d, dimension_expr(payload, d), pred.input)
-                        } else {
-                            fail!("measure predicate on canonical dimension supports only Eq", d.id, pred.op)
-                        }
+                        canonical_compare(d, dimension_expr(payload, d), pred.op, pred.input)
                     } else if array::length(d.values) > 0 {
                         match pred.op {
                             FilterOp::Eq => match pred.input {
@@ -4664,11 +4682,7 @@ def peer_attr_expr: Fn(PreparedPayload, DimensionEntry, FilterRequest, String) -
     } else {
         let base = dimension_expr_on_alias(payload, entry, alias);
         if array::length(entry.canonical_values) > 0 {
-            if req.op == FilterOp::Eq {
-                canonical_eq(entry, base, req.input)
-            } else {
-                fail!("participant filter on canonical dimension supports only Eq", req.id, req.op)
-            }
+            canonical_compare(entry, base, req.op, req.input)
         } else if array::length(entry.values) > 0 {
             match req.op {
                 FilterOp::Eq => match req.input {
@@ -4855,6 +4869,7 @@ def peer_side_filter_ok: Fn(PreparedPayload, Int, FilterRequest) -> Bool = fn(pa
                 } else if array::length(d.canonical_values) > 0 {
                     match (req.op, req.input) {
                         (FilterOp::Eq, FilterInput::Text(s)) => array::any(d.canonical_values, fn(v) { v.id == s }),
+                        (FilterOp::Ne, FilterInput::Text(s)) => array::any(d.canonical_values, fn(v) { v.id == s }),
                         _ => False,
                     }
                 } else if array::length(d.values) > 0 {
@@ -7471,6 +7486,7 @@ def scope_filter_value_ok: Fn(DimensionEntry, FilterOp, FilterInput) -> Bool = f
     if array::length(d.canonical_values) > 0 {
         match (op, input) {
             (FilterOp::Eq, FilterInput::Text(s)) => array::any(d.canonical_values, fn(v) { v.id == s }),
+            (FilterOp::Ne, FilterInput::Text(s)) => array::any(d.canonical_values, fn(v) { v.id == s }),
             _ => False,
         }
     } else if array::length(d.values) > 0 {
@@ -7530,11 +7546,7 @@ def resolve_inner_scope_filter: Fn(PreparedPayload, Int, FilterRequest) -> qb::E
                 } else if !array::any(d.ops, fn(op) { op == spec.op }) {
                     fail!("comparison scope filter uses an operation not supported by the dimension", d.id, spec.op)
                 } else if array::length(d.canonical_values) > 0 {
-                    if spec.op == FilterOp::Eq {
-                        canonical_eq(d, dimension_expr(payload, d), spec.input)
-                    } else {
-                        fail!("comparison scope filter on canonical dimension supports only Eq", d.id, spec.op)
-                    }
+                    canonical_compare(d, dimension_expr(payload, d), spec.op, spec.input)
                 } else if array::length(d.values) > 0 {
                     if spec.op != FilterOp::Eq {
                         fail!("comparison scope filter on enum dimension supports only Eq", d.id, spec.op)
