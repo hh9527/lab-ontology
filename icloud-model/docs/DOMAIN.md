@@ -154,8 +154,8 @@ unaggregated top-five rows. The corpus SQL uses `EntNetworkElement`, whereas
 the current IC source mapping names that logical source ID but declares
 `I_EntNetworkElement` as its SQL relation; the fixture follows the model
 mapping. For relative N-day windows, the platform supplies a validated
-canonical UTC `as_of` instant and N; SQLite computes the lower bound using a
-closed, bound `-N days` modifier, and the same instant is the exclusive upper
+canonical UTC `as_of` instant and N; the AST binds the integer day count and
+SQLite constructs its `-N days` modifier at rendering, with the same instant as the exclusive upper
 bound. The platform owns capturing that clock value; calendar-month windows
 and native timestamp storage remain separate requirements. Relative windows
 whose lower bound would cross before year 0001 are rejected at lowering time.

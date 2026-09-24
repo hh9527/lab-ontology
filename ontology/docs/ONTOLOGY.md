@@ -1792,6 +1792,7 @@ owner 的完整声明 grain（未声明 dataset 时为标记的 key）必须参�
 同一 KPI 物理字段可分别声明采样行维度和经聚合校验的 metric measure：
 `utc_window` 的行级 ORDER BY 只允许维度，不能将汇总 measure 冒充样本值排序。
 `utc_days_window` 从外部提供的规范 UTC 秒 `as_of` 与 1..3650 天的整数跨度
-生成半开相对窗；Query AST 的 `UtcDaysAgo` 固定 SQLite strftime 模板，锚点和
-`-N days` 均为绑定值。没有隐式当前时间，也不将日历月等同于固定天数。
+生成半开相对窗；Query AST 的 `UtcDaysAgo` 携带锚点与整数天数，SQLite 物化时
+才生成 `strftime` 的天数 modifier；锚点与整数天数均为绑定值。没有隐式当前时间，
+也不将日历月等同于固定天数。
 如窗口会跨到规范 UTC 日期范围之外的 0000 年，lowering 在构造查询前拒绝。
