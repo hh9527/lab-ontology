@@ -681,4 +681,30 @@ regular_result="$(sqlite3 -json :memory: -cmd "${slot_schema}" -cmd '.parameter 
 jq -e 'length == 1 and .[0].id == "child" and .[0].name == "Daughter"' <<< "${daughter_result}" >/dev/null
 jq -e 'length == 1 and .[0].id == "parent" and .[0].name == "Main"' <<< "${regular_result}" >/dev/null
 
-printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, and component filter/context execute correctly\n'
+ap_ssid_schema="CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT);
+CREATE TABLE NetworkApRadioSsidKPI (resId TEXT, parentId TEXT, tenantId TEXT, ts TEXT, connectedTerminals INTEGER);
+INSERT INTO I_EntNetworkElement VALUES
+ ('A','red','Twin','ne.category.fatap'),('A','blue','Twin','AP'),('B','red','Twin','AP');
+INSERT INTO NetworkApRadioSsidKPI VALUES
+ ('ssid-red-1','A','red','2024-02-05T00:00:00Z',10),
+ ('ssid-red-2','A','red','2024-02-06T00:00:00Z',30),
+ ('ssid-red-2','A','red','2024-02-07T00:00:00Z',30),
+ ('ssid-red-2','A','red','2024-02-08T00:00:00Z',30),
+ ('ssid-red-1','A','red','2024-03-03T00:00:00Z',90),
+ ('ssid-blue-1','A','blue','2024-02-05T00:00:00Z',60),
+ ('ssid-blue-2','A','blue','2024-02-06T00:00:00Z',80),
+ ('ssid-other','B','red','2024-02-05T00:00:00Z',5),
+ ('ssid-foreign','A','green','2024-02-05T00:00:00Z',300);"
+ap_ssid_window_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:ap_ssid_mean_window)"
+jq -e '.bindings == ["ne.category.fatap","AP","2024-02-01T00:00:00Z","2024-03-01T00:00:00Z"]' <<< "${ap_ssid_window_plan}" >/dev/null
+ap_ssid_window_result="$(sqlite3 -json :memory: -cmd "${ap_ssid_schema}" -cmd '.parameter init' \
+    -cmd ".parameter set ?1 'ne.category.fatap'" -cmd ".parameter set ?2 'AP'" \
+    -cmd ".parameter set ?3 '2024-02-01T00:00:00Z'" -cmd ".parameter set ?4 '2024-03-01T00:00:00Z'" \
+    "$(jq -r '.sql' <<< "${ap_ssid_window_plan}")")"
+jq -e 'length == 3 and (map(.ap_ssid_connected_terminals_sample_avg) | sort) == [5,25,70] and all(.[]; .name == "Twin")' <<< "${ap_ssid_window_result}" >/dev/null
+ap_ssid_all_plan="$("${telora_bin}" -C "${fixture_dir}" eval icloud-model/sample_execution:ap_ssid_mean_all)"
+jq -e '.bindings == []' <<< "${ap_ssid_all_plan}" >/dev/null
+ap_ssid_all_result="$(sqlite3 -json :memory: -cmd "${ap_ssid_schema}" "$(jq -r '.sql' <<< "${ap_ssid_all_plan}")")"
+jq -e 'length == 3 and (map(.ap_ssid_connected_terminals_sample_avg) | sort) == [5,38,70]' <<< "${ap_ssid_all_result}" >/dev/null
+
+printf 'bounded sample counts, local epoch-ms filter, distinct alarm occurrence/arrival clocks, PON ONU dual-clock raw sample trends, canonical value exclusions, tenant-scoped storage counts, Bool daughter-card filters, owner-scoped sample tops, interface KPI qualifications, independent sample averages, site-scoped event alternatives, reverse site/device fan-out rows, tenant site qualification, scoped server fans and power supplies, link-device association rows, event-qualified peak, metric count, qualified observation, sample peak, component filter/context, and AP SSID pooled means execute correctly\n'

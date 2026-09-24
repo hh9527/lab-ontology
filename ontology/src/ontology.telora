@@ -6904,18 +6904,14 @@ def lower_latest_epoch_sample: Fn(PreparedPayload, QueryRequest, String, String,
             TimeEncoding::UtcEpochMillis, scope, site_scope)
     };
 
-def lower_timed_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, SampleWindow, Array(TimedSampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
-    fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
-        if array::length(specs) == 0 && array::length(components) == 0 && context == None {
+def lower_timed_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, String, Option(SampleWindow), Array(TimedSampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec), Bool) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, observation_dataset, observation, specs, components, context, require_qualification) {
+        if require_qualification && array::length(specs) == 0 && array::length(components) == 0 && context == None {
             fail!("qualified observation requires a sample or component qualification or context")
         } else if context != None && array::length(components) != 0 {
             fail!("component context and component-only qualification require separate requests")
         }
         else {
-            let observation_dataset = match observation {
-                SampleWindow::Text(bounds) => bounds.dataset,
-                SampleWindow::Epoch(bounds) => bounds.dataset,
-            };
             let root_id = entity_by_id(payload, observation_dataset);
             let sample_dimensions = array::filter(request.dimensions, fn(d) {
                 match array::find(payload.dimensions, fn(entry) { entry.id == d.id }) {
@@ -6931,15 +6927,20 @@ def lower_timed_qualified_observation: Fn(PreparedPayload, QueryRequest, String,
             } else {
             let arranged: QueryRequest = {...request, dimensions: array::concat([sample_dimensions, owner_dimensions])};
             let raw_plan = match observation {
-                SampleWindow::Text(bounds) => lower_utc_window(payload, arranged, bounds),
-                SampleWindow::Epoch(bounds) => do {
-                    let clock = match dataset_domain(payload, observation_dataset).utc_time {
-                        Some(name) => name,
-                        None => fail!("observation dataset lacks authoritative UTC time", observation_dataset),
-                    };
-                    if bounds.field != clock {
-                        fail!("observation window must use the authoritative UTC clock", observation_dataset, bounds.field)
-                    } else { lower_utc_epoch_window(payload, arranged, bounds) }
+                None => lower(payload, arranged),
+                Some(bounds) => match bounds {
+                    SampleWindow::Text(text_bounds) => if text_bounds.dataset != observation_dataset {
+                        fail!("observation window must use its sample dataset", observation_dataset, text_bounds.dataset)
+                    } else { lower_utc_window(payload, arranged, text_bounds) },
+                    SampleWindow::Epoch(epoch_bounds) => do {
+                        let clock = match dataset_domain(payload, observation_dataset).utc_time {
+                            Some(name) => name,
+                            None => fail!("observation dataset lacks authoritative UTC time", observation_dataset),
+                        };
+                        if epoch_bounds.dataset != observation_dataset || epoch_bounds.field != clock {
+                            fail!("observation window must use the authoritative UTC clock", observation_dataset, epoch_bounds.field)
+                        } else { lower_utc_epoch_window(payload, arranged, epoch_bounds) }
+                    },
                 },
             };
             let output: Array(ProjectionToken) = array::concat([
@@ -7044,14 +7045,42 @@ def lower_timed_qualified_observation: Fn(PreparedPayload, QueryRequest, String,
 
 def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
-        lower_timed_qualified_observation(payload, request, owner_id, relation_id, SampleWindow::Text(observation),
-            array::map(specs, fn(spec) { timed_sample(spec) }), components, context)
+        lower_timed_qualified_observation(payload, request, owner_id, relation_id, observation.dataset, Some(SampleWindow::Text(observation)),
+            array::map(specs, fn(spec) { timed_sample(spec) }), components, context, True)
     };
 
 def lower_epoch_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcEpochWindowRequest, Array(EpochSampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
-        lower_timed_qualified_observation(payload, request, owner_id, relation_id, SampleWindow::Epoch(observation),
-            array::map(specs, fn(spec) { timed_epoch_sample(spec) }), components, context)
+        lower_timed_qualified_observation(payload, request, owner_id, relation_id, observation.dataset, Some(SampleWindow::Epoch(observation)),
+            array::map(specs, fn(spec) { timed_epoch_sample(spec) }), components, context, True)
+    };
+
+def lower_related_observation: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window) {
+        let spec = dataset_domain(payload, dataset_id);
+        let clock = match spec.utc_time {
+            Some(name) => name,
+            None => fail!("related observation requires an authoritative UTC clock", dataset_id),
+        };
+        if time_domain(payload, dataset_id, clock).encoding != TimeEncoding::CanonicalUtcSecondText {
+            fail!("related observation requires a canonical UTC text clock", dataset_id)
+        } else { () };
+        lower_timed_qualified_observation(payload, request, owner_id, relation_id, dataset_id,
+            match window { Some(bounds) => Some(SampleWindow::Text(bounds)), None => None }, [], [], None, False)
+    };
+
+def lower_related_epoch_observation: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcEpochWindowRequest)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window) {
+        let spec = dataset_domain(payload, dataset_id);
+        let clock = match spec.utc_time {
+            Some(name) => name,
+            None => fail!("related observation requires an authoritative UTC clock", dataset_id),
+        };
+        if time_domain(payload, dataset_id, clock).encoding != TimeEncoding::UtcEpochMillis {
+            fail!("related observation requires a UTC epoch-millisecond clock", dataset_id)
+        } else { () };
+        lower_timed_qualified_observation(payload, request, owner_id, relation_id, dataset_id,
+            match window { Some(bounds) => Some(SampleWindow::Epoch(bounds)), None => None }, [], [], None, False)
     };
 
 # Canonical UTC-second text sorts in instant order under SQLite's binary text
@@ -8701,6 +8730,8 @@ pub use self::{
     lower_sample_epoch_count_ranges,
     lower_qualified_observation,
     lower_epoch_qualified_observation,
+    lower_related_observation,
+    lower_related_epoch_observation,
     lower_sample_top,
     lower_sample_epoch_top,
     lower_latest_sample,

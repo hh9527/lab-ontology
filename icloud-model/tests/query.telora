@@ -2399,3 +2399,64 @@ pub def device_to_kpi_preserves_tenant_key: test::Test = test::should_ok(fn() {
         fail!("KPI access must retain both owner keys", q)
     }
 });
+
+pub def ap_ssid_sample_mean_is_distinct_from_published_sum: test::Test = test::should_ok(fn() {
+    let metrics = edsl::metric_domain(payload, "ap_radio_ssid_kpi");
+    let published = array::any(metrics, fn(m) {
+        m.id == "ap_ssid_connected_terminals" && m.aggregate == qb::AggregateFunction::Sum
+    });
+    let sample_mean = array::any(metrics, fn(m) {
+        m.id == "ap_ssid_connected_terminals_sample_avg" && m.aggregate == qb::AggregateFunction::Avg
+    });
+    if published && sample_mean { True }
+    else { fail!("AP SSID Model must declare published Sum and separate sample Avg", metrics) }
+});
+
+pub def ap_ssid_mean_groups_by_complete_ap_identity: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_related","dataset":"ap_radio_ssid_kpi","owner":"device","relation":"ap_ssid_kpi_of_device","measures":["ap_ssid_connected_terminals_sample_avg"],"dimensions":["device_name"],"filters":[{"dimension":"device_class","op":"eq","kind":"text","value":"AP"}],"ordering":[],"window":{"start":"2024-02-01T00:00:00Z","end":"2024-03-01T00:00:00Z"},"limit":null,"offset":null}`);
+    if string::contains(q.sql, "avg(ask.connectedTerminals)")
+        && string::contains(q.sql, "ask.parentId = d.id")
+        && string::contains(q.sql, "ask.tenantId = d.tenant_id")
+        && string::contains(q.sql, "GROUP BY d.name, d.id, d.tenant_id")
+        && q.bindings == [qb::Val::String("ne.category.fatap"), qb::Val::String("AP"),
+            qb::Val::String("2024-02-01T00:00:00Z"), qb::Val::String("2024-03-01T00:00:00Z")] { True }
+    else { fail!("AP SSID mean must pool raw rows within complete AP identity", q) }
+});
+
+pub def ap_ssid_all_history_mean_requires_no_fake_qualification: test::Test = test::should_ok(fn() {
+    let q = lower_json(`{"op":"observe_related","dataset":"ap_radio_ssid_kpi","owner":"device","relation":"ap_ssid_kpi_of_device","measures":["ap_ssid_connected_terminals_sample_avg"],"dimensions":["device_name"],"filters":[],"ordering":[],"window":null,"limit":null,"offset":null}`);
+    if string::contains(q.sql, "GROUP BY d.name, d.id, d.tenant_id")
+        && !string::contains(q.sql, "EXISTS (")
+        && !string::contains(q.sql, "ask.ts >= ?")
+        && q.bindings == [] { True }
+    else { fail!("unbounded AP SSID mean must aggregate raw history without fabricated qualification", q) }
+});
+
+pub def ap_ssid_mean_rejects_wrong_named_relation: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"observe_related","dataset":"ap_radio_ssid_kpi","owner":"device","relation":"device_kpi_of_device","measures":["ap_ssid_connected_terminals_sample_avg"],"dimensions":["device_name"],"filters":[],"ordering":[],"window":null,"limit":null,"offset":null}`)
+}, "observation requires a named grain-safe sample-to-owner relation");
+
+pub def ap_ssid_mean_rejects_unbounded_epoch_encoding: test::Test = test::should_fail_with(fn() {
+    lower_json(`{"op":"observe_related_epoch","dataset":"ap_radio_ssid_kpi","owner":"device","relation":"ap_ssid_kpi_of_device","measures":["ap_ssid_connected_terminals_sample_avg"],"dimensions":["device_name"],"filters":[],"ordering":[],"window":null,"limit":null,"offset":null}`)
+}, "related observation requires a UTC epoch-millisecond clock");
+
+pub def ap_ssid_mean_rejects_missing_tenant_ownership_key: test::Test = test::should_fail_with(fn() {
+    let relations = array::map(payload.relations, fn(relation) {
+        if relation.id == "ap_ssid_kpi_of_device" {
+            let key = match relation.key {
+                edsl::RelationKey::And(keys) => match array::get(keys, 0) {
+                    Some(first) => first,
+                    None => fail!("missing AP ownership key"),
+                },
+                _ => fail!("expected compound AP ownership key"),
+            };
+            {...relation, key}
+        } else { relation }
+    });
+    let request: edsl::QueryRequest = {
+        measures: [{id: "ap_ssid_connected_terminals_sample_avg", subject: "public", input: edsl::MeasureInput::All}],
+        dimensions: [{id: "device_name", subject: "public", input: edsl::DimensionInput::None}],
+        filters: [], ordering: [], limit: None, offset: None, partition: None,
+    };
+    edsl::lower_related_observation({...payload, relations}, request, "device", "ap_ssid_kpi_of_device", "ap_radio_ssid_kpi", None)
+}, "observation relation must cover the owner's complete declared grain");

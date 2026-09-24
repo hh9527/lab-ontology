@@ -122,6 +122,16 @@ per-owner event count use integer bounds; wrong tenant roles and secondary UTC
 clocks are diagnosed. This does not assert that `T_CURRENT_ALARM.OCCURUTC` has
 an established epoch-ms production mapping.
 
+For AP-radio-SSID KPI, IC metadata names `resId` as SSID ID, `parentId` as AP ID,
+and marks `resId` as a primary-key field; the IC product data link pairs both
+`parent_id=id` and `tenant_id=tenant_id`. The pressure model declares a candidate
+`(res_id,tenant_id,ts)` sample grain, preserves the published Sum metric, and
+adds an explicit Avg over raw `connectedTerminals` samples. `observe_related`
+allows optional UTC bounds without fabricating a qualification; the SQLite
+fixture proves pooled sample weighting and separates namesake APs by hidden
+identity. The metadata marker does not establish production uniqueness of the
+candidate sample grain, and the fixture is not a production mapping audit.
+
 Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 `zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device
 JOIN. These are separate from the explicit Device A/Z relation test. The
