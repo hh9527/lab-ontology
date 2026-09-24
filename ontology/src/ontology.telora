@@ -371,6 +371,7 @@ type GraphRequest = struct {
     edges: Array(GraphEdge),
     select: Array(GraphSelect),
     exists: Array(GraphExist),
+    count: Option(String),
 };
 
 # Filter operations. Comparison ops map to the closed query scalars
@@ -4620,8 +4621,8 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
     if !payload.authorize(subject) { fail!("subject is not authorized for graph query", subject) }
-    else if array::length(request.nodes) == 0 || array::length(request.select) == 0 {
-        fail!("graph requires nodes and projections")
+    else if array::length(request.nodes) == 0 || (array::length(request.select) == 0 && request.count == None) {
+        fail!("graph requires nodes and projections or an explicit count subject")
     } else if array::any(request.nodes, fn(node) {
         node.id == "" || array::length(array::filter(request.nodes, fn(other) { other.id == node.id })) != 1
     }) { fail!("graph node instance ids must be nonempty and unique") }
@@ -4664,7 +4665,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         if array::length(built.1) != array::length(request.nodes) {
             fail!("graph contains nodes disconnected from the root")
         } else {
-            let projection = array::map(request.select, fn(item) {
+            let row_projection = array::map(request.select, fn(item) {
                 let instance = graph_instance(built.1, item.node);
                 let dimension = match array::find(payload.dimensions, fn(d) { d.id == item.dimension }) {
                     Some(d) => d,
@@ -4677,6 +4678,24 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     qb::named_expr_item(qb::column(instance.source, field.column), `\{item.node}_\{item.dimension}`)
                 }
             });
+            let projection = match request.count {
+                None => row_projection,
+                Some(subject_id) => {
+                    if subject_id != request.root || array::length(request.select) != 0 {
+                        fail!("graph count subject must be the root and cannot combine with row projections", subject_id)
+                    } else if !array::fold(request.edges, ([request.root], True), fn(state, edge) {
+                        let relation = relation_domain(payload, edge.relation);
+                        (array::push(state.0, edge.to), state.1 && relation.kind == RelationKind::Safe
+                            && array::any(state.0, fn(id) { id == edge.from }))
+                    }).1 {
+                        fail!("graph count requires grain-safe forward joins; use existence for fan-out edges", subject_id)
+                    } else {
+                        let entity = get_index(payload.entities, root_entity);
+                        let key = get_index(entity.fields, entity.key_field);
+                        [qb::aggregate(qb::AggregateFunction::Count, qb::column(root.1, key.column), False, `\{subject_id}_count`)]
+                    }
+                },
+            };
             let existential = array::fold(request.exists, (built.0, []), fn(state, spec) {
                 let result = graph_existence(state.0, payload, built.1, spec);
                 (result.0, array::push(state.1, result.1))
