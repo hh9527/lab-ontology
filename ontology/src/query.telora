@@ -195,7 +195,7 @@ type HavingMeasure = enum {
 type Having = struct {
     op: HavingOp,
     measure: HavingMeasure,
-    threshold: Val,
+    threshold: Expr,
 };
 
 # ---------------------------------------------------------------------------
@@ -1458,13 +1458,18 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
                 };
                 let group_ok = array::all(ex.grouping, fn(expr) { expr_valid(expr, allowed) });
                 let having_ok = array::all(ex.having, fn(h) {
-                    match h.measure {
+                    let measure_ok = match h.measure {
                         HavingMeasure::Ref(_) => False,
                         HavingMeasure::Call(call) => expr_valid(call.arg, allowed)
                             && (match call.filter {
                                 Some(expr) => expr_valid(expr, allowed),
                                 None => True,
                             }),
+                    };
+                    measure_ok && match h.threshold {
+                        Expr::Bind(_) => True,
+                        Expr::AllocatedBind(binding) => binding.index > 0,
+                        _ => False,
                     }
                 });
                 match ex.alternatives {
@@ -1512,7 +1517,11 @@ def having_measure_ok: Fn(Plan, HavingMeasure, Array(String)) -> Bool = fn(plan,
 };
 
 def having_ok: Fn(Plan, Array(String), Having) -> Bool = fn(plan, aliases, h) {
-    having_measure_ok(plan, h.measure, aliases)
+    having_measure_ok(plan, h.measure, aliases) && match h.threshold {
+        Expr::Bind(_) => True,
+        Expr::AllocatedBind(binding) => binding.index > 0,
+        _ => False,
+    }
 };
 
 def having_list_ok: Fn(Plan, Array(String), Array(Having)) -> Bool = fn(plan, aliases, having_list) {
@@ -2818,8 +2827,9 @@ def render_exists_having_clause: Fn(Array(Having), BuildCtx) -> Tuple([String, A
         match h.measure {
             HavingMeasure::Call(call) => {
                 let rendered = render_aggregate_call(call, ctx);
-                let values: Array(Val) = [h.threshold];
-                (`\{rendered.0} \{having_op_sql(h.op)} ?`, array::concat([rendered.1, values]))
+                let threshold = render_expr(h.threshold, ctx);
+                (`\{rendered.0} \{having_op_sql(h.op)} \{threshold.0}`,
+                    array::concat([rendered.1, threshold.1]))
             },
             HavingMeasure::Ref(_) => fail!("EXISTS HAVING must reference a direct aggregate call", having_list),
         }
@@ -3145,8 +3155,9 @@ def render_having: Fn(Plan, Having, BuildCtx) -> Tuple([String, Array(Val)]) = f
         HavingMeasure::Ref(ref) => render_measure_ref(plan, ref.alias, ctx),
         HavingMeasure::Call(call) => render_aggregate_call(call, ctx),
     };
-    let values: Array(Val) = [h.threshold];
-    (`\{rendered.0} \{having_op_sql(h.op)} ?`, array::concat([rendered.1, values]))
+    let threshold = render_expr(h.threshold, ctx);
+    (`\{rendered.0} \{having_op_sql(h.op)} \{threshold.0}`,
+        array::concat([rendered.1, threshold.1]))
 };
 
 def render_having_clause: Fn(Plan, Array(Having), BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, having_list, ctx) {
@@ -4187,8 +4198,13 @@ def exists_three_hop_double_alternatives: Fn(Source, Array(Array(ColumnEq)), Sou
 # `<alias> <op> <threshold>`; `threshold` is a dynamic scalar (always bound).
 def having: Fn(HavingOp, String, Val) -> Having = fn(op, measure_alias, threshold) {
     let ref: AggregateRef = {alias: measure_alias};
-    let item: Having = {op: op, measure: HavingMeasure::Ref(ref), threshold: threshold};
+    let item: Having = {op: op, measure: HavingMeasure::Ref(ref), threshold: Expr::Bind(threshold)};
     item
+};
+
+def having_bound: Fn(HavingOp, String, Expr) -> Having = fn(op, measure_alias, threshold) {
+    let ref: AggregateRef = {alias: measure_alias};
+    {op, measure: HavingMeasure::Ref(ref), threshold}
 };
 
 # Aggregate-result predicate over a direct aggregate expression (not projected):
@@ -4201,8 +4217,13 @@ def having_call: Fn(HavingOp, AggregateFunction, Expr, Bool, Val) -> Having = fn
         filter: None,
         alias: "__having",
     };
-    let item: Having = {op: op, measure: HavingMeasure::Call(call), threshold: threshold};
+    let item: Having = {op: op, measure: HavingMeasure::Call(call), threshold: Expr::Bind(threshold)};
     item
+};
+
+def having_call_bound: Fn(HavingOp, AggregateFunction, Expr, Bool, Expr) -> Having = fn(op, function, arg, distinct, threshold) {
+    let call: AggregateCall = {function, arg, distinct, filter: None, alias: "__having"};
+    {op, measure: HavingMeasure::Call(call), threshold}
 };
 
 # A named output column of one UNION ALL branch.
@@ -4395,7 +4416,9 @@ pub use self::{
     peer_corr_roles,
     exists_peer,
     having,
+    having_bound,
     having_call,
+    having_call_bound,
     union_column,
     union_branch,
     derived_source,
