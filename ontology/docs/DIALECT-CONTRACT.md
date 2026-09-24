@@ -10,10 +10,11 @@ simply producing syntactically plausible SQL.
 renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
 paging, derived UNION ALL sources and correlated EXISTS, including bounded
 linked and paired-endpoint bodies, scalar aggregate comparisons, ranked-key
-comparisons, and initial partitioned Top-N. Every rendering stage takes and returns
+comparisons, and initial partitioned Top-N. Its candidate `QueryPlan` entry
+dispatches the same five validated result shapes as SQLite. Every rendering stage takes and returns
 an immutable context that allocates numbered bindings and collision-free
-internal aliases. Unsupported shapes still fail explicitly; there is no
-complete `QueryPlan` materializer yet, so PostgreSQL is not an admitted dialect.
+internal aliases. The entry is not yet an admitted PostgreSQL dialect: shared
+set projection types and full cross-dialect execution semantics remain unproven.
 The shared set validator currently compares projection *shapes*, not SQL
 value types: a SQLite set can contain unlike scalar types while PostgreSQL
 may reject them. Type equivalence must be resolved before set operations can

@@ -728,26 +728,6 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
     }
 };
 
-# Candidates remain separate from the admitted SQLite QueryPlan materializer
-# until every query shape and semantic check is covered by PostgreSQL.
-pub def render_rows_candidate: Fn(qb::Plan, Bool) -> qb::Query = fn(plan, distinct) {
-    let rows = emit_rows(plan, distinct, plan_context(plan));
-    {sql: rows.sql, bindings: rows.ctx.bindings}
-};
-
-pub def render_group_count_candidate: Fn(qb::Plan) -> qb::Query = fn(plan) {
-    let checked = qb::validate_query_plan(qb::QueryPlan::GroupCount(plan));
-    match checked {
-        qb::QueryPlan::GroupCount(grouped) => {
-            let rows = emit_rows(grouped, False, plan_context(grouped));
-            let alias = internal_alias(rows.ctx);
-            {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
-                bindings: alias.1.bindings}
-        },
-        _ => fail!("unexpected PostgreSQL group-count plan", plan),
-    }
-};
-
 def emit_set: Fn(qb::SetPlan) -> Emitted = fn(set) {
     let operands = qb::validate_set_operands(set.kind, set.left, set.right);
     let reserved = array::concat([plan_aliases(operands.0), plan_aliases(operands.1)]);
@@ -757,13 +737,47 @@ def emit_set: Fn(qb::SetPlan) -> Emitted = fn(set) {
     {sql: `\{left.sql} \{op} \{right.sql}`, ctx: right.ctx}
 };
 
-pub def render_set_candidate: Fn(qb::SetPlan, Bool) -> qb::Query = fn(set, count) {
-    let inner = emit_set(set);
-    if count {
-        let alias = internal_alias(inner.ctx);
-        {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`,
-            bindings: alias.1.bindings}
-    } else {
-        {sql: inner.sql, bindings: inner.ctx.bindings}
+# The single PG AST boundary remains a candidate until the dialect contract
+# (notably set projection types) is proven by cross-dialect execution.
+pub def render_query_plan_candidate: Fn(qb::QueryPlan) -> qb::Query = fn(raw) {
+    match qb::validate_query_plan(raw) {
+        qb::QueryPlan::Rows(plan) => {
+            let rows = emit_rows(plan, False, plan_context(plan));
+            {sql: rows.sql, bindings: rows.ctx.bindings}
+        },
+        qb::QueryPlan::DistinctRows(plan) => {
+            let rows = emit_rows(plan, True, plan_context(plan));
+            {sql: rows.sql, bindings: rows.ctx.bindings}
+        },
+        qb::QueryPlan::GroupCount(plan) => {
+            let rows = emit_rows(plan, False, plan_context(plan));
+            let alias = internal_alias(rows.ctx);
+            {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
+                bindings: alias.1.bindings}
+        },
+        qb::QueryPlan::SetRows(set) => {
+            let rows = emit_set(set);
+            {sql: rows.sql, bindings: rows.ctx.bindings}
+        },
+        qb::QueryPlan::SetCount(set) => {
+            let rows = emit_set(set);
+            let alias = internal_alias(rows.ctx);
+            {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
+                bindings: alias.1.bindings}
+        },
     }
+};
+
+pub def render_rows_candidate: Fn(qb::Plan, Bool) -> qb::Query = fn(plan, distinct) {
+    if distinct { render_query_plan_candidate(qb::QueryPlan::DistinctRows(plan)) }
+    else { render_query_plan_candidate(qb::QueryPlan::Rows(plan)) }
+};
+
+pub def render_group_count_candidate: Fn(qb::Plan) -> qb::Query = fn(plan) {
+    render_query_plan_candidate(qb::QueryPlan::GroupCount(plan))
+};
+
+pub def render_set_candidate: Fn(qb::SetPlan, Bool) -> qb::Query = fn(set, count) {
+    if count { render_query_plan_candidate(qb::QueryPlan::SetCount(set)) }
+    else { render_query_plan_candidate(qb::QueryPlan::SetRows(set)) }
 };
