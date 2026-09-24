@@ -12,6 +12,25 @@ use std::value::{ Value };
 
 def lower: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload, "resolver");
 
+@edsl::entity_id("ambiguous_connection")
+@edsl::entity_source("ambiguous_connections", "ambiguous_connection")
+@edsl::named_relation_key("ambiguous_safe_endpoint", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::Or([
+        edsl::RelationKey::Eq({from: 0, to: 0}),
+        edsl::RelationKey::Eq({from: 1, to: 0}),
+    ]))
+type AmbiguousConnection = struct {
+    @edsl::column("a_device_id")
+    a_device_id: String,
+    @edsl::column("z_device_id")
+    z_device_id: String,
+};
+
+pub def safe_alternative_key_cannot_prove_unique_target: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("unsafe-alternative", [Tenant.type, Site.type, Device.type, AmbiguousConnection.type],
+        payload.profile, fn(subject) { subject == "resolver" })
+}, "safe relation cannot prove a unique target across alternative keys");
+
 pub def graph_rejects_ignored_top_level_condition: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
         "op":"graph","root":"d","nodes":[{"id":"d","entity":"device"}],
@@ -894,14 +913,54 @@ pub def count_rejects_tenant_sibling_as_site_child: test::Test = test::should_fa
     }"#).unwrap!())
 }, "graph cannot prove the non-root count subject has one row per root relationship");
 
-pub def grouped_count_rejects_nonroot_dimension: test::Test = test::should_fail_with(fn() {
+pub def grouped_count_projects_nonroot_site_on_proven_child_grain: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"tenant", "include_empty":true,
+        "nodes":[{"id":"tenant","entity":"tenant"},{"id":"site","entity":"site"},{"id":"device","entity":"device"}],
+        "edges":[{"relation":"site_tenant","from":"site","to":"tenant"},
+                 {"relation":"device_site","from":"device","to":"site"}],
+        "select":[{"node":"tenant","dimension":"tenant_id"},
+                  {"node":"site","dimension":"site_id"}], "count":"device"
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "site.id AS site_site_id")
+        && string::contains(sq.sql, "count(device.id)")
+        && string::contains(sq.sql, "GROUP BY tenant.id, site.id")
+        && string::contains(sq.sql, "LEFT JOIN sites AS site")
+        && string::contains(sq.sql, "LEFT JOIN devices AS device")
+        && string::contains(pg.sql, "GROUP BY \"tenant\".\"id\", \"site\".\"id\"") {
+        True
+    } else { fail!("grouped child count lost site identity or zero groups", sq, pg) }
+});
+
+pub def root_device_count_groups_by_declared_safe_site: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"site","entity":"site"}],
+        "edges":[{"relation":"device_site","from":"device","to":"site"}],
+        "select":[{"node":"site","dimension":"site_id"}], "count":"device"
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "count(device.id)")
+        && string::contains(sq.sql, "GROUP BY site.id")
+        && string::contains(sq.sql, "device.tenant_id = site.tenant_id")
+        && string::contains(pg.sql, "GROUP BY \"site\".\"id\"") {
+        True
+    } else { fail!("safe ancestor dimension did not group root device count", sq, pg) }
+});
+
+pub def grouped_count_rejects_nonfunctional_peer_branch: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
         "op":"graph", "root":"tenant",
-        "nodes":[{"id":"tenant","entity":"tenant"},{"id":"device","entity":"device"}],
-        "edges":[{"relation":"device_tenant","from":"device","to":"tenant"}],
+        "nodes":[{"id":"tenant","entity":"tenant"},{"id":"device","entity":"device"},
+                 {"id":"link","entity":"connection"}],
+        "edges":[{"relation":"device_tenant","from":"device","to":"tenant"},
+                 {"relation":"connection_a","from":"link","to":"device"}],
         "select":[{"node":"device","dimension":"device_id"}], "count":"device"
     }"#).unwrap!())
-}, "graph count grouping dimensions must belong to the root");
+}, "graph cannot prove the non-root count subject has one row per root relationship");
 
 pub def count_rejects_shared_tenant_as_site_identity: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{

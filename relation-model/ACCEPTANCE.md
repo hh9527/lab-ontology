@@ -22,7 +22,8 @@ so that matching children cannot multiply its rows. It counts the root key
 without reducing a composite grain to one guessed DISTINCT column. It
 also supports grouping by root dimensions while counting a non-root child
 when every edge in the outer join tree is functional when traversed from that
-child. Reverse Safe chains and forward FanOut edges whose keys cover the
+child. Grouping dimensions may name any declared graph instance because the
+same proof prevents joins from duplicating the counted subject. Reverse Safe chains and forward FanOut edges whose keys cover the
 complete parent identity provide this proof, including multi-hop paths.
 Matching only a shared tenant does not prove site identity, so counting
 same-tenant devices as children of a particular site is rejected. Branches
@@ -78,5 +79,5 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The Model explicitly establishes
 endpoint identities and symmetric/directed peer semantics; unrelated-branch
-EXISTS under empty-group counting, business-link outer joins, and non-root grouping dimensions remain
+EXISTS under empty-group counting and business-link outer joins remain
 pending.
