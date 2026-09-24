@@ -23,8 +23,12 @@ child. Reverse Safe chains and forward FanOut edges whose keys cover the
 complete parent identity provide this proof, including multi-hop paths.
 Matching only a shared tenant does not prove site identity, so counting
 same-tenant devices as children of a particular site is rejected. Branches
-that can duplicate the counted child remain unproven and are rejected; inner
-joins do not yet preserve root groups with zero children. It
+that can duplicate the counted child remain unproven and are rejected. By
+default joins are inner; `include_empty: true` for non-root count subjects
+uses LEFT JOINs to retain root groups with zero children. Outer filters and
+EXISTS must be anchored on the root, since predicates on nullable instances
+would silently discard those groups; business-link joins are not yet supported
+in this mode. It
 rejects missing edges, role mismatches and disconnected nodes. Reverse
 navigation reads the same edge from its other endpoint; it does
 not establish any business-level peer direction or symmetry. Named business
@@ -62,5 +66,6 @@ role, or missing proof.
 
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The Model explicitly establishes
-endpoint identities and symmetric/directed peer semantics; zero-child outer
-join counts and non-root grouping dimensions remain pending.
+endpoint identities and symmetric/directed peer semantics; filtered nullable
+children, business-link outer joins, and non-root grouping dimensions remain
+pending.
