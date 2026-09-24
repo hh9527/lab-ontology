@@ -18,11 +18,11 @@ The shared set validator currently compares projection *shapes*, not SQL
 value types: a SQLite set can contain unlike scalar types while PostgreSQL
 may reject them. Type equivalence must be resolved before set operations can
 be admitted as supported PostgreSQL queries.
-Partitioned Top-N has execution checks for column grouping and aggregate
-ranking. Parameterized grouping expressions repeated in SELECT, window clauses
-and GROUP BY still need an expression-reference strategy: independently numbered
-PostgreSQL placeholders make otherwise identical expressions different grouping
-keys. The current candidate must not be promoted while that case is unresolved.
+Partitioned Top-N now reuses the original numbered placeholders for the same
+structural grouping expression across SELECT, window clauses and GROUP BY.
+This is an explicit AST-expression reference, not a SQL-text rewrite. Its
+execution checks include column grouping, aggregate ranking and a parameterized
+grouping key. Full cross-dialect query equivalence is still pending.
 
 ## Common contract
 

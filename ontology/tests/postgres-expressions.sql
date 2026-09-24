@@ -152,6 +152,17 @@ SELECT "ranked"."kind" FROM (
 ORDER BY "ranked"."category" ASC NULLS FIRST,
     "ranked"."total" DESC NULLS LAST, "ranked"."kind" ASC NULLS FIRST;
 
+PREPARE ontology_parameterized_group(integer, integer) AS
+WITH "Events"("category", "amount") AS
+    (VALUES (10, 2), (10, 3), (20, 7))
+SELECT "ranked"."category" FROM (
+    SELECT ("e"."category" + $1) AS "category", sum("e"."amount") AS "total",
+        row_number() OVER (PARTITION BY ("e"."category" + $1)
+            ORDER BY sum("e"."amount") DESC NULLS LAST) AS "rn"
+    FROM "Events" AS "e" GROUP BY ("e"."category" + $1)
+) AS "ranked" WHERE "ranked"."rn" <= $2
+ORDER BY "ranked"."category" ASC NULLS FIRST, "ranked"."total" DESC NULLS LAST;
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -225,6 +236,10 @@ BEGIN
     IF selected_name IS DISTINCT FROM 'z' THEN
         RAISE EXCEPTION 'partitioned grouped aggregate rank differs';
     END IF;
+    EXECUTE 'EXECUTE ontology_parameterized_group(5, 1)' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 15 THEN
+        RAISE EXCEPTION 'parameterized grouping key did not reuse one placeholder';
+    END IF;
 
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
@@ -250,4 +265,5 @@ DEALLOCATE ontology_scalar;
 DEALLOCATE ontology_ranked;
 DEALLOCATE ontology_partitioned;
 DEALLOCATE ontology_group_partitioned;
+DEALLOCATE ontology_parameterized_group;
 COMMIT;
