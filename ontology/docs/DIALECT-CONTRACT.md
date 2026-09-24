@@ -37,6 +37,27 @@ simply producing syntactically plausible SQL.
 | Derived/set | UNION ALL source, INTERSECT/EXCEPT/distinct UNION, set count | Compare projected types and row duplicates, branch-local binding order, and NULL treatment in distinct/set operations. |
 | Partitioned Top-N | `row_number()` with hidden grouping/order columns | Compare partition grain, tie breakers, projected output and NULL ordering. |
 
+### JSON path and representation checkpoint
+
+The current AST stores a JSON1 path as a bound string and only checks that it
+is a string. PostgreSQL's `json_extract_path` accepts separate text path
+segments, not the JSON1 path syntax. Before admitting PostgreSQL, parse and
+validate the path once in the shared layer, including quoted object keys,
+array indices and JSON1's reverse-index forms; reject unsupported paths at
+plan preparation with a path-specific diagnostic. A renderer must consume the
+parsed segments, never interpolate the path into SQL. The present string-only
+check does **not** establish cross-dialect path equivalence.
+
+Use PostgreSQL's original `json` representation for `JsonType` when numeric
+lexical form matters: SQLite distinguishes `json_type('1e0', '$') = 'real'`
+from `json_type('1', '$') = 'integer'`, whereas `jsonb` normalizes `1e0` to
+`1`. Verified on PostgreSQL 16: `json_extract_path` on a nested `json` value
+retains `1e0`; `json_extract_path_text` returns SQL NULL for JSON null, and a
+numeric array segment selects its element. These observations establish a
+possible implementation route, not complete equivalence. In particular,
+text extraction, JSON type classification and invalid-document behavior each
+need independent execution tests.
+
 Some entries may require tightening the shared semantics or changing the SQLite
 renderer before PostgreSQL can be admitted. Until these checks are executable
 and pass, a PostgreSQL renderer must not be advertised as supporting the entire
