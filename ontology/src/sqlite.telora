@@ -1,0 +1,761 @@
+use std::array as array;
+use std::string as string;
+use crate::query::{
+    Val, Query, ColumnRef, ColumnEq, ScalarFunction, ScalarCall, Expr,
+    AggregateFunction, AggregateCall, ComputedOp, ComputedAggregate,
+    SelectItem, NamedExprItem, HavingOp, HavingMeasure, Having, Source,
+    BuildCtx, JoinKind, JoinCondition, Join, Exists, ExistsLink, ExistsTail,
+    PeerBranch, PeerCorr, UnionColumn, UnionBranch, DerivedSource,
+    SetOpKind, Ordering, AggregateRef, OrderKey, OrderBy, Plan, SetPlan,
+    QueryPlan, PartitionedTopN, ScalarSubquery, ScalarAggregateComparison,
+    RankedKeySubquery, RankedKeyComparison, is_sql_identifier,
+    validate_contextual_pagination, validate_query_plan, validate_structure,
+    validate_distinct_plan, find_item_by_alias, set_op_sql,
+};
+
+# ---------------------------------------------------------------------------
+# SQLite lowering.
+# ---------------------------------------------------------------------------
+
+def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
+    match function {
+        ScalarFunction::Substr => "substr",
+        ScalarFunction::Instr => "instr",
+        ScalarFunction::If => "if",
+        ScalarFunction::Add => "+",
+        ScalarFunction::Sub => "-",
+        ScalarFunction::Lower => "lower",
+        ScalarFunction::Length => "length",
+        ScalarFunction::UtcDaysAgo => "strftime",
+        ScalarFunction::Eq => "=",
+        ScalarFunction::Ne => "!=",
+        ScalarFunction::Lt => "<",
+        ScalarFunction::Le => "<=",
+        ScalarFunction::Gt => ">",
+        ScalarFunction::Ge => ">=",
+        ScalarFunction::And => "AND",
+        ScalarFunction::Or => "OR",
+        ScalarFunction::Not => "NOT",
+    }
+};
+
+def aggregate_name: Fn(AggregateFunction) -> String = fn(function) {
+    match function {
+        AggregateFunction::Count => "count",
+        AggregateFunction::Sum => "sum",
+        AggregateFunction::Avg => "avg",
+        AggregateFunction::Min => "min",
+        AggregateFunction::Max => "max",
+    }
+};
+
+def join_kind_sql: Fn(JoinKind) -> String = fn(kind) {
+    match kind {
+        JoinKind::Inner => "INNER JOIN",
+        JoinKind::Left => "LEFT JOIN",
+    }
+};
+
+def direction_sql: Fn(Ordering) -> String = fn(direction) {
+    match direction {
+        Ordering::Asc => "ASC",
+        Ordering::Desc => "DESC",
+    }
+};
+
+def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function, parts) {
+    match function {
+        ScalarFunction::Substr => `\{scalar_name(function)}(\{string::join(parts, ", ")})`,
+        ScalarFunction::Instr => `instr(\{parts[0]}, \{parts[1]})`,
+        ScalarFunction::If => `CASE WHEN \{parts[0]} THEN \{parts[1]} ELSE \{parts[2]} END`,
+        ScalarFunction::Add => `(\{parts[0]} + \{parts[1]})`,
+        ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
+        ScalarFunction::Lower => `lower(\{parts[0]})`,
+        ScalarFunction::Length => `length(\{parts[0]})`,
+        ScalarFunction::UtcDaysAgo => `strftime('%Y-%m-%dT%H:%M:%SZ', \{parts[0]}, printf('-%d days', \{parts[1]}))`,
+        ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
+        ScalarFunction::Ne => `\{parts[0]} != \{parts[1]}`,
+        ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,
+        ScalarFunction::Le => `\{parts[0]} <= \{parts[1]}`,
+        ScalarFunction::Gt => `\{parts[0]} > \{parts[1]}`,
+        ScalarFunction::Ge => `\{parts[0]} >= \{parts[1]}`,
+        ScalarFunction::And => `(\{parts[0]} AND \{parts[1]})`,
+        ScalarFunction::Or => `(\{parts[0]} OR \{parts[1]})`,
+        ScalarFunction::Not => `NOT (\{parts[0]})`,
+    }
+};
+
+# Bindings are allocated by the builder; rendering only resolves their handles.
+def render_expr: Fn(Expr, BuildCtx) -> String = fn(expr, ctx) {
+    match expr {
+        Expr::Column(ref) => if is_sql_identifier(ref.source) && is_sql_identifier(ref.column) {
+            `\{ref.source}.\{ref.column}`
+        } else { fail!("invalid SQLite column identifier", ref) },
+        Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(ctx.bindings) {
+            `?\{binding.index}`
+        } else { fail!("binding handle is not registered in builder context", binding) },
+        Expr::Scalar(call) => {
+            render_scalar_sql(call.function, array::map(call.args, fn(arg) { render_expr(arg, ctx) }))
+        },
+    }
+};
+
+def render_sqlite_expr_with_context: Fn(Expr, BuildCtx) -> Query = fn(expr, ctx) {
+    {sql: render_expr(expr, ctx), bindings: ctx.bindings}
+};
+
+# Render a scalar aggregate subquery using already allocated binding handles.
+def render_scalar_subquery: Fn(ScalarSubquery, BuildCtx) -> String = fn(sq, ctx) {
+    let rendered = render_expr(sq.arg, ctx);
+    let distinct_sql = if sq.distinct { "DISTINCT " } else { "" };
+    let agg_filter_part = match sq.agg_filter {
+        Some(expr) => ` FILTER (WHERE \{render_expr(expr, ctx)})`,
+        None => "",
+    };
+    let agg_sql = `\{aggregate_name(sq.function)}(\{distinct_sql}\{rendered})\{agg_filter_part}`;
+    let from = render_source(sq.source, ctx);
+    let rendered_joins = array::map(sq.joins, fn(join) { render_join(join, ctx) });
+    let joins_text = string::join(rendered_joins, " ");
+    let join_text = if array::length(sq.joins) > 0 {
+        ` \{joins_text}`
+    } else {
+        ""
+    };
+    let filter_part = match sq.filter {
+        Some(expr) => ` WHERE \{render_expr(expr, ctx)}`,
+        None => "",
+    };
+    `(SELECT \{agg_sql} FROM \{from}\{join_text}\{filter_part})`
+};
+
+def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> String = fn(call, ctx) {
+    let rendered = render_expr(call.arg, ctx);
+    let distinct_sql = if call.distinct { "DISTINCT " } else { "" };
+    let filter_part = match call.filter {
+        Some(expr) => ` FILTER (WHERE \{render_expr(expr, ctx)})`,
+        None => "",
+    };
+    `\{aggregate_name(call.function)}(\{distinct_sql}\{rendered})\{filter_part}`
+};
+
+# Renders the full expression of a measure alias (aggregate or computed) by
+# re-expanding its declaration.  A computed aggregate may reference another
+# computed aggregate; acyclicity is enforced by structural validation.
+def render_computed_aggregate: Fn(Plan, ComputedAggregate, BuildCtx) -> String = fn(plan, ca, ctx) {
+    let left = render_measure_ref(plan, ca.left, ctx);
+    let right = render_measure_ref(plan, ca.right, ctx);
+    let op = match ca.op {
+        ComputedOp::Add => "+",
+        ComputedOp::Sub => "-",
+    };
+    `(\{left} \{op} \{right})`
+};
+
+def render_measure_ref: Fn(Plan, String, BuildCtx) -> String = fn(plan, alias, ctx) {
+    match find_item_by_alias(plan, alias) {
+        Some(SelectItem::Aggregate(call)) => render_aggregate_call(call, ctx),
+        Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca, ctx),
+        _ => fail!("measure reference is not a declared aggregate or computed aggregate", plan, alias),
+    }
+};
+
+def render_select_item: Fn(SelectItem, Plan, BuildCtx) -> String = fn(item, plan, ctx) {
+    match item {
+        SelectItem::Expr(expr) => render_expr(expr, ctx),
+        SelectItem::NamedExpr(named) => `\{render_expr(named.expr, ctx)} AS \{named.alias}`,
+        SelectItem::Aggregate(call) => `\{render_aggregate_call(call, ctx)} AS \{call.alias}`,
+        SelectItem::Computed(ca) => `\{render_computed_aggregate(plan, ca, ctx)} AS \{ca.alias}`,
+    }
+};
+
+# Renders an ON-condition tree to SQL text.  A single `ScalarFunction.Eq` atom renders
+# without parentheses so simple equality joins keep the documented shape;
+# `ScalarFunction.And`/`ScalarFunction.Or` render parenthesized so nested precedence is deterministic.
+def render_join_condition: Fn(JoinCondition, BuildCtx) -> String = fn(condition, ctx) {
+    match condition {
+        JoinCondition::Eq(eq) => `\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`,
+        JoinCondition::Predicate(expr) => render_expr(expr, ctx),
+        JoinCondition::And(items) => {
+            `(\{string::join(array::map(items, fn(item) { render_join_condition(item, ctx) }), " AND ")})`
+        },
+        JoinCondition::Or(items) => {
+            `(\{string::join(array::map(items, fn(item) { render_join_condition(item, ctx) }), " OR ")})`
+        },
+    }
+};
+
+def render_source: Fn(Source, BuildCtx) -> String = fn(source_item, ctx) {
+    match source_item.scope {
+        None => `\{source_item.table} AS \{source_item.alias}`,
+        Some(scope) => `(SELECT * FROM \{source_item.table} AS \{source_item.alias} WHERE \{render_expr(scope, ctx)}) AS \{source_item.alias}`,
+    }
+};
+
+def render_join: Fn(Join, BuildCtx) -> String = fn(join, ctx) {
+    let source_part = render_source(join.source, ctx);
+    let condition = render_join_condition(join.condition, ctx);
+    `\{join_kind_sql(join.kind)} \{source_part} ON \{condition}`
+};
+
+def render_group_part: Fn(Array(Expr), BuildCtx) -> String = fn(grouping, ctx) {
+    if array::length(grouping) > 0 {
+        ` GROUP BY \{string::join(array::map(grouping, fn(expr) { render_expr(expr, ctx) }), ", ")}`
+    } else {
+        ""
+    }
+};
+
+# Renders the HAVING clause of a correlated EXISTS aggregate body.  Only
+# direct `HavingMeasure.Call` aggregate measures are allowed there (validated up front), so
+# no outer Plan is needed.
+def render_exists_having_clause: Fn(Array(Having), BuildCtx) -> String = fn(having_list, ctx) {
+    let parts = array::map(having_list, fn(h) {
+        match h.measure {
+            HavingMeasure::Call(call) => {
+                let rendered = render_aggregate_call(call, ctx);
+                let threshold = render_expr(h.threshold, ctx);
+                `\{rendered} \{having_op_sql(h.op)} \{threshold}`
+            },
+            HavingMeasure::Ref(_) => fail!("EXISTS HAVING must reference a direct aggregate call", having_list),
+        }
+    });
+    let sql = if array::length(having_list) > 0 {
+        ` HAVING \{string::join(parts, " AND ")}`
+    } else {
+        ""
+    };
+    sql
+};
+
+# Renders one qualified column reference.
+def render_eq_col: Fn(ColumnRef) -> String = fn(col) {
+    `\{col.source}.\{col.column}`
+};
+
+# Renders one equality atom of a correlated predicate.
+def render_eq_sql: Fn(ColumnEq) -> String = fn(eq) {
+    `\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`
+};
+
+# Renders a correlated paired-endpoint EXISTS with two inner participant
+# sources and the two ordered endpoint-exchange branches:
+#   EXISTS (SELECT 1 FROM <origin> AS <oa>, <peer> AS <pa>
+#           WHERE ((<hub.origin-role> = <oa.key> AND <hub.peer-role> = <pa.key>)
+#                  OR (<hub.peer-role> = <oa.key> AND <hub.origin-role> = <pa.key>))
+#           [AND <origin_filter>][AND <peer_filter>])
+# Origin/peer filters and key binds belong to their own inner aliases.  No
+# participant table is ever outer-joined; the predicate only filters hub rows.
+def render_peer_corr: Fn(PeerCorr, BuildCtx) -> String = fn(corr, ctx) {
+    let origin_source = render_source(corr.origin, ctx);
+    let peer_source = render_source(corr.peer, ctx);
+    let from_sql = `\{origin_source}, \{peer_source}`;
+    let a_origin = render_eq_sql(corr.branch_a.origin);
+    let a_peer = render_eq_sql(corr.branch_a.peer);
+    let b_origin = render_eq_sql(corr.branch_b.origin);
+    let b_peer = render_eq_sql(corr.branch_b.peer);
+    let branch_a_sql = `(\{a_origin} AND \{a_peer})`;
+    let branch_b_sql = `(\{b_origin} AND \{b_peer})`;
+    let exchange_sql = if corr.exchange { `(\{branch_a_sql} OR \{branch_b_sql})` } else { branch_a_sql };
+    # Same-entity identity proof: the two participant rows must have distinct
+    # stable keys so one row can never occupy both endpoints of the hub row.
+    let distinct_part = if corr.distinct_keys {
+        let origin_key_sql = render_eq_col(corr.branch_a.origin.right);
+        let peer_key_sql = render_eq_col(corr.branch_a.peer.right);
+        ` AND \{origin_key_sql} <> \{peer_key_sql}`
+    } else {
+        ""
+    };
+    let origin_part = match corr.origin_filter {
+        Some(expr) => ` AND \{render_expr(expr, ctx)}`,
+        None => "",
+    };
+    let peer_part = match corr.peer_filter {
+        Some(expr) => ` AND \{render_expr(expr, ctx)}`,
+        None => "",
+    };
+    `EXISTS (SELECT 1 FROM \{from_sql} WHERE \{exchange_sql}\{distinct_part}\{origin_part}\{peer_part})`
+};
+
+# Renders a correlated EXISTS predicate without a leading WHERE/AND.  A grouped
+# body renders as
+#   EXISTS (SELECT 1 FROM <table> AS <alias>
+#           WHERE <correlations> [AND <filter>]
+#           [GROUP BY ...] [HAVING ...])
+# With `alternatives` set (dual-endpoint hub union mode) the WHERE body is a
+# closed OR of ANDed equalities `(a1 AND a2) OR (b1 ...)`; otherwise it is the
+# ANDed `pairs` equalities.  With `peer` set it is the two-participant paired
+# correlation (see `render_peer_corr`).
+def render_exists: Fn(Exists, BuildCtx) -> String = fn(ex, ctx) {
+    match ex.peer {
+        Some(corr) => render_peer_corr(corr, ctx),
+        None => match ex.link {
+            Some(link) => do {
+                # Bounded correlated two-hop link body: the whole A -> B -> C
+                # condition stays inside ONE correlated EXISTS.  B (`ex.source`)
+                # is INNER JOINed to C (`link.source`) inside the subquery, so a
+                # fan-out A -> B first hop never fans out the outer A rows.
+                let hop_from = render_source(ex.source, ctx);
+                let link_from = render_source(link.source, ctx);
+                let on_sql = match link.alternatives {
+                    None => string::join(array::map(link.pairs, fn(p) {
+                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                    }), " AND "),
+                    Some(alternatives) => `(\{string::join(array::map(alternatives, fn(branch) {
+                        `(\{string::join(array::map(branch, fn(p) {
+                            `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                        }), " AND ")})`
+                    }), " OR ")})`,
+                };
+                let tail_join: String = match link.tail {
+                    None => "",
+                    Some(tail) => {
+                        let tail_source = render_source(tail.source, ctx);
+                        let conditions = string::join(array::map(tail.pairs, fn(p) {
+                            `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                        }), " AND ");
+                        ` INNER JOIN \{tail_source} ON \{conditions}`
+                    },
+                };
+                let corr_sql = match ex.alternatives {
+                    Some(alternatives) => do {
+                        let branches = array::map(alternatives, fn(branch) {
+                            let terms = array::map(branch, fn(p) {
+                                `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                            });
+                            `(\{string::join(terms, " AND ")})`
+                        });
+                        let joined = string::join(branches, " OR ");
+                        `(\{joined})`
+                    },
+                    None => string::join(array::map(ex.pairs, fn(p) {
+                        `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                    }), " AND "),
+                };
+                let link_filter_part = match link.filter {
+                    Some(expr) => ` AND \{render_expr(expr, ctx)}`,
+                    None => "",
+                };
+                `EXISTS (SELECT 1 FROM \{hop_from} INNER JOIN \{link_from} ON \{on_sql}\{tail_join} WHERE \{corr_sql}\{link_filter_part})`
+            },
+            None => do {
+                let source_part = render_source(ex.source, ctx);
+                let filter_part = match ex.filter {
+                    Some(expr) => ` AND \{render_expr(expr, ctx)}`,
+                    None => "",
+                };
+                let group_part = render_group_part(ex.grouping, ctx);
+                let having_part = render_exists_having_clause(ex.having, ctx);
+                match ex.alternatives {
+                    Some(alternatives) => do {
+                        let alternative_sqls = array::map(alternatives, fn(alt) {
+                            string::join(array::map(alt, fn(p) {
+                                `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                            }), " AND ")
+                        });
+                        let union_sql = string::join(alternative_sqls, " OR ");
+                        `EXISTS (SELECT 1 FROM \{source_part} WHERE (\{union_sql})\{filter_part}\{group_part}\{having_part})`
+                    },
+                    None => do {
+                        let pairs_sql = string::join(array::map(ex.pairs, fn(p) {
+                            `\{p.left.source}.\{p.left.column} = \{p.right.source}.\{p.right.column}`
+                        }), " AND ");
+                        `EXISTS (SELECT 1 FROM \{source_part} WHERE \{pairs_sql}\{filter_part}\{group_part}\{having_part})`
+                    },
+                }
+            },
+        },
+    }
+};
+
+# Renders one scalar aggregate comparison predicate.
+def render_scalar_comparison: Fn(ScalarAggregateComparison, BuildCtx) -> String = fn(cmp, ctx) {
+    let rendered = render_scalar_subquery(cmp.inner, ctx);
+    `\{cmp.outer.source}.\{cmp.outer.column} \{scalar_name(cmp.op)} \{rendered}`
+};
+
+# Renders one ranked grouped-key scalar subquery.
+def render_ranked_subquery: Fn(RankedKeySubquery, BuildCtx) -> String = fn(sq, ctx) {
+    let key_parts = array::map(sq.keys, fn(expr) { render_expr(expr, ctx) });
+    let key_sql = string::join(key_parts, ", ");
+    let from = render_source(sq.source, ctx);
+    let rendered_joins = array::map(sq.joins, fn(join) { render_join(join, ctx) });
+    let joins_text = string::join(rendered_joins, " ");
+    let join_text = if array::length(sq.joins) > 0 {
+        ` \{joins_text}`
+    } else {
+        ""
+    };
+    let filter_part = match sq.filter {
+        Some(expr) => ` WHERE \{render_expr(expr, ctx)}`,
+        None => "",
+    };
+    let order_rendered = render_aggregate_call(sq.order, ctx);
+    `(SELECT \{key_sql} FROM \{from}\{join_text}\{filter_part} GROUP BY \{key_sql} ORDER BY \{order_rendered} \{direction_sql(sq.direction)} LIMIT 1)`
+};
+
+# Renders one ranked grouped-key comparison predicate.
+def render_ranked_comparison: Fn(RankedKeyComparison, BuildCtx) -> String = fn(cmp, ctx) {
+    let rendered = render_ranked_subquery(cmp.inner, ctx);
+    `\{cmp.outer.source}.\{cmp.outer.column} \{scalar_name(cmp.op)} \{rendered}`
+};
+
+# Renders the whole ` WHERE ...` clause combining the row filter, every
+# correlated EXISTS predicate, every scalar aggregate comparison predicate and
+# every ranked grouped-key comparison predicate.
+def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateComparison), Array(RankedKeyComparison), BuildCtx) -> String = fn(filter, exists_list, comparisons, ranked_comparisons, ctx) {
+    let filter_part = match filter {
+        Some(expr) => render_expr(expr, ctx),
+        None => "",
+    };
+    let has_filter = filter != None;
+    let has_exists = array::length(exists_list) > 0;
+    let has_comparisons = array::length(comparisons) > 0;
+    let has_ranked = array::length(ranked_comparisons) > 0;
+    # A negated exists renders as `NOT EXISTS (...)` (anti-existence).  The
+    # correlated body and grain semantics are unchanged; only
+    # the SQL keyword prefix differs.
+    let exists_parts = array::map(exists_list, fn(ex) {
+        let rendered = render_exists(ex, ctx);
+        if ex.negated {
+            `NOT \{rendered}`
+        } else {
+            rendered
+        }
+    });
+    let comparison_parts = array::map(comparisons, fn(cmp) { render_scalar_comparison(cmp, ctx) });
+    let ranked_parts = array::map(ranked_comparisons, fn(cmp) { render_ranked_comparison(cmp, ctx) });
+    let where_body: Array(String) = [];
+    let body_parts = if has_filter {
+        array::push(where_body, filter_part)
+    } else {
+        where_body
+    };
+    let body_with_exists = if has_exists {
+        array::concat([body_parts, exists_parts])
+    } else {
+        body_parts
+    };
+    let body_with_comparisons = if has_comparisons {
+        array::concat([body_with_exists, comparison_parts])
+    } else {
+        body_with_exists
+    };
+    let body_with_ranked = if has_ranked {
+        array::concat([body_with_comparisons, ranked_parts])
+    } else {
+        body_with_comparisons
+    };
+    let sql = if array::length(body_with_ranked) > 0 {
+        ` WHERE \{string::join(body_with_ranked, " AND ")}`
+    } else {
+        ""
+    };
+    sql
+};
+
+def having_op_sql: Fn(HavingOp) -> String = fn(op) {
+    match op {
+        HavingOp::Eq => "=",
+        HavingOp::Ne => "!=",
+        HavingOp::Lt => "<",
+        HavingOp::Le => "<=",
+        HavingOp::Gt => ">",
+        HavingOp::Ge => ">=",
+    }
+};
+
+# Renders one aggregate-result predicate.  A `HavingMeasure.Ref` measure is re-expanded to
+# its full aggregate/computed SQL; a `HavingMeasure.Call` measure renders its own aggregate
+# expression. Binding handles retain their construction-time indexes.
+def render_having: Fn(Plan, Having, BuildCtx) -> String = fn(plan, h, ctx) {
+    let rendered = match h.measure {
+        HavingMeasure::Ref(ref) => render_measure_ref(plan, ref.alias, ctx),
+        HavingMeasure::Call(call) => render_aggregate_call(call, ctx),
+    };
+    let threshold = render_expr(h.threshold, ctx);
+    `\{rendered} \{having_op_sql(h.op)} \{threshold}`
+};
+
+def render_having_clause: Fn(Plan, Array(Having), BuildCtx) -> String = fn(plan, having_list, ctx) {
+    let parts = array::map(having_list, fn(h) { render_having(plan, h, ctx) });
+    let sql = if array::length(having_list) > 0 {
+        ` HAVING \{string::join(parts, " AND ")}`
+    } else {
+        ""
+    };
+    sql
+};
+
+# Renders an ordering key.  An AggregateRef renders the full aggregate or
+# computed aggregate expression of the projected measure (never a
+# source-qualified alias), so the generated SQL is executable and unambiguous.
+def render_order_key: Fn(OrderKey, Plan, BuildCtx) -> String = fn(key, plan, ctx) {
+    match key {
+        OrderKey::Expr(expr) => render_expr(expr, ctx),
+        OrderKey::AggregateRef(ref) => {
+            match find_item_by_alias(plan, ref.alias) {
+                Some(SelectItem::Aggregate(call)) => render_aggregate_call(call, ctx),
+                Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca, ctx),
+                _ => fail!("ordering references an unprojected measure", plan, ref),
+            }
+        },
+        # A direct ordering aggregate renders its own aggregate expression (the
+        # internal value used only to order the groups is never projected).
+        OrderKey::Aggregate(call) => render_aggregate_call(call, ctx),
+    }
+};
+
+# Renders one UNION ALL branch as `SELECT <name> AS <col>, ... FROM <table> AS
+# <alias> [WHERE ...]`.
+def render_union_branch: Fn(UnionBranch, BuildCtx) -> String = fn(branch, ctx) {
+    let items = array::map(branch.outputs, fn(col) {
+        `\{render_expr(col.expr, ctx)} AS \{col.name}`
+    });
+    let select_sql = string::join(items, ", ");
+    let filter_part = match branch.filter {
+        Some(expr) => ` WHERE \{render_expr(expr, ctx)}`,
+        None => "",
+    };
+    let from = render_source(branch.source, ctx);
+    `SELECT \{select_sql} FROM \{from}\{filter_part}`
+};
+
+# Renders the ordered branches merged with UNION ALL.
+def render_union: Fn(DerivedSource, BuildCtx) -> String = fn(ds, ctx) {
+    let parts = array::map(ds.branches, fn(branch) { render_union_branch(branch, ctx) });
+    string::join(parts, " UNION ALL ")
+};
+
+# Renders the FROM item of a plan: either the physical primary source or the
+# derived UNION ALL relation `(<union>) AS <alias>`.
+def render_from_clause: Fn(Plan, BuildCtx) -> String = fn(plan, ctx) {
+    match plan.derived {
+        Some(ds) => {
+            let inner = render_union(ds, ctx);
+            `(\{inner}) AS \{ds.alias}`
+        },
+        None => {
+            render_source(plan.sources[0], ctx)
+        },
+    }
+};
+
+def render_unpartitioned: Fn(Plan, Bool, BuildCtx) -> String = fn(plan, distinct, ctx) {
+    let select_sql = string::join(array::map(plan.projection, fn(item) {
+        render_select_item(item, plan, ctx)
+    }), ", ");
+    let from_sql = render_from_clause(plan, ctx);
+    let joins = array::map(plan.joins, fn(join) { render_join(join, ctx) });
+    let join_text = if array::length(joins) > 0 {
+        ` \{string::join(joins, " ")}`
+    } else { "" };
+    let where_clause = render_where_clause(plan.filter, plan.exists, plan.scalar_comparisons, plan.ranked_key_comparisons, ctx);
+    let group_part = render_group_part(plan.grouping, ctx);
+    let having_part = render_having_clause(plan, plan.having, ctx);
+    let order_part = if array::length(plan.ordering) > 0 {
+        let items = array::map(plan.ordering, fn(ob) {
+            `\{render_order_key(ob.key, plan, ctx)} \{direction_sql(ob.direction)}`
+        });
+        ` ORDER BY \{string::join(items, ", ")}`
+    } else { "" };
+    # SQLite uses LIMIT -1 to express an offset without a row cap.
+    let limit_part = match plan.limit {
+        Some(value) => ` LIMIT \{render_expr(value, ctx)}`,
+        None => if plan.offset != None { " LIMIT -1" } else { "" },
+    };
+    let offset_part = match plan.offset {
+        Some(value) => ` OFFSET \{render_expr(value, ctx)}`,
+        None => "",
+    };
+    let select_prefix = if distinct { "SELECT DISTINCT " } else { "SELECT " };
+    `\{select_prefix}\{select_sql} FROM \{from_sql}\{join_text}\{where_clause}\{group_part}\{having_part}\{order_part}\{limit_part}\{offset_part}`
+};
+
+# If the expression is a projection expression item, return its stable outer
+# column reference (`__q_<index>`); otherwise `None`.
+def expr_projection_ref: Fn(Expr, Array(SelectItem)) -> Option(String) = fn(expr, projection) {
+    let found = array::find(array::enumerate(projection), fn(pair) {
+        match pair.1 {
+            SelectItem::Expr(item_expr) => item_expr == expr,
+            SelectItem::NamedExpr(named) => named.expr == expr,
+            SelectItem::Aggregate(_) => False,
+            SelectItem::Computed(_) => False,
+        }
+    });
+    match found {
+        Some(pair) => Some(`__q_\{pair.0}`),
+        None => None,
+    }
+};
+
+# Renders a projection item for the inner subquery: (inner_sql, outer_ref).
+# Expression items get a stable `__q_<index>` alias; aggregate and
+# computed aggregates keep their public alias.  Everything is referenced by
+# name from the outer query.
+def render_partition_item: Fn(SelectItem, Int, Plan, BuildCtx) -> (String, String) = fn(item, index, plan, ctx) {
+    match item {
+        SelectItem::Expr(expr) => {
+            let rendered = render_expr(expr, ctx);
+            (`\{rendered} AS __q_\{index}`, `__q_\{index}`)
+        },
+        SelectItem::NamedExpr(named) => {
+            let rendered = render_expr(named.expr, ctx);
+            (`\{rendered} AS \{named.alias}`, named.alias)
+        },
+        SelectItem::Aggregate(call) => {
+            let rendered = render_aggregate_call(call, ctx);
+            (`\{rendered} AS \{call.alias}`, call.alias)
+        },
+        SelectItem::Computed(ca) => {
+            let rendered = render_computed_aggregate(plan, ca, ctx);
+            (`\{rendered} AS \{ca.alias}`, ca.alias)
+        },
+    }
+};
+
+# Partitioned Top N lowering.  The inner subquery is the grouped query plus a
+# `row_number() over (partition by ...)`, aliased as `__q_rn`; the outer query
+# selects the projected columns by name, filters `__q_rn <= ?` (the take
+# binding) and orders deterministically by the partition keys then the partition
+# ordering.  Partition keys and ordering expression keys that are not already
+# projected are exposed as hidden `__q_pk_<i>` / `__q_ok_<j>` columns so the
+# outer ORDER BY is always stable.
+def render_partitioned: Fn(Plan, PartitionedTopN, BuildCtx) -> String = fn(plan, pt, ctx) {
+    let item_parts = array::map(array::enumerate(plan.projection), fn(pair) {
+        render_partition_item(pair.1, pair.0, plan, ctx)
+    });
+    let inner_select_parts = array::map(item_parts, fn(part) { part.0 });
+    let outer_refs = array::map(item_parts, fn(part) { part.1 });
+
+    let pk_entries = array::enumerate(pt.partition_by);
+    let ok_entries = array::enumerate(pt.order_by);
+
+    # Partition keys: outer ref and hidden column when not projected.
+    let pk_outer_parts = array::map(pk_entries, fn(pair) {
+        match expr_projection_ref(pair.1, plan.projection) {
+            Some(ref) => `\{ref} ASC`,
+            None => `__q_pk_\{pair.0} ASC`,
+        }
+    });
+    let pk_hidden_parts = array::filter(pk_entries, fn(pair) {
+        match expr_projection_ref(pair.1, plan.projection) {
+            Some(_) => False,
+            None => True,
+        }
+    });
+    let pk_hidden = array::map(pk_hidden_parts, fn(pair) {
+        `\{render_expr(pair.1, ctx)} AS __q_pk_\{pair.0}`
+    });
+
+    # Partition ordering keys: outer ref (projection alias, hidden `__q_ok_<j>`
+    # or projected aggregate alias) with direction.
+    let ok_outer_parts = array::map(ok_entries, fn(pair) {
+        let ref = match pair.1.key {
+            OrderKey::Expr(expr) => match expr_projection_ref(expr, plan.projection) {
+                Some(r) => r,
+                None => `__q_ok_\{pair.0}`,
+            },
+            OrderKey::AggregateRef(r) => r.alias,
+            # A direct ordering aggregate is rejected by partition structure
+            # validation before rendering.
+            OrderKey::Aggregate(_) => "__q_rejected",
+        };
+        `\{ref} \{direction_sql(pair.1.direction)}`
+    });
+    let ok_hidden_parts = array::filter(ok_entries, fn(pair) {
+        match pair.1.key {
+            OrderKey::Expr(expr) => match expr_projection_ref(expr, plan.projection) {
+                Some(_) => False,
+                None => True,
+            },
+            OrderKey::AggregateRef(_) => False,
+            OrderKey::Aggregate(_) => False,
+        }
+    });
+    let ok_hidden = array::map(ok_hidden_parts, fn(pair) {
+        match pair.1.key {
+            OrderKey::Expr(expr) => {
+                `\{render_expr(expr, ctx)} AS __q_ok_\{pair.0}`
+            },
+            OrderKey::AggregateRef(_) => "",
+            OrderKey::Aggregate(_) => "",
+        }
+    });
+
+    # Window clause: PARTITION BY the partition keys, ORDER BY the partition
+    # ordering (aggregate keys render the full aggregate expression).
+    let partition_parts = array::map(pt.partition_by, fn(expr) { render_expr(expr, ctx) });
+    let partition_sql = string::join(partition_parts, ", ");
+    let window_order_parts = array::map(pt.order_by, fn(ob) {
+        `\{render_order_key(ob.key, plan, ctx)} \{direction_sql(ob.direction)}`
+    });
+    let window_order_sql = string::join(window_order_parts, ", ");
+
+    # FROM / JOIN / WHERE / GROUP BY (identical to the plain path).
+    let from_clause = render_from_clause(plan, ctx);
+    let from_sql = from_clause;
+    let rendered_joins = array::map(plan.joins, fn(join) { render_join(join, ctx) });
+    let joins_text = string::join(rendered_joins, " ");
+    let join_text = if array::length(plan.joins) > 0 {
+        ` \{joins_text}`
+    } else {
+        ""
+    };
+    let where_clause = render_where_clause(plan.filter, plan.exists, plan.scalar_comparisons, plan.ranked_key_comparisons, ctx);
+    let group_part = render_group_part(plan.grouping, ctx);
+    let having_part = render_having_clause(plan, plan.having, ctx);
+
+    let hidden_sqls = array::concat([
+        pk_hidden,
+        ok_hidden,
+    ]);
+
+    let rn_column = `row_number() OVER (PARTITION BY \{partition_sql} ORDER BY \{window_order_sql}) AS __q_rn`;
+    let inner_columns = array::concat([inner_select_parts, hidden_sqls, [rn_column]]);
+    let inner_select_sql = string::join(inner_columns, ", ");
+    let inner_sql = `SELECT \{inner_select_sql} FROM \{from_sql}\{join_text}\{where_clause}\{group_part}\{having_part}`;
+
+    let outer_order_sql = string::join(array::concat([
+        pk_outer_parts,
+        ok_outer_parts,
+    ]), ", ");
+    let outer_select_sql = string::join(outer_refs, ", ");
+    let take = render_expr(pt.take, ctx);
+    `SELECT \{outer_select_sql} FROM (\{inner_sql}) AS __partitioned WHERE __q_rn <= \{take} ORDER BY \{outer_order_sql}`
+};
+
+def render_plan: Fn(Plan, BuildCtx) -> String = fn(plan, ctx) {
+    match plan.partition {
+        Some(pt) => render_partitioned(plan, pt, ctx),
+        None => render_unpartitioned(plan, False, ctx),
+    }
+};
+# Materialize the same validated AST as PostgreSQL, with SQLite syntax.
+def render_sqlite_plan: Fn(QueryPlan, BuildCtx) -> String = fn(query_plan, ctx) {
+    match validate_query_plan(query_plan) {
+        QueryPlan::Rows(plan) => render_plan(plan, ctx),
+        QueryPlan::DistinctRows(plan) => render_unpartitioned(plan, True, ctx),
+        QueryPlan::SetRows(set) => {
+            let left = render_plan(set.left, ctx);
+            let right = render_plan(set.right, ctx);
+            `\{left} \{set_op_sql(set.kind)} \{right}`
+        },
+        QueryPlan::SetCount(set) => {
+            let left = render_plan(set.left, ctx);
+            let right = render_plan(set.right, ctx);
+            `SELECT count(1) FROM (\{left} \{set_op_sql(set.kind)} \{right}) AS __q_set`
+        },
+        QueryPlan::GroupCount(plan) => {
+            let inner = render_plan(plan, ctx);
+            `SELECT count(1) FROM (\{inner}) AS __q_count`
+        },
+    }
+};
+
+
+def render_query_plan_with_context: Fn(QueryPlan, BuildCtx) -> Query = fn(query_plan, ctx) {
+    {sql: render_sqlite_plan(validate_contextual_pagination(query_plan, ctx), ctx), bindings: ctx.bindings}
+};
+
+
+pub use self::{ render_query_plan_with_context, render_sqlite_expr_with_context };

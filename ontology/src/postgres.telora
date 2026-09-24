@@ -3,8 +3,6 @@ use std::string as string;
 use crate::query as qb;
 
 type RenderCtx = struct {
-    next_binding: Int,
-    bindings: Array(qb::Val),
     builder_bindings: Array(qb::Val),
     reserved_aliases: Array(String),
     next_alias: Int,
@@ -12,15 +10,8 @@ type RenderCtx = struct {
 
 type Emitted = struct { sql: String, ctx: RenderCtx };
 
-pub def context: Fn(Int, Array(String)) -> RenderCtx = fn(start, reserved) {
-    if start <= 0 { fail!("PostgreSQL placeholder index must be positive", start) }
-    else { {next_binding: start, bindings: [], builder_bindings: [], reserved_aliases: reserved, next_alias: 0} }
-};
-
-def bind: Fn(RenderCtx, qb::Val) -> Emitted = fn(ctx, value) {
-    {sql: `$\{ctx.next_binding}`, ctx: {...ctx,
-        next_binding: ctx.next_binding + 1,
-        bindings: array::push(ctx.bindings, value)}}
+def context: Fn(Array(String), Array(qb::Val)) -> RenderCtx = fn(reserved, bindings) {
+    {builder_bindings: bindings, reserved_aliases: reserved, next_alias: 0}
 };
 
 pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
@@ -57,13 +48,12 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
 
 type Arguments = struct { sql: Array(String), ctx: RenderCtx };
 
-# The context owns all placeholder assignments, even in nested scalars.
+# The build context owns placeholder assignments; rendering only resolves handles.
 pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
     match expr {
         qb::Expr::Column(ref) => if qb::is_sql_identifier(ref.source) && qb::is_sql_identifier(ref.column) {
             {sql: `"\{ref.source}"."\{ref.column}"`, ctx}
         } else { fail!("invalid PostgreSQL column identifier", ref) },
-        qb::Expr::Bind(value) => bind(ctx, value),
         qb::Expr::AllocatedBind(binding) => if binding.index > 0
             && binding.index <= array::length(ctx.builder_bindings) {
             {sql: `$\{binding.index}`, ctx}
@@ -79,17 +69,10 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
     }
 };
 
-pub def render_expr: Fn(qb::Expr, Int) -> qb::Query = fn(expr, start) {
-    let emitted = emit_expr(expr, context(start, []));
-    {sql: emitted.sql, bindings: emitted.ctx.bindings}
-};
-
 pub def render_expr_with_context: Fn(qb::Expr, qb::BuildCtx) -> qb::Query = fn(expr, builder) {
-    let initial: RenderCtx = {...context(1, []), builder_bindings: builder.bindings};
+    let initial = context([], builder.bindings);
     let emitted = emit_expr(expr, initial);
-    if array::length(emitted.ctx.bindings) != 0 {
-        fail!("context-bound expression cannot mix legacy bindings", expr)
-    } else { {sql: emitted.sql, bindings: builder.bindings} }
+    {sql: emitted.sql, bindings: builder.bindings}
 };
 
 def quoted: Fn(String) -> String = fn(identifier) {
@@ -504,9 +487,6 @@ def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
     ])
 };
 
-def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
-    context(1, plan_aliases(plan))
-};
 
 type PartitionItem = struct {sql: String, value: String, alias: String, ctx: RenderCtx};
 type ExprBinding = struct {expr: qb::Expr, sql: String, alias: String};
@@ -713,36 +693,6 @@ def emit_set: Fn(qb::SetPlan, RenderCtx) -> Emitted = fn(set, ctx) {
 
 # The single PG AST boundary remains a candidate until the dialect contract
 # (notably set projection types) is proven by cross-dialect execution.
-pub def render_query_plan_candidate: Fn(qb::QueryPlan) -> qb::Query = fn(raw) {
-    match qb::validate_query_plan(raw) {
-        qb::QueryPlan::Rows(plan) => {
-            let rows = emit_rows(plan, False, plan_context(plan));
-            {sql: rows.sql, bindings: rows.ctx.bindings}
-        },
-        qb::QueryPlan::DistinctRows(plan) => {
-            let rows = emit_rows(plan, True, plan_context(plan));
-            {sql: rows.sql, bindings: rows.ctx.bindings}
-        },
-        qb::QueryPlan::GroupCount(plan) => {
-            let rows = emit_rows(plan, False, plan_context(plan));
-            let alias = internal_alias(rows.ctx);
-            {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
-                bindings: alias.1.bindings}
-        },
-        qb::QueryPlan::SetRows(set) => {
-            let reserved = array::concat([plan_aliases(set.left), plan_aliases(set.right)]);
-            let rows = emit_set(set, context(1, reserved));
-            {sql: rows.sql, bindings: rows.ctx.bindings}
-        },
-        qb::QueryPlan::SetCount(set) => {
-            let reserved = array::concat([plan_aliases(set.left), plan_aliases(set.right)]);
-            let rows = emit_set(set, context(1, reserved));
-            let alias = internal_alias(rows.ctx);
-            {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
-                bindings: alias.1.bindings}
-        },
-    }
-};
 
 pub def render_query_plan_with_context: Fn(qb::QueryPlan, qb::BuildCtx) -> qb::Query = fn(raw, builder) {
     let plan = qb::validate_query_plan(qb::validate_contextual_pagination(raw, builder));
@@ -753,8 +703,7 @@ pub def render_query_plan_with_context: Fn(qb::QueryPlan, qb::BuildCtx) -> qb::Q
         qb::QueryPlan::SetRows(set) => array::concat([plan_aliases(set.left), plan_aliases(set.right)]),
         qb::QueryPlan::SetCount(set) => array::concat([plan_aliases(set.left), plan_aliases(set.right)]),
     };
-    let ctx: RenderCtx = {...context(builder.next_binding, reserved),
-        bindings: builder.bindings, builder_bindings: builder.bindings};
+    let ctx = context(reserved, builder.bindings);
     let rendered = match plan {
         qb::QueryPlan::Rows(rows) => emit_rows(rows, False, ctx),
         qb::QueryPlan::DistinctRows(rows) => emit_rows(rows, True, ctx),
@@ -770,21 +719,5 @@ pub def render_query_plan_with_context: Fn(qb::QueryPlan, qb::BuildCtx) -> qb::Q
             {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}
         },
     };
-    if array::length(rendered.ctx.bindings) != array::length(builder.bindings) {
-        fail!("constructed query plan contains values not allocated by qb", plan)
-    } else { {sql: rendered.sql, bindings: builder.bindings} }
-};
-
-pub def render_rows_candidate: Fn(qb::Plan, Bool) -> qb::Query = fn(plan, distinct) {
-    if distinct { render_query_plan_candidate(qb::QueryPlan::DistinctRows(plan)) }
-    else { render_query_plan_candidate(qb::QueryPlan::Rows(plan)) }
-};
-
-pub def render_group_count_candidate: Fn(qb::Plan) -> qb::Query = fn(plan) {
-    render_query_plan_candidate(qb::QueryPlan::GroupCount(plan))
-};
-
-pub def render_set_candidate: Fn(qb::SetPlan, Bool) -> qb::Query = fn(set, count) {
-    if count { render_query_plan_candidate(qb::QueryPlan::SetCount(set)) }
-    else { render_query_plan_candidate(qb::QueryPlan::SetRows(set)) }
+    {sql: rendered.sql, bindings: builder.bindings}
 };
