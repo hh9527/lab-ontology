@@ -269,7 +269,6 @@ INNER JOIN 得到的 1..N 结果误称为 0..N。
 | `named_typed_relation_key(id, source, target, kind, pairs)` | 类型 | 带来源/目标类型见证的具名复合关系；准备时解析为闭合列等值条件 |
 | `relation(target, kind, from_field, to_field)` | 类型 | 到另一个实体的单列等值关系 |
 | `relation_key(target, kind, key)` | 类型 | 带结构化键的关系：`Eq(RelationPair)`/`And`/`Or` 列等值组合 |
-| `exists_route(via, target)` | 类型 | 显式声明有界两跳相关存在路径：base → `via`（唯一、grain-safe owner）→ `target`（可组合 fold） |
 | `dual_hub(participant, key_field, left_field, right_field)` | 类型（hub 上） | 声明 hub 的两个角色化端点字段均引用 `participant` 的 `key_field`；base 命中任一角色即关联该 hub（可组合 fold） |
 | `peer_hub(origin_participant, origin_key, origin_field, peer_participant, peer_key, peer_field)` | 类型（hub 上） | 声明同一 hub 行的 paired-endpoint 路线：两个角色字段分别引用两个 participant 的 key；同 participant 时允许端点交换（可组合 fold） |
 | `enum_value(value, label)` | enum variant | 封闭值域的稳定值和展示标签 |
@@ -765,9 +764,7 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
   正向，缺失时使用 target→base 反向边（反向存在性）推导相关性，不要求模型复制反向
   图边。反向边不参与普通 join 路径闭包；同一对实体声明双向边也不会令 `build_root`
   耗尽燃料（路径搜索按访问集去环，Parent→Child 双向 fixture 通过）。
-- 两跳（受控多跳）：当 base 与目标之间没有一跳关系时，lowering 使用作者在 base 上
-  显式声明的 `@edsl.exists_route(via, target)` 路线（见下文“两跳相关存在”）。路线在
-  prepare 时校验并存入 payload，热路径不做元数据扫描或 BFS；请求无需感知路线。
+- 多跳：使用 `graph` Intent 显式命名实体实例及每段关系；不根据终点类型猜测路径。
 - fan-out 关系允许（存在性不放大主体 grain）。`min_matches: None` 时是普通相关
   EXISTS；`min_matches: Some(n)`（正整数）时是相关聚合 EXISTS：内层按相关性分组并
   `HAVING count(关联 id) >= n`，仍保持主体 grain（Parent 计数 + `exists child`/
@@ -779,69 +776,23 @@ let plan: qb.Plan = edsl.lower_full(knowledge.payload, request, [exists], []);
   的内层筛选都原子失败。
 - 当 measure 的 `requires` 实体恰好是 exists 目标时，该必需实体由相关存在谓词满足，
   不再生成 fan-out join；`Plan.joins` 不放大 subject measure。
-- 未知实体、目标即 base、没有声明一跳关系或路线、内层引用非目标实体、非正整数
+- 未知实体、目标即 base、没有声明直接关系、内层引用非目标实体、非正整数
   `min_matches` 都原子失败。
 
-### 两跳相关存在（declared bounded route）
+### 多跳相关存在（具名图）
 
-KPI 事实或子部件往往不直接关联告警等稳定对象，而是经中间实体再关联（唯一 owner
-或 link 实体）。Ontology 不猜测任意可达路径：作者在 base 实体类型上显式声明路线：
+多跳路径由 Intent 中的实例和具名边指定；Model 为每条边证明实体角色与连接键。
+EXISTS 内部的 JOIN 不放大外层主体粒度，过滤值仍然参数化：
 
-```telora
-@edsl.entity_id("components")
-@edsl.entity_source("components", "m")
-@edsl.relation(Site.type, edsl.RelationKind.Safe, 1, 0)    # component.site_id -> site.id
-@edsl.exists_route(Site.type, Alarm.type)  # 显式：base -> Site -> Alarm
-type Component = struct {
-    @edsl.column("id")
-    @edsl.key(flag_true)
-    @edsl.measure("ComponentCount", qb.AggregateFunction.Count, no_types)
-    id: Int,
-    @edsl.column("site_id")
-    site_id: Int,
-};
+```json
+{"op":"graph","root":"component","nodes":[{"id":"component","entity":"components"}],
+ "edges":[],"select":[],"count":"component",
+ "exists":[{"anchor":"component","nodes":[{"id":"site","entity":"sites"},{"id":"alarm","entity":"alarms"}],
+ "edges":[{"relation":"component_site","from":"component","to":"site"},
+          {"relation":"site_alarms","from":"site","to":"alarm"}]}]}
 ```
 
-`exists_route(via, target)` 是 base 实体上的 type-level property，可多次标注（按声明
-顺序 fold 追加）。prepare 时对每条路线做确定性校验并保存到 `PreparedPayload.routes`：
-
-- 第一跳 base → `via` 必须存在且**唯一**：base 上恰好一条声明到 `via` 的 forward 关系。
-  关系缺失（反向-only 属于方向不匹配）、多条候选、同一 base 多条到达同一 target 的
-  路线（歧义路径）都原子拒绝。
-- 第二跳 `via` → `target` 使用已声明关系（任一方向，存在性语义允许 fan-out）；via 与
-  target 之间关系缺失或存在多条候选关系都原子拒绝。
-
-Lowering 依据第一跳的 kind 选择两种**封闭存在**形状，二者都只把整个 A→B→C 条件
-表达为谓词：
-
-- 第一跳 `Safe`（唯一 owner）：保持 owner-join 形状——base `INNER JOIN` via（不复制
-  base 行），再用 correlated EXISTS 关联 owner 与 target 内层：
-
-```text
-SELECT count(m.id) AS ComponentCount
-FROM components AS m
-INNER JOIN sites AS s ON m.site_id = s.id
-WHERE EXISTS (SELECT 1 FROM alarms AS al WHERE s.id = al.site_id [AND al.level = ?])
-```
-
-- 第一跳 `FanOut`（subject A 对 B 是 one-to-many）：改用 bounded **link** 形状——B
-  与 C 在**同一个 correlated EXISTS 内相互 INNER JOIN**，绝不放 B/C 进外层 FROM，
-  因此 one-to-many 首跳不会放大外层 A 的 grain：
-
-```text
-SELECT count(s.id) AS SubjectCount
-FROM link_subjects AS s
-WHERE EXISTS (SELECT 1 FROM link_owners AS b
-              INNER JOIN link_targets AS c ON b.id = c.owner_id
-              WHERE s.owner_id = b.id [AND c.level = ?])
-```
-
-- 永不为该 target 发射外层 fan-out join（`JOIN alarms`/`JOIN link_owners`），因此 base
-  计数不被放大；同一 subject 有多个匹配 B/C 时外层仍只计一次。
-- `Safe` owner-join 形状的 `min_matches`/内层 `any_of`/授权/profile 递归收窄与参数化
-  绑定规则与一跳完全一致；`FanOut` link 形状 v1 不支持 `min_matches` 分组（确定性
-  拒绝），内层 filter/any_of/授权/profile 收窄与绑定规则保持一致。
-- 一跳直接/反向直接行为完全保留：未声明路线时按原有一跳逻辑解析。
+关系 ID 必须由 Model 显式声明；不能用终点类型自动挑选路线。
 
 ### 双端 hub（dual-end hub union slice）
 
@@ -1067,7 +1018,6 @@ type PreparedPayload = struct {
     measures: Array(MeasureEntry),
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
-    routes: Array(RouteEntry),
     hub_routes: Array(HubRouteEntry),
     peer_routes: Array(PeerRouteEntry),
     paths: Array(Array(PathResult)),

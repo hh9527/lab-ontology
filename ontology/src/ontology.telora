@@ -296,21 +296,6 @@ type LocalizedCanonicalValue = struct { id: String, locale: String, label: Strin
 @prelude::property(PropertyTarget::Field)
 type LocalizedCanonicalValuesDef = struct { labels: Array(LocalizedCanonicalValue) };
 
-# Type-level: explicitly declared correlated-existence route for this base
-# entity. Each route names the unique, grain-safe owner entity (`via`) and the
-# target entity whose related rows are tested by the existence filter. A route
-# is the author's explicit declaration of a bounded two-hop path: base -> via
-# (a unique, grain-safe forward relation) then via -> target (the declared
-# relation in either direction). Routes are validated once at prepare time and
-# saved on the payload; the hot path never scans metadata or runs BFS.
-@prelude::property(PropertyTarget::Type)
-type ExistsRouteDef = struct { routes: Array(ExistsRouteSpec) };
-
-type ExistsRouteSpec = struct {
-    via: Type,
-    target: Type,
-};
-
 @prelude::property(PropertyTarget::Type)
 type NativePairDef = struct { pairs: Array(NativePairSpec) };
 type NativePairSpec = struct { id: String, first: String, second: String };
@@ -912,21 +897,6 @@ type RelationBrief = struct {
     shape: RelationShape,
 };
 
-# A prepared, validated correlated-existence route. `base` is the entity that
-# declares the route; `via` is its unique grain-safe owner entity; `target` is
-# the existence end entity. `via_edge` is the relation index of the forward
-# base -> via edge (kind Safe); `target_edge` is the relation index connecting
-# via to target; `target_reversed` is True when that edge is declared
-# target -> via and must be derived backwards for the existence correlation.
-type RouteEntry = struct {
-    base: Int,
-    via: Int,
-    target: Int,
-    via_edge: Int,
-    target_edge: Int,
-    target_reversed: Bool,
-};
-
 # A prepared, validated dual-endpoint hub route.  `hub` is the base-grain hub
 # entity whose rows carry two role columns (`left`/`right` field indexes) that
 # reference the participant entity (`participant`) through its stable key field
@@ -972,7 +942,6 @@ type PreparedPayload = struct {
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
     business_links: Array(BusinessLinkEntry),
-    routes: Array(RouteEntry),
     hub_routes: Array(HubRouteEntry),
     peer_routes: Array(PeerRouteEntry),
     native_pairs: Array(NativePairEntry),
@@ -1352,21 +1321,6 @@ def entity_scope: Fn(Array(EntityScopePredicate)) -> Fn(td::TypeDesc, Option(Ent
             None => predicates,
         };
         {predicates: all}
-    }
-};
-
-# Correlated-existence route declaration on the base entity type:
-# base -> `via` (unique grain-safe owner) -> `target` (existence end). Multiple
-# annotations fold by appending.
-def exists_route: Fn(Type, Type) -> Fn(td::TypeDesc, Option(ExistsRouteDef)) -> ExistsRouteDef = fn(via, target) {
-    fn(ctx, previous) {
-        let spec: ExistsRouteSpec = { via, target };
-        let all = match previous {
-            Some(p) => array::push(p.routes, spec),
-            None => [spec],
-        };
-        let result: ExistsRouteDef = { routes: all };
-        result
     }
 };
 
@@ -2759,117 +2713,6 @@ def build_ambiguous_paths: Fn(Int, Array(RelationEntry)) -> Array(Array(Bool)) =
 };
 
 # ---------------------------------------------------------------------------
-# Correlated-existence route preparation.
-#
-# A route is the author's explicit declaration of a bounded two-hop existence
-# path: base -> via (forward, grain-safe) and via -> target. Preparation
-# validates each declaration deterministically and stores the resolved route on
-# the payload; lowering never rescans metadata or runs BFS.
-# ---------------------------------------------------------------------------
-
-type RouteResult = enum {
-    Ok(RouteEntry),
-    Err(String),
-};
-
-def find_entity_index: Fn(Array(EntityEntry), Type) -> Option(Int) = fn(entities, ty) {
-    match array::find(entities, fn(e) { e.entity_type == ty }) {
-        Some(e) => Some(e.index),
-        None => None,
-    }
-};
-
-def resolve_route: Fn(Array(EntityEntry), Array(RelationEntry), Int, Type, Type) -> RouteResult = fn(entities, relations, base, via_type, target_type) {
-    let via_opt = find_entity_index(entities, via_type);
-    let target_opt = find_entity_index(entities, target_type);
-    match (via_opt, target_opt) {
-        (None, _) => RouteResult::Err("exists route via entity is not part of this knowledge"),
-        (_, None) => RouteResult::Err("exists route target entity is not part of this knowledge"),
-        (Some(via), Some(target)) =>
-            if via == base {
-                RouteResult::Err("exists route via entity must differ from the base entity")
-            } else if target == via {
-                RouteResult::Err("exists route target entity must differ from the via entity")
-            } else {
-                let via_edges = array::filter(array::enumerate(relations), fn(p) {
-                    p.1.from == base && p.1.to == via
-                });
-                if array::length(via_edges) == 0 {
-                    RouteResult::Err("exists route first hop requires a declared forward relation from the base entity to the via entity")
-                } else if array::length(via_edges) > 1 {
-                    RouteResult::Err("exists route first hop is ambiguous: the base declares multiple relations to the via entity")
-                } else {
-                    # A bounded two-hop existence may have a FanOut first hop:
-                    # the whole A -> B -> C condition is a correlated predicate
-                    # (B and C never enter the outer FROM), so a one-to-many
-                    # first hop does not amplify the subject A grain.  The
-                    # first hop must still be a single declared forward
-                    # relation from the base to the via entity.
-                    let first_via = get_index(via_edges, 0);
-                    let both = array::filter(array::enumerate(relations), fn(p) {
-                        (p.1.from == via && p.1.to == target) || (p.1.from == target && p.1.to == via)
-                    });
-                    if array::length(both) == 0 {
-                        RouteResult::Err("exists route has no declared relation between the via entity and the target entity")
-                    } else if array::length(both) > 1 {
-                        RouteResult::Err("exists route second hop is ambiguous: multiple relations connect the via entity and the target entity")
-                    } else {
-                        let second = get_index(both, 0);
-                        let entry: RouteEntry = {
-                            base,
-                            via,
-                            target,
-                            via_edge: first_via.0,
-                            target_edge: second.0,
-                            target_reversed: second.1.from == target,
-                        };
-                        let ok: RouteResult = RouteResult::Ok(entry);
-                        ok
-                    }
-                }
-            },
-    }
-};
-
-type RouteBuild = struct { routes: Array(RouteEntry), problems: Array(String) };
-
-# Pure, deterministic route collection: never fails, so tests can assert both
-# valid and invalid declarations. `build_root` fails on the first problem.
-def route_build: Fn(Array(EntityEntry), Array(RelationEntry)) -> RouteBuild = fn(entities, relations) {
-    let init: RouteBuild = { routes: [], problems: [] };
-    let collected = array::fold(entities, init, fn(acc, entity) {
-        let rd = property::get_type_prop(entity.entity_type, ExistsRouteDef.type);
-        let specs = match rd {
-            Some(d) => d.routes,
-            None => [],
-        };
-        array::fold(specs, acc, fn(inner_acc, spec) {
-            let resolved = resolve_route(entities, relations, entity.index, spec.via, spec.target);
-            match resolved {
-                RouteResult::Err(message) => do {
-                    let result: RouteBuild = { routes: inner_acc.routes, problems: array::push(inner_acc.problems, message) };
-                    result
-                },
-                RouteResult::Ok(entry) => do {
-                    let dup = array::find(inner_acc.routes, fn(r) { r.base == entry.base && r.target == entry.target });
-                    match dup {
-                        Some(_) => do {
-                            let result: RouteBuild = { routes: inner_acc.routes, problems: array::push(inner_acc.problems, "exists route is ambiguous: multiple declared routes reach the same target from the same base") };
-                            result
-                        },
-                        None => do {
-                            let result: RouteBuild = { routes: array::push(inner_acc.routes, entry), problems: inner_acc.problems };
-                            result
-                        },
-                    }
-                },
-            }
-        })
-    });
-    collected
-};
-
-# ---------------------------------------------------------------------------
 # Dual-endpoint hub preparation.
 #
 # A dual hub is declared on the hub entity with two role columns referencing a
@@ -2877,6 +2720,13 @@ def route_build: Fn(Array(EntityEntry), Array(RelationEntry)) -> RouteBuild = fn
 # uniqueness, then stores the resolved hub route on the payload.  Lowering reads
 # only the prepared route and never rescans metadata.
 # ---------------------------------------------------------------------------
+
+def find_entity_index: Fn(Array(EntityEntry), Type) -> Option(Int) = fn(entities, ty) {
+    match array::find(entities, fn(e) { e.entity_type == ty }) {
+        Some(e) => Some(e.index),
+        None => None,
+    }
+};
 
 type HubResult = enum { Ok(HubRouteEntry), Err(String) };
 
@@ -3177,12 +3027,6 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         fail!("duplicate named relation id", duplicate.id)
     } else { () };
     let business_links = collect_business_links(entities, relations);
-    let routes_build = route_build(entities, relations);
-    let routes = if array::length(routes_build.problems) > 0 {
-        fail!("invalid correlated-existence route declaration", get_index(routes_build.problems, 0))
-    } else {
-        routes_build.routes
-    };
     let hub_build_result = hub_build(entities);
     let hub_routes = if array::length(hub_build_result.problems) > 0 {
         fail!("invalid dual hub declaration", get_index(hub_build_result.problems, 0))
@@ -3204,7 +3048,6 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         dimensions,
         relations,
         business_links,
-        routes,
         hub_routes,
         peer_routes,
         native_pairs,
@@ -3271,8 +3114,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
 # ---------------------------------------------------------------------------
 
 # Prepare only the entity/relation graph of a candidate knowledge (no measures,
-# dimensions, routes, paths or profile processing). Used by tests to exercise
-# route preparation on local fixtures.
+# dimensions, paths or profile processing).
 def knowledge_graph: Fn(Array(Type)) -> (Array(EntityEntry), Array(RelationEntry)) = fn(entity_types) {
     let n = array::length(entity_types);
     let entities = array::map(int_range(n), fn(i) {
@@ -3283,9 +3125,8 @@ def knowledge_graph: Fn(Array(Type)) -> (Array(EntityEntry), Array(RelationEntry
 };
 
 # Pure feasibility probe: True when a correlated existence between the two
-# stable entity ids is lowerable through an explicitly declared route or through
-# a declared one-hop relation in either direction. False for an unknown base or
-# target, a self-target, or an entity with no declared relation or route.
+# stable entity ids is lowerable through a declared one-hop relation in either
+# direction or a dual-hub relation. Longer paths require an explicit graph Intent.
 def correlation_feasible: Fn(PreparedPayload, String, String) -> Bool = fn(payload, base_id, target_id) {
     match array::find(payload.entities, fn(e) { e.id == base_id }) {
         None => False,
@@ -3294,12 +3135,9 @@ def correlation_feasible: Fn(PreparedPayload, String, String) -> Bool = fn(paylo
             Some(t) => if base.index == t.index {
                 False
             } else {
-                match find_route(payload, base.index, t.index) {
+                match find_hub_route(payload, base.index, t.index) {
                     Some(_) => True,
-                    None => match find_hub_route(payload, base.index, t.index) {
-                        Some(_) => True,
-                        None => lookup_existence_relation_opt(payload, base.index, t.index) != None,
-                    },
+                    None => lookup_existence_relation_opt(payload, base.index, t.index) != None,
                 }
             },
         },
@@ -5113,7 +4951,7 @@ def entity_by_id: Fn(PreparedPayload, String) -> Int = fn(payload, id) {
 type RelationLookup = struct { index: Int, reversed: Bool };
 
 # Pure one-hop lookup: Some when base and target share a declared relation in
-# either direction, otherwise None (a declared two-hop route may still exist).
+# either direction, otherwise None. Longer paths require a named graph Intent.
 def lookup_existence_relation_opt: Fn(PreparedPayload, Int, Int) -> Option(RelationLookup) = fn(payload, base_entity, target) {
     let enumerated = array::enumerate(payload.relations);
     match array::find(enumerated, fn(pair) { pair.1.from == base_entity && pair.1.to == target }) {
@@ -5138,10 +4976,6 @@ def lookup_existence_relation_opt: Fn(PreparedPayload, Int, Int) -> Option(Relat
 
 # Pure declared-route lookup for a (base, target) pair. Prepare-time validation
 # guarantees at most one route per pair, so the lookup is unambiguous.
-def find_route: Fn(PreparedPayload, Int, Int) -> Option(RouteEntry) = fn(payload, base, target) {
-    array::find(payload.routes, fn(r) { r.base == base && r.target == target })
-};
-
 # Pure declared dual-hub lookup for a (hub base entity, participant target)
 # pair. Prepare-time validation guarantees at most one route per pair, so the
 # lookup is unambiguous.
@@ -5512,13 +5346,6 @@ def build_correlated_exists_with_context: Fn(qb::BuildCtx, PreparedPayload, Enti
         }
 };
 
-# A lowered correlated existence: the qb.Exists predicate plus the optional via
-# (owner) entity that must be added to the outer FROM through a grain-safe join.
-type ExistsResolution = struct {
-    exists: qb::Exists,
-    via: Option(Int),
-};
-
 # Inner body of a dual-hub union existence (hub base grain).  The hub's two role
 # columns (`route.left`/`route.right`) reference the participant entity's stable
 # key; the correlated union EXISTS keeps the hub base grain and each hub base
@@ -5548,81 +5375,27 @@ def build_hub_union_exists: Fn(qb::BuildCtx, PreparedPayload, HubRouteEntry, Exi
 
 # Lower one correlated existence request. Rows of the base entity that have at
 # least one (or, with `min_matches`, at least N) related row in the target
-# entity are kept. The request is resolved through an explicitly declared
-# bounded two-hop route (base -> via -> target), a declared dual-endpoint hub
-# union (the hub is the base grain and reaches the participant target through
-# either of its two role endpoints), or a declared one-hop relation in either
-# direction. Existence never amplifies the subject grain.
-def resolve_exists: Fn(qb::BuildCtx, PreparedPayload, Int, ExistsRequest) -> (qb::BuildCtx, ExistsResolution) = fn(ctx, payload, base_entity, spec) {
+# entity are kept. This legacy shape resolves a dual-endpoint hub union or a
+# declared one-hop relation; multi-hop paths use named graph existence.
+def resolve_exists: Fn(qb::BuildCtx, PreparedPayload, Int, ExistsRequest) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, base_entity, spec) {
     let target = entity_by_id(payload, spec.target);
     if target == base_entity {
         fail!("exists target must differ from the base entity", spec.target)
     } else {
-        let route_opt = find_route(payload, base_entity, target);
-        match route_opt {
-            Some(route) => do {
-                # Declared two-hop route.  A grain-safe (owner) first hop keeps
-                # the owner-join lowering: base INNER JOIN via, then a correlated
-                # EXISTS on the target.  A FanOut first hop uses the bounded link
-                # lowering instead: B (via) and C (target) both stay inside ONE
-                # correlated EXISTS joined to each other, so the one-to-many
-                # first hop never amplifies the subject A grain.
-                let base_entry = get_index(payload.entities, base_entity);
-                let via_entry = get_index(payload.entities, route.via);
-                let target_entry = get_index(payload.entities, target);
-                let via_rel = get_index(payload.relations, route.via_edge);
-                if via_rel.kind == RelationKind::Safe {
-                    let rel = get_index(payload.relations, route.target_edge);
-                    let pairs = exists_pairs(rel.key);
-                    let col_eqs = array::map(pairs, fn(pair) { exists_col_eq(via_entry, target_entry, pair, route.target_reversed) });
-                    let lowered = build_correlated_exists_with_context(ctx, payload, target_entry, col_eqs, spec, target);
-                    let result: ExistsResolution = { exists: lowered.1, via: Some(route.via) };
-                    (lowered.0, result)
-                } else {
-                    if spec.min_matches != None {
-                        fail!("two-hop link existence does not support minimum-match grouping in this shape", spec.target)
-                    } else {
-                        let hop_pairs = array::map(exists_pairs(via_rel.key), fn(pair) {
-                            exists_col_eq(base_entry, via_entry, pair, False)
-                        });
-                        let target_rel = get_index(payload.relations, route.target_edge);
-                        let link_pairs = array::map(exists_pairs(target_rel.key), fn(pair) {
-                            exists_col_eq(via_entry, target_entry, pair, route.target_reversed)
-                        });
-                            let inner = exists_inner_with_context(ctx, payload, spec, target);
-                            let via_source = entity_source_at_with_context(qb::independent_query_scope(inner.0), payload, via_entry, via_entry.alias);
-                            let target_source = entity_source_at_with_context(via_source.0, payload, target_entry, target_entry.alias);
-                            let exists = qb::exists_two_hop(
-                                via_source.1,
-                                hop_pairs,
-                                target_source.1,
-                                link_pairs,
-                                inner.1,
-                            );
-                            let result: ExistsResolution = { exists, via: None };
-                            (target_source.0, result)
-                    }
-                }
+        match find_hub_route(payload, base_entity, target) {
+            Some(hub_route) => do {
+                build_hub_union_exists(ctx, payload, hub_route, spec)
             },
-            None => match find_hub_route(payload, base_entity, target) {
-                Some(hub_route) => do {
-                    let lowered = build_hub_union_exists(ctx, payload, hub_route, spec);
-                    let result: ExistsResolution = { exists: lowered.1, via: None };
-                    (lowered.0, result)
+            None => match lookup_existence_relation_opt(payload, base_entity, target) {
+                Some(lookup) => do {
+                    let rel = get_index(payload.relations, lookup.index);
+                    let pairs = exists_pairs(rel.key);
+                    let base_entry = get_index(payload.entities, base_entity);
+                    let target_entry = get_index(payload.entities, target);
+                    let col_eqs = array::map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
+                    build_correlated_exists_with_context(ctx, payload, target_entry, col_eqs, spec, target)
                 },
-                None => match lookup_existence_relation_opt(payload, base_entity, target) {
-                    Some(lookup) => do {
-                        let rel = get_index(payload.relations, lookup.index);
-                        let pairs = exists_pairs(rel.key);
-                        let base_entry = get_index(payload.entities, base_entity);
-                        let target_entry = get_index(payload.entities, target);
-                        let col_eqs = array::map(pairs, fn(pair) { exists_col_eq(base_entry, target_entry, pair, lookup.reversed) });
-                        let lowered = build_correlated_exists_with_context(ctx, payload, target_entry, col_eqs, spec, target);
-                        let result: ExistsResolution = { exists: lowered.1, via: None };
-                        (lowered.0, result)
-                    },
-                    None => fail!("exists target has no declared relation, hub route or two-hop route from the base entity", spec.target),
-                },
+                None => fail!("exists target has no declared direct relation or hub route from the base entity; use a named graph for longer paths", spec.target),
             },
         }
     }
@@ -5813,7 +5586,7 @@ def lower_core: Fn(qb::BuildCtx, PreparedPayload, QueryRequest, Array(AnyOfReque
         let base_entry = get_index(payload.entities, base_entity);
         let source_plan = match base_entry.union {
             None => do {
-                let exists_initial: (qb::BuildCtx, Array(ExistsResolution)) = (partitioned.0, []);
+                let exists_initial: (qb::BuildCtx, Array(qb::Exists)) = (partitioned.0, []);
                 let exists_built = array::fold(exists_specs, exists_initial, fn(state, spec) {
                     let next = resolve_exists(state.0, payload, base_entity, spec);
                     (next.0, array::push(state.1, next.1))
@@ -5824,19 +5597,10 @@ def lower_core: Fn(qb::BuildCtx, PreparedPayload, QueryRequest, Array(AnyOfReque
                 });
                 let exists_resolutions = exists_built.1;
                 let absence_resolutions = absence_built.1;
-                let exists_plans = array::map(exists_resolutions, fn(r) { r.exists });
+                let exists_plans = exists_resolutions;
                 # Anti-existence: the same resolved correlated body rendered as
                 # `NOT EXISTS (...)`, keeping base rows with no matching related row.
-                let absence_plans = array::map(absence_resolutions, fn(r) { qb::exists_not(r.exists) });
-                # The via (owner) of a declared two-hop route becomes an ordinary
-                # grain-safe join target; the correlated EXISTS then references
-                # the joined owner alias, never the fan-out target edge.
-                let via_entities = array::flat_map(array::concat([exists_resolutions, absence_resolutions]), fn(r) {
-                    match r.via {
-                        Some(v) => [v],
-                        None => [],
-                    }
-                });
+                let absence_plans = array::map(absence_resolutions, qb::exists_not);
                 let exists_targets = array::map(exists_specs, fn(spec) { entity_by_id(payload, spec.target) });
                 # A measure-required entity that is also an existence target is
                 # satisfied by the correlated existence predicate instead of a
@@ -5848,7 +5612,7 @@ def lower_core: Fn(qb::BuildCtx, PreparedPayload, QueryRequest, Array(AnyOfReque
                 let dim_entities = array::map(dimensions, fn(d) { d.entry.entity });
                 let scope_entities = array::map(scope_resolutions, fn(f) { f.entity });
                 let filter_entities = array::map(filter_resolutions, fn(f) { f.entity });
-                let targets = array::concat([filtered_measure_targets, via_entities, dim_entities, scope_entities, filter_entities, any_entities, ordering_entities]);
+                let targets = array::concat([filtered_measure_targets, dim_entities, scope_entities, filter_entities, any_entities, ordering_entities]);
                 let base_source = entity_source_at_with_context(absence_built.0, payload, base_entry, base_entry.alias);
                 let joined = select_joins_with_context(base_source.0, payload, base_entity, targets);
                 let joins = joined.1;
@@ -9303,11 +9067,6 @@ pub use self::{
     RelationFieldPair,
     RelationKey,
     EnumValueDef,
-    ExistsRouteDef,
-    ExistsRouteSpec,
-    RouteEntry,
-    RouteResult,
-    RouteBuild,
     DualHubDef,
     DualHubDecl,
     HubRouteEntry,
@@ -9438,9 +9197,6 @@ pub use self::{
     localized_canonical_value,
     scope,
     entity_scope,
-    exists_route,
-    route_build,
-    resolve_route,
     dual_hub,
     hub_build,
     resolve_hub_decl,
