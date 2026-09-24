@@ -364,11 +364,13 @@ type RelationKind = enum { Safe, FanOut };
 type GraphNode = struct { id: String, entity: String };
 type GraphEdge = struct { relation: String, from: String, to: String };
 type GraphSelect = struct { node: String, dimension: String };
+type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), negated: Bool };
 type GraphRequest = struct {
     root: String,
     nodes: Array(GraphNode),
     edges: Array(GraphEdge),
     select: Array(GraphSelect),
+    exists: Array(GraphExist),
 };
 
 # Filter operations. Comparison ops map to the closed query scalars
@@ -4546,6 +4548,74 @@ def graph_instance: Fn(Array(GraphInstance), String) -> GraphInstance = fn(insta
     }
 };
 
+# EXISTS correlations require equality pairs, with the outer/hop source on the
+# left regardless of the declaration's physical from/to orientation.
+def graph_correlation_pairs: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Source, Bool, RelationKey) -> Array(qb::ColumnEq) = fn(payload, relation, outer, inner, forward, key) {
+    match key {
+        RelationKey::Eq(pair) => do {
+            let from_field = get_index(get_index(payload.entities, relation.from).fields, pair.from);
+            let to_field = get_index(get_index(payload.entities, relation.to).fields, pair.to);
+            if forward {
+                [qb::column_eq(qb::column_ref(outer, from_field.column), qb::column_ref(inner, to_field.column))]
+            } else {
+                [qb::column_eq(qb::column_ref(outer, to_field.column), qb::column_ref(inner, from_field.column))]
+            }
+        },
+        RelationKey::And(parts) => array::concat(array::map(parts, fn(part) {
+            graph_correlation_pairs(payload, relation, outer, inner, forward, part)
+        })),
+        RelationKey::Or(_) => fail!("unsupported graph existence key with alternative matches", relation.id),
+        RelationKey::FieldEq(_) => fail!("unresolved graph existence key", relation.id),
+    }
+};
+
+def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, instances, spec) {
+    let anchor = graph_instance(instances, spec.anchor);
+    let count = array::length(spec.edges);
+    if count == 0 || count != array::length(spec.nodes) {
+        fail!("graph existence needs one declared node per edge", spec.anchor)
+    } else if count > 2 {
+        fail!("unsupported graph existence depth in current QueryAst", count)
+    } else if array::any(spec.nodes, fn(node) {
+        node.id == "" || array::any(instances, fn(existing) { existing.id == node.id })
+            || array::length(array::filter(spec.nodes, fn(other) { other.id == node.id })) != 1
+    }) { fail!("graph existence node ids must be distinct from outer graph instances") }
+    else {
+        let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq))) = (ctx, [anchor], []);
+        let built = array::fold(spec.edges, initial, fn(state, edge) {
+            let forward = edge.from == get_index(state.1, array::length(state.1) - 1).id;
+            let next_id = if forward { edge.to } else { edge.from };
+            let previous_id = if forward { edge.from } else { edge.to };
+            let previous = get_index(state.1, array::length(state.1) - 1);
+            let next_node = match array::find(spec.nodes, fn(node) { node.id == next_id }) {
+                Some(node) => node,
+                None => fail!("graph existence edge references an unknown inner node", edge.relation, next_id),
+            };
+            if previous_id != previous.id || array::any(state.1, fn(item) { item.id == next_id }) {
+                fail!("graph existence edges must form an ordered path from the anchor", edge.relation)
+            } else {
+                let relation = relation_domain(payload, edge.relation);
+                let next_entity = entity_by_id(payload, next_node.entity);
+                let valid = if forward {
+                    relation.from == previous.entity && relation.to == next_entity
+                } else { relation.to == previous.entity && relation.from == next_entity };
+                if !valid { fail!("graph existence edge role or target does not match declared relation", edge.relation, next_node.entity) }
+                else {
+                    let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, next_entity), next_id);
+                    let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
+                    let instance: GraphInstance = {id: next_id, entity: next_entity, source: source.1};
+                    (source.0, array::push(state.1, instance), array::push(state.2, pairs))
+                }
+            }
+        });
+        let first = get_index(built.1, 1).source;
+        let first_pairs = get_index(built.2, 0);
+        let exists = if count == 1 { qb::exists(first, first_pairs, None) }
+        else { qb::exists_two_hop(first, first_pairs, get_index(built.1, 2).source, get_index(built.2, 1), None) };
+        (built.0, if spec.negated { qb::exists_not(exists) } else { exists })
+    }
+};
+
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
@@ -4607,13 +4677,17 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     qb::named_expr_item(qb::column(instance.source, field.column), `\{item.node}_\{item.dimension}`)
                 }
             });
+            let existential = array::fold(request.exists, (built.0, []), fn(state, spec) {
+                let result = graph_existence(state.0, payload, built.1, spec);
+                (result.0, array::push(state.1, result.1))
+            });
             let sources = array::map(built.1, fn(instance) { instance.source });
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: None,
-                exists: [], joins: built.2, grouping: [], having: [], ordering: [],
+                exists: existential.1, joins: built.2, grouping: [], having: [], ordering: [],
                 limit: None, offset: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
             };
-            (built.0, qb::validate(plan, payload.profile))
+            (existential.0, qb::validate(plan, payload.profile))
         }
     }
 };
@@ -8879,6 +8953,7 @@ pub use self::{
     GraphNode,
     GraphEdge,
     GraphSelect,
+    GraphExist,
     GraphRequest,
     FilterOp,
     FilterInputKind,
