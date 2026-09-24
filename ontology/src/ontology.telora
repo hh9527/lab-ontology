@@ -4759,33 +4759,44 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Graph
                 let tail = array::filter(array::enumerate(spec.edges), fn(indexed) { indexed.0 > 0 });
                 let built = array::fold(tail, (peer.0, instances, [join]), fn(state, indexed) {
                     let next_edge = indexed.1;
-                    if array::any(payload.business_links, fn(entry) { entry.id == next_edge.relation }) {
-                        fail!("unsupported second business link in one existence graph", next_edge.relation)
+                    let forward = array::any(state.1, fn(item) { item.id == next_edge.from });
+                    let backward = array::any(state.1, fn(item) { item.id == next_edge.to });
+                    if forward == backward {
+                        fail!("graph existence edge must introduce one node connected to the root", next_edge.relation)
                     } else {
-                        let forward = array::any(state.1, fn(item) { item.id == next_edge.from });
-                        let backward = array::any(state.1, fn(item) { item.id == next_edge.to });
-                        if forward == backward {
-                            fail!("graph existence edge must introduce one node connected to the root", next_edge.relation)
-                        } else {
-                            let previous = graph_instance(state.1, if forward { next_edge.from } else { next_edge.to });
-                            let new_id = if forward { next_edge.to } else { next_edge.from };
-                            let new_node = match array::find(spec.nodes, fn(item) { item.id == new_id }) {
-                                Some(item) => item,
-                                None => fail!("graph existence edge references an unknown inner node", next_edge.relation, new_id),
-                            };
-                            let relation = relation_domain(payload, next_edge.relation);
-                            let new_entity = entity_by_id(payload, new_node.entity);
-                            if (forward && (relation.from != previous.entity || relation.to != new_entity))
-                                || (!forward && (relation.to != previous.entity || relation.from != new_entity)) {
-                                fail!("graph existence edge role or target does not match declared relation", next_edge.relation, new_node.entity)
-                            } else {
-                                let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_id);
-                                let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
-                                let conditions = array::map(pairs, fn(pair) { qb::on_eq(pair.left, pair.right) });
-                                let next_join = qb::join_on(qb::JoinKind::Inner, source.1, qb::on_and(conditions));
-                                let instance: GraphInstance = {id: new_id, entity: new_entity, source: source.1};
-                                (source.0, array::push(state.1, instance), array::push(state.2, next_join))
-                            }
+                        let previous = graph_instance(state.1, if forward { next_edge.from } else { next_edge.to });
+                        let new_id = if forward { next_edge.to } else { next_edge.from };
+                        let new_node = match array::find(spec.nodes, fn(item) { item.id == new_id }) {
+                            Some(item) => item,
+                            None => fail!("graph existence edge references an unknown inner node", next_edge.relation, new_id),
+                        };
+                        let new_entity = entity_by_id(payload, new_node.entity);
+                        match array::find(payload.business_links, fn(entry) { entry.id == next_edge.relation }) {
+                            Some(next_link) => do {
+                                if previous.entity != next_link.participant || new_entity != next_link.participant {
+                                    fail!("graph business link endpoints must both be its declared participant", next_edge.relation)
+                                } else if !forward && next_link.direction == LinkDirection::Directed {
+                                    fail!("directed business link cannot be traversed from Z to A", next_edge.relation)
+                                } else {
+                                    let joined = graph_link_joins(state.0, payload, next_link, previous.source, new_id);
+                                    let instance: GraphInstance = {id: new_id, entity: new_entity, source: joined.1};
+                                    (joined.0, array::push(state.1, instance), array::concat([state.2, joined.2]))
+                                }
+                            },
+                            None => do {
+                                let relation = relation_domain(payload, next_edge.relation);
+                                if (forward && (relation.from != previous.entity || relation.to != new_entity))
+                                    || (!forward && (relation.to != previous.entity || relation.from != new_entity)) {
+                                    fail!("graph existence edge role or target does not match declared relation", next_edge.relation, new_node.entity)
+                                } else {
+                                    let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_id);
+                                    let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
+                                    let conditions = array::map(pairs, fn(pair) { qb::on_eq(pair.left, pair.right) });
+                                    let next_join = qb::join_on(qb::JoinKind::Inner, source.1, qb::on_and(conditions));
+                                    let instance: GraphInstance = {id: new_id, entity: new_entity, source: source.1};
+                                    (source.0, array::push(state.1, instance), array::push(state.2, next_join))
+                                }
+                            },
                         }
                     }
                 });

@@ -36,12 +36,10 @@ filtering an origin device and a peer device of the same type must use their
 distinct allocated aliases inside the appropriate outer/EXISTS scopes.
 An EXISTS can branch from its root or any previously connected instance, and
 can follow an undirected/directed business link first, then continue along
-ordinary named relations. It can also follow a business link after a physical
-edge, retaining the original root correlation and checking business direction.
-A second business link after a business-link first edge in the same EXISTS
-currently reports `unsupported`; physical-first paths can chain further
-declared business links. Unconnected edges and incorrect endpoint roles remain
-invalid.
+ordinary named relations or more declared business links. It can also follow a
+business link after a physical edge, retaining the original root correlation
+and checking business direction at every step. Unconnected edges and incorrect
+endpoint roles remain invalid.
 `tests/graph.telora`
 exercises these cases against QueryAst and both SQL materializers.
 
@@ -61,7 +59,6 @@ role, or missing proof.
 | Traverse the declared directed `upstream_device` relation from A to Z. | Traverse Z to A without an inverse declaration: direction violation. |
 
 An otherwise valid but unimplemented composition must report `unsupported`
-separately from invalid model semantics. The current Model only establishes
-the endpoint and tenant identity facts; symmetric/directed peer semantics,
-business-link-first paths with multiple business links and cross-branch or
+separately from invalid model semantics. The Model explicitly establishes
+endpoint identities and symmetric/directed peer semantics; cross-branch or
 multi-hop non-root grain-aware aggregates remain pending.
