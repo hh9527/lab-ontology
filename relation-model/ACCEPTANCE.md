@@ -1,8 +1,10 @@
 # Relation-first acceptance slice
 
-This model is a pressure fixture, not a complete network inventory. All IDs
-are tenant-scoped: a connection endpoint matches a device only when both the
-device ID and tenant ID agree. A/Z denote stored endpoint positions, not
+This model is a pressure fixture, not a complete network inventory. Tenant
+IDs identify the namespace; Site, Device, Connection, and Route IDs are
+tenant-scoped and declare `(id, tenant_id)` as their identity grain. A
+connection endpoint matches a device only when both the device ID and tenant
+ID agree. A/Z denote stored endpoint positions, not
 business direction. `connected_device` explicitly declares undirected business
 connectivity over the two endpoint relations, while `upstream_device` declares
 a directed A-to-Z relation on a separate route dataset. No peer semantics are
@@ -82,6 +84,7 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 | From device `d`, follow `device_site` to site `s`, then `site_tenant` to tenant `t`; test existence without changing the grain of `d`. | Follow `device_site` to a tenant instance: invalid target type at that edge. |
 | From device `d`, test existence of a connection via the reverse of `connection_a` and project/count devices at the explicit `d` grain. | Join all matching connections and count rows as devices: grain amplification, require an explicit count subject. |
 | A connection endpoint and its Device share `tenant_id` as well as device ID. | Join only on device ID while omitting tenant ID: incomplete declared identity key. |
+| Declare Device identity as the composite `(id, tenant_id)` grain and join both fields. | Declare an ID-only `Safe` endpoint relation to Device: Model preparation rejects its incomplete target identity. |
 | Join a child to a composite-grain Reading using both reading ID and tenant ID. | Declare the same relation `Safe` using only reading ID: incomplete target identity; mark both fields `@key` instead of declaring a composite grain: ambiguous representative key. |
 | Check existence through `connection_endpoint`, matching A or Z with complete tenant identity, and continue along another named edge. | Connect the same edge to Site instead of Device: invalid relation endpoint role. |
 | Traverse the declared symmetric `connected_device` relation from either endpoint. | Infer symmetry solely from A/Z endpoint declarations: missing business link proof. |
