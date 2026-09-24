@@ -221,6 +221,11 @@ type UnionSourceDef = struct {
 @prelude::property(PropertyTarget::Type)
 type RelationDef = struct { relations: Array(RelationDecl) };
 
+type LinkDirection = enum { Undirected, Directed };
+type BusinessLinkDecl = struct { id: String, a_relation: String, z_relation: String, direction: LinkDirection };
+@prelude::property(PropertyTarget::Type)
+type BusinessLinkDef = struct { links: Array(BusinessLinkDecl) };
+
 # A single column-equality key between two entities: `from`/`to` are canonical
 # field indexes of the declaring (from) entity and the target (to) entity.
 type RelationPair = struct { from: Int, to: Int };
@@ -877,6 +882,15 @@ type RelationEntry = struct {
     key: RelationKey,
 };
 
+type BusinessLinkEntry = struct {
+    id: String,
+    hub: Int,
+    participant: Int,
+    a_relation: String,
+    z_relation: String,
+    direction: LinkDirection,
+};
+
 type RelationShape = enum {
     Equality,
     All(Array(RelationShape)),
@@ -954,6 +968,7 @@ type PreparedPayload = struct {
     measures: Array(MeasureEntry),
     dimensions: Array(DimensionEntry),
     relations: Array(RelationEntry),
+    business_links: Array(BusinessLinkEntry),
     routes: Array(RouteEntry),
     hub_routes: Array(HubRouteEntry),
     peer_routes: Array(PeerRouteEntry),
@@ -1266,6 +1281,18 @@ def named_typed_relation_key: for(Src, Dest) Fn(String, TypeOf(Src), TypeOf(Dest
                 None => [entry],
             };
             {relations}
+        }
+    }
+};
+
+def business_link: Fn(String, String, String, LinkDirection) -> Fn(td::TypeDesc, Option(BusinessLinkDef)) -> BusinessLinkDef = fn(id, a_relation, z_relation, direction) {
+    fn(ctx, previous) {
+        if id == "" || a_relation == "" || z_relation == "" || a_relation == z_relation {
+            fail!("business link requires a name and two distinct endpoint relations", id, a_relation, z_relation)
+        } else {
+            let entry: BusinessLinkDecl = {id, a_relation, z_relation, direction};
+            let links = match previous { Some(p) => array::push(p.links, entry), None => [entry] };
+            {links}
         }
     }
 };
@@ -2458,6 +2485,60 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
     })
 };
 
+def business_link_pairs: Fn(RelationKey, String) -> Array(RelationPair) = fn(key, id) {
+    match key {
+        RelationKey::Eq(pair) => [pair],
+        RelationKey::And(parts) => array::concat(array::map(parts, fn(part) { business_link_pairs(part, id) })),
+        _ => fail!("business link endpoints require conjunctions of identity equalities", id),
+    }
+};
+
+def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Array(BusinessLinkEntry) = fn(entities, relations) {
+    let links = array::flat_map(entities, fn(hub) {
+        let declarations = match property::get_type_prop(hub.entity_type, BusinessLinkDef.type) {
+            Some(definition) => definition.links,
+            None => [],
+        };
+        array::map(declarations, fn(declaration) {
+            let a = match array::find(relations, fn(r) { r.id == declaration.a_relation && r.from == hub.index }) {
+                Some(r) => r,
+                None => fail!("business link A endpoint relation is not declared on its hub", declaration.id, declaration.a_relation),
+            };
+            let z = match array::find(relations, fn(r) { r.id == declaration.z_relation && r.from == hub.index }) {
+                Some(r) => r,
+                None => fail!("business link Z endpoint relation is not declared on its hub", declaration.id, declaration.z_relation),
+            };
+            if a.to != z.to || a.kind != RelationKind::Safe || z.kind != RelationKind::Safe {
+                fail!("business link endpoints must identify the same unique participant entity", declaration.id)
+            } else {
+                let a_pairs = business_link_pairs(a.key, declaration.id);
+                let z_pairs = business_link_pairs(z.key, declaration.id);
+                let same_identity = array::length(a_pairs) == array::length(z_pairs)
+                    && array::all(a_pairs, fn(pair) {
+                        array::length(array::filter(z_pairs, fn(other) { other.to == pair.to })) == 1
+                    });
+                let distinct_endpoints = array::any(a_pairs, fn(pair) {
+                    array::any(z_pairs, fn(other) { other.to == pair.to && other.from != pair.from })
+                });
+                if !same_identity || !distinct_endpoints {
+                    fail!("business link endpoints must carry the same complete identity through distinct roles", declaration.id)
+                } else {
+                    let result: BusinessLinkEntry = {
+                        id: declaration.id, hub: hub.index, participant: a.to,
+                        a_relation: a.id, z_relation: z.id, direction: declaration.direction,
+                    };
+                    result
+                }
+            }
+        })
+    });
+    if let Some(duplicate) = array::find(links, fn(entry) {
+        array::length(array::filter(links, fn(other) { other.id == entry.id })) != 1
+            || array::any(relations, fn(r) { r.id == entry.id })
+    }) { fail!("duplicate or conflicting business link id", duplicate.id) }
+    else { links }
+};
+
 # ---------------------------------------------------------------------------
 # BFS path precomputation (prepare-time only).
 #
@@ -3065,6 +3146,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     }) {
         fail!("duplicate named relation id", duplicate.id)
     } else { () };
+    let business_links = collect_business_links(entities, relations);
     let routes_build = route_build(entities, relations);
     let routes = if array::length(routes_build.problems) > 0 {
         fail!("invalid correlated-existence route declaration", get_index(routes_build.problems, 0))
@@ -3091,6 +3173,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         measures,
         dimensions,
         relations,
+        business_links,
         routes,
         hub_routes,
         peer_routes,
@@ -4533,6 +4616,26 @@ def graph_key_condition: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Sour
     }
 };
 
+def graph_link_joins: Fn(qb::BuildCtx, PreparedPayload, BusinessLinkEntry, qb::Source, String) -> (qb::BuildCtx, qb::Source, Array(qb::Join)) = fn(ctx, payload, link, origin, target_hint) {
+    let a = relation_domain(payload, link.a_relation);
+    let z = relation_domain(payload, link.z_relation);
+    let hub_entry = get_index(payload.entities, link.hub);
+    let peer_entry = get_index(payload.entities, link.participant);
+    let hub = entity_source_at_with_context(ctx, payload, hub_entry, `\{link.id}_link`);
+    let peer = entity_source_at_with_context(hub.0, payload, peer_entry, target_hint);
+    let origin_a = graph_key_condition(payload, a, hub.1, origin, a.key);
+    let origin_z = graph_key_condition(payload, z, hub.1, origin, z.key);
+    let peer_a = graph_key_condition(payload, a, hub.1, peer.1, a.key);
+    let peer_z = graph_key_condition(payload, z, hub.1, peer.1, z.key);
+    let symmetric = link.direction == LinkDirection::Undirected;
+    let hub_condition = if symmetric { qb::on_or([origin_a, origin_z]) } else { origin_a };
+    let peer_condition = if symmetric {
+        qb::on_or([qb::on_and([origin_a, peer_z]), qb::on_and([origin_z, peer_a])])
+    } else { peer_z };
+    (peer.0, peer.1, [qb::join_on(qb::JoinKind::Inner, hub.1, hub_condition),
+        qb::join_on(qb::JoinKind::Inner, peer.1, peer_condition)])
+};
+
 type GraphInstance = struct { id: String, entity: Int, source: qb::Source };
 
 def graph_node: Fn(GraphRequest, String) -> GraphNode = fn(request, id) {
@@ -4570,6 +4673,43 @@ def graph_correlation_pairs: Fn(PreparedPayload, RelationEntry, qb::Source, qb::
     }
 };
 
+def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, anchor, spec, link) {
+    if array::length(spec.edges) != 1 || array::length(spec.nodes) != 1 {
+        fail!("unsupported business link in a multi-edge existence path", link.id)
+    } else {
+        let edge = get_index(spec.edges, 0);
+        let from_anchor = edge.from == anchor.id;
+        let next_id = if from_anchor { edge.to } else { edge.from };
+        if !from_anchor && (edge.to != anchor.id || link.direction == LinkDirection::Directed) {
+            fail!("directed business link cannot be traversed from Z to A", link.id)
+        } else {
+            let node = get_index(spec.nodes, 0);
+            if node.id != next_id || anchor.entity != link.participant || entity_by_id(payload, node.entity) != link.participant {
+                fail!("graph business link endpoints must both be its declared participant", link.id)
+            } else {
+                let hub_entry = get_index(payload.entities, link.hub);
+                let peer_entry = get_index(payload.entities, link.participant);
+                let hub = entity_source_at_with_context(ctx, payload, hub_entry, `\{link.id}_link`);
+                let peer = entity_source_at_with_context(hub.0, payload, peer_entry, next_id);
+                let a = relation_domain(payload, link.a_relation);
+                let z = relation_domain(payload, link.z_relation);
+                let origin_a = graph_correlation_pairs(payload, a, anchor.source, hub.1, False, a.key);
+                let origin_z = graph_correlation_pairs(payload, z, anchor.source, hub.1, False, z.key);
+                let symmetric = link.direction == LinkDirection::Undirected;
+                let correlation = if symmetric { [origin_a, origin_z] } else { [origin_a] };
+                let peer_a = graph_key_condition(payload, a, hub.1, peer.1, a.key);
+                let peer_z = graph_key_condition(payload, z, hub.1, peer.1, z.key);
+                let branch_a = qb::on_and(array::concat([array::map(origin_a, fn(p) { qb::on_eq(p.left, p.right) }), [peer_z]]));
+                let branch_z = qb::on_and(array::concat([array::map(origin_z, fn(p) { qb::on_eq(p.left, p.right) }), [peer_a]]));
+                let condition = if symmetric { qb::on_or([branch_a, branch_z]) } else { peer_z };
+                let join = qb::join_on(qb::JoinKind::Inner, peer.1, condition);
+                let exists = qb::exists_path_alternatives(hub.1, correlation, [join]);
+                (peer.0, if spec.negated { qb::exists_not(exists) } else { exists })
+            }
+        }
+    }
+};
+
 def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, instances, spec) {
     let anchor = graph_instance(instances, spec.anchor);
     let count = array::length(spec.edges);
@@ -4580,6 +4720,11 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
             || array::length(array::filter(spec.nodes, fn(other) { other.id == node.id })) != 1
     }) { fail!("graph existence node ids must be distinct from outer graph instances") }
     else {
+        match array::find(payload.business_links, fn(link) {
+            array::any(spec.edges, fn(edge) { edge.relation == link.id })
+        }) {
+            Some(link) => graph_link_existence(ctx, payload, anchor, spec, link),
+            None => do {
         let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq))) = (ctx, [anchor], []);
         let built = array::fold(spec.edges, initial, fn(state, edge) {
             let forward = edge.from == get_index(state.1, array::length(state.1) - 1).id;
@@ -4621,6 +4766,8 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
         let path = array::flat_map(joins, fn(item) { match item { Some(join) => [join], None => [] } });
         let exists = qb::exists_path(first, first_pairs, path);
         (built.0, if spec.negated { qb::exists_not(exists) } else { exists })
+            },
+        }
     }
 };
 
@@ -4644,9 +4791,32 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let to_node = graph_node(request, edge.to);
             if edge.from == edge.to { fail!("graph edge must connect distinct instances", edge.relation) }
             else {
-                let relation = relation_domain(payload, edge.relation);
                 let from_entity = entity_by_id(payload, from_node.entity);
                 let to_entity = entity_by_id(payload, to_node.entity);
+                match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
+                    Some(link) => do {
+                        if from_entity != link.participant || to_entity != link.participant {
+                            fail!("graph business link endpoints must both be its declared participant", edge.relation)
+                        } else if array::any(state.1, fn(item) { item.id == edge.from })
+                            && !array::any(state.1, fn(item) { item.id == edge.to }) {
+                            let origin = graph_instance(state.1, edge.from);
+                            let joined = graph_link_joins(state.0, payload, link, origin.source, edge.to);
+                            let instance: GraphInstance = {id: edge.to, entity: to_entity, source: joined.1};
+                            (joined.0, array::push(state.1, instance), array::concat([state.2, joined.2]))
+                        } else if link.direction == LinkDirection::Undirected
+                            && array::any(state.1, fn(item) { item.id == edge.to })
+                            && !array::any(state.1, fn(item) { item.id == edge.from }) {
+                            let origin = graph_instance(state.1, edge.to);
+                            let joined = graph_link_joins(state.0, payload, link, origin.source, edge.from);
+                            let instance: GraphInstance = {id: edge.from, entity: from_entity, source: joined.1};
+                            (joined.0, array::push(state.1, instance), array::concat([state.2, joined.2]))
+                        } else if link.direction == LinkDirection::Directed
+                            && array::any(state.1, fn(item) { item.id == edge.to }) {
+                            fail!("directed business link cannot be traversed from Z to A", edge.relation)
+                        } else { fail!("graph business link must introduce one connected participant", edge.relation) }
+                    },
+                    None => do {
+                let relation = relation_domain(payload, edge.relation);
                 if relation.from != from_entity || relation.to != to_entity {
                     fail!("graph edge role or target does not match declared relation", edge.relation, from_node.entity, to_node.entity)
                 } else if array::any(state.1, fn(item) { item.id == edge.from })
@@ -4666,6 +4836,8 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     let join = qb::join_on(qb::JoinKind::Inner, target.1, condition);
                     let instance: GraphInstance = {id: new_node.id, entity: new_entity, source: target.1};
                     (target.0, array::push(state.1, instance), array::push(state.2, join))
+                }
+                    },
                 }
             }
         });
@@ -4691,8 +4863,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     if subject_id != request.root || array::length(request.select) != 0 {
                         fail!("graph count subject must be the root and cannot combine with row projections", subject_id)
                     } else if !array::fold(request.edges, ([request.root], True), fn(state, edge) {
-                        let relation = relation_domain(payload, edge.relation);
-                        (array::push(state.0, edge.to), state.1 && relation.kind == RelationKind::Safe
+                        let safe = match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
+                            Some(_) => False,
+                            None => relation_domain(payload, edge.relation).kind == RelationKind::Safe,
+                        };
+                        (array::push(state.0, edge.to), state.1 && safe
                             && array::any(state.0, fn(id) { id == edge.from }))
                     }).1 {
                         fail!("graph count requires grain-safe forward joins; use existence for fan-out edges", subject_id)
@@ -4707,7 +4882,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 let result = graph_existence(state.0, payload, built.1, spec);
                 (result.0, array::push(state.1, result.1))
             });
-            let sources = array::map(built.1, fn(instance) { instance.source });
+            let sources = array::concat([[root.1], array::map(built.2, fn(join) { join.source })]);
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: None,
                 exists: existential.1, joins: built.2, grouping: [], having: [], ordering: [],
@@ -8976,6 +9151,10 @@ pub use self::{
     HubRouteEntry,
     HubBuild,
     RelationKind,
+    LinkDirection,
+    BusinessLinkDef,
+    BusinessLinkDecl,
+    BusinessLinkEntry,
     GraphNode,
     GraphEdge,
     GraphSelect,
@@ -9089,6 +9268,7 @@ pub use self::{
     model_field,
     typed_relation_pair,
     named_typed_relation_key,
+    business_link,
     enum_value,
     canonical_values,
     canonical_alias,

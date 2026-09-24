@@ -1,14 +1,159 @@
-use crate::model::{ payload };
+use crate::model::{ payload, Tenant, Site, Device, Connection, Route };
 use ontology::intent::{ query_intent_ast_factory };
+use ontology::ontology as edsl;
 use ontology::query as qb;
 use ontology::sqlite as sqlite;
 use ontology::postgres as postgres;
 use std::json as json;
 use std::string as string;
 use std::test as test;
+use std::array as array;
 use std::value::{ Value };
 
 def lower: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload, "resolver");
+
+@edsl::entity_id("foreign_link")
+@edsl::entity_source("foreign_links", "foreign_link")
+@edsl::business_link("foreign_peer", "connection_a", "connection_z", edsl::LinkDirection::Undirected)
+type ForeignLink = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+};
+
+@edsl::entity_id("same_endpoint_link")
+@edsl::entity_source("same_endpoint_links", "same_endpoint_link")
+@edsl::business_link("same_endpoint_peer", "same_endpoint_a", "same_endpoint_z", edsl::LinkDirection::Undirected)
+@edsl::named_typed_relation_key("same_endpoint_a", SameEndpointLink.type, Device.type, edsl::RelationKind::Safe, [
+    edsl::typed_relation_pair(edsl::model_field(SameEndpointLink.type, String.type, "device_id"), edsl::model_field(Device.type, String.type, "id")),
+    edsl::typed_relation_pair(edsl::model_field(SameEndpointLink.type, String.type, "tenant_id"), edsl::model_field(Device.type, String.type, "tenant_id")),
+])
+@edsl::named_typed_relation_key("same_endpoint_z", SameEndpointLink.type, Device.type, edsl::RelationKind::Safe, [
+    edsl::typed_relation_pair(edsl::model_field(SameEndpointLink.type, String.type, "device_id"), edsl::model_field(Device.type, String.type, "id")),
+    edsl::typed_relation_pair(edsl::model_field(SameEndpointLink.type, String.type, "tenant_id"), edsl::model_field(Device.type, String.type, "tenant_id")),
+])
+type SameEndpointLink = struct {
+    @edsl::column("device_id")
+    device_id: String,
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+};
+
+pub def rejects_foreign_hub_endpoint: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("invalid", [Tenant.type, Site.type, Device.type, Connection.type, Route.type, ForeignLink.type],
+        payload.profile, fn(subject) { subject == "resolver" })
+}, "business link A endpoint relation is not declared on its hub");
+
+pub def rejects_same_endpoint_twice: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("invalid", [Tenant.type, Site.type, Device.type, Connection.type, Route.type, SameEndpointLink.type],
+        payload.profile, fn(subject) { subject == "resolver" })
+}, "business link endpoints must carry the same complete identity through distinct roles");
+
+pub def declared_business_links: test::Test = test::should_ok(fn() {
+    let symmetric = array::find(payload.business_links, fn(link) { link.id == "connected_device" });
+    let directed = array::find(payload.business_links, fn(link) { link.id == "upstream_device" });
+    match (symmetric, directed) {
+        (Some(a), Some(b)) => if a.direction == edsl::LinkDirection::Undirected
+            && b.direction == edsl::LinkDirection::Directed
+            && a.participant == b.participant { True }
+            else { fail!("business direction was not preserved in prepared Model") },
+        _ => fail!("missing prepared business link"),
+    }
+});
+
+pub def undirected_business_link: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"a",
+        "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"connected_device","from":"a","to":"z"}],
+        "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, " OR ")
+        && string::contains(sq.sql, "a_device_id") && string::contains(sq.sql, "z_device_id")
+        && string::contains(sq.sql, "tenant_id") && string::contains(pg.sql, " OR ") {
+        True
+    } else { fail!("bidirectional link did not bind both complete endpoint identities", sq.sql, pg.sql) }
+});
+
+pub def undirected_business_link_from_z: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"z",
+        "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"connected_device","from":"a","to":"z"}],
+        "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!());
+    let sql = sqlite::build_query(ast).sql;
+    if string::contains(sql, " OR ") && string::contains(sql, "connected_device_link") {
+        True
+    } else { fail!("undirected link should be traversable from either device", sql) }
+});
+
+pub def directed_business_link: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"a",
+        "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"upstream_device","from":"a","to":"z"}],
+        "select":[{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!());
+    let sql = sqlite::build_query(ast).sql;
+    if string::contains(sql, "a_device_id") && string::contains(sql, "z_device_id")
+        && !string::contains(sql, " OR ") {
+        True
+    } else { fail!("directed link must retain A-to-Z orientation", sql) }
+});
+
+pub def directed_business_link_rejects_reverse: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"z",
+        "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"upstream_device","from":"a","to":"z"}],
+        "select":[{"node":"a","dimension":"device_id"}]
+    }"#).unwrap!())
+}, "directed business link cannot be traversed from Z to A");
+
+pub def count_devices_with_business_peer: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"d", "nodes":[{"id":"d","entity":"device"}],
+        "edges":[], "select":[], "count":"d",
+        "exists":[{"anchor":"d","nodes":[{"id":"peer","entity":"device"}],
+            "edges":[{"relation":"connected_device","from":"d","to":"peer"}]}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "count(d.id)")
+        && string::contains(sq.sql, "EXISTS (SELECT 1 FROM connections")
+        && string::contains(sq.sql, " OR ") && string::contains(sq.sql, "tenant_id")
+        && string::contains(pg.sql, "EXISTS (SELECT 1 FROM \"connections\"") {
+        True
+    } else { fail!("business peer existence must preserve device grain and both identities", sq.sql, pg.sql) }
+});
+
+pub def directed_business_peer_exists: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"d", "nodes":[{"id":"d","entity":"device"}],
+        "edges":[], "select":[], "count":"d",
+        "exists":[{"anchor":"d","nodes":[{"id":"peer","entity":"device"}],
+            "edges":[{"relation":"upstream_device","from":"d","to":"peer"}]}]
+    }"#).unwrap!());
+    let sql = sqlite::build_query(ast).sql;
+    if string::contains(sql, "routes AS upstream_device_link") && !string::contains(sql, " OR ") {
+        True
+    } else { fail!("directed peer existence changed orientation", sql) }
+});
+
+pub def directed_business_peer_exists_rejects_reverse: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"z", "nodes":[{"id":"z","entity":"device"}],
+        "edges":[], "select":[], "count":"z",
+        "exists":[{"anchor":"z","nodes":[{"id":"a","entity":"device"}],
+            "edges":[{"relation":"upstream_device","from":"a","to":"z"}]}]
+    }"#).unwrap!())
+}, "directed business link cannot be traversed from Z to A");
 
 pub def role_distinct_join: test::Test = test::should_ok(fn() {
     let ast = lower(json::parse(r#"{
