@@ -3,6 +3,32 @@ use std::test as test;
 use crate::query as qb;
 use crate::postgres as pg;
 
+pub def reserved_source_aliases_materialize_in_both_dialects: test::Test = test::should_ok(fn() {
+    let existing = qb::reserve_source_aliases(qb::build_context(), ["role_0", "role_0_2", "base"]);
+    let role = qb::source_with_hint(existing, "members", "role_0");
+    let bound = qb::bind(role.0, qb::Val::Int(3));
+    let plan: qb::Plan = {
+        revision: "reserved-alias", sources: [qb::source("base", "teams")],
+        joins: [qb::join(qb::JoinKind::Inner, role.1,
+            qb::column_ref("base", "id"), qb::source_column_ref(role.1, "team_id"))],
+        projection: [qb::expr_item(qb::source_column(role.1, "id"))],
+        filter: Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::source_column(role.1, "id"), bound.1])),
+        grouping: [], having: [], ordering: [], limit: None, offset: None,
+        exists: [], derived: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    let ast = qb::QueryPlan::Rows(plan);
+    let sqlite = qb::render_query_plan_with_context(ast, bound.0);
+    let postgres = pg::render_query_plan_with_context(ast, bound.0);
+    if role.1.alias == "role_0_3"
+        && string::contains(sqlite.sql, "members AS role_0_3 ON base.id = role_0_3.team_id")
+        && string::contains(sqlite.sql, "role_0_3.id = ?1")
+        && string::contains(postgres.sql, "\"members\" AS \"role_0_3\" ON \"base\".\"id\" = \"role_0_3\".\"team_id\"")
+        && string::contains(postgres.sql, "\"role_0_3\".\"id\" = $1")
+        && sqlite.bindings == [qb::Val::Int(3)] && postgres.bindings == sqlite.bindings { True }
+    else { fail!("reserved source aliases must survive both dialect materializers", sqlite, postgres) }
+});
+
 pub def source_hint_allocates_stable_join_aliases: test::Test = test::should_ok(fn() {
     let first = qb::source_with_hint(qb::build_context(), "table1", "t");
     let second = qb::source_with_hint(first.0, "table2", "t");
@@ -149,37 +175,6 @@ pub def constructed_partition_rejects_out_of_range_handle: test::Test = test::sh
     };
     pg::render_query_plan_with_context(qb::QueryPlan::Rows(plan), bad.0)
 }, "constructed pagination binding must contain an integer within its allowed range");
-
-pub def nested_json_bind_order: test::Test = test::should_ok(fn() {
-    let path = qb::json_path([qb::JsonPathSegment::Key("a.b"), qb::JsonPathSegment::FromEnd(1)]);
-    let predicate = qb::scalar(qb::ScalarFunction::Eq, [
-        qb::json_extract(qb::column("MixedAlias", "PayloadJSON"), path, qb::JsonScalarKind::Int),
-        qb::bind_int(20),
-    ]);
-    let query = pg::render_expr(predicate, 4);
-    if query.sql == `(json_extract_path_text("MixedAlias"."PayloadJSON"::json, VARIADIC ARRAY[$4::text, $5::text]))::bigint = $6`
-        && query.bindings == [qb::Val::String("a.b"), qb::Val::String("-1"), qb::Val::Int(20)] {
-        True
-    } else { fail!("PostgreSQL JSON expression must number path and filter bindings in SQL order", query) }
-});
-
-pub def root_path_has_no_binding: test::Test = test::should_ok(fn() {
-    let query = pg::render_expr(qb::json_type(qb::bind_string("42"), qb::json_path([])), 1);
-    if query.bindings == [qb::Val::String("42")]
-        && string::contains(query.sql, "VARIADIC ARRAY[]::text[]")
-        && string::contains(query.sql, "json_typeof(") {
-        True
-    } else { fail!("root path must not add phantom placeholders", query) }
-});
-
-pub def repeated_operand_uses_one_binding: test::Test = test::should_ok(fn() {
-    let query = pg::render_expr(qb::json_valid(qb::bind_string("{\"x\":1}")), 1);
-    if query.bindings == [qb::Val::String("{\"x\":1}")]
-        && string::contains(query.sql, "$1 IS NULL")
-        && string::contains(query.sql, "pg_input_is_valid($1::text, 'json')") {
-        True
-    } else { fail!("a repeated PG placeholder must not duplicate the binding", query) }
-});
 
 pub def ascii_only_case_fold: test::Test = test::should_ok(fn() {
     let query = pg::render_expr(qb::lower(qb::bind_string("ABCÉ")), 2);

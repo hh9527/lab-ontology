@@ -49,8 +49,7 @@ type ColumnRef = struct {
 # normalizer (`lower(value)`), which in the default SQLite build folds ASCII
 # A-Z only, so `lower(a) = lower(b)` is the closed way to do case-insensitive
 # comparison; `Length` (`length(value)`) is the character count of a text
-# value; `JsonExtract`/`JsonType`/`JsonValid` are the closed SQLite JSON1
-# v1 vocabulary (the JSON path is a structural value, never SQL text).
+# value.
 # The remaining variants are operator-style scalar predicates/logic rendered
 # with SQLite operator syntax.  The AST is closed: no raw SQL fragment, no
 # arbitrary function name/operator and no identifier can escape through this
@@ -63,11 +62,6 @@ type ScalarFunction = enum {
     Sub,
     Lower,
     Length,
-    JsonExtractText,
-    JsonExtractInt,
-    JsonExtractNumber,
-    JsonType,
-    JsonValid,
     UtcDaysAgo,
     Eq,
     Ne,
@@ -80,13 +74,13 @@ type ScalarFunction = enum {
     Not,
 };
 
-# Arity and JSON path shape belong to the call itself; source visibility and
+# Arity belongs to the call itself; source visibility and
 # profile capabilities remain contextual Plan checks.
 @check(fn(call) {
-    if json_call_valid(call.function, call.args) {
+    if scalar_call_valid(call.function, call.args) {
         Ok(())
     } else {
-        Err(blame!("invalid scalar call arity or JSON path argument", call.args))
+        Err(blame!("invalid scalar call arity", call.args))
     }
 })
 type ScalarCall = struct {
@@ -94,32 +88,10 @@ type ScalarCall = struct {
     args: Array(Expr),
 };
 
-type JsonScalarKind = enum { Text, Int, Number };
-
-type JsonPathSegment = enum {
-    Key(String),
-    Index(Int),
-    FromEnd(Int),
-};
-
-@check(fn(path) {
-    if array::all(path.segments, fn(segment) {
-        match segment {
-            JsonPathSegment::Key(key) => string::length(key) > 0
-                && !(string::contains(key, "\"") && (string::contains(key, ".")
-                    || string::contains(key, "[") || string::contains(key, "]"))),
-            JsonPathSegment::Index(index) => index >= 0,
-            JsonPathSegment::FromEnd(index) => index > 0,
-        }
-    }) { Ok(()) } else { Err(blame!("JSON path contains an unrepresentable key or index", path.segments)) }
-})
-type JsonPath = struct { segments: Array(JsonPathSegment) };
-
 type Expr = enum {
     Column(ColumnRef),
     Bind(Val),
     AllocatedBind(AllocatedBinding),
-    JsonPath(JsonPath),
     Scalar(ScalarCall),
 };
 
@@ -213,17 +185,17 @@ type BuildCtx = struct { source_aliases: Array(String), projection_aliases: Arra
 
 def build_context: Fn() -> BuildCtx = fn() { {source_aliases: [], projection_aliases: [], bindings: [], next_binding: 1} };
 
-def bind: Fn(BuildCtx, Val) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
+def bind: Fn(BuildCtx, Val) -> (BuildCtx, Expr) = fn(ctx, value) {
     ({...ctx, bindings: array::push(ctx.bindings, value), next_binding: ctx.next_binding + 1},
         Expr::AllocatedBind({index: ctx.next_binding}))
 };
 
-def page_bound: Fn(BuildCtx, Int) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
+def page_bound: Fn(BuildCtx, Int) -> (BuildCtx, Expr) = fn(ctx, value) {
     if value < 0 { fail!("pagination value must be non-negative", value) }
     else { bind(ctx, Val::Int(value)) }
 };
 
-def take_bound: Fn(BuildCtx, Int) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
+def take_bound: Fn(BuildCtx, Int) -> (BuildCtx, Expr) = fn(ctx, value) {
     if value <= 0 || value > max_partition_take {
         fail!("partition take must be a positive integer within the cap", value)
     } else { bind(ctx, Val::Int(value)) }
@@ -236,7 +208,7 @@ def available_source_alias: Fn(Array(String), String, Int) -> String = fn(used, 
     } else { candidate }
 };
 
-def source_with_hint: Fn(BuildCtx, String, String) -> Tuple([BuildCtx, Source]) = fn(ctx, table, hint) {
+def source_with_hint: Fn(BuildCtx, String, String) -> (BuildCtx, Source) = fn(ctx, table, hint) {
     if !is_sql_identifier(table) || !is_sql_identifier(hint) {
         fail!("invalid source table or alias hint", (table, hint))
     } else {
@@ -244,6 +216,14 @@ def source_with_hint: Fn(BuildCtx, String, String) -> Tuple([BuildCtx, Source]) 
         let next: BuildCtx = {...ctx, source_aliases: array::push(ctx.source_aliases, alias)};
         (next, {alias, table, scope: None})
     }
+};
+
+pub def reserve_source_aliases: Fn(BuildCtx, Array(String)) -> BuildCtx = fn(ctx, aliases) {
+    array::fold(aliases, ctx, fn(state, alias) {
+        if !is_sql_identifier(alias) { fail!("invalid source alias", alias) }
+        else if array::any(state.source_aliases, fn(used) { used == alias }) { state }
+        else { {...state, source_aliases: array::push(state.source_aliases, alias)} }
+    })
 };
 
 def source_column_ref: Fn(Source, String) -> ColumnRef = fn(source_item, column_name) {
@@ -256,7 +236,7 @@ def source_column: Fn(Source, String) -> Expr = fn(source_item, column_name) {
     Expr::Column(source_column_ref(source_item, column_name))
 };
 
-def project_column: Fn(BuildCtx, Source, String, String) -> Tuple([BuildCtx, SelectItem]) = fn(ctx, source_item, column_name, hint) {
+def project_column: Fn(BuildCtx, Source, String, String) -> (BuildCtx, SelectItem) = fn(ctx, source_item, column_name, hint) {
     if !is_sql_identifier(hint) { fail!("invalid projected column alias hint", hint) }
     else {
         let alias = available_source_alias(ctx.projection_aliases, hint, 1);
@@ -645,7 +625,6 @@ def expr_operators: Fn(Expr) -> Array(Operator) = fn(expr) {
         Expr::Column(_) => [Operator::Column],
         Expr::Bind(_) => [Operator::Bind],
         Expr::AllocatedBind(_) => [Operator::Bind],
-        Expr::JsonPath(_) => [Operator::Bind],
         Expr::Scalar(call) => {
             let empty: Array(Operator) = [];
             let child = array::fold(call.args, empty, fn(acc, arg) {
@@ -971,11 +950,6 @@ def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args
         ScalarFunction::Sub => len == 2,
         ScalarFunction::Lower => len == 1,
         ScalarFunction::Length => len == 1,
-        ScalarFunction::JsonExtractText => len == 2,
-        ScalarFunction::JsonExtractInt => len == 2,
-        ScalarFunction::JsonExtractNumber => len == 2,
-        ScalarFunction::JsonType => len == 2,
-        ScalarFunction::JsonValid => len == 1,
         ScalarFunction::UtcDaysAgo => len == 2,
         ScalarFunction::Eq => len == 2,
         ScalarFunction::Ne => len == 2,
@@ -991,18 +965,6 @@ def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args
 
 def known_alias: Fn(Array(String), String) -> Bool = fn(aliases, alias) {
     array::any(aliases, fn(candidate) { candidate == alias })
-};
-
-# A JSON path is an AST value, not a dialect-specific string binding.
-def json_path_ok: Fn(Expr) -> Bool = fn(expr) {
-    match expr {
-        Expr::JsonPath(_) => True,
-        _ => False,
-    }
-};
-
-def has_json_path: Fn(Array(Expr)) -> Bool = fn(args) {
-    array::any(args, fn(arg) { match arg { Expr::JsonPath(_) => True, _ => False } })
 };
 
 def utc_days_args_ok: Fn(Array(Expr)) -> Bool = fn(args) {
@@ -1021,18 +983,11 @@ def utc_days_args_ok: Fn(Array(Expr)) -> Bool = fn(args) {
     }
 };
 
-# Arity plus the JSON path-argument constraint for the JSON1 scalar vocabulary.
-def json_call_valid: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args) {
-    let arity_ok = scalar_arity_ok(function, args);
-    match function {
-        ScalarFunction::JsonExtractText => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
-        ScalarFunction::JsonExtractInt => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
-        ScalarFunction::JsonExtractNumber => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
-        ScalarFunction::JsonType => arity_ok && !json_path_ok(args[0]) && json_path_ok(args[1]),
-        ScalarFunction::JsonValid => arity_ok && !has_json_path(args),
-        ScalarFunction::UtcDaysAgo => arity_ok && !has_json_path(args) && utc_days_args_ok(args),
-        _ => arity_ok && !has_json_path(args),
-    }
+def scalar_call_valid: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args) {
+    scalar_arity_ok(function, args) && (match function {
+        ScalarFunction::UtcDaysAgo => utc_days_args_ok(args),
+        _ => True,
+    })
 };
 
 def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
@@ -1040,10 +995,7 @@ def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
         Expr::Column(ref) => is_sql_identifier(ref.column) && known_alias(aliases, ref.source),
         Expr::Bind(_) => True,
         Expr::AllocatedBind(binding) => binding.index > 0,
-        Expr::JsonPath(_) => False,
-        Expr::Scalar(call) => {
-            array::all(call.args, fn(arg) { json_path_ok(arg) || expr_valid(arg, aliases) })
-        },
+        Expr::Scalar(call) => array::all(call.args, fn(arg) { expr_valid(arg, aliases) }),
     }
 };
 
@@ -1128,7 +1080,7 @@ def join_condition_valid: Fn(Join, Array(String)) -> Bool = fn(join, aliases) {
 };
 
 def joins_conditions_valid: Fn(Array(Join), Array(String)) -> Bool = fn(joins, initial_aliases) {
-    let state: Tuple([Array(String), Bool]) = array::fold(joins, (initial_aliases, True), fn(acc, join) {
+    let state: (Array(String), Bool) = array::fold(joins, (initial_aliases, True), fn(acc, join) {
         let visible = array::push(acc.0, join.source.alias);
         (visible, acc.1 && join_condition_valid(join, visible))
     });
@@ -1599,7 +1551,6 @@ def expr_derived_cols_ok: Fn(Expr, String, Array(String)) -> Bool = fn(expr, ali
         },
         Expr::Bind(_) => True,
         Expr::AllocatedBind(_) => True,
-        Expr::JsonPath(_) => True,
         Expr::Scalar(call) => array::all(call.args, fn(arg) { expr_derived_cols_ok(arg, alias, names) }),
     }
 };
@@ -1983,10 +1934,6 @@ def expr_subqueries: Fn(Expr) -> Array(ScalarSubquery) = fn(expr) {
             empty
         },
         Expr::AllocatedBind(_) => [],
-        Expr::JsonPath(_) => {
-            let empty: Array(ScalarSubquery) = [];
-            empty
-        },
     }
 };
 
@@ -2328,7 +2275,6 @@ def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed)
         Expr::Column(_) => True,
         Expr::Bind(_) => True,
         Expr::AllocatedBind(_) => True,
-        Expr::JsonPath(_) => True,
         Expr::Scalar(call) => {
             let self_ok = array::any(allowed, fn(candidate) { candidate == call.function });
             self_ok && array::all(call.args, fn(arg) { expr_scalars_ok(arg, allowed) })
@@ -2615,11 +2561,6 @@ def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
         ScalarFunction::Sub => "-",
         ScalarFunction::Lower => "lower",
         ScalarFunction::Length => "length",
-        ScalarFunction::JsonExtractText => "json_extract",
-        ScalarFunction::JsonExtractInt => "json_extract",
-        ScalarFunction::JsonExtractNumber => "json_extract",
-        ScalarFunction::JsonType => "json_type",
-        ScalarFunction::JsonValid => "json_valid",
         ScalarFunction::UtcDaysAgo => "strftime",
         ScalarFunction::Eq => "=",
         ScalarFunction::Ne => "!=",
@@ -2666,11 +2607,6 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
         ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
         ScalarFunction::Lower => `lower(\{parts[0]})`,
         ScalarFunction::Length => `length(\{parts[0]})`,
-        ScalarFunction::JsonExtractText => `json_extract(\{parts[0]}, \{parts[1]})`,
-        ScalarFunction::JsonExtractInt => `json_extract(\{parts[0]}, \{parts[1]})`,
-        ScalarFunction::JsonExtractNumber => `json_extract(\{parts[0]}, \{parts[1]})`,
-        ScalarFunction::JsonType => `json_type(\{parts[0]}, \{parts[1]})`,
-        ScalarFunction::JsonValid => `json_valid(\{parts[0]})`,
         ScalarFunction::UtcDaysAgo => `strftime('%Y-%m-%dT%H:%M:%SZ', \{parts[0]}, printf('-%d days', \{parts[1]}))`,
         ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         ScalarFunction::Ne => `\{parts[0]} != \{parts[1]}`,
@@ -2686,20 +2622,7 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
 
 # Renders an expression to (sql_fragment, bindings).  Dynamic values always
 # become `?` placeholders and are collected into bindings in placeholder order.
-def sqlite_json_path: Fn(JsonPath) -> String = fn(path) {
-    let parts = array::map(path.segments, fn(segment) {
-        match segment {
-            JsonPathSegment::Key(key) => if string::contains(key, ".") || string::contains(key, "[") || string::contains(key, "]") {
-                `."\{key}"`
-            } else { `.\{key}` },
-            JsonPathSegment::Index(index) => `[\{index}]`,
-            JsonPathSegment::FromEnd(index) => `[#-\{index}]`,
-        }
-    });
-    `$\{string::join(parts, "")}`
-};
-
-def render_expr: Fn(Expr, BuildCtx) -> Tuple([String, Array(Val)]) = fn(expr, ctx) {
+def render_expr: Fn(Expr, BuildCtx) -> (String, Array(Val)) = fn(expr, ctx) {
     match expr {
         Expr::Column(ref) => if is_sql_identifier(ref.source) && is_sql_identifier(ref.column) {
             let empty: Array(Val) = [];
@@ -2709,7 +2632,6 @@ def render_expr: Fn(Expr, BuildCtx) -> Tuple([String, Array(Val)]) = fn(expr, ct
         Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(ctx.bindings) {
             (`?\{binding.index}`, [])
         } else { fail!("binding handle is not registered in builder context", binding) },
-        Expr::JsonPath(path) => ("?", [Val::String(sqlite_json_path(path))]),
         Expr::Scalar(call) => {
             let rendered_args = array::map(call.args, fn(arg) { render_expr(arg, ctx) });
             let sql_parts = array::map(rendered_args, fn(pair) { pair.0 });
@@ -2730,7 +2652,7 @@ def render_sqlite_expr_with_context: Fn(Expr, BuildCtx) -> Query = fn(expr, ctx)
 # Renders a scalar-subquery payload to `(<sql>)` plus its bindings.  Bindings
 # follow placeholder order inside the subquery text: the aggregate argument,
 # aggregate-local filter, then the row filter (joins carry no bindings).
-def render_scalar_subquery: Fn(ScalarSubquery, BuildCtx) -> Tuple([String, Array(Val)]) = fn(sq, ctx) {
+def render_scalar_subquery: Fn(ScalarSubquery, BuildCtx) -> (String, Array(Val)) = fn(sq, ctx) {
     let rendered = render_expr(sq.arg, ctx);
     let distinct_sql = if sq.distinct { "DISTINCT " } else { "" };
     let agg_filter_part = match sq.agg_filter {
@@ -2768,7 +2690,7 @@ def render_scalar_subquery: Fn(ScalarSubquery, BuildCtx) -> Tuple([String, Array
     (sql, binds)
 };
 
-def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> Tuple([String, Array(Val)]) = fn(call, ctx) {
+def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> (String, Array(Val)) = fn(call, ctx) {
     let rendered = render_expr(call.arg, ctx);
     let distinct_sql = if call.distinct { "DISTINCT " } else { "" };
     let filter_part = match call.filter {
@@ -2788,7 +2710,7 @@ def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> Tuple([String, Array(V
 # Renders the full expression of a measure alias (aggregate or computed) by
 # re-expanding its declaration.  A computed aggregate may reference another
 # computed aggregate; acyclicity is enforced by structural validation.
-def render_computed_aggregate: Fn(Plan, ComputedAggregate, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, ca, ctx) {
+def render_computed_aggregate: Fn(Plan, ComputedAggregate, BuildCtx) -> (String, Array(Val)) = fn(plan, ca, ctx) {
     let left = render_measure_ref(plan, ca.left, ctx);
     let right = render_measure_ref(plan, ca.right, ctx);
     let op = match ca.op {
@@ -2798,7 +2720,7 @@ def render_computed_aggregate: Fn(Plan, ComputedAggregate, BuildCtx) -> Tuple([S
     (`(\{left.0} \{op} \{right.0})`, array::concat([left.1, right.1]))
 };
 
-def render_measure_ref: Fn(Plan, String, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, alias, ctx) {
+def render_measure_ref: Fn(Plan, String, BuildCtx) -> (String, Array(Val)) = fn(plan, alias, ctx) {
     match find_item_by_alias(plan, alias) {
         Some(SelectItem::Aggregate(call)) => render_aggregate_call(call, ctx),
         Some(SelectItem::Computed(ca)) => render_computed_aggregate(plan, ca, ctx),
@@ -2806,7 +2728,7 @@ def render_measure_ref: Fn(Plan, String, BuildCtx) -> Tuple([String, Array(Val)]
     }
 };
 
-def render_select_item: Fn(SelectItem, Plan, BuildCtx) -> Tuple([String, Array(Val)]) = fn(item, plan, ctx) {
+def render_select_item: Fn(SelectItem, Plan, BuildCtx) -> (String, Array(Val)) = fn(item, plan, ctx) {
     match item {
         SelectItem::Expr(expr) => render_expr(expr, ctx),
         SelectItem::NamedExpr(named) => do {
@@ -2829,7 +2751,7 @@ def render_select_item: Fn(SelectItem, Plan, BuildCtx) -> Tuple([String, Array(V
 # Renders an ON-condition tree to SQL text.  A single `ScalarFunction.Eq` atom renders
 # without parentheses so simple equality joins keep the documented shape;
 # `ScalarFunction.And`/`ScalarFunction.Or` render parenthesized so nested precedence is deterministic.
-def render_join_condition: Fn(JoinCondition, BuildCtx) -> Tuple([String, Array(Val)]) = fn(condition, ctx) {
+def render_join_condition: Fn(JoinCondition, BuildCtx) -> (String, Array(Val)) = fn(condition, ctx) {
     match condition {
         JoinCondition::Eq(eq) => (`\{eq.left.source}.\{eq.left.column} = \{eq.right.source}.\{eq.right.column}`, []),
         JoinCondition::Predicate(expr) => render_expr(expr, ctx),
@@ -2846,7 +2768,7 @@ def render_join_condition: Fn(JoinCondition, BuildCtx) -> Tuple([String, Array(V
     }
 };
 
-def render_source: Fn(Source, BuildCtx) -> Tuple([String, Array(Val)]) = fn(source_item, ctx) {
+def render_source: Fn(Source, BuildCtx) -> (String, Array(Val)) = fn(source_item, ctx) {
     match source_item.scope {
         None => {
             let empty: Array(Val) = [];
@@ -2859,13 +2781,13 @@ def render_source: Fn(Source, BuildCtx) -> Tuple([String, Array(Val)]) = fn(sour
     }
 };
 
-def render_join: Fn(Join, BuildCtx) -> Tuple([String, Array(Val)]) = fn(join, ctx) {
+def render_join: Fn(Join, BuildCtx) -> (String, Array(Val)) = fn(join, ctx) {
     let source_part = render_source(join.source, ctx);
     let condition = render_join_condition(join.condition, ctx);
     (`\{join_kind_sql(join.kind)} \{source_part.0} ON \{condition.0}`, array::concat([source_part.1, condition.1]))
 };
 
-def render_group_part: Fn(Array(Expr), BuildCtx) -> Tuple([String, Array(Val)]) = fn(grouping, ctx) {
+def render_group_part: Fn(Array(Expr), BuildCtx) -> (String, Array(Val)) = fn(grouping, ctx) {
     if array::length(grouping) > 0 {
         let rendered_group = array::map(grouping, fn(expr) { render_expr(expr, ctx) });
         let group_sql = string::join(array::map(rendered_group, fn(pair) { pair.0 }), ", ");
@@ -2880,7 +2802,7 @@ def render_group_part: Fn(Array(Expr), BuildCtx) -> Tuple([String, Array(Val)]) 
 # Renders the HAVING clause of a correlated EXISTS aggregate body.  Only
 # direct `HavingMeasure.Call` aggregate measures are allowed there (validated up front), so
 # no outer Plan is needed.
-def render_exists_having_clause: Fn(Array(Having), BuildCtx) -> Tuple([String, Array(Val)]) = fn(having_list, ctx) {
+def render_exists_having_clause: Fn(Array(Having), BuildCtx) -> (String, Array(Val)) = fn(having_list, ctx) {
     let parts = array::map(having_list, fn(h) {
         match h.measure {
             HavingMeasure::Call(call) => {
@@ -2919,7 +2841,7 @@ def render_eq_sql: Fn(ColumnEq) -> String = fn(eq) {
 #           [AND <origin_filter>][AND <peer_filter>])
 # Origin/peer filters and key binds belong to their own inner aliases.  No
 # participant table is ever outer-joined; the predicate only filters hub rows.
-def render_peer_corr: Fn(PeerCorr, BuildCtx) -> Tuple([String, Array(Val)]) = fn(corr, ctx) {
+def render_peer_corr: Fn(PeerCorr, BuildCtx) -> (String, Array(Val)) = fn(corr, ctx) {
     let origin_source = render_source(corr.origin, ctx);
     let peer_source = render_source(corr.peer, ctx);
     let from_sql = `\{origin_source.0}, \{peer_source.0}`;
@@ -2973,7 +2895,7 @@ def render_peer_corr: Fn(PeerCorr, BuildCtx) -> Tuple([String, Array(Val)]) = fn
 # closed OR of ANDed equalities `(a1 AND a2) OR (b1 ...)`; otherwise it is the
 # ANDed `pairs` equalities.  With `peer` set it is the two-participant paired
 # correlation (see `render_peer_corr`).
-def render_exists: Fn(Exists, BuildCtx) -> Tuple([String, Array(Val)]) = fn(ex, ctx) {
+def render_exists: Fn(Exists, BuildCtx) -> (String, Array(Val)) = fn(ex, ctx) {
     match ex.peer {
         Some(corr) => render_peer_corr(corr, ctx),
         None => match ex.link {
@@ -2994,7 +2916,7 @@ def render_exists: Fn(Exists, BuildCtx) -> Tuple([String, Array(Val)]) = fn(ex, 
                         }), " AND ")})`
                     }), " OR ")})`,
                 };
-                let tail_join: Tuple([String, Array(Val)]) = match link.tail {
+                let tail_join: (String, Array(Val)) = match link.tail {
                     None => {
                         let empty: Array(Val) = [];
                         ("", empty)
@@ -3079,7 +3001,7 @@ def render_exists: Fn(Exists, BuildCtx) -> Tuple([String, Array(Val)]) = fn(ex, 
 # `<outer.column> <op> <(scalar subquery)>`.  Bindings follow the scalar
 # subquery's own placeholder order (aggregate argument, aggregate-local filter,
 # then inner row filter).
-def render_scalar_comparison: Fn(ScalarAggregateComparison, BuildCtx) -> Tuple([String, Array(Val)]) = fn(cmp, ctx) {
+def render_scalar_comparison: Fn(ScalarAggregateComparison, BuildCtx) -> (String, Array(Val)) = fn(cmp, ctx) {
     let rendered = render_scalar_subquery(cmp.inner, ctx);
     let sql = `\{cmp.outer.source}.\{cmp.outer.column} \{scalar_name(cmp.op)} \{rendered.0}`;
     (sql, rendered.1)
@@ -3090,7 +3012,7 @@ def render_scalar_comparison: Fn(ScalarAggregateComparison, BuildCtx) -> Tuple([
 # row filter, GROUP BY <key>, ORDER BY <order-aggregate> <direction>, LIMIT 1.
 # Bindings follow placeholder order: key (SELECT), row filter, key (GROUP BY),
 # then the ordering aggregate expression.
-def render_ranked_subquery: Fn(RankedKeySubquery, BuildCtx) -> Tuple([String, Array(Val)]) = fn(sq, ctx) {
+def render_ranked_subquery: Fn(RankedKeySubquery, BuildCtx) -> (String, Array(Val)) = fn(sq, ctx) {
     let key_parts = array::map(sq.keys, fn(expr) { render_expr(expr, ctx) });
     let key_sql = string::join(array::map(key_parts, fn(p) { p.0 }), ", ");
     let key_binds = array::concat(array::map(key_parts, fn(p) { p.1 }));
@@ -3121,7 +3043,7 @@ def render_ranked_subquery: Fn(RankedKeySubquery, BuildCtx) -> Tuple([String, Ar
 # Renders one ranked grouped-key comparison predicate as
 # `<outer.column> <op> <(grouped-key scalar subquery)>`.  Bindings follow the
 # subquery's own placeholder order.
-def render_ranked_comparison: Fn(RankedKeyComparison, BuildCtx) -> Tuple([String, Array(Val)]) = fn(cmp, ctx) {
+def render_ranked_comparison: Fn(RankedKeyComparison, BuildCtx) -> (String, Array(Val)) = fn(cmp, ctx) {
     let rendered = render_ranked_subquery(cmp.inner, ctx);
     let sql = `\{cmp.outer.source}.\{cmp.outer.column} \{scalar_name(cmp.op)} \{rendered.0}`;
     (sql, rendered.1)
@@ -3133,7 +3055,7 @@ def render_ranked_comparison: Fn(RankedKeyComparison, BuildCtx) -> Tuple([String
 # order: the row filter first, then each EXISTS subquery's own bindings, then
 # each scalar comparison's inner bindings and each ranked comparison's inner
 # bindings in deterministic predicate order.
-def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateComparison), Array(RankedKeyComparison), BuildCtx) -> Tuple([String, Array(Val)]) = fn(filter, exists_list, comparisons, ranked_comparisons, ctx) {
+def render_where_clause: Fn(Option(Expr), Array(Exists), Array(ScalarAggregateComparison), Array(RankedKeyComparison), BuildCtx) -> (String, Array(Val)) = fn(filter, exists_list, comparisons, ranked_comparisons, ctx) {
     let filter_part = match filter {
         Some(expr) => render_expr(expr, ctx),
         None => {
@@ -3208,7 +3130,7 @@ def having_op_sql: Fn(HavingOp) -> String = fn(op) {
 # Renders one aggregate-result predicate.  A `HavingMeasure.Ref` measure is re-expanded to
 # its full aggregate/computed SQL; a `HavingMeasure.Call` measure renders its own aggregate
 # expression.  Measure bindings stay before the trailing threshold `?` binding.
-def render_having: Fn(Plan, Having, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, h, ctx) {
+def render_having: Fn(Plan, Having, BuildCtx) -> (String, Array(Val)) = fn(plan, h, ctx) {
     let rendered = match h.measure {
         HavingMeasure::Ref(ref) => render_measure_ref(plan, ref.alias, ctx),
         HavingMeasure::Call(call) => render_aggregate_call(call, ctx),
@@ -3218,7 +3140,7 @@ def render_having: Fn(Plan, Having, BuildCtx) -> Tuple([String, Array(Val)]) = f
         array::concat([rendered.1, threshold.1]))
 };
 
-def render_having_clause: Fn(Plan, Array(Having), BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, having_list, ctx) {
+def render_having_clause: Fn(Plan, Array(Having), BuildCtx) -> (String, Array(Val)) = fn(plan, having_list, ctx) {
     let parts = array::map(having_list, fn(h) { render_having(plan, h, ctx) });
     let sql = if array::length(having_list) > 0 {
         ` HAVING \{string::join(array::map(parts, fn(p) { p.0 }), " AND ")}`
@@ -3232,7 +3154,7 @@ def render_having_clause: Fn(Plan, Array(Having), BuildCtx) -> Tuple([String, Ar
 # Renders an ordering key.  An AggregateRef renders the full aggregate or
 # computed aggregate expression of the projected measure (never a
 # source-qualified alias), so the generated SQL is executable and unambiguous.
-def render_order_key: Fn(OrderKey, Plan, BuildCtx) -> Tuple([String, Array(Val)]) = fn(key, plan, ctx) {
+def render_order_key: Fn(OrderKey, Plan, BuildCtx) -> (String, Array(Val)) = fn(key, plan, ctx) {
     match key {
         OrderKey::Expr(expr) => render_expr(expr, ctx),
         OrderKey::AggregateRef(ref) => {
@@ -3250,7 +3172,7 @@ def render_order_key: Fn(OrderKey, Plan, BuildCtx) -> Tuple([String, Array(Val)]
 
 # Renders one UNION ALL branch as `SELECT <name> AS <col>, ... FROM <table> AS
 # <alias> [WHERE ...]`.  Bindings follow the branch's own placeholder order.
-def render_union_branch: Fn(UnionBranch, BuildCtx) -> Tuple([String, Array(Val)]) = fn(branch, ctx) {
+def render_union_branch: Fn(UnionBranch, BuildCtx) -> (String, Array(Val)) = fn(branch, ctx) {
     let items = array::map(branch.outputs, fn(col) {
         let rendered = render_expr(col.expr, ctx);
         (`\{rendered.0} AS \{col.name}`, rendered.1)
@@ -3273,7 +3195,7 @@ def render_union_branch: Fn(UnionBranch, BuildCtx) -> Tuple([String, Array(Val)]
 };
 
 # Renders the ordered branches merged with UNION ALL (text and merged bindings).
-def render_union: Fn(DerivedSource, BuildCtx) -> Tuple([String, Array(Val)]) = fn(ds, ctx) {
+def render_union: Fn(DerivedSource, BuildCtx) -> (String, Array(Val)) = fn(ds, ctx) {
     let parts = array::map(ds.branches, fn(branch) { render_union_branch(branch, ctx) });
     let sql = string::join(array::map(parts, fn(pair) { pair.0 }), " UNION ALL ");
     let binds = array::concat(array::map(parts, fn(pair) { pair.1 }));
@@ -3282,7 +3204,7 @@ def render_union: Fn(DerivedSource, BuildCtx) -> Tuple([String, Array(Val)]) = f
 
 # Renders the FROM item of a plan: either the physical primary source or the
 # derived UNION ALL relation `(<union>) AS <alias>`.
-def render_from_clause: Fn(Plan, BuildCtx) -> Tuple([String, Array(Val)]) = fn(plan, ctx) {
+def render_from_clause: Fn(Plan, BuildCtx) -> (String, Array(Val)) = fn(plan, ctx) {
     match plan.derived {
         Some(ds) => {
             let inner = render_union(ds, ctx);
@@ -3409,7 +3331,7 @@ def expr_projection_ref: Fn(Expr, Array(SelectItem)) -> Option(String) = fn(expr
 # bindings).  Expression items get a stable `__q_<index>` alias; aggregate and
 # computed aggregates keep their public alias.  Everything is referenced by
 # name from the outer query.
-def render_partition_item: Fn(SelectItem, Int, Plan, BuildCtx) -> Tuple([String, String, Array(Val)]) = fn(item, index, plan, ctx) {
+def render_partition_item: Fn(SelectItem, Int, Plan, BuildCtx) -> (String, String, Array(Val)) = fn(item, index, plan, ctx) {
     match item {
         SelectItem::Expr(expr) => {
             let rendered = render_expr(expr, ctx);
@@ -3721,7 +3643,7 @@ def set_ok: Fn(SetOpKind, Plan, Plan) -> Bool = fn(kind, left, right) {
 # a nested/derived operand that genuinely needs a wrapper is rendered through a
 # valid derived-table/select form instead (e.g. `transform_sqlite_set_count`
 # wraps the whole compound as `(<compound>) AS __q_set`).
-def validate_set_operands: Fn(SetOpKind, Plan, Plan) -> Tuple([Plan, Plan]) = fn(kind, left, right) {
+def validate_set_operands: Fn(SetOpKind, Plan, Plan) -> (Plan, Plan) = fn(kind, left, right) {
     let left_structured = validate_structure(left);
     let right_structured = validate_structure(right);
     if !set_operand_embeddable(left_structured) || !set_operand_embeddable(right_structured) {
@@ -3953,32 +3875,6 @@ def lower: Fn(Expr) -> Expr = fn(value) {
 # for an ends-with predicate.
 def length: Fn(Expr) -> Expr = fn(value) {
     let call: ScalarCall = {function: ScalarFunction::Length, args: [value]};
-    Expr::Scalar(call)
-};
-
-# Paths are structural AST values. SQLite serializes them into JSON1 Bind
-# values only during rendering; other dialects consume the same segments.
-def json_path: Fn(Array(JsonPathSegment)) -> JsonPath = fn(segments) {
-    {segments}
-};
-
-def json_extract: Fn(Expr, JsonPath, JsonScalarKind) -> Expr = fn(document, path, kind) {
-    let function = match kind {
-        JsonScalarKind::Text => ScalarFunction::JsonExtractText,
-        JsonScalarKind::Int => ScalarFunction::JsonExtractInt,
-        JsonScalarKind::Number => ScalarFunction::JsonExtractNumber,
-    };
-    let call: ScalarCall = {function, args: [document, Expr::JsonPath(path)]};
-    Expr::Scalar(call)
-};
-
-def json_type: Fn(Expr, JsonPath) -> Expr = fn(document, path) {
-    let call: ScalarCall = {function: ScalarFunction::JsonType, args: [document, Expr::JsonPath(path)]};
-    Expr::Scalar(call)
-};
-
-def json_valid: Fn(Expr) -> Expr = fn(document) {
-    let call: ScalarCall = {function: ScalarFunction::JsonValid, args: [document]};
     Expr::Scalar(call)
 };
 
@@ -4351,9 +4247,6 @@ pub use self::{
     ColumnEq,
     ScalarFunction,
     ScalarCall,
-    JsonScalarKind,
-    JsonPathSegment,
-    JsonPath,
     Expr,
     AggregateFunction,
     AggregateCall,
@@ -4447,10 +4340,6 @@ pub use self::{
     sub,
     lower,
     length,
-    json_path,
-    json_extract,
-    json_type,
-    json_valid,
     utc_days_ago,
     expr_item,
     named_expr_item,

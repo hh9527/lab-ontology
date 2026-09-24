@@ -481,7 +481,7 @@ def has_unknown_key: Fn(Dict(Value), Array(String)) -> Bool = fn(obj, allowed) {
     })
 };
 
-def build_set_branch: Fn(edsl::PreparedPayload, String, Value) -> qb::Plan = fn(payload, subject, branch) {
+def build_set_branch: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Value) -> (qb::BuildCtx, qb::Plan, edsl::QueryRequest) = fn(ctx, payload, subject, branch) {
     let obj = as_object(branch);
     if has_unknown_key(obj, set_branch_keys) {
         fail!("set branch contains unsupported keys", branch)
@@ -500,15 +500,15 @@ def build_set_branch: Fn(edsl::PreparedPayload, String, Value) -> qb::Plan = fn(
                     if array::length(exists) != 0 || array::length(having) != 0 {
                         fail!("row set branch must not carry existence or having constraints", branch)
                     } else {
-                        let plan: qb::Plan = edsl::lower(payload, request);
-                        plan
+                        let lowered = edsl::lower(ctx, payload, request);
+                        (lowered.0, lowered.1, request)
                     }
                 } else if shape == "exists" {
-                    let plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
-                    plan
+                    let lowered = edsl::lower_full(ctx, payload, request, exists, having);
+                    (lowered.0, lowered.1, request)
                 } else {
-                    let plan: qb::Plan = edsl::lower_absence(payload, request, exists, having);
-                    plan
+                    let lowered = edsl::lower_absence(ctx, payload, request, exists, having);
+                    (lowered.0, lowered.1, request)
                 }
             }
         } else {
@@ -544,9 +544,9 @@ def reorder_if_requested: Fn(edsl::PreparedPayload, edsl::QueryRequest, qb::Plan
         }
     };
 
-def lower_list_with_order: Fn(edsl::PreparedPayload, edsl::QueryRequest, Array(edsl::ProjectionToken)) -> qb::Plan = fn(payload, request, output) {
-    let base_plan: qb::Plan = edsl::lower(payload, request);
-    reorder_if_requested(payload, request, base_plan, output)
+def lower_list_with_order: Fn(qb::BuildCtx, edsl::PreparedPayload, edsl::QueryRequest, Array(edsl::ProjectionToken)) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, request, output) {
+    let lowered = edsl::lower(ctx, payload, request);
+    (lowered.0, reorder_if_requested(payload, request, lowered.1, output))
 };
 
 def build_request: Fn(edsl::PreparedPayload, String, Dict(Value)) -> edsl::QueryRequest = fn(payload, subject, obj) {
@@ -574,21 +574,21 @@ def build_request: Fn(edsl::PreparedPayload, String, Dict(Value)) -> edsl::Query
 # Public lowering entry: intent Value -> Query
 # ---------------------------------------------------------------------------
 
-def lower_set_query: Fn(edsl::PreparedPayload, String, qb::SetOpKind, Value) -> qb::QueryPlan =
-    fn(payload, subject, kind, intent) {
+def lower_set_query: Fn(qb::BuildCtx, edsl::PreparedPayload, String, qb::SetOpKind, Value) -> (qb::BuildCtx, qb::QueryPlan) =
+    fn(ctx, payload, subject, kind, intent) {
         let obj = as_object(intent);
         let branches = as_array(field(obj, "branches"));
         let branch_count = array::length(branches);
         if branch_count == 2 {
-            let left = build_set_branch(payload, subject, branches[0]);
-            let right = build_set_branch(payload, subject, branches[1]);
+            let left = build_set_branch(ctx, payload, subject, branches[0]);
+            let right = build_set_branch(left.0, payload, subject, branches[1]);
             let op = as_string(field(obj, "op"));
-            if edsl::validate_set_projection_types(payload, left, right) {
-                let set: qb::SetPlan = {kind, left, right};
+            if edsl::validate_set_projection_types(payload, left.2, left.1, right.2, right.1) {
+                let set: qb::SetPlan = {kind, left: left.1, right: right.1};
                 if op == "set" {
-                    qb::QueryPlan::SetRows(set)
+                    (right.0, qb::QueryPlan::SetRows(set))
                 } else {
-                    qb::QueryPlan::SetCount(set)
+                    (right.0, qb::QueryPlan::SetCount(set))
                 }
             } else { fail!("invalid set projection types") }
         } else {
@@ -596,12 +596,25 @@ def lower_set_query: Fn(edsl::PreparedPayload, String, qb::SetOpKind, Value) -> 
         }
     };
 
-def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan = fn(payload, subject, intent) {
+def rows: Fn((qb::BuildCtx, qb::Plan)) -> (qb::BuildCtx, qb::QueryPlan) = fn(lowered) {
+    (lowered.0, qb::QueryPlan::Rows(lowered.1))
+};
+
+def distinct_rows: Fn((qb::BuildCtx, qb::Plan)) -> (qb::BuildCtx, qb::QueryPlan) = fn(lowered) {
+    (lowered.0, qb::QueryPlan::DistinctRows(lowered.1))
+};
+
+def group_count: Fn((qb::BuildCtx, qb::Plan)) -> (qb::BuildCtx, qb::QueryPlan) = fn(lowered) {
+    (lowered.0, qb::QueryPlan::GroupCount(lowered.1))
+};
+
+def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> (qb::BuildCtx, qb::QueryPlan) = fn(payload, subject, intent) {
+    let ctx = qb::build_context();
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "set" || op == "set_count" {
         let kind = parse_set_kind(as_string(field(obj, "kind")));
-        lower_set_query(payload, subject, kind, intent)
+        lower_set_query(ctx, payload, subject, kind, intent)
     } else {
         let field_values = field_filter_items(as_array(field(obj, "filters")));
         if array::length(field_values) != 0 && op != "list" {
@@ -612,23 +625,22 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                 "list" => {
                     let output_values = array_opt(obj, "output_order");
                     let output: Array(edsl::ProjectionToken) = array::map(output_values, parse_projection_token);
-                    let plan: qb::Plan = if array::length(field_values) != 0 {
+                    let plan: (qb::BuildCtx, qb::Plan) = if array::length(field_values) != 0 {
                         let field_filters: Array(edsl::FieldFilterRequest) =
                             array::map(field_values, fn(item) { parse_field_filter(subject, item) });
-                        let base_plan: qb::Plan = edsl::lower_field_filtered(payload, request, field_filters);
-                        reorder_if_requested(payload, request, base_plan, output)
+                        let base_plan = edsl::lower_field_filtered(ctx, payload, request, field_filters);
+                        (base_plan.0, reorder_if_requested(payload, request, base_plan.1, output))
                     } else {
-                        lower_list_with_order(payload, request, output)
+                        lower_list_with_order(ctx, payload, request, output)
                     };
-                    qb::QueryPlan::Rows(plan)
+                    rows(plan)
                 },
                 "count" => {
                     let exists: Array(edsl::ExistsRequest) =
                         array::map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                    let plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
-                    qb::QueryPlan::Rows(plan)
+                    rows(edsl::lower_full(ctx, payload, request, exists, having))
                 },
                 "qualify_group" => {
                     let having: Array(edsl::HavingRequest) =
@@ -640,7 +652,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         Some(Value::False) => False,
                         Some(value) => fail!("show_measure requires a boolean", value),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_group_projection(payload, request,
+                    rows(edsl::lower_group_projection(ctx, payload, request,
                         as_string(field(obj, "relation")), having, output, show_measure))
                 },
                 "exists_via" => {
@@ -649,7 +661,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                     if array::length(specs) == 0 {
                         fail!("exists_via requires a named relation")
                     } else {
-                        qb::QueryPlan::Rows(edsl::lower_named_exists(payload, request, specs, parse_site_tenant_scope(subject, obj)))
+                        rows(edsl::lower_named_exists(ctx, payload, request, specs, parse_site_tenant_scope(subject, obj)))
                     }
                 },
                 "qualify_metrics" => {
@@ -668,7 +680,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                               threshold: parse_input(as_string(field(having, "kind")), field(having, "value")) }
                         });
                     let scope = parse_owner_site_scope(subject, obj);
-                    qb::QueryPlan::Rows(edsl::lower_metric_qualifications(payload, request, specs, scope))
+                    rows(edsl::lower_metric_qualifications(ctx, payload, request, specs, scope))
                 },
                 "qualify_epoch_metrics" => {
                     let specs: Array(edsl::EpochMetricQualification) = array::map(
@@ -686,20 +698,20 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                               op: parse_having_op(as_string(field(having, "op"))),
                               threshold: parse_input(as_string(field(having, "kind")), field(having, "value")) }
                         });
-                    qb::QueryPlan::Rows(edsl::lower_epoch_metric_qualifications(payload, request, specs,
+                    rows(edsl::lower_epoch_metric_qualifications(ctx, payload, request, specs,
                         parse_owner_site_scope(subject, obj)))
                 },
                 "qualify_samples" => {
                     let specs = array::map(as_array(field(obj, "qualifications")), fn(value) {
                         parse_sample_qualification(subject, value)
                     });
-                    qb::QueryPlan::Rows(edsl::lower_sample_qualifications(payload, request, specs))
+                    rows(edsl::lower_sample_qualifications(ctx, payload, request, specs))
                 },
                 "qualify_epoch_samples" => {
                     let specs = array::map(as_array(field(obj, "qualifications")), fn(value) {
                         parse_epoch_sample_qualification(subject, value)
                     });
-                    qb::QueryPlan::Rows(edsl::lower_sample_epoch_qualifications(payload, request, specs))
+                    rows(edsl::lower_sample_epoch_qualifications(ctx, payload, request, specs))
                 },
                 "qualify_sample_count" => {
                     let ranges: Array(edsl::SampleCountRange) = array::map(
@@ -717,7 +729,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                             };
                             { qualification, min_matches: minimum, max_matches: as_int(field(item, "max_matches")) }
                         });
-                    qb::QueryPlan::Rows(edsl::lower_sample_count_ranges(payload, request, ranges))
+                    rows(edsl::lower_sample_count_ranges(ctx, payload, request, ranges))
                 },
                 "qualify_epoch_sample_count" => {
                     let ranges: Array(edsl::EpochSampleCountRange) = array::map(
@@ -727,7 +739,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                             let spec = parse_epoch_sample_qualification(subject, value);
                             { qualification: spec, min_matches: minimum, max_matches: as_int(field(item, "max_matches")) }
                         });
-                    qb::QueryPlan::Rows(edsl::lower_sample_epoch_count_ranges(payload, request, ranges))
+                    rows(edsl::lower_sample_epoch_count_ranges(ctx, payload, request, ranges))
                 },
                 "observe_qualified" => {
                     let specs = array::map(as_array(field(obj, "qualifications")), fn(value) {
@@ -741,7 +753,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_string(field(window, "start")),
                         end: as_string(field(window, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_qualified_observation(payload, request,
+                    rows(edsl::lower_qualified_observation(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), observation, specs, components, context))
                 },
                 "observe_epoch_qualified" => {
@@ -755,7 +767,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_int(field(bounds, "start")),
                         end: as_int(field(bounds, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_epoch_qualified_observation(payload, request,
+                    rows(edsl::lower_epoch_qualified_observation(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), observation, specs,
                         parse_observation_components(subject, obj), parse_observation_context(subject, obj)))
                 },
@@ -774,7 +786,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                             Some(result)
                         },
                     };
-                    qb::QueryPlan::Rows(edsl::lower_related_observation(payload, request,
+                    rows(edsl::lower_related_observation(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), dataset_id, window))
                 },
                 "observe_peer_related" => {
@@ -799,7 +811,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         owner_relation: as_string(field(peer, "owner_relation")),
                         origin_filters: array::map(array_opt(peer, "origin_filters"), fn(v) { parse_filter(subject, v) }),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_peer_related_observation(payload, request,
+                    rows(edsl::lower_peer_related_observation(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), dataset_id, window, scope))
                 },
                 "observe_related_epoch" => {
@@ -818,19 +830,19 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                             Some(result)
                         },
                     };
-                    qb::QueryPlan::Rows(edsl::lower_related_epoch_observation(payload, request,
+                    rows(edsl::lower_related_epoch_observation(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")), dataset_id, window))
                 },
                 "list_via" => {
                     let relation_id = as_string(field(obj, "relation"));
-                    qb::QueryPlan::Rows(edsl::lower_via(payload, request, relation_id))
+                    rows(edsl::lower_via(ctx, payload, request, relation_id))
                 },
                 "list_relation" => {
-                    let plan = edsl::lower_relation_rows(payload, request,
+                    let plan = edsl::lower_relation_rows(ctx, payload, request,
                         as_string(field(obj, "base")), as_string(field(obj, "relation")));
                     match as_string(field(obj, "mode")) {
-                        "rows" => qb::QueryPlan::Rows(plan),
-                        "distinct" => qb::QueryPlan::DistinctRows(plan),
+                        "rows" => rows(plan),
+                        "distinct" => distinct_rows(plan),
                         _ => fail!("relation rows require rows or distinct mode"),
                     }
                 },
@@ -843,7 +855,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         second: parse_input(kind, field(endpoints, "second")),
                         subject,
                     };
-                    qb::QueryPlan::Rows(edsl::lower_endpoint_pair(payload, request,
+                    rows(edsl::lower_endpoint_pair(ctx, payload, request,
                         as_string(field(obj, "tenant_relation")), pair))
                 },
                 "qualify_child_site" => {
@@ -857,7 +869,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         site_filters: array::map(as_array(field(obj, "site_filters")), fn(v) { parse_filter(subject, v) }),
                         tenant_filters: array::map(as_array(field(obj, "tenant_filters")), fn(v) { parse_filter(subject, v) }),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_child_site_scope(payload, request, scope))
+                    rows(edsl::lower_child_site_scope(ctx, payload, request, scope))
                 },
                 "list_roles" => {
                     let roles: Array(edsl::RoleProjectionSpec) = array::map(as_array(field(obj, "roles")), fn(value) {
@@ -870,7 +882,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         let item = as_object(value);
                         { role: as_string(field(item, "role")), filter: parse_filter(subject, value) }
                     });
-                    qb::QueryPlan::Rows(edsl::lower_roles(payload, request, roles, role_filters))
+                    rows(edsl::lower_roles(ctx, payload, request, roles, role_filters))
                 },
                 "utc_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -879,7 +891,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_string(field(window_obj, "start")),
                         end: as_string(field(window_obj, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_utc_window(payload, request, window))
+                    rows(edsl::lower_utc_window(ctx, payload, request, window))
                 },
                 "utc_field_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -889,7 +901,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_string(field(window_obj, "start")),
                         end: as_string(field(window_obj, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_utc_field_window(payload, request, window))
+                    rows(edsl::lower_utc_field_window(ctx, payload, request, window))
                 },
                 "utc_epoch_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -899,7 +911,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_int(field(window_obj, "start")),
                         end: as_int(field(window_obj, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_utc_epoch_window(payload, request, window))
+                    rows(edsl::lower_utc_epoch_window(ctx, payload, request, window))
                 },
                 "sample_top" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -909,7 +921,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         end: as_string(field(window_obj, "end")),
                     };
                     let scope = parse_owner_site_scope(subject, obj);
-                    qb::QueryPlan::Rows(edsl::lower_sample_top(payload, request,
+                    rows(edsl::lower_sample_top(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         window, as_string(field(obj, "rank")), as_int(field(obj, "take")), scope))
                 },
@@ -921,7 +933,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_int(field(bounds, "start")),
                         end: as_int(field(bounds, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_sample_epoch_top(payload, request,
+                    rows(edsl::lower_sample_epoch_top(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         window, as_string(field(obj, "rank")), as_int(field(obj, "take")),
                         parse_owner_site_scope(subject, obj)))
@@ -941,7 +953,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         },
                         None => None,
                     };
-                    qb::QueryPlan::Rows(edsl::lower_latest_sample(payload, request,
+                    rows(edsl::lower_latest_sample(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         dataset_id, window, parse_owner_site_scope(subject, obj), parse_site_tenant_scope(subject, obj)))
                 },
@@ -961,7 +973,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         },
                         None => None,
                     };
-                    qb::QueryPlan::Rows(edsl::lower_latest_epoch_sample(payload, request,
+                    rows(edsl::lower_latest_epoch_sample(ctx, payload, request,
                         as_string(field(obj, "owner")), as_string(field(obj, "relation")),
                         dataset_id, window, parse_owner_site_scope(subject, obj), parse_site_tenant_scope(subject, obj)))
                 },
@@ -972,7 +984,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_string(field(bounds, "start")),
                         end: as_string(field(bounds, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_event_component(payload, request, window,
+                    rows(edsl::lower_event_component(ctx, payload, request, window,
                         as_string(field(obj, "owner")), as_string(field(obj, "event_relation")),
                         as_string(field(obj, "component_relation")),
                         as_string(field(obj, "owner_tenant_relation")), as_string(field(obj, "component_tenant_relation")),
@@ -987,7 +999,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         start: as_int(field(bounds, "start")),
                         end: as_int(field(bounds, "end")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_epoch_event_component(payload, request, window,
+                    rows(edsl::lower_epoch_event_component(ctx, payload, request, window,
                         as_string(field(obj, "owner")), as_string(field(obj, "event_relation")),
                         as_string(field(obj, "component_relation")),
                         as_string(field(obj, "owner_tenant_relation")), as_string(field(obj, "component_tenant_relation")),
@@ -996,11 +1008,11 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                 },
                 "qualify_link_site" => {
                     let scope = parse_link_site_scope(subject, field(obj, "link_site"));
-                    qb::QueryPlan::Rows(edsl::lower_link_site(payload, request, scope))
+                    rows(edsl::lower_link_site(ctx, payload, request, scope))
                 },
                 "list_link_device_site" => {
                     let scope = parse_link_site_scope(subject, field(obj, "link_site"));
-                    qb::QueryPlan::Rows(edsl::lower_link_device_site_rows(payload, request, scope))
+                    rows(edsl::lower_link_device_site_rows(ctx, payload, request, scope))
                 },
                 "utc_days_window" => {
                     let window_obj = as_object(field(obj, "window"));
@@ -1009,7 +1021,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         as_of: as_string(field(window_obj, "as_of")),
                         days: as_int(field(window_obj, "days")),
                     };
-                    qb::QueryPlan::Rows(edsl::lower_utc_days_window(payload, request, window))
+                    rows(edsl::lower_utc_days_window(ctx, payload, request, window))
                 },
                 "aggregate" => {
                     if array::length(request.measures) == 0 {
@@ -1028,25 +1040,23 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                             } else {
                                 let hidden: Array(edsl::InternalHavingRequest) =
                                     array::map(hidden_values, fn(item) { parse_internal_having(subject, item) });
-                                let base_plan: qb::Plan = edsl::lower_hidden_having(payload, request, hidden);
-                                let plan = reorder_if_requested(payload, request, base_plan, output);
-                                qb::QueryPlan::Rows(plan)
+                                let lowered = edsl::lower_hidden_having(ctx, payload, request, hidden);
+                                rows((lowered.0, reorder_if_requested(payload, request, lowered.1, output)))
                             }
                         } else {
                             let exists: Array(edsl::ExistsRequest) =
                                 array::map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                             let having: Array(edsl::HavingRequest) =
                                 array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                            let base_plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
-                            let plan = reorder_if_requested(payload, request, base_plan, output);
-                            qb::QueryPlan::Rows(plan)
+                            let lowered = edsl::lower_full(ctx, payload, request, exists, having);
+                            rows((lowered.0, reorder_if_requested(payload, request, lowered.1, output)))
                         }
                     }
                 },
                 "count_groups" => {
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                    qb::QueryPlan::GroupCount(edsl::lower_group_count_plan(payload, request, having))
+                    group_count(edsl::lower_group_count_plan(ctx, payload, request, having))
                 },
                 "count_related_groups" => {
                     let population = as_string(field(obj, "population"));
@@ -1055,7 +1065,7 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                     } else {
                         let having: Array(edsl::HavingRequest) =
                             array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                        qb::QueryPlan::GroupCount(edsl::lower_related_group_count_plan(payload, request,
+                        group_count(edsl::lower_related_group_count_plan(ctx, payload, request,
                             as_string(field(obj, "relation")), having, population == "all"))
                     }
                 },
@@ -1069,54 +1079,47 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
                         let internal_having: Array(edsl::InternalHavingRequest) =
                             array::map(array_opt(obj, "hidden_having"), fn(item) { parse_internal_having(subject, item) });
                         let top_request = request <~ { ordering: [] };
-                        let plan: qb::Plan = edsl::lower_internal_related(
-                            payload,
+                        let plan = edsl::lower_internal_related(
+                            ctx, payload,
                             top_request,
                             internal_orders,
                             internal_having,
                         );
-                        qb::QueryPlan::Rows(plan)
+                        rows(plan)
                     }
                 },
                 "distinct" => {
-                    let plan: qb::Plan = edsl::lower(payload, request);
-                    qb::QueryPlan::DistinctRows(plan)
+                    distinct_rows(edsl::lower(ctx, payload, request))
                 },
                 "exists" => {
                     let exists: Array(edsl::ExistsRequest) =
                         array::map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                    let plan: qb::Plan = edsl::lower_full(payload, request, exists, having);
-                    qb::QueryPlan::Rows(plan)
+                    rows(edsl::lower_full(ctx, payload, request, exists, having))
                 },
                 "absence" => {
                     let absence: Array(edsl::ExistsRequest) =
                         array::map(array_opt(obj, "exists"), fn(item) { parse_exists(subject, item) });
                     let having: Array(edsl::HavingRequest) =
                         array::map(array_opt(obj, "having"), fn(item) { parse_having(subject, item) });
-                    let plan: qb::Plan = edsl::lower_absence(payload, request, absence, having);
-                    qb::QueryPlan::Rows(plan)
+                    rows(edsl::lower_absence(ctx, payload, request, absence, having))
                 },
                 "compare" => {
                     let comparisons: Array(edsl::ScalarCompareRequest) =
                         array::map(as_array(field(obj, "comparisons")), fn(item) { parse_compare(subject, item) });
-                    let base_plan: qb::Plan =
-                        edsl::lower_attribute_compare(payload, request, comparisons);
+                    let base_plan = edsl::lower_attribute_compare(ctx, payload, request, comparisons);
                     let output_values = array_opt(obj, "output_order");
                     let output: Array(edsl::ProjectionToken) = array::map(output_values, parse_projection_token);
-                    let plan = reorder_if_requested(payload, request, base_plan, output);
-                    qb::QueryPlan::Rows(plan)
+                    rows((base_plan.0, reorder_if_requested(payload, request, base_plan.1, output)))
                 },
                 "ranked" => {
                     let comparisons: Array(edsl::RankedKeyCompareRequest) =
                         array::map(as_array(field(obj, "ranked")), fn(item) { parse_ranked_key(subject, item) });
-                    let base_plan: qb::Plan =
-                        edsl::lower_ranked_key_compare(payload, request, comparisons);
+                    let base_plan = edsl::lower_ranked_key_compare(ctx, payload, request, comparisons);
                     let output_values = array_opt(obj, "output_order");
                     let output: Array(edsl::ProjectionToken) = array::map(output_values, parse_projection_token);
-                    let plan = reorder_if_requested(payload, request, base_plan, output);
-                    qb::QueryPlan::Rows(plan)
+                    rows((base_plan.0, reorder_if_requested(payload, request, base_plan.1, output)))
                 },
                 _ => fail!("unsupported intent op", op),
             }
@@ -1125,11 +1128,14 @@ def lower_intent_plan: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryPlan
 };
 
 def query_intent_lower_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::Query = fn(payload, subject) {
-    fn(intent) { qb::transform_sqlite_query_plan(lower_intent_plan(payload, subject, intent)) }
+    fn(intent) {
+        let lowered = lower_intent_plan(payload, subject, intent);
+        qb::render_query_plan_with_context(lowered.1, lowered.0)
+    }
 };
 
 def query_intent_plan_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::QueryPlan = fn(payload, subject) {
-    fn(intent) { qb::validate_query_plan(lower_intent_plan(payload, subject, intent)) }
+    fn(intent) { qb::validate_query_plan(lower_intent_plan(payload, subject, intent).1) }
 };
 
 # ---------------------------------------------------------------------------

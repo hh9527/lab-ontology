@@ -27,7 +27,7 @@ def main() -> int:
             ("ontology/src/ontology.telora", r"lower_hidden_having"),
             ("ontology/src/ontology.telora", r"scalar.{0,40}subquery"),
             ("ontology/docs/ONTOLOGY.md", r"scalar.{0,40}subquery|标量.{0,20}子查询"),
-            ("ontology/tests/ontology.telora", r"scalar.{0,40}subquery"),
+            ("ontology/tests/query.telora", r"scalar.{0,40}subquery"),
         ]
 
     missing = [path for path, pattern in requirements if not contains(path, pattern)]

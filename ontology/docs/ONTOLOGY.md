@@ -43,7 +43,7 @@ def lower_intent: Fn(Value) -> qb.Query =
 不唯一关系路径以及不兼容 grain 都原子失败，不产生部分 Query。同一 payload、subject 和
 Intent 的重复 lowering 必须得到逐值相同的 SQL 与 bindings。
 
-`tests/intent.telora` 使用 ontology 自带知识模型验证跨模型派生；领域测试只需把自己的
+`tests/ontology/intent.telora` 使用 ontology 测试模型验证跨模型派生；领域测试只需把自己的
 payload 交给同一 Factory。新增查询形状应扩展公共封闭协议和通用 lowering，不应在领域
 crate 中增加查询分支。模型无法表达某项业务语义时，应扩充本体 property，而不是以领域
 `query.telora` 补写程序。
@@ -259,7 +259,6 @@ INNER JOIN 得到的 1..N 结果误称为 0..N。
 | `computed_measure(id, op, left, right)` | 字段 | 以已声明指标为依赖的受限计算指标（`Add`/`Sub`） |
 | `dimension(id, authorized, filterable, ops, input_kinds)` | 字段 | 普通维度及其能力 |
 | `computed_dimension(id, authorized, filterable, ops, input_kinds, build)` | 字段 | 从字段表达式构造的计算维度 |
-| `json_dimension(id, authorized, filterable, ops, input_kinds, path, value_kind)` | 字段 | 按固定 path 和 Text/Int/Number 值类型声明 JSON 业务维度（可组合 fold） |
 | `scope(predicates)` | 字段 | 维度成员的固有行范围（`Array(ScopePredicate)`，可组合 fold） |
 | `entity_source(table, alias)` | 类型 | 实体的数据源和别名 |
 | `entity_scope(predicates)` | 类型 | 物理实体始终生效的行域（`Array(EntityScopePredicate)`，按字段名声明） |
@@ -469,36 +468,6 @@ def head_builder: Fn(qb.Expr) -> qb.Expr = fn(col) {
 };
 ```
 
-### JSON-backed Dimension
-
-`json_dimension` 把被标注字段的物理 JSON 列按固定 `path` 声明为业务 Dimension。
-领域作者在 knowledge 声明时固定 path；动态 `QueryRequest` 只能选择/筛选/排序业务
-Dimension id，不得携带 path、raw predicate、SQLite 函数名或 JSON 表达式。
-
-```telora
-@edsl.entity_source("devices", "d")
-type Device = struct {
-    @edsl.column("attributes_json")
-    @edsl.json_dimension("DeviceChannel", flag_true, flag_true, eq_ops, text_kinds, qb.json_path([qb.JsonPathSegment.Key("channel")]), qb.JsonScalarKind.Text)
-    @edsl.json_dimension("DeviceRetryCount", flag_true, flag_true, eq_ops, int_kinds, qb.json_path([qb.JsonPathSegment.Key("retry"), qb.JsonPathSegment.Key("count")]), qb.JsonScalarKind.Int)
-    attributes_json: String,
-    # ...
-};
-```
-
-- path 在 Model 和 Query AST 中保留为键/索引序列；SQLite 渲染器才把它变为 String binding（`?`），绝不成为
-  SQL literal 或 identifier；JSON Dimension 复用现有 authorization、filterable、
-  ops、input kinds、enum domain、scope、grain、relation path、grouping、ordering
-  与 Top Per Group 检查。
-- `value_kind` 描述来源 JSON 值，独立于允许的过滤输入；准备期拒绝类型不符的过滤声明。
-- knowledge Profile 必须显式允许所使用的 JSON scalar：缺对应类型提取算子的 Profile
-  在 lowering 时原子失败。
-- 同一 JSON Dimension 在 projection/grouping/filter/order 中重复 lowering 时保持
-  确定性与正确 binding 顺序（顶层 `$.channel` 与嵌套 `$.retry.count` 均可用于授权
-  选择、参数化筛选、分组、稳定排序，并可作为 Top Per Group 的 ordering/tie-breaker）。
-- **SQL NULL 边界**：missing path 与 JSON null 都可能降低为 NULL；v1 不把它们伪装成
-  空字符串，也不承诺自动 `coalesce`。
-
 ### 领域成员的固有 scope
 
 `scope` 让一个维度成员声明其固有的行范围，调用者无需每次手工重复这组约束。
@@ -678,7 +647,7 @@ Safe 身份证明和关联 EXISTS 会递归展开纯 AND 的相等键，嵌套�
 确定性优先），只保存最短的确定性路径矩阵，不在热路径执行 BFS。多个目标按请求顺序
 合并并复用已有边。只有全 Safe 路径能进入 Plan；fan-out-only、不可达或被深度截断的
 目标都使请求失败。遍历成本按源实体受控：业务模型即使增加若干枢纽关系也不会使
-prepare 耗尽求值燃料（`tests/ontology.telora` 内含较密 hub/leaf 关系图的燃料回归）。
+  prepare 耗尽求值燃料；此类模型需另设有界性压力测试。
 
 关系键可以结构化：`relation(target, kind, from_field, to_field)` 是单列等值糖，
 `relation_key(target, kind, key)` 接受 `RelationKey`，其中
@@ -1070,8 +1039,6 @@ def profile: qb.PlanProfile = {
     allowed_aggregates: [qb.AggregateFunction.Count, qb.AggregateFunction.Sum, qb.AggregateFunction.Avg, qb.AggregateFunction.Min, qb.AggregateFunction.Max],
     allowed_scalars: [
         qb.ScalarFunction.Substr, qb.ScalarFunction.Instr, qb.ScalarFunction.If, qb.ScalarFunction.Add, qb.ScalarFunction.Sub, qb.ScalarFunction.Lower, qb.ScalarFunction.Length,
-        qb.ScalarFunction.JsonExtractText, qb.ScalarFunction.JsonExtractInt,
-        qb.ScalarFunction.JsonExtractNumber, qb.ScalarFunction.JsonType, qb.ScalarFunction.JsonValid,
         qb.ScalarFunction.Eq, qb.ScalarFunction.Ne, qb.ScalarFunction.Lt, qb.ScalarFunction.Le, qb.ScalarFunction.Gt, qb.ScalarFunction.Ge, qb.ScalarFunction.And, qb.ScalarFunction.Or, qb.ScalarFunction.Not,
     ],
     allow_distinct: True,
@@ -1218,7 +1185,7 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
 以下情况原子失败：未知 id、授权失败、缺失筛选能力、非法筛选输入、未知枚举值、
 非正 limit、负 offset、缺稳定排序的 offset、互斥的 scope/filter 约束、scope 引用
 非法字段或缺失能力、未请求的排序目标、grain 冲突、不安全或缺失路径、profile
-越界，以及 Top Per Group、条件/计算指标与 JSON-backed Dimension 相关的非法组合：
+越界，以及 Top Per Group、条件/计算指标相关的非法组合：
 未选择的 partition 维度、未请求的 partition 排序目标、非稳定 partition 排序、
 非正或超上限的 `take`、partition 与全局 limit/offset 组合、条件指标 predicate
 引用未授权/不可筛选/未知枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术、
@@ -1622,8 +1589,7 @@ union，不是 UNION ALL）。
 在资产根目录运行：
 
 ```bash
-./bin/telora -C ontology test ontology
-./bin/telora -C ontology test intent
+./bin/telora -C ontology test ontology/intent
 ./bin/telora -C ontology test model-rules
 python3 scripts/test-model-diagnostics.py
 ```
@@ -1632,152 +1598,11 @@ python3 scripts/test-model-diagnostics.py
 `tests/diagnostics/rejections.telora` 的预期失败、消息、rule 模块与数据来源；该入口
 故意失败，应通过脚本验收，不应作为期望退出 0 的普通套件运行。
 
-`tests/ontology.telora` 覆盖 property fold、关系选择、筛选与 Top N、绑定顺序、profile、重复
-lowering 确定性、封闭枚举值域、封闭计算表达式（`If`/`Instr` 参与
-projection/grouping/ordering）、分页（offset 降低与绑定顺序、确定性）、领域
-scope（声明、合并顺序、参数化）、Top Per Group（每分区 Top 2、computed 维度
-tie-breaker、与全局 limit/offset 不组合）、条件/计算指标（FILTER lowering、
-依赖投影、计算指标参与普通与分区排序、全局 filter 与固有 predicate 分离、
-非 Timeline 的 Approval 条件计数与 Add/Sub 组合）及 JSON-backed Dimension（顶层
-与嵌套 path 的 projection/grouping/filter/order、path 参与 Top Per Group
-tie-breaker、binding 顺序确定性），并验证非法请求不发布可信结果，
-包括负 offset、缺排序 offset、scope/filter 冲突、partition 非法组合、计算指标
-契约破坏（未知依赖、依赖环、跨 grain）、filtered Measure 非法 predicate（引用
-未授权/不可筛选维度、不允许的 operation/input kind、enum 未知稳定值）与 JSON
-Dimension 拒绝（Profile 缺对应的有类型 JSON 提取算子、未授权 JSON Dimension、非法筛选输入、
-未请求排序目标）。测试还覆盖下一轮能力：measureless
-行级投影（无虚构 COUNT、无 grouping、跨安全 join 列表、contains 参数化绑定）、
-文本筛选算子（starts-with/contains/not-contains/ends-with 的封闭 lowering 与
-binding 顺序）、HAVING（阈值绑定、需已选 measure）、EXISTS（fan-out 必需实体改为
-相关存在谓词、不产生 fan-out join）与结构化复合关系键（`And` 合取键降低为
-`join_on` 的 AND ON 条件）。本轮的受控两跳相关存在也纳入覆盖：知识 payload 保存
-Component → Site → Alarm 路线；两跳 lowering 只发 grain-safe owner join + 相关
-EXISTS（SQL 形状、外层 grain 不被 Site→Alarm fan-out 放大、`min_matches` 分组计数、
-内层筛选绑定顺序与重复 lowering 逐字节一致）；fan-out 首跳的两跳路线走 link 形状
-（B/C 在同一个 EXISTS 内 JOIN）；纯可行性/内层筛选探针对未知/自指/无关
-target 返回拒绝；路线 prepare 探针验证合法路线解析一次，并拒绝非唯一 owner、方向不匹配、
-同 base 同 target 多路线歧义与 `via`→target 关系歧义；较密的 hub/leaf 关系图在
-prepare 时保持有界不耗尽求值燃料。双端 hub 切片也纳入覆盖：payload 保存 Pair(hub base)→Member 双端路线；union EXISTS
-lowering 方向为 `FROM hub WHERE EXISTS(participant ...)`（左右角色两条 alternative、
-无 fan-out join、绑定顺序与逐字节确定性）、participant 属性内层筛选参数化、可行性
-探针，以及 prepare 对同端、非 key participant、participant 缺 key、端点越界与重复
-声明的确定性拒绝。paired-endpoint（peer）切片也纳入覆盖：payload 保存
-Pair(hub base) 的同 participant peer 路线；`lower_peer` 对两个指定 Member key 生成
-双内层 alias 的 correlated EXISTS（`((left = mo.id AND right = mp.id) OR
-(right = mo.id AND left = mp.id)) AND mo.id <> mp.id AND mo.id = ? AND mp.id = ?`）、
-bindings 按占位符
-顺序、无外层 JOIN/fan-out、交换顺序共享同一 SQL 形状且 key 绑定镜像、重复 lowering
-逐字节一致；`peer_request_ok` 纯探针对合法/自配/未知实体/无路线 hub 返回预期；异构
-（不同 participant 表）peer 路线 forward/swap 请求都各自以请求声明的 participant
-表为内层源生成两组交换分支，跨表同值 key 保持独立内层 alias，杜绝把同一端点值同时
-解释为两种实体；filtered-participant 能力覆盖：同类型两侧属性过滤、异构两侧属性过滤、
-key+属性混合（同侧 AND，key 绑定先于属性）、A/Z 交换、跨表相同 key、两侧过滤值相同
-（各自独立 alias 绑定）、过滤引用错误实体、entity-only participant（合法）、未授权算子、
-self-pair、
-无 route，以及重复 lowering SQL/bindings 完全一致；同实体（exact-key / attribute-only /
-key+attribute / entity-only）SQL 均含 `origin.key <> peer.key` 身份不等（self-loop 结构性
-证明），相同过滤值双 alias 成功且含身份不等，异构（不同表）不出现裸 key 不等、跨表相同
-key 保持合法；结构断言验证只有一个 correlated
-EXISTS、两个 participant alias、两个交换分支，每侧过滤只引用自己的 alias；query 结构
-测试验证两个 participant alias 都存在、各自只出现在自己的端点 equality 与 filter、
-两组交换分支齐全，并确定性拒绝同端、self-pair 身份缺失形状；prepare 对同端字段、非
-key participant、越界与同一 participant 对的重复 peer 路线确定性拒绝；同一 hub 的
-多类 participant `dual_hub` 元数据仍合法。本轮 spider 评估形状测试另覆盖：行级请求
-按未投影的已授权维度排序（含 Top N、返回列不含 C）、`lower_distinct` 的
-`SELECT DISTINCT`（多维度、含 JSON 维度过滤/排序/limit 的占位符顺序与确定性）、
-`lower_absence` 的 `NOT EXISTS`（零匹配主体、owner join、`negated` 结构标志）、
-两个独立 correlated EXISTS 表达“分别满足 A/B 的不同关联行”、跨关系无 measure 维度
-投影（无虚构 COUNT、无 GROUP BY）与返回列顺序契约（measures 在 dims 前、各自保持
-请求顺序）。spider round 3 测试另覆盖：`lower_internal_top` 分组维度请求只返回组列、
-按内部（未投影）聚合排序（含维度 tie-breaker 与 Top N 绑定）、`check_internal_top_group`
-的 SQL/分组/投影结构断言，以及 measureless 请求用直接关系（反向 fan-out）的
-correlated EXISTS 证明主体存在而只返回主体维度（无 link-count measure、无 join/group）。
-spider round 4 测试另覆盖 fan-out 首跳的两跳 link 存在：`check_link_route_prepared`
-（fan-out 首跳路线 resolve 一次）、`check_link_two_hop_lowering`（B/C 在同一个
-correlated EXISTS 内 JOIN、无外层 fan-out join、目标过滤绑定）、
-`check_link_two_hop_returns_subject_dims_only`（measureless 只返回主体维度）与
-`check_link_two_hop_deterministic_and_absence`（重复 lowering 逐字节一致、NOT EXISTS
-反存在）。related aggregate 测试另覆盖 `check_related_aggregate_ordering_top_n`（隐藏
-关联计数排序 + Top-N）、`check_related_aggregate_having`（隐藏关联计数 HAVING + 阈值
-binding）、`check_related_aggregate_reverse_relation`（反向声明关系按 prepared 方向
-join）与 `check_related_aggregate_deterministic_and_rejections`（重复 lowering 一致；
-越权/未知 measure/无关系/歧义经 `related_measure_ok` 确定性拒绝）。bounded two-hop
-related aggregate 测试另覆盖合成 `rm_subjects`/`rm_intermediates`/`rm_events` fixture：
-`check_related_two_hop_ordering_top_n`（subject → intermediate → event population 的
-唯一两跳 route：隐藏 count 排序 + Top-N 的精确 SQL、两个 route join 依依赖顺序、只按
-主体维度分组、只投影主体维度）、`check_related_two_hop_having`（同一两跳 route 的隐藏
-聚合 HAVING 精确 SQL/绑定、隐藏 measure 不投影）、
-`check_related_two_hop_determinism`（重复 lowering 逐字节一致）与
-`check_related_two_hop_rejection_probes`（唯一两跳 route 可行；直接路线优先于较长
-detour；唯一三跳 route 可 lower 为三个依赖有序 join 的精确 SQL；无已声明路线、越权
-role、未知 measure 经 `related_measure_ok` 确定性拒绝）。集合运算测试另覆盖
-`check_set_intersect_direct`（直接 INTERSECT + 左到右 bindings）、
-`check_set_union_and_except_keywords`（去重 UNION/EXCEPT 关键字，非 UNION ALL）、
-`check_set_outer_count`（外层单列 count over 派生集合）与 `check_set_deterministic`
-（重复 lowering 一致）。显式投影顺序测试另覆盖 `check_explicit_projection_order`（跨 measure/dimension
-交错列序、只改 SELECT 列序）与 `check_default_projection_order_compat`（空 order 保留
-默认 measure-then-dimension 行为）。field-to-field 谓词测试另覆盖
-`check_field_to_field_success`（双列比较、无 binding、不加入投影）、
-`check_field_to_field_combination_and_determinism`（与普通标量过滤组合的谓词/bindings
-顺序与重复 lowering）与 `check_field_to_field_rejections`（未知/未授权/跨实体/类型不兼容/
-非法算子经纯探针确定性拒绝）。hidden same-source HAVING 测试另覆盖
-`check_hidden_having_same_source`（隐藏 OrderCount HAVING 不进入投影、SQL
-`GROUP BY ... HAVING count(...) >= ?`、阈值绑定）与
-`check_hidden_having_determinism_and_probe`（重复 lowering 一致；同源/越权/未知/跨实体
-measure 经 `same_source_having_ok` 确定性拒绝）。attribute-versus-aggregate 测试另覆盖
-`check_attribute_vs_scalar_aggregate`（**数值正例**：外层 Int 属性 OrderId vs 数值
-`sum(OrderAmount)`——Plan 级单一标量聚合比较谓词、投影只含列表维度、
-`o.order_id > (SELECT sum(o.amount) FROM orders AS o)` 的 SQL 形状、无动态绑定）与
-`check_attribute_vs_scalar_aggregate_probe_and_determinism`（重复 lowering 逐字节一致；
-数值外层 + 数值聚合与 Count 整数结果可行；text-vs-number（OrderRegion vs sum）、
-enum-vs-number（CustomerTier vs count）、越权、未知/跨实体属性、未知 measure 经
-`attribute_compare_ok` 确定性拒绝）。scoped attribute-versus-aggregate 测试另覆盖
-合成领域 `sc_accounts`/`sc_txns` fixture：`check_scoped_attribute_compare_positive`
-（数值外层 ScAccountId vs 带**两个有序 scope filter** 的 `avg` 内层聚合，精确
-SQL/bindings、投影保持、无 join/EXISTS、无 `coalesce`）、
-`check_scoped_attribute_compare_min_max`（带单 scope filter 的 `max`/`min` 聚合精确
-SQL/bindings）、`check_scoped_attribute_compare_empty_and_determinism`（空 scope
-保持全局聚合行为、`scoped_attribute_compare_ok([])` 与既有无 scope 探针一致、重复
-lowering 逐字节一致）、`check_scoped_attribute_compare_profile_and_projection`
-（全 profile 接受、缺 `Avg` 的 profile 递归拒绝、投影保持）与
-`check_scoped_attribute_compare_rejections`（scope filter 属于外层 base 实体而非内层
-实体、跨实体维度、未知/未授权/不可筛选维度、不支持算子、非法输入类型、越权 role 全部
-经 `scoped_attribute_compare_ok` 确定性拒绝；两个合法内层实体 scope filter 可行）。
-ranked grouped-key comparison 测试另覆盖合成 `sc_accounts`/`sc_txns` fixture：
-`check_ranked_key_positive`（多实体正例：外层 account kind 行被“按
-`max(amount_max) DESC` 排名第一的 txn category key”过滤，精确 projection/SQL/
-bindings）、`check_ranked_key_scoped_and_min_asc`（带内层 scope filter 的 asc
-`min` 排名与直接同 grain `count` DESC 排名的精确 SQL/bindings）、
-`check_ranked_key_rejections`（外 key/分组 key 类型不兼容、measure 非内层
-population grain、未知外属性/分组维度/measure、未授权分组维度、scope 归属/输入
-错误全部经 `ranked_key_compare_ok` 拒绝）与
-`check_ranked_key_determinism_profile_and_compat`（重复 lowering 逐字节一致、
-全 profile 接受而缺排名聚合的 profile 拒绝、既有 scalar aggregate comparison 未被
-注入/保持不变）。ranked outer-join 与路由边界另覆盖合成
-`rk_lines`/`rk_parents`/`rk_events`（及 fan-out/歧义/union 变体）fixture：
-`check_ranked_key_outer_parent_join`（detail-grain base 的比较属性位于安全可达的
-父实体：外层 Plan 精确物化唯一 Safe 路径的 Inner join、SQL/bindings/projection
-精确、detail grain 不被分组、比较属性与排名 measure 不进入投影、探针可行）与
-`check_ranked_key_fanout_route_rejected`（fan-out-only owner 被探针拒绝，base 自身
-属性仍可行）、`check_ranked_key_ambiguous_route_rejected`（两条并行 Safe 路由：
-路径矩阵仍记录首条 Safe 路径、`ambiguous_paths` 歧义标志为真、探针拒绝而不按声明
-顺序选择）、`check_ranked_key_missing_route_rejected`（与 base 无已声明路由的
-owner 被拒绝）及 `check_ranked_key_derived_plan_join_rejected`（derived(union)
-外层 Plan 对需要新增 join 的父属性拒绝、base 自身属性可行）。
-query 模块测试另覆盖 `qb.transform_sqlite_distinct`、
-`qb.exists_not`、`OrderKey Aggregate` 内部排序聚合与 `qb.exists_two_hop`
-（SQL/bindings/确定性）。model-derived intent factory 测试（`@test/intent`）另覆盖
-**两份结构不同的领域中性模型**（虚构企业 `@test/test_knowledge` 与本地 org
-teams/members 模型）：`count_members`/`filtered_members`/`knowledge_distinct`
-（精确 SQL/bindings），`org_field_to_field`（`list` 内 field-to-field 谓词降低为
-双列比较、无 binding）、`org_hidden_row_ordering`（行级按未投影维度排序）、
-`org_selected_having` / `org_hidden_having`（selected 与隐藏同源聚合 HAVING 精确
-SQL/bindings）、`org_related_exists` / `org_related_absence`（相关存在/NOT EXISTS）、
-`org_related_hidden_ordering`（`top`：隐藏相关聚合排序 + Top-N 的 route join）、
-`org_set_intersect` / `org_set_count`（集合组合与外层 count），以及
-`deterministic_knowledge` / `deterministic_org`（重复 lowering 逐字节一致）；拒绝侧
-经纯探针 `query_intent_ok` 覆盖未授权 subject、未知 op、malformed measures、非
-`list` 上的 field-to-field 谓词、未知 set kind，并保留合法 intent 的正控断言。
+现有回归入口为 `tests/ontology/intent.telora`（跨模型意图、binding 与 SQL）、
+`tests/query.telora`（封闭 AST 与 SQLite 物化）、`tests/postgres.telora`
+（PostgreSQL 物化）、`tests/model-rules.telora`（模型定义约束）以及诊断脚本。
+早期针对旧 AST 形状的 `tests/ontology.telora` 已移除；新的领域能力应以
+具体合法意图、构造期句柄以及 SQLite/PostgreSQL 实际物化行为建立验收测试。
 
 具名安全边还支持 `list_roles`：根实体维度加上若干
 `{relation, dimension, output}`，每个角色生成独立 JOIN 别名和命名投影，

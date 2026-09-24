@@ -42,7 +42,6 @@ type ColumnRef = struct { source: String, column: String };
 
 type ScalarFunction = enum {
     Substr, Instr, If, Add, Sub, Lower, Length,
-    JsonExtractText, JsonExtractInt, JsonExtractNumber, JsonType, JsonValid,
     Eq, Ne, Lt, Le, Gt, Ge, And, Or, Not,
 };
 type ScalarCall = struct { function: ScalarFunction, args: Array(Expr) };
@@ -157,9 +156,6 @@ alias 做 `Add`/`Sub` 算术组合。
 | `Add` / `Sub` | 2 | 整数算术，渲染为 `(a + b)` / `(a - b)` |
 | `Lower` | 1 | `lower(value)`：大小写归一；默认 SQLite build 只折叠 ASCII A-Z |
 | `Length` | 1 | `length(value)`：文本按字符计数的长度 |
-| `JsonExtract` | 2 | `json_extract(document, path)`；path 是结构化 `JsonPath` |
-| `JsonType` | 2 | `json_type(document, path)`；path 是结构化 `JsonPath` |
-| `JsonValid` | 1 | `json_valid(document)` |
 | `Eq/Ne/Lt/Le/Gt/Ge` | 2 | 比较运算 |
 | `And` / `Or` | 2 | 逻辑运算 |
 | `Not` | 1 | 逻辑非 |
@@ -177,12 +173,6 @@ Ontology eDSL 以 `FieldFilterRequest` / `lower_field_filtered` 公开这一 sha
 收窄：比较 scalar（`Eq`/`Ne`/…）必须出现在 `allowed_scalars`，`Column` 与 `Scalar`
 operator 必须被允许；profile 只保留部分能力时，调用方只能引用该属性在 profile 下
 实际保留的比较能力。
-
-SQLite JSON1 v1 词汇（`JsonExtract`/`JsonType`/`JsonValid`）同样属于
-`allowed_scalars` 并消耗 `Scalar` operator。`JsonExtract`/`JsonType` 的第二个参数
-（JSON path）在结构校验中必须确认为 `JsonPath`：列、计算表达式、普通 Bind
-或缺失参数均原子失败；SQLite 渲染时将路径段序列化后经 `?` 进入 bindings，绝不插入 SQL 文本。arity 固定
-（Extract/Type 为 2，Valid 为 1）。
 
 ### Plan
 
@@ -376,8 +366,6 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `aggregate_filtered` | `Fn(AggregateFunction, Expr, Bool, Option(Expr), String) -> SelectItem` |
 | `computed_aggregate` | `Fn(ComputedOp, String, String, String) -> ComputedAggregate` |
 | `computed_item` | `Fn(ComputedOp, String, String, String) -> SelectItem` |
-| `json_extract` / `json_type` | `Fn(Expr, String) -> Expr` |
-| `json_valid` | `Fn(Expr) -> Expr` |
 | `source` | `Fn(String, String) -> Source` |
 | `column_eq` | `Fn(ColumnRef, ColumnRef) -> ColumnEq` |
 | `on_eq` | `Fn(ColumnRef, ColumnRef) -> JoinCondition` |
@@ -771,70 +759,6 @@ bindings 严格按占位符出现顺序：两个 FILTER 的 `?`、全局 WHERE�
   aggregate 语义或用户提供的 aggregate expression；
 - ordering、全局分页与分组内 Top N 可以引用最终 computed aggregate；与分组内
   Top N 组合时按分区内 ordering 稳定排序。
-
-## SQLite JSON v1
-
-从 `payload_json` 风格列提取字段，并用于 projection、filter、grouping 与
-ordering。公共 AST 保存结构化 `JsonPath`；SQLite 渲染器生成字符串 `Bind`，
-进入 `?`/bindings，绝不进入 SQL 文本。
-
-```telora
-def attempts: qb.Plan = {
-    revision: "attempt-json-v1",
-    sources: [qb.source("e", "events")],
-    projection: [
-        qb.expr_item(qb.column("e", "id")),
-        qb.expr_item(qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("attempt_id")]), qb.JsonScalarKind.Int)),
-        qb.expr_item(qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("status")]), qb.JsonScalarKind.Text)),
-        qb.expr_item(qb.json_type(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("amount")]))),
-        qb.expr_item(qb.json_valid(qb.column("e", "payload"))),
-    ],
-    filter: Some(qb.scalar(qb.ScalarFunction.Eq, [
-        qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("status")]), qb.JsonScalarKind.Text),
-        qb.bind_string("ok"),
-    ])),
-    joins: [],
-    grouping: [qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("attempt_id")]), qb.JsonScalarKind.Int)],
-    ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), qb.json_path([qb.JsonPathSegment.Key("attempt_id")]), qb.JsonScalarKind.Int))],
-    limit: None,
-    offset: None,
-    exists: [],
-    having: [],
-    partition: None,
-    derived: None,
-    scalar_comparisons: [],
-    ranked_key_comparisons: [],
-};
-```
-
-lowering：
-
-```sql
-SELECT e.id, json_extract(e.payload, ?), json_extract(e.payload, ?),
-       json_type(e.payload, ?), json_valid(e.payload)
-FROM events AS e
-WHERE json_extract(e.payload, ?) = ?
-GROUP BY json_extract(e.payload, ?)
-ORDER BY json_extract(e.payload, ?) ASC
-```
-
-bindings：`[String("$.attempt_id"), String("$.status"), String("$.amount"),
-String("$.status"), String("ok"), String("$.attempt_id"), String("$.attempt_id")]`
-——严格按占位符出现顺序。
-
-SQLite JSON1 标量语义（v1 精确采用，schema 保证被读文档是合法 JSON；v1 不在
-Query AST 内修复 malformed JSON）：
-
-- `json_extract(doc, path, kind)`：AST 必须显式声明 Text/Int/Number；path 缺失或
-  对应 JSON null → SQL NULL。声明类型是来源数据契约，不从过滤输入类型反推；
-  SQLite 当前调用 JSON1 `json_extract`，来源中与声明类型不符的 JSON 值不由
-  query renderer 自动修复或诊断，方言一致性需以符合契约的数据检验；
-- `json_type(doc, path)`：返回 SQLite 类型文本（`null`/`true`/`false`/
-  `integer`/`real`/`text`/`array`/`object`）或 path 缺失时 NULL；
-- `json_valid(doc)`：合法 JSON 返回 `1`，否则 `0`。
-
-path binding 在 projection、filter、grouping、ordering、computed dimension 与
-partition ordering 中保持严格占位符顺序与重复表达式确定性。
 
 ## 大小写归一与子串语义（Lower / Length / Instr / Substr）
 
@@ -1522,9 +1446,8 @@ JSON 文本不能保留整数值 Float 的身份：`Float(3.0)` 紧凑编码可�
 | count_groups：内层 HAVING 引用未知列/别名 | `count_groups` 失败（`validate` 前），或 `structure_ok == False` |
 | 派生 UNION ALL：derived 与物理 sources/joins/EXISTS 并存、空分支、列数为空/不一致、别名顺序不一致、重复/非法输出别名、派生 alias 遮蔽分支、外层引用未投影列 | `validate_structure` 失败，或 `structure_ok == False` |
 | Join ON：条件引用未知 alias、`And`/`Or` 为空 | `validate_structure` 失败，或 `structure_ok == False` |
-| JSON：Extract/Type arity 非 2、Valid arity 非 1、path 非结构化 `JsonPath`（列/计算表达式/普通 Bind/缺失） | `validate_structure` 失败，或 `structure_ok == False` |
 | FILTER predicate 使用 profile 未允许的表达式 | `validate` 失败，或 `profile_accepts == False` |
-| Profile 缺 JsonExtract / JsonType / JsonValid / Lower / Length | `validate` 失败，或 `profile_accepts == False` |
+| Profile 缺 Lower / Length | `validate` 失败，或 `profile_accepts == False` |
 | Profile 缺 `Exists` / `Having` | `validate` 失败，或 `profile_accepts == False` |
 | Profile 递归收窄嵌套体（count_groups 内层、相关聚合 EXISTS 内层、派生 UNION ALL 每个分支）：缺 Aggregate/Group/Having/Exists/Filter operator、缺 `allowed_aggregates` 中函数或缺内层 scalar | `count_groups`/`validate` 失败，或 `profile_accepts == False` |
 | SQLite 转换失败 | `transform_sqlite` 失败 |
@@ -1547,14 +1470,13 @@ JSON 文本不能保留整数值 Float 的身份：`Float(3.0)` 紧凑编码可�
 （SQL/bindings/offset 安全约束）、分组内 Top N（row_number 子查询、bindings、
 profile、tie-breaker 拒绝）、filtered/computed aggregates（FILTER lowering、计算
 聚合 arithmetic、computed 参与 ordering、computed 与分组 Top N 组合、未知操作数与
-循环依赖拒绝）、SQLite JSON1 v1（projection/filter/grouping/ordering 与 partition
-ordering 的 path binding 顺序、path 不进入 SQL 文本、profile 覆盖）、P0 新能力
+循环依赖拒绝）、P0 新能力
 （HAVING lowering/profile、Lower/Length 大小写归一与动态值不内联、EXISTS 半连接
 无 JOIN fan-out 与 profile、角色化/复合 ON Join）、嵌套聚合（count_groups 对满足
 HAVING 的组计数、相关聚合 EXISTS 的 group/having 与 base-grain 保持）、派生
 UNION ALL 关系（多来源合并为具名 source，外层分组/聚合/分区 Top 1 完整 SQL 形状、
 参数分支与 HAVING/过滤的固定 binding 顺序与确定性、profile 递归与非法结构拒绝）、
-多关系组合的确定性 SQL/bindings 顺序、JSON codec，并验证 JSON path、HAVING
+多关系组合的确定性 SQL/bindings 顺序、JSON codec，并验证 HAVING
 measure、EXISTS 相关引用、空 Join 条件、count_groups 内层未知列、相关聚合 EXISTS
 内层未知 grouping、派生 UNION 列集不一致/外层引用未投影列等非法 Plan 只产生诊断。
 测试还包含相同契约的逐项断言，包括
