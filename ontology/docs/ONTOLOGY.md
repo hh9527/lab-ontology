@@ -241,6 +241,7 @@ origin_field, participant, key_field, peer_field)`；它保留 origin/peer 的
 把子行谓词限制在 ON 条件内，因此 COUNT(child) 可以等于零。
 JOIN 的 ON 谓词是受 profile、别名和绑定校验的封闭表达式，不能把
 INNER JOIN 得到的 1..N 结果误称为 0..N。
+额外的 ON 谓词消耗 `Filter` 能力；单纯的列等值 JOIN 只消耗 `Join`/`Column`。
 
 领域作者用具名 struct 表达实体，用 property decorator 就近声明事实：
 
