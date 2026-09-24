@@ -9,6 +9,7 @@ identities remain structurally validated.
 
 本文档是 `ontology/query` 模块的使用指南与公共契约。QueryBuilder 接收结构化、
 后端无关的 `Plan`，验证其结构和能力范围，并确定性地生成参数化 SQLite `Query`。
+统一顶层 `QueryPlan` 与未来方言的共同执行验收见 [DIALECT-CONTRACT.md](DIALECT-CONTRACT.md)。
 
 ```telora
 import "ontology/query" as qb;
