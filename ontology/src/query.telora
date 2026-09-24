@@ -118,9 +118,12 @@ type JsonPath = struct { segments: Array(JsonPathSegment) };
 type Expr = enum {
     Column(ColumnRef),
     Bind(Val),
+    AllocatedBind(AllocatedBinding),
     JsonPath(JsonPath),
     Scalar(ScalarCall),
 };
+
+type AllocatedBinding = struct { index: Int };
 
 type AggregateFunction = enum {
     Count,
@@ -203,6 +206,33 @@ type Source = struct {
     alias: String,
     table: String,
     scope: Option(Expr),
+};
+
+# Construction-time identifiers are stable across all dialect renderers.
+type BuildCtx = struct { source_aliases: Array(String), bindings: Array(Val), next_binding: Int };
+
+def build_context: Fn() -> BuildCtx = fn() { {source_aliases: [], bindings: [], next_binding: 1} };
+
+def bind: Fn(BuildCtx, Val) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
+    ({...ctx, bindings: array::push(ctx.bindings, value), next_binding: ctx.next_binding + 1},
+        Expr::AllocatedBind({index: ctx.next_binding}))
+};
+
+def available_source_alias: Fn(Array(String), String, Int) -> String = fn(used, hint, index) {
+    let candidate = if index == 1 { hint } else { `\{hint}_\{index}` };
+    if array::any(used, fn(alias) { alias == candidate }) {
+        available_source_alias(used, hint, index + 1)
+    } else { candidate }
+};
+
+def source_with_hint: Fn(BuildCtx, String, String) -> Tuple([BuildCtx, Source]) = fn(ctx, table, hint) {
+    if !is_sql_identifier(table) || !is_sql_identifier(hint) {
+        fail!("invalid source table or alias hint", (table, hint))
+    } else {
+        let alias = available_source_alias(ctx.source_aliases, hint, 1);
+        let next: BuildCtx = {...ctx, source_aliases: array::push(ctx.source_aliases, alias)};
+        (next, {alias, table, scope: None})
+    }
 };
 
 type JoinKind = enum {
@@ -584,6 +614,7 @@ def expr_operators: Fn(Expr) -> Array(Operator) = fn(expr) {
     match expr {
         Expr::Column(_) => [Operator::Column],
         Expr::Bind(_) => [Operator::Bind],
+        Expr::AllocatedBind(_) => [Operator::Bind],
         Expr::JsonPath(_) => [Operator::Bind],
         Expr::Scalar(call) => {
             let empty: Array(Operator) = [];
@@ -948,6 +979,12 @@ def utc_days_args_ok: Fn(Array(Expr)) -> Bool = fn(args) {
     match args[0] {
         Expr::Bind(Val::String(_)) => match args[1] {
             Expr::Bind(Val::Int(days)) => days > 0,
+            Expr::AllocatedBind(_) => True,
+            _ => False,
+        },
+        Expr::AllocatedBind(_) => match args[1] {
+            Expr::Bind(Val::Int(days)) => days > 0,
+            Expr::AllocatedBind(_) => True,
             _ => False,
         },
         _ => False,
@@ -972,6 +1009,7 @@ def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
     match expr {
         Expr::Column(ref) => is_sql_identifier(ref.column) && known_alias(aliases, ref.source),
         Expr::Bind(_) => True,
+        Expr::AllocatedBind(binding) => binding.index > 0,
         Expr::JsonPath(_) => False,
         Expr::Scalar(call) => {
             array::all(call.args, fn(arg) { json_path_ok(arg) || expr_valid(arg, aliases) })
@@ -1476,6 +1514,7 @@ def expr_derived_cols_ok: Fn(Expr, String, Array(String)) -> Bool = fn(expr, ali
             True
         },
         Expr::Bind(_) => True,
+        Expr::AllocatedBind(_) => True,
         Expr::JsonPath(_) => True,
         Expr::Scalar(call) => array::all(call.args, fn(arg) { expr_derived_cols_ok(arg, alias, names) }),
     }
@@ -1859,6 +1898,7 @@ def expr_subqueries: Fn(Expr) -> Array(ScalarSubquery) = fn(expr) {
             let empty: Array(ScalarSubquery) = [];
             empty
         },
+        Expr::AllocatedBind(_) => [],
         Expr::JsonPath(_) => {
             let empty: Array(ScalarSubquery) = [];
             empty
@@ -2201,6 +2241,7 @@ def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed)
     match expr {
         Expr::Column(_) => True,
         Expr::Bind(_) => True,
+        Expr::AllocatedBind(_) => True,
         Expr::JsonPath(_) => True,
         Expr::Scalar(call) => {
             let self_ok = array::any(allowed, fn(candidate) { candidate == call.function });
@@ -2579,6 +2620,7 @@ def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
             (`\{ref.source}.\{ref.column}`, empty)
         },
         Expr::Bind(val) => ("?", [val]),
+        Expr::AllocatedBind(binding) => fail!("SQLite numbered binding rendering requires a build context", binding),
         Expr::JsonPath(path) => ("?", [Val::String(sqlite_json_path(path))]),
         Expr::Scalar(call) => {
             let rendered_args = array::map(call.args, render_expr);
@@ -2588,6 +2630,25 @@ def render_expr: Fn(Expr) -> Tuple([String, Array(Val)]) = fn(expr) {
             (render_scalar_sql(call.function, sql_parts), bindings)
         },
     }
+};
+
+def render_numbered_expr: Fn(Expr, BuildCtx) -> String = fn(expr, ctx) {
+    match expr {
+        Expr::Column(ref) => if is_sql_identifier(ref.source) && is_sql_identifier(ref.column) {
+            `"\{ref.source}"."\{ref.column}"`
+        } else { fail!("invalid column symbol", ref) },
+        Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(ctx.bindings) {
+            `?\{binding.index}`
+        } else { fail!("binding handle is not registered in builder context", binding) },
+        Expr::Scalar(call) => render_scalar_sql(call.function,
+            array::map(call.args, fn(arg) { render_numbered_expr(arg, ctx) })),
+        Expr::Bind(_) => fail!("context-bound expression cannot mix legacy bindings", expr),
+        Expr::JsonPath(_) => fail!("context-bound expression requires an allocated JSON path", expr),
+    }
+};
+
+def render_sqlite_expr_with_context: Fn(Expr, BuildCtx) -> Query = fn(expr, ctx) {
+    {sql: render_numbered_expr(expr, ctx), bindings: ctx.bindings}
 };
 
 # Renders a scalar-subquery payload to `(<sql>)` plus its bindings.  Bindings
@@ -4191,6 +4252,11 @@ pub use self::{
     HavingMeasure,
     Having,
     Source,
+    AllocatedBinding,
+    BuildCtx,
+    build_context,
+    bind,
+    source_with_hint,
     JoinKind,
     JoinCondition,
     Join,
@@ -4233,6 +4299,7 @@ pub use self::{
     transform_sqlite_set,
     transform_sqlite_set_count,
     transform_sqlite_query_plan,
+    render_sqlite_expr_with_context,
     set_ok,
     set_op_sql,
     count_groups,

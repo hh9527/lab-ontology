@@ -3,6 +3,42 @@ use std::test as test;
 use crate::query as qb;
 use crate::postgres as pg;
 
+pub def source_hint_allocates_stable_join_aliases: test::Test = test::should_ok(fn() {
+    let first = qb::source_with_hint(qb::build_context(), "table1", "t");
+    let second = qb::source_with_hint(first.0, "table2", "t");
+    let third = qb::source_with_hint(second.0, "table3", "t");
+    let plan: qb::Plan = {
+        revision: "alias-allocation", sources: [first.1],
+        joins: [qb::join(qb::JoinKind::Inner, second.1,
+            qb::column_ref(first.1.alias, "id"), qb::column_ref(second.1.alias, "parent_id")),
+            qb::join(qb::JoinKind::Inner, third.1,
+            qb::column_ref(second.1.alias, "id"), qb::column_ref(third.1.alias, "parent_id"))],
+        projection: [qb::expr_item(qb::column(third.1.alias, "id"))],
+        filter: None, grouping: [], having: [], ordering: [], limit: None, offset: None,
+        exists: [], derived: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    let query = pg::render_rows_candidate(plan, False);
+    if first.1.alias == "t" && second.1.alias == "t_2" && third.1.alias == "t_3"
+        && string::contains(query.sql, "SELECT \"t_3\".\"id\" FROM \"table1\" AS \"t\"")
+        && string::contains(query.sql, "\"t\".\"id\" = \"t_2\".\"parent_id\"")
+        && string::contains(query.sql, "\"t_2\".\"id\" = \"t_3\".\"parent_id\"") {
+        True
+    } else { fail!("source hints must allocate stable reusable aliases", query) }
+});
+
+pub def allocated_binding_reuses_physical_placeholder: test::Test = test::should_ok(fn() {
+    let first = qb::bind(qb::build_context(), qb::Val::Int(1));
+    let second = qb::bind(first.0, qb::Val::Int(2));
+    let expr = qb::scalar(qb::ScalarFunction::And, [
+        qb::scalar(qb::ScalarFunction::Eq, [first.1, second.1]),
+        qb::scalar(qb::ScalarFunction::Eq, [first.1, second.1]),
+    ]);
+    let query = pg::render_expr_with_context(expr, second.0);
+    if query.sql == "($1 = $2 AND $1 = $2)" && query.bindings == [qb::Val::Int(1), qb::Val::Int(2)] {
+        True
+    } else { fail!("binding handles must retain their physical placeholder across reuse", query) }
+});
+
 pub def nested_json_bind_order: test::Test = test::should_ok(fn() {
     let path = qb::json_path([qb::JsonPathSegment::Key("a.b"), qb::JsonPathSegment::FromEnd(1)]);
     let predicate = qb::scalar(qb::ScalarFunction::Eq, [

@@ -13,6 +13,7 @@ def path_value: Fn(qb::JsonPathSegment) -> qb::Val = fn(segment) {
 type RenderCtx = struct {
     next_binding: Int,
     bindings: Array(qb::Val),
+    builder_bindings: Array(qb::Val),
     reserved_aliases: Array(String),
     next_alias: Int,
 };
@@ -21,7 +22,7 @@ type Emitted = struct { sql: String, ctx: RenderCtx };
 
 pub def context: Fn(Int, Array(String)) -> RenderCtx = fn(start, reserved) {
     if start <= 0 { fail!("PostgreSQL placeholder index must be positive", start) }
-    else { {next_binding: start, bindings: [], reserved_aliases: reserved, next_alias: 0} }
+    else { {next_binding: start, bindings: [], builder_bindings: [], reserved_aliases: reserved, next_alias: 0} }
 };
 
 def bind: Fn(RenderCtx, qb::Val) -> Emitted = fn(ctx, value) {
@@ -100,6 +101,10 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
             {sql: `"\{ref.source}"."\{ref.column}"`, ctx}
         } else { fail!("invalid PostgreSQL column identifier", ref) },
         qb::Expr::Bind(value) => bind(ctx, value),
+        qb::Expr::AllocatedBind(binding) => if binding.index > 0
+            && binding.index <= array::length(ctx.builder_bindings) {
+            {sql: `$\{binding.index}`, ctx}
+        } else { fail!("binding handle is not registered in builder context", binding) },
         qb::Expr::JsonPath(path) => path_expr(path, ctx),
         qb::Expr::Scalar(call) => {
             let initial: Arguments = {sql: [], ctx};
@@ -115,6 +120,14 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
 pub def render_expr: Fn(qb::Expr, Int) -> qb::Query = fn(expr, start) {
     let emitted = emit_expr(expr, context(start, []));
     {sql: emitted.sql, bindings: emitted.ctx.bindings}
+};
+
+pub def render_expr_with_context: Fn(qb::Expr, qb::BuildCtx) -> qb::Query = fn(expr, builder) {
+    let initial: RenderCtx = {...context(1, []), builder_bindings: builder.bindings};
+    let emitted = emit_expr(expr, initial);
+    if array::length(emitted.ctx.bindings) != 0 {
+        fail!("context-bound expression cannot mix legacy bindings", expr)
+    } else { {sql: emitted.sql, bindings: builder.bindings} }
 };
 
 def quoted: Fn(String) -> String = fn(identifier) {
