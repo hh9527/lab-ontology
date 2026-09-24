@@ -4697,16 +4697,18 @@ def graph_correlation_pairs: Fn(PreparedPayload, RelationEntry, qb::Source, qb::
 };
 
 def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, anchor, spec, link) {
-    if array::length(spec.edges) != 1 || array::length(spec.nodes) != 1 {
-        fail!("unsupported business link in a multi-edge existence path", link.id)
-    } else {
+    if array::length(spec.edges) == 0 { fail!("business link existence requires an edge", link.id) }
+    else {
         let edge = get_index(spec.edges, 0);
         let from_anchor = edge.from == anchor.id;
         let next_id = if from_anchor { edge.to } else { edge.from };
         if !from_anchor && (edge.to != anchor.id || link.direction == LinkDirection::Directed) {
             fail!("directed business link cannot be traversed from Z to A", link.id)
         } else {
-            let node = get_index(spec.nodes, 0);
+            let node = match array::find(spec.nodes, fn(item) { item.id == next_id }) {
+                Some(item) => item,
+                None => fail!("graph business link references an unknown peer node", next_id),
+            };
             if node.id != next_id || anchor.entity != link.participant || entity_by_id(payload, node.entity) != link.participant {
                 fail!("graph business link endpoints must both be its declared participant", link.id)
             } else {
@@ -4727,8 +4729,41 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Graph
                 let condition = if symmetric { qb::on_or([branch_a, branch_z]) } else { peer_z };
                 let join = qb::join_on(qb::JoinKind::Inner, peer.1, condition);
                 let instances: Array(GraphInstance) = [anchor, {id: node.id, entity: link.participant, source: peer.1}];
-                let filtered = graph_filters(peer.0, payload, instances, spec.filters);
-                let exists = qb::exists_path_alternatives(hub.1, correlation, [join]);
+                let tail = array::filter(array::enumerate(spec.edges), fn(indexed) { indexed.0 > 0 });
+                let built = array::fold(tail, (peer.0, instances, [join]), fn(state, indexed) {
+                    let next_edge = indexed.1;
+                    if array::any(payload.business_links, fn(entry) { entry.id == next_edge.relation }) {
+                        fail!("unsupported second business link in one existence graph", next_edge.relation)
+                    } else {
+                        let forward = array::any(state.1, fn(item) { item.id == next_edge.from });
+                        let backward = array::any(state.1, fn(item) { item.id == next_edge.to });
+                        if forward == backward {
+                            fail!("graph existence edge must introduce one node connected to the root", next_edge.relation)
+                        } else {
+                            let previous = graph_instance(state.1, if forward { next_edge.from } else { next_edge.to });
+                            let new_id = if forward { next_edge.to } else { next_edge.from };
+                            let new_node = match array::find(spec.nodes, fn(item) { item.id == new_id }) {
+                                Some(item) => item,
+                                None => fail!("graph existence edge references an unknown inner node", next_edge.relation, new_id),
+                            };
+                            let relation = relation_domain(payload, next_edge.relation);
+                            let new_entity = entity_by_id(payload, new_node.entity);
+                            if (forward && (relation.from != previous.entity || relation.to != new_entity))
+                                || (!forward && (relation.to != previous.entity || relation.from != new_entity)) {
+                                fail!("graph existence edge role or target does not match declared relation", next_edge.relation, new_node.entity)
+                            } else {
+                                let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_id);
+                                let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
+                                let conditions = array::map(pairs, fn(pair) { qb::on_eq(pair.left, pair.right) });
+                                let next_join = qb::join_on(qb::JoinKind::Inner, source.1, qb::on_and(conditions));
+                                let instance: GraphInstance = {id: new_id, entity: new_entity, source: source.1};
+                                (source.0, array::push(state.1, instance), array::push(state.2, next_join))
+                            }
+                        }
+                    }
+                });
+                let filtered = graph_filters(built.0, payload, built.1, spec.filters);
+                let exists = qb::exists_path_alternatives(hub.1, correlation, built.2);
                 let exists = {...exists, filter: filtered.1};
                 (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
             }
@@ -4747,23 +4782,26 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
     }) { fail!("graph existence node ids must be distinct from outer graph instances") }
     else {
         match array::find(payload.business_links, fn(link) {
-            array::any(spec.edges, fn(edge) { edge.relation == link.id })
+            get_index(spec.edges, 0).relation == link.id
         }) {
             Some(link) => graph_link_existence(ctx, payload, anchor, spec, link),
             None => do {
         let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq))) = (ctx, [anchor], []);
         let built = array::fold(spec.edges, initial, fn(state, edge) {
-            let forward = edge.from == get_index(state.1, array::length(state.1) - 1).id;
+            let forward = array::any(state.1, fn(item) { item.id == edge.from });
+            let backward = array::any(state.1, fn(item) { item.id == edge.to });
             let next_id = if forward { edge.to } else { edge.from };
             let previous_id = if forward { edge.from } else { edge.to };
-            let previous = get_index(state.1, array::length(state.1) - 1);
-            let next_node = match array::find(spec.nodes, fn(node) { node.id == next_id }) {
-                Some(node) => node,
-                None => fail!("graph existence edge references an unknown inner node", edge.relation, next_id),
-            };
-            if previous_id != previous.id || array::any(state.1, fn(item) { item.id == next_id }) {
-                fail!("graph existence edges must form an ordered path from the anchor", edge.relation)
+            if forward == backward {
+                fail!("graph existence edge must introduce one node connected to the root", edge.relation)
+            } else if array::any(payload.business_links, fn(link) { link.id == edge.relation }) {
+                fail!("unsupported business link after a physical existence edge", edge.relation)
             } else {
+                let previous = graph_instance(state.1, previous_id);
+                let next_node = match array::find(spec.nodes, fn(node) { node.id == next_id }) {
+                    Some(node) => node,
+                    None => fail!("graph existence edge references an unknown inner node", edge.relation, next_id),
+                };
                 let relation = relation_domain(payload, edge.relation);
                 let next_entity = entity_by_id(payload, next_node.entity);
                 let valid = if forward {
