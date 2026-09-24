@@ -353,3 +353,47 @@ pub def ranked_key_groups_projected_parameterized_expression: test::Test = test:
         True
     } else { fail!("ranked key must group the projected expression without duplicate binding", query) }
 });
+
+pub def partitioned_rows_allocate_hidden_columns_and_take: test::Test = test::should_ok(fn() {
+    let plan: qb::Plan = {
+        revision: "pg-partition", sources: [qb::source("e", "Events")],
+        projection: [qb::expr_item(qb::column("e", "id"))],
+        filter: Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("e", "status"), qb::bind_string("active")])),
+        exists: [], joins: [], grouping: [], having: [], ordering: [],
+        limit: None, offset: None, derived: None,
+        partition: Some(qb::partitioned_top_n([qb::column("e", "category")],
+            [qb::desc(qb::column("e", "score"))], 2)),
+        scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    let query = pg::render_rows_candidate(plan, False);
+    if query.bindings == [qb::Val::String("active"), qb::Val::Int(2)]
+        && string::contains(query.sql, "\"e\".\"category\" AS \"__q_1\"")
+        && string::contains(query.sql, "\"e\".\"score\" AS \"__q_2\"")
+        && string::contains(query.sql, "row_number() OVER (PARTITION BY \"e\".\"category\" ORDER BY \"e\".\"score\" DESC NULLS LAST) AS \"__q_3\"")
+        && string::contains(query.sql, "WHERE \"__q_4\".\"__q_3\" <= $2 ORDER BY \"__q_4\".\"__q_1\" ASC NULLS FIRST, \"__q_4\".\"__q_2\" DESC NULLS LAST") {
+        True
+    } else { fail!("partitioned rows must keep base projection and hidden ordering separate", query) }
+});
+
+pub def partitioned_grouped_measure_keeps_outer_projection: test::Test = test::should_ok(fn() {
+    let plan: qb::Plan = {
+        revision: "pg-group-partition", sources: [qb::source("e", "Events")],
+        projection: [qb::named_expr_item(qb::column("e", "category"), "category"),
+            qb::named_expr_item(qb::column("e", "kind"), "kind"),
+            qb::aggregate(qb::AggregateFunction::Sum, qb::column("e", "amount"), False, "total")],
+        filter: None, exists: [], joins: [],
+        grouping: [qb::column("e", "category"), qb::column("e", "kind")],
+        having: [], ordering: [], limit: None, offset: None, derived: None,
+        partition: Some(qb::partitioned_top_n([qb::column("e", "category")],
+            [qb::desc_aggregate("total"), qb::asc(qb::column("e", "kind"))], 1)),
+        scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    let query = pg::render_rows_candidate(plan, False);
+    if query.bindings == [qb::Val::Int(1)]
+        && string::contains(query.sql, "row_number() OVER (PARTITION BY \"e\".\"category\" ORDER BY sum(\"e\".\"amount\") DESC NULLS LAST, \"e\".\"kind\" ASC NULLS FIRST)")
+        && string::contains(query.sql, "GROUP BY \"e\".\"category\", \"e\".\"kind\"")
+        && string::contains(query.sql, "ORDER BY \"__q_1\".\"category\" ASC NULLS FIRST, \"__q_1\".\"total\" DESC NULLS LAST, \"__q_1\".\"kind\" ASC NULLS FIRST") {
+        True
+    } else { fail!("grouped partition must rank aggregates and expose only declared columns", query) }
+});

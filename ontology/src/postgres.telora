@@ -496,6 +496,14 @@ def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
     array::concat([
         array::map(plan.sources, fn(source) { source.alias }),
         array::map(plan.joins, fn(join) { join.source.alias }),
+        array::concat(array::map(plan.projection, fn(item) {
+            match item {
+                qb::SelectItem::Expr(_) => [],
+                qb::SelectItem::NamedExpr(named) => [named.alias],
+                qb::SelectItem::Aggregate(call) => [call.alias],
+                qb::SelectItem::Computed(ca) => [ca.alias],
+            }
+        })),
         array::map(plan.exists, fn(ex) { ex.source.alias }),
         array::concat(array::map(plan.scalar_comparisons, fn(cmp) {
             array::concat([[cmp.inner.source.alias],
@@ -525,11 +533,131 @@ def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
     context(1, plan_aliases(plan))
 };
 
+type PartitionItem = struct {sql: String, alias: String, ctx: RenderCtx};
+type PartitionItems = struct {sql: Array(String), aliases: Array(String), ctx: RenderCtx};
+
+def partition_item: Fn(qb::SelectItem, qb::Plan, RenderCtx) -> PartitionItem = fn(item, plan, ctx) {
+    match item {
+        qb::SelectItem::Expr(expr) => {
+            let emitted = emit_expr(expr, ctx);
+            let allocated = internal_alias(emitted.ctx);
+            {sql: `\{emitted.sql} AS \{quoted(allocated.0)}`, alias: allocated.0, ctx: allocated.1}
+        },
+        qb::SelectItem::NamedExpr(named) => {
+            let emitted = emit_expr(named.expr, ctx);
+            {sql: `\{emitted.sql} AS \{quoted(named.alias)}`, alias: named.alias, ctx: emitted.ctx}
+        },
+        qb::SelectItem::Aggregate(call) => {
+            let emitted = aggregate(call, ctx);
+            {sql: `\{emitted.sql} AS \{quoted(call.alias)}`, alias: call.alias, ctx: emitted.ctx}
+        },
+        qb::SelectItem::Computed(ca) => {
+            let emitted = measure(plan, ca.alias, ctx);
+            {sql: `\{emitted.sql} AS \{quoted(ca.alias)}`, alias: ca.alias, ctx: emitted.ctx}
+        },
+    }
+};
+
+def projected_expr_alias: Fn(qb::Expr, qb::Plan, Array(String)) -> Option(String) = fn(expr, plan, aliases) {
+    let entries = array::enumerate(plan.projection);
+    let found = array::find(entries, fn(pair) {
+        match pair.1 {
+            qb::SelectItem::Expr(value) => value == expr,
+            qb::SelectItem::NamedExpr(named) => named.expr == expr,
+            _ => False,
+        }
+    });
+    match found { Some(pair) => Some(aliases[pair.0]), None => None }
+};
+
+type PartitionKeys = struct {hidden: Array(String), outer: Array(String), ctx: RenderCtx};
+
+def partition_key: Fn(qb::Expr, qb::Plan, Array(String), PartitionKeys) -> PartitionKeys = fn(expr, plan, aliases, state) {
+    match projected_expr_alias(expr, plan, aliases) {
+        Some(name) => {hidden: state.hidden, outer: array::push(state.outer, name), ctx: state.ctx},
+        None => {
+            let emitted = emit_expr(expr, state.ctx);
+            let allocated = internal_alias(emitted.ctx);
+            {hidden: array::push(state.hidden, `\{emitted.sql} AS \{quoted(allocated.0)}`),
+                outer: array::push(state.outer, allocated.0), ctx: allocated.1}
+        },
+    }
+};
+
+def partition_order_key: Fn(qb::OrderBy, qb::Plan, Array(String), PartitionKeys) -> PartitionKeys = fn(item, plan, aliases, state) {
+    match item.key {
+        qb::OrderKey::Expr(expr) => partition_key(expr, plan, aliases, state),
+        qb::OrderKey::AggregateRef(ref) => {
+            {hidden: state.hidden, outer: array::push(state.outer, ref.alias), ctx: state.ctx}
+        },
+        qb::OrderKey::Aggregate(_) => fail!("partition ordering requires a projected aggregate", item),
+    }
+};
+
+def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = fn(plan, pt, ctx) {
+    let initial: PartitionItems = {sql: [], aliases: [], ctx};
+    let selected = array::fold(plan.projection, initial, fn(state, item) {
+        let emitted = partition_item(item, plan, state.ctx);
+        {sql: array::push(state.sql, emitted.sql),
+            aliases: array::push(state.aliases, emitted.alias), ctx: emitted.ctx}
+    });
+    let key_initial: PartitionKeys = {hidden: [], outer: [], ctx: selected.ctx};
+    let partition = array::fold(pt.partition_by, key_initial, fn(state, expr) {
+        partition_key(expr, plan, selected.aliases, state)
+    });
+    let order_initial: PartitionKeys = {hidden: [], outer: [], ctx: partition.ctx};
+    let ordered = array::fold(pt.order_by, order_initial, fn(state, item) {
+        partition_order_key(item, plan, selected.aliases, state)
+    });
+    let window_partition = render_exprs(pt.partition_by, ordered.ctx);
+    let window_initial: Arguments = {sql: [], ctx: window_partition.ctx};
+    let window_order = array::fold(pt.order_by, window_initial, fn(state, item) {
+        let rendered = order_item(item, plan, state.ctx);
+        {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+    });
+    let row_alias = internal_alias(window_order.ctx);
+    let source = render_from(plan, row_alias.1);
+    let join_initial: Arguments = {sql: [], ctx: source.ctx};
+    let joins = array::fold(plan.joins, join_initial, fn(state, join) {
+        let rendered = render_join(join, state.ctx);
+        {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+    });
+    let where_clause = render_where(plan, joins.ctx);
+    let grouping = render_exprs(plan.grouping, where_clause.ctx);
+    let having_initial: Arguments = {sql: [], ctx: grouping.ctx};
+    let having = array::fold(plan.having, having_initial, fn(state, item) {
+        let rendered = having_item(item, plan, state.ctx);
+        {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+    });
+    let inner_alias = internal_alias(having.ctx);
+    let take = bind(inner_alias.1, qb::Val::Int(pt.take));
+    let hidden = array::concat([partition.hidden, ordered.hidden]);
+    let row_number = `row_number() OVER (PARTITION BY \{window_partition.sql} ORDER BY \{string::join(window_order.sql, ", ")}) AS \{quoted(row_alias.0)}`;
+    let inner_items = array::concat([selected.sql, hidden, [row_number]]);
+    let join_sql = if array::length(plan.joins) > 0 { ` \{string::join(joins.sql, " ")}` } else { "" };
+    let group_sql = if array::length(plan.grouping) > 0 { ` GROUP BY \{grouping.sql}` } else { "" };
+    let having_sql = if array::length(plan.having) > 0 { ` HAVING \{string::join(having.sql, " AND ")}` } else { "" };
+    let inner_sql = `SELECT \{string::join(inner_items, ", ")} FROM \{source.sql}\{join_sql}\{where_clause.sql}\{group_sql}\{having_sql}`;
+    let outer_columns = array::map(selected.aliases, fn(name) { `\{quoted(inner_alias.0)}.\{quoted(name)}` });
+    let partition_order = array::map(partition.outer, fn(name) {
+        `\{quoted(inner_alias.0)}.\{quoted(name)} ASC NULLS FIRST`
+    });
+    let ranked_order = array::map(array::enumerate(pt.order_by), fn(pair) {
+        let direction = match pair.1.direction {
+            qb::Ordering::Asc => "ASC NULLS FIRST", qb::Ordering::Desc => "DESC NULLS LAST",
+        };
+        `\{quoted(inner_alias.0)}.\{quoted(ordered.outer[pair.0])} \{direction}`
+    });
+    let outer_order = string::join(array::concat([partition_order, ranked_order]), ", ");
+    {sql: `SELECT \{string::join(outer_columns, ", ")} FROM (\{inner_sql}) AS \{quoted(inner_alias.0)} WHERE \{quoted(inner_alias.0)}.\{quoted(row_alias.0)} <= \{take.sql} ORDER BY \{outer_order}`,
+        ctx: take.ctx}
+};
+
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
     let plan = if distinct { qb::validate_distinct_plan(raw) } else { qb::validate_structure(raw) };
-    if plan.partition != None {
-        fail!("PostgreSQL query shape is not yet implemented", plan)
-    } else {
+    match plan.partition {
+        Some(pt) => emit_partitioned(plan, pt, ctx),
+        None => {
         let select_initial: Arguments = {sql: [], ctx};
         let selected = array::fold(plan.projection, select_initial, fn(state, item) {
             let value = select_item(item, plan, state.ctx);
@@ -575,6 +703,7 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
         let order_sql = if array::length(plan.ordering) > 0 { ` ORDER BY \{string::join(ordering.sql, ", ")}` } else { "" };
         {sql: `\{prefix} \{string::join(selected.sql, ", ")} FROM \{source.sql}\{join_sql}\{where_sql}\{group_sql}\{having_sql}\{order_sql}\{limit.sql}\{offset.sql}`,
             ctx: offset.ctx}
+        },
     }
 };
 

@@ -9,8 +9,8 @@ simply producing syntactically plausible SQL.
 `ontology/postgres` has expression, Rows/DistinctRows, GroupCount and set candidate
 renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
 paging, derived UNION ALL sources and correlated EXISTS, including bounded
-linked and paired-endpoint bodies, scalar aggregate comparisons, and ranked-key
-comparisons. Every rendering stage takes and returns
+linked and paired-endpoint bodies, scalar aggregate comparisons, ranked-key
+comparisons, and initial partitioned Top-N. Every rendering stage takes and returns
 an immutable context that allocates numbered bindings and collision-free
 internal aliases. Unsupported shapes still fail explicitly; there is no
 complete `QueryPlan` materializer yet, so PostgreSQL is not an admitted dialect.
@@ -18,6 +18,11 @@ The shared set validator currently compares projection *shapes*, not SQL
 value types: a SQLite set can contain unlike scalar types while PostgreSQL
 may reject them. Type equivalence must be resolved before set operations can
 be admitted as supported PostgreSQL queries.
+Partitioned Top-N has execution checks for column grouping and aggregate
+ranking. Parameterized grouping expressions repeated in SELECT, window clauses
+and GROUP BY still need an expression-reference strategy: independently numbered
+PostgreSQL placeholders make otherwise identical expressions different grouping
+keys. The current candidate must not be promoted while that case is unresolved.
 
 ## Common contract
 

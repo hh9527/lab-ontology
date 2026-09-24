@@ -123,6 +123,35 @@ SELECT "o"."id" FROM "Orders" AS "o" WHERE "o"."category" = (
     GROUP BY 1 ORDER BY sum("e"."amount") FILTER (WHERE "e"."kind" = $5)
     DESC NULLS LAST LIMIT 1);
 
+PREPARE ontology_partitioned(text, integer) AS
+WITH "Events"("id", "category", "status", "score") AS
+    (VALUES (1, 'A', 'active', 10), (2, 'A', 'active', 20),
+            (3, 'A', 'active', 30), (4, 'B', 'active', 5))
+SELECT "__q_4"."__q_0" FROM (
+    SELECT "e"."id" AS "__q_0", "e"."category" AS "__q_1",
+        "e"."score" AS "__q_2",
+        row_number() OVER (PARTITION BY "e"."category"
+            ORDER BY "e"."score" DESC NULLS LAST) AS "__q_3"
+    FROM "Events" AS "e" WHERE "e"."status" = $1
+) AS "__q_4" WHERE "__q_4"."__q_3" <= $2
+ORDER BY "__q_4"."__q_1" ASC NULLS FIRST,
+    "__q_4"."__q_2" DESC NULLS LAST;
+
+PREPARE ontology_group_partitioned(integer) AS
+WITH "Events"("category", "kind", "amount") AS
+    (VALUES ('A', 'x', 1), ('A', 'y', 3), ('A', 'z', 5),
+            ('B', 'x', 2), ('B', 'y', 4))
+SELECT "ranked"."kind" FROM (
+    SELECT "e"."category" AS "category", "e"."kind" AS "kind",
+        sum("e"."amount") AS "total",
+        row_number() OVER (PARTITION BY "e"."category"
+            ORDER BY sum("e"."amount") DESC NULLS LAST,
+                "e"."kind" ASC NULLS FIRST) AS "rn"
+    FROM "Events" AS "e" GROUP BY "e"."category", "e"."kind"
+) AS "ranked" WHERE "ranked"."rn" <= $1
+ORDER BY "ranked"."category" ASC NULLS FIRST,
+    "ranked"."total" DESC NULLS LAST, "ranked"."kind" ASC NULLS FIRST;
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -188,6 +217,14 @@ BEGIN
     IF selected_id IS DISTINCT FROM 2 THEN
         RAISE EXCEPTION 'ranked grouped key or binding order differs';
     END IF;
+    EXECUTE 'EXECUTE ontology_partitioned(''active'', 2)' INTO selected_id;
+    IF selected_id IS DISTINCT FROM 3 THEN
+        RAISE EXCEPTION 'partitioned row rank or binding order differs';
+    END IF;
+    EXECUTE 'EXECUTE ontology_group_partitioned(1)' INTO selected_name;
+    IF selected_name IS DISTINCT FROM 'z' THEN
+        RAISE EXCEPTION 'partitioned grouped aggregate rank differs';
+    END IF;
 
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
@@ -211,4 +248,6 @@ DEALLOCATE ontology_linked;
 DEALLOCATE ontology_peer;
 DEALLOCATE ontology_scalar;
 DEALLOCATE ontology_ranked;
+DEALLOCATE ontology_partitioned;
+DEALLOCATE ontology_group_partitioned;
 COMMIT;
