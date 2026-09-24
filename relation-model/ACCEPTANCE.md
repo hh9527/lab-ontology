@@ -6,10 +6,18 @@ device ID and tenant ID agree. A/Z denote stored endpoint positions, not
 business direction. Neither a symmetric nor a directed peer relation has yet
 been declared; the ontology must not infer either from the two endpoint keys.
 
-The following cases specify the intended relation-based Intent contract. They
-are acceptance targets, not currently supported Intent syntax. Each positive
-case must lower to a QueryAst; each negative case must fail before QueryAst
-construction with a diagnostic identifying the edge, role, or missing proof.
+The following cases specify the intended relation-based Intent contract. The
+`graph` row-query shape now supports rooted, explicitly named instance trees,
+projection of authorized plain dimensions, forward and reverse navigation of
+declared edges, and rejects missing edges, role mismatches and disconnected
+nodes. Reverse navigation reads the same edge from its other endpoint; it does
+not establish any business-level peer direction or symmetry. `tests/graph.telora`
+exercises these cases against QueryAst and both SQL materializers.
+
+The remaining cases are acceptance targets, not currently supported Intent
+syntax. Each positive case must lower to a QueryAst; each negative case must
+fail before QueryAst construction with a diagnostic identifying the edge,
+role, or missing proof.
 
 | Positive intent | Negative neighbor / required diagnosis |
 | --- | --- |
@@ -23,5 +31,5 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The current Model only establishes
-the endpoint and tenant identity facts; symmetric/directed peer semantics are
-explicitly pending ontology vocabulary and must not pass prematurely.
+the endpoint and tenant identity facts; symmetric/directed peer semantics,
+graph-level existence and grain-aware aggregates remain pending.

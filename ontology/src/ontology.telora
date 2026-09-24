@@ -359,6 +359,18 @@ type PeerHubRelations = struct { origin: String, peer: String };
 
 type RelationKind = enum { Safe, FanOut };
 
+# A graph query names entity instances separately from entity types. Each edge
+# references a declared relation, whose from/to roles remain authoritative.
+type GraphNode = struct { id: String, entity: String };
+type GraphEdge = struct { relation: String, from: String, to: String };
+type GraphSelect = struct { node: String, dimension: String };
+type GraphRequest = struct {
+    root: String,
+    nodes: Array(GraphNode),
+    edges: Array(GraphEdge),
+    select: Array(GraphSelect),
+};
+
 # Filter operations. Comparison ops map to the closed query scalars
 # (FilterOp.Eq/FilterOp.Ne/FilterOp.Gt/FilterOp.Ge/FilterOp.Lt/FilterOp.Le); text ops (FilterOp.Contains/FilterOp.NotContains/FilterOp.StartsWith/
 # FilterOp.EndsWith) lower through the closed qb.ScalarFunction.Instr/qb.ScalarFunction.Lower/qb.ScalarFunction.Length/qb.ScalarFunction.Substr/qb.ComputedOp.Add/qb.ComputedOp.Sub
@@ -4500,6 +4512,109 @@ def key_to_condition: Fn(PreparedPayload, Int, Int, RelationKey) -> qb::JoinCond
         RelationKey::FieldEq(_) => fail!("unresolved relation field key"),
         RelationKey::And(keys) => qb::on_and(array::map(keys, fn(k) { key_to_condition(payload, from_entity, to_entity, k) })),
         RelationKey::Or(keys) => qb::on_or(array::map(keys, fn(k) { key_to_condition(payload, from_entity, to_entity, k) })),
+    }
+};
+
+# The relation key is prepared once, but graph instances can use the same
+# entity more than once; always qualify key columns with allocated sources.
+def graph_key_condition: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Source, RelationKey) -> qb::JoinCondition = fn(payload, relation, from_source, to_source, key) {
+    match key {
+        RelationKey::Eq(pair) => do {
+            let from_field = get_index(get_index(payload.entities, relation.from).fields, pair.from);
+            let to_field = get_index(get_index(payload.entities, relation.to).fields, pair.to);
+            qb::on_eq(qb::column_ref(from_source, from_field.column), qb::column_ref(to_source, to_field.column))
+        },
+        RelationKey::FieldEq(_) => fail!("unresolved graph relation key", relation.id),
+        RelationKey::And(parts) => qb::on_and(array::map(parts, fn(part) { graph_key_condition(payload, relation, from_source, to_source, part) })),
+        RelationKey::Or(parts) => qb::on_or(array::map(parts, fn(part) { graph_key_condition(payload, relation, from_source, to_source, part) })),
+    }
+};
+
+type GraphInstance = struct { id: String, entity: Int, source: qb::Source };
+
+def graph_node: Fn(GraphRequest, String) -> GraphNode = fn(request, id) {
+    match array::find(request.nodes, fn(node) { node.id == id }) {
+        Some(node) => node,
+        None => fail!("graph edge references an unknown node", id),
+    }
+};
+
+def graph_instance: Fn(Array(GraphInstance), String) -> GraphInstance = fn(instances, id) {
+    match array::find(instances, fn(instance) { instance.id == id }) {
+        Some(instance) => instance,
+        None => fail!("graph node is not connected to the root", id),
+    }
+};
+
+# Each edge adds exactly one new instance. This makes a rooted graph explicit
+# without choosing a shortest path or silently multiplying a join already used.
+def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
+    if !payload.authorize(subject) { fail!("subject is not authorized for graph query", subject) }
+    else if array::length(request.nodes) == 0 || array::length(request.select) == 0 {
+        fail!("graph requires nodes and projections")
+    } else if array::any(request.nodes, fn(node) {
+        node.id == "" || array::length(array::filter(request.nodes, fn(other) { other.id == node.id })) != 1
+    }) { fail!("graph node instance ids must be nonempty and unique") }
+    else {
+        let root_node = graph_node(request, request.root);
+        let root_entity = entity_by_id(payload, root_node.entity);
+        let root = entity_source_at_with_context(ctx, payload, get_index(payload.entities, root_entity), root_node.id);
+        let initial: (qb::BuildCtx, Array(GraphInstance), Array(qb::Join)) =
+            (root.0, [{id: root_node.id, entity: root_entity, source: root.1}], []);
+        let built = array::fold(request.edges, initial, fn(state, edge) {
+            let from_node = graph_node(request, edge.from);
+            let to_node = graph_node(request, edge.to);
+            if edge.from == edge.to { fail!("graph edge must connect distinct instances", edge.relation) }
+            else {
+                let relation = relation_domain(payload, edge.relation);
+                let from_entity = entity_by_id(payload, from_node.entity);
+                let to_entity = entity_by_id(payload, to_node.entity);
+                if relation.from != from_entity || relation.to != to_entity {
+                    fail!("graph edge role or target does not match declared relation", edge.relation, from_node.entity, to_node.entity)
+                } else if array::any(state.1, fn(item) { item.id == edge.from })
+                    && array::any(state.1, fn(item) { item.id == edge.to }) {
+                    fail!("graph cycles and repeated instance edges are not supported", edge.relation, edge.to)
+                } else if !array::any(state.1, fn(item) { item.id == edge.from })
+                    && !array::any(state.1, fn(item) { item.id == edge.to }) {
+                    fail!("graph edge has no endpoint connected to the root", edge.relation)
+                } else {
+                    let forward = array::any(state.1, fn(item) { item.id == edge.from });
+                    let new_node = if forward { to_node } else { from_node };
+                    let new_entity = if forward { to_entity } else { from_entity };
+                    let target = entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_node.id);
+                    let from_source = if forward { graph_instance(state.1, edge.from).source } else { target.1 };
+                    let to_source = if forward { target.1 } else { graph_instance(state.1, edge.to).source };
+                    let condition = graph_key_condition(payload, relation, from_source, to_source, relation.key);
+                    let join = qb::join_on(qb::JoinKind::Inner, target.1, condition);
+                    let instance: GraphInstance = {id: new_node.id, entity: new_entity, source: target.1};
+                    (target.0, array::push(state.1, instance), array::push(state.2, join))
+                }
+            }
+        });
+        if array::length(built.1) != array::length(request.nodes) {
+            fail!("graph contains nodes disconnected from the root")
+        } else {
+            let projection = array::map(request.select, fn(item) {
+                let instance = graph_instance(built.1, item.node);
+                let dimension = match array::find(payload.dimensions, fn(d) { d.id == item.dimension }) {
+                    Some(d) => d,
+                    None => fail!("graph projection references an unknown dimension", item.node, item.dimension),
+                };
+                if dimension.entity != instance.entity || !dimension.authorized || dimension.computed || array::length(dimension.scope) > 0 {
+                    fail!("graph projection dimension is unavailable on this node", item.node, item.dimension)
+                } else {
+                    let field = get_index(get_index(payload.entities, instance.entity).fields, dimension.field);
+                    qb::named_expr_item(qb::column(instance.source, field.column), `\{item.node}_\{item.dimension}`)
+                }
+            });
+            let sources = array::map(built.1, fn(instance) { instance.source });
+            let plan: qb::Plan = {
+                revision: payload.revision, sources, derived: None, projection, filter: None,
+                exists: [], joins: built.2, grouping: [], having: [], ordering: [],
+                limit: None, offset: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+            };
+            (built.0, qb::validate(plan, payload.profile))
+        }
     }
 };
 
@@ -8761,6 +8876,10 @@ pub use self::{
     HubRouteEntry,
     HubBuild,
     RelationKind,
+    GraphNode,
+    GraphEdge,
+    GraphSelect,
+    GraphRequest,
     FilterOp,
     FilterInputKind,
     FilterInput,
@@ -8898,6 +9017,7 @@ pub use self::{
     correlation_feasible,
     filters_on_entity,
     build_root,
+    lower_graph,
     native_pair_domain,
     lower,
     lower_full,

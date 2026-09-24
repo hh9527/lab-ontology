@@ -1,0 +1,81 @@
+use crate::model::{ payload };
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+def lower: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload, "resolver");
+
+pub def role_distinct_join: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"link",
+        "nodes":[{"id":"link","entity":"connection"},{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"connection_a","from":"link","to":"a"},{"relation":"connection_z","from":"link","to":"z"}],
+        "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "a_device_id") && string::contains(sq.sql, "z_device_id")
+        && string::contains(sq.sql, " AS a") && string::contains(sq.sql, " AS z")
+        && string::contains(pg.sql, " AS \"a\"") && string::contains(pg.sql, " AS \"z\"")
+        && string::contains(sq.sql, "tenant_id") && string::contains(pg.sql, "tenant_id") {
+        True
+    } else { fail!("graph did not retain both endpoint identities", sq.sql, pg.sql) }
+});
+
+pub def two_hop: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"d",
+        "nodes":[{"id":"d","entity":"device"},{"id":"s","entity":"site"},{"id":"t","entity":"tenant"}],
+        "edges":[{"relation":"device_site","from":"d","to":"s"},{"relation":"site_tenant","from":"s","to":"t"}],
+        "select":[{"node":"d","dimension":"device_id"},{"node":"t","dimension":"tenant_id"}]
+    }"#).unwrap!());
+    let query = sqlite::build_query(ast);
+    if string::contains(query.sql, "JOIN sites") && string::contains(query.sql, "JOIN tenants") {
+        True
+    } else { fail!("two-hop graph did not lower", query.sql) }
+});
+
+pub def reverse_navigation_preserves_role: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"d",
+        "nodes":[{"id":"d","entity":"device"},{"id":"link","entity":"connection"}],
+        "edges":[{"relation":"connection_a","from":"link","to":"d"}],
+        "select":[{"node":"d","dimension":"device_id"}]
+    }"#).unwrap!());
+    let query = sqlite::build_query(ast);
+    if string::contains(query.sql, "link.a_device_id = d.id")
+        && string::contains(query.sql, "link.tenant_id = d.tenant_id") {
+        True
+    } else { fail!("reverse navigation lost the declared endpoint role", query.sql) }
+});
+
+pub def wrong_role: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"link",
+        "nodes":[{"id":"link","entity":"connection"},{"id":"s","entity":"site"}],
+        "edges":[{"relation":"connection_a","from":"link","to":"s"}],
+        "select":[{"node":"s","dimension":"site_id"}]
+    }"#).unwrap!())
+}, "graph edge role or target does not match declared relation");
+
+pub def disconnected: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"d",
+        "nodes":[{"id":"d","entity":"device"},{"id":"s","entity":"site"}],
+        "edges":[], "select":[{"node":"d","dimension":"device_id"}]
+    }"#).unwrap!())
+}, "graph contains nodes disconnected from the root");
+
+pub def missing_relation: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"d",
+        "nodes":[{"id":"d","entity":"device"},{"id":"s","entity":"site"}],
+        "edges":[{"relation":"guessed_shortest_path","from":"d","to":"s"}],
+        "select":[{"node":"s","dimension":"site_id"}]
+    }"#).unwrap!())
+}, "unknown named relation");
