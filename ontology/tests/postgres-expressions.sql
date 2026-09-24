@@ -109,6 +109,20 @@ WHERE "o"."total" > (SELECT sum("e"."amount" + $1)
     INNER JOIN "Tags" AS "t" ON ("e"."id" = "t"."event_id" AND "t"."kind" = $4)
     WHERE "e"."status" = $5);
 
+PREPARE ontology_ranked(integer, text, text, text, text) AS
+WITH "Orders"("id", "category") AS (VALUES (1, 10), (2, 20)),
+     "Events"("id", "scope", "status", "kind", "category", "amount") AS
+         (VALUES (10, 'private', 'active', 'sale', 10, 2),
+                 (11, 'private', 'active', 'sale', 20, 8)),
+     "Tags"("event_id", "kind") AS (VALUES (10, 'primary'), (11, 'primary'))
+SELECT "o"."id" FROM "Orders" AS "o" WHERE "o"."category" = (
+    SELECT ("e"."category" + $1)
+    FROM (SELECT * FROM "Events" AS "e" WHERE "e"."scope" = $2) AS "e"
+    INNER JOIN "Tags" AS "t" ON ("e"."id" = "t"."event_id" AND "t"."kind" = $3)
+    WHERE "e"."status" = $4
+    GROUP BY 1 ORDER BY sum("e"."amount") FILTER (WHERE "e"."kind" = $5)
+    DESC NULLS LAST LIMIT 1);
+
 DO $$
 DECLARE result boolean;
         selected_name text;
@@ -169,6 +183,11 @@ BEGIN
     IF selected_id IS DISTINCT FROM 2 THEN
         RAISE EXCEPTION 'scalar aggregate subquery or clause binding order differs';
     END IF;
+    EXECUTE 'EXECUTE ontology_ranked(0, ''private'', ''primary'', ''active'', ''sale'')'
+        INTO selected_id;
+    IF selected_id IS DISTINCT FROM 2 THEN
+        RAISE EXCEPTION 'ranked grouped key or binding order differs';
+    END IF;
 
     IF json_extract_path('{"n":1e0}'::json, VARIADIC ARRAY['n'::text])::text <> '1e0'
         OR json_extract_path_text('{"n":null}'::json, VARIADIC ARRAY['n'::text]) IS NOT NULL
@@ -191,4 +210,5 @@ DEALLOCATE ontology_exists;
 DEALLOCATE ontology_linked;
 DEALLOCATE ontology_peer;
 DEALLOCATE ontology_scalar;
+DEALLOCATE ontology_ranked;
 COMMIT;

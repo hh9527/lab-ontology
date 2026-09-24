@@ -316,3 +316,40 @@ pub def scalar_comparison_threads_inner_clause_bindings: test::Test = test::shou
         True
     } else { fail!("scalar subquery must allocate bindings in rendered SQL order", query) }
 });
+
+pub def ranked_key_groups_projected_parameterized_expression: test::Test = test::should_ok(fn() {
+    let ordering: qb::AggregateCall = {
+        function: qb::AggregateFunction::Sum, arg: qb::column("e", "amount"),
+        distinct: False,
+        filter: Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("e", "kind"), qb::bind_string("sale")])),
+        alias: "rank",
+    };
+    let inner = qb::ranked_key_subquery_spec(
+        qb::scoped_source("e", "Events", qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("e", "scope"), qb::bind_string("private")])),
+        [qb::join_on(qb::JoinKind::Inner, qb::source("t", "Tags"),
+            qb::on_and([qb::on_eq(qb::column_ref("e", "id"), qb::column_ref("t", "event_id")),
+                qb::on_predicate(qb::scalar(qb::ScalarFunction::Eq,
+                    [qb::column("t", "kind"), qb::bind_string("primary")]))]))],
+        Some(qb::scalar(qb::ScalarFunction::Eq,
+            [qb::column("e", "status"), qb::bind_string("active")])),
+        [qb::scalar(qb::ScalarFunction::Add,
+            [qb::column("e", "category"), qb::bind_int(0)])],
+        ordering, qb::Ordering::Desc);
+    let plan: qb::Plan = {
+        revision: "pg-ranked", sources: [qb::source("o", "Orders")],
+        projection: [qb::expr_item(qb::column("o", "id"))],
+        filter: None, exists: [], joins: [], grouping: [], having: [], ordering: [],
+        limit: None, offset: None, derived: None, partition: None,
+        scalar_comparisons: [], ranked_key_comparisons: [qb::ranked_key_comparison(
+            qb::column_ref("o", "category"), qb::ScalarFunction::Eq, inner)],
+    };
+    let query = pg::render_rows_candidate(plan, False);
+    if query.bindings == [qb::Val::Int(0), qb::Val::String("private"),
+        qb::Val::String("primary"), qb::Val::String("active"), qb::Val::String("sale")]
+        && string::contains(query.sql, "SELECT (\"e\".\"category\" + $1)")
+        && string::contains(query.sql, "GROUP BY 1 ORDER BY sum(\"e\".\"amount\") FILTER (WHERE \"e\".\"kind\" = $5) DESC NULLS LAST LIMIT 1") {
+        True
+    } else { fail!("ranked key must group the projected expression without duplicate binding", query) }
+});
