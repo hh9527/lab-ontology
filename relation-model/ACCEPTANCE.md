@@ -28,8 +28,9 @@ default joins are inner; `include_empty: true` for non-root count subjects
 uses LEFT JOINs to retain root groups with zero children. Root filters stay in
 the outer WHERE; filters on nullable instances narrow their individual joined
 sources rather than the outer WHERE, preserving empty root
-groups. EXISTS anchored on a nullable instance and business-link joins are not
-yet supported in this mode. A count uses a declared key, or a column of the dataset's
+groups. EXISTS anchored on the counted instance or its nullable ancestors
+narrows that instance's LEFT JOIN ON condition; unrelated branches remain
+unsupported. Business-link joins are not yet supported in this mode. A count uses a declared key, or a column of the dataset's
 declared non-null identity grain when there is no single-column key. It never
 uses a guessed DISTINCT key; entities without either identity declaration are
 rejected. It
@@ -72,6 +73,6 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The Model explicitly establishes
-endpoint identities and symmetric/directed peer semantics; nullable-child
-EXISTS, business-link outer joins, and non-root grouping dimensions remain
+endpoint identities and symmetric/directed peer semantics; unrelated-branch
+EXISTS under empty-group counting, business-link outer joins, and non-root grouping dimensions remain
 pending.
