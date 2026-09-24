@@ -39,13 +39,14 @@ simply producing syntactically plausible SQL.
 
 ### JSON path and representation checkpoint
 
-The current AST stores a JSON1 path as a bound string and only checks that it
-is a string. PostgreSQL's `json_extract_path` accepts separate text path
+The current AST stores a JSON1 path as a bound string and checks its root
+marker, but does not yet validate individual segments. PostgreSQL's
+`json_extract_path` accepts separate text path
 segments, not the JSON1 path syntax. Before admitting PostgreSQL, parse and
 validate the path once in the shared layer, including quoted object keys,
 array indices and JSON1's reverse-index forms; reject unsupported paths at
 plan preparation with a path-specific diagnostic. A renderer must consume the
-parsed segments, never interpolate the path into SQL. The present string-only
+parsed segments, never interpolate the path into SQL. The present root-only
 check does **not** establish cross-dialect path equivalence.
 
 Use PostgreSQL's original `json` representation for `JsonType` when numeric
