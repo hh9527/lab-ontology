@@ -10,15 +10,47 @@ def path_value: Fn(qb::JsonPathSegment) -> qb::Val = fn(segment) {
     }
 };
 
-def path_expr: Fn(qb::JsonPath, Int) -> qb::Query = fn(path, start) {
-    let indexed = array::enumerate(path.segments);
-    let placeholders = array::map(indexed, fn(item) { `$\{start + item.0}::text` });
-    let sql = if array::length(path.segments) == 0 {
-        "ARRAY[]::text[]"
+type RenderCtx = struct {
+    next_binding: Int,
+    bindings: Array(qb::Val),
+    reserved_aliases: Array(String),
+    next_alias: Int,
+};
+
+type Emitted = struct { sql: String, ctx: RenderCtx };
+
+pub def context: Fn(Int, Array(String)) -> RenderCtx = fn(start, reserved) {
+    if start <= 0 { fail!("PostgreSQL placeholder index must be positive", start) }
+    else { {next_binding: start, bindings: [], reserved_aliases: reserved, next_alias: 0} }
+};
+
+def bind: Fn(RenderCtx, qb::Val) -> Emitted = fn(ctx, value) {
+    {sql: `$\{ctx.next_binding}`, ctx: {...ctx,
+        next_binding: ctx.next_binding + 1,
+        bindings: array::push(ctx.bindings, value)}}
+};
+
+pub def internal_alias: Fn(RenderCtx) -> Tuple([String, RenderCtx]) = fn(ctx) {
+    let candidate = `__q_\{ctx.next_alias}`;
+    let next: RenderCtx = {...ctx, next_alias: ctx.next_alias + 1};
+    if array::any(ctx.reserved_aliases, fn(name) { name == candidate }) {
+        internal_alias(next)
     } else {
-        `ARRAY[\{string::join(placeholders, ", ")}]`
-    };
-    {sql, bindings: array::map(path.segments, path_value)}
+        (candidate, {...next, reserved_aliases: array::push(next.reserved_aliases, candidate)})
+    }
+};
+
+def path_expr: Fn(qb::JsonPath, RenderCtx) -> Emitted = fn(path, ctx) {
+    let initial: Emitted = {sql: "", ctx};
+    let args = array::fold(path.segments, initial, fn(state, segment) {
+        let allocated = bind(state.ctx, path_value(segment));
+        let sql = if state.sql == "" { `\{allocated.sql}::text` }
+            else { `\{state.sql}, \{allocated.sql}::text` };
+        {sql, ctx: allocated.ctx}
+    });
+    let sql = if array::length(path.segments) == 0 { "ARRAY[]::text[]" }
+        else { `ARRAY[\{args.sql}]` };
+    {sql, ctx: args.ctx}
 };
 
 def json_value: Fn(String, String) -> String = fn(document, path) {
@@ -59,28 +91,299 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
     }
 };
 
-type Arguments = struct {
-    sql: Array(String),
-    bindings: Array(qb::Val),
+type Arguments = struct { sql: Array(String), ctx: RenderCtx };
+
+# The context owns all placeholder assignments, even in nested scalars.
+pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
+    match expr {
+        qb::Expr::Column(ref) => if qb::is_sql_identifier(ref.source) && qb::is_sql_identifier(ref.column) {
+            {sql: `"\{ref.source}"."\{ref.column}"`, ctx}
+        } else { fail!("invalid PostgreSQL column identifier", ref) },
+        qb::Expr::Bind(value) => bind(ctx, value),
+        qb::Expr::JsonPath(path) => path_expr(path, ctx),
+        qb::Expr::Scalar(call) => {
+            let initial: Arguments = {sql: [], ctx};
+            let args = array::fold(call.args, initial, fn(state, arg) {
+                let rendered = emit_expr(arg, state.ctx);
+                {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+            });
+            {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+        },
+    }
 };
 
-# Fragment bindings are numbered when each AST child is rendered, not by
-# rewriting an already-rendered SQL string.
 pub def render_expr: Fn(qb::Expr, Int) -> qb::Query = fn(expr, start) {
-    if start <= 0 { fail!("PostgreSQL placeholder index must be positive", start) } else { match expr {
-        qb::Expr::Column(ref) => if qb::is_sql_identifier(ref.source) && qb::is_sql_identifier(ref.column) {
-            {sql: `"\{ref.source}"."\{ref.column}"`, bindings: []}
-        } else { fail!("invalid PostgreSQL column identifier", ref) },
-        qb::Expr::Bind(value) => {sql: `$\{start}`, bindings: [value]},
-        qb::Expr::JsonPath(path) => path_expr(path, start),
-        qb::Expr::Scalar(call) => {
-            let initial: Arguments = {sql: [], bindings: []};
-            let args = array::fold(call.args, initial, fn(state, arg) {
-                let rendered = render_expr(arg, start + array::length(state.bindings));
-                {sql: array::push(state.sql, rendered.sql),
-                    bindings: array::concat([state.bindings, rendered.bindings])}
-            });
-            {sql: scalar_sql(call.function, args.sql), bindings: args.bindings}
+    let emitted = emit_expr(expr, context(start, []));
+    {sql: emitted.sql, bindings: emitted.ctx.bindings}
+};
+
+def quoted: Fn(String) -> String = fn(identifier) {
+    if qb::is_sql_identifier(identifier) { `"\{identifier}"` }
+    else { fail!("invalid PostgreSQL identifier", identifier) }
+};
+
+def render_exprs: Fn(Array(qb::Expr), RenderCtx) -> Emitted = fn(exprs, ctx) {
+    let initial: Arguments = {sql: [], ctx};
+    let parts = array::fold(exprs, initial, fn(state, expr) {
+        let value = emit_expr(expr, state.ctx);
+        {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+    });
+    {sql: string::join(parts.sql, ", "), ctx: parts.ctx}
+};
+
+def render_source: Fn(qb::Source, RenderCtx) -> Emitted = fn(source, ctx) {
+    let table = quoted(source.table);
+    let alias = quoted(source.alias);
+    match source.scope {
+        None => {sql: `\{table} AS \{alias}`, ctx},
+        Some(expr) => {
+            let predicate = emit_expr(expr, ctx);
+            {sql: `(SELECT * FROM \{table} AS \{alias} WHERE \{predicate.sql}) AS \{alias}`,
+                ctx: predicate.ctx}
         },
-    } }
+    }
+};
+
+def render_branch: Fn(qb::UnionBranch, RenderCtx) -> Emitted = fn(branch, ctx) {
+    let initial: Arguments = {sql: [], ctx};
+    let items = array::fold(branch.outputs, initial, fn(state, item) {
+        let value = emit_expr(item.expr, state.ctx);
+        {sql: array::push(state.sql, `\{value.sql} AS \{quoted(item.name)}`), ctx: value.ctx}
+    });
+    let source = render_source(branch.source, items.ctx);
+    let filtered: Emitted = match branch.filter {
+        Some(expr) => {
+            let value = emit_expr(expr, source.ctx);
+            {sql: ` WHERE \{value.sql}`, ctx: value.ctx}
+        },
+        None => {sql: "", ctx: source.ctx},
+    };
+    {sql: `SELECT \{string::join(items.sql, ", ")} FROM \{source.sql}\{filtered.sql}`,
+        ctx: filtered.ctx}
+};
+
+def render_from: Fn(qb::Plan, RenderCtx) -> Emitted = fn(plan, ctx) {
+    match plan.derived {
+        None => render_source(plan.sources[0], ctx),
+        Some(derived) => {
+            let initial: Arguments = {sql: [], ctx};
+            let branches = array::fold(derived.branches, initial, fn(state, branch) {
+                let value = render_branch(branch, state.ctx);
+                {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+            });
+            {sql: `(\{string::join(branches.sql, " UNION ALL ")}) AS \{quoted(derived.alias)}`,
+                ctx: branches.ctx}
+        },
+    }
+};
+
+def column_sql: Fn(qb::ColumnRef) -> String = fn(ref) {
+    `\{quoted(ref.source)}.\{quoted(ref.column)}`
+};
+
+def render_on: Fn(qb::JoinCondition, RenderCtx) -> Emitted = fn(condition, ctx) {
+    match condition {
+        qb::JoinCondition::Eq(eq) => {sql: `\{column_sql(eq.left)} = \{column_sql(eq.right)}`, ctx},
+        qb::JoinCondition::Predicate(expr) => emit_expr(expr, ctx),
+        qb::JoinCondition::And(items) => {
+            let initial: Arguments = {sql: [], ctx};
+            let parts = array::fold(items, initial, fn(state, item) {
+                let value = render_on(item, state.ctx);
+                {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+            });
+            {sql: `(\{string::join(parts.sql, " AND ")})`, ctx: parts.ctx}
+        },
+        qb::JoinCondition::Or(items) => {
+            let initial: Arguments = {sql: [], ctx};
+            let parts = array::fold(items, initial, fn(state, item) {
+                let value = render_on(item, state.ctx);
+                {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+            });
+            {sql: `(\{string::join(parts.sql, " OR ")})`, ctx: parts.ctx}
+        },
+    }
+};
+
+def render_join: Fn(qb::Join, RenderCtx) -> Emitted = fn(join, ctx) {
+    let source = render_source(join.source, ctx);
+    let on = render_on(join.condition, source.ctx);
+    let kind = match join.kind {
+        qb::JoinKind::Inner => "INNER JOIN",
+        qb::JoinKind::Left => "LEFT JOIN",
+    };
+    {sql: `\{kind} \{source.sql} ON \{on.sql}`, ctx: on.ctx}
+};
+
+def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
+    let arg = emit_expr(call.arg, ctx);
+    let distinct = if call.distinct { "DISTINCT " } else { "" };
+    let filtered: Emitted = match call.filter {
+        Some(expr) => {
+            let value = emit_expr(expr, arg.ctx);
+            {sql: ` FILTER (WHERE \{value.sql})`, ctx: value.ctx}
+        },
+        None => {sql: "", ctx: arg.ctx},
+    };
+    {sql: `\{qb::aggregate_name(call.function)}(\{distinct}\{arg.sql})\{filtered.sql}`,
+        ctx: filtered.ctx}
+};
+
+def measure: Fn(qb::Plan, String, RenderCtx) -> Emitted = fn(plan, name, ctx) {
+    let found = array::find(plan.projection, fn(item) {
+        match item {
+            qb::SelectItem::Aggregate(call) => call.alias == name,
+            qb::SelectItem::Computed(ca) => ca.alias == name,
+            _ => False,
+        }
+    });
+    match found {
+        Some(qb::SelectItem::Aggregate(call)) => aggregate(call, ctx),
+        Some(qb::SelectItem::Computed(ca)) => {
+            let left = measure(plan, ca.left, ctx);
+            let right = measure(plan, ca.right, left.ctx);
+            let op = match ca.op { qb::ComputedOp::Add => "+", qb::ComputedOp::Sub => "-" };
+            {sql: `(\{left.sql} \{op} \{right.sql})`, ctx: right.ctx}
+        },
+        _ => fail!("PostgreSQL measure references an undeclared aggregate", name),
+    }
+};
+
+def select_item: Fn(qb::SelectItem, qb::Plan, RenderCtx) -> Emitted = fn(item, plan, ctx) {
+    match item {
+        qb::SelectItem::Expr(expr) => emit_expr(expr, ctx),
+        qb::SelectItem::NamedExpr(named) => {
+            let value = emit_expr(named.expr, ctx);
+            {sql: `\{value.sql} AS \{quoted(named.alias)}`, ctx: value.ctx}
+        },
+        qb::SelectItem::Aggregate(call) => {
+            let value = aggregate(call, ctx);
+            {sql: `\{value.sql} AS \{quoted(call.alias)}`, ctx: value.ctx}
+        },
+        qb::SelectItem::Computed(ca) => {
+            let value = measure(plan, ca.alias, ctx);
+            {sql: `\{value.sql} AS \{quoted(ca.alias)}`, ctx: value.ctx}
+        },
+    }
+};
+
+def order_key: Fn(qb::OrderKey, qb::Plan, RenderCtx) -> Emitted = fn(key, plan, ctx) {
+    match key {
+        qb::OrderKey::Expr(expr) => emit_expr(expr, ctx),
+        qb::OrderKey::AggregateRef(ref) => measure(plan, ref.alias, ctx),
+        qb::OrderKey::Aggregate(call) => aggregate(call, ctx),
+    }
+};
+
+def order_item: Fn(qb::OrderBy, qb::Plan, RenderCtx) -> Emitted = fn(item, plan, ctx) {
+    let key = order_key(item.key, plan, ctx);
+    let suffix = match item.direction {
+        qb::Ordering::Asc => "ASC NULLS FIRST",
+        qb::Ordering::Desc => "DESC NULLS LAST",
+    };
+    {sql: `\{key.sql} \{suffix}`, ctx: key.ctx}
+};
+
+def having_item: Fn(qb::Having, qb::Plan, RenderCtx) -> Emitted = fn(item, plan, ctx) {
+    let value = match item.measure {
+        qb::HavingMeasure::Ref(ref) => measure(plan, ref.alias, ctx),
+        qb::HavingMeasure::Call(call) => aggregate(call, ctx),
+    };
+    let op = match item.op {
+        qb::HavingOp::Eq => "=", qb::HavingOp::Ne => "!=",
+        qb::HavingOp::Lt => "<", qb::HavingOp::Le => "<=",
+        qb::HavingOp::Gt => ">", qb::HavingOp::Ge => ">=",
+    };
+    let threshold = bind(value.ctx, item.threshold);
+    {sql: `\{value.sql} \{op} \{threshold.sql}`, ctx: threshold.ctx}
+};
+
+def plan_context: Fn(qb::Plan) -> RenderCtx = fn(plan) {
+    let derived_aliases = match plan.derived {
+        Some(derived) => array::concat([[derived.alias],
+            array::map(derived.branches, fn(branch) { branch.source.alias })]),
+        None => [],
+    };
+    let reserved = array::concat([
+        array::map(plan.sources, fn(source) { source.alias }),
+        array::map(plan.joins, fn(join) { join.source.alias }),
+        derived_aliases,
+    ]);
+    context(1, reserved)
+};
+
+def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
+    let plan = if distinct { qb::validate_distinct_plan(raw) } else { qb::validate_structure(raw) };
+    if plan.partition != None || array::length(plan.exists) > 0
+        || array::length(plan.scalar_comparisons) > 0 || array::length(plan.ranked_key_comparisons) > 0 {
+        fail!("PostgreSQL query shape is not yet implemented", plan)
+    } else {
+        let select_initial: Arguments = {sql: [], ctx};
+        let selected = array::fold(plan.projection, select_initial, fn(state, item) {
+            let value = select_item(item, plan, state.ctx);
+            {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+        });
+        let source = render_from(plan, selected.ctx);
+        let join_initial: Arguments = {sql: [], ctx: source.ctx};
+        let joins = array::fold(plan.joins, join_initial, fn(state, join) {
+            let value = render_join(join, state.ctx);
+            {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+        });
+        let filter = match plan.filter {
+            Some(expr) => emit_expr(expr, joins.ctx),
+            None => {sql: "", ctx: joins.ctx},
+        };
+        let grouping = render_exprs(plan.grouping, filter.ctx);
+        let having_initial: Arguments = {sql: [], ctx: grouping.ctx};
+        let having = array::fold(plan.having, having_initial, fn(state, item) {
+            let value = having_item(item, plan, state.ctx);
+            {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+        });
+        let ordering_initial: Arguments = {sql: [], ctx: having.ctx};
+        let ordering = array::fold(plan.ordering, ordering_initial, fn(state, item) {
+            let value = order_item(item, plan, state.ctx);
+            {sql: array::push(state.sql, value.sql), ctx: value.ctx}
+        });
+        let limit: Emitted = match plan.limit {
+            Some(value) => {
+                let allocated = bind(ordering.ctx, qb::Val::Int(value));
+                {sql: ` LIMIT \{allocated.sql}`, ctx: allocated.ctx}
+            },
+            None => {sql: "", ctx: ordering.ctx},
+        };
+        let offset: Emitted = match plan.offset {
+            Some(value) => {
+                let allocated = bind(limit.ctx, qb::Val::Int(value));
+                {sql: ` OFFSET \{allocated.sql}`, ctx: allocated.ctx}
+            },
+            None => {sql: "", ctx: limit.ctx},
+        };
+        let prefix = if distinct { "SELECT DISTINCT" } else { "SELECT" };
+        let join_sql = if array::length(plan.joins) > 0 { ` \{string::join(joins.sql, " ")}` } else { "" };
+        let where_sql = if plan.filter != None { ` WHERE \{filter.sql}` } else { "" };
+        let group_sql = if array::length(plan.grouping) > 0 { ` GROUP BY \{grouping.sql}` } else { "" };
+        let having_sql = if array::length(plan.having) > 0 { ` HAVING \{string::join(having.sql, " AND ")}` } else { "" };
+        let order_sql = if array::length(plan.ordering) > 0 { ` ORDER BY \{string::join(ordering.sql, ", ")}` } else { "" };
+        {sql: `\{prefix} \{string::join(selected.sql, ", ")} FROM \{source.sql}\{join_sql}\{where_sql}\{group_sql}\{having_sql}\{order_sql}\{limit.sql}\{offset.sql}`,
+            ctx: offset.ctx}
+    }
+};
+
+# Candidates remain separate from the admitted SQLite QueryPlan materializer
+# until every query shape and semantic check is covered by PostgreSQL.
+pub def render_rows_candidate: Fn(qb::Plan, Bool) -> qb::Query = fn(plan, distinct) {
+    let rows = emit_rows(plan, distinct, plan_context(plan));
+    {sql: rows.sql, bindings: rows.ctx.bindings}
+};
+
+pub def render_group_count_candidate: Fn(qb::Plan) -> qb::Query = fn(plan) {
+    let checked = qb::validate_query_plan(qb::QueryPlan::GroupCount(plan));
+    match checked {
+        qb::QueryPlan::GroupCount(grouped) => {
+            let rows = emit_rows(grouped, False, plan_context(grouped));
+            let alias = internal_alias(rows.ctx);
+            {sql: `SELECT count(1) FROM (\{rows.sql}) AS \{quoted(alias.0)}`,
+                bindings: alias.1.bindings}
+        },
+        _ => fail!("unexpected PostgreSQL group-count plan", plan),
+    }
 };

@@ -6,10 +6,12 @@ The materializer is responsible for turning that same plan into a parameterized
 supported dialect. Adding it means passing the execution checks below, not
 simply producing syntactically plausible SQL.
 
-`ontology/postgres` now has an expression renderer for the closed scalar
-vocabulary, including numbered bindings, quoted identifiers and structural
-JSON paths. It is not a `QueryPlan` materializer and is not yet an admitted
-dialect: complete query shapes and scalar edge cases still need verification.
+`ontology/postgres` has expression, Rows/DistinctRows and GroupCount candidate
+renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
+paging and derived UNION ALL sources. Every rendering stage takes and returns
+an immutable context that allocates numbered bindings and collision-free
+internal aliases. Unsupported shapes still fail explicitly; there is no
+complete `QueryPlan` materializer yet, so PostgreSQL is not an admitted dialect.
 
 ## Common contract
 
