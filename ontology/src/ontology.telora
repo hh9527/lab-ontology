@@ -6875,7 +6875,7 @@ def lower_latest_epoch_sample: Fn(PreparedPayload, QueryRequest, String, String,
             TimeEncoding::UtcEpochMillis, scope, site_scope)
     };
 
-def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
+def lower_timed_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, SampleWindow, Array(TimedSampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
         if array::length(specs) == 0 && array::length(components) == 0 && context == None {
             fail!("qualified observation requires a sample or component qualification or context")
@@ -6883,7 +6883,11 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
             fail!("component context and component-only qualification require separate requests")
         }
         else {
-            let root_id = entity_by_id(payload, observation.dataset);
+            let observation_dataset = match observation {
+                SampleWindow::Text(bounds) => bounds.dataset,
+                SampleWindow::Epoch(bounds) => bounds.dataset,
+            };
+            let root_id = entity_by_id(payload, observation_dataset);
             let sample_dimensions = array::filter(request.dimensions, fn(d) {
                 match array::find(payload.dimensions, fn(entry) { entry.id == d.id }) {
                     Some(entry) => entry.entity == root_id,
@@ -6894,10 +6898,21 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                 !array::any(sample_dimensions, fn(sample) { sample.id == d.id })
             });
             if array::length(request.measures) == 0 && array::length(sample_dimensions) == 0 {
-                fail!("observation without a measure requires a sample dimension", observation.dataset)
+                fail!("observation without a measure requires a sample dimension", observation_dataset)
             } else {
             let arranged: QueryRequest = {...request, dimensions: array::concat([sample_dimensions, owner_dimensions])};
-            let raw_plan = lower_utc_window(payload, arranged, observation);
+            let raw_plan = match observation {
+                SampleWindow::Text(bounds) => lower_utc_window(payload, arranged, bounds),
+                SampleWindow::Epoch(bounds) => do {
+                    let clock = match dataset_domain(payload, observation_dataset).utc_time {
+                        Some(name) => name,
+                        None => fail!("observation dataset lacks authoritative UTC time", observation_dataset),
+                    };
+                    if bounds.field != clock {
+                        fail!("observation window must use the authoritative UTC clock", observation_dataset, bounds.field)
+                    } else { lower_utc_epoch_window(payload, arranged, bounds) }
+                },
+            };
             let output: Array(ProjectionToken) = array::concat([
                 array::map(request.measures, fn(m) { ProjectionToken::Measure(m.id) }),
                 array::map(request.dimensions, fn(d) { ProjectionToken::Dimension(d.id) }),
@@ -6914,8 +6929,8 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                 fail!("observation requires a named grain-safe sample-to-owner relation", relation_id)
             } else if !relation_covers_target_grain(owner, exists_pairs(relation.key)) {
                 fail!("observation relation must cover the owner's complete declared grain", relation_id, owner_id)
-            } else if root.dataset == None || dataset_domain(payload, observation.dataset).kind != DatasetKind::Metric {
-                fail!("observation root must be a metric dataset", observation.dataset)
+            } else if root.dataset == None || dataset_domain(payload, observation_dataset).kind != DatasetKind::Metric {
+                fail!("observation root must be a metric dataset", observation_dataset)
             } else {
                 let condition = key_to_condition(payload, relation.from, relation.to, relation.key);
                 let joined = array::any(plan.joins, fn(j) { j.source.alias == owner.alias && j.condition == condition && j.kind == qb::JoinKind::Inner });
@@ -6925,7 +6940,9 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
                     let owner_join = qb::join_on(qb::JoinKind::Inner, entity_source_at(payload, owner, owner.alias), condition);
                     let sources = if joined { plan.sources } else { array::push(plan.sources, owner_join.source) };
                     let joins = if joined { plan.joins } else { array::push(plan.joins, owner_join) };
-                    let clauses = array::map(specs, fn(spec) { sample_qualification_exists(payload, sources, owner, spec) });
+                    let clauses = array::map(specs, fn(spec) {
+                        sample_count_timed_exists(payload, sources, owner, spec, spec.min_matches, qb::HavingOp::Ge)
+                    });
                     let component_clauses = array::map(components, fn(spec) {
                         component_qualification_exists(payload, sources, owner, spec)
                     });
@@ -6994,6 +7011,18 @@ def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, Strin
             }
             }
         }
+    };
+
+def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
+        lower_timed_qualified_observation(payload, request, owner_id, relation_id, SampleWindow::Text(observation),
+            array::map(specs, fn(spec) { timed_sample(spec) }), components, context)
+    };
+
+def lower_epoch_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcEpochWindowRequest, Array(EpochSampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, observation, specs, components, context) {
+        lower_timed_qualified_observation(payload, request, owner_id, relation_id, SampleWindow::Epoch(observation),
+            array::map(specs, fn(spec) { timed_epoch_sample(spec) }), components, context)
     };
 
 # Canonical UTC-second text sorts in instant order under SQLite's binary text
@@ -8642,6 +8671,7 @@ pub use self::{
     lower_sample_count_ranges,
     lower_sample_epoch_count_ranges,
     lower_qualified_observation,
+    lower_epoch_qualified_observation,
     lower_sample_top,
     lower_sample_epoch_top,
     lower_latest_sample,

@@ -109,6 +109,11 @@ Model-declared Sum/HAVING qualification in two windows, a pre-aggregate raw
 sample filter and full owner identity. This exercises the capability needed by
 IC's independent-KPI family without claiming that its production KPI table is
 stored as epoch milliseconds.
+The epoch sample fixture now also keeps qualification and observation windows
+independent: a qualifying count in one window can select raw rows or a declared
+Sum from another, grouped by hidden complete owner identity. A secondary UTC
+clock cannot silently replace the authoritative observation clock. IC's
+production timestamp encoding remains an explicit unresolved mapping question.
 
 Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 `zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device
