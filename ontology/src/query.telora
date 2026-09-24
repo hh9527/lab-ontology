@@ -218,6 +218,17 @@ def bind: Fn(BuildCtx, Val) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
         Expr::AllocatedBind({index: ctx.next_binding}))
 };
 
+def page_bound: Fn(BuildCtx, Int) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
+    if value < 0 { fail!("pagination value must be non-negative", value) }
+    else { bind(ctx, Val::Int(value)) }
+};
+
+def take_bound: Fn(BuildCtx, Int) -> Tuple([BuildCtx, Expr]) = fn(ctx, value) {
+    if value <= 0 || value > max_partition_take {
+        fail!("partition take must be a positive integer within the cap", value)
+    } else { bind(ctx, Val::Int(value)) }
+};
+
 def available_source_alias: Fn(Array(String), String, Int) -> String = fn(used, hint, index) {
     let candidate = if index == 1 { hint } else { `\{hint}_\{index}` };
     if array::any(used, fn(alias) { alias == candidate }) {
@@ -473,8 +484,8 @@ type Plan = struct {
     grouping: Array(Expr),
     having: Array(Having),
     ordering: Array(OrderBy),
-    limit: Option(Int),
-    offset: Option(Int),
+    limit: Option(Expr),
+    offset: Option(Expr),
     partition: Option(PartitionedTopN),
     scalar_comparisons: Array(ScalarAggregateComparison),
     ranked_key_comparisons: Array(RankedKeyComparison),
@@ -500,7 +511,7 @@ type QueryPlan = enum {
 type PartitionedTopN = struct {
     partition_by: Array(Expr),
     order_by: Array(OrderBy),
-    take: Int,
+    take: Expr,
 };
 
 # A flat, non-recursive inner aggregate specification of a Plan-level scalar
@@ -1254,7 +1265,7 @@ def computed_items_ok: Fn(Plan) -> Bool = fn(plan) {
 #     (deterministic tie-breaker);
 #   - v1 does not combine partitioned Top N with global limit/offset/ordering.
 def partition_structure_ok: Fn(Plan, PartitionedTopN) -> Bool = fn(plan, pt) {
-    let take_ok = pt.take > 0 && pt.take <= max_partition_take;
+    let take_ok = page_value_ok(pt.take, True);
     let row_plan = array::length(plan.grouping) == 0
         && array::length(plan.having) == 0
         && array::all(plan.projection, fn(item) { match item { SelectItem::Expr(_) => True, _ => False } });
@@ -1524,6 +1535,51 @@ def having_ok: Fn(Plan, Array(String), Having) -> Bool = fn(plan, aliases, h) {
     }
 };
 
+def page_value_ok: Fn(Expr, Bool) -> Bool = fn(expr, positive) {
+    match expr {
+        Expr::Bind(Val::Int(value)) => if positive { value > 0 && value <= max_partition_take }
+            else { value >= 0 },
+        Expr::AllocatedBind(binding) => binding.index > 0,
+        _ => False,
+    }
+};
+
+def page_value_in_context: Fn(Expr, BuildCtx, Bool) -> Bool = fn(expr, ctx, positive) {
+    match expr {
+        Expr::AllocatedBind(binding) => if binding.index > 0
+            && binding.index <= array::length(ctx.bindings) {
+            page_value_ok(Expr::Bind(ctx.bindings[binding.index - 1]), positive)
+        } else { False },
+        _ => page_value_ok(expr, positive),
+    }
+};
+
+def pagination_in_context: Fn(Plan, BuildCtx) -> Plan = fn(plan, ctx) {
+    let limit_ok = match plan.limit {
+        Some(value) => page_value_in_context(value, ctx, False), None => True,
+    };
+    let offset_ok = match plan.offset {
+        Some(value) => page_value_in_context(value, ctx, False), None => True,
+    };
+    let take_ok = match plan.partition {
+        Some(partition) => page_value_in_context(partition.take, ctx, True), None => True,
+    };
+    if limit_ok && offset_ok && take_ok { plan }
+    else { fail!("constructed pagination binding must contain an integer within its allowed range", plan) }
+};
+
+def validate_contextual_pagination: Fn(QueryPlan, BuildCtx) -> QueryPlan = fn(query_plan, ctx) {
+    match query_plan {
+        QueryPlan::Rows(plan) => QueryPlan::Rows(pagination_in_context(plan, ctx)),
+        QueryPlan::DistinctRows(plan) => QueryPlan::DistinctRows(pagination_in_context(plan, ctx)),
+        QueryPlan::GroupCount(plan) => QueryPlan::GroupCount(pagination_in_context(plan, ctx)),
+        QueryPlan::SetRows(set) => QueryPlan::SetRows({...set,
+            left: pagination_in_context(set.left, ctx), right: pagination_in_context(set.right, ctx)}),
+        QueryPlan::SetCount(set) => QueryPlan::SetCount({...set,
+            left: pagination_in_context(set.left, ctx), right: pagination_in_context(set.right, ctx)}),
+    }
+};
+
 def having_list_ok: Fn(Plan, Array(String), Array(Having)) -> Bool = fn(plan, aliases, having_list) {
     array::all(having_list, fn(h) { having_ok(plan, aliases, h) })
 };
@@ -1685,11 +1741,11 @@ def derived_plan_ok: Fn(Plan, DerivedSource) -> Bool = fn(plan, ds) {
         True
     };
     let limit_ok = match plan.limit {
-        Some(value) => value >= 0,
+        Some(value) => page_value_ok(value, False),
         None => True,
     };
     let offset_ok = match plan.offset {
-        Some(value) => value >= 0,
+        Some(value) => page_value_ok(value, False),
         None => True,
     };
     let offset_ordering_ok = match plan.offset {
@@ -1764,11 +1820,11 @@ def structure_ok_tables: Fn(Plan) -> Bool = fn(plan) {
         True
     };
     let limit_ok = match plan.limit {
-        Some(value) => value >= 0,
+        Some(value) => page_value_ok(value, False),
         None => True,
     };
     let offset_ok = match plan.offset {
-        Some(value) => value >= 0,
+        Some(value) => page_value_ok(value, False),
         None => True,
     };
     let offset_ordering_ok = match plan.offset {
@@ -2141,11 +2197,13 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
     # Retain the authored scalar, not the newly constructed Option wrapper,
     # so a diagnostic can point back to the input that supplied the window.
     let negative_limit = match plan.limit {
-        Some(value) => if value < 0 { Some(value) } else { None },
+        Some(Expr::Bind(Val::Int(value))) => if value < 0 { Some(value) } else { None },
+        Some(_) => None,
         None => None,
     };
     let negative_offset = match plan.offset {
-        Some(value) => if value < 0 { Some(value) } else { None },
+        Some(Expr::Bind(Val::Int(value))) => if value < 0 { Some(value) } else { None },
+        Some(_) => None,
         None => None,
     };
     if array::length(plan.sources) == 0 {
@@ -2185,7 +2243,7 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
     } {
         fail!("plan offset requires a stable ordering", plan.offset, plan.ordering)
     } else if !match plan.partition {
-        Some(pt) => pt.take > 0 && pt.take <= max_partition_take,
+        Some(pt) => page_value_ok(pt.take, True),
         None => True,
     } {
         fail!("partition take must be a positive integer within the cap", plan)
@@ -3287,8 +3345,8 @@ def render_unpartitioned: Fn(Plan, Bool, BuildCtx) -> Query = fn(plan, distinct,
     # the bound value.
     let limit_part = match plan.limit {
         Some(value) => {
-            let values: Array(Val) = [Val::Int(value)];
-            (" LIMIT ?", values)
+            let rendered = render_expr(value, ctx);
+            (` LIMIT \{rendered.0}`, rendered.1)
         },
         None => if plan.offset != None {
             let empty: Array(Val) = [];
@@ -3301,8 +3359,8 @@ def render_unpartitioned: Fn(Plan, Bool, BuildCtx) -> Query = fn(plan, distinct,
 
     let offset_part = match plan.offset {
         Some(value) => {
-            let values: Array(Val) = [Val::Int(value)];
-            (" OFFSET ?", values)
+            let rendered = render_expr(value, ctx);
+            (` OFFSET \{rendered.0}`, rendered.1)
         },
         None => {
             let empty: Array(Val) = [];
@@ -3528,9 +3586,9 @@ def render_partitioned: Fn(Plan, PartitionedTopN, BuildCtx) -> Query = fn(plan, 
         array::map(ok_outer_parts, fn(p) { p.0 }),
     ]), ", ");
     let outer_select_sql = string::join(outer_refs, ", ");
-    let take_values: Array(Val) = [Val::Int(pt.take)];
-    let sql = `SELECT \{outer_select_sql} FROM (\{inner_sql}) AS __partitioned WHERE __q_rn <= ? ORDER BY \{outer_order_sql}`;
-    let all_bindings = array::concat([inner_bindings, take_values]);
+    let take = render_expr(pt.take, ctx);
+    let sql = `SELECT \{outer_select_sql} FROM (\{inner_sql}) AS __partitioned WHERE __q_rn <= \{take.0} ORDER BY \{outer_order_sql}`;
+    let all_bindings = array::concat([inner_bindings, take.1]);
 
     let result: Query = {sql: sql, bindings: all_bindings};
     result
@@ -3752,7 +3810,7 @@ def transform_sqlite_query_plan: Fn(QueryPlan) -> Query = fn(query_plan) {
 };
 
 def render_query_plan_with_context: Fn(QueryPlan, BuildCtx) -> Query = fn(query_plan, ctx) {
-    let rendered = render_sqlite_plan(query_plan, ctx);
+    let rendered = render_sqlite_plan(validate_contextual_pagination(query_plan, ctx), ctx);
     if array::length(rendered.bindings) != 0 {
         fail!("constructed query plan contains values not allocated by qb", query_plan)
     } else { {sql: rendered.sql, bindings: ctx.bindings} }
@@ -4274,8 +4332,12 @@ def order_by: Fn(OrderKey, Ordering) -> OrderBy = fn(key, direction) {
 };
 
 def partitioned_top_n: Fn(Array(Expr), Array(OrderBy), Int) -> PartitionedTopN = fn(partition_by, order_by, take) {
-    let item: PartitionedTopN = {partition_by: partition_by, order_by: order_by, take: take};
+    let item: PartitionedTopN = {partition_by: partition_by, order_by: order_by, take: Expr::Bind(Val::Int(take))};
     item
+};
+
+def partitioned_top_n_bound: Fn(Array(Expr), Array(OrderBy), Expr) -> PartitionedTopN = fn(partition_by, order_by, take) {
+    {partition_by, order_by, take}
 };
 
 # ---------------------------------------------------------------------------
@@ -4307,6 +4369,8 @@ pub use self::{
     BuildCtx,
     build_context,
     bind,
+    page_bound,
+    take_bound,
     source_with_hint,
     source_column_ref,
     source_column,
@@ -4345,6 +4409,7 @@ pub use self::{
     validate_distinct_plan,
     validate_set_operands,
     validate_query_plan,
+    validate_contextual_pagination,
     profile_accepts,
     source_profile_accepts,
     validate,
@@ -4428,4 +4493,5 @@ pub use self::{
     desc_aggregate,
     order_by,
     partitioned_top_n,
+    partitioned_top_n_bound,
 };

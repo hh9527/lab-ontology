@@ -108,6 +108,48 @@ pub def constructed_having_uses_existing_binding_handle: test::Test = test::shou
     else { fail!("HAVING must reuse its constructed binding handle", query) }
 });
 
+pub def constructed_pagination_and_partition_use_bound_handles: test::Test = test::should_ok(fn() {
+    let first = qb::page_bound(qb::build_context(), 10);
+    let second = qb::page_bound(first.0, 0);
+    let base: qb::Plan = {
+        revision: "constructed-page", sources: [qb::source("e", "events")], joins: [],
+        projection: [qb::expr_item(qb::column("e", "id"))],
+        filter: Some(qb::scalar(qb::ScalarFunction::Lt, [qb::column("e", "id"), first.1])),
+        grouping: [], having: [], ordering: [qb::asc(qb::column("e", "id"))],
+        limit: Some(first.1), offset: Some(second.1),
+        exists: [], derived: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    let page = pg::render_query_plan_with_context(qb::QueryPlan::Rows(base), second.0);
+    let take = qb::take_bound(qb::build_context(), 1);
+    let ranked: qb::Plan = {...base,
+        filter: Some(qb::scalar(qb::ScalarFunction::Gt, [qb::column("e", "id"), take.1])),
+        ordering: [], limit: None, offset: None,
+        partition: Some(qb::partitioned_top_n_bound(
+            [qb::column("e", "id")], [qb::desc(qb::column("e", "id"))], take.1)),
+    };
+    let partition = pg::render_query_plan_with_context(qb::QueryPlan::Rows(ranked), take.0);
+    if string::contains(page.sql, "\"e\".\"id\" < $1 ORDER BY \"e\".\"id\" ASC NULLS FIRST LIMIT $1 OFFSET $2")
+        && page.bindings == [qb::Val::Int(10), qb::Val::Int(0)]
+        && string::contains(partition.sql, "WHERE \"e\".\"id\" > $1")
+        && string::contains(partition.sql, " <= $1")
+        && partition.bindings == [qb::Val::Int(1)] { True }
+    else { fail!("pagination and partition take must use construction-time handles", page, partition) }
+});
+
+pub def constructed_partition_rejects_out_of_range_handle: test::Test = test::should_fail_with(fn() {
+    let bad = qb::bind(qb::build_context(), qb::Val::Int(0));
+    let plan: qb::Plan = {
+        revision: "bad-take", sources: [qb::source("e", "events")], joins: [],
+        projection: [qb::expr_item(qb::column("e", "id"))], filter: None,
+        grouping: [], having: [], ordering: [], limit: None, offset: None,
+        exists: [], derived: None,
+        partition: Some(qb::partitioned_top_n_bound(
+            [qb::column("e", "id")], [qb::desc(qb::column("e", "id"))], bad.1)),
+        scalar_comparisons: [], ranked_key_comparisons: [],
+    };
+    pg::render_query_plan_with_context(qb::QueryPlan::Rows(plan), bad.0)
+}, "constructed pagination binding must contain an integer within its allowed range");
+
 pub def nested_json_bind_order: test::Test = test::should_ok(fn() {
     let path = qb::json_path([qb::JsonPathSegment::Key("a.b"), qb::JsonPathSegment::FromEnd(1)]);
     let predicate = qb::scalar(qb::ScalarFunction::Eq, [
@@ -180,7 +222,7 @@ pub def rows_assign_resources_in_sql_order: test::Test = test::should_ok(fn() {
             [qb::column("Mixed", "Role"), qb::bind_string("root")])),
         grouping: [], having: [],
         ordering: [qb::asc(qb::column("Mixed", "Id"))],
-        limit: None, offset: Some(2),
+        limit: None, offset: Some(qb::bind_int(2)),
         exists: [], derived: None, partition: None,
         scalar_comparisons: [], ranked_key_comparisons: [],
     };
@@ -207,7 +249,7 @@ pub def grouped_rows_reexpand_measure_with_fresh_bindings: test::Test = test::sh
             [qb::column("e", "category"), qb::bind_string("A")])),
         grouping: [qb::column("e", "category")],
         having: [qb::having(qb::HavingOp::Gt, "hits", qb::Val::Int(1))],
-        ordering: [qb::desc_aggregate("hits")], limit: Some(5), offset: None,
+        ordering: [qb::desc_aggregate("hits")], limit: Some(qb::bind_int(5)), offset: None,
         exists: [], derived: None, partition: None,
         scalar_comparisons: [], ranked_key_comparisons: [],
     };

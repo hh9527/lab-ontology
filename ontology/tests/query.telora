@@ -73,6 +73,42 @@ pub def constructed_having_uses_existing_binding_handle: test::Test = test::shou
     else { fail!("HAVING must reuse its constructed binding handle", query) }
 });
 
+pub def constructed_pagination_and_partition_use_bound_handles: test::Test = test::should_ok(fn() {
+    let first = qb::page_bound(qb::build_context(), 10);
+    let second = qb::page_bound(first.0, 0);
+    let base = simple_plan();
+    let rows: qb::Plan = {...base,
+        projection: [qb::expr_item(qb::column("orders", "id"))],
+        filter: Some(qb::scalar(qb::ScalarFunction::Lt, [qb::column("orders", "id"), first.1])),
+        limit: Some(first.1), offset: Some(second.1),
+    };
+    let page = qb::render_query_plan_with_context(qb::QueryPlan::Rows(rows), second.0);
+    let take = qb::take_bound(qb::build_context(), 1);
+    let ranked: qb::Plan = {...base,
+        projection: [qb::expr_item(qb::column("orders", "id"))],
+        filter: Some(qb::scalar(qb::ScalarFunction::Gt, [qb::column("orders", "id"), take.1])),
+        ordering: [], partition: Some(qb::partitioned_top_n_bound(
+            [qb::column("orders", "id")], [qb::desc(qb::column("orders", "id"))], take.1)),
+    };
+    let partition = qb::render_query_plan_with_context(qb::QueryPlan::Rows(ranked), take.0);
+    if string::contains(page.sql, "orders.id < ?1 ORDER BY orders.id ASC LIMIT ?1 OFFSET ?2")
+        && page.bindings == [qb::Val::Int(10), qb::Val::Int(0)]
+        && string::contains(partition.sql, "WHERE orders.id > ?1")
+        && string::contains(partition.sql, "__q_rn <= ?1")
+        && partition.bindings == [qb::Val::Int(1)] { True }
+    else { fail!("pagination and partition take must use construction-time handles", page, partition) }
+});
+
+pub def constructed_pagination_checks_registered_value: test::Test = test::should_fail_with(fn() {
+    let bad = qb::bind(qb::build_context(), qb::Val::String("ten"));
+    let base = simple_plan();
+    let plan: qb::Plan = {...base,
+        projection: [qb::expr_item(qb::column("orders", "id"))],
+        limit: Some(bad.1),
+    };
+    qb::render_query_plan_with_context(qb::QueryPlan::Rows(plan), bad.0)
+}, "constructed pagination binding must contain an integer within its allowed range");
+
 pub def source_hints_allocate_join_symbols: test::Test = test::should_ok(fn() {
     let first = qb::source_with_hint(qb::build_context(), "table1", "t");
     let second = qb::source_with_hint(first.0, "table2", "t");
@@ -437,7 +473,7 @@ def demo_plan: Fn() -> qb::Plan = fn() {
         ],
         grouping: [qb::column("o", "customer_id")],
         ordering: [qb::asc(qb::column("o", "customer_id"))],
-        limit: Some(10),
+        limit: Some(qb::bind_int(10)),
         offset: None,
         exists: [],
         having: [],
@@ -545,7 +581,7 @@ def negative_limit_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [],
         ordering: [],
-        limit: Some(-1),
+        limit: Some(qb::bind_int(-1)),
         offset: None,
         exists: [],
         having: [],
@@ -620,7 +656,7 @@ def top_n_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [qb::column("o", "customer_id")],
         ordering: [qb::desc_aggregate("order_count"), qb::asc(qb::column("o", "customer_id"))],
-        limit: Some(5),
+        limit: Some(qb::bind_int(5)),
         offset: None,
         exists: [],
         having: [],
@@ -896,7 +932,7 @@ def first_token_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [segment],
         ordering: [qb::desc_aggregate("uses"), qb::asc(qb::column("c", "command"))],
-        limit: Some(100),
+        limit: Some(qb::bind_int(100)),
         offset: None,
         exists: [],
         having: [],
@@ -1083,8 +1119,8 @@ def paged_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [],
         ordering: [qb::asc(qb::column("o", "id"))],
-        limit: Some(10),
-        offset: Some(20),
+        limit: Some(qb::bind_int(10)),
+        offset: Some(qb::bind_int(20)),
         exists: [],
         having: [],
         derived: None,
@@ -1105,7 +1141,7 @@ def offset_only_plan: Fn() -> qb::Plan = fn() {
         grouping: [],
         ordering: [qb::asc(qb::column("o", "id"))],
         limit: None,
-        offset: Some(5),
+        offset: Some(qb::bind_int(5)),
         exists: [],
         having: [],
         derived: None,
@@ -1125,8 +1161,8 @@ def offset_zero_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [],
         ordering: [qb::asc(qb::column("o", "id"))],
-        limit: Some(10),
-        offset: Some(0),
+        limit: Some(qb::bind_int(10)),
+        offset: Some(qb::bind_int(0)),
         exists: [],
         having: [],
         derived: None,
@@ -1146,8 +1182,8 @@ def offset_no_ordering_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [],
         ordering: [],
-        limit: Some(10),
-        offset: Some(5),
+        limit: Some(qb::bind_int(10)),
+        offset: Some(qb::bind_int(5)),
         exists: [],
         having: [],
         derived: None,
@@ -1167,8 +1203,8 @@ def negative_offset_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [],
         ordering: [qb::asc(qb::column("o", "id"))],
-        limit: Some(10),
-        offset: Some(-1),
+        limit: Some(qb::bind_int(10)),
+        offset: Some(qb::bind_int(-1)),
         exists: [],
         having: [],
         derived: None,
@@ -1482,7 +1518,7 @@ def partition_with_limit_plan: Fn() -> qb::Plan = fn() {
         joins: [],
         grouping: [qb::column("e", "role")],
         ordering: [],
-        limit: Some(10),
+        limit: Some(qb::bind_int(10)),
         offset: None,
         exists: [],
         having: [],
@@ -1508,7 +1544,7 @@ def partition_with_offset_plan: Fn() -> qb::Plan = fn() {
         grouping: [qb::column("e", "role")],
         ordering: [],
         limit: None,
-        offset: Some(5),
+        offset: Some(qb::bind_int(5)),
         exists: [],
         having: [],
         derived: None,
@@ -3376,7 +3412,7 @@ def combined_plan: Fn() -> qb::Plan = fn() {
         grouping: [qb::column("t", "id"), qb::column("a", "site")],
         having: [qb::having(qb::HavingOp::Gt, "transfer_count", qb::Val::Int(2))],
         ordering: [qb::desc_aggregate("transfer_count"), qb::asc(qb::column("a", "site"))],
-        limit: Some(10),
+        limit: Some(qb::bind_int(10)),
         offset: None,
         derived: None,
         partition: None,
@@ -4537,7 +4573,7 @@ def distinct_probe_plan: Fn() -> qb::Plan = fn() {
         grouping: [],
         having: [],
         ordering: [qb::asc(qb::column("o", "region"))],
-        limit: Some(25),
+        limit: Some(qb::bind_int(25)),
         offset: None,
         exists: [],
         derived: None,
@@ -4685,7 +4721,7 @@ def internal_agg_order_plan: Fn() -> qb::Plan = fn() {
         grouping: [qb::column("o", "region")],
         having: [],
         ordering: [ob],
-        limit: Some(3),
+        limit: Some(qb::bind_int(3)),
         offset: None,
         exists: [],
         derived: None,
