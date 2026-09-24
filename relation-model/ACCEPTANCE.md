@@ -28,7 +28,10 @@ default joins are inner; `include_empty: true` for non-root count subjects
 uses LEFT JOINs to retain root groups with zero children. Outer filters and
 EXISTS must be anchored on the root, since predicates on nullable instances
 would silently discard those groups; business-link joins are not yet supported
-in this mode. It
+in this mode. A count uses a declared key, or a column of the dataset's
+declared non-null identity grain when there is no single-column key. It never
+uses a guessed DISTINCT key; entities without either identity declaration are
+rejected. It
 rejects missing edges, role mismatches and disconnected nodes. Reverse
 navigation reads the same edge from its other endpoint; it does
 not establish any business-level peer direction or symmetry. Named business
