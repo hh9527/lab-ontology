@@ -276,8 +276,8 @@ JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不�
 仅将该目标的路径固定为指定一跳，其余目标仍按各自的歧义规则检查。
 
 `dataset(kind, grain_fields, utc_time)` 声明 Entity / Event / Metric 的行粒度与
-权威 UTC 字段；Event 和 Metric 必须声明一个实际存在且带
-`time_field(TimeSemantics::Utc, TimeEncoding::CanonicalUtcSecondText)` 的文本时间字段。
+权威 UTC 字段；Event 和 Metric 必须声明一个实际存在、带 UTC 时间角色的
+`CanonicalUtcSecondText` 文本字段或 `UtcEpochMillis` 整数字段。
 本地时间应标记为 `Local` / `LocalText`，不能冒充 UTC 权威字段。
 `dataset_domain(payload, id)` 发现这些声明。
 数据集目录的 `time_roles` 从 Model 的字段时间角色派生逻辑字段名、UTC/Local、
@@ -292,10 +292,14 @@ JOIN 恰好使用同一关系时省去冗余 EXISTS；需要内层过滤或不�
 `utc_field_window` 另要求逻辑字段名，该字段必须有 UTC/CanonicalUtcSecondText
 时间角色，并属于同一根数据集；它可明确选取非权威的到达或更新时间，仍执行
 相同的 UTC 边界与先后校验。未声明时间角色或本地时间不能通过此入口查询。
+`utc_epoch_window` 明确指定同一根数据集的 UTC/`UtcEpochMillis` 字段，
+由外部提供整数毫秒起止值，使用 `>= start AND < end` 绑定；它拒绝反向窗口、
+本地 epoch 毫秒字段和 UTC 文本字段，也不会自行解析本地日期或推断数据库列单位。
+文本窗口仍只接受 `CanonicalUtcSecondText`，不能因为字段同为 UTC 就跨编码调用。
 窗口目标数据集在请求中有维度或第一个度量时，lowering 用该数据集固定查询根，
 不会因为另一数据集的展示维度排在前面而反转一对多的采样路径；最终 SELECT
 保持请求的字段顺序。仅提供其他数据集维度/度量、没有目标数据集入口时仍诊断。
-不支持偏移输入、亚秒精度或原生 timestamp 列。
+文本窗口不支持偏移输入或亚秒精度；原生 timestamp 列尚未建模。
 
 `dataset_description(label, summary)` 和 `relation_description(id, label, summary)`
 将简要说明附于模型声明；准备期校验关系说明确实引用了本实体的具名关系。

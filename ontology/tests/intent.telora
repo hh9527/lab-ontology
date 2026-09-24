@@ -20,6 +20,72 @@ use crate::query as qb;
 use std::array as array;
 use std::json as json;
 use std::value::{ Value };
+use std::string as string;
+
+@edsl::entity_id("epoch_events")
+@edsl::entity_source("epoch_events", "ee")
+@edsl::dataset(edsl::DatasetKind::Event, ["id"], Some("occurred_ms"))
+type EpochEvent = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    @edsl::dimension("EpochEventId", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Int])
+    id: Int,
+    @edsl::column("occurredMs")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    occurred_ms: Int,
+    @edsl::column("receivedMs")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    received_ms: Int,
+    @edsl::column("localMs")
+    @edsl::time_field(edsl::TimeSemantics::Local, edsl::TimeEncoding::LocalEpochMillis)
+    local_ms: Int,
+};
+
+def lower_epoch: Fn(Value) -> qb::Query = query_intent_lower_factory(
+    edsl::build_root("epoch-clock-test", [EpochEvent.type], profile, fn(subject) { True }), "analyst");
+
+pub def epoch_window_uses_declared_clock_and_integer_bounds: test::Test = test::should_ok(fn() {
+    let query = lower_epoch(parse(r#"{"op":"utc_epoch_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","field":"occurred_ms","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "ee.occurredMs >= ?")
+        && string::contains(query.sql, "ee.occurredMs < ?")
+        && query.bindings == [qb::Val::Int(1700000000000), qb::Val::Int(1700000001000)] { True }
+    else { fail!("UTC epoch-millisecond bounds must retain integer bindings", query) }
+});
+
+pub def epoch_window_selects_secondary_utc_clock: test::Test = test::should_ok(fn() {
+    let query = lower_epoch(parse(r#"{"op":"utc_epoch_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","field":"received_ms","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "ee.receivedMs >= ?")
+        && !string::contains(query.sql, "ee.occurredMs >= ?")
+        && query.bindings == [qb::Val::Int(1700000000000), qb::Val::Int(1700000001000)] { True }
+    else { fail!("secondary UTC epoch clock must be selected explicitly", query) }
+});
+
+@edsl::entity_source("wrong_epoch_clock", "wec")
+@edsl::dataset(edsl::DatasetKind::Event, ["id"], Some("occurred"))
+type WrongEpochClock = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    id: Int,
+    @edsl::column("occurred")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    occurred: String,
+};
+
+pub def epoch_clock_rejects_text_field: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("wrong-epoch-clock", [WrongEpochClock.type], profile, fn(subject) { True })
+}, "time encoding disagrees with field type");
+
+pub def epoch_window_rejects_local_clock: test::Test = test::should_fail_with(fn() {
+    lower_epoch(parse(r#"{"op":"utc_epoch_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","field":"local_ms","start":100,"end":200},"limit":null,"offset":null}"#))
+}, "UTC window encoding does not match");
+
+pub def epoch_window_rejects_reversed_bounds: test::Test = test::should_fail_with(fn() {
+    lower_epoch(parse(r#"{"op":"utc_epoch_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","field":"received_ms","start":200,"end":100},"limit":null,"offset":null}"#))
+}, "UTC epoch-millisecond window start must precede end");
+
+pub def text_window_rejects_epoch_clock: test::Test = test::should_fail_with(fn() {
+    lower_epoch(parse(r#"{"op":"utc_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","start":"2024-01-01T00:00:00Z","end":"2024-02-01T00:00:00Z"},"limit":null,"offset":null}"#))
+}, "UTC window requires a declared canonical UTC time field");
 
 pub def lowering_rejects_non_object_case: test::Test = test::should_fail_with(fn() {
     lower_knowledge(Value::Int(7))
