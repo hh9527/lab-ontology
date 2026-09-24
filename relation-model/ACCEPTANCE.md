@@ -56,10 +56,9 @@ ignored when they could narrow the intended result.
 `tests/graph.telora`
 exercises these cases against QueryAst and both SQL materializers.
 
-The remaining cases are acceptance targets, not currently supported Intent
-syntax. Each positive case must lower to a QueryAst; each negative case must
-fail before QueryAst construction with a diagnostic identifying the edge,
-role, or missing proof.
+These pairs are the implemented minimal-model acceptance cases. Each positive
+case must lower to a QueryAst; each negative case must fail before QueryAst
+construction with a diagnostic identifying the edge, role, or missing proof.
 
 | Positive intent | Negative neighbor / required diagnosis |
 | --- | --- |
