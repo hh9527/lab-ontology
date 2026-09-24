@@ -63,6 +63,9 @@ endpoint roles remain invalid.
 The graph Intent is closed at every level: unknown request, node, edge,
 projection, filter or existence fields are rejected as unsupported, never
 ignored when they could narrow the intended result.
+Graph projection also distinguishes unimplemented computed/scoped dimensions
+(`unsupported`) from unauthorized dimensions or dimensions on the wrong
+instance (invalid intent).
 `tests/graph.telora`
 exercises these cases against QueryAst and both SQL materializers.
 
