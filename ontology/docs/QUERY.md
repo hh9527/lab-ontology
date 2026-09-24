@@ -287,6 +287,11 @@ type Plan = struct {
     ranked_key_comparisons: Array(RankedKeyComparison),
 };
 
+type SetPlan = struct { kind: SetOpKind, left: Plan, right: Plan };
+type QueryPlan = enum {
+    Rows(Plan), DistinctRows(Plan), SetRows(SetPlan), SetCount(SetPlan),
+};
+
 type PartitionedTopN = struct {
     partition_by: Array(Expr),
     order_by: Array(OrderBy),
@@ -304,6 +309,10 @@ type PartitionedTopN = struct {
 `exists` 是保持 base grain 的相关存在性过滤（见下文“存在性过滤 (EXISTS)”）。
 `having` 是聚合结果谓词（见下文“HAVING”），其阈值永远作为 `?` 绑定。
 `partition` 是受限的分组内 Top N 阶段（见下文“分组内 Top N”）。
+`QueryPlan` 进一步规定顶层结果形状：普通行、去重行、集合结果或集合计数。
+`validate_query_plan` 在任何 SQL 物化前校验该形状；SQLite 的
+`transform_sqlite_query_plan` 消费同一封闭 AST。它目前不涵盖需要额外
+`PlanProfile` 的 `count_groups`；这项剩余边界仍需统一。
 
 ### 能力 Profile
 
@@ -334,6 +343,10 @@ Profile 声明应用接受的标准能力子集，不改变算子本身的语义
 | `structure_ok` | `Fn(Plan) -> Bool` | 不产生失败的纯结构检查 |
 | `validate_structure` | `Fn(Plan) -> Plan` | 结构非法时 `fail!`，成功时返回原 Plan |
 | `validate` | `Fn(Plan, PlanProfile) -> Plan` | 结构或能力非法时 `fail!`，成功时返回原 Plan |
+| `validate_distinct_plan` | `Fn(Plan) -> Plan` | 验证行级去重的投影、排序与组合约束，不生成 SQL |
+| `validate_set_operands` | `Fn(SetOpKind, Plan, Plan) -> Tuple([Plan, Plan])` | 验证集合两侧的结构与投影形状，不生成 SQL |
+| `validate_query_plan` | `Fn(QueryPlan) -> QueryPlan` | 验证顶层封闭结果形状，不生成 SQL |
+| `transform_sqlite_query_plan` | `Fn(QueryPlan) -> Query` | 校验并将顶层查询 AST 物化为 SQLite Query |
 | `transform_sqlite` | `Fn(Plan) -> Query` | 合法 Plan 确定性转换为 SQLite Query |
 | `transform_sqlite_distinct` | `Fn(Plan) -> Query` | 行级（无分组/无聚合/纯表达式投影）Plan 渲染为 `SELECT DISTINCT ...`（distinct 行） |
 | `transform_sqlite_set` | `Fn(SetOpKind, Plan, Plan) -> Query` | 两个可嵌入 Plan 的封闭集合运算（INTERSECT/EXCEPT/distinct UNION） |

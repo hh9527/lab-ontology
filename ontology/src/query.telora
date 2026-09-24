@@ -404,6 +404,16 @@ type Plan = struct {
     ranked_key_comparisons: Array(RankedKeyComparison),
 };
 
+# Top-level result shape is part of the shared AST.  DISTINCT and set
+# operations cannot be inferred from a plain Plan's projection alone.
+type SetPlan = struct { kind: SetOpKind, left: Plan, right: Plan };
+type QueryPlan = enum {
+    Rows(Plan),
+    DistinctRows(Plan),
+    SetRows(SetPlan),
+    SetCount(SetPlan),
+};
+
 # Restricted partitioned Top N stage.  It runs after filter, join, group and
 # aggregate: within each partition (a subset of the selected grouping
 # expressions) the stable ordering keeps the top `take` rows.  The public AST
@@ -3529,6 +3539,21 @@ def validate_set_operands: Fn(SetOpKind, Plan, Plan) -> Tuple([Plan, Plan]) = fn
     }
 };
 
+def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
+    match query_plan {
+        QueryPlan::Rows(plan) => QueryPlan::Rows(validate_structure(plan)),
+        QueryPlan::DistinctRows(plan) => QueryPlan::DistinctRows(validate_distinct_plan(plan)),
+        QueryPlan::SetRows(set) => {
+            let operands = validate_set_operands(set.kind, set.left, set.right);
+            QueryPlan::SetRows({kind: set.kind, left: operands.0, right: operands.1})
+        },
+        QueryPlan::SetCount(set) => {
+            let operands = validate_set_operands(set.kind, set.left, set.right);
+            QueryPlan::SetCount({kind: set.kind, left: operands.0, right: operands.1})
+        },
+    }
+};
+
 def transform_sqlite_set: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, left, right) {
     let operands = validate_set_operands(kind, left, right);
     let lq = render_plan(operands.0);
@@ -3546,6 +3571,17 @@ def transform_sqlite_set_count: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, le
     let sql = `SELECT count(1) FROM (\{inner.sql}) AS __q_set`;
     let result: Query = {sql: sql, bindings: inner.bindings};
     result
+};
+
+# The dialect boundary consumes one validated top-level AST shape.  Legacy
+# shape-specific entry points delegate to the same validators and renderer.
+def transform_sqlite_query_plan: Fn(QueryPlan) -> Query = fn(query_plan) {
+    match validate_query_plan(query_plan) {
+        QueryPlan::Rows(plan) => render_plan(plan),
+        QueryPlan::DistinctRows(plan) => render_unpartitioned(plan, True),
+        QueryPlan::SetRows(set) => transform_sqlite_set(set.kind, set.left, set.right),
+        QueryPlan::SetCount(set) => transform_sqlite_set_count(set.kind, set.left, set.right),
+    }
 };
 
 # Nested aggregate primitive (shape 1): count the rows produced by a grouped
@@ -4088,6 +4124,8 @@ pub use self::{
     OrderKey,
     OrderBy,
     Plan,
+    SetPlan,
+    QueryPlan,
     PartitionedTopN,
     ScalarSubquery,
     ScalarAggregateComparison,
@@ -4102,6 +4140,7 @@ pub use self::{
     validate_structure,
     validate_distinct_plan,
     validate_set_operands,
+    validate_query_plan,
     profile_accepts,
     source_profile_accepts,
     validate,
@@ -4109,6 +4148,7 @@ pub use self::{
     transform_sqlite_distinct,
     transform_sqlite_set,
     transform_sqlite_set_count,
+    transform_sqlite_query_plan,
     set_ok,
     set_op_sql,
     count_groups,
