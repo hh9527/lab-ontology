@@ -4574,6 +4574,24 @@ def graph_correlation_pairs: Fn(PreparedPayload, RelationEntry, qb::Source, qb::
     }
 };
 
+# Distribute declared AND/OR keys into closed correlation branches; each
+# branch retains every equality declared for that alternative.
+def graph_correlation_alternatives: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Source, Bool, RelationKey) -> Array(Array(qb::ColumnEq)) = fn(payload, relation, outer, inner, forward, key) {
+    match key {
+        RelationKey::Eq(_) => [graph_correlation_pairs(payload, relation, outer, inner, forward, key)],
+        RelationKey::And(parts) => array::fold(parts, [[]], fn(branches, part) {
+            let next = graph_correlation_alternatives(payload, relation, outer, inner, forward, part);
+            array::concat(array::map(branches, fn(branch) {
+                array::map(next, fn(other) { array::concat([branch, other]) })
+            }))
+        }),
+        RelationKey::Or(parts) => array::concat(array::map(parts, fn(part) {
+            graph_correlation_alternatives(payload, relation, outer, inner, forward, part)
+        })),
+        RelationKey::FieldEq(_) => fail!("unresolved graph existence key", relation.id),
+    }
+};
+
 def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, anchor, spec, link) {
     if array::length(spec.edges) == 0 { fail!("business link existence requires an edge", link.id) }
     else {
@@ -4712,23 +4730,28 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
                         if !valid { fail!("graph existence edge role or target does not match declared relation", edge.relation, next_node.entity) }
                         else {
                             let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, next_entity), next_id);
-                            let pairs = graph_correlation_pairs(payload, relation, previous.source, source.1, forward, relation.key);
+                            let first_edge = array::length(state.2) == 0;
+                            let alternatives = if first_edge {
+                                graph_correlation_alternatives(payload, relation, previous.source, source.1, forward, relation.key)
+                            } else { state.2 };
                             let instance: GraphInstance = {id: next_id, entity: next_entity, source: source.1};
-                            let join = if array::length(state.2) == 0 { [] } else {
-                                [qb::join_on(qb::JoinKind::Inner, source.1, qb::on_and(array::map(pairs, fn(pair) {
-                                    qb::on_eq(pair.left, pair.right)
-                                })))]
+                            let join = if first_edge { [] } else {
+                                [qb::join_on(qb::JoinKind::Inner, source.1,
+                                    graph_key_condition(payload, relation,
+                                        if forward { previous.source } else { source.1 },
+                                        if forward { source.1 } else { previous.source }, relation.key))]
                             };
-                            (source.0, array::push(state.1, instance), array::push(state.2, pairs), array::concat([state.3, join]))
+                            (source.0, array::push(state.1, instance), alternatives, array::concat([state.3, join]))
                         }
                     },
                 }
             }
         });
         let first = get_index(built.1, 1).source;
-        let first_pairs = get_index(built.2, 0);
         let filtered = graph_filters(built.0, payload, built.1, spec.filters);
-        let exists = qb::exists_path(first, first_pairs, built.3);
+        let exists = if array::length(built.2) == 1 {
+            qb::exists_path(first, get_index(built.2, 0), built.3)
+        } else { qb::exists_path_alternatives(first, built.2, built.3) };
         let exists = {...exists, filter: filtered.1};
         (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },

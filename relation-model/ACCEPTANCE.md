@@ -7,6 +7,9 @@ business direction. `connected_device` explicitly declares undirected business
 connectivity over the two endpoint relations, while `upstream_device` declares
 a directed A-to-Z relation on a separate route dataset. No peer semantics are
 inferred from endpoint field names alone.
+`connection_endpoint` separately declares the physical alternative: a device
+participates when its tenant-scoped identity matches the A or Z endpoint.
+This does not imply a device-to-device business connection.
 
 The following cases specify the intended relation-based Intent contract. The
 `graph` row-query shape now supports rooted, explicitly named instance trees,
@@ -68,6 +71,7 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 | From device `d`, follow `device_site` to site `s`, then `site_tenant` to tenant `t`; test existence without changing the grain of `d`. | Follow `device_site` to a tenant instance: invalid target type at that edge. |
 | From device `d`, test existence of a connection via the reverse of `connection_a` and project/count devices at the explicit `d` grain. | Join all matching connections and count rows as devices: grain amplification, require an explicit count subject. |
 | A connection endpoint and its Device share `tenant_id` as well as device ID. | Join only on device ID while omitting tenant ID: incomplete declared identity key. |
+| Check existence through `connection_endpoint`, matching A or Z with complete tenant identity, and continue along another named edge. | Connect the same edge to Site instead of Device: invalid relation endpoint role. |
 | Traverse the declared symmetric `connected_device` relation from either endpoint. | Infer symmetry solely from A/Z endpoint declarations: missing business link proof. |
 | Traverse the declared directed `upstream_device` relation from A to Z. | Traverse Z to A without an inverse declaration: direction violation. |
 
