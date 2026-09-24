@@ -17,12 +17,14 @@ also accepts `count: "<root instance>"` instead of `select` when every outer
 JOIN follows a forward Safe edge; otherwise counting the root requires EXISTS
 so that matching children cannot multiply its rows. It counts the root key
 without reducing a composite grain to one guessed DISTINCT column. It
-also supports grouping by root dimensions while counting one non-root child
-through one reverse Safe edge or one forward FanOut edge whose key covers the
-complete root identity. Each child then belongs to at most one root, and no
-other outer JOIN may duplicate that child. Matching only a shared tenant does
-not prove site identity, so a site-to-device count on that edge is rejected.
-Other non-root or cross-branch counts remain unproven and are rejected. It
+also supports grouping by root dimensions while counting a non-root child
+when every edge in the outer join tree is functional when traversed from that
+child. Reverse Safe chains and forward FanOut edges whose keys cover the
+complete parent identity provide this proof, including multi-hop paths.
+Matching only a shared tenant does not prove site identity, so counting
+same-tenant devices as children of a particular site is rejected. Branches
+that can duplicate the counted child remain unproven and are rejected; inner
+joins do not yet preserve root groups with zero children. It
 rejects missing edges, role mismatches and disconnected nodes. Reverse
 navigation reads the same edge from its other endpoint; it does
 not establish any business-level peer direction or symmetry. Named business
@@ -60,5 +62,5 @@ role, or missing proof.
 
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The Model explicitly establishes
-endpoint identities and symmetric/directed peer semantics; cross-branch or
-multi-hop non-root grain-aware aggregates remain pending.
+endpoint identities and symmetric/directed peer semantics; zero-child outer
+join counts and non-root grouping dimensions remain pending.

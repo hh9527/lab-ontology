@@ -4883,6 +4883,32 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
     }
 };
 
+# Counting a subject is safe only if every joined instance is functionally
+# determined by it. Walk the declared tree from the subject, independently of
+# the root-first order used to construct the SQL joins.
+def graph_count_subject_grain: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, subject_id) {
+    let proved = array::fold(request.nodes, ([subject_id], True), fn(state, node) {
+        array::fold(request.edges, state, fn(step, edge) {
+            let from_known = array::any(step.0, fn(id) { id == edge.from });
+            let to_known = array::any(step.0, fn(id) { id == edge.to });
+            if from_known == to_known { step }
+            else {
+                let safe = match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
+                    Some(_) => False,
+                    None => do {
+                        let relation = relation_domain(payload, edge.relation);
+                        (from_known && relation.kind == RelationKind::Safe)
+                            || (to_known && relation.kind == RelationKind::FanOut
+                                && relation_covers_source_identity(get_index(payload.entities, relation.from), relation.key))
+                    },
+                };
+                (array::push(step.0, if from_known { edge.to } else { edge.from }), step.1 && safe)
+            }
+        })
+    });
+    proved.1 && array::length(proved.0) == array::length(request.nodes)
+};
+
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
@@ -4983,23 +5009,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                             && array::any(state.0, fn(id) { id == edge.from }))
                     }).1 {
                         fail!("graph count requires grain-safe forward joins; use existence for fan-out edges", subject_id)
-                    } else if subject_id != request.root && !(
-                        array::length(request.edges) == 1
-                        && array::any(request.edges, fn(edge) {
-                            if array::any(payload.business_links, fn(link) { link.id == edge.relation }) { False }
-                            else {
-                                let relation = relation_domain(payload, edge.relation);
-                                let instance = graph_instance(built.1, subject_id);
-                                (edge.from == subject_id && edge.to == request.root
-                                    && relation.kind == RelationKind::Safe
-                                    && relation.from == instance.entity && relation.to == root_entity)
-                                || (edge.from == request.root && edge.to == subject_id
-                                    && relation.kind == RelationKind::FanOut
-                                    && relation.from == root_entity && relation.to == instance.entity
-                                    && relation_covers_source_identity(get_index(payload.entities, root_entity), relation.key))
-                            }
-                        })
-                    ) {
+                    } else if subject_id != request.root && !graph_count_subject_grain(payload, request, subject_id) {
                         fail!("graph cannot prove the non-root count subject has one row per root relationship", subject_id)
                     } else {
                         let instance = graph_instance(built.1, subject_id);
