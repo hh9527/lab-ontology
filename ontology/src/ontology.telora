@@ -3853,6 +3853,112 @@ def resolve_filters: Fn(PreparedPayload, Array(FilterRequest)) -> Array(FilterRe
     })
 };
 
+# Construction-time variant: validation precedes allocation for each request,
+# and each generated predicate carries handles registered in the returned ctx.
+def canonical_compare_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, FilterOp, FilterInput) -> Tuple([qb::BuildCtx, qb::Expr]) = fn(ctx, entry, base, op, input) {
+    let id = match input {
+        FilterInput::Text(value) => value,
+        _ => fail!("canonical dimension requires a text business value", entry.id, input),
+    };
+    if op != FilterOp::Eq && op != FilterOp::Ne {
+        fail!("canonical dimension supports only Eq or Ne", entry.id, op)
+    } else {
+        let matched = match array::find(entry.canonical_values, fn(v) { v.id == id }) {
+            Some(value) => value,
+            None => fail!("unknown canonical value for dimension", entry.id, input),
+        };
+        let scalar = if op == FilterOp::Eq { qb::ScalarFunction::Eq } else { qb::ScalarFunction::Ne };
+        let wires = array::fold(matched.wires, (ctx, None), fn(state, wire) {
+            let (next, bound) = qb::bind(state.0, to_val(wire));
+            let term = qb::scalar(scalar, [base, bound]);
+            let expr = match state.1 {
+                None => term,
+                Some(prev) => qb::scalar(if op == FilterOp::Eq { qb::ScalarFunction::Or } else { qb::ScalarFunction::And }, [prev, term]),
+            };
+            (next, Some(expr))
+        });
+        let compared = match wires.1 {
+            Some(expr) => expr,
+            None => fail!("canonical value has no physical wires", entry.id, id),
+        };
+        if op == FilterOp::Eq { (wires.0, compared) }
+        else {
+            let known = array::fold(entry.canonical_values, (wires.0, None), fn(state, value) {
+                let equal = canonical_compare_with_context(state.0, entry, base, FilterOp::Eq, FilterInput::Text(value.id));
+                let expr = match state.1 {
+                    None => equal.1,
+                    Some(prev) => qb::scalar(qb::ScalarFunction::Or, [prev, equal.1]),
+                };
+                (equal.0, Some(expr))
+            });
+            match known.1 {
+                Some(domain) => (known.0, qb::scalar(qb::ScalarFunction::And, [compared, domain])),
+                None => fail!("canonical dimension has no declared business values", entry.id),
+            }
+        }
+    }
+};
+
+def open_condition_with_context: Fn(qb::BuildCtx, qb::Expr, FilterOp, qb::Expr) -> Tuple([qb::BuildCtx, qb::Expr]) = fn(ctx, base, op, bound) {
+    if is_text_op(op) {
+        let constant = qb::bind(ctx, qb::Val::Int(if op == FilterOp::StartsWith || op == FilterOp::EndsWith { 1 } else { 0 }));
+        let expr = match op {
+            FilterOp::Contains => qb::scalar(qb::ScalarFunction::Gt, [qb::instr(qb::lower(base), qb::lower(bound)), constant.1]),
+            FilterOp::NotContains => qb::scalar(qb::ScalarFunction::Eq, [qb::instr(base, bound), constant.1]),
+            FilterOp::StartsWith => qb::scalar(qb::ScalarFunction::Eq, [qb::instr(qb::lower(base), qb::lower(bound)), constant.1]),
+            FilterOp::EndsWith => do {
+                let lower_base = qb::lower(base);
+                let lower_bound = qb::lower(bound);
+                let start = qb::add(qb::sub(qb::length(lower_base), qb::length(lower_bound)), constant.1);
+                qb::scalar(qb::ScalarFunction::Eq, [qb::substr([lower_base, start]), lower_bound])
+            },
+            _ => fail!("invalid text filter operation", op),
+        };
+        (constant.0, expr)
+    } else { (ctx, open_condition_expr(base, op, bound)) }
+};
+
+def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(FilterRequest)) -> Tuple([qb::BuildCtx, Array(FilterResolution)]) = fn(ctx, payload, requests) {
+    let initial: Tuple([qb::BuildCtx, Array(FilterResolution)]) = (ctx, []);
+    array::fold(requests, initial, fn(state, req) {
+        if !payload.authorize(req.subject) { fail!("subject is not authorized for filter", req.subject, req.id) }
+        else {
+            let entry = match array::find(payload.dimensions, fn(d) { d.id == req.id }) {
+                Some(d) => d,
+                None => fail!("unknown filter dimension", req.subject, req.id),
+            };
+            if !entry.authorized { fail!("dimension is not authorized", req.subject, req.id) }
+            else if !entry.filterable { fail!("dimension has no filter capability", req.subject, req.id) }
+            else if !array::any(entry.ops, fn(op) { op == req.op }) { fail!("filter operation not supported for dimension", req.subject, req.id) }
+            else {
+                let base = dimension_expr(payload, entry);
+                let resolved = if array::length(entry.canonical_values) > 0 {
+                    canonical_compare_with_context(state.0, entry, base, req.op, req.input)
+                } else if array::length(entry.values) > 0 {
+                    match req.input {
+                        FilterInput::Text(s) => if req.op != FilterOp::Eq {
+                            fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op)
+                        } else if array::any(entry.values, fn(v) { v.value == s }) {
+                            let bound = qb::bind(state.0, qb::Val::String(s));
+                            (bound.0, qb::scalar(qb::ScalarFunction::Eq, [base, bound.1]))
+                        } else { fail!("unknown enum value for dimension", req.subject, req.id, s) },
+                        _ => fail!("invalid enum filter value for dimension", req.subject, req.id, req.input),
+                    }
+                } else if is_text_op(req.op) && match req.input { FilterInput::Text(_) => False, _ => True } {
+                    fail!("text filter operation requires a text input value", req.subject, req.id)
+                } else if !filter_input_allowed(entry.input_kinds, req.input) {
+                    fail!("invalid filter value for dimension", req.subject, req.id)
+                } else {
+                    let bound = qb::bind(state.0, to_val(req.input));
+                    open_condition_with_context(bound.0, base, req.op, bound.1)
+                };
+                let item: FilterResolution = {expr: resolved.1, entity: entry.entity, field: entry.field, op: req.op, input: req.input};
+                (resolved.0, array::push(state.1, item))
+            }
+        }
+    })
+};
+
 def combine_filters: Fn(Array(qb::Expr)) -> Option(qb::Expr) = fn(exprs) {
     let init_none: Option(qb::Expr) = None;
     match array::fold(exprs, init_none, fn(acc, expr) {
@@ -8833,6 +8939,8 @@ pub use self::{
     MeasureRequest,
     DimensionRequest,
     FilterRequest,
+    FilterResolution,
+    resolve_filters_with_context,
     FieldFilterRequest,
     OrderRequest,
     PartitionRequest,

@@ -9,6 +9,7 @@
 # Any failed assertion fails the exported Test loudly.
 
 use crate::query as qb;
+use crate::postgres as pg;
 use std::value::{ Value };
 use std::array as array;
 use std::string as string;
@@ -1228,6 +1229,14 @@ def negated_canonical_values: Array(edsl::CanonicalValueSpec) = [
     {id: "offline", label: "Offline", wires: [edsl::FilterInput::Text("0"), edsl::FilterInput::Text("2")]},
 ];
 
+@edsl::entity_source("canonical_context_probe", "ccp")
+type CanonicalContextProbe = struct {
+    @edsl::column("state")
+    @edsl::dimension("canonical_context_state", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(negated_canonical_values)
+    state: String,
+};
+
 def two_single_wire_values: Array(edsl::CanonicalValueSpec) = [
     {id: "offline", label: "Offline", wires: [edsl::FilterInput::Text("0")]},
     {id: "online", label: "Online", wires: [edsl::FilterInput::Text("1")]},
@@ -2032,6 +2041,49 @@ def check_open_string_dimension: Fn() -> Bool = fn() {
     let expected: Array(qb::Val) = [qb::Val::String("west")];
     check(query.bindings == expected, "open string dimension: filter binding stays parameterized")
 };
+
+pub def contextual_filters_allocate_in_request_order: test::Test = test::should_ok(fn() {
+    let requests = array::concat([enum_request.filters, open_string_request.filters]);
+    let resolved = edsl::resolve_filters_with_context(qb::build_context(), knowledge::payload, requests);
+    let expr = qb::scalar(qb::ScalarFunction::And, [resolved.1[0].expr, resolved.1[1].expr]);
+    let sqlite = qb::render_sqlite_expr_with_context(expr, resolved.0);
+    let postgres = pg::render_expr_with_context(expr, resolved.0);
+    if sqlite.bindings == [qb::Val::String("gold"), qb::Val::String("west")]
+        && postgres.bindings == sqlite.bindings
+        && string::contains(sqlite.sql, "?1") && string::contains(sqlite.sql, "?2")
+        && string::contains(postgres.sql, "$1") && string::contains(postgres.sql, "$2") { True }
+    else { fail!("ontology filter values must retain construction-time handles", sqlite, postgres) }
+});
+
+pub def contextual_canonical_filters_allocate_all_wires: test::Test = test::should_ok(fn() {
+    let payload = edsl::build_root("canonical-context", [CanonicalContextProbe.type], knowledge::profile,
+        fn(subject) { subject == "public" });
+    let requests: Array(edsl::FilterRequest) = [
+        {id: "canonical_context_state", subject: "public", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("offline")},
+    ];
+    let resolved = edsl::resolve_filters_with_context(qb::build_context(), payload, requests);
+    let sqlite = qb::render_sqlite_expr_with_context(resolved.1[0].expr, resolved.0);
+    let postgres = pg::render_expr_with_context(resolved.1[0].expr, resolved.0);
+    if sqlite.bindings == [qb::Val::String("0"), qb::Val::String("2")]
+        && postgres.bindings == sqlite.bindings
+        && string::contains(sqlite.sql, "?1") && string::contains(sqlite.sql, "?2")
+        && string::contains(postgres.sql, "$1") && string::contains(postgres.sql, "$2") { True }
+    else { fail!("canonical wires must be allocated before dialect materialization", sqlite, postgres) }
+});
+
+pub def contextual_text_filters_allocate_operator_constants: test::Test = test::should_ok(fn() {
+    let requests: Array(edsl::FilterRequest) = [
+        {id: "OrderRegion", subject: "analyst", op: edsl::FilterOp::Contains, input: edsl::FilterInput::Text("west")},
+    ];
+    let resolved = edsl::resolve_filters_with_context(qb::build_context(), knowledge::payload, requests);
+    let sqlite = qb::render_sqlite_expr_with_context(resolved.1[0].expr, resolved.0);
+    let postgres = pg::render_expr_with_context(resolved.1[0].expr, resolved.0);
+    if sqlite.bindings == [qb::Val::String("west"), qb::Val::Int(0)]
+        && postgres.bindings == sqlite.bindings
+        && string::contains(sqlite.sql, "?1") && string::contains(sqlite.sql, "?2")
+        && string::contains(postgres.sql, "$1") && string::contains(postgres.sql, "$2") { True }
+    else { fail!("text-search constants must be allocated during ontology construction", sqlite, postgres) }
+});
 
 def check_enum_determinism: Fn() -> Bool = fn() {
     let plan1: qb::Plan = edsl::lower(knowledge::payload, enum_request);
