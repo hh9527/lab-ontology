@@ -24,6 +24,10 @@ links do: the Model specifies whether A/Z may be exchanged, and both roles
 must cover the complete participant identity. Graph rows and single-edge
 EXISTS can reference these links by their business ids; counting connected
 devices uses EXISTS so that multiple link rows do not change device grain.
+Graph filters name a particular entity instance and a declared dimension;
+their values are bound rather than interpolated into SQL. In particular,
+filtering an origin device and a peer device of the same type must use their
+distinct allocated aliases inside the appropriate outer/EXISTS scopes.
 `tests/graph.telora`
 exercises these cases against QueryAst and both SQL materializers.
 

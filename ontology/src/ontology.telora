@@ -369,12 +369,14 @@ type RelationKind = enum { Safe, FanOut };
 type GraphNode = struct { id: String, entity: String };
 type GraphEdge = struct { relation: String, from: String, to: String };
 type GraphSelect = struct { node: String, dimension: String };
-type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), negated: Bool };
+type GraphFilter = struct { node: String, request: FilterRequest };
+type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), filters: Array(GraphFilter), negated: Bool };
 type GraphRequest = struct {
     root: String,
     nodes: Array(GraphNode),
     edges: Array(GraphEdge),
     select: Array(GraphSelect),
+    filters: Array(GraphFilter),
     exists: Array(GraphExist),
     count: Option(String),
 };
@@ -4652,6 +4654,27 @@ def graph_instance: Fn(Array(GraphInstance), String) -> GraphInstance = fn(insta
     }
 };
 
+def graph_filters: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array(GraphFilter)) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, instances, filters) {
+    let built = array::fold(filters, (ctx, []), fn(state, spec) {
+        let instance = graph_instance(instances, spec.node);
+        let dimension = match array::find(payload.dimensions, fn(d) { d.id == spec.request.id }) {
+            Some(d) => d,
+            None => fail!("graph filter references an unknown dimension", spec.node, spec.request.id),
+        };
+        if dimension.entity != instance.entity {
+            fail!("graph filter dimension does not belong to its named node", spec.node, spec.request.id)
+        } else {
+            let resolved = resolve_request_filters_with_context(state.0, payload, [dimension], [spec.request]);
+            let original = get_index(payload.entities, instance.entity).alias;
+            let expressions = array::map(resolved.1, fn(item) {
+                retarget_inner_expr(item.expr, original, instance.source.alias)
+            });
+            (resolved.0, array::concat([state.1, expressions]))
+        }
+    });
+    (built.0, append_filter_terms(None, built.1))
+};
+
 # EXISTS correlations require equality pairs, with the outer/hop source on the
 # left regardless of the declaration's physical from/to orientation.
 def graph_correlation_pairs: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Source, Bool, RelationKey) -> Array(qb::ColumnEq) = fn(payload, relation, outer, inner, forward, key) {
@@ -4703,8 +4726,11 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Graph
                 let branch_z = qb::on_and(array::concat([array::map(origin_z, fn(p) { qb::on_eq(p.left, p.right) }), [peer_a]]));
                 let condition = if symmetric { qb::on_or([branch_a, branch_z]) } else { peer_z };
                 let join = qb::join_on(qb::JoinKind::Inner, peer.1, condition);
+                let instances: Array(GraphInstance) = [anchor, {id: node.id, entity: link.participant, source: peer.1}];
+                let filtered = graph_filters(peer.0, payload, instances, spec.filters);
                 let exists = qb::exists_path_alternatives(hub.1, correlation, [join]);
-                (peer.0, if spec.negated { qb::exists_not(exists) } else { exists })
+                let exists = {...exists, filter: filtered.1};
+                (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
             }
         }
     }
@@ -4764,8 +4790,10 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
             }
         });
         let path = array::flat_map(joins, fn(item) { match item { Some(join) => [join], None => [] } });
+        let filtered = graph_filters(built.0, payload, built.1, spec.filters);
         let exists = qb::exists_path(first, first_pairs, path);
-        (built.0, if spec.negated { qb::exists_not(exists) } else { exists })
+        let exists = {...exists, filter: filtered.1};
+        (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },
         }
     }
@@ -4878,13 +4906,14 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     }
                 },
             };
-            let existential = array::fold(request.exists, (built.0, []), fn(state, spec) {
+            let filtered = graph_filters(built.0, payload, built.1, request.filters);
+            let existential = array::fold(request.exists, (filtered.0, []), fn(state, spec) {
                 let result = graph_existence(state.0, payload, built.1, spec);
                 (result.0, array::push(state.1, result.1))
             });
             let sources = array::concat([[root.1], array::map(built.2, fn(join) { join.source })]);
             let plan: qb::Plan = {
-                revision: payload.revision, sources, derived: None, projection, filter: None,
+                revision: payload.revision, sources, derived: None, projection, filter: filtered.1,
                 exists: existential.1, joins: built.2, grouping: [], having: [], ordering: [],
                 limit: None, offset: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
             };
@@ -9158,6 +9187,7 @@ pub use self::{
     GraphNode,
     GraphEdge,
     GraphSelect,
+    GraphFilter,
     GraphExist,
     GraphRequest,
     FilterOp,
