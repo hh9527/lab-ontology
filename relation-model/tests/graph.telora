@@ -76,6 +76,56 @@ type Reading = struct {
     tenant_id: String,
 };
 
+@edsl::entity_id("reading_child")
+@edsl::entity_source("reading_children", "child")
+@edsl::named_relation_key("child_reading", Reading.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::Eq({from: 1, to: 0}),
+        edsl::RelationKey::Eq({from: 2, to: 1}),
+    ]))
+type ReadingChild = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    @edsl::dimension("child_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    id: String,
+    @edsl::column("reading_id")
+    reading_id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+};
+
+@edsl::entity_id("partial_reading_child")
+@edsl::entity_source("partial_reading_children", "partial_child")
+@edsl::named_relation_key("partial_child_reading", Reading.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::Eq({from: 0, to: 0}))
+type PartialReadingChild = struct {
+    @edsl::column("reading_id")
+    reading_id: String,
+};
+
+pub def composite_target_requires_full_identity: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("partial-composite-join", [Tenant.type, Reading.type, PartialReadingChild.type],
+        payload.profile, fn(subject) { subject == "resolver" })
+}, "safe relation must cover the target's declared identity");
+
+pub def composite_target_full_identity_is_lowerable: test::Test = test::should_ok(fn() {
+    let model = edsl::build_root("composite-join", [Tenant.type, Reading.type, ReadingChild.type],
+        payload.profile, fn(subject) { subject == "resolver" });
+    let ast = query_intent_ast_factory(model, "resolver")(json::parse(r#"{
+        "op":"graph", "root":"child",
+        "nodes":[{"id":"child","entity":"reading_child"},{"id":"reading","entity":"reading"}],
+        "edges":[{"relation":"child_reading","from":"child","to":"reading"}],
+        "select":[{"node":"child","dimension":"child_id"}], "count":"child"
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "child.reading_id = reading.reading_id")
+        && string::contains(sq.sql, "child.tenant_id = reading.tenant_id")
+        && string::contains(pg.sql, "\"child\".\"tenant_id\" = \"reading\".\"tenant_id\"") {
+        True
+    } else { fail!("composite target identity was truncated", sq, pg) }
+});
+
 @edsl::entity_id("nullable_reading")
 @edsl::entity_source("nullable_readings", "nullable_reading")
 @edsl::dataset(edsl::DatasetKind::Entity, ["reading_id"], None)
@@ -111,6 +161,22 @@ type NullableKey = struct {
     @edsl::key(True)
     id: Option(String),
 };
+
+@edsl::entity_id("two_keys")
+@edsl::entity_source("two_keys", "two_keys")
+type TwoKeys = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+    @edsl::column("tenant_id")
+    @edsl::key(True)
+    tenant_id: String,
+};
+
+pub def multiple_representative_keys_are_not_an_identity_proof: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("multiple-keys", [TwoKeys.type], payload.profile,
+        fn(subject) { subject == "resolver" })
+}, "entity declares multiple key fields; use dataset grain for composite identity");
 
 pub def nullable_key_cannot_prove_identity: test::Test = test::should_fail_with(fn() {
     edsl::build_root("nullable-key", [NullableKey.type], payload.profile,

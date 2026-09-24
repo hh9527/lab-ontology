@@ -39,7 +39,10 @@ declared non-null identity grain when there is no single-column key. It never
 uses a guessed DISTINCT key; entities without either identity declaration are
 rejected. Identity fields in a single key or any position of a composite
 dataset grain must be non-nullable, or the Model fails preparation before an
-intent can count rows. It
+intent can count rows. Composite identity is declared once with
+`@dataset(DatasetKind::Entity, ["reading_id", "tenant_id"], None)`, not by
+marking both fields `@key`; a Safe relation to it must match every grain field.
+It
 rejects missing edges, role mismatches and disconnected nodes. Reverse
 navigation reads the same edge from its other endpoint; it does
 not establish any business-level peer direction or symmetry. Named business
@@ -74,6 +77,7 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 | From device `d`, follow `device_site` to site `s`, then `site_tenant` to tenant `t`; test existence without changing the grain of `d`. | Follow `device_site` to a tenant instance: invalid target type at that edge. |
 | From device `d`, test existence of a connection via the reverse of `connection_a` and project/count devices at the explicit `d` grain. | Join all matching connections and count rows as devices: grain amplification, require an explicit count subject. |
 | A connection endpoint and its Device share `tenant_id` as well as device ID. | Join only on device ID while omitting tenant ID: incomplete declared identity key. |
+| Join a child to a composite-grain Reading using both reading ID and tenant ID. | Declare the same relation `Safe` using only reading ID: incomplete target identity; mark both fields `@key` instead of declaring a composite grain: ambiguous representative key. |
 | Check existence through `connection_endpoint`, matching A or Z with complete tenant identity, and continue along another named edge. | Connect the same edge to Site instead of Device: invalid relation endpoint role. |
 | Traverse the declared symmetric `connected_device` relation from either endpoint. | Infer symmetry solely from A/Z endpoint declarations: missing business link proof. |
 | Traverse the declared directed `upstream_device` relation from A to Z. | Traverse Z to A without an inverse declaration: direction violation. |
