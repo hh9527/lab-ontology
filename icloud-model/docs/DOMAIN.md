@@ -92,6 +92,14 @@ Source references: `network/entity_sets/physical_link.telora`,
 `network/data_links/cross/governance.telora`, and
 `network/entity_set_links/intra.telora` in the iCloud modeling tree.
 
+The independent UTC epoch-millisecond acceptance model now also covers
+per-owner raw-sample Top-N and latest whole sample, including a composite
+owner grain, full sample-grain tie breakers, integer half-open bounds, an
+optional all-history latest window and rejection of a secondary clock in the
+latest-sample window. This does not resolve whether IC's alarm or KPI physical
+clock columns are actually epoch milliseconds; the IC source mapping remains
+the authority to verify before adopting that encoding in a production model.
+
 Q0268 and Q0270 operate on native `EnterprisePhysicalLink` attributes:
 `zPortName` filters `aPortIp`, and `aNeIp` filters link count, without a Device
 JOIN. These are separate from the explicit Device A/Z relation test. The

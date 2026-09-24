@@ -593,6 +593,7 @@ type ChildSiteScope = struct {
 type UtcWindowRequest = struct { dataset: String, start: String, end: String };
 type UtcFieldWindowRequest = struct { dataset: String, field: String, start: String, end: String };
 type UtcEpochWindowRequest = struct { dataset: String, field: String, start: Int, end: Int };
+type SampleWindow = enum { Text(UtcWindowRequest), Epoch(UtcEpochWindowRequest) };
 type UtcDaysWindowRequest = struct { dataset: String, as_of: String, days: Int };
 
 # Aggregate-result (HAVING) predicate over a requested measure alias.
@@ -6576,7 +6577,7 @@ def owner_site_scope: Fn(PreparedPayload, EntityEntry, EntityEntry, OwnerSiteSco
         }
     };
 
-def lower_sample_top_base: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest), String, Int, Option(OwnerSiteScope)) -> qb::Plan =
+def lower_sample_top_base: Fn(PreparedPayload, QueryRequest, String, String, String, Option(SampleWindow), String, Int, Option(OwnerSiteScope)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, dataset_id, window, rank_id, take, scope) {
         let sample = get_index(payload.entities, entity_by_id(payload, dataset_id));
         let owner = get_index(payload.entities, entity_by_id(payload, owner_id));
@@ -6612,9 +6613,14 @@ def lower_sample_top_base: Fn(PreparedPayload, QueryRequest, String, String, Str
                 });
                 let arranged: QueryRequest = {...request, dimensions: array::concat([sample_dimensions, remaining])};
                 let raw = match window {
-                    Some(bounds) => if bounds.dataset == dataset_id {
-                        lower_utc_window(payload, arranged, bounds)
-                    } else { fail!("sample top window must use its sample dataset", dataset_id, bounds.dataset) },
+                    Some(bounds) => match bounds {
+                        SampleWindow::Text(text_bounds) => if text_bounds.dataset == dataset_id {
+                            lower_utc_window(payload, arranged, text_bounds)
+                        } else { fail!("sample top window must use its sample dataset", dataset_id, text_bounds.dataset) },
+                        SampleWindow::Epoch(epoch_bounds) => if epoch_bounds.dataset == dataset_id {
+                            lower_utc_epoch_window(payload, arranged, epoch_bounds)
+                        } else { fail!("sample top window must use its sample dataset", dataset_id, epoch_bounds.dataset) },
+                    },
                     None => lower(payload, arranged),
                 };
                 let output = array::map(request.dimensions, fn(d) { ProjectionToken::Dimension(d.id) });
@@ -6678,11 +6684,16 @@ def lower_sample_top_base: Fn(PreparedPayload, QueryRequest, String, String, Str
 
 def lower_sample_top: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, String, Int, Option(OwnerSiteScope)) -> qb::Plan =
     fn(payload, request, owner_id, relation_id, window, rank_id, take, scope) {
-        lower_sample_top_base(payload, request, owner_id, relation_id, window.dataset, Some(window), rank_id, take, scope)
+        lower_sample_top_base(payload, request, owner_id, relation_id, window.dataset, Some(SampleWindow::Text(window)), rank_id, take, scope)
     };
 
-def lower_latest_sample: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest), Option(OwnerSiteScope), Option(SiteTenantScope)) -> qb::Plan =
-    fn(payload, request, owner_id, relation_id, dataset_id, window, scope, site_scope) {
+def lower_sample_epoch_top: Fn(PreparedPayload, QueryRequest, String, String, UtcEpochWindowRequest, String, Int, Option(OwnerSiteScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, window, rank_id, take, scope) {
+        lower_sample_top_base(payload, request, owner_id, relation_id, window.dataset, Some(SampleWindow::Epoch(window)), rank_id, take, scope)
+    };
+
+def lower_latest_sample_base: Fn(PreparedPayload, QueryRequest, String, String, String, Option(SampleWindow), TimeEncoding, Option(OwnerSiteScope), Option(SiteTenantScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window, encoding, scope, site_scope) {
         let sample = get_index(payload.entities, entity_by_id(payload, dataset_id));
         let spec = dataset_domain(payload, dataset_id);
         let clock = match spec.utc_time {
@@ -6696,9 +6707,18 @@ def lower_latest_sample: Fn(PreparedPayload, QueryRequest, String, String, Strin
         };
         if scope != None && site_scope != None {
             fail!("latest sample cannot combine ancestor and direct site scopes")
-        } else if role.semantics != TimeSemantics::Utc || role.encoding != TimeEncoding::CanonicalUtcSecondText {
-            fail!("latest sample requires a canonical UTC time role", dataset_id)
+        } else if role.semantics != TimeSemantics::Utc || role.encoding != encoding {
+            fail!("latest sample requires the requested UTC time encoding", dataset_id, encoding)
         } else {
+            match window {
+                Some(bounds) => match bounds {
+                    SampleWindow::Epoch(epoch_bounds) => if epoch_bounds.field != clock.name {
+                        fail!("latest sample window must use the authoritative UTC clock", dataset_id, epoch_bounds.field)
+                    } else { () },
+                    SampleWindow::Text(_) => (),
+                },
+                None => (),
+            };
             let rank = match array::find(payload.dimensions, fn(d) {
                 d.entity == sample.index && !d.computed && d.field == clock.index
             }) {
@@ -6713,6 +6733,20 @@ def lower_latest_sample: Fn(PreparedPayload, QueryRequest, String, String, Strin
                 },
             }
         }
+    };
+
+def lower_latest_sample: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcWindowRequest), Option(OwnerSiteScope), Option(SiteTenantScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window, scope, site_scope) {
+        lower_latest_sample_base(payload, request, owner_id, relation_id, dataset_id,
+            match window { Some(bounds) => Some(SampleWindow::Text(bounds)), None => None },
+            TimeEncoding::CanonicalUtcSecondText, scope, site_scope)
+    };
+
+def lower_latest_epoch_sample: Fn(PreparedPayload, QueryRequest, String, String, String, Option(UtcEpochWindowRequest), Option(OwnerSiteScope), Option(SiteTenantScope)) -> qb::Plan =
+    fn(payload, request, owner_id, relation_id, dataset_id, window, scope, site_scope) {
+        lower_latest_sample_base(payload, request, owner_id, relation_id, dataset_id,
+            match window { Some(bounds) => Some(SampleWindow::Epoch(bounds)), None => None },
+            TimeEncoding::UtcEpochMillis, scope, site_scope)
     };
 
 def lower_qualified_observation: Fn(PreparedPayload, QueryRequest, String, String, UtcWindowRequest, Array(SampleQualification), Array(NamedExistsRequest), Option(ComponentContextSpec)) -> qb::Plan =
@@ -8477,7 +8511,9 @@ pub use self::{
     lower_sample_count_ranges,
     lower_qualified_observation,
     lower_sample_top,
+    lower_sample_epoch_top,
     lower_latest_sample,
+    lower_latest_epoch_sample,
     lower_event_component,
     lower_link_site,
     lower_link_device_site_rows,

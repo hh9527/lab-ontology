@@ -87,6 +87,81 @@ pub def text_window_rejects_epoch_clock: test::Test = test::should_fail_with(fn(
     lower_epoch(parse(r#"{"op":"utc_window","measures":[],"dimensions":["EpochEventId"],"filters":[],"ordering":[],"window":{"dataset":"epoch_events","start":"2024-01-01T00:00:00Z","end":"2024-02-01T00:00:00Z"},"limit":null,"offset":null}"#))
 }, "UTC window requires a declared canonical UTC time field");
 
+@edsl::entity_id("epoch_owner")
+@edsl::entity_source("epoch_owner", "eo")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+type EpochOwner = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    @edsl::dimension("EpochOwnerId", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    id: String,
+    @edsl::column("tenantId")
+    @edsl::dimension("EpochOwnerTenant", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    tenant_id: String,
+};
+
+@edsl::entity_id("epoch_samples")
+@edsl::entity_source("epoch_samples", "es")
+@edsl::dataset(edsl::DatasetKind::Metric, ["owner_id", "tenant_id", "ts", "sequence"], Some("ts"))
+@edsl::named_relation_key("epoch_sample_owner", EpochOwner.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "tenant_id", to: "tenant_id"}),
+    ]))
+type EpochSample = struct {
+    @edsl::column("ownerId")
+    owner_id: String,
+    @edsl::column("tenantId")
+    tenant_id: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    @edsl::dimension("EpochSampleTs", True, True, [edsl::FilterOp::Ge], [edsl::FilterInputKind::Int])
+    ts: Int,
+    @edsl::column("receivedMs")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::UtcEpochMillis)
+    received_ms: Int,
+    @edsl::column("sequence")
+    sequence: Int,
+    @edsl::column("value")
+    @edsl::dimension("EpochSampleValue", True, True, [edsl::FilterOp::Ge], [edsl::FilterInputKind::Int])
+    value: Int,
+};
+
+def lower_epoch_sample: Fn(Value) -> qb::Query = query_intent_lower_factory(
+    edsl::build_root("epoch-sample-test", [EpochOwner.type, EpochSample.type], profile, fn(subject) { True }), "analyst");
+
+pub def epoch_sample_top_preserves_owner_grain: test::Test = test::should_ok(fn() {
+    let query = lower_epoch_sample(parse(r#"{"op":"sample_epoch_top","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"owner":"epoch_owner","relation":"epoch_sample_owner","rank":"EpochSampleValue","take":2,"window":{"dataset":"epoch_samples","field":"ts","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "es.ts >= ?")
+        && string::contains(query.sql, "PARTITION BY eo.id, eo.tenantId")
+        && query.bindings == [qb::Val::Int(1700000000000), qb::Val::Int(1700000001000), qb::Val::Int(2)] { True }
+    else { fail!("epoch sample Top-N must bind milliseconds and partition by full owner grain", query) }
+});
+
+pub def latest_epoch_sample_uses_authoritative_clock: test::Test = test::should_ok(fn() {
+    let query = lower_epoch_sample(parse(r#"{"op":"latest_epoch_sample","dataset":"epoch_samples","owner":"epoch_owner","relation":"epoch_sample_owner","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"window":{"field":"ts","start":1700000000000,"end":1700000001000},"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "es.ts DESC")
+        && string::contains(query.sql, "PARTITION BY eo.id, eo.tenantId")
+        && query.bindings == [qb::Val::Int(1700000000000), qb::Val::Int(1700000001000), qb::Val::Int(1)] { True }
+    else { fail!("latest epoch sample must rank whole rows by the authoritative clock", query) }
+});
+
+pub def latest_epoch_sample_rejects_secondary_clock: test::Test = test::should_fail_with(fn() {
+    lower_epoch_sample(parse(r#"{"op":"latest_epoch_sample","dataset":"epoch_samples","owner":"epoch_owner","relation":"epoch_sample_owner","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"window":{"field":"received_ms","start":100,"end":200},"limit":null,"offset":null}"#))
+}, "latest sample window must use the authoritative UTC clock");
+
+pub def latest_epoch_sample_all_history: test::Test = test::should_ok(fn() {
+    let query = lower_epoch_sample(parse(r#"{"op":"latest_epoch_sample","dataset":"epoch_samples","owner":"epoch_owner","relation":"epoch_sample_owner","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"window":null,"limit":null,"offset":null}"#));
+    if string::contains(query.sql, "es.ts DESC")
+        && !string::contains(query.sql, "es.ts >= ?")
+        && query.bindings == [qb::Val::Int(1)] { True }
+    else { fail!("unbounded latest epoch sample must use all history", query) }
+});
+
+pub def text_sample_top_rejects_epoch_clock: test::Test = test::should_fail_with(fn() {
+    lower_epoch_sample(parse(r#"{"op":"sample_top","measures":[],"dimensions":["EpochOwnerId","EpochSampleValue","EpochSampleTs"],"filters":[],"ordering":[],"owner":"epoch_owner","relation":"epoch_sample_owner","rank":"EpochSampleValue","take":2,"window":{"dataset":"epoch_samples","start":"2024-01-01T00:00:00Z","end":"2024-02-01T00:00:00Z"},"limit":null,"offset":null}"#))
+}, "UTC window requires a declared canonical UTC time field");
+
 pub def lowering_rejects_non_object_case: test::Test = test::should_fail_with(fn() {
     lower_knowledge(Value::Int(7))
 }, "intent field is not an object");
