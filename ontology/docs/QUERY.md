@@ -42,7 +42,7 @@ type ColumnRef = struct { source: String, column: String };
 
 type ScalarFunction = enum {
     Substr, Instr, If, Add, Sub, Lower, Length,
-    JsonExtract, JsonType, JsonValid,
+    JsonExtractText, JsonExtractInt, JsonExtractNumber, JsonType, JsonValid,
     Eq, Ne, Lt, Le, Gt, Ge, And, Or, Not,
 };
 type ScalarCall = struct { function: ScalarFunction, args: Array(Expr) };
@@ -783,18 +783,18 @@ def attempts: qb.Plan = {
     sources: [qb.source("e", "events")],
     projection: [
         qb.expr_item(qb.column("e", "id")),
-        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.attempt_id")),
-        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.status")),
+        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.attempt_id", qb.JsonScalarKind.Int)),
+        qb.expr_item(qb.json_extract(qb.column("e", "payload"), "$.status", qb.JsonScalarKind.Text)),
         qb.expr_item(qb.json_type(qb.column("e", "payload"), "$.amount")),
         qb.expr_item(qb.json_valid(qb.column("e", "payload"))),
     ],
     filter: Some(qb.scalar(qb.ScalarFunction.Eq, [
-        qb.json_extract(qb.column("e", "payload"), "$.status"),
+        qb.json_extract(qb.column("e", "payload"), "$.status", qb.JsonScalarKind.Text),
         qb.bind_string("ok"),
     ])),
     joins: [],
-    grouping: [qb.json_extract(qb.column("e", "payload"), "$.attempt_id")],
-    ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id"))],
+    grouping: [qb.json_extract(qb.column("e", "payload"), "$.attempt_id", qb.JsonScalarKind.Int)],
+    ordering: [qb.asc(qb.json_extract(qb.column("e", "payload"), "$.attempt_id", qb.JsonScalarKind.Int))],
     limit: None,
     offset: None,
     exists: [],
@@ -824,8 +824,10 @@ String("$.status"), String("ok"), String("$.attempt_id"), String("$.attempt_id")
 SQLite JSON1 标量语义（v1 精确采用，schema 保证被读文档是合法 JSON；v1 不在
 Query AST 内修复 malformed JSON）：
 
-- `json_extract(doc, path)`：path 缺失或对应 JSON null → SQL NULL；字符串/数值/
-  布尔 → 对应 SQL scalar；对象/数组 → JSON text；
+- `json_extract(doc, path, kind)`：AST 必须显式声明 Text/Int/Number；path 缺失或
+  对应 JSON null → SQL NULL。声明类型是来源数据契约，不从过滤输入类型反推；
+  SQLite 当前调用 JSON1 `json_extract`，来源中与声明类型不符的 JSON 值不由
+  query renderer 自动修复或诊断，方言一致性需以符合契约的数据检验；
 - `json_type(doc, path)`：返回 SQLite 类型文本（`null`/`true`/`false`/
   `integer`/`real`/`text`/`array`/`object`）或 path 缺失时 NULL；
 - `json_valid(doc)`：合法 JSON 返回 `1`，否则 `0`。

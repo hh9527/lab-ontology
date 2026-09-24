@@ -138,6 +138,7 @@ type JsonDimensionSpec = struct {
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
     path: String,
+    value_kind: qb::JsonScalarKind,
 };
 
 # Member-level: inherent row-range scope of a dimension member. Predicates
@@ -1086,9 +1087,9 @@ def computed_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInpu
     }
 };
 
-def json_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind), String) -> Fn(property::FieldPropertyCtx, Option(JsonDimensionDef)) -> JsonDimensionDef = fn(id, authorized, filterable, ops, input_kinds, path) {
+def json_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKind), String, qb::JsonScalarKind) -> Fn(property::FieldPropertyCtx, Option(JsonDimensionDef)) -> JsonDimensionDef = fn(id, authorized, filterable, ops, input_kinds, path, value_kind) {
     fn(ctx, previous) {
-        let spec: JsonDimensionSpec = { id, authorized, filterable, ops, input_kinds, path };
+        let spec: JsonDimensionSpec = { id, authorized, filterable, ops, input_kinds, path, value_kind };
         let all = match previous {
             Some(p) => array::push(p.dimensions, spec),
             None => [spec],
@@ -1101,8 +1102,8 @@ def json_dimension: Fn(String, Bool, Bool, Array(FilterOp), Array(FilterInputKin
 # Prepared build closure for a JSON dimension: json_extract(column, fixed path).
 # The path is a String capture that query lowers to a `?` binding, never into SQL
 # text or an identifier.
-def json_builder: Fn(String) -> Fn(qb::Expr) -> qb::Expr = fn(path) {
-    fn(col) { qb::json_extract(col, path) }
+def json_builder: Fn(String, qb::JsonScalarKind) -> Fn(qb::Expr) -> qb::Expr = fn(path, kind) {
+    fn(col) { qb::json_extract(col, path, kind) }
 };
 
 def entity_source: Fn(String, String) -> Fn(td::TypeDesc, Option(EntitySource)) -> EntitySource = fn(table, alias) {
@@ -2288,7 +2289,19 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         let d = property::get_field_prop(entity.entity_type, f.index, JsonDimensionDef.type);
         match d {
             Some(dd) => array::map(dd.dimensions, fn(spec) {
-                dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))
+                let input_ok = array::all(spec.input_kinds, fn(kind) {
+                    match spec.value_kind {
+                        qb::JsonScalarKind::Text => kind == FilterInputKind::Text,
+                        qb::JsonScalarKind::Int => kind == FilterInputKind::Int,
+                        qb::JsonScalarKind::Number => kind == FilterInputKind::Int || kind == FilterInputKind::Number,
+                    }
+                });
+                if !input_ok || (spec.value_kind != qb::JsonScalarKind::Text
+                    && array::any(spec.ops, fn(op) { is_text_op(op) })) {
+                    fail!("JSON dimension filter input or operation disagrees with declared value type", entity.id, f.name, spec.id)
+                } else {
+                    dimension_entry(entity.index, f.index, spec.id, True, json_builder(spec.path, spec.value_kind), spec.authorized, spec.filterable, spec.ops, spec.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))
+                }
             }),
             None => [],
         }

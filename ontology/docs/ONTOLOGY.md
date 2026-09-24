@@ -259,7 +259,7 @@ INNER JOIN 得到的 1..N 结果误称为 0..N。
 | `computed_measure(id, op, left, right)` | 字段 | 以已声明指标为依赖的受限计算指标（`Add`/`Sub`） |
 | `dimension(id, authorized, filterable, ops, input_kinds)` | 字段 | 普通维度及其能力 |
 | `computed_dimension(id, authorized, filterable, ops, input_kinds, build)` | 字段 | 从字段表达式构造的计算维度 |
-| `json_dimension(id, authorized, filterable, ops, input_kinds, path)` | 字段 | 把被标注字段的物理 JSON 列按固定 path 声明为业务维度（可组合 fold） |
+| `json_dimension(id, authorized, filterable, ops, input_kinds, path, value_kind)` | 字段 | 按固定 path 和 Text/Int/Number 值类型声明 JSON 业务维度（可组合 fold） |
 | `scope(predicates)` | 字段 | 维度成员的固有行范围（`Array(ScopePredicate)`，可组合 fold） |
 | `entity_source(table, alias)` | 类型 | 实体的数据源和别名 |
 | `entity_scope(predicates)` | 类型 | 物理实体始终生效的行域（`Array(EntityScopePredicate)`，按字段名声明） |
@@ -479,18 +479,19 @@ Dimension id，不得携带 path、raw predicate、SQLite 函数名或 JSON 表�
 @edsl.entity_source("devices", "d")
 type Device = struct {
     @edsl.column("attributes_json")
-    @edsl.json_dimension("DeviceChannel", flag_true, flag_true, eq_ops, text_kinds, "$.channel")
-    @edsl.json_dimension("DeviceRetryCount", flag_true, flag_true, eq_ops, int_kinds, "$.retry.count")
+    @edsl.json_dimension("DeviceChannel", flag_true, flag_true, eq_ops, text_kinds, "$.channel", qb.JsonScalarKind.Text)
+    @edsl.json_dimension("DeviceRetryCount", flag_true, flag_true, eq_ops, int_kinds, "$.retry.count", qb.JsonScalarKind.Int)
     attributes_json: String,
     # ...
 };
 ```
 
-- path 通过 Query 的公共 `JsonExtract` 构造器成为 String binding（`?`），绝不成为
+- path 通过 Query 的有类型 `JsonExtractText/Int/Number` 构造器成为 String binding（`?`），绝不成为
   SQL literal 或 identifier；JSON Dimension 复用现有 authorization、filterable、
   ops、input kinds、enum domain、scope、grain、relation path、grouping、ordering
   与 Top Per Group 检查。
-- knowledge Profile 必须显式允许所使用的 JSON scalar：缺 `JsonExtract` 的 Profile
+- `value_kind` 描述来源 JSON 值，独立于允许的过滤输入；准备期拒绝类型不符的过滤声明。
+- knowledge Profile 必须显式允许所使用的 JSON scalar：缺对应类型提取算子的 Profile
   在 lowering 时原子失败。
 - 同一 JSON Dimension 在 projection/grouping/filter/order 中重复 lowering 时保持
   确定性与正确 binding 顺序（顶层 `$.channel` 与嵌套 `$.retry.count` 均可用于授权
@@ -1069,7 +1070,8 @@ def profile: qb.PlanProfile = {
     allowed_aggregates: [qb.AggregateFunction.Count, qb.AggregateFunction.Sum, qb.AggregateFunction.Avg, qb.AggregateFunction.Min, qb.AggregateFunction.Max],
     allowed_scalars: [
         qb.ScalarFunction.Substr, qb.ScalarFunction.Instr, qb.ScalarFunction.If, qb.ScalarFunction.Add, qb.ScalarFunction.Sub, qb.ScalarFunction.Lower, qb.ScalarFunction.Length,
-        qb.ScalarFunction.JsonExtract, qb.ScalarFunction.JsonType, qb.ScalarFunction.JsonValid,
+        qb.ScalarFunction.JsonExtractText, qb.ScalarFunction.JsonExtractInt,
+        qb.ScalarFunction.JsonExtractNumber, qb.ScalarFunction.JsonType, qb.ScalarFunction.JsonValid,
         qb.ScalarFunction.Eq, qb.ScalarFunction.Ne, qb.ScalarFunction.Lt, qb.ScalarFunction.Le, qb.ScalarFunction.Gt, qb.ScalarFunction.Ge, qb.ScalarFunction.And, qb.ScalarFunction.Or, qb.ScalarFunction.Not,
     ],
     allow_distinct: True,
@@ -1220,7 +1222,7 @@ id** 与封闭算子词表，绝不携带表、列、alias、join 数组或 raw 
 未选择的 partition 维度、未请求的 partition 排序目标、非稳定 partition 排序、
 非正或超上限的 `take`、partition 与全局 limit/offset 组合、条件指标 predicate
 引用未授权/不可筛选/未知枚举值维度、计算指标未知依赖、依赖环、跨 grain 算术、
-Profile 缺 `JsonExtract` 时使用 JSON Dimension、选择未授权 JSON Dimension、
+Profile 缺对应类型的 JSON 提取算子时使用 JSON Dimension、选择未授权 JSON Dimension、
 非法 JSON 筛选输入、按未请求 JSON Dimension 排序。相关存在失败还包括：目标即 base、
 没有声明一跳关系或路线、两跳路线第一跳缺失/反向-only（方向不匹配）或非唯一
 （多条候选）、`via`/`target` 之间缺失或多条候选关系、同一 base 对同一 target
@@ -1642,7 +1644,7 @@ tie-breaker、binding 顺序确定性），并验证非法请求不发布可信�
 包括负 offset、缺排序 offset、scope/filter 冲突、partition 非法组合、计算指标
 契约破坏（未知依赖、依赖环、跨 grain）、filtered Measure 非法 predicate（引用
 未授权/不可筛选维度、不允许的 operation/input kind、enum 未知稳定值）与 JSON
-Dimension 拒绝（Profile 缺 JsonExtract、未授权 JSON Dimension、非法筛选输入、
+Dimension 拒绝（Profile 缺对应的有类型 JSON 提取算子、未授权 JSON Dimension、非法筛选输入、
 未请求排序目标）。测试还覆盖下一轮能力：measureless
 行级投影（无虚构 COUNT、无 grouping、跨安全 join 列表、contains 参数化绑定）、
 文本筛选算子（starts-with/contains/not-contains/ends-with 的封闭 lowering 与
