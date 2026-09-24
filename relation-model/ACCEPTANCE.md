@@ -27,7 +27,9 @@ same proof prevents joins from duplicating the counted subject. Reverse Safe cha
 complete parent identity provide this proof, including multi-hop paths.
 Matching only a shared tenant does not prove site identity, so counting
 same-tenant devices as children of a particular site is rejected. Branches
-that can duplicate the counted child remain unproven and are rejected. By
+that can duplicate the counted child remain unproven and are rejected; the
+diagnostic identifies the first offending named edge and distinguishes a
+qualifying EXISTS rewrite from choosing a different count subject. By
 default joins are inner; `include_empty: true` for non-root count subjects
 uses LEFT JOINs to retain root groups with zero children. Root filters stay in
 the outer WHERE; filters on nullable instances narrow their individual joined

@@ -4786,8 +4786,9 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
 # Counting a subject is safe only if every joined instance is functionally
 # determined by it. Walk the declared tree from the subject, independently of
 # the root-first order used to construct the SQL joins.
-def graph_count_subject_grain: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, subject_id) {
-    let proved = array::fold(request.nodes, ([subject_id], True), fn(state, node) {
+def graph_count_subject_grain: Fn(PreparedPayload, GraphRequest, String) -> (Bool, Option(GraphEdge)) = fn(payload, request, subject_id) {
+    let initial: (Array(String), Option(GraphEdge)) = ([subject_id], None);
+    let proved = array::fold(request.nodes, initial, fn(state, node) {
         array::fold(request.edges, state, fn(step, edge) {
             let from_known = array::any(step.0, fn(id) { id == edge.from });
             let to_known = array::any(step.0, fn(id) { id == edge.to });
@@ -4802,11 +4803,12 @@ def graph_count_subject_grain: Fn(PreparedPayload, GraphRequest, String) -> Bool
                                 && relation_covers_source_identity(get_index(payload.entities, relation.from), relation.key))
                     },
                 };
-                (array::push(step.0, if from_known { edge.to } else { edge.from }), step.1 && safe)
+                (array::push(step.0, if from_known { edge.to } else { edge.from }),
+                    if safe { step.1 } else { match step.1 { Some(_) => step.1, None => Some(edge) } })
             }
         })
     });
-    proved.1 && array::length(proved.0) == array::length(request.nodes)
+    (proved.1 == None && array::length(proved.0) == array::length(request.nodes), proved.1)
 };
 
 # The join tree is rooted by construction. Only an ancestor of the counted
@@ -4966,17 +4968,32 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let projection = match request.count {
                 None => row_projection,
                 Some(subject_id) => {
-                    if subject_id == request.root && !array::fold(request.edges, ([request.root], True), fn(state, edge) {
-                        let safe = match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
-                            Some(_) => False,
-                            None => relation_domain(payload, edge.relation).kind == RelationKind::Safe,
-                        };
-                        (array::push(state.0, edge.to), state.1 && safe
-                            && array::any(state.0, fn(id) { id == edge.from }))
-                    }).1 {
-                        fail!("graph count requires grain-safe forward joins; use existence for fan-out edges", subject_id)
-                    } else if subject_id != request.root && !graph_count_subject_grain(payload, request, subject_id) {
-                        fail!("graph cannot prove the non-root count subject has one row per root relationship", subject_id)
+                    let grain = if subject_id == request.root {
+                        (True, None)
+                    } else { graph_count_subject_grain(payload, request, subject_id) };
+                    let root_count_edge: Option(GraphEdge) = if subject_id == request.root {
+                        array::fold(request.edges, ([request.root], None), fn(state, edge) {
+                            let safe = match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
+                                Some(_) => False,
+                                None => relation_domain(payload, edge.relation).kind == RelationKind::Safe,
+                            };
+                            (array::push(state.0, edge.to),
+                                if safe && array::any(state.0, fn(id) { id == edge.from }) { state.1 }
+                                else { match state.1 { Some(_) => state.1, None => Some(edge) } })
+                        }).1
+                    } else { None };
+                    if subject_id == request.root && root_count_edge != None {
+                        match root_count_edge {
+                            Some(edge) => fail!(`graph count requires grain-safe forward joins: relation \{edge.relation} between \{edge.from} and \{edge.to} may multiply \{subject_id}; use correlated EXISTS if it only filters roots, or count the related instance to count its rows`,
+                                subject_id, edge.relation, edge.from, edge.to),
+                            None => fail!("graph count requires grain-safe forward joins", subject_id),
+                        }
+                    } else if subject_id != request.root && !grain.0 {
+                        match grain.1 {
+                            Some(edge) => fail!(`graph cannot prove the non-root count subject has one row per root relationship: relation \{edge.relation} between \{edge.from} and \{edge.to} may multiply \{subject_id}; if this edge only filters rows, use correlated EXISTS, otherwise choose a count subject whose grain stays unique`,
+                                subject_id, edge.relation, edge.from, edge.to),
+                            None => fail!("unsupported graph count: cannot establish a connected functional path from the count subject", subject_id),
+                        }
                     } else {
                         let instance = graph_instance(built.1, subject_id);
                         let entity = get_index(payload.entities, instance.entity);
