@@ -50,6 +50,9 @@ ordinary named relations or more declared business links. It can also follow a
 business link after a physical edge, retaining the original root correlation
 and checking business direction at every step. Unconnected edges and incorrect
 endpoint roles remain invalid.
+The graph Intent is closed at every level: unknown request, node, edge,
+projection, filter or existence fields are rejected as unsupported, never
+ignored when they could narrow the intended result.
 `tests/graph.telora`
 exercises these cases against QueryAst and both SQL materializers.
 
