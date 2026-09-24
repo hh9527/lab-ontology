@@ -3401,16 +3401,7 @@ def transform_sqlite: Fn(Plan) -> Query = fn(plan) {
     render_plan(structured)
 };
 
-# Deterministic distinct-row lowering: renders the same validated Plan as
-# `SELECT DISTINCT ...`, producing a result set of mutually distinct rows.
-# The Plan must be an ungrouped, aggregate-free projection of plain dimension
-# expressions (a row/listing shape); no grouped/HAVING/partitioned body is
-# accepted.  SQLite requires every ORDER BY term of a SELECT DISTINCT to appear
-# in the result set, so each ordering key must be an expression that is one of
-# the projected expressions (an ordering-by-non-projected-column is a plain
-# (non-distinct) lowering concern).  Bindings keep placeholder order and the
-# same Plan always produces byte-identical SQL/bindings.
-def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
+def validate_distinct_plan: Fn(Plan) -> Plan = fn(plan) {
     let structured = validate_structure(plan);
     if structured.partition != None {
         fail!("distinct row lowering does not combine with partitioned top N", plan)
@@ -3445,9 +3436,15 @@ def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
         if !order_ok {
             fail!("distinct row ordering must reference a projected dimension expression", plan)
         } else {
-            render_unpartitioned(structured, True)
+            structured
         }
     }
+};
+
+# DISTINCT is a plan shape, not a SQLite-specific permission.  All renderers
+# receive the same validated ungrouped projection and projected ordering.
+def transform_sqlite_distinct: Fn(Plan) -> Query = fn(plan) {
+    render_unpartitioned(validate_distinct_plan(plan), True)
 };
 
 # ---------------------------------------------------------------------------
@@ -3515,7 +3512,7 @@ def set_ok: Fn(SetOpKind, Plan, Plan) -> Bool = fn(kind, left, right) {
 # a nested/derived operand that genuinely needs a wrapper is rendered through a
 # valid derived-table/select form instead (e.g. `transform_sqlite_set_count`
 # wraps the whole compound as `(<compound>) AS __q_set`).
-def transform_sqlite_set: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, left, right) {
+def validate_set_operands: Fn(SetOpKind, Plan, Plan) -> Tuple([Plan, Plan]) = fn(kind, left, right) {
     let left_structured = validate_structure(left);
     let right_structured = validate_structure(right);
     if !set_operand_embeddable(left_structured) || !set_operand_embeddable(right_structured) {
@@ -3528,12 +3525,17 @@ def transform_sqlite_set: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, left, ri
     } else if set_categories(left_structured) != set_categories(right_structured) {
         fail!("set operation operands have positionally incompatible projection shapes", kind)
     } else {
-        let lq = render_plan(left_structured);
-        let rq = render_plan(right_structured);
-        let sql = `\{lq.sql} \{set_op_sql(kind)} \{rq.sql}`;
-        let result: Query = {sql: sql, bindings: array::concat([lq.bindings, rq.bindings])};
-        result
+        (left_structured, right_structured)
     }
+};
+
+def transform_sqlite_set: Fn(SetOpKind, Plan, Plan) -> Query = fn(kind, left, right) {
+    let operands = validate_set_operands(kind, left, right);
+    let lq = render_plan(operands.0);
+    let rq = render_plan(operands.1);
+    let sql = `\{lq.sql} \{set_op_sql(kind)} \{rq.sql}`;
+    let result: Query = {sql: sql, bindings: array::concat([lq.bindings, rq.bindings])};
+    result
 };
 
 # Outer count over the derived set: `SELECT count(1) FROM (<set>) AS __q_set`.
@@ -4098,6 +4100,8 @@ pub use self::{
     operators,
     structure_ok,
     validate_structure,
+    validate_distinct_plan,
+    validate_set_operands,
     profile_accepts,
     source_profile_accepts,
     validate,
