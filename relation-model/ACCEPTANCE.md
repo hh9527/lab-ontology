@@ -51,7 +51,7 @@ rejects missing edges, role mismatches and disconnected nodes. Reverse
 navigation reads the same edge from its other endpoint; it does
 not establish any business-level peer direction or symmetry. Named business
 links do: the Model specifies whether A/Z may be exchanged, and both roles
-must cover the complete participant identity. Graph rows and single-edge
+must cover the complete participant identity. Graph rows and multi-edge
 EXISTS can reference these links by their business ids; counting connected
 devices uses EXISTS so that multiple link rows do not change device grain.
 Graph filters name a particular entity instance and a declared dimension;
@@ -62,7 +62,8 @@ An EXISTS can branch from its root or any previously connected instance, and
 can follow an undirected/directed business link first, then continue along
 ordinary named relations or more declared business links. It can also follow a
 business link after a physical edge, retaining the original root correlation
-and checking business direction at every step. Unconnected edges and incorrect
+and checking business direction at every step. Subsequent physical relations
+may use Model-declared AND/OR connection keys. Unconnected edges and incorrect
 endpoint roles remain invalid.
 The graph Intent is closed at every level: unknown request, node, edge,
 projection, filter or existence fields are rejected as unsupported, never
