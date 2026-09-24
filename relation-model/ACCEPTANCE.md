@@ -25,10 +25,11 @@ Matching only a shared tenant does not prove site identity, so counting
 same-tenant devices as children of a particular site is rejected. Branches
 that can duplicate the counted child remain unproven and are rejected. By
 default joins are inner; `include_empty: true` for non-root count subjects
-uses LEFT JOINs to retain root groups with zero children. Outer filters and
-EXISTS must be anchored on the root, since predicates on nullable instances
-would silently discard those groups; business-link joins are not yet supported
-in this mode. A count uses a declared key, or a column of the dataset's
+uses LEFT JOINs to retain root groups with zero children. Root filters stay in
+the outer WHERE; filters on nullable instances narrow their individual joined
+sources rather than the outer WHERE, preserving empty root
+groups. EXISTS anchored on a nullable instance and business-link joins are not
+yet supported in this mode. A count uses a declared key, or a column of the dataset's
 declared non-null identity grain when there is no single-column key. It never
 uses a guessed DISTINCT key; entities without either identity declaration are
 rejected. It
@@ -69,6 +70,6 @@ role, or missing proof.
 
 An otherwise valid but unimplemented composition must report `unsupported`
 separately from invalid model semantics. The Model explicitly establishes
-endpoint identities and symmetric/directed peer semantics; filtered nullable
-children, business-link outer joins, and non-root grouping dimensions remain
+endpoint identities and symmetric/directed peer semantics; nullable-child
+EXISTS, business-link outer joins, and non-root grouping dimensions remain
 pending.

@@ -35,8 +35,25 @@ type Unidentified = struct {
     tenant_id: String,
 };
 
+@edsl::entity_id("scoped_reading")
+@edsl::entity_source("scoped_readings", "sr")
+@edsl::entity_scope([{field: "classification", op: edsl::FilterOp::Eq,
+    input: edsl::FilterInput::Text("active")}])
+@edsl::named_relation_key("scoped_reading_tenant", Tenant.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::Eq({from: 2, to: 0}))
+type ScopedReading = struct {
+    @edsl::column("classification")
+    @edsl::dimension("scoped_reading_class", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    classification: String,
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+};
+
 def count_payload: edsl::PreparedPayload = edsl::build_root("count-grain-pressure",
-    [Tenant.type, Reading.type, Unidentified.type], payload.profile,
+    [Tenant.type, Reading.type, Unidentified.type, ScopedReading.type], payload.profile,
     fn(subject) { subject == "resolver" });
 def lower_count_grain: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(count_payload, "resolver");
 
@@ -80,6 +97,24 @@ pub def root_count_rejects_missing_identity: test::Test = test::should_fail_with
         "edges":[], "select":[], "count":"u"
     }"#).unwrap!())
 }, "graph count subject requires a declared key or dataset grain");
+
+pub def empty_count_keeps_child_entity_scope_inside_source: test::Test = test::should_ok(fn() {
+    let ast = lower_count_grain(json::parse(r#"{
+        "op":"graph", "root":"tenant", "nodes":[{"id":"tenant","entity":"tenant"},{"id":"reading","entity":"scoped_reading"}],
+        "edges":[{"relation":"scoped_reading_tenant","from":"reading","to":"tenant"}],
+        "select":[{"node":"tenant","dimension":"tenant_id"}], "count":"reading", "include_empty":true,
+        "filters":[{"node":"tenant","dimension":"tenant_id","op":"eq","kind":"text","value":"tenant-1"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "LEFT JOIN (SELECT * FROM scoped_readings AS reading WHERE reading.classification = ?1) AS reading")
+        && string::contains(sq.sql, "WHERE tenant.id = ?2")
+        && string::contains(pg.sql, "LEFT JOIN (SELECT * FROM \"scoped_readings\" AS \"reading\" WHERE \"reading\".\"classification\" = $1) AS \"reading\"")
+        && sq.bindings == [qb::Val::String("active"), qb::Val::String("tenant-1")]
+        && pg.bindings == sq.bindings {
+        True
+    } else { fail!("child source scope escaped the nullable LEFT JOIN", sq, pg) }
+});
 
 @edsl::entity_id("foreign_link")
 @edsl::entity_source("foreign_links", "foreign_link")
@@ -588,15 +623,34 @@ pub def count_devices_by_tenant_including_empty_groups: test::Test = test::shoul
     } else { fail!("empty-child count lost outer joins or root filter binding", sq, pg) }
 });
 
-pub def empty_group_count_rejects_nullable_filter: test::Test = test::should_fail_with(fn() {
-    lower(json::parse(r#"{
+pub def empty_group_count_filters_nullable_child: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
         "op":"graph", "root":"tenant", "include_empty":true,
         "nodes":[{"id":"tenant","entity":"tenant"},{"id":"device","entity":"device"}],
         "edges":[{"relation":"device_tenant","from":"device","to":"tenant"}],
         "select":[{"node":"tenant","dimension":"tenant_id"}], "count":"device",
         "filters":[{"node":"device","dimension":"device_id","op":"eq","kind":"text","value":"device-1"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "LEFT JOIN (SELECT * FROM devices AS device WHERE device.id = ?1) AS device")
+        && string::contains(sq.sql, "ON device.tenant_id = tenant.id GROUP BY tenant.id")
+        && string::contains(pg.sql, "LEFT JOIN (SELECT * FROM \"devices\" AS \"device\" WHERE \"device\".\"id\" = $1) AS \"device\"")
+        && sq.bindings == [qb::Val::String("device-1")]
+        && pg.bindings == sq.bindings {
+        True
+    } else { fail!("nullable child filter must narrow joined rows without removing empty roots", sq, pg) }
+});
+
+pub def empty_group_count_rejects_unknown_filter_node: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"tenant", "include_empty":true,
+        "nodes":[{"id":"tenant","entity":"tenant"},{"id":"device","entity":"device"}],
+        "edges":[{"relation":"device_tenant","from":"device","to":"tenant"}],
+        "select":[{"node":"tenant","dimension":"tenant_id"}], "count":"device",
+        "filters":[{"node":"missing","dimension":"device_id","op":"eq","kind":"text","value":"device-1"}]
     }"#).unwrap!())
-}, "graph include_empty cannot filter a nullable joined instance");
+}, "graph filter references an unknown node");
 
 pub def empty_group_count_rejects_nullable_exists: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
@@ -607,7 +661,7 @@ pub def empty_group_count_rejects_nullable_exists: test::Test = test::should_fai
         "exists":[{"anchor":"device","nodes":[{"id":"site","entity":"site"}],
             "edges":[{"relation":"device_site","from":"device","to":"site"}]}]
     }"#).unwrap!())
-}, "graph include_empty cannot filter a nullable joined instance");
+}, "graph include_empty cannot filter a nullable joined instance through existence");
 
 pub def empty_group_requires_nonroot_count: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
