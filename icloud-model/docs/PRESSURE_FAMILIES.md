@@ -27,6 +27,11 @@ Each candidate takes the normal Eq authorization, canonical-value lookup and
 parameter-binding path; raw severity wire codes, wrong node roles and empty
 groups fail. Outer `include_empty` rejects WHERE-based `any_of` rather than
 silently removing empty populations.
+Graph dimension projection now also uses the Model's declared output mapping:
+`alarm_severity` returns stable `critical`/`major`, not physical `"1"`/`"2"`.
+Grouped counts reuse that same CASE expression, so Device classification
+values with several declared physical wires form one business-value group.
+Unknown physical values map to NULL rather than masquerading as a known ID.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,
