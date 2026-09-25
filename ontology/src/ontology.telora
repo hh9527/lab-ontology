@@ -3645,74 +3645,81 @@ def graph_count_subject_grain: Fn(PreparedPayload, GraphRequest, String) -> (Boo
     (proved.1 == None && array::length(proved.0) == array::length(request.nodes), proved.1)
 };
 
-def graph_grouped_fanout_child_count: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, subject_id) {
-    if subject_id == request.root || array::length(request.nodes) != 2
-        || array::length(request.edges) != 1 || request.group_by_identity != [request.root]
+def graph_grouped_child_chain_count: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, subject_id) {
+    if subject_id == request.root || array::length(request.edges) != array::length(request.nodes) - 1
+        || request.group_by_identity != [request.root]
         || !array::all(request.select, fn(item) { item.node == request.root }) { False }
     else {
-        let edge = request.edges[0];
-        if edge.from != subject_id || edge.to != request.root
-            || array::any(payload.business_links, fn(link) { link.id == edge.relation }) { False }
-        else {
-            let relation = relation_domain(payload, edge.relation);
-            let root = graph_node(request, request.root);
-            let child = graph_node(request, subject_id);
-            let root_entity = entity_by_id(payload, root.entity);
-            let child_entity = entity_by_id(payload, child.entity);
-            let target = get_index(payload.entities, root_entity);
-            let branches = match relation.key {
-                RelationKey::Or(parts) => parts,
-                _ => [],
-            };
-            relation.from == child_entity && relation.to == root_entity
-                && relation.kind == RelationKind::FanOut && array::length(branches) > 0
-                && array::all(branches, fn(part) {
-                    conjunctive_identity_key(part)
-                        && safe_relation_covers_target_identity(target, exists_pairs(part))
-                })
-        }
+        let path = graph_count_ancestors(request, subject_id);
+        array::length(path) == array::length(request.nodes)
+            && array::all(array::filter(array::enumerate(path), fn(entry) { entry.0 > 0 }), fn(entry) {
+                let child = graph_node(request, entry.1);
+                let parent = graph_node(request, path[entry.0 - 1]);
+                match array::find(request.edges, fn(edge) { edge.from == child.id && edge.to == parent.id }) {
+                    None => False,
+                    Some(edge) => if array::any(payload.business_links, fn(link) { link.id == edge.relation }) { False }
+                    else {
+                        let relation = relation_domain(payload, edge.relation);
+                        let target = get_index(payload.entities, entity_by_id(payload, parent.entity));
+                        let branches = match relation.key {
+                            RelationKey::Or(parts) => parts,
+                            key => [key],
+                        };
+                        relation.from == entity_by_id(payload, child.entity) && relation.to == target.index
+                            && array::length(branches) > 0
+                            && array::all(branches, fn(part) {
+                                conjunctive_identity_key(part)
+                                    && safe_relation_covers_target_identity(target, exists_pairs(part))
+                            })
+                    },
+                }
+            })
     }
 };
 
-def graph_grouped_fanout_missing_root_key: Fn(PreparedPayload, GraphRequest, String) -> Option((String, Int, String)) = fn(payload, request, subject_id) {
-    if subject_id == request.root || array::length(request.nodes) != 2
-        || array::length(request.edges) != 1 || request.group_by_identity != [request.root]
+def graph_grouped_chain_missing_target_key: Fn(PreparedPayload, GraphRequest, String) -> Option((String, Int, String)) = fn(payload, request, subject_id) {
+    if subject_id == request.root || array::length(request.edges) != array::length(request.nodes) - 1
+        || request.group_by_identity != [request.root]
         || !array::all(request.select, fn(item) { item.node == request.root }) { None }
     else {
-        let edge = request.edges[0];
-        if edge.from != subject_id || edge.to != request.root
-            || array::any(payload.business_links, fn(link) { link.id == edge.relation }) { None }
+        let path = graph_count_ancestors(request, subject_id);
+        if array::length(path) != array::length(request.nodes) { None }
         else {
-            let relation = relation_domain(payload, edge.relation);
-            let root = graph_node(request, request.root);
-            let child = graph_node(request, subject_id);
-            let target = get_index(payload.entities, entity_by_id(payload, root.entity));
-            let branches = match relation.key {
-                RelationKey::Or(parts) => parts,
-                _ => [],
-            };
-            if relation.from != entity_by_id(payload, child.entity)
-                || relation.to != target.index || relation.kind != RelationKind::FanOut { None }
-            else {
-                let missing = array::flat_map(array::enumerate(branches), fn(entry) {
-                    let part = entry.1;
-                    if !conjunctive_identity_key(part) { [] }
+            let missing = array::flat_map(array::filter(array::enumerate(path), fn(entry) { entry.0 > 0 }), fn(step) {
+                let child = graph_node(request, step.1);
+                let parent = graph_node(request, path[step.0 - 1]);
+                match array::find(request.edges, fn(edge) { edge.from == child.id && edge.to == parent.id }) {
+                    None => [],
+                    Some(edge) => if array::any(payload.business_links, fn(link) { link.id == edge.relation }) { [] }
                     else {
-                        let pairs = exists_pairs(part);
-                        let names = match target.dataset {
-                            Some(dataset) => dataset.grain,
-                            None => array::map(array::filter(target.fields, fn(field) { field.index == target.key_field }), fn(field) { field.name }),
+                        let relation = relation_domain(payload, edge.relation);
+                        let target = get_index(payload.entities, entity_by_id(payload, parent.entity));
+                        let branches = match relation.key {
+                            RelationKey::Or(parts) => parts,
+                            key => [key],
                         };
-                        array::map(array::filter(names, fn(name) {
-                            match array::find(target.fields, fn(field) { field.name == name }) {
-                                Some(field) => !array::any(pairs, fn(pair) { pair.to == field.index }),
-                                None => False,
+                        if relation.from != entity_by_id(payload, child.entity) || relation.to != target.index { [] }
+                        else { array::flat_map(array::enumerate(branches), fn(entry) {
+                            let part = entry.1;
+                            if !conjunctive_identity_key(part) { [] }
+                            else {
+                                let pairs = exists_pairs(part);
+                                let names = match target.dataset {
+                                    Some(dataset) => dataset.grain,
+                                    None => array::map(array::filter(target.fields, fn(field) { field.index == target.key_field }), fn(field) { field.name }),
+                                };
+                                array::map(array::filter(names, fn(name) {
+                                    match array::find(target.fields, fn(field) { field.name == name }) {
+                                        Some(field) => !array::any(pairs, fn(pair) { pair.to == field.index }),
+                                        None => False,
+                                    }
+                                }), fn(name) { (edge.relation, entry.0 + 1, name) })
                             }
-                        }), fn(name) { (edge.relation, entry.0 + 1, name) })
-                    }
-                });
-                array::get(missing, 0)
-            }
+                        }) }
+                    },
+                }
+            });
+            array::get(missing, 0)
         }
     }
 };
@@ -4090,9 +4097,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                             None => fail!("graph count requires grain-safe forward joins", subject_id),
                         }
                     } else if subject_id != request.root && !grain.0
-                        && !graph_grouped_fanout_child_count(payload, request, subject_id) {
-                        match graph_grouped_fanout_missing_root_key(payload, request, subject_id) {
-                            Some(missing) => fail!(`graph count relation \{missing.0} alternative \{missing.1} does not cover root identity field \{missing.2}; add the missing equality to this relation branch or use correlated EXISTS when the relation only filters roots`, missing.0, missing.1, missing.2),
+                        && !graph_grouped_child_chain_count(payload, request, subject_id) {
+                        match graph_grouped_chain_missing_target_key(payload, request, subject_id) {
+                            Some(missing) => fail!(`graph count relation \{missing.0} alternative \{missing.1} does not cover target identity field \{missing.2}; add the missing equality to this relation branch or use correlated EXISTS when the relation only filters roots`, missing.0, missing.1, missing.2),
                             None => match grain.1 {
                             Some(edge) => fail!(`graph cannot prove the non-root count subject has one row per root relationship: relation \{edge.relation} between \{edge.from} and \{edge.to} may multiply \{subject_id}; if this edge only filters rows, use correlated EXISTS, otherwise choose a count subject whose grain stays unique`,
                                 subject_id, edge.relation, edge.from, edge.to),
