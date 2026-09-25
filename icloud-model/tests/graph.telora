@@ -796,6 +796,52 @@ pub def independent_kpi_windows_cannot_share_a_joined_aggregate_population: test
                    {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}]}"#).unwrap!())
 }, "graph measure source may be multiplied by a joined relation");
 
+def independent_window_intent: Fn() -> std::value::Value = fn() {
+    json::parse(r#"{"op":"graph_pair",
+        "left":{"op":"graph","root":"device",
+            "nodes":[{"id":"device","entity":"device"},{"id":"week","entity":"device_kpi"}],
+            "edges":[{"relation":"device_kpi_of_device","from":"week","to":"device"}],
+            "select":[{"node":"device","dimension":"device_name"}],
+            "measures":[{"node":"week","measure":"port_count"}],"group_by_identity":["device"],
+            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}]},
+        "right":{"op":"graph","root":"device",
+            "nodes":[{"id":"device","entity":"device"},{"id":"month","entity":"device_kpi"}],
+            "edges":[{"relation":"device_kpi_of_device","from":"month","to":"device"}],
+            "select":[{"node":"device","dimension":"device_name"}],
+            "measures":[{"node":"month","measure":"port_count"}],"group_by_identity":["device"],
+            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}]}}"#).unwrap!()
+};
+
+pub def independent_kpi_windows_join_only_complete_owner_groups: test::Test = test::should_ok(fn() {
+    let intent = independent_window_intent();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "sum(week.portCount) AS week_port_count")
+        && string::contains(sq.sql, "sum(month.portCount) AS month_port_count")
+        && string::contains(sq.sql, "__q_left.__q_key_1 = __q_right.__q_key_1")
+        && string::contains(sq.sql, "__q_left.__q_key_2 = __q_right.__q_key_2")
+        && !string::contains(sq.sql, "week.resId = month.resId")
+        && string::contains(pg.sql, "\"week\".\"portCount\"")
+        && string::contains(pg.sql, "\"month\".\"portCount\"")
+        && sq.bindings == [qb::Val::String("2025-01-01 00:00:00"), qb::Val::String("2025-01-08 00:00:00"),
+            qb::Val::String("2025-01-01 00:00:00"), qb::Val::String("2025-02-01 00:00:00")]
+        && pg.bindings == sq.bindings { True }
+    else { fail!(`independent KPI groups were multiplied or lost owner identity: \{sq.sql} / \{pg.sql}`, sq.bindings, pg.bindings) }
+});
+
+pub def joined_groups_reject_incomplete_owner_identity: test::Test = test::should_fail_with(fn() {
+    let ast = query_intent_ast_factory(payload, "public")(independent_window_intent());
+    match ast.plan {
+        qb::QueryPlan::JoinedGroups(joined) => {
+            sqlite::build_query(qb::finish(ast.ctx, qb::QueryPlan::JoinedGroups({...joined,
+                keys: [joined.keys[0], joined.keys[1]]})))
+        },
+        _ => fail!("expected joined grouped plans"),
+    }
+}, "joined groups require grouped, embeddable operands, identity keys and visible outputs");
+
 pub def frame_context_threshold_requires_owner_identity: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"frame",
         "nodes":[{"id":"frame","entity":"frame"},{"id":"device","entity":"device"},

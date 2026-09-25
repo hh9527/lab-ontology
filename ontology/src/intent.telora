@@ -148,10 +148,8 @@ def parse_graph_existence: Fn(String, Value) -> edsl::GraphExist = fn(subject, i
         negated}
 };
 
-def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, intent) {
-    let obj = as_object(intent);
-    let op = as_string(field(obj, "op"));
-    if op != "graph" { fail!("unsupported intent op; use graph with named nodes and relations", op) }
+def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, obj) {
+    if as_string(field(obj, "op")) != "graph" { fail!("aggregate pair operands must be graph intents") }
     else {
         graph_keys(obj, "request", ["op", "root", "distinct", "nodes", "edges", "constraints", "select", "measures", "measure_having", "filters", "any_of", "exists", "count", "count_having", "count_groups", "include_empty", "group_by_identity", "top_per", "top_by_measure", "order_by", "take"]);
         let request: edsl::GraphRequest = {
@@ -268,13 +266,66 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst =
                 },
             },
         };
-        let ctx = qb::build_context();
         let lowered = edsl::lower_graph(ctx, payload, subject, request);
-        let plan = if request.count_groups { qb::QueryPlan::GroupCount(lowered.1) }
-            else if request.distinct { qb::QueryPlan::DistinctRows(lowered.1) }
-            else { qb::QueryPlan::Rows(lowered.1) };
-        qb::finish(lowered.0, qb::validate_query_plan(plan))
+        (lowered.0, request, lowered.1)
     }
+};
+
+def paired_graph_shape: Fn(edsl::GraphRequest) -> Bool = fn(request) {
+    request.group_by_identity == [request.root]
+        && array::length(request.measures) == 1 && request.count == None
+        && request.count_having == None && !request.count_groups && !request.distinct
+        && !request.include_empty && request.top_per == None && request.top_by_measure == None
+        && array::length(request.order_by) == 0 && request.take == None
+        && array::all(request.select, fn(item) { item.node == request.root })
+};
+
+def paired_group_operand: Fn(qb::Plan) -> qb::Plan = fn(plan) {
+    let keys = array::map(array::enumerate(plan.grouping), fn(entry) {
+        qb::named_expr_item(entry.1, `__q_key_\{entry.0}`)
+    });
+    {...plan, projection: array::concat([plan.projection, keys])}
+};
+
+def lower_graph_pair: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::QueryAst = fn(payload, subject, obj) {
+    graph_keys(obj, "aggregate pair", ["op", "left", "right"]);
+    let left = lower_graph_object(qb::build_context(), payload, subject, as_object(field(obj, "left")));
+    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, as_object(field(obj, "right")));
+    if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
+        fail!("aggregate pair operands each require one measure, group_by_identity [root], root-only dimensions and no row ordering or count; qualify each window inside its own graph")
+    } else if left.1.root != right.1.root
+        || edsl::graph_node(left.1, left.1.root).entity != edsl::graph_node(right.1, right.1.root).entity {
+        fail!("aggregate pair roots must name the same entity instance on both sides", left.1.root, right.1.root)
+    } else if left.1.select != right.1.select {
+        fail!("aggregate pair operands must select the same root dimensions in the same order", left.1.select, right.1.select)
+    } else if left.2.grouping != right.2.grouping {
+        fail!("aggregate pair operands must group by the same complete root identity", left.1.root)
+    } else {
+        let keys = array::map(array::enumerate(left.2.grouping), fn(entry) { `__q_key_\{entry.0}` });
+        let visible = array::map(left.1.select, fn(item) { `\{item.node}_\{item.dimension}` });
+        let left_measure = left.1.measures[0];
+        let right_measure = right.1.measures[0];
+        let joined: qb::JoinedGroups = {
+            left: paired_group_operand(left.2), right: paired_group_operand(right.2), keys,
+            left_outputs: array::push(visible, `\{left_measure.node}_\{left_measure.measure}`),
+            right_outputs: [`\{right_measure.node}_\{right_measure.measure}`],
+        };
+        qb::finish(right.0, qb::validate_query_plan(qb::QueryPlan::JoinedGroups(joined)))
+    }
+};
+
+def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, intent) {
+    let obj = as_object(intent);
+    let op = as_string(field(obj, "op"));
+    if op == "graph" {
+        let lowered = lower_graph_object(qb::build_context(), payload, subject, obj);
+        let request = lowered.1;
+        let plan = if request.count_groups { qb::QueryPlan::GroupCount(lowered.2) }
+            else if request.distinct { qb::QueryPlan::DistinctRows(lowered.2) }
+            else { qb::QueryPlan::Rows(lowered.2) };
+        qb::finish(lowered.0, qb::validate_query_plan(plan))
+    } else if op == "graph_pair" { lower_graph_pair(payload, subject, obj) }
+    else { fail!("unsupported intent op; use graph or graph_pair with named nodes and relations", op) }
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
