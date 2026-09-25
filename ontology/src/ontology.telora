@@ -231,7 +231,7 @@ type UnionSourceDef = struct {
 type RelationDef = struct { relations: Array(RelationDecl) };
 
 type LinkDirection = enum { Undirected, Directed };
-type BusinessLinkDecl = struct { id: String, a_relation: String, z_relation: String, direction: LinkDirection };
+type BusinessLinkDecl = struct { id: String, a_relation: String, z_relation: String, direction: LinkDirection, guard: Option(ScopePredicate) };
 @prelude::property(PropertyTarget::Type)
 type BusinessLinkDef = struct { links: Array(BusinessLinkDecl) };
 
@@ -591,6 +591,7 @@ type BusinessLinkEntry = struct {
     a_relation: String,
     z_relation: String,
     direction: LinkDirection,
+    guard: Option(ScopePredicate),
 };
 
 type RelationShape = enum {
@@ -959,9 +960,20 @@ def business_link: Fn(String, String, String, LinkDirection) -> Fn(td::TypeDesc,
         if id == "" || a_relation == "" || z_relation == "" || a_relation == z_relation {
             fail!("business link requires a name and two distinct endpoint relations", id, a_relation, z_relation)
         } else {
-            let entry: BusinessLinkDecl = {id, a_relation, z_relation, direction};
+            let entry: BusinessLinkDecl = {id, a_relation, z_relation, direction, guard: None};
             let links = match previous { Some(p) => array::push(p.links, entry), None => [entry] };
             {links}
+        }
+    }
+};
+
+def guarded_business_link: Fn(String, String, String, LinkDirection, ScopePredicate) -> Fn(td::TypeDesc, Option(BusinessLinkDef)) -> BusinessLinkDef = fn(id, a_relation, z_relation, direction, guard) {
+    fn(ctx, previous) {
+        if id == "" || a_relation == "" || z_relation == "" || a_relation == z_relation {
+            fail!("guarded business link requires a name and two distinct endpoint relations", id, a_relation, z_relation)
+        } else {
+            let entry: BusinessLinkDecl = {id, a_relation, z_relation, direction, guard: Some(guard)};
+            {links: match previous { Some(p) => array::push(p.links, entry), None => [entry] }}
         }
     }
 };
@@ -2164,6 +2176,26 @@ def relation_covers_source_identity: Fn(EntityEntry, RelationKey) -> Bool = fn(s
     }
 };
 
+def prepare_source_guard: Fn(EntityEntry, String, Option(ScopePredicate)) -> Option(ScopePredicate) = fn(entity, id, guard) {
+    match guard {
+        None => None,
+        Some(pred) => do {
+            let field = match array::find(entity.fields, fn(field) { field.name == pred.field }) {
+                Some(found) => found,
+                None => fail!("relation or business link guard references an unknown source field", id, pred.field),
+            };
+            if field.column == "" { fail!("relation or business link guard field requires a physical column", id, pred.field) }
+            else if pred.op != FilterOp::Eq && pred.op != FilterOp::Ne {
+                fail!("relation or business link guard supports only Eq or Ne", id, pred.op)
+            } else if !((field.ty == String.type && match pred.input { FilterInput::Text(_) => True, _ => False })
+                || (field.ty == Int.type && match pred.input { FilterInput::Int(_) => True, _ => False })
+                || (field.ty == Bool.type && match pred.input { FilterInput::Bool(_) => True, _ => False })) {
+                fail!("relation or business link guard value disagrees with source field type", id, pred.field, pred.input)
+            } else { Some(pred) }
+        },
+    }
+};
+
 def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Array(BusinessLinkEntry) = fn(entities, relations) {
     let links = array::flat_map(entities, fn(hub) {
         let declarations = match property::get_type_prop(hub.entity_type, BusinessLinkDef.type) {
@@ -2199,6 +2231,7 @@ def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Arra
                     let result: BusinessLinkEntry = {
                         id: declaration.id, hub: hub.index, participant: a.to,
                         a_relation: a.id, z_relation: z.id, direction: declaration.direction,
+                        guard: prepare_source_guard(hub, declaration.id, declaration.guard),
                     };
                     result
                 }
@@ -3317,19 +3350,39 @@ def graph_guarded_join: Fn(qb::BuildCtx, PreparedPayload, RelationEntry, qb::Sou
     })
 };
 
+def graph_business_link_guard: Fn(qb::BuildCtx, PreparedPayload, BusinessLinkEntry, qb::Source) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, link, hub) {
+    match link.guard {
+        None => (ctx, None),
+        Some(pred) => do {
+            let entity = get_index(payload.entities, link.hub);
+            let field = match array::find(entity.fields, fn(item) { item.name == pred.field }) {
+                Some(item) => item, None => fail!("prepared business link guard field is missing", link.id, pred.field),
+            };
+            let bound = qb::bind(ctx, to_val(pred.input));
+            let op = if pred.op == FilterOp::Ne { qb::ScalarFunction::Ne } else { qb::ScalarFunction::Eq };
+            (bound.0, Some(qb::scalar(op, [qb::column(hub, field.column), bound.1])))
+        },
+    }
+};
+
 def graph_link_joins: Fn(qb::BuildCtx, PreparedPayload, BusinessLinkEntry, qb::Source, String) -> (qb::BuildCtx, qb::Source, Array(qb::Join)) = fn(ctx, payload, link, origin, target_hint) {
     let a = relation_domain(payload, link.a_relation);
     let z = relation_domain(payload, link.z_relation);
     let hub_entry = get_index(payload.entities, link.hub);
     let peer_entry = get_index(payload.entities, link.participant);
     let hub = entity_source_at_with_context(ctx, payload, hub_entry, `\{link.id}_link`);
-    let peer = entity_source_at_with_context(hub.0, payload, peer_entry, target_hint);
+    let guard = graph_business_link_guard(hub.0, payload, link, hub.1);
+    let peer = entity_source_at_with_context(guard.0, payload, peer_entry, target_hint);
     let origin_a = graph_key_condition(payload, a, hub.1, origin, a.key);
     let origin_z = graph_key_condition(payload, z, hub.1, origin, z.key);
     let peer_a = graph_key_condition(payload, a, hub.1, peer.1, a.key);
     let peer_z = graph_key_condition(payload, z, hub.1, peer.1, z.key);
     let symmetric = link.direction == LinkDirection::Undirected;
     let hub_condition = if symmetric { qb::on_or([origin_a, origin_z]) } else { origin_a };
+    let hub_condition = match guard.1 {
+        None => hub_condition,
+        Some(expr) => qb::on_and([hub_condition, qb::on_predicate(expr)]),
+    };
     let peer_condition = if symmetric {
         qb::on_or([qb::on_and([origin_a, peer_z]), qb::on_and([origin_z, peer_a])])
     } else { peer_z };
@@ -3528,7 +3581,8 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphI
                 let hub_entry = get_index(payload.entities, link.hub);
                 let peer_entry = get_index(payload.entities, link.participant);
                 let hub = entity_source_at_with_context(ctx, payload, hub_entry, `\{link.id}_link`);
-                let peer = entity_source_at_with_context(hub.0, payload, peer_entry, next_id);
+                let guard = graph_business_link_guard(hub.0, payload, link, hub.1);
+                let peer = entity_source_at_with_context(guard.0, payload, peer_entry, next_id);
                 let a = relation_domain(payload, link.a_relation);
                 let z = relation_domain(payload, link.z_relation);
                 let origin_a = graph_correlation_pairs(payload, a, anchor.source, hub.1, False, a.key);
@@ -3596,7 +3650,7 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphI
                 let exists = qb::exists_path_alternatives(hub.1, correlation, built.2);
                 let constraints = graph_constraints(alternatives.0, payload, array::concat([outer, built.1]), spec.constraints);
                 let constrained = append_filter_terms(filtered.1,
-                    array::concat([alternatives.1, constraints.1]));
+                    array::concat([match guard.1 { Some(expr) => [expr], None => [] }, alternatives.1, constraints.1]));
                 let exists = {...exists, filter: constrained};
                 (constraints.0, if spec.negated { qb::exists_not(exists) } else { exists })
             }
@@ -4696,6 +4750,7 @@ pub use self::{
     typed_relation_pair,
     named_typed_relation_key,
     business_link,
+    guarded_business_link,
     enum_value,
     canonical_values,
     canonical_alias,
