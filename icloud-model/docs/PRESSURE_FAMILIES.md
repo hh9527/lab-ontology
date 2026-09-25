@@ -41,6 +41,15 @@ multiplying KPI rows. Both SQLite and PostgreSQL render the same QueryAst
 with dialect-specific identifiers and placeholders. Port.id's asserted global
 identity and KPI.resId ownership remain IC pressure-model contracts, not
 production-verified keys.
+A separate Frame-normal EXISTS and Port-KPI AVG EXISTS can jointly qualify a
+Device without joining Frame rows into the KPI aggregation; that composition
+requires no new lowering operator. IC's per-interface TOP3 by outgoing packet
+speed does: graph `top_per.rank` now permits the Model's plain Float sample
+dimension, partitions by full Port identity and adds declared sample-grain
+tie-breakers. This ranking is distinct from latest-by-UTC-clock. Canonical,
+enum and Boolean dimensions have no declared business order and are rejected
+as ranks, with a repair-oriented diagnostic. The Q0401-style probe checks the
+ranking shape, not the full site, tenant or time-window conditions.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,
