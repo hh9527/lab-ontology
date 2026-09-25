@@ -22,6 +22,12 @@ the bound wire and threshold are distinct from the externally supplied KPI
 window. The IC graph probe uses the already declared Device/DeviceKpi carrier,
 not a claim that the heterogeneous-server model or its production ownership
 key is complete. A text threshold for the integer event count is diagnosed.
+Knowledge refs now link each filtered count to its `alarm_severity` dimension
+and exact `critical`/`major` value point, rather than leaving the predicate
+only as a detached text field. Computed measures also link their declared
+operand measure points. These references come from the Prepared Model and
+pass the existing global reachability/closure check. `doc.ic` still rebuilds
+the full detailed catalog per request; that scaling pressure remains separate.
 
 The relation-first graph Intent now supports `constraints` between already
 introduced named nodes, both at the outer graph and inside correlated EXISTS.
