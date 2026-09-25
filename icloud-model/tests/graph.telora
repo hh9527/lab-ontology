@@ -164,6 +164,58 @@ pub def alarm_severity_counts_keep_independent_aggregate_scopes: test::Test = te
     else { fail!(`filtered event counts changed sample population: \{sqlite_query.sql} / \{pg_query.sql}`) }
 });
 
+pub def computed_severe_alarm_count_projects_only_requested_business_measure: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"alarm","entity":"current_alarm"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"alarm","measure":"critical_or_major_alarm_count"}],
+        "group_by_identity":["device"],
+        "measure_having":[{"node":"alarm","measure":"critical_or_major_alarm_count","op":"gt","kind":"int","value":2}],
+        "top_by_measure":{"node":"alarm","measure":"critical_or_major_alarm_count","direction":"desc","take":5}}
+    "#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "AS alarm_critical_or_major_alarm_count")
+        && !string::contains(sq.sql, "AS alarm_critical_alarm_count")
+        && !string::contains(sq.sql, "AS alarm_major_alarm_count")
+        && string::contains(sq.sql, "count(alarm.CSN) FILTER (WHERE alarm.SEVERITY = ?1) + count(alarm.CSN) FILTER (WHERE alarm.SEVERITY = ?2)")
+        && string::contains(sq.sql, "HAVING (count(alarm.CSN) FILTER")
+        && string::contains(sq.sql, "ORDER BY (count(alarm.CSN) FILTER")
+        && sq.bindings == [qb::Val::String("1"), qb::Val::String("2"), qb::Val::Int(5), qb::Val::Int(2)]
+        && pg.bindings == sq.bindings { True }
+    else { fail!(`computed alarm count exposed operands or lost their distinct filters: \{sq.sql} / \{pg.sql}`, sq.bindings, pg.bindings) }
+});
+
+pub def nested_alarm_score_reuses_hidden_filtered_operands: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"alarm","entity":"current_alarm"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"alarm","measure":"weighted_severe_alarm_score"}],
+        "group_by_identity":["device"]}"#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "AS alarm_weighted_severe_alarm_score")
+        && !string::contains(sq.sql, "AS alarm_critical_or_major_alarm_count")
+        && !string::contains(sq.sql, "AS alarm_critical_alarm_count")
+        && !string::contains(sq.sql, "AS alarm_major_alarm_count")
+        && sq.bindings == [qb::Val::String("1"), qb::Val::String("2")]
+        && pg.bindings == sq.bindings { True }
+    else { fail!(`nested Model score published operands or duplicated their binds: \{sq.sql} / \{pg.sql}`, sq.bindings, pg.bindings) }
+});
+
+pub def computed_alarm_count_rejects_multiplying_site_join: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"alarm","entity":"current_alarm"},
+                 {"id":"site","entity":"site"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"},
+                 {"relation":"device_located_at_site","from":"device","to":"site"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"alarm","measure":"critical_or_major_alarm_count"}],
+        "group_by_identity":["device"]}"#).unwrap!())
+}, "graph measure source may be multiplied by a joined relation");
+
 pub def filtered_alarm_count_rejects_wrong_named_owner: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"device",
         "nodes":[{"id":"device","entity":"device"}],"edges":[],

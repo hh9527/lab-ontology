@@ -116,9 +116,9 @@ type AggregateCall = struct {
     alias: String,
 };
 
-# v1 computed aggregate: a restricted arithmetic combination of declared
-# aggregates, referenced by their output alias.  Leaves must resolve to
-# aggregate/computed items in the same projection; dependencies must be acyclic.
+# A restricted arithmetic combination of declared aggregates. Operands resolve
+# to projected measures or validated internal dependencies; only projected
+# items become result columns. Dependencies must be acyclic.
 type ComputedOp = enum {
     Add,
     Sub,
@@ -470,6 +470,8 @@ type Plan = struct {
     sources: Array(Source),
     derived: Option(DerivedSource),
     projection: Array(SelectItem),
+    # Closed dependencies of projected computed measures, never result columns.
+    internal_measures: Array(SelectItem),
     filter: Option(Expr),
     exists: Array(Exists),
     joins: Array(Join),
@@ -672,8 +674,8 @@ def select_item_operators: Fn(SelectItem) -> Array(Operator) = fn(item) {
         SelectItem::NamedExpr(named) => expr_operators(named.expr),
         SelectItem::Aggregate(call) => aggregate_operators(call),
         # A computed aggregate consumes the Scalar capability (the restricted
-        # Add/Sub arithmetic over aggregates); the operand aggregate items are
-        # counted separately and must be projection items.
+        # Add/Sub arithmetic over aggregates); operand items contribute their
+        # own operators whether projected or internal.
         SelectItem::Computed(_) => {
             let empty: Array(Operator) = [];
             ops_union(empty, [Operator::Scalar])
@@ -908,9 +910,12 @@ def operators: Fn(Plan) -> Array(Operator) = fn(plan) {
     let with_items = array::fold(plan.projection, with_projection, fn(acc, item) {
         ops_union(acc, select_item_operators(item))
     });
+    let with_internal = array::fold(plan.internal_measures, with_items, fn(acc, item) {
+        ops_union(acc, select_item_operators(item))
+    });
     let with_filter = match plan.filter {
-        Some(expr) => ops_union(ops_union(with_items, expr_operators(expr)), [Operator::Filter]),
-        None => with_items,
+        Some(expr) => ops_union(ops_union(with_internal, expr_operators(expr)), [Operator::Filter]),
+        None => with_internal,
     };
     let with_exists = ops_union(with_filter, exists_operators(plan.exists));
     let with_comparisons = ops_union(with_exists, scalar_comparisons_operators(plan.scalar_comparisons));
@@ -1163,6 +1168,19 @@ def find_item_by_alias: Fn(Plan, String) -> Option(SelectItem) = fn(plan, alias)
     })
 };
 
+def computed_operand: Fn(Plan, String) -> Option(SelectItem) = fn(plan, alias) {
+    match find_item_by_alias(plan, alias) {
+        Some(item) => Some(item),
+        None => array::find(plan.internal_measures, fn(item) {
+            match item {
+                SelectItem::Aggregate(call) => call.alias == alias,
+                SelectItem::Computed(ca) => ca.alias == alias,
+                _ => False,
+            }
+        }),
+    }
+};
+
 def count_in: Fn(Array(String), String) -> Int = fn(items, target) {
     array::length(array::filter(items, fn(item) { item == target }))
 };
@@ -1170,7 +1188,14 @@ def count_in: Fn(Array(String), String) -> Int = fn(items, target) {
 # Aggregate/computed aliases must be distinct so references are unambiguous and
 # reusing a filtered aggregate always means the same declaration.
 def measure_aliases_distinct: Fn(Plan) -> Bool = fn(plan) {
-    let aliases = projected_measure_aliases(plan);
+    let aliases = array::concat([projected_measure_aliases(plan),
+        array::map(plan.internal_measures, fn(item) {
+            match item {
+                SelectItem::Aggregate(call) => call.alias,
+                SelectItem::Computed(ca) => ca.alias,
+                _ => "",
+            }
+        })]);
     array::all(array::enumerate(aliases), fn(pair) { count_in(aliases, pair.1) == 1 })
 };
 
@@ -1180,7 +1205,7 @@ def computed_cycle_from: Fn(Plan, String, Array(String)) -> Bool = fn(plan, alia
     if array::any(path, fn(p) { p == alias }) {
         True
     } else {
-        match find_item_by_alias(plan, alias) {
+        match computed_operand(plan, alias) {
             Some(SelectItem::Computed(ca)) => {
                 let next_path = array::push(path, alias);
                 computed_cycle_from(plan, ca.left, next_path)
@@ -1192,19 +1217,19 @@ def computed_cycle_from: Fn(Plan, String, Array(String)) -> Bool = fn(plan, alia
 };
 
 # A computed aggregate is well-formed when its alias is a valid SQL identifier,
-# both operands resolve to declared aggregate/computed items in the same
-# projection, and the dependency graph is acyclic.  Query only guarantees this
+# both operands resolve to projected or internal aggregate/computed items,
+# and the dependency graph is acyclic. Query only guarantees this
 # structural resolution (alias, dependency order, SQL structure); business
 # grain/relation-path compatibility is the Ontology's responsibility and is NOT
 # asserted here.
 def computed_ok: Fn(Plan, ComputedAggregate) -> Bool = fn(plan, ca) {
     let alias_ok = is_sql_identifier(ca.alias) && !computed_cycle_from(plan, ca.alias, []);
-    let left_ok = match find_item_by_alias(plan, ca.left) {
+    let left_ok = match computed_operand(plan, ca.left) {
         Some(SelectItem::Aggregate(_)) => True,
         Some(SelectItem::Computed(_)) => True,
         _ => False,
     };
-    let right_ok = match find_item_by_alias(plan, ca.right) {
+    let right_ok = match computed_operand(plan, ca.right) {
         Some(SelectItem::Aggregate(_)) => True,
         Some(SelectItem::Computed(_)) => True,
         _ => False,
@@ -1213,11 +1238,40 @@ def computed_ok: Fn(Plan, ComputedAggregate) -> Bool = fn(plan, ca) {
 };
 
 def computed_items_ok: Fn(Plan) -> Bool = fn(plan) {
-    array::all(plan.projection, fn(item) {
+    array::all(array::concat([plan.projection, plan.internal_measures]), fn(item) {
         match item {
             SelectItem::Computed(ca) => computed_ok(plan, ca),
             _ => True,
         }
+    })
+};
+
+def computed_reaches: Fn(Plan, String, String, Array(String)) -> Bool = fn(plan, alias, target, visited) {
+    if alias == target { True }
+    else if array::any(visited, fn(name) { name == alias }) { False }
+    else match computed_operand(plan, alias) {
+        Some(SelectItem::Computed(item)) => {
+            let path = array::push(visited, alias);
+            computed_reaches(plan, item.left, target, path)
+                || computed_reaches(plan, item.right, target, path)
+        },
+        _ => False,
+    }
+};
+
+def internal_measures_used: Fn(Plan) -> Bool = fn(plan) {
+    array::all(plan.internal_measures, fn(item) {
+        let alias = match item {
+            SelectItem::Aggregate(call) => call.alias,
+            SelectItem::Computed(ca) => ca.alias,
+            _ => "",
+        };
+        array::any(plan.projection, fn(projected) {
+            match projected {
+                SelectItem::Computed(ca) => computed_reaches(plan, ca.alias, alias, []),
+                _ => False,
+            }
+        })
     })
 };
 
@@ -2209,6 +2263,11 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
         fail!("plan join condition references a source not yet joined", plan)
     } else if !array::all(plan.projection, fn(item) { select_item_valid(item, aliases_of(plan)) }) {
         fail!("plan projection contains an invalid expression", plan)
+    } else if !array::all(plan.internal_measures, fn(item) {
+        (match item { SelectItem::Aggregate(_) => True, SelectItem::Computed(_) => True, _ => False })
+            && select_item_valid(item, aliases_of(plan))
+    }) {
+        fail!("plan internal aggregate contains an invalid expression", plan)
     } else if !match plan.filter {
         Some(expr) => expr_valid(expr, aliases_of(plan)),
         None => True,
@@ -2273,6 +2332,8 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
         fail!("projected aggregate and computed aggregate aliases must be distinct", plan)
     } else if !computed_items_ok(plan) {
         fail!("computed aggregate has an unknown operand, an unresolved alias or a dependency cycle", plan)
+    } else if !internal_measures_used(plan) {
+        fail!("internal measure must be referenced by a projected computed measure", plan)
     } else {
         plan
     }
@@ -2286,8 +2347,9 @@ def validate_structure: Fn(Plan) -> Plan = fn(plan) {
         Some(ds) => {
             if array::length(plan.sources) > 0
                 || array::length(plan.joins) > 0
-                || array::length(plan.exists) > 0 {
-                fail!("a derived source plan cannot also declare physical sources, joins or EXISTS", plan)
+                || array::length(plan.exists) > 0
+                || array::length(plan.internal_measures) > 0 {
+                fail!("a derived source plan cannot also declare physical sources, joins, EXISTS or internal measures", plan)
             } else if !derived_structure_ok(ds) {
                 fail!("plan declares an invalid derived UNION ALL relation", plan)
             } else if !derived_plan_ok(plan, ds) {
@@ -2526,6 +2588,7 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
         array::any(profile.allowed_join_kinds, fn(kind) { kind == join.kind })
     });
     let aggregates_ok = array::all(plan.projection, fn(item) { select_aggregate_ok(item, profile.allowed_aggregates) })
+        && array::all(plan.internal_measures, fn(item) { select_aggregate_ok(item, profile.allowed_aggregates) })
         && having_list_aggregates_ok(plan.having, profile.allowed_aggregates)
         && array::all(plan.exists, fn(ex) { exists_body_aggregates_ok(ex, profile.allowed_aggregates) })
         && array::all(plan.ordering, fn(ob) {
@@ -2541,6 +2604,7 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
                 && join_condition_scalars_ok(join_item.condition, profile.allowed_scalars)
         })
         && array::all(plan.projection, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
+        && array::all(plan.internal_measures, fn(item) { select_scalars_ok(item, profile.allowed_scalars) })
         && (match plan.filter {
             Some(expr) => expr_scalars_ok(expr, profile.allowed_scalars),
             None => True,
@@ -2562,6 +2626,13 @@ def profile_accepts: Fn(Plan, PlanProfile) -> Bool = fn(plan, profile) {
                 SelectItem::NamedExpr(_) => True,
                 SelectItem::Aggregate(call) => call.distinct == False,
                 SelectItem::Computed(_) => True,
+            }
+        })
+        && array::all(plan.internal_measures, fn(item) {
+            match item {
+                SelectItem::Aggregate(call) => !call.distinct,
+                SelectItem::Computed(_) => True,
+                _ => False,
             }
         })
         && array::all(plan.having, fn(h) { having_measure_distinct_ok(h.measure) })
@@ -3290,6 +3361,7 @@ pub use self::{
     validate_query_plan,
     validate_contextual_pagination,
     find_item_by_alias,
+    computed_operand,
     profile_accepts,
     source_profile_accepts,
     validate,

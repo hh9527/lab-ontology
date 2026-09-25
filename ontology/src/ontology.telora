@@ -2338,6 +2338,19 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     } else {
         True
     };
+    let computed_profile_ok = if let Some(measure) = array::find(measures, fn(measure) {
+        match measure.computed {
+            Some(spec) => !array::any(profile.allowed_scalars, fn(op) {
+                op == (match spec.op {
+                    qb::ComputedOp::Add => qb::ScalarFunction::Add,
+                    qb::ComputedOp::Sub => qb::ScalarFunction::Sub,
+                })
+            }) || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Scalar })
+                || !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Aggregate }),
+            None => False,
+        }
+    }) { fail!("computed measure requires its declared arithmetic and aggregate capabilities in the query profile", measure.id) }
+    else { True };
     let relations = collect_relations(entities);
     if let Some(duplicate) = array::find(relations, fn(rel) {
         rel.id != "" && array::length(array::filter(relations, fn(other) { other.id == rel.id })) > 1
@@ -2391,7 +2404,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     let aliases_ok = check_knowledge_aliases(payload);
     let localized_ok = check_localized_knowledge(payload);
     let annotations_ok = check_knowledge_annotations(payload);
-    if profile_ok && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok && annotations_ok { payload } else { payload }
+    if profile_ok && computed_profile_ok && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok && annotations_ok { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -3826,17 +3839,35 @@ def graph_contextual_measure_grain: Fn(PreparedPayload, GraphRequest, String) ->
     }
 };
 
-def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphMeasureSelect) -> (qb::BuildCtx, qb::SelectItem) =
-    fn(ctx, payload, request, instances, selection) {
+def graph_measure_alias: Fn(qb::SelectItem) -> String = fn(item) {
+    match item {
+        qb::SelectItem::Aggregate(call) => call.alias,
+        qb::SelectItem::Computed(computed) => computed.alias,
+        _ => fail!("graph measure cache contains a non-measure projection"),
+    }
+};
+
+def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphMeasureSelect, Array(qb::SelectItem)) -> (qb::BuildCtx, qb::SelectItem, Array(qb::SelectItem)) =
+    fn(ctx, payload, request, instances, selection, cached) {
         let instance = graph_instance(instances, selection.node);
         let measure = match array::find(payload.measures, fn(entry) { entry.id == selection.measure }) {
             Some(entry) => entry,
             None => fail!("graph projection references an unknown declared measure", selection.node, selection.measure),
         };
+        let alias = `\{selection.node}_\{selection.measure}`;
         if measure.entity != instance.entity {
             fail!("graph projection measure does not belong to its named node", selection.node, selection.measure)
-        } else if measure.computed != None || array::length(measure.requires) > 0 {
-            fail!("graph measure projection requires a non-computed measure without external dependencies", selection.node, selection.measure)
+        } else if let Some(item) = array::find(cached, fn(item) { graph_measure_alias(item) == alias }) {
+            (ctx, item, cached)
+        } else if array::length(measure.requires) > 0 {
+            fail!("graph measure projection cannot resolve external dataset dependencies", selection.node, selection.measure)
+        } else if let Some(computed) = measure.computed {
+            let left = graph_measure_projection(ctx, payload, request, instances,
+                {node: selection.node, measure: computed.left}, cached);
+            let right = graph_measure_projection(left.0, payload, request, instances,
+                {node: selection.node, measure: computed.right}, left.2);
+            let item = qb::computed_item(computed.op, graph_measure_alias(left.1), graph_measure_alias(right.1), alias);
+            (right.0, item, array::push(right.2, item))
         } else {
             let proof = graph_count_subject_grain(payload, request, selection.node);
             if !proof.0 && !graph_contextual_measure_grain(payload, request, selection.node) {
@@ -3861,8 +3892,9 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
                         (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, instance.source.alias)))
                     },
                 };
-                (filtered.0, qb::aggregate_filtered(measure.aggregate, qb::column(instance.source, field.column),
-                    measure.input == MeasureInput::Distinct, filtered.1, `\{selection.node}_\{selection.measure}`))
+                let item = qb::aggregate_filtered(measure.aggregate, qb::column(instance.source, field.column),
+                    measure.input == MeasureInput::Distinct, filtered.1, alias);
+                (filtered.0, item, array::push(cached, item))
             }
         }
     };
@@ -4155,9 +4187,12 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     })
                 }),
             };
-            let measures = array::fold(request.measures, (selected.0, []), fn(state, item) {
-                let projected = graph_measure_projection(state.0, payload, request, built.1, item);
-                (projected.0, array::push(state.1, projected.1))
+            let measures = array::fold(request.measures, (selected.0, [], []), fn(state, item) {
+                let projected = graph_measure_projection(state.0, payload, request, built.1, item, state.2);
+                (projected.0, array::push(state.1, projected.1), projected.2)
+            });
+            let internal_measures = array::filter(measures.2, fn(item) {
+                !array::any(measures.1, fn(visible) { graph_measure_alias(visible) == graph_measure_alias(item) })
             });
             let projection = match request.count {
                 None => array::concat([row_projection, measures.1]),
@@ -4278,7 +4313,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 }
             });
             let plan: qb::Plan = {
-                revision: payload.revision, sources, derived: None, projection, filter: constrained,
+                revision: payload.revision, sources, derived: None, projection, internal_measures, filter: constrained,
                 exists: existential.1, joins: built.2, grouping, having: having.1, ordering: array::concat([top.1, raw_order]),
                 limit: raw_limit.1, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
