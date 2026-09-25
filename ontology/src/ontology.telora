@@ -17,6 +17,9 @@ use std::prelude as prelude;
 use std::regex as regex;
 use std::string as string;
 
+@regex::parse_by(regex::compile(r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2}) (?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})$"))
+type CanonicalUtcParts = struct { year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int };
+
 # SQL-facing scalar result of a declared Model projection. This knowledge is
 # checked before ontology lowering emits a set QueryPlan.
 type OutputType = enum { Text, Integer, Number, Boolean };
@@ -2395,9 +2398,16 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
             } else if array::length(entry.values) > 0 {
                 array::map(entry.values, fn(value) { FilterInput::Text(value.value) })
             } else {
+                let entity = get_index(payload.entities, entry.entity);
+                let time = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
                 array::map(entry.input_kinds, fn(kind) {
                     match kind {
-                        FilterInputKind::Text => FilterInput::Text("probe"),
+                        FilterInputKind::Text => FilterInput::Text(match time {
+                            Some(role) => if !entry.computed && role.encoding == TimeEncoding::CanonicalUtcSecondText {
+                                "2024-01-01 00:00:00"
+                            } else { "probe" },
+                            None => "probe",
+                        }),
                         FilterInputKind::Number => FilterInput::Number(1.0),
                         FilterInputKind::Int => FilterInput::Int(1),
                         FilterInputKind::Bool => FilterInput::Bool(True),
@@ -2784,6 +2794,38 @@ def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(k
     array::any(kinds, fn(k) { k == kind })
 };
 
+def canonical_utc_second: Fn(String) -> Bool = fn(value) {
+    match string::parse@[CanonicalUtcParts](value) {
+        Err(_) => False,
+        Ok(parts) => do {
+            let leap = parts.year % 4 == 0 && (parts.year % 100 != 0 || parts.year % 400 == 0);
+            let days = match parts.month {
+                2 => if leap { 29 } else { 28 },
+                4 => 30, 6 => 30, 9 => 30, 11 => 30,
+                1 => 31, 3 => 31, 5 => 31, 7 => 31, 8 => 31, 10 => 31, 12 => 31,
+                _ => 0,
+            };
+            parts.year > 0 && parts.day >= 1 && parts.day <= days
+                && parts.hour < 24 && parts.minute < 60 && parts.second < 60
+        },
+    }
+};
+
+def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bool = fn(payload, entry, input) {
+    let entity = get_index(payload.entities, entry.entity);
+    let role = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
+    match role {
+        Some(time) => if !entry.computed && time.encoding == TimeEncoding::CanonicalUtcSecondText {
+            match input {
+                FilterInput::Text(value) => if canonical_utc_second(value) { True }
+                    else { fail!("invalid canonical UTC second filter value", entry.id, value) },
+                _ => fail!("canonical UTC second filter requires text", entry.id, input),
+            }
+        } else { True },
+        None => True,
+    }
+};
+
 # True for the text-search operations (starts-with/contains/ends-with families).
 def is_text_op: Fn(FilterOp) -> Bool = fn(op) {
     match op {
@@ -2922,8 +2964,10 @@ def filter_value_on_base_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr
 };
 
 def filter_value_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry, FilterOp, FilterInput) -> (qb::BuildCtx, qb::Expr) = fn(ctx, payload, entry, op, input) {
+    let valid = validate_time_filter(payload, entry, input);
     let base = dimension_expr(ctx, payload, entry);
-    filter_value_on_base_with_context(base.0, entry, base.1, op, input)
+    if valid { filter_value_on_base_with_context(base.0, entry, base.1, op, input) }
+    else { fail!("invalid time filter", entry.id) }
 };
 
 def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(FilterRequest)) -> (qb::BuildCtx, Array(FilterResolution)) = fn(ctx, payload, requests) {
@@ -2939,9 +2983,11 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
             else if !entry.filterable { fail!("dimension has no filter capability", req.subject, req.id) }
             else if !array::any(entry.ops, fn(op) { op == req.op }) { fail!("filter operation not supported for dimension", req.subject, req.id) }
             else {
+                let valid_time = validate_time_filter(payload, entry, req.input);
                 let computed = dimension_expr(state.0, payload, entry);
                 let base = computed.1;
-                let resolved = if array::length(entry.canonical_values) > 0 {
+                let resolved = if !valid_time { fail!("invalid time filter", entry.id) }
+                else if array::length(entry.canonical_values) > 0 {
                     canonical_compare_with_context(computed.0, entry, base, req.op, req.input)
                 } else if array::length(entry.values) > 0 {
                     match req.input {
