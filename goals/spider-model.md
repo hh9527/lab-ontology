@@ -2,9 +2,9 @@
 
 开始任务时，参考 `goals/telora-context.md`，按当前需要阅读语言与工具资料；准备工作属于本次任务。
 
-使用计划显式提供的 schema、SQLite 数据库和 modeling 用例，在 `spider-model/` 中建立一个
+使用计划显式提供的 schema、SQLite 数据库和 modeling 用例，在 `spider_model/` 中建立一个
 基于 `ontology` eDSL 的 EnterpriseKnowledge，并实现自然语言意图到参数化 SQL Query 的确定性入口。
-当前 `spider-model/` 中的旧演唱会领域资产只是上一轮实验遗留；必须完整替换为学生成绩单跟踪领域，
+当前 `spider_model/` 中的旧演唱会领域资产只是上一轮实验遗留；必须完整替换为学生成绩单跟踪领域，
 不得保留 Singer、Concert 或 Stadium 词汇、示例和映射。
 
 ## 数据边界
@@ -12,7 +12,7 @@
 - modeling 用例用于理解问法、领域语义和预期 SQL；它们可以进入测试。
 - `spider-data-1/eval/` 是严格 held-out 的评测集，不得读取、搜索、推断或复制其中内容。
 - 物理表列、Join 路径和 mapping 属于私有实现，不进入 Resolver 公共资料。
-- `spider-model/docs/DOMAIN.md` 与 `spider-model/docs/INTENT.md` 是 Resolver 唯一可读的知识包，
+- `spider_model/docs/DOMAIN.md` 与 `spider_model/docs/INTENT.md` 是 Resolver 唯一可读的知识包，
   必须自包含，但不得包含 modeling/eval 题目、SQL、标准答案、物理 schema 或 Join 路径。
 - `DOMAIN.md` 描述业务对象、领域词汇、概念关系、值域和统计口径。
 - `INTENT.md` 完整定义 `spider-eval/input.json` 的 JSON 契约，包括字段、类型、枚举、过滤、

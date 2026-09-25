@@ -7,20 +7,20 @@ equivalent unbound entry. No database connection or SQL backend is required.
 The response can be serialized with `std::json::stringify`.
 
 An entry `MainService` can mount separate `TransformService` slots for
-`doc.<domain>` and `index.<domain>`. Telora's collection routes by method and
+`<domain>/info` and `<domain>/index`. Telora's collection routes by method and
 passes only `input` to the selected slot. Use
-`knowledge::knowledge_method_factory(payload, subject, domain, method)` in
-each slot's `init` to bind that method without expecting an envelope inside
-`transform`. The dog, spider, and world models mount these slots alongside
-their existing `transform` query service. No second copy of the Model is
-needed.
+`knowledge::knowledge_info_method_factory(payload, subject)` and
+`knowledge::knowledge_index_method_factory(payload, subject)` in the respective
+slots' `init`; neither expects an envelope inside `transform`. The dog,
+spider, world, and ic models mount these alongside `<domain>/transform`.
+No second copy of the Model is needed.
 
 Requests have exactly `method` and `input`:
 
 ```json
-{"method":"index.foo","input":{"offset":0,"limit":50}}
-{"method":"doc.foo","input":{"topic":"Order status"}}
-{"method":"doc.foo","input":{"target":{"kind":"dimension","owner":"order","id":"order_status"}}}
+{"method":"foo/index","input":{"offset":0,"limit":50}}
+{"method":"foo/info","input":{"topic":"Order status"}}
+{"method":"foo/info","input":{"target":{"kind":"dimension","owner":"order","id":"order_status"}}}
 ```
 
 `foo` is the domain bound by the host, not a hard-coded Model name. The

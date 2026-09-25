@@ -3,7 +3,7 @@
 开始任务时，参考 `goals/telora-context.md`，按当前需要阅读语言与工具资料；准备工作属于本次任务。
 
 Use the explicitly provided `world_1` schema, SQLite database, and modeling examples to build an
-EnterpriseKnowledge model in `world-model/` on top of the `ontology` eDSL. Implement a deterministic
+EnterpriseKnowledge model in `world_model/` on top of the `ontology` eDSL. Implement a deterministic
 closed intent-to-parameterized-SQL entry point.
 
 When a feedback artifact is present, read its current file at the start of every turn. The current
@@ -18,7 +18,7 @@ multi-round experiment objective with one artifact revision's completion conditi
 - `spider-data-1/eval/` is strictly held out and must not be read, searched, inferred, or copied.
 - Physical tables, columns, aliases, and Join paths are private implementation details and must not
   appear in resolver-facing documentation.
-- `world-model/docs/DOMAIN.md` and `world-model/docs/INTENT.md` are the resolver's only knowledge.
+- `world_model/docs/DOMAIN.md` and `world_model/docs/INTENT.md` are the resolver's only knowledge.
   They must be self-contained without reproducing dataset questions, SQL, answers, or data values.
 - Do not rely on memorized Spider questions or SQL. Derive the model only from the provided assets.
 

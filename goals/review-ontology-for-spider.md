@@ -7,7 +7,7 @@
 Top N、子查询和集合运算的表达能力。生成的 SQL 必须参数化；不能表达时应产生确定诊断，
 不得绕过 eDSL 拼接 SQL。
 
-将结论写入 `spider-model/my-feedbacks/ontology.md`。这里只提出领域无关的基础层改进；
+将结论写入 `spider_model/my-feedbacks/ontology.md`。这里只提出领域无关的基础层改进；
 `student_transcripts_tracking` 的具体词汇映射和能力取舍留给后续 Spider 建模阶段。
 
 审查只能使用计划提供的 modeling 资产，不得读取 `spider-data-1/eval/` 或其他 held-out 数据。

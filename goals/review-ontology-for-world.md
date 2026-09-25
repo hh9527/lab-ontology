@@ -10,7 +10,7 @@ relationships, projection, filtering, aggregation, grouping, ordering, Top N, ne
 derived relations, and set operations. Generated SQL must remain parameterized and deterministic;
 unsupported shapes must produce attributable diagnostics rather than raw SQL or approximate output.
 
-Write the review to `world-model/my-feedbacks/ontology.md`. Report only domain-independent
+Write the review to `world_model/my-feedbacks/ontology.md`. Report only domain-independent
 foundation gaps here. Leave world-specific vocabulary and mapping choices to the later modeling
 stage.
 
