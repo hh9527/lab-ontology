@@ -344,6 +344,7 @@ type GraphRequest = struct {
     any_of: Array(GraphAnyOf),
     exists: Array(GraphExist),
     count: Option(String),
+    count_value: Option(GraphSelect),
     count_having: Option(GraphCountHaving),
     measure_having: Array(GraphHaving),
     count_groups: Bool,
@@ -4190,8 +4191,14 @@ def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
     if !payload.authorize(subject) { fail!("subject is not authorized for graph query", subject) }
     else if array::length(request.nodes) == 0 || (array::length(request.select) == 0
-        && array::length(request.measures) == 0 && request.count == None) {
+        && array::length(request.measures) == 0 && request.count == None && request.count_value == None) {
         fail!("graph requires nodes and projections or an explicit count subject")
+    } else if request.count_value != None && (request.count != None || array::length(request.select) > 0
+        || array::length(request.measures) > 0 || array::length(request.group_by_identity) > 0
+        || request.count_having != None || array::length(request.measure_having) > 0 || request.count_groups
+        || request.distinct || request.include_empty || request.top_per != None
+        || request.top_by_measure != None || array::length(request.order_by) > 0 || request.take != None) {
+        fail!("graph count_value counts one declared dimension across matching rows; remove other projections, counts, grouping, ordering and Top-N")
     } else if array::any(request.nodes, fn(node) {
         node.id == "" || array::length(array::filter(request.nodes, fn(other) { other.id == node.id })) != 1
     }) { fail!("graph node instance ids must be nonempty and unique") }
@@ -4404,8 +4411,30 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let internal_measures = array::filter(measures.2, fn(item) {
                 !array::any(measures.1, fn(visible) { graph_measure_alias(visible) == graph_measure_alias(item) })
             });
+            let value_count = match request.count_value {
+                None => (measures.0, []),
+                Some(item) => do {
+                    let instance = graph_instance(built.1, item.node);
+                    let dimension = match array::find(payload.dimensions, fn(d) { d.id == item.dimension }) {
+                        Some(d) => d,
+                        None => fail!("graph count_value references an unknown dimension", item.node, item.dimension),
+                    };
+                    if dimension.entity != instance.entity {
+                        fail!("graph count_value dimension does not belong to its named node", item.node, item.dimension)
+                    } else if !dimension.authorized {
+                        fail!("graph count_value dimension is not authorized", item.node, item.dimension)
+                    } else if dimension.computed || array::length(dimension.scope) > 0 {
+                        fail!("graph count_value requires a plain unscoped dimension", item.node, item.dimension)
+                    } else {
+                        let output = dimension_output_with_context(measures.0, payload, dimension);
+                        let original = get_index(payload.entities, instance.entity).alias;
+                        let expr = retarget_inner_expr(output.1, original, instance.source.alias);
+                        (output.0, [qb::aggregate(qb::AggregateFunction::Count, expr, True, `\{item.node}_\{item.dimension}_count`)])
+                    }
+                },
+            };
             let projection = match request.count {
-                None => array::concat([row_projection, measures.1]),
+                None => array::concat([row_projection, measures.1, value_count.1]),
                 Some(subject_id) => {
                     let grain = if subject_id == request.root {
                         (True, None)
@@ -4466,7 +4495,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let outer_filters = if request.include_empty {
                 array::filter(request.filters, fn(item) { item.node == request.root })
             } else { request.filters };
-            let filtered = graph_filters(measures.0, payload, built.1, outer_filters);
+            let filtered = graph_filters(value_count.0, payload, built.1, outer_filters);
             let outer_exists = if request.include_empty {
                 array::filter(request.exists, fn(spec) { spec.anchor == request.root })
             } else { request.exists };
