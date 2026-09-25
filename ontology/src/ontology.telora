@@ -3671,6 +3671,49 @@ def graph_grouped_fanout_child_count: Fn(PreparedPayload, GraphRequest, String) 
     }
 };
 
+def graph_grouped_fanout_missing_root_key: Fn(PreparedPayload, GraphRequest, String) -> Option((String, Int, String)) = fn(payload, request, subject_id) {
+    if subject_id == request.root || array::length(request.nodes) != 2
+        || array::length(request.edges) != 1 || request.group_by_identity != [request.root]
+        || !array::all(request.select, fn(item) { item.node == request.root }) { None }
+    else {
+        let edge = request.edges[0];
+        if edge.from != subject_id || edge.to != request.root
+            || array::any(payload.business_links, fn(link) { link.id == edge.relation }) { None }
+        else {
+            let relation = relation_domain(payload, edge.relation);
+            let root = graph_node(request, request.root);
+            let child = graph_node(request, subject_id);
+            let target = get_index(payload.entities, entity_by_id(payload, root.entity));
+            let branches = match relation.key {
+                RelationKey::Or(parts) => parts,
+                _ => [],
+            };
+            if relation.from != entity_by_id(payload, child.entity)
+                || relation.to != target.index || relation.kind != RelationKind::FanOut { None }
+            else {
+                let missing = array::flat_map(array::enumerate(branches), fn(entry) {
+                    let part = entry.1;
+                    if !conjunctive_identity_key(part) { [] }
+                    else {
+                        let pairs = exists_pairs(part);
+                        let names = match target.dataset {
+                            Some(dataset) => dataset.grain,
+                            None => array::map(array::filter(target.fields, fn(field) { field.index == target.key_field }), fn(field) { field.name }),
+                        };
+                        array::map(array::filter(names, fn(name) {
+                            match array::find(target.fields, fn(field) { field.name == name }) {
+                                Some(field) => !array::any(pairs, fn(pair) { pair.to == field.index }),
+                                None => False,
+                            }
+                        }), fn(name) { (edge.relation, entry.0 + 1, name) })
+                    }
+                });
+                array::get(missing, 0)
+            }
+        }
+    }
+};
+
 # The join tree is rooted by construction. Only an ancestor of the counted
 # instance can narrow its LEFT JOIN lineage without filtering an unrelated branch.
 def graph_count_ancestors: Fn(GraphRequest, String) -> Array(String) = fn(request, subject_id) {
@@ -4039,10 +4082,13 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                         }
                     } else if subject_id != request.root && !grain.0
                         && !graph_grouped_fanout_child_count(payload, request, subject_id) {
-                        match grain.1 {
+                        match graph_grouped_fanout_missing_root_key(payload, request, subject_id) {
+                            Some(missing) => fail!(`graph count relation \{missing.0} alternative \{missing.1} does not cover root identity field \{missing.2}; add the missing equality to this relation branch or use correlated EXISTS when the relation only filters roots`, missing.0, missing.1, missing.2),
+                            None => match grain.1 {
                             Some(edge) => fail!(`graph cannot prove the non-root count subject has one row per root relationship: relation \{edge.relation} between \{edge.from} and \{edge.to} may multiply \{subject_id}; if this edge only filters rows, use correlated EXISTS, otherwise choose a count subject whose grain stays unique`,
                                 subject_id, edge.relation, edge.from, edge.to),
                             None => fail!("unsupported graph count: cannot establish a connected functional path from the count subject", subject_id),
+                            },
                         }
                     } else {
                         let instance = graph_instance(built.1, subject_id);
