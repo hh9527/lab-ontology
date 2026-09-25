@@ -12,6 +12,21 @@ global sample TOP. The latter represents associations, not memory CPU samples.
 The composite memory ownership key remains a business pressure contract to
 validate against production data.
 
+Q0447 qualifies Taishan servers by more than two major alarm events before
+returning their independent average-power sample trend. The Model declares
+`major_alarm_count` on Alarm and raw `averagePower` on ServerKpi, never an
+alarm-to-sample join. Graph's correlated grouped EXISTS counts only the
+declared major wire within the server's complete `(id,tenant_id)` identity;
+the externally resolved half-open sample window stays on the outer KPI rows.
+SQLite verifies three red major alarms do not triple two red power samples,
+two blue alarms on a server with the same ID cannot complete the threshold,
+another server class is excluded and the upper window boundary is exclusive.
+Joining Alarm directly into a globally capped raw trend is rejected. The
+corpus SQL's ID-only correlation and missing upper bound are not treated as
+business contracts. The ontology raw-take diagnostic now distinguishes a
+projected *multiplying endpoint* from a projected common ancestor, including
+FanOut relations whose destination is the multiplying endpoint.
+
 IC's severity predicates (Q0123-Q0131, Q0444-Q0446) motivate a paired
 critical/major count probe; the corpus SQL does not itself demand both columns.
 This probe exposed a Model/graph mismatch: the Model already
