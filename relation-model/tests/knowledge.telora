@@ -1,0 +1,187 @@
+use ontology::ontology as edsl;
+use ontology::knowledge as knowledge;
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::query as qb;
+use std::json as json;
+use std::array as array;
+use std::test as test;
+
+def eq_ops: Array(edsl::FilterOp) = [edsl::FilterOp::Eq];
+def text_inputs: Array(edsl::FilterInputKind) = [edsl::FilterInputKind::Text];
+def order_status: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dimension, owner: "order", id: "order_status"};
+def status_event: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "status_event"};
+def unrelated: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "unrelated"};
+def status_values: Array(edsl::CanonicalValueSpec) = [
+    {id: "paid", label: "Paid", wires: [edsl::FilterInput::Text("P")]},
+    {id: "cancelled", label: "Cancelled", wires: [edsl::FilterInput::Text("C")]},
+];
+
+@edsl::entity_id("order")
+@edsl::entity_source("orders", "o")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+@edsl::dataset_description("Order", "One commercial order per tenant")
+@edsl::dataset_alias("订单")
+@edsl::doc(order_status, "Status is the current lifecycle value")
+@edsl::related_to(order_status, status_event)
+@edsl::related_to(order_status, unrelated)
+type Order = struct {
+    @edsl::column("id")
+    @edsl::dimension("order_id", True, True, eq_ops, text_inputs)
+    id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+    @edsl::column("status")
+    @edsl::dimension("order_status", True, True, eq_ops, text_inputs)
+    @edsl::dimension_alias("order_status", "订单状态")
+    @edsl::canonical_values(status_values)
+    status: String,
+    @edsl::column("secret")
+    @edsl::dimension("private_status", False, True, eq_ops, text_inputs)
+    @edsl::dimension_alias("private_status", "隐私状态")
+    secret: String,
+};
+
+@edsl::entity_id("status_event")
+@edsl::entity_source("status_events", "ev")
+@edsl::dataset(edsl::DatasetKind::Event, ["id"], Some("occurred_at"))
+@edsl::dataset_description("Status event", "Each recorded order status transition")
+@edsl::dataset_alias("订单状态")
+@edsl::relation_description("event_order", "Changed order", "Event belongs to one order")
+@edsl::named_relation_key("event_order", Order.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "order_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "tenant_id", to: "tenant_id"}),
+    ]))
+type StatusEvent = struct {
+    @edsl::column("id")
+    @edsl::dimension("event_id", True, True, eq_ops, text_inputs)
+    id: String,
+    @edsl::column("order_id")
+    order_id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+    @edsl::column("occurred_at")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::CanonicalUtcSecondText)
+    @edsl::dimension("event_time", True, True, eq_ops, text_inputs)
+    occurred_at: String,
+};
+
+@edsl::entity_id("unrelated")
+@edsl::entity_source("unrelated", "u")
+@edsl::dataset_description("Lifecycle concept", "Related in documentation, without a declared join")
+type Unrelated = struct {
+    @edsl::column("id")
+    @edsl::key(True)
+    id: String,
+};
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project,
+        qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind, qb::Operator::Join],
+    allowed_join_kinds: [qb::JoinKind::Inner], allowed_aggregates: [],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Or, qb::ScalarFunction::If],
+    allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("doc-pressure", [Order.type, StatusEvent.type, Unrelated.type],
+    profile, fn(subject) { subject == "reader" });
+
+pub def topic_collision_returns_contextual_candidates: test::Test = test::should_ok(fn() {
+    match knowledge::doc(payload, "reader", "订单状态") {
+        knowledge::DocResult::Candidates(items) => if array::length(items) == 2
+            && array::any(items, fn(item) { item.target == order_status })
+            && array::any(items, fn(item) { item.target == status_event }) { True }
+            else { fail!("topic ambiguity lost its contextual candidates", items) },
+        other => fail!("ambiguous topic was guessed", other),
+    }
+});
+
+pub def exact_topic_and_private_dimension: test::Test = test::should_ok(fn() {
+    let missing = knowledge::doc(payload, "reader", " 订单状态");
+    let secret = knowledge::doc(payload, "reader", "隐私状态");
+    if missing == knowledge::DocResult::NotFound && secret == knowledge::DocResult::NotFound { True }
+    else { fail!("topic matching was normalized or private dimension leaked", missing, secret) }
+});
+
+pub def local_document_has_separate_structural_and_semantic_links: test::Test = test::should_ok(fn() {
+    match knowledge::doc(payload, "reader", "order_status") {
+        knowledge::DocResult::Found(point) => if point.summary == "Status is the current lifecycle value"
+            && array::any(point.refs, fn(ref) { ref.target == status_event && ref.kind == knowledge::LinkKind::Related })
+            && array::any(point.refs, fn(ref) { ref.target == unrelated && ref.kind == knowledge::LinkKind::Related })
+            && array::any(point.refs, fn(ref) {
+                ref.target.kind == edsl::KnowledgeKind::Value && ref.target.id == "paid" && ref.kind == knowledge::LinkKind::Member
+            }) { True }
+            else { fail!("knowledge links confused related text with model structure", point) },
+        other => fail!("exact stable id was not found", other),
+    }
+});
+
+pub def declared_relation_is_navigable_but_related_doc_is_not: test::Test = test::should_ok(fn() {
+    let graph = knowledge::map(payload, "reader");
+    let relation = array::find(graph, fn(point) {
+        point.target.kind == edsl::KnowledgeKind::Relation && point.target.id == "event_order"
+    });
+    match relation {
+        Some(point) => if array::any(point.refs, fn(ref) {
+            ref.target.kind == edsl::KnowledgeKind::Dataset && ref.target.id == "order"
+                && ref.kind == knowledge::LinkKind::Traversable
+        }) { True } else { fail!("named relation does not expose legal target", point) },
+        None => fail!("declared relation missing from map"),
+    }
+});
+
+pub def document_reference_does_not_make_a_query_relation: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph", "root":"o", "nodes":[{"id":"o","entity":"order"},{"id":"u","entity":"unrelated"}],
+        "edges":[{"relation":"documentation_link","from":"o","to":"u"}],
+        "select":[{"node":"o","dimension":"order_status"}]
+    }"#).unwrap!())
+}, "unknown named relation");
+
+pub def every_visible_point_has_an_exact_topic_and_closed_references: test::Test = test::should_ok(fn() {
+    let points = knowledge::map(payload, "reader");
+    let topics = knowledge::topic_index(payload, "reader");
+    if array::all(points, fn(point) {
+        array::any(topics, fn(entry) { entry.target == point.target && entry.topic == point.target.id })
+            && array::all(point.refs, fn(ref) {
+                array::any(points, fn(other) { other.target == ref.target })
+            })
+    }) { True } else { fail!("a knowledge point is undiscoverable or references an invisible point") }
+});
+
+pub def localized_topic_preserves_locale: test::Test = test::should_ok(fn() {
+    let entries = array::filter(knowledge::topic_index(payload, "reader"), fn(entry) {
+        entry.topic == "订单状态"
+    });
+    if array::length(entries) == 2
+        && array::any(entries, fn(entry) { entry.target == order_status && entry.locale == None })
+    { True } else { fail!("topic candidate lost its declaring context", entries) }
+});
+
+@edsl::entity_id("bad_doc")
+@edsl::entity_source("bad_docs", "bd")
+@edsl::doc(order_status, "Wrong owner")
+type BadDoc = struct { @edsl::column("id") @edsl::key(True) id: String };
+
+pub def annotation_cannot_claim_another_entity_point: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("invalid-knowledge", [Order.type, BadDoc.type], profile, fn(subject) { True })
+}, "knowledge doc must describe an existing point owned by its declaring entity");
+
+@edsl::entity_id("duplicate_doc")
+@edsl::entity_source("duplicate_docs", "dd")
+@edsl::doc({kind: edsl::KnowledgeKind::Dataset, owner: "", id: "duplicate_doc"}, "First")
+@edsl::doc({kind: edsl::KnowledgeKind::Dataset, owner: "", id: "duplicate_doc"}, "Second")
+type DuplicateDoc = struct { @edsl::column("id") @edsl::key(True) id: String };
+
+pub def duplicate_documentation_is_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("duplicate-knowledge", [DuplicateDoc.type], profile, fn(subject) { True })
+}, "duplicate knowledge doc target");
+
+@edsl::entity_id("invalid_ref")
+@edsl::entity_source("invalid_refs", "ir")
+@edsl::related_to({kind: edsl::KnowledgeKind::Dataset, owner: "", id: "invalid_ref"},
+    {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "missing"})
+type InvalidRef = struct { @edsl::column("id") @edsl::key(True) id: String };
+
+pub def nonexistent_related_point_is_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("invalid-reference", [InvalidRef.type], profile, fn(subject) { True })
+}, "knowledge reference must link distinct declared points from its owner");

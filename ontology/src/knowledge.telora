@@ -1,0 +1,244 @@
+use crate::ontology as edsl;
+use std::array as array;
+use std::type_property as property;
+
+type LinkKind = enum { Member, Traversable, Related };
+type KnowledgeLink = struct { target: edsl::KnowledgeTarget, kind: LinkKind };
+type Point = struct {
+    target: edsl::KnowledgeTarget,
+    label: String,
+    aliases: Array(String),
+    localized: Array(edsl::LocalizedKnowledgeText),
+    summary: String,
+    refs: Array(KnowledgeLink),
+    grain: Array(String),
+    time_roles: Array(edsl::TimeRoleBrief),
+    dimension: Option(edsl::SubjectDimensionBrief),
+    measure: Option(edsl::MeasureBrief),
+    relation: Option(edsl::RelationBrief),
+    metric: Option(edsl::MetricValueEntry),
+    direction: Option(edsl::LinkDirection),
+};
+type TopicEntry = struct { topic: String, target: edsl::KnowledgeTarget, label: String, owner: String, locale: Option(String) };
+type DocResult = enum { NotFound, Found(Point), Candidates(Array(TopicEntry)) };
+
+def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
+    {kind, owner, id}
+};
+
+def member: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target: item, kind: LinkKind::Member} };
+def traversable: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target: item, kind: LinkKind::Traversable} };
+
+def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(KnowledgeLink)) -> Point =
+    fn(id, label, aliases, summary, refs) {
+        {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [],
+            dimension: None, measure: None, relation: None, metric: None, direction: None}
+    };
+
+def labels: Fn(Array(edsl::LocalizedKnowledgeText)) -> Array(String) = fn(texts) {
+    array::map(texts, fn(entry) { entry.label })
+};
+
+def dataset_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Point = fn(payload, brief) {
+    let id = target(edsl::KnowledgeKind::Dataset, "", brief.id);
+    let dimensions = array::map(brief.dimension_ids, fn(name) {
+        member(target(edsl::KnowledgeKind::Dimension, brief.id, name))
+    });
+    let measures = array::map(brief.measure_ids, fn(name) {
+        member(target(edsl::KnowledgeKind::Measure, brief.id, name))
+    });
+    let metrics = array::map(brief.metric_ids, fn(name) {
+        member(target(edsl::KnowledgeKind::Metric, brief.id, name))
+    });
+    let times = array::map(brief.time_roles, fn(role) {
+        member(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field))
+    });
+    let relations = array::map(brief.relation_ids, fn(name) {
+        let declared = match array::find(payload.relations, fn(entry) { entry.id == name }) {
+            Some(entry) => entry,
+            None => fail!("knowledge relation disappeared from prepared model", name),
+        };
+        member(target(edsl::KnowledgeKind::Relation, payload.entities[declared.from].id, name))
+    });
+    let links = array::map(array::filter(payload.business_links, fn(link) {
+        let hub = payload.entities[link.hub].id;
+        let participant = payload.entities[link.participant].id;
+        hub == brief.id || participant == brief.id
+    }), fn(link) {
+        member(target(edsl::KnowledgeKind::BusinessLink, payload.entities[link.hub].id, link.id))
+    });
+    let refs = array::concat([dimensions, measures, metrics, times, relations, links]);
+    let item = point(id, brief.label, array::concat([brief.aliases, labels(brief.localized)]), brief.summary, refs);
+    let entity = match array::find(payload.entities, fn(e) { e.id == brief.id }) {
+        Some(e) => e, None => fail!("knowledge dataset disappeared from prepared model", brief.id),
+    };
+    let grain = match entity.dataset { Some(spec) => spec.grain, None => [] };
+    {...item, localized: brief.localized, grain, time_roles: brief.time_roles}
+};
+
+def dimension_points: Fn(edsl::PreparedPayload, String, String) -> Array(Point) = fn(payload, subject, id) {
+    let detail = edsl::dimension_detail_for_subject(payload, subject, id);
+    let parent = target(edsl::KnowledgeKind::Dataset, "", detail.dataset);
+    let dimension = target(edsl::KnowledgeKind::Dimension, detail.dataset, detail.id);
+    let values = array::map(detail.values, fn(value) {
+        let current = target(edsl::KnowledgeKind::Value, detail.id, value.id);
+        let item = point(current, value.label, array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]),
+            "", [member(dimension)]);
+        {...item, localized: array::map(value.localized, fn(text) {
+            {locale: text.locale, label: text.label, summary: ""}
+        })}
+    });
+    let value_refs = array::map(detail.values, fn(value) {
+        member(target(edsl::KnowledgeKind::Value, detail.id, value.id))
+    });
+    let base = point(dimension, detail.label, array::concat([detail.aliases, labels(detail.localized)]),
+        detail.summary, array::concat([[member(parent)], value_refs]));
+    array::concat([[{...base, dimension: Some(detail), localized: detail.localized}], values])
+};
+
+def measure_point: Fn(edsl::PreparedPayload, String, String) -> Point = fn(payload, subject, id) {
+    let detail = edsl::measure_domain_for_subject(payload, subject, id);
+    let refs = array::concat([
+        [member(target(edsl::KnowledgeKind::Dataset, "", detail.dataset))],
+        array::map(detail.required_dataset_ids, fn(dataset) {
+            member(target(edsl::KnowledgeKind::Dataset, "", dataset))
+        }),
+    ]);
+    let base = point(target(edsl::KnowledgeKind::Measure, detail.dataset, detail.id), detail.label,
+        array::concat([detail.aliases, labels(detail.localized)]), detail.summary, refs);
+    {...base, measure: Some(detail), localized: detail.localized}
+};
+
+def relation_point: Fn(edsl::PreparedPayload, String, String) -> Point = fn(payload, subject, id) {
+    let detail = edsl::relation_detail_for_subject(payload, subject, id);
+    let base = point(target(edsl::KnowledgeKind::Relation, detail.from_dataset, detail.id), detail.label,
+        array::concat([detail.aliases, labels(detail.localized)]), detail.summary,
+        [member(target(edsl::KnowledgeKind::Dataset, "", detail.from_dataset)),
+         traversable(target(edsl::KnowledgeKind::Dataset, "", detail.to_dataset))]);
+    {...base, relation: Some(detail), localized: detail.localized}
+};
+
+def link_point: Fn(edsl::PreparedPayload, edsl::BusinessLinkEntry) -> Point = fn(payload, link) {
+    let hub = payload.entities[link.hub].id;
+    let participant = payload.entities[link.participant].id;
+    let base = point(target(edsl::KnowledgeKind::BusinessLink, hub, link.id), link.id, [], "",
+        [member(target(edsl::KnowledgeKind::Dataset, "", hub)),
+         traversable(target(edsl::KnowledgeKind::Dataset, "", participant)),
+         member(target(edsl::KnowledgeKind::Relation, hub, link.a_relation)),
+         member(target(edsl::KnowledgeKind::Relation, hub, link.z_relation))]);
+    {...base, direction: Some(link.direction)}
+};
+
+def dataset_members: Fn(edsl::PreparedPayload, String, edsl::DatasetBrief) -> Array(Point) = fn(payload, subject, brief) {
+    let dimensions = array::flat_map(brief.dimension_ids, fn(id) { dimension_points(payload, subject, id) });
+    let measures = array::map(brief.measure_ids, fn(id) { measure_point(payload, subject, id) });
+    let relations = array::map(array::filter(payload.relations, fn(entry) {
+        entry.id != "" && payload.entities[entry.from].id == brief.id
+    }), fn(entry) { relation_point(payload, subject, entry.id) });
+    let metrics = array::map(array::filter(payload.entities, fn(e) { e.id == brief.id }), fn(e) { e.metrics });
+    let metric_points = array::flat_map(metrics, fn(items) { array::map(items, fn(metric) {
+        let measure_refs = if array::any(brief.measure_ids, fn(id) { id == metric.id }) {
+            [member(target(edsl::KnowledgeKind::Measure, brief.id, metric.id))]
+        } else { [] };
+        let base = point(target(edsl::KnowledgeKind::Metric, brief.id, metric.id), metric.id, [], "",
+            array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id))], measure_refs]));
+        {...base, metric: Some(metric)}
+    }) });
+    let times = array::map(brief.time_roles, fn(role) {
+        point(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], "",
+            array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id))],
+                array::map(role.dimension_ids, fn(id) {
+                    member(target(edsl::KnowledgeKind::Dimension, brief.id, id))
+                })]))
+    });
+    let links = array::map(array::filter(payload.business_links, fn(link) {
+        payload.entities[link.hub].id == brief.id
+    }), fn(link) { link_point(payload, link) });
+    array::concat([dimensions, measures, relations, metric_points, times, links])
+};
+
+def doc_text: Fn(edsl::PreparedPayload, edsl::KnowledgeTarget) -> Option(String) = fn(payload, id) {
+    let notes = array::flat_map(payload.entities, fn(entity) {
+        match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+            Some(declared) => declared.entries, None => [],
+        }
+    });
+    match array::find(notes, fn(entry) { entry.target == id }) {
+        Some(entry) => Some(entry.text), None => None,
+    }
+};
+
+def related_refs: Fn(edsl::PreparedPayload, edsl::KnowledgeTarget) -> Array(KnowledgeLink) = fn(payload, id) {
+    array::flat_map(payload.entities, fn(entity) {
+        let declared = match property::get_type_prop(entity.entity_type, edsl::KnowledgeRelations.type) {
+            Some(value) => value.entries, None => [],
+        };
+        array::map(array::filter(declared, fn(entry) { entry.source == id }), fn(entry) {
+            {target: entry.target, kind: LinkKind::Related}
+        })
+    })
+};
+
+# Every node is addressable by stable id or declared label, but details and
+# references are returned one point at a time. No topic string is a query id.
+def map: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(payload, subject) {
+    let datasets = edsl::knowledge_index_for_subject(payload, subject);
+    let raw = array::concat([
+        array::map(datasets, fn(brief) { dataset_point(payload, brief) }),
+        array::flat_map(datasets, fn(brief) { dataset_members(payload, subject, brief) }),
+    ]);
+    if let Some(dangling) = array::find(raw, fn(item) {
+        array::any(item.refs, fn(ref) {
+            !array::any(raw, fn(other) { other.target == ref.target })
+        })
+    }) { fail!("knowledge point references a point outside the visible model", dangling.target) }
+    else if let Some(orphan) = array::find(raw, fn(item) {
+        item.target.kind != edsl::KnowledgeKind::Dataset
+            && !array::any(raw, fn(other) {
+                array::any(other.refs, fn(ref) { ref.kind != LinkKind::Related && ref.target == item.target })
+            })
+    }) { fail!("knowledge point is not reachable from its declaring model", orphan.target) }
+    else {
+        array::map(raw, fn(item) {
+            let refs = array::concat([item.refs, array::filter(related_refs(payload, item.target), fn(ref) {
+                array::any(raw, fn(point) { point.target == ref.target })
+            })]);
+            let summary = match doc_text(payload, item.target) { Some(text) => text, None => item.summary };
+            {...item, refs, summary}
+        })
+    }
+};
+
+def topic_index: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(payload, subject) {
+    array::flat_map(map(payload, subject), fn(item) {
+        let names = array::concat([[item.target.id, item.label], item.aliases]);
+        array::map(array::filter(array::enumerate(names), fn(indexed) {
+            indexed.1 != "" && !array::any(array::filter(array::enumerate(names), fn(other) {
+                other.0 < indexed.0
+            }), fn(other) { other.1 == indexed.1 })
+        }), fn(indexed) {
+            let locale = match array::find(item.localized, fn(text) { text.label == indexed.1 }) {
+                Some(text) => Some(text.locale), None => None,
+            };
+            {topic: indexed.1, target: item.target, label: item.label, owner: item.target.owner, locale}
+        })
+    })
+};
+
+# Exact codepoint match: no trimming, case folding, language inference or
+# automatic disambiguation. A missing topic returns a value, not a fallback.
+def doc: Fn(edsl::PreparedPayload, String, String) -> DocResult = fn(payload, subject, topic) {
+    let items = map(payload, subject);
+    let candidates = array::filter(topic_index(payload, subject), fn(entry) { entry.topic == topic });
+    if array::length(candidates) == 0 { DocResult::NotFound }
+    else if array::length(candidates) > 1 { DocResult::Candidates(candidates) }
+    else {
+        let candidate = candidates[0];
+        match array::find(items, fn(point) { point.target == candidate.target }) {
+            Some(item) => DocResult::Found(item),
+            None => fail!("knowledge topic has no point in prepared model", candidate),
+        }
+    }
+};
+
+pub use self::{ LinkKind, KnowledgeLink, Point, TopicEntry, DocResult, map, topic_index, doc };

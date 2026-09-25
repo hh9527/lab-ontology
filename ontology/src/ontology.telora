@@ -56,6 +56,14 @@ type DimensionNote = struct { id: String, label: String, summary: String };
 type DimensionDescriptions = struct { notes: Array(DimensionNote) };
 
 type LocalizedKnowledgeText = struct { locale: String, label: String, summary: String };
+type KnowledgeKind = enum { Dataset, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
+type KnowledgeTarget = struct { kind: KnowledgeKind, owner: String, id: String };
+type KnowledgeDoc = struct { target: KnowledgeTarget, text: String };
+type KnowledgeRelation = struct { source: KnowledgeTarget, target: KnowledgeTarget };
+@prelude::property(PropertyTarget::Type)
+type KnowledgeDocs = struct { entries: Array(KnowledgeDoc) };
+@prelude::property(PropertyTarget::Type)
+type KnowledgeRelations = struct { entries: Array(KnowledgeRelation) };
 type LocalizedMemberText = struct { kind: MemberAliasKind, id: String, text: LocalizedKnowledgeText };
 @prelude::property(PropertyTarget::Field)
 type LocalizedMemberTexts = struct { notes: Array(LocalizedMemberText) };
@@ -790,6 +798,20 @@ def dataset_alias: Fn(String) -> Fn(td::TypeDesc, Option(DatasetAliasesDef)) -> 
     fn(ctx, previous) {
         let labels = match previous { Some(p) => p.labels, None => [] };
         { labels: array::push(labels, label) }
+    }
+};
+
+def doc: Fn(KnowledgeTarget, String) -> Fn(td::TypeDesc, Option(KnowledgeDocs)) -> KnowledgeDocs = fn(target, text) {
+    fn(ctx, previous) {
+        let entries = match previous { Some(value) => value.entries, None => [] };
+        {entries: array::push(entries, {target, text})}
+    }
+};
+
+def related_to: Fn(KnowledgeTarget, KnowledgeTarget) -> Fn(td::TypeDesc, Option(KnowledgeRelations)) -> KnowledgeRelations = fn(source, target) {
+    fn(ctx, previous) {
+        let entries = match previous { Some(value) => value.entries, None => [] };
+        {entries: array::push(entries, {source, target})}
     }
 };
 
@@ -2137,6 +2159,77 @@ def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Arra
 
 
 
+def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn(payload, target) {
+    match target.kind {
+        KnowledgeKind::Dataset => target.owner == "" && array::any(payload.entities, fn(e) { e.id == target.id }),
+        KnowledgeKind::Dimension => array::any(payload.dimensions, fn(d) {
+            d.id == target.id && get_index(payload.entities, d.entity).id == target.owner
+        }),
+        KnowledgeKind::Measure => array::any(payload.measures, fn(m) {
+            m.id == target.id && get_index(payload.entities, m.entity).id == target.owner
+        }),
+        KnowledgeKind::Value => array::any(payload.dimensions, fn(d) {
+            d.id == target.owner && (array::any(d.canonical_values, fn(v) { v.id == target.id })
+                || array::any(d.values, fn(v) { v.value == target.id }))
+        }),
+        KnowledgeKind::Relation => array::any(payload.relations, fn(r) {
+            r.id != "" && r.id == target.id && get_index(payload.entities, r.from).id == target.owner
+        }),
+        KnowledgeKind::BusinessLink => array::any(payload.business_links, fn(link) {
+            link.id == target.id && get_index(payload.entities, link.hub).id == target.owner
+        }),
+        KnowledgeKind::Metric => array::any(payload.entities, fn(e) {
+            e.id == target.owner && array::any(e.metrics, fn(metric) { metric.id == target.id })
+        }),
+        KnowledgeKind::TimeRole => array::any(payload.entities, fn(e) {
+            e.id == target.owner && array::any(e.fields, fn(field) {
+                field.name == target.id && property::get_field_prop(e.entity_type, field.index, TimeField.type) != None
+            })
+        }),
+    }
+};
+
+def knowledge_owned_by: Fn(PreparedPayload, EntityEntry, KnowledgeTarget) -> Bool = fn(payload, entity, target) {
+    if !knowledge_target_declared(payload, target) { False }
+    else match target.kind {
+        KnowledgeKind::Dataset => target.id == entity.id,
+        KnowledgeKind::Value => array::any(payload.dimensions, fn(d) {
+            d.id == target.owner && d.entity == entity.index
+        }),
+        _ => target.owner == entity.id,
+    }
+};
+
+def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
+    let docs = array::flat_map(payload.entities, fn(entity) {
+        let entries = match property::get_type_prop(entity.entity_type, KnowledgeDocs.type) {
+            Some(declared) => declared.entries, None => [],
+        };
+        array::map(entries, fn(item) {
+            if item.text == "" || !knowledge_owned_by(payload, entity, item.target) {
+                fail!("knowledge doc must describe an existing point owned by its declaring entity", entity.id, item.target)
+            } else { item }
+        })
+    });
+    if let Some(duplicate) = array::find(docs, fn(item) {
+        array::length(array::filter(docs, fn(other) { other.target == item.target })) > 1
+    }) { fail!("duplicate knowledge doc target", duplicate.target) } else { () };
+    let refs = array::flat_map(payload.entities, fn(entity) {
+        let entries = match property::get_type_prop(entity.entity_type, KnowledgeRelations.type) {
+            Some(declared) => declared.entries, None => [],
+        };
+        array::map(entries, fn(item) {
+            if !knowledge_owned_by(payload, entity, item.source) || !knowledge_target_declared(payload, item.target)
+                || item.source == item.target {
+                fail!("knowledge reference must link distinct declared points from its owner", entity.id, item)
+            } else { item }
+        })
+    });
+    if let Some(duplicate) = array::find(refs, fn(item) {
+        array::length(array::filter(refs, fn(other) { other == item })) > 1
+    }) { fail!("duplicate knowledge reference", duplicate) } else { True }
+};
+
 def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> PreparedPayload = fn(revision, entity_types, profile, authorize) {
     let n = array::length(entity_types);
     let entities = check_entity_aliases(check_entity_ids(array::map(int_range(n), fn(i) {
@@ -2261,7 +2354,8 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     });
     let aliases_ok = check_knowledge_aliases(payload);
     let localized_ok = check_localized_knowledge(payload);
-    if profile_ok && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok { payload } else { payload }
+    let annotations_ok = check_knowledge_annotations(payload);
+    if profile_ok && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && predicates_validated && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok && annotations_ok { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -3752,6 +3846,14 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
 # ---------------------------------------------------------------------------
 
 pub use self::{
+    KnowledgeKind,
+    KnowledgeTarget,
+    KnowledgeDoc,
+    KnowledgeRelation,
+    KnowledgeDocs,
+    KnowledgeRelations,
+    doc,
+    related_to,
     OutputType,
     ColumnMap,
     KeyFlag,
@@ -3769,6 +3871,7 @@ pub use self::{
     DatasetSpec,
     MetricValueSpec,
     MetricValueEntry,
+    MeasureBrief,
     MetricValueRole,
     SampleAggregateDef,
     DatasetDescription,
