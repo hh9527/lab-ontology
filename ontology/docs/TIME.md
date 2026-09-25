@@ -50,6 +50,11 @@ including `exists` subgraphs and both operands of `graph_pair`. Without a
 context, `ctx.now` fails; the existing context-free factories never read a
 system or database clock.
 
+`{"ctx":"now","as":"rfc3339"}` and `{"ctx":"now","as":"utc_second"}`
+explicitly convert between the two validated UTC-second text spellings,
+preserving the instant and binding the converted value. This is not a timezone
+conversion; epoch milliseconds cannot use this text-spelling conversion.
+
 Telora's transform-service initialization context is long-lived, not a
 per-request clock. The current model services still expose context-free
 factories; a trusted platform adapter must call the context-aware factory for
