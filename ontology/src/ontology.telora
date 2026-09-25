@@ -3779,6 +3779,52 @@ def graph_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity
     }
 };
 
+# One owner-owned sample population may be repeated once per distinct context
+# identity, but only when both populations meet at that same complete owner.
+def graph_contextual_measure_grain: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, sample_id) {
+    if sample_id == request.root || array::length(request.nodes) != 3 || array::length(request.edges) != 2
+        || request.count != None || request.include_empty
+        || !array::all(request.select, fn(item) { item.node == request.root
+            || array::any(request.edges, fn(edge) { edge.from == request.root && edge.to == item.node }) }) { False }
+    else {
+        match array::find(request.edges, fn(edge) { edge.from == request.root && edge.to != sample_id }) {
+            None => False,
+            Some(context_edge) => {
+                let owner_id = context_edge.to;
+                let sample_edge = array::find(request.edges, fn(edge) {
+                    edge.from == sample_id && edge.to == owner_id
+                });
+                if request.group_by_identity != [request.root, owner_id]
+                    || array::any(payload.business_links, fn(link) { link.id == context_edge.relation }) { False }
+                else { match sample_edge {
+                    None => False,
+                    Some(edge) => if array::any(payload.business_links, fn(link) { link.id == edge.relation }) { False }
+                    else {
+                        let context = graph_node(request, request.root);
+                        let owner = graph_node(request, owner_id);
+                        let sample = graph_node(request, sample_id);
+                        let context_entity = get_index(payload.entities, entity_by_id(payload, context.entity));
+                        let owner_entity = get_index(payload.entities, entity_by_id(payload, owner.entity));
+                        let sample_entity = get_index(payload.entities, entity_by_id(payload, sample.entity));
+                        let context_relation = relation_domain(payload, context_edge.relation);
+                        let sample_relation = relation_domain(payload, edge.relation);
+                        array::length(graph_identity_columns(context_entity, request.root)) > 0
+                            && array::length(graph_identity_columns(owner_entity, owner_id)) > 0
+                            && array::length(graph_identity_columns(sample_entity, sample_id)) > 0
+                            && context_relation.from == context_entity.index && context_relation.to == owner_entity.index
+                            && sample_relation.from == sample_entity.index && sample_relation.to == owner_entity.index
+                            && context_relation.kind == RelationKind::Safe && sample_relation.kind == RelationKind::Safe
+                            && conjunctive_identity_key(context_relation.key)
+                            && conjunctive_identity_key(sample_relation.key)
+                            && safe_relation_covers_target_identity(owner_entity, exists_pairs(context_relation.key))
+                            && safe_relation_covers_target_identity(owner_entity, exists_pairs(sample_relation.key))
+                    },
+                } }
+            },
+        }
+    }
+};
+
 def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphMeasureSelect) -> (qb::BuildCtx, qb::SelectItem) =
     fn(ctx, payload, request, instances, selection) {
         let instance = graph_instance(instances, selection.node);
@@ -3792,8 +3838,18 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
             fail!("graph measure projection requires a non-computed measure without external dependencies", selection.node, selection.measure)
         } else {
             let proof = graph_count_subject_grain(payload, request, selection.node);
-            if !proof.0 {
-                fail!("graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification", selection.node, selection.measure, proof.1)
+            if !proof.0 && !graph_contextual_measure_grain(payload, request, selection.node) {
+                let owner = array::find(request.edges, fn(edge) {
+                    edge.from == request.root && edge.to != selection.node
+                });
+                match owner {
+                    Some(edge) => if graph_contextual_measure_grain(payload,
+                        {...request, group_by_identity: [request.root, edge.to]}, selection.node) {
+                        fail!(`graph contextual measure requires group_by_identity [\{request.root}, \{edge.to}] to keep context and owner identities separate; the measure remains owned by \{selection.node}`,
+                            request.root, edge.to, selection.node, selection.measure)
+                    } else { fail!("graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification", selection.node, selection.measure, proof.1) },
+                    None => fail!("graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification", selection.node, selection.measure, proof.1),
+                }
             } else {
                 let entity = get_index(payload.entities, instance.entity);
                 let field = get_index(entity.fields, measure.field);

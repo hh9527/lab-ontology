@@ -387,6 +387,79 @@ pub def independently_filtered_alarm_measures_keep_separate_thresholds: test::Te
     else { fail!("independent filtered alarm thresholds merged their populations", sq, pg) }
 });
 
+pub def device_kpi_sum_in_each_frame_context: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"frame",
+        "nodes":[{"id":"frame","entity":"frame"},{"id":"device","entity":"device"},
+                 {"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"frame_belongs_to_device","from":"frame","to":"device"},
+                 {"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"frame","dimension":"frame_name"},{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"port_count"}],
+        "group_by_identity":["frame","device"],
+        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}]}
+    "#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "frame.refParentNE = device.id AND frame.tenantId = device.tenant_id")
+        && string::contains(sq.sql, "sample.resId = device.id")
+        && string::contains(sq.sql, "sample.tenantId = device.tenant_id")
+        && string::contains(sq.sql, "sum(sample.portCount) AS sample_port_count")
+        && string::contains(sq.sql, "GROUP BY frame.name, device.name, frame.id, frame.tenantId, device.id, device.tenant_id")
+        && string::contains(pg.sql, "sum(\"sample\".\"portCount\")")
+        && sq.bindings == pg.bindings { True }
+    else { fail!(`contextual Device KPI SUM lost Frame and owner identity: \{sq.sql} / \{pg.sql}`, sq, pg) }
+});
+
+pub def frame_context_requires_owner_identity_group: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"frame",
+        "nodes":[{"id":"frame","entity":"frame"},{"id":"device","entity":"device"},
+                 {"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"frame_belongs_to_device","from":"frame","to":"device"},
+                 {"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"frame","dimension":"frame_name"}],
+        "measures":[{"node":"sample","measure":"port_count"}],
+        "group_by_identity":["frame"]}"#).unwrap!())
+}, "graph contextual measure requires group_by_identity [frame, device] to keep context and owner identities separate");
+
+pub def frame_context_rejects_extra_multiplying_site_branch: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"frame",
+        "nodes":[{"id":"frame","entity":"frame"},{"id":"device","entity":"device"},
+                 {"id":"sample","entity":"device_kpi"},{"id":"site","entity":"site"}],
+        "edges":[{"relation":"frame_belongs_to_device","from":"frame","to":"device"},
+                 {"relation":"device_kpi_of_device","from":"sample","to":"device"},
+                 {"relation":"device_located_at_site","from":"device","to":"site"}],
+        "select":[{"node":"frame","dimension":"frame_name"}],
+        "measures":[{"node":"sample","measure":"port_count"}],
+        "group_by_identity":["frame","device"]}"#).unwrap!())
+}, "graph measure source may be multiplied by a joined relation");
+
+pub def normal_wac_frame_context_observes_device_cpu_peak: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"frame",
+        "nodes":[{"id":"frame","entity":"frame"},{"id":"device","entity":"device"},
+                 {"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"frame_belongs_to_device","from":"frame","to":"device"},
+                 {"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"frame","dimension":"frame_name"},{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_peak"}],
+        "group_by_identity":["frame","device"],
+        "filters":[{"node":"frame","dimension":"frame_oper_state","op":"eq","kind":"text","value":"normal"},
+                   {"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"WAC"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}]}
+    "#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "max(sample.cpuUsage) AS sample_cpu_peak")
+        && string::contains(sq.sql, "frame.operState")
+        && string::contains(sq.sql, "device.classification")
+        && string::contains(sq.sql, "sample.ts >=") && string::contains(sq.sql, "sample.ts <")
+        && string::contains(sq.sql, "GROUP BY frame.name, device.name, frame.id, frame.tenantId, device.id, device.tenant_id")
+        && string::contains(pg.sql, "max(\"sample\".\"cpuUsage\")")
+        && sq.bindings == pg.bindings { True }
+    else { fail!("frame context changed Device CPU peak ownership or canonical/time filters", sq, pg) }
+});
+
 pub def aggregate_top_requires_owner_identity: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
         "op":"graph", "root":"device",
