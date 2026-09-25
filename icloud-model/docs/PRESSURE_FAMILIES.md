@@ -1,5 +1,17 @@
 # Corpus pressure families (first pass)
 
+Q0097/Q0098 mix physical memory names with server-owned CPU KPI samples.
+The pressure model now declares Memory -> Server containment and a server CPU
+sample, but no memory CPU metric: the corpus SQL duplicates each server sample
+once per memory component and cannot establish memory-level attribution.
+Graph accepts a named-memory EXISTS to qualify the server while preserving
+sample grain and composite tenant ownership. Global raw TOP projecting memory
+names is rejected with separate guidance: remove the component projection and
+qualify through EXISTS, or explicitly request relationship rows without a
+global sample TOP. The latter represents associations, not memory CPU samples.
+The composite memory ownership key remains a business pressure contract to
+validate against production data.
+
 IC's severity predicates (Q0123-Q0131, Q0444-Q0446) motivate a paired
 critical/major count probe; the corpus SQL does not itself demand both columns.
 This probe exposed a Model/graph mismatch: the Model already
