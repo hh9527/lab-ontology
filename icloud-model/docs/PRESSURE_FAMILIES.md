@@ -108,11 +108,18 @@ as one navigable catalog. `IndexService` now retains only topic entries at
 initialization, preserving full catalog closure validation without retaining
 every detailed Point. A single `index.ic` page request fell from 361.7 million
 to about 1.5 million Wasm fuel (offset 0, limit 1); index construction still
-costs initialization work. `doc.ic` still reconstructs full details per
-request (roughly 362 million fuel for the Device document), a separate scaling
-pressure. Capturing full catalogs in service slots exceeded the runtime's
-single growth-operation limit; optimizing doc must not weaken visibility or
-graph-closure checks.
+costs initialization work. `doc.ic` now derives topic entries from the Prepared
+Model without rebuilding the validated full Point graph, then materializes the
+addressed dataset's members and selects the target point with its declared
+docs/related references.
+The Device document fell from about 375 million to 79 million request fuel at
+the default 64 MiB limit; `index.ic` remains about 1.5 million. The index slot
+still validates the full catalog and reference closure at initialization;
+`doc.ic` depends on that paired service slot and uses the same subject and
+Prepared Model. Caching a second full catalog/topic graph in the doc slot
+exceeded the runtime's single growth-operation limit. Small-model tests compare
+all topic entries and exact document output against the validated catalog;
+IC tests cover dataset, relation and filtered-measure details.
 
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes

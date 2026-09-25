@@ -285,6 +285,16 @@ def topic_index: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(pay
     topic_index_from_points(map(payload, subject))
 };
 
+# Lightweight request index; the service's index slot validates the full
+# catalog and reference closure once at initialization.
+def topic_index_from_model: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(payload, subject) {
+    let datasets = edsl::knowledge_index_for_subject(payload, subject);
+    topic_index_from_points(array::concat([
+        array::map(datasets, fn(brief) { dataset_point(payload, brief) }),
+        array::flat_map(datasets, fn(brief) { dataset_members(payload, subject, brief) }),
+    ]))
+};
+
 def prepare_catalog: Fn(edsl::PreparedPayload, String) -> Catalog = fn(payload, subject) {
     let points = map(payload, subject);
     {points, topics: topic_index_from_points(points)}
@@ -301,6 +311,51 @@ def doc_in_catalog: Fn(Catalog, String) -> DocResult = fn(catalog, topic) {
             None => fail!("knowledge topic has no point in prepared model", candidate),
         }
     }
+};
+
+def point_from_topics: Fn(edsl::PreparedPayload, String, Array(TopicEntry), edsl::KnowledgeTarget) -> DocResult = fn(payload, subject, topics, id) {
+    if !array::any(topics, fn(entry) { entry.target == id }) { DocResult::NotFound }
+    else {
+        let datasets = edsl::knowledge_index_for_subject(payload, subject);
+        let brief = match array::find(datasets, fn(entry) {
+            if id.kind == edsl::KnowledgeKind::Dataset { entry.id == id.id }
+            else if id.kind == edsl::KnowledgeKind::Value {
+                array::any(entry.dimension_ids, fn(name) { name == id.owner })
+            } else { entry.id == id.owner }
+        }) {
+            Some(entry) => entry,
+            None => fail!("knowledge topic owner disappeared from prepared model", id),
+        };
+        let raw = if id.kind == edsl::KnowledgeKind::Dataset { dataset_point(payload, brief) }
+        else { match array::find(dataset_members(payload, subject, brief), fn(item) { item.target == id }) {
+            Some(item) => item,
+            None => fail!("knowledge topic has no point in prepared model", id),
+        } };
+        let docs = array::flat_map(payload.entities, fn(entity) {
+            match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+                Some(declared) => declared.entries, None => [],
+            }
+        });
+        let related = array::flat_map(payload.entities, fn(entity) {
+            match property::get_type_prop(entity.entity_type, edsl::KnowledgeRelations.type) {
+                Some(declared) => declared.entries, None => [],
+            }
+        });
+        let refs = array::concat([raw.refs, array::map(array::filter(related, fn(ref) {
+            ref.source == id && array::any(topics, fn(entry) { entry.target == ref.target })
+        }), fn(ref) { {target: ref.target, kind: LinkKind::Related} })]);
+        let summary = match array::find(docs, fn(note) { note.target == id }) {
+            Some(note) => note.text, None => raw.summary,
+        };
+        DocResult::Found({...raw, refs, summary})
+    }
+};
+
+def doc_in_topics: Fn(edsl::PreparedPayload, String, Array(TopicEntry), String) -> DocResult = fn(payload, subject, topics, topic) {
+    let candidates = array::filter(topics, fn(entry) { entry.topic == topic });
+    if array::length(candidates) == 0 { DocResult::NotFound }
+    else if array::length(candidates) > 1 { DocResult::Candidates(candidates) }
+    else { point_from_topics(payload, subject, topics, candidates[0].target) }
 };
 
 # Exact codepoint match: no trimming, case folding, language inference or
@@ -421,8 +476,38 @@ def knowledge_service_factory: Fn(edsl::PreparedPayload, String, String) -> Fn(V
 # selected its method. Bind that method once when initializing the slot.
 def knowledge_method_factory: Fn(edsl::PreparedPayload, String, String, String) -> Fn(Value) -> Value =
     fn(payload, subject, domain, method) {
-        fn(input) { serve_value(payload, subject, domain,
-            Value::Object({method: Value::String(method), input})) }
+        let index_topics = if method == `index.\{domain}` { topic_index(payload, subject) } else { [] };
+        fn(input) {
+            if domain == "" { fail!("knowledge domain must not be empty") }
+            else if method == `index.\{domain}` {
+                let fields = object(input);
+                keys(fields, ["offset", "limit"]);
+                codec::encode(KnowledgeResponse::Index(page_entries(index_topics,
+                    int_field(fields, "offset", 0), int_field(fields, "limit", 50))))
+            } else if method == `doc.\{domain}` {
+                let fields = object(input);
+                let topic = dict::get(fields, "topic");
+                let id = dict::get(fields, "target");
+                let document = match (topic, id) {
+                    (Some(Value::String(name)), None) => do {
+                        keys(fields, ["topic"]);
+                        let topics = topic_index_from_model(payload, subject);
+                        doc_in_topics(payload, subject, topics, name)
+                    },
+                    (None, Some(value)) => do {
+                        keys(fields, ["target"]);
+                        let target_fields = object(value);
+                        keys(target_fields, ["kind", "owner", "id"]);
+                        let topics = topic_index_from_model(payload, subject);
+                        point_from_topics(payload, subject, topics,
+                            target(parse_kind(text_field(target_fields, "kind")),
+                                text_field(target_fields, "owner"), text_field(target_fields, "id")))
+                    },
+                    _ => fail!("knowledge doc requires exactly one topic string or target", input),
+                };
+                codec::encode(KnowledgeResponse::Document(document))
+            } else { fail!("unknown knowledge method for domain", method, domain) }
+        }
     };
 
 def knowledge_index_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> Value =
@@ -437,5 +522,5 @@ def knowledge_index_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Valu
     };
 
 pub use self::{ LinkKind, KnowledgeLink, Point, TopicEntry, DocResult, TopicPage, KnowledgeResponse,
-    map, topic_index, topic_index_from_points, doc, by_target, page, serve, serve_value,
+    map, topic_index, topic_index_from_model, topic_index_from_points, doc, by_target, page, serve, serve_value,
     knowledge_service_factory, knowledge_method_factory, knowledge_index_method_factory };
