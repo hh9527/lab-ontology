@@ -1,6 +1,8 @@
 use crate::ontology as edsl;
 use std::array as array;
+use std::dict as dict;
 use std::type_property as property;
+use std::value::{ Value };
 
 type LinkKind = enum { Member, Traversable, Related };
 type KnowledgeLink = struct { target: edsl::KnowledgeTarget, kind: LinkKind };
@@ -21,6 +23,8 @@ type Point = struct {
 };
 type TopicEntry = struct { topic: String, target: edsl::KnowledgeTarget, label: String, owner: String, locale: Option(String) };
 type DocResult = enum { NotFound, Found(Point), Candidates(Array(TopicEntry)) };
+type TopicPage = struct { entries: Array(TopicEntry), next_offset: Option(Int) };
+type KnowledgeResponse = enum { Index(TopicPage), Document(DocResult) };
 
 def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
     {kind, owner, id}
@@ -241,4 +245,94 @@ def doc: Fn(edsl::PreparedPayload, String, String) -> DocResult = fn(payload, su
     }
 };
 
-pub use self::{ LinkKind, KnowledgeLink, Point, TopicEntry, DocResult, map, topic_index, doc };
+def by_target: Fn(edsl::PreparedPayload, String, edsl::KnowledgeTarget) -> DocResult = fn(payload, subject, id) {
+    match array::find(map(payload, subject), fn(item) { item.target == id }) {
+        Some(item) => DocResult::Found(item), None => DocResult::NotFound,
+    }
+};
+
+def page: Fn(edsl::PreparedPayload, String, Int, Int) -> TopicPage = fn(payload, subject, offset, limit) {
+    if offset < 0 || limit < 1 || limit > 100 { fail!("knowledge index requires nonnegative offset and limit in 1..100", offset, limit) }
+    else {
+        let entries = topic_index(payload, subject);
+        let selected = array::map(array::filter(array::enumerate(entries), fn(item) {
+            item.0 >= offset && item.0 - offset < limit
+        }), fn(item) { item.1 });
+        let next_offset = if offset < array::length(entries) && limit < array::length(entries) - offset {
+            Some(offset + limit)
+        } else { None };
+        {entries: selected, next_offset}
+    }
+};
+
+def object: Fn(Value) -> Dict(Value) = fn(value) {
+    match value { Value::Object(fields) => fields, _ => fail!("knowledge request must be an object", value) }
+};
+def required: Fn(Dict(Value), String) -> Value = fn(fields, key) {
+    match dict::get(fields, key) {
+        Some(value) => value, None => fail!("knowledge request field is missing", key),
+    }
+};
+def text_field: Fn(Dict(Value), String) -> String = fn(fields, key) {
+    match required(fields, key) {
+        Value::String(value) => value, other => fail!("knowledge request field must be a string", key, other),
+    }
+};
+def int_field: Fn(Dict(Value), String, Int) -> Int = fn(fields, key, fallback) {
+    match dict::get(fields, key) {
+        None => fallback, Some(Value::Int(value)) => value,
+        Some(other) => fail!("knowledge request field must be an integer", key, other),
+    }
+};
+def keys: Fn(Dict(Value), Array(String)) -> () = fn(fields, allowed) {
+    match array::find(dict::keys(fields), fn(key) { !array::any(allowed, fn(name) { name == key }) }) {
+        Some(key) => fail!("knowledge request contains unsupported field", key), None => (),
+    }
+};
+def parse_kind: Fn(String) -> edsl::KnowledgeKind = fn(name) {
+    match name {
+        "dataset" => edsl::KnowledgeKind::Dataset,
+        "dimension" => edsl::KnowledgeKind::Dimension,
+        "measure" => edsl::KnowledgeKind::Measure,
+        "value" => edsl::KnowledgeKind::Value,
+        "relation" => edsl::KnowledgeKind::Relation,
+        "business_link" => edsl::KnowledgeKind::BusinessLink,
+        "time_role" => edsl::KnowledgeKind::TimeRole,
+        "metric" => edsl::KnowledgeKind::Metric,
+        _ => fail!("unknown knowledge target kind", name),
+    }
+};
+
+# The caller binds a domain to its prepared model and subject. Input is
+# validated before looking up a point; topic text never enters query lowering.
+def serve: Fn(edsl::PreparedPayload, String, String, Value) -> KnowledgeResponse = fn(payload, subject, domain, request) {
+    if domain == "" { fail!("knowledge domain must not be empty") } else { () };
+    let envelope = object(request);
+    keys(envelope, ["method", "input"]);
+    let method = text_field(envelope, "method");
+    let input = object(required(envelope, "input"));
+    if method == `index.\{domain}` {
+        keys(input, ["offset", "limit"]);
+        KnowledgeResponse::Index(page(payload, subject, int_field(input, "offset", 0), int_field(input, "limit", 50)))
+    } else if method == `doc.\{domain}` {
+        let topic = dict::get(input, "topic");
+        let id = dict::get(input, "target");
+        match (topic, id) {
+            (Some(Value::String(name)), None) => do {
+                keys(input, ["topic"]);
+                KnowledgeResponse::Document(doc(payload, subject, name))
+            },
+            (None, Some(value)) => do {
+                keys(input, ["target"]);
+                let fields = object(value);
+                keys(fields, ["kind", "owner", "id"]);
+                let target = target(parse_kind(text_field(fields, "kind")), text_field(fields, "owner"), text_field(fields, "id"));
+                KnowledgeResponse::Document(by_target(payload, subject, target))
+            },
+            _ => fail!("knowledge doc requires exactly one topic string or target", input),
+        }
+    } else { fail!("unknown knowledge method for domain", method, domain) }
+};
+
+pub use self::{ LinkKind, KnowledgeLink, Point, TopicEntry, DocResult, TopicPage, KnowledgeResponse,
+    map, topic_index, doc, by_target, page, serve };
