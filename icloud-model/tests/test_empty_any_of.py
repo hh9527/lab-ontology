@@ -16,7 +16,7 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
         self.db = sqlite3.connect(":memory:")
         self.addCleanup(self.db.close)
         self.db.execute("CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT, name TEXT, classification TEXT)")
-        self.db.execute("CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, SEVERITY TEXT)")
+        self.db.execute("CREATE TABLE T_CURRENT_ALARM (CSN INTEGER, MEDN TEXT, TENANTID TEXT, SEVERITY TEXT, STREXT13 TEXT)")
         self.db.executemany(
             "INSERT INTO I_EntNetworkElement VALUES (?, ?, ?, ?)",
             [
@@ -27,13 +27,13 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
             ],
         )
         self.db.executemany(
-            "INSERT INTO T_CURRENT_ALARM VALUES (?, ?, ?, ?)",
+            "INSERT INTO T_CURRENT_ALARM VALUES (?, ?, ?, ?, ?)",
             [
-                (1, "same", "blue", "2"),
-                (2, "other", "red", "1"),
-                (3, "other", "red", "2"),
-                (4, "other", "red", "3"),
-                (5, "excluded", "red", "1"),
+                (1, "same", "blue", "2", None),
+                (2, "other", "red", "1", None),
+                (3, "other", "red", "2", None),
+                (4, "other", "red", "3", None),
+                (5, "excluded", "red", "1", None),
             ],
         )
 
@@ -103,6 +103,35 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
             sorted(self.lower(intent)),
             [("Blue", 0, 1, 1), ("Empty", 0, 0, 0), ("Excluded", 1, 0, 1), ("Two", 1, 1, 2)],
         )
+
+    def test_system_alarm_is_not_a_site_relation_but_remains_an_event(self):
+        self.db.execute("CREATE TABLE X_SITE_VIEW (SITE_ID TEXT)")
+        self.db.executemany("INSERT INTO X_SITE_VIEW VALUES (?)", [("3",), ("site-a",)])
+        self.db.executemany(
+            "INSERT INTO T_CURRENT_ALARM VALUES (?, ?, ?, ?, ?)",
+            [(6, "other", "red", "1", "3"), (7, "other", "red", "2", "site-a")],
+        )
+        site_counts = self.lower({
+            "op": "graph", "root": "site", "include_empty": True,
+            "nodes": [{"id": "site", "entity": "site"}, {"id": "alarm", "entity": "current_alarm"}],
+            "edges": [{"relation": "alarm_site_reference", "from": "alarm", "to": "site"}],
+            "select": [{"node": "site", "dimension": "site_id"}],
+            "count": "alarm", "group_by_identity": ["site"],
+        })
+        all_alarms = self.lower({
+            "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "edges": [], "select": [], "count": "alarm",
+        })
+        no_site_alarms = self.lower({
+            "op": "graph", "root": "site", "nodes": [{"id": "site", "entity": "site"}],
+            "edges": [], "select": [{"node": "site", "dimension": "site_id"}],
+            "exists": [{"anchor": "site", "negated": True,
+                "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+                "edges": [{"relation": "alarm_site_reference", "from": "alarm", "to": "site"}]}],
+        })
+        self.assertEqual(sorted(site_counts), [("3", 0), ("site-a", 1)])
+        self.assertEqual(all_alarms, [(7,)])
+        self.assertEqual(no_site_alarms, [("3",)])
 
 
 if __name__ == "__main__":

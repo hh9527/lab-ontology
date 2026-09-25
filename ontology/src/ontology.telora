@@ -277,6 +277,7 @@ type RelationDecl = struct {
     target: Type,
     kind: RelationKind,
     key: RelationKey,
+    guard: Option(ScopePredicate),
 };
 
 # Variant-level: stable external/physical value and display label for a
@@ -579,6 +580,7 @@ type RelationEntry = struct {
     to: Int,
     kind: RelationKind,
     key: RelationKey,
+    guard: Option(ScopePredicate),
 };
 
 type BusinessLinkEntry = struct {
@@ -606,6 +608,7 @@ type RelationBrief = struct {
     to_dataset: String,
     kind: RelationKind,
     shape: RelationShape,
+    guard: Option(ScopePredicate),
 };
 
 
@@ -878,7 +881,7 @@ def union_source: Fn(String, Array(UnionBranchDecl)) -> Fn(td::TypeDesc, Option(
 def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, from_field, to_field) {
     fn(ctx, previous) {
         let pair: RelationPair = { from: from_field, to: to_field };
-        let entry: RelationDecl = { id: "", target, kind, key: RelationKey::Eq(pair) };
+        let entry: RelationDecl = { id: "", target, kind, key: RelationKey::Eq(pair), guard: None };
         let relations = match previous {
             Some(p) => array::push(p.relations, entry),
             None => [entry],
@@ -893,7 +896,7 @@ def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td::TypeDesc, Option(Relati
 # fold by appending.
 def relation_key: Fn(Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, key) {
     fn(ctx, previous) {
-        let entry: RelationDecl = { id: "", target, kind, key };
+        let entry: RelationDecl = { id: "", target, kind, key, guard: None };
         let relations = match previous {
             Some(p) => array::push(p.relations, entry),
             None => [entry],
@@ -906,13 +909,25 @@ def relation_key: Fn(Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option
 def named_relation_key: Fn(String, Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key) {
     fn(ctx, previous) {
         if id == "" { fail!("named relation requires a nonempty id") } else {
-            let entry: RelationDecl = { id, target, kind, key };
+            let entry: RelationDecl = { id, target, kind, key, guard: None };
             let relations = match previous {
                 Some(p) => array::push(p.relations, entry),
                 None => [entry],
             };
             let result: RelationDef = { relations };
             result
+        }
+    }
+};
+
+def named_guarded_relation_key: Fn(String, Type, RelationKind, RelationKey, ScopePredicate) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key, guard) {
+    fn(ctx, previous) {
+        if id == "" { fail!("guarded relation requires a nonempty id") }
+        else {
+            let entry: RelationDecl = {id, target, kind, key, guard: Some(guard)};
+            {relations: match previous {
+                Some(p) => array::push(p.relations, entry), None => [entry],
+            }}
         }
     }
 };
@@ -928,7 +943,7 @@ def named_typed_relation_key: for(Src, Dest) Fn(String, TypeOf(Src), TypeOf(Dest
                 RelationKey::FieldEq({from: pair.from, to: pair.to})
             });
             let key = if array::length(keys) == 1 { keys[0] } else { RelationKey::And(keys) };
-            let entry: RelationDecl = {id, target, kind, key};
+            let entry: RelationDecl = {id, target, kind, key, guard: None};
             let relations = match previous {
                 Some(p) => array::push(p.relations, entry),
                 None => [entry],
@@ -2055,6 +2070,23 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
             };
             let target = get_index(entities, to_index);
             let key = resolve_relation_key(entity, target, rel.key);
+            let guard = match rel.guard {
+                None => None,
+                Some(pred) => do {
+                    let field = match array::find(entity.fields, fn(field) { field.name == pred.field }) {
+                        Some(found) => found,
+                        None => fail!("relation guard references an unknown source field", rel.id, pred.field),
+                    };
+                    if field.column == "" { fail!("relation guard field requires a physical column", rel.id, pred.field) }
+                    else if pred.op != FilterOp::Eq && pred.op != FilterOp::Ne {
+                        fail!("relation guard supports only Eq or Ne", rel.id, pred.op)
+                    } else if !((field.ty == String.type && match pred.input { FilterInput::Text(_) => True, _ => False })
+                        || (field.ty == Int.type && match pred.input { FilterInput::Int(_) => True, _ => False })
+                        || (field.ty == Bool.type && match pred.input { FilterInput::Bool(_) => True, _ => False })) {
+                        fail!("relation guard value disagrees with source field type", rel.id, pred.field, pred.input)
+                    } else { Some(pred) }
+                },
+            };
             if rel.kind == RelationKind::Safe && !conjunctive_identity_key(key) {
                 fail!("safe relation cannot prove a unique target across alternative keys", rel.id, entity.id, target.id)
             } else if rel.kind == RelationKind::Safe && !safe_relation_covers_target_identity(target, exists_pairs(key)) {
@@ -2089,6 +2121,7 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
                 to: to_index,
                 kind: rel.kind,
                 key,
+                guard,
             };
             result
         })
@@ -2145,7 +2178,9 @@ def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Arra
                 Some(r) => r,
                 None => fail!("business link Z endpoint relation is not declared on its hub", declaration.id, declaration.z_relation),
             };
-            if a.to != z.to || a.kind != RelationKind::Safe || z.kind != RelationKind::Safe {
+            if a.guard != None || z.guard != None {
+                fail!("business link endpoint relation cannot carry a guard", declaration.id)
+            } else if a.to != z.to || a.kind != RelationKind::Safe || z.kind != RelationKind::Safe {
                 fail!("business link endpoints must identify the same unique participant entity", declaration.id)
             } else {
                 let a_pairs = business_link_pairs(a.key, declaration.id);
@@ -2189,6 +2224,11 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
                     || array::any(payload.dimensions, fn(d) { d.entity == e.index && d.authorized && d.field == field.index })
                     || array::any(payload.measures, fn(m) { m.entity == e.index && m.field == field.index })
                     || array::any(e.metrics, fn(metric) { metric.field == field.name })
+                    || array::any(payload.relations, fn(rel) {
+                        rel.from == e.index && rel.id != "" && match rel.guard {
+                            Some(guard) => guard.field == field.name, None => False,
+                        }
+                    })
                 )
             })
         }),
@@ -2661,7 +2701,7 @@ def relation_brief: Fn(PreparedPayload, RelationEntry) -> RelationBrief = fn(pay
         localized: localized_relation_texts(get_index(payload.entities, entry.from).entity_type, entry.id),
         from_dataset: get_index(payload.entities, entry.from).id,
         to_dataset: get_index(payload.entities, entry.to).id,
-        kind: entry.kind, shape: relation_shape(entry.key)}
+        kind: entry.kind, shape: relation_shape(entry.key), guard: entry.guard}
 };
 
 def relation_detail_for_subject: Fn(PreparedPayload, String, String) -> RelationBrief = fn(payload, subject, id) {
@@ -3252,6 +3292,30 @@ def graph_key_condition: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Sour
     }
 };
 
+def graph_relation_guard: Fn(qb::BuildCtx, PreparedPayload, RelationEntry, qb::Source) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, relation, source) {
+    match relation.guard {
+        None => (ctx, None),
+        Some(pred) => do {
+            let entity = get_index(payload.entities, relation.from);
+            let field = match array::find(entity.fields, fn(item) { item.name == pred.field }) {
+                Some(item) => item, None => fail!("prepared relation guard field is missing", relation.id, pred.field),
+            };
+            let bound = qb::bind(ctx, to_val(pred.input));
+            let op = if pred.op == FilterOp::Ne { qb::ScalarFunction::Ne } else { qb::ScalarFunction::Eq };
+            (bound.0, Some(qb::scalar(op, [qb::column(source, field.column), bound.1])))
+        },
+    }
+};
+
+def graph_guarded_join: Fn(qb::BuildCtx, PreparedPayload, RelationEntry, qb::Source, qb::Source) -> (qb::BuildCtx, qb::JoinCondition) = fn(ctx, payload, relation, from_source, to_source) {
+    let key = graph_key_condition(payload, relation, from_source, to_source, relation.key);
+    let guard = graph_relation_guard(ctx, payload, relation, from_source);
+    (guard.0, match guard.1 {
+        None => key,
+        Some(expr) => qb::on_and([key, qb::on_predicate(expr)]),
+    })
+};
+
 def graph_link_joins: Fn(qb::BuildCtx, PreparedPayload, BusinessLinkEntry, qb::Source, String) -> (qb::BuildCtx, qb::Source, Array(qb::Join)) = fn(ctx, payload, link, origin, target_hint) {
     let a = relation_domain(payload, link.a_relation);
     let z = relation_domain(payload, link.z_relation);
@@ -3305,9 +3369,9 @@ def graph_constraint_key: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Sou
         }
     };
 
-def graph_constraints: Fn(PreparedPayload, Array(GraphInstance), Array(GraphEdge)) -> Array(qb::Expr) =
-    fn(payload, instances, edges) {
-        array::map(edges, fn(edge) {
+def graph_constraints: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array(GraphEdge)) -> (qb::BuildCtx, Array(qb::Expr)) =
+    fn(ctx, payload, instances, edges) {
+        array::fold(edges, (ctx, []), fn(state, edge) {
             if edge.from == edge.to { fail!("graph constraint requires two distinct named nodes", edge) }
             else {
                 let from = graph_instance(instances, edge.from);
@@ -3316,7 +3380,15 @@ def graph_constraints: Fn(PreparedPayload, Array(GraphInstance), Array(GraphEdge
                 if relation.from != from.entity || relation.to != to.entity {
                     fail!("graph constraint relation does not match its named node roles", edge,
                         payload.entities[relation.from].id, payload.entities[relation.to].id)
-                } else { graph_constraint_key(payload, relation, from.source, to.source, relation.key) }
+                } else {
+                    let key = graph_constraint_key(payload, relation, from.source, to.source, relation.key);
+                    let guard = graph_relation_guard(state.0, payload, relation, from.source);
+                    let expr = match guard.1 {
+                        None => key,
+                        Some(value) => qb::scalar(qb::ScalarFunction::And, [key, value]),
+                    };
+                    (guard.0, array::push(state.1, expr))
+                }
             }
         })
     };
@@ -3507,12 +3579,12 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphI
                                     fail!(`graph existence edge role or target does not match declared relation: \{next_edge.relation} expects from \{expected_from} to \{expected_to}, but \{next_edge.from} is \{actual_from} and \{next_edge.to} is \{actual_to}; correct the node entity or choose a relation declared for these roles`, next_edge)
                                 } else {
                                     let source = entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_id);
-                                    let condition = graph_key_condition(payload, relation,
+                                    let condition = graph_guarded_join(source.0, payload, relation,
                                         if forward { previous.source } else { source.1 },
-                                        if forward { source.1 } else { previous.source }, relation.key);
-                                    let next_join = qb::join_on(qb::JoinKind::Inner, source.1, condition);
+                                        if forward { source.1 } else { previous.source });
+                                    let next_join = qb::join_on(qb::JoinKind::Inner, source.1, condition.1);
                                     let instance: GraphInstance = {id: new_id, entity: new_entity, source: source.1};
-                                    (source.0, array::push(state.1, instance), array::push(state.2, next_join))
+                                    (condition.0, array::push(state.1, instance), array::push(state.2, next_join))
                                 }
                             },
                         }
@@ -3521,11 +3593,11 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphI
                 let filtered = graph_filters(built.0, payload, built.1, spec.filters);
                 let alternatives = graph_any_of(filtered.0, payload, subject, built.1, spec.any_of);
                 let exists = qb::exists_path_alternatives(hub.1, correlation, built.2);
+                let constraints = graph_constraints(alternatives.0, payload, array::concat([outer, built.1]), spec.constraints);
                 let constrained = append_filter_terms(filtered.1,
-                    array::concat([alternatives.1,
-                        graph_constraints(payload, array::concat([outer, built.1]), spec.constraints)]));
+                    array::concat([alternatives.1, constraints.1]));
                 let exists = {...exists, filter: constrained};
-                (alternatives.0, if spec.negated { qb::exists_not(exists) } else { exists })
+                (constraints.0, if spec.negated { qb::exists_not(exists) } else { exists })
             }
         }
     }
@@ -3625,7 +3697,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
         }) {
             Some(link) => graph_link_existence(ctx, payload, subject, instances, anchor, spec, link),
             None => do {
-        let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq)), Array(qb::Join)) = (ctx, [anchor], [], []);
+        let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq)), Array(qb::Join), Array(qb::Expr)) = (ctx, [anchor], [], [], []);
         let built = array::fold(spec.edges, initial, fn(state, edge) {
             let forward = array::any(state.1, fn(item) { item.id == edge.from });
             let backward = array::any(state.1, fn(item) { item.id == edge.to });
@@ -3649,7 +3721,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
                         } else {
                             let joined = graph_link_joins(state.0, payload, link, previous.source, next_id);
                             let instance: GraphInstance = {id: next_id, entity: next_entity, source: joined.1};
-                            (joined.0, array::push(state.1, instance), state.2, array::concat([state.3, joined.2]))
+                            (joined.0, array::push(state.1, instance), state.2, array::concat([state.3, joined.2]), state.4)
                         }
                     },
                     None => do {
@@ -3671,13 +3743,17 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
                                 graph_correlation_alternatives(payload, relation, previous.source, source.1, forward, relation.key)
                             } else { state.2 };
                             let instance: GraphInstance = {id: next_id, entity: next_entity, source: source.1};
-                            let join = if first_edge { [] } else {
-                                [qb::join_on(qb::JoinKind::Inner, source.1,
-                                    graph_key_condition(payload, relation,
-                                        if forward { previous.source } else { source.1 },
-                                        if forward { source.1 } else { previous.source }, relation.key))]
+                            let from_source = if forward { previous.source } else { source.1 };
+                            let to_source = if forward { source.1 } else { previous.source };
+                            let guarded = if first_edge {
+                                let guard = graph_relation_guard(source.0, payload, relation, from_source);
+                                (guard.0, [], match guard.1 { Some(expr) => [expr], None => [] })
+                            } else {
+                                let joined = graph_guarded_join(source.0, payload, relation, from_source, to_source);
+                                (joined.0, [qb::join_on(qb::JoinKind::Inner, source.1, joined.1)], [])
                             };
-                            (source.0, array::push(state.1, instance), alternatives, array::concat([state.3, join]))
+                            (guarded.0, array::push(state.1, instance), alternatives,
+                                array::concat([state.3, guarded.1]), array::concat([state.4, guarded.2]))
                         }
                     },
                 }
@@ -3711,11 +3787,11 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
         let exists = if array::length(built.2) == 1 {
             qb::exists_path(first, get_index(built.2, 0), built.3)
         } else { qb::exists_path_alternatives(first, built.2, built.3) };
+        let constraints = graph_constraints(aggregate.0, payload, array::concat([instances, built.1]), spec.constraints);
         let constrained = append_filter_terms(filtered.1,
-            array::concat([alternatives.1,
-                graph_constraints(payload, array::concat([instances, built.1]), spec.constraints)]));
+            array::concat([built.4, alternatives.1, constraints.1]));
         let exists = {...exists, filter: constrained, grouping: grouped, having: aggregate.1};
-        (aggregate.0, if spec.negated { qb::exists_not(exists) } else { exists })
+        (constraints.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },
         }
     }
@@ -4246,16 +4322,16 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     };
                     let from_source = if forward { graph_instance(state.1, edge.from).source } else { target.1 };
                     let to_source = if forward { target.1 } else { graph_instance(state.1, edge.to).source };
-                    let condition = graph_key_condition(payload, relation, from_source, to_source, relation.key);
+                    let condition = graph_guarded_join(target.0, payload, relation, from_source, to_source);
                     let instance: GraphInstance = {id: new_node.id, entity: new_entity, source: target.1};
                     let instances = array::push(state.1, instance);
                     let narrowed = if request.include_empty {
                         array::fold(array::filter(request.exists, fn(spec) { spec.anchor == new_node.id }),
-                            (target.0, condition), fn(current, spec) {
+                            condition, fn(current, spec) {
                                 let result = graph_existence(current.0, payload, subject, instances, spec);
                                 (result.0, qb::on_and([current.1, qb::on_exists(result.1)]))
                             })
-                    } else { (target.0, condition) };
+                    } else { condition };
                     let join = qb::join_on(if request.include_empty { qb::JoinKind::Left } else { qb::JoinKind::Inner }, target.1, narrowed.1);
                     (narrowed.0, instances, array::push(state.2, join))
                 }
@@ -4423,13 +4499,14 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     (bound.0, Some(bound.1))
                 },
             };
+            let constraints = graph_constraints(raw_limit.0, payload, built.1, request.constraints);
             let constrained = append_filter_terms(filtered.1,
-                array::concat([alternatives.1, graph_constraints(payload, built.1, request.constraints)]));
+                array::concat([alternatives.1, constraints.1]));
             let count_having = match request.count_having {
-                None => (raw_limit.0, []),
+                None => (constraints.0, []),
                 Some(spec) => do {
                     let subject_id = match request.count { Some(id) => id, None => fail!("graph count threshold requires a count subject") };
-                    let bound = qb::bind(raw_limit.0, qb::Val::Int(spec.threshold));
+                    let bound = qb::bind(constraints.0, qb::Val::Int(spec.threshold));
                     (bound.0, [qb::having_bound(graph_aggregate_op(spec.op), `\{subject_id}_count`, bound.1)])
                 },
             };
@@ -4585,6 +4662,7 @@ pub use self::{
     relation,
     relation_key,
     named_relation_key,
+    named_guarded_relation_key,
     model_field,
     typed_relation_pair,
     named_typed_relation_key,
