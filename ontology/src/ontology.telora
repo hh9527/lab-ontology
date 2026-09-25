@@ -323,6 +323,7 @@ type GraphMeasureSelect = struct { node: String, measure: String };
 type GraphFilter = struct { node: String, request: FilterRequest };
 type GraphAnyOf = struct { node: String, dimension: String, values: Array(FilterInput) };
 type GraphHaving = struct { node: String, measure: String, op: FilterOp, threshold: FilterInput };
+type GraphCountHaving = struct { op: FilterOp, threshold: Int };
 type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), constraints: Array(GraphEdge), filters: Array(GraphFilter), any_of: Array(GraphAnyOf), having: Array(GraphHaving), negated: Bool };
 type GraphTopPer = struct { owner: String, sample: String, rank: String, take: Int };
 type GraphTopMeasure = struct { node: String, measure: String, direction: qb::Ordering, take: Int };
@@ -339,6 +340,7 @@ type GraphRequest = struct {
     any_of: Array(GraphAnyOf),
     exists: Array(GraphExist),
     count: Option(String),
+    count_having: Option(GraphCountHaving),
     include_empty: Bool,
     group_by_identity: Array(String),
     top_per: Option(GraphTopPer),
@@ -3895,6 +3897,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         fail!("graph dimension order requires raw rows; use aggregate top or sample top for aggregated or partitioned results")
     } else if request.count != None && array::length(request.measures) > 0 {
         fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
+    } else if request.count_having != None && (request.count == None || request.group_by_identity != [request.root]
+        || array::any(request.select, fn(item) { item.node != request.root })) {
+        fail!("graph count threshold requires a count subject, complete root identity grouping and root-only dimensions", request.root)
     } else if request.include_empty && array::length(request.measures) > 0 {
         fail!("graph measure projection does not support an empty related population")
     } else if request.include_empty && array::length(request.constraints) > 0 {
@@ -4145,12 +4150,20 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             };
             let constrained = append_filter_terms(filtered.1,
                 array::concat([alternatives.1, graph_constraints(payload, built.1, request.constraints)]));
+            let count_having = match request.count_having {
+                None => (top.0, []),
+                Some(spec) => do {
+                    let subject_id = match request.count { Some(id) => id, None => fail!("graph count threshold requires a count subject") };
+                    let bound = qb::bind(top.0, qb::Val::Int(spec.threshold));
+                    (bound.0, [qb::having_bound(graph_aggregate_op(spec.op), `\{subject_id}_count`, bound.1)])
+                },
+            };
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: constrained,
-                exists: existential.1, joins: built.2, grouping, having: [], ordering: array::concat([top.1, ordered]),
+                exists: existential.1, joins: built.2, grouping, having: count_having.1, ordering: array::concat([top.1, ordered]),
                 limit: top.2, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
-            (top.0, qb::validate(plan, payload.profile))
+            (count_having.0, qb::validate(plan, payload.profile))
         }
     }
 };
