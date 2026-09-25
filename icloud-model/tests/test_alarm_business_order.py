@@ -20,12 +20,15 @@ class AlarmBusinessOrderTest(unittest.TestCase):
             (1, "4", "Communication Alarm"), (2, "2", "Communication Alarm"),
             (3, "1", "Communication Alarm"), (4, "3", "Communication Alarm"),
             (5, "other", "Communication Alarm"), (6, "1", "Other Alarm"),
+            (7, "1", "Communication Alarm"),
         ])
-        for direction, expected in [
-            ("asc", [(3, "critical"), (2, "major"), (4, "minor"), (1, "warning")]),
-            ("desc", [(1, "warning"), (4, "minor"), (2, "major"), (3, "critical")]),
+        for direction, take, expected in [
+            ("asc", None, [(3, "critical"), (7, "critical"), (2, "major"), (4, "minor"), (1, "warning")]),
+            ("desc", None, [(1, "warning"), (4, "minor"), (2, "major"), (3, "critical"), (7, "critical")]),
+            ("asc", 2, [(3, "critical"), (7, "critical")]),
+            ("desc", 2, [(1, "warning"), (4, "minor")]),
         ]:
-            with self.subTest(direction=direction):
+            with self.subTest(direction=direction, take=take):
                 intent = {
                     "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
                     "edges": [], "select": [
@@ -36,6 +39,8 @@ class AlarmBusinessOrderTest(unittest.TestCase):
                                  "kind": "text", "value": "Communication Alarm"}],
                     "order_by": [{"node": "alarm", "dimension": "alarm_severity", "direction": direction}],
                 }
+                if take is not None:
+                    intent["take"] = take
                 result = subprocess.run(
                     [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud-model"],
                     input=json.dumps({"method": "transform", "input": intent}),
@@ -43,7 +48,12 @@ class AlarmBusinessOrderTest(unittest.TestCase):
                 )
                 query = json.loads(result.stdout)
                 bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
-                self.assertEqual(db.execute(query["sql"], bindings).fetchall(), expected)
+                rows = db.execute(query["sql"], bindings).fetchall()
+                if take is None:
+                    self.assertEqual([value for _, value in rows], [value for _, value in expected])
+                    self.assertEqual(sorted(rows), sorted(expected))
+                else:
+                    self.assertEqual(rows, expected)
 
 
 if __name__ == "__main__":
