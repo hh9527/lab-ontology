@@ -291,6 +291,102 @@ pub def top_devices_by_declared_cpu_average_keep_full_identity: test::Test = tes
     else { fail!("aggregate top-five lost device identity or external window", sq, pg) }
 });
 
+pub def projected_cpu_average_filters_same_sample_group: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "group_by_identity":["device"],
+        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+        "measure_having":[{"node":"sample","measure":"cpu_usage","op":"ge","kind":"number","value":80.0}]}
+    "#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "avg(sample.cpuUsage) AS sample_cpu_usage")
+        && string::contains(sq.sql, "GROUP BY device.name, device.id, device.tenant_id HAVING avg(sample.cpuUsage) >= ?3")
+        && string::contains(pg.sql, "HAVING avg(\"sample\".\"cpuUsage\") >= $3")
+        && sq.bindings == [qb::Val::String("2025-01-01 00:00:00"),
+            qb::Val::String("2025-01-04 00:00:00"), qb::Val::Float(80.0)]
+        && pg.bindings == sq.bindings { True }
+    else { fail!("CPU threshold did not filter the same declared aggregate it projects", sq, pg) }
+});
+
+pub def count_devices_qualified_by_projected_cpu_average: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "group_by_identity":["device"],
+        "measure_having":[{"node":"sample","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}],
+        "count_groups":true}"#).unwrap!());
+    if string::contains(query.sql, "SELECT count(1) FROM (SELECT device.name")
+        && string::contains(query.sql, "GROUP BY device.name, device.id, device.tenant_id HAVING avg(sample.cpuUsage) > ?1") { True }
+    else { fail!("qualified device count lost its declared AVG sample grain", query.sql) }
+});
+
+pub def measure_threshold_requires_projected_measure: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],"group_by_identity":["device"],
+        "measure_having":[{"node":"sample","measure":"memory_usage","op":"gt","kind":"number","value":80.0}]}"#).unwrap!())
+}, "graph measure threshold must reference a projected measure on its named node");
+
+pub def measure_threshold_rejects_text_for_avg: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],"group_by_identity":["device"],
+        "measure_having":[{"node":"sample","measure":"cpu_usage","op":"gt","kind":"text","value":"high"}]}"#).unwrap!())
+}, "graph measure threshold does not match measure output type");
+
+pub def measure_threshold_requires_complete_root_grain: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "measure_having":[{"node":"sample","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]}"#).unwrap!())
+}, "graph measure threshold requires complete root identity grouping and root-only dimensions");
+
+pub def measure_threshold_rejects_multiplying_site_join: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"},{"id":"site","entity":"site"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"},
+                 {"relation":"device_located_at_site","from":"device","to":"site"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],"group_by_identity":["device"],
+        "measure_having":[{"node":"sample","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]}"#).unwrap!())
+}, "graph measure source may be multiplied by a joined relation");
+
+pub def independently_filtered_alarm_measures_keep_separate_thresholds: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"alarm","entity":"current_alarm"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"alarm","measure":"critical_alarm_count"},
+                    {"node":"alarm","measure":"major_alarm_count"}],
+        "group_by_identity":["device"],
+        "measure_having":[{"node":"alarm","measure":"critical_alarm_count","op":"gt","kind":"int","value":2},
+                          {"node":"alarm","measure":"major_alarm_count","op":"gt","kind":"int","value":1}]}
+    "#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "count(alarm.CSN) FILTER (WHERE alarm.SEVERITY = ?1) AS alarm_critical_alarm_count")
+        && string::contains(sq.sql, "count(alarm.CSN) FILTER (WHERE alarm.SEVERITY = ?2) AS alarm_major_alarm_count")
+        && string::contains(sq.sql, "HAVING count(alarm.CSN) FILTER (WHERE alarm.SEVERITY = ?1) > ?3")
+        && string::contains(sq.sql, "count(alarm.CSN) FILTER (WHERE alarm.SEVERITY = ?2) > ?4")
+        && string::contains(pg.sql, "FILTER (WHERE \"alarm\".\"SEVERITY\" = $1)")
+        && sq.bindings == [qb::Val::String("1"), qb::Val::String("2"), qb::Val::Int(2), qb::Val::Int(1)]
+        && pg.bindings == sq.bindings { True }
+    else { fail!("independent filtered alarm thresholds merged their populations", sq, pg) }
+});
+
 pub def aggregate_top_requires_owner_identity: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
         "op":"graph", "root":"device",
@@ -741,7 +837,7 @@ pub def graph_group_count_requires_threshold: test::Test = test::should_fail_wit
     lower(json::parse(r#"{"op":"graph","root":"site",
         "nodes":[{"id":"site","entity":"site"}],"edges":[],"select":[],
         "count":"site","group_by_identity":["site"],"count_groups":true}"#).unwrap!())
-}, "graph count_groups requires a grouped count threshold");
+}, "graph count_groups requires a grouped aggregate threshold");
 
 pub def graph_group_count_rejects_top: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"site",
@@ -749,7 +845,7 @@ pub def graph_group_count_rejects_top: test::Test = test::should_fail_with(fn() 
         "count":"site","group_by_identity":["site"],
         "count_having":{"op":"gt","value":0},"count_groups":true,
         "top_by_measure":{"node":"site","measure":"site_count","direction":"desc","take":5}}"#).unwrap!())
-}, "graph count_groups requires a grouped count threshold without DISTINCT, ordering or Top-N");
+}, "graph count_groups requires a grouped aggregate threshold without DISTINCT, ordering or Top-N");
 
 pub def count_tenants_with_more_than_five_uncleared_alarms: test::Test = test::should_ok(fn() {
     let intent = json::parse(r#"{"op":"graph","root":"tenant",

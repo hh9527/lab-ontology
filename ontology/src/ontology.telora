@@ -341,6 +341,7 @@ type GraphRequest = struct {
     exists: Array(GraphExist),
     count: Option(String),
     count_having: Option(GraphCountHaving),
+    measure_having: Array(GraphHaving),
     count_groups: Bool,
     include_empty: Bool,
     group_by_identity: Array(String),
@@ -3442,6 +3443,17 @@ def graph_aggregate_op: Fn(FilterOp) -> qb::HavingOp = fn(op) {
     }
 };
 
+def graph_having_input_ok: Fn(OutputType, FilterInput) -> Bool = fn(output, input) {
+    match (output, input) {
+        (OutputType::Integer, FilterInput::Int(_)) => True,
+        (OutputType::Number, FilterInput::Number(_)) => True,
+        (OutputType::Number, FilterInput::Int(_)) => True,
+        (OutputType::Text, FilterInput::Text(_)) => True,
+        (OutputType::Boolean, FilterInput::Bool(_)) => True,
+        _ => False,
+    }
+};
+
 def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Array(GraphHaving)) -> (qb::BuildCtx, Array(qb::Having)) = fn(ctx, payload, sample, specs) {
     array::fold(specs, (ctx, []), fn(state, spec) {
         let measure = match array::find(payload.measures, fn(entry) { entry.id == spec.measure }) {
@@ -3454,15 +3466,7 @@ def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Arr
             fail!("graph aggregate requires a non-computed sample measure without external dependencies", spec.measure)
         } else {
             let output = measure_output_type(payload, spec.measure);
-            let input_ok = match (output, spec.threshold) {
-                (OutputType::Integer, FilterInput::Int(_)) => True,
-                (OutputType::Number, FilterInput::Number(_)) => True,
-                (OutputType::Number, FilterInput::Int(_)) => True,
-                (OutputType::Text, FilterInput::Text(_)) => True,
-                (OutputType::Boolean, FilterInput::Bool(_)) => True,
-                _ => False,
-            };
-            if !input_ok { fail!("graph aggregate threshold does not match measure output type", spec.measure, output, spec.threshold) }
+            if !graph_having_input_ok(output, spec.threshold) { fail!("graph aggregate threshold does not match measure output type", spec.measure, output, spec.threshold) }
             else {
                 let entity = get_index(payload.entities, sample.entity);
                 let field = get_index(entity.fields, measure.field);
@@ -3908,9 +3912,13 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
     } else if request.count_having != None && (request.count == None || request.group_by_identity != [request.root]
         || array::any(request.select, fn(item) { item.node != request.root })) {
         fail!("graph count threshold requires a count subject, complete root identity grouping and root-only dimensions", request.root)
-    } else if request.count_groups && (request.count_having == None || request.distinct
+    } else if array::length(request.measure_having) > 0 && (request.group_by_identity != [request.root]
+        || array::any(request.select, fn(item) { item.node != request.root })) {
+        fail!("graph measure threshold requires complete root identity grouping and root-only dimensions", request.root)
+    } else if request.count_groups && (request.count_having == None && array::length(request.measure_having) == 0
+        || request.distinct
         || request.top_per != None || request.top_by_measure != None || array::length(request.order_by) > 0) {
-        fail!("graph count_groups requires a grouped count threshold without DISTINCT, ordering or Top-N")
+        fail!("graph count_groups requires a grouped aggregate threshold without DISTINCT, ordering or Top-N")
     } else if request.include_empty && array::length(request.measures) > 0 {
         fail!("graph measure projection does not support an empty related population")
     } else if request.include_empty && array::length(request.constraints) > 0 {
@@ -4169,12 +4177,27 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     (bound.0, [qb::having_bound(graph_aggregate_op(spec.op), `\{subject_id}_count`, bound.1)])
                 },
             };
+            let having = array::fold(request.measure_having, count_having, fn(state, spec) {
+                if !array::any(request.measures, fn(item) {
+                    item.node == spec.node && item.measure == spec.measure
+                }) { fail!("graph measure threshold must reference a projected measure on its named node", spec.node, spec.measure) }
+                else {
+                    let output = measure_output_type(payload, spec.measure);
+                    if !graph_having_input_ok(output, spec.threshold) {
+                        fail!("graph measure threshold does not match measure output type", spec.node, spec.measure, output, spec.threshold)
+                    } else {
+                        let bound = qb::bind(state.0, to_val(spec.threshold));
+                        (bound.0, array::push(state.1, qb::having_bound(graph_aggregate_op(spec.op),
+                            `\{spec.node}_\{spec.measure}`, bound.1)))
+                    }
+                }
+            });
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: constrained,
-                exists: existential.1, joins: built.2, grouping, having: count_having.1, ordering: array::concat([top.1, ordered]),
+                exists: existential.1, joins: built.2, grouping, having: having.1, ordering: array::concat([top.1, ordered]),
                 limit: top.2, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
-            (count_having.0, qb::validate(plan, payload.profile))
+            (having.0, qb::validate(plan, payload.profile))
         }
     }
 };
