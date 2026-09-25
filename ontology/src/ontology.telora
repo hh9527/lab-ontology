@@ -318,6 +318,7 @@ type RelationKind = enum { Safe, FanOut };
 type GraphNode = struct { id: String, entity: String };
 type GraphEdge = struct { relation: String, from: String, to: String };
 type GraphSelect = struct { node: String, dimension: String };
+type GraphMeasureSelect = struct { node: String, measure: String };
 type GraphFilter = struct { node: String, request: FilterRequest };
 type GraphHaving = struct { node: String, measure: String, op: FilterOp, threshold: FilterInput };
 type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), filters: Array(GraphFilter), having: Array(GraphHaving), negated: Bool };
@@ -327,6 +328,7 @@ type GraphRequest = struct {
     nodes: Array(GraphNode),
     edges: Array(GraphEdge),
     select: Array(GraphSelect),
+    measures: Array(GraphMeasureSelect),
     filters: Array(GraphFilter),
     exists: Array(GraphExist),
     count: Option(String),
@@ -3581,6 +3583,30 @@ def graph_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity
     }
 };
 
+def graph_measure_projection: Fn(PreparedPayload, GraphRequest, Array(GraphInstance), GraphMeasureSelect) -> qb::SelectItem =
+    fn(payload, request, instances, selection) {
+        let instance = graph_instance(instances, selection.node);
+        let measure = match array::find(payload.measures, fn(entry) { entry.id == selection.measure }) {
+            Some(entry) => entry,
+            None => fail!("graph projection references an unknown declared measure", selection.node, selection.measure),
+        };
+        if measure.entity != instance.entity {
+            fail!("graph projection measure does not belong to its named node", selection.node, selection.measure)
+        } else if measure.computed != None || measure.predicate != None || array::length(measure.requires) > 0 {
+            fail!("graph measure projection requires a plain measure without external dependencies", selection.node, selection.measure)
+        } else {
+            let proof = graph_count_subject_grain(payload, request, selection.node);
+            if !proof.0 {
+                fail!("graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification", selection.node, selection.measure, proof.1)
+            } else {
+                let entity = get_index(payload.entities, instance.entity);
+                let field = get_index(entity.fields, measure.field);
+                qb::aggregate(measure.aggregate, qb::column(instance.source, field.column),
+                    measure.input == MeasureInput::Distinct, `\{selection.node}_\{selection.measure}`)
+            }
+        }
+    };
+
 def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphTopPer) -> (qb::BuildCtx, qb::PartitionedTopN) = fn(ctx, payload, request, instances, spec) {
     if request.count != None || request.include_empty || array::length(request.nodes) != 2
         || array::length(request.edges) != 1 || request.root != spec.owner || spec.owner == spec.sample {
@@ -3637,13 +3663,20 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
     if !payload.authorize(subject) { fail!("subject is not authorized for graph query", subject) }
-    else if array::length(request.nodes) == 0 || (array::length(request.select) == 0 && request.count == None) {
+    else if array::length(request.nodes) == 0 || (array::length(request.select) == 0
+        && array::length(request.measures) == 0 && request.count == None) {
         fail!("graph requires nodes and projections or an explicit count subject")
     } else if array::any(request.nodes, fn(node) {
         node.id == "" || array::length(array::filter(request.nodes, fn(other) { other.id == node.id })) != 1
     }) { fail!("graph node instance ids must be nonempty and unique") }
-    else if request.count == None && array::length(request.group_by_identity) > 0 {
-        fail!("graph identity grouping requires an aggregate count")
+    else if request.count == None && array::length(request.measures) == 0 && array::length(request.group_by_identity) > 0 {
+        fail!("graph identity grouping requires an aggregate projection")
+    } else if request.count != None && array::length(request.measures) > 0 {
+        fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
+    } else if request.include_empty && array::length(request.measures) > 0 {
+        fail!("graph measure projection does not support an empty related population")
+    } else if request.top_per != None && array::length(request.measures) > 0 {
+        fail!("graph measure projection cannot rank raw rows with top_per")
     } else if let Some(unknown) = array::find(request.group_by_identity, fn(id) {
         !array::any(request.nodes, fn(node) { node.id == id })
     }) { fail!("graph group identity references an unknown node", unknown) }
@@ -3776,8 +3809,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     qb::named_expr_item(qb::column(instance.source, field.column), `\{item.node}_\{item.dimension}`)
                 }
             });
+            let measures = array::map(request.measures, fn(item) {
+                graph_measure_projection(payload, request, built.1, item)
+            });
             let projection = match request.count {
-                None => row_projection,
+                None => array::concat([row_projection, measures]),
                 Some(subject_id) => {
                     let grain = if subject_id == request.root {
                         (True, None)
@@ -3814,15 +3850,14 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     }
                 },
             };
-            let visible_grouping = match request.count {
-                None => [],
-                Some(_) => array::map(row_projection, fn(item) {
+            let visible_grouping = if request.count != None || array::length(request.measures) > 0 {
+                array::map(row_projection, fn(item) {
                     match item {
                         qb::SelectItem::NamedExpr(named) => named.expr,
                         _ => fail!("graph grouping requires a plain dimension"),
                     }
-                }),
-            };
+                })
+            } else { [] };
             let grouping = array::fold(request.group_by_identity, visible_grouping, fn(grouped, id) {
                 let instance = graph_instance(built.1, id);
                 let entity = get_index(payload.entities, instance.entity);
@@ -3918,6 +3953,7 @@ pub use self::{
     GraphNode,
     GraphEdge,
     GraphSelect,
+    GraphMeasureSelect,
     GraphFilter,
     GraphHaving,
     GraphTopPer,

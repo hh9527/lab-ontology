@@ -1,13 +1,24 @@
 # Corpus pressure families (first pass)
 
-The reconnected relation-first `icloud-model/tests/graph.telora` first checks
-independent Device KPI qualifications using two correlated aggregate EXISTS,
-separate explicit UTC windows and the complete `(id, tenant_id)` owner identity.
-This validates the current graph Intent for qualification, not the legacy
-`qualify_metrics` API described later in this historical pressure log. The
-next gap is projecting a declared measure over a separate observation window
-after qualification: the current graph Intent projects dimensions or counts,
-not measures. That gap belongs in ontology, not a per-domain query template.
+The reconnected relation-first `icloud-model/tests/graph.telora` checks two
+independent Device KPI qualifications with correlated aggregate EXISTS,
+separate explicit UTC windows and the complete `(id, tenant_id)` identity.
+It also selects a Model-declared Avg over a *different* observation window.
+The generic graph Intent now accepts `measures:[{node,measure}]` and proves
+that other joins cannot multiply the measure's sample rows; fan-out must be
+moved into a correlated EXISTS. Identity grouping remains explicit, so
+same-name devices cannot be merged by accident. These cases replace reliance
+on the legacy `qualify_metrics` API described later in this historical log;
+they do not establish production KPI grain or clock encoding.
+
+`icloud-model/tests/knowledge.telora` also checks the 19-entity Prepared Model
+as one navigable catalog. The current `doc.ic`/`index.ic` TransformService
+works under the default request budget but reconstructs the catalog per
+request (roughly 359 million Wasm fuel for one indexed request on this model).
+Capturing the full catalog in both service slots exceeded the runtime's
+single growth-operation limit; a compact shared or lazily derived knowledge
+representation is a separate ontology scaling pressure, not an excuse to
+weaken visibility or graph-closure checks.
 
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes
