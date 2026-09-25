@@ -1,4 +1,4 @@
-"""Distinguish site-name cardinality from site-identity cardinality."""
+"""Count declared business values, not identities or physical wire variants."""
 
 import json
 from pathlib import Path
@@ -12,6 +12,15 @@ TELORA = MODEL.parent / "bin" / "telora"
 
 
 class SiteNameCountTest(unittest.TestCase):
+    def lower(self, intent):
+        result = subprocess.run(
+            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud-model"],
+            input=json.dumps({"method": "transform", "input": intent}),
+            text=True, capture_output=True, cwd=MODEL, check=True,
+        )
+        query = json.loads(result.stdout)
+        return query["sql"], {str(index): value for index, value in enumerate(query["bindings"], 1)}
+
     def test_count_of_distinct_names_does_not_count_sites_or_join_rows(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
@@ -36,14 +45,23 @@ class SiteNameCountTest(unittest.TestCase):
                 {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "kunlun"},
             ],
         }
-        result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud-model"],
-            input=json.dumps({"method": "transform", "input": intent}),
-            text=True, capture_output=True, cwd=MODEL, check=True,
-        )
-        query = json.loads(result.stdout)
-        bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
-        self.assertEqual(db.execute(query["sql"], bindings).fetchall(), [(2,)])
+        sql, bindings = self.lower(intent)
+        self.assertEqual(db.execute(sql, bindings).fetchall(), [(2,)])
+
+    def test_distinct_canonical_class_excludes_unmapped_wire_values(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE I_EntNetworkElement (classification TEXT)")
+        db.executemany("INSERT INTO I_EntNetworkElement VALUES (?)", [
+            ("ne.category.ac",), ("AC",), ("WAC",),
+            ("ne.category.switch",), ("unknown-from-source",), (None,),
+        ])
+        sql, bindings = self.lower({
+            "op": "graph", "root": "device",
+            "nodes": [{"id": "device", "entity": "device"}], "edges": [], "select": [],
+            "count_value": {"node": "device", "dimension": "device_class"},
+        })
+        self.assertEqual(db.execute(sql, bindings).fetchall(), [(2,)])
 
 
 if __name__ == "__main__":
