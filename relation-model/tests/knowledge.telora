@@ -70,6 +70,10 @@ type StatusEvent = struct {
     @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::CanonicalUtcSecondText)
     @edsl::dimension("event_time", True, True, eq_ops, text_inputs)
     occurred_at: String,
+    @edsl::column("display_time")
+    @edsl::time_field(edsl::TimeSemantics::Local, edsl::TimeEncoding::LocalText)
+    @edsl::dimension("display_time", True, True, eq_ops, text_inputs)
+    display_time: String,
 };
 
 @edsl::entity_id("unrelated")
@@ -163,6 +167,42 @@ pub def document_reference_does_not_make_a_query_relation: test::Test = test::sh
     }"#).unwrap!())
 }, "unknown named relation");
 
+@edsl::entity_id("doc_case")
+@edsl::entity_source("doc_cases", "dc")
+@edsl::doc({kind: edsl::KnowledgeKind::Dimension, owner: "doc_case", id: "state"}, "Documented state")
+type DocumentedCase = struct {
+    @edsl::column("id") @edsl::key(True) id: String,
+    @edsl::column("state") @edsl::dimension("state", True, True, eq_ops, text_inputs) state: String,
+};
+
+@edsl::entity_id("doc_case")
+@edsl::entity_source("doc_cases", "dc")
+type UndocumentedCase = struct {
+    @edsl::column("id") @edsl::key(True) id: String,
+    @edsl::column("state") @edsl::dimension("state", True, True, eq_ops, text_inputs) state: String,
+};
+
+pub def explanatory_doc_does_not_change_query_lowering: test::Test = test::should_ok(fn() {
+    let with_doc = edsl::build_root("with-doc", [DocumentedCase.type], profile, fn(subject) { True });
+    let without_doc = edsl::build_root("without-doc", [UndocumentedCase.type], profile, fn(subject) { True });
+    let request = json::parse(r#"{
+        "op":"graph", "root":"dc", "nodes":[{"id":"dc","entity":"doc_case"}],
+        "edges":[], "select":[{"node":"dc","dimension":"state"}]
+    }"#).unwrap!();
+    let a = sqlite::build_query(query_intent_ast_factory(with_doc, "reader")(request));
+    let b = sqlite::build_query(query_intent_ast_factory(without_doc, "reader")(request));
+    let explained = knowledge::by_target(with_doc, "reader",
+        {kind: edsl::KnowledgeKind::Dimension, owner: "doc_case", id: "state"});
+    let bare = knowledge::by_target(without_doc, "reader",
+        {kind: edsl::KnowledgeKind::Dimension, owner: "doc_case", id: "state"});
+    match (explained, bare) {
+        (knowledge::DocResult::Found(x), knowledge::DocResult::Found(y)) =>
+            if a == b && x.summary == "Documented state" && y.summary == "" { True }
+            else { fail!("documentation changed the query or failed to change the description", a, b, x, y) },
+        other => fail!("documentation affected knowledge point identity", other),
+    }
+});
+
 pub def every_visible_point_has_an_exact_topic_and_closed_references: test::Test = test::should_ok(fn() {
     let points = knowledge::map(payload, "reader");
     let topics = knowledge::topic_index(payload, "reader");
@@ -205,6 +245,26 @@ pub def event_time_role_retains_authoritative_clock_semantics: test::Test = test
         other => fail!("event time role is undiscoverable", other),
     }
 });
+
+pub def local_display_time_is_not_the_authoritative_clock: test::Test = test::should_ok(fn() {
+    let id = {kind: edsl::KnowledgeKind::TimeRole, owner: "status_event", id: "display_time"};
+    match knowledge::by_target(payload, "reader", id) {
+        knowledge::DocResult::Found(item) => match item.time_role {
+            Some(role) => if !role.authoritative && role.semantics == edsl::TimeSemantics::Local
+                && role.encoding == edsl::TimeEncoding::LocalText { True }
+                else { fail!("local display time was presented as an authoritative instant", item) },
+            None => fail!("local time role is missing its declared semantics", item),
+        },
+        other => fail!("local time role is undiscoverable", other),
+    }
+});
+
+pub def business_alias_is_not_a_strict_dimension_id: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph", "root":"o", "nodes":[{"id":"o","entity":"order"}],
+        "edges":[], "select":[{"node":"o","dimension":"订单状态"}]
+    }"#).unwrap!())
+}, "unknown dimension");
 
 pub def localized_topic_preserves_locale: test::Test = test::should_ok(fn() {
     let entries = array::filter(knowledge::topic_index(payload, "reader"), fn(entry) {
@@ -301,6 +361,22 @@ pub def service_rejects_unauthorized_subject: test::Test = test::should_fail_wit
         "method":"index.foo", "input":{}
     }"#).unwrap!())
 }, "subject is not authorized for knowledge discovery");
+
+pub def bound_service_keeps_its_model_subject_and_domain: test::Test = test::should_ok(fn() {
+    let service = knowledge::knowledge_service_factory(payload, "reader", "foo");
+    let first = service(json::parse(r#"{
+        "method":"doc.foo", "input":{"topic":"order_status"}
+    }"#).unwrap!());
+    let second = service(json::parse(r#"{
+        "method":"index.foo", "input":{"limit":1}
+    }"#).unwrap!());
+    match (first, second) {
+        (Value::Object(found), Value::Object(index)) =>
+            if dict::get(found, "Document") != None && dict::get(index, "Index") != None { True }
+            else { fail!("bound knowledge service lost its domain", found, index) },
+        other => fail!("bound knowledge service returned an invalid response", other),
+    }
+});
 
 @edsl::entity_id("bad_doc")
 @edsl::entity_source("bad_docs", "bd")

@@ -1,10 +1,10 @@
 # Knowledge discovery
 
-`knowledge::serve_value(payload, subject, domain, request)` is the pure
-request/response boundary for a host-provided knowledge service. The host
-binds a prepared Model, authorized subject, and domain name; no database
-connection or SQL backend is required. The returned `std::value::Value` can
-be serialized with `std::json::stringify`.
+`knowledge::knowledge_service_factory(payload, subject, domain)` binds a
+prepared Model, authorized subject, and domain name and returns a pure
+`Fn(Value) -> Value` request handler. `knowledge::serve_value` is the
+equivalent unbound entry. No database connection or SQL backend is required.
+The response can be serialized with `std::json::stringify`.
 
 Requests have exactly `method` and `input`:
 
@@ -42,7 +42,12 @@ authoritativeness come from the same prepared Model used for query lowering.
 `@doc` only changes explanatory text; it cannot grant visibility or create a
 query relation. Field points are limited to fields declared as grain, time
 roles, visible dimensions, measures, or metrics: a private physical column
-alone does not become a knowledge point.
+alone does not become a knowledge point. A field ID is not automatically a
+queryable dimension ID; only a declared dimension can be used for projection
+or filtering in a strict query intent. A UTC time role tells the agent which
+clock and encoding the Model declares, but does not itself validate arbitrary
+timestamp literals or convert local calendar time to UTC (the separate time
+semantics contract in issue #11 covers those operations).
 
 Requests with unknown keys, conflicting topic/target, wrong types, invalid
 pagination, or another domain's method fail with a structured diagnostic.
