@@ -311,7 +311,9 @@ type GraphNode = struct { id: String, entity: String };
 type GraphEdge = struct { relation: String, from: String, to: String };
 type GraphSelect = struct { node: String, dimension: String };
 type GraphFilter = struct { node: String, request: FilterRequest };
-type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), filters: Array(GraphFilter), negated: Bool };
+type GraphHaving = struct { node: String, measure: String, op: FilterOp, threshold: FilterInput };
+type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), filters: Array(GraphFilter), having: Array(GraphHaving), negated: Bool };
+type GraphTopPer = struct { owner: String, sample: String, rank: String, take: Int };
 type GraphRequest = struct {
     root: String,
     nodes: Array(GraphNode),
@@ -321,6 +323,8 @@ type GraphRequest = struct {
     exists: Array(GraphExist),
     count: Option(String),
     include_empty: Bool,
+    group_by_identity: Array(String),
+    top_per: Option(GraphTopPer),
 };
 
 # Filter operations. Comparison ops map to the closed query scalars
@@ -3147,6 +3151,7 @@ def graph_correlation_alternatives: Fn(PreparedPayload, RelationEntry, qb::Sourc
 
 def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, anchor, spec, link) {
     if array::length(spec.edges) == 0 { fail!("business link existence requires an edge", link.id) }
+    else if array::length(spec.having) > 0 { fail!("graph aggregate existence requires a single Safe sample-to-owner relation", link.id) }
     else {
         let edge = get_index(spec.edges, 0);
         let from_anchor = edge.from == anchor.id;
@@ -3238,6 +3243,51 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Graph
     }
 };
 
+def graph_aggregate_op: Fn(FilterOp) -> qb::HavingOp = fn(op) {
+    match op {
+        FilterOp::Eq => qb::HavingOp::Eq,
+        FilterOp::Ne => qb::HavingOp::Ne,
+        FilterOp::Gt => qb::HavingOp::Gt,
+        FilterOp::Ge => qb::HavingOp::Ge,
+        FilterOp::Lt => qb::HavingOp::Lt,
+        FilterOp::Le => qb::HavingOp::Le,
+        _ => fail!("graph aggregate threshold requires a comparison operator", op),
+    }
+};
+
+def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Array(GraphHaving)) -> (qb::BuildCtx, Array(qb::Having)) = fn(ctx, payload, sample, specs) {
+    array::fold(specs, (ctx, []), fn(state, spec) {
+        let measure = match array::find(payload.measures, fn(entry) { entry.id == spec.measure }) {
+            Some(entry) => entry,
+            None => fail!("graph aggregate references an unknown declared measure", spec.measure),
+        };
+        if spec.node != sample.id || measure.entity != sample.entity {
+            fail!("graph aggregate measure does not belong to its sample node", spec.node, spec.measure)
+        } else if measure.computed != None || measure.predicate != None || array::length(measure.requires) > 0 {
+            fail!("graph aggregate requires a plain sample measure without external dependencies", spec.measure)
+        } else {
+            let output = measure_output_type(payload, spec.measure);
+            let input_ok = match (output, spec.threshold) {
+                (OutputType::Integer, FilterInput::Int(_)) => True,
+                (OutputType::Number, FilterInput::Number(_)) => True,
+                (OutputType::Number, FilterInput::Int(_)) => True,
+                (OutputType::Text, FilterInput::Text(_)) => True,
+                (OutputType::Boolean, FilterInput::Bool(_)) => True,
+                _ => False,
+            };
+            if !input_ok { fail!("graph aggregate threshold does not match measure output type", spec.measure, output, spec.threshold) }
+            else {
+                let entity = get_index(payload.entities, sample.entity);
+                let field = get_index(entity.fields, measure.field);
+                let threshold = qb::bind(state.0, to_val(spec.threshold));
+                let having = qb::having_call_bound(graph_aggregate_op(spec.op), measure.aggregate,
+                    qb::column(sample.source, field.column), measure.input == MeasureInput::Distinct, threshold.1);
+                (threshold.0, array::push(state.1, having))
+            }
+        }
+    })
+};
+
 def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, instances, spec) {
     let anchor = graph_instance(instances, spec.anchor);
     let count = array::length(spec.edges);
@@ -3311,13 +3361,28 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
                 }
             }
         });
-        let first = get_index(built.1, 1).source;
+        let first_instance = get_index(built.1, 1);
+        let first = first_instance.source;
+        let grouped = if array::length(spec.having) == 0 { [] }
+        else {
+            let edge = get_index(spec.edges, 0);
+            let relation = relation_domain(payload, edge.relation);
+            if count != 1 || relation.kind != RelationKind::Safe
+                || relation.from != first_instance.entity || relation.to != anchor.entity
+                || edge.from != first_instance.id || edge.to != anchor.id
+                || array::length(built.2) != 1 {
+                fail!("graph aggregate existence requires a single Safe sample-to-owner relation", edge.relation)
+            } else {
+                array::map(get_index(built.2, 0), fn(pair) { qb::Expr::Column(pair.right) })
+            }
+        };
         let filtered = graph_filters(built.0, payload, built.1, spec.filters);
+        let aggregate = graph_aggregate_having(filtered.0, payload, first_instance, spec.having);
         let exists = if array::length(built.2) == 1 {
             qb::exists_path(first, get_index(built.2, 0), built.3)
         } else { qb::exists_path_alternatives(first, built.2, built.3) };
-        let exists = {...exists, filter: filtered.1};
-        (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
+        let exists = {...exists, filter: filtered.1, grouping: grouped, having: aggregate.1};
+        (aggregate.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },
         }
     }
@@ -3384,6 +3449,76 @@ def graph_count_identity_column: Fn(EntityEntry, String) -> String = fn(entity, 
     }
 };
 
+def graph_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity, node_id) {
+    match entity.dataset {
+        Some(dataset) => if array::length(dataset.grain) == 0 {
+            fail!("graph identity has an empty declared grain", node_id)
+        } else {
+            array::map(dataset.grain, fn(name) {
+                match array::find(entity.fields, fn(field) { field.name == name }) {
+                    Some(field) => field.column,
+                    None => fail!("graph identity references an unknown grain field", node_id, name),
+                }
+            })
+        },
+        None => if entity.key_field >= 0 {
+            [get_index(entity.fields, entity.key_field).column]
+        } else { fail!("graph identity requires a declared key or dataset grain", node_id) },
+    }
+};
+
+def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphTopPer) -> (qb::BuildCtx, qb::PartitionedTopN) = fn(ctx, payload, request, instances, spec) {
+    if request.count != None || request.include_empty || array::length(request.nodes) != 2
+        || array::length(request.edges) != 1 || request.root != spec.owner || spec.owner == spec.sample {
+        fail!("graph top-per requires one sample joined directly to its root owner", spec)
+    } else if spec.take <= 0 || spec.take > qb::max_partition_take {
+        fail!("graph top-per take must be positive and within the declared bound", spec.take)
+    } else {
+        let owner = graph_instance(instances, spec.owner);
+        let sample = graph_instance(instances, spec.sample);
+        let edge = get_index(request.edges, 0);
+        let relation = relation_domain(payload, edge.relation);
+        if edge.from != spec.sample || edge.to != spec.owner
+            || relation.from != sample.entity || relation.to != owner.entity || relation.kind != RelationKind::Safe {
+            fail!("graph top-per requires a named Safe sample-to-owner relation", edge.relation)
+        } else {
+            let sample_entity = get_index(payload.entities, sample.entity);
+            let sample_dataset = match sample_entity.dataset {
+                Some(dataset) => dataset,
+                None => fail!("graph top-per sample requires a declared sampling grain and clock", spec.sample),
+            };
+            let clock = match sample_dataset.utc_time {
+                Some(name) => name,
+                None => fail!("graph top-per sample requires a declared UTC clock", spec.sample),
+            };
+            let rank = match array::find(payload.dimensions, fn(entry) { entry.id == spec.rank }) {
+                Some(dimension) => dimension,
+                None => fail!("graph top-per rank must be a plain authorized sample dimension", spec.rank),
+            };
+            let rank_field = get_index(sample_entity.fields, rank.field);
+            if rank.entity != sample.entity || rank.computed || !rank.authorized || rank_field.name != clock {
+                fail!("graph top-per rank must be a plain authorized sample dimension on its declared UTC clock", spec.rank)
+            } else {
+                let owner_entity = get_index(payload.entities, owner.entity);
+                let partitions = array::map(graph_identity_columns(owner_entity, spec.owner), fn(column) {
+                    qb::column(owner.source, column)
+                });
+                let rank_expr = qb::column(sample.source, rank_field.column);
+                let ordering = array::concat([
+                    [qb::order_by(qb::OrderKey::Expr(rank_expr), qb::Ordering::Desc)],
+                    array::map(array::filter(graph_identity_columns(sample_entity, spec.sample), fn(column) {
+                        column != rank_field.column
+                    }), fn(column) {
+                        qb::order_by(qb::OrderKey::Expr(qb::column(sample.source, column)), qb::Ordering::Asc)
+                    }),
+                ]);
+                let bound = qb::bind(ctx, qb::Val::Int(spec.take));
+                (bound.0, qb::partitioned_top_n_bound(partitions, ordering, bound.1))
+            }
+        }
+    }
+};
+
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
@@ -3393,6 +3528,17 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
     } else if array::any(request.nodes, fn(node) {
         node.id == "" || array::length(array::filter(request.nodes, fn(other) { other.id == node.id })) != 1
     }) { fail!("graph node instance ids must be nonempty and unique") }
+    else if request.count == None && array::length(request.group_by_identity) > 0 {
+        fail!("graph identity grouping requires an aggregate count")
+    } else if let Some(unknown) = array::find(request.group_by_identity, fn(id) {
+        !array::any(request.nodes, fn(node) { node.id == id })
+    }) { fail!("graph group identity references an unknown node", unknown) }
+    else if let Some(duplicate) = array::find(request.group_by_identity, fn(id) {
+        array::length(array::filter(request.group_by_identity, fn(other) { other == id })) > 1
+    }) { fail!("graph group identity repeats a node", duplicate) }
+    else if request.top_per != None && array::length(request.group_by_identity) > 0 {
+        fail!("graph top-per cannot combine with identity grouping")
+    }
     else if let Some(unknown) = array::find(request.filters, fn(item) {
         !array::any(request.nodes, fn(node) { node.id == item.node })
     }) { fail!("graph filter references an unknown node", unknown.node) }
@@ -3554,7 +3700,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     }
                 },
             };
-            let grouping = match request.count {
+            let visible_grouping = match request.count {
                 None => [],
                 Some(_) => array::map(row_projection, fn(item) {
                     match item {
@@ -3563,6 +3709,15 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     }
                 }),
             };
+            let grouping = array::fold(request.group_by_identity, visible_grouping, fn(grouped, id) {
+                let instance = graph_instance(built.1, id);
+                let entity = get_index(payload.entities, instance.entity);
+                array::fold(graph_identity_columns(entity, id), grouped, fn(acc, column) {
+                    let expr = qb::column(instance.source, column);
+                    if array::any(acc, fn(existing) { existing == expr }) { acc }
+                    else { array::push(acc, expr) }
+                })
+            });
             let outer_filters = if request.include_empty {
                 array::filter(request.filters, fn(item) { item.node == request.root })
             } else { request.filters };
@@ -3575,12 +3730,19 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 (result.0, array::push(state.1, result.1))
             });
             let sources = array::concat([[root.1], array::map(built.2, fn(join) { join.source })]);
+            let partitioned = match request.top_per {
+                Some(spec) => do {
+                    let built_partition = graph_top_per(existential.0, payload, request, built.1, spec);
+                    (built_partition.0, Some(built_partition.1))
+                },
+                None => (existential.0, None),
+            };
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: filtered.1,
                 exists: existential.1, joins: built.2, grouping, having: [], ordering: [],
-                limit: None, offset: None, partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+                limit: None, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
-            (existential.0, qb::validate(plan, payload.profile))
+            (partitioned.0, qb::validate(plan, payload.profile))
         }
     }
 };
@@ -3634,6 +3796,8 @@ pub use self::{
     GraphEdge,
     GraphSelect,
     GraphFilter,
+    GraphHaving,
+    GraphTopPer,
     GraphExist,
     GraphRequest,
     FilterOp,

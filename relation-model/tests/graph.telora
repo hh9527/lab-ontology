@@ -12,6 +12,152 @@ use std::value::{ Value };
 
 def lower: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload, "resolver");
 
+# Two independent sample populations share a composite owner, but must never
+# multiply one another before their aggregate thresholds are evaluated.
+@edsl::entity_id("sample_a")
+@edsl::entity_source("sample_a", "sample_a")
+@edsl::dataset(edsl::DatasetKind::Metric, ["id", "tenant_id", "ts"], Some("ts"))
+@edsl::named_relation_key("sample_a_owner", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "tenant_id", to: "tenant_id"}),
+    ]))
+type SampleA = struct {
+    @edsl::column("id")
+    @edsl::dimension("sample_a_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    id: String,
+    @edsl::column("owner_id")
+    owner_id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::CanonicalUtcSecondText)
+    @edsl::dimension("sample_a_ts", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    ts: String,
+    @edsl::column("value")
+    @edsl::dimension("sample_a_value", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Int])
+    @edsl::measure("sample_a_sum", qb::AggregateFunction::Sum, [])
+    value: Int,
+};
+
+@edsl::entity_id("sample_b")
+@edsl::entity_source("sample_b", "sample_b")
+@edsl::dataset(edsl::DatasetKind::Metric, ["id", "tenant_id", "ts"], Some("ts"))
+@edsl::named_relation_key("sample_b_owner", Device.type, edsl::RelationKind::Safe,
+    edsl::RelationKey::And([
+        edsl::RelationKey::FieldEq({from: "owner_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "tenant_id", to: "tenant_id"}),
+    ]))
+type SampleB = struct {
+    @edsl::column("id")
+    id: String,
+    @edsl::column("owner_id")
+    owner_id: String,
+    @edsl::column("tenant_id")
+    tenant_id: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::CanonicalUtcSecondText)
+    ts: String,
+    @edsl::column("value")
+    @edsl::measure("sample_b_count", qb::AggregateFunction::Count, [])
+    value: Int,
+};
+
+def sample_profile: qb::PlanProfile = {...payload.profile,
+    allowed_operators: array::concat([payload.profile.allowed_operators, [qb::Operator::Having, qb::Operator::Partition, qb::Operator::Order]]),
+    allowed_aggregates: [qb::AggregateFunction::Count, qb::AggregateFunction::Sum],
+    allowed_scalars: array::concat([payload.profile.allowed_scalars, [qb::ScalarFunction::Gt]]),
+};
+def sample_payload: edsl::PreparedPayload = edsl::build_root("independent-sample-pressure",
+    [Tenant.type, Site.type, Device.type, SampleA.type, SampleB.type], sample_profile, fn(subject) { subject == "resolver" });
+def lower_samples: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(sample_payload, "resolver");
+
+pub def independent_sample_aggregates_do_not_multiply: test::Test = test::should_ok(fn() {
+    let ast = lower_samples(json::parse(r#"{
+        "op":"graph", "root":"owner", "nodes":[{"id":"owner","entity":"device"}],
+        "edges":[], "select":[], "count":"owner",
+        "exists":[
+            {"anchor":"owner","nodes":[{"id":"a","entity":"sample_a"}],
+             "edges":[{"relation":"sample_a_owner","from":"a","to":"owner"}],
+             "having":[{"node":"a","measure":"sample_a_sum","op":"gt","kind":"int","value":9}]},
+            {"anchor":"owner","nodes":[{"id":"b","entity":"sample_b"}],
+             "edges":[{"relation":"sample_b_owner","from":"b","to":"owner"}],
+             "having":[{"node":"b","measure":"sample_b_count","op":"gt","kind":"int","value":1}]}
+        ]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "HAVING sum(a.value) > ?1")
+        && string::contains(sq.sql, "HAVING count(b.value) > ?2")
+        && string::contains(sq.sql, "GROUP BY a.owner_id, a.tenant_id")
+        && string::contains(sq.sql, "GROUP BY b.owner_id, b.tenant_id")
+        && !string::contains(sq.sql, "JOIN sample_a")
+        && !string::contains(sq.sql, "JOIN sample_b")
+        && string::contains(pg.sql, "HAVING sum(\"a\".\"value\") > $1") {
+        True
+    } else { fail!("independent sample aggregates lost their owner grain", sq, pg) }
+});
+
+pub def aggregate_existence_rejects_wrong_measure_owner: test::Test = test::should_fail_with(fn() {
+    lower_samples(json::parse(r#"{
+        "op":"graph", "root":"owner", "nodes":[{"id":"owner","entity":"device"}],
+        "edges":[], "select":[], "count":"owner",
+        "exists":[{"anchor":"owner","nodes":[{"id":"a","entity":"sample_a"}],
+            "edges":[{"relation":"sample_a_owner","from":"a","to":"owner"}],
+            "having":[{"node":"a","measure":"sample_b_count","op":"gt","kind":"int","value":1}]}]
+    }"#).unwrap!())
+}, "graph aggregate measure does not belong to its sample node");
+
+pub def aggregate_existence_rejects_wrong_sample_relation: test::Test = test::should_fail_with(fn() {
+    lower_samples(json::parse(r#"{
+        "op":"graph", "root":"owner", "nodes":[{"id":"owner","entity":"device"}],
+        "edges":[], "select":[], "count":"owner",
+        "exists":[{"anchor":"owner","nodes":[{"id":"a","entity":"sample_a"}],
+            "edges":[{"relation":"sample_b_owner","from":"a","to":"owner"}],
+            "having":[{"node":"a","measure":"sample_a_sum","op":"gt","kind":"int","value":1}]}]
+    }"#).unwrap!())
+}, "graph existence edge role or target does not match declared relation");
+
+pub def latest_sample_keeps_the_whole_row_and_composite_owner: test::Test = test::should_ok(fn() {
+    let ast = lower_samples(json::parse(r#"{
+        "op":"graph", "root":"owner",
+        "nodes":[{"id":"owner","entity":"device"},{"id":"sample","entity":"sample_a"}],
+        "edges":[{"relation":"sample_a_owner","from":"sample","to":"owner"}],
+        "select":[{"node":"owner","dimension":"device_id"},
+                  {"node":"sample","dimension":"sample_a_ts"},
+                  {"node":"sample","dimension":"sample_a_value"}],
+        "top_per":{"owner":"owner","sample":"sample","rank":"sample_a_ts","take":1}
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "PARTITION BY owner.id, owner.tenant_id")
+        && string::contains(sq.sql, "ORDER BY sample.ts DESC, sample.id ASC")
+        && string::contains(sq.sql, "sample.value AS sample_sample_a_value")
+        && string::contains(pg.sql, "PARTITION BY \"owner\".\"id\", \"owner\".\"tenant_id\"") {
+        True
+    } else { fail!("latest sample lost full row or owner identity", sq, pg) }
+});
+
+pub def latest_sample_rejects_unrelated_rank: test::Test = test::should_fail_with(fn() {
+    lower_samples(json::parse(r#"{
+        "op":"graph", "root":"owner",
+        "nodes":[{"id":"owner","entity":"device"},{"id":"sample","entity":"sample_a"}],
+        "edges":[{"relation":"sample_a_owner","from":"sample","to":"owner"}],
+        "select":[{"node":"sample","dimension":"sample_a_value"}],
+        "top_per":{"owner":"owner","sample":"sample","rank":"device_id","take":1}
+    }"#).unwrap!())
+}, "graph top-per rank must be a plain authorized sample dimension");
+
+pub def latest_sample_rejects_unrelated_owner_relation: test::Test = test::should_fail_with(fn() {
+    lower_samples(json::parse(r#"{
+        "op":"graph", "root":"owner",
+        "nodes":[{"id":"owner","entity":"device"},{"id":"sample","entity":"sample_a"}],
+        "edges":[{"relation":"sample_b_owner","from":"sample","to":"owner"}],
+        "select":[{"node":"sample","dimension":"sample_a_value"}],
+        "top_per":{"owner":"owner","sample":"sample","rank":"sample_a_ts","take":1}
+    }"#).unwrap!())
+}, "graph edge role or target does not match declared relation");
+
 def plain_builder: Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr) = fn(ctx, col) { (ctx, col) };
 def projection_scope: Array(edsl::ScopePredicate) = [
     {field: 0, op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("active")},
@@ -1281,6 +1427,31 @@ pub def root_device_count_groups_by_declared_safe_site: test::Test = test::shoul
         True
     } else { fail!("safe ancestor dimension did not group root device count", sq, pg) }
 });
+
+# Two owners can display the same id while differing by tenant. A request for
+# per-owner counts must group on the entire declared identity, even when it
+# displays only the shared id.
+pub def owner_count_keeps_hidden_composite_identity: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[{"node":"device","dimension":"device_id"}],
+        "count":"device", "group_by_identity":["device"]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "GROUP BY device.id, device.tenant_id")
+        && string::contains(pg.sql, "GROUP BY \"device\".\"id\", \"device\".\"tenant_id\"")
+        && !string::contains(sq.sql, "tenant_id AS") {
+        True
+    } else { fail!("per-owner count merged composite identities", sq, pg) }
+});
+
+pub def owner_count_rejects_unrelated_identity: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[], "count":"device", "group_by_identity":["tenant"]
+    }"#).unwrap!())
+}, "graph group identity references an unknown node");
 
 pub def grouped_count_rejects_nonfunctional_peer_branch: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
