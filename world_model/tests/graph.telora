@@ -1,9 +1,63 @@
 use crate::model::{ payload };
+use ontology::ontology as edsl;
+use ontology::knowledge as knowledge;
 use ontology::intent::{ query_intent_ast_factory };
 use ontology::sqlite as sqlite;
+use ontology::query as qb;
+use std::array as array;
 use std::json as json;
 use std::string as string;
 use std::test as test;
+
+pub def aggregate_knowledge_uses_real_fields: test::Test = test::should_ok(fn() {
+    let points = knowledge::map(payload, "public");
+    let expected = [
+        ("country", "country_gnp_sum", "gnp"),
+        ("country", "country_population_avg", "population"),
+        ("country", "country_surface_area_max", "surface_area"),
+        ("city", "city_population_min", "population"),
+    ];
+    if array::all(expected, fn(item) {
+        let (owner, id, field) = item;
+        array::any(points, fn(point) {
+            point.target == {kind: edsl::KnowledgeKind::Measure, owner, id}
+                && array::any(point.refs, fn(link) {
+                    link.kind == knowledge::LinkKind::Member
+                        && link.target == {kind: edsl::KnowledgeKind::Field, owner, id: field}
+                })
+        })
+    }) && !array::any(points, fn(point) {
+        point.target.kind == edsl::KnowledgeKind::Field
+            && array::any(["gnp_sum", "gnp_min", "gnp_max", "population_avg"], fn(id) {
+                point.target.id == id
+            })
+    }) { True } else { fail!("aggregate knowledge retained synthetic fields or lost real-field references") }
+});
+
+pub def aggregates_share_the_declared_field: test::Test = test::should_ok(fn() {
+    let country = match array::find(payload.entities, fn(e) { e.id == "country" }) {
+        Some(e) => e, None => fail!("country is missing"),
+    };
+    let measures = array::filter(payload.measures, fn(m) {
+        m.id == "country_gnp_avg" || m.id == "country_gnp_sum"
+            || m.id == "country_gnp_min" || m.id == "country_gnp_max"
+    });
+    if array::length(measures) == 4 && array::all(measures, fn(m) {
+        m.entity == country.index && country.fields[m.field].name == "gnp"
+    }) { True } else { fail!("GNP measures must share the actual model field", measures) }
+});
+
+@edsl::entity_source("duplicate_measures", "dm")
+type DuplicateMeasure = struct {
+    @edsl::column("value")
+    @edsl::measure("same_measure", qb::AggregateFunction::Min, [])
+    @edsl::measure("same_measure", qb::AggregateFunction::Max, [])
+    value: Int,
+};
+
+pub def duplicate_aggregates_still_fail: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("duplicate-measure", [DuplicateMeasure.type], payload.profile, fn(subject) { True })
+}, "duplicate measure id");
 
 pub def city_country_projection: test::Test = test::should_ok(fn() {
     let lower = query_intent_ast_factory(payload, "public");

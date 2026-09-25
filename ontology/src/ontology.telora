@@ -35,7 +35,7 @@ type ColumnMap = struct { column: String };
 # Member-level: marks the representative key field. A declared dataset grain,
 # when present, defines the complete identity and may include other fields.
 @prelude::property(PropertyTarget::Field)
-type KeyFlag = struct { value: Bool };
+type KeyFlag = struct {};
 
 # Member-level: measure declaration (aggregate over a field at the entity's
 # natural grain). The id is the stable business vocabulary id (exchange
@@ -43,7 +43,9 @@ type KeyFlag = struct { value: Bool };
 # `requires` lists additional entities the measure semantics need (beyond its
 # own grain), reached only through grain-safe paths.
 @prelude::property(PropertyTarget::Field)
-type MeasureDef = struct {
+type MeasureDef = struct { measures: Array(MeasureSpec) };
+
+type MeasureSpec = struct {
     id: String,
     aggregate: qb::AggregateFunction,
     input: MeasureInput,
@@ -239,12 +241,16 @@ type BusinessLinkDef = struct { links: Array(BusinessLinkDecl) };
 # field indexes of the declaring (from) entity and the target (to) entity.
 type RelationPair = struct { from: Int, to: Int };
 
-# Relation key: a closed conjunction/disjunction tree over column-equality
-# pairs. `RelationKey.And`/`RelationKey.Or` arrays must be non-empty. It lowers to the query public
-# JoinCondition tree via `join_on`/`on_eq`/`on_and`/`on_or`; no raw SQL.
+# Model declarations name fields. Prepared relations contain only resolved
+# field indexes, so a model cannot construct an index-based relation key.
+type DeclaredRelationKey = enum {
+    FieldEq(RelationFieldPair),
+    And(Array(DeclaredRelationKey)),
+    Or(Array(DeclaredRelationKey)),
+};
+
 type RelationKey = enum {
     Eq(RelationPair),
-    FieldEq(RelationFieldPair),
     And(Array(RelationKey)),
     Or(Array(RelationKey)),
 };
@@ -252,7 +258,7 @@ type RelationKey = enum {
 type RelationFieldPair = struct { from: String, to: String };
 
 # Owner/scalar witnesses keep both sides of a relation key aligned at model
-# construction time; the prepared key remains the closed RelationKey tree.
+# construction time; the prepared key is a closed index-based tree.
 type ModelFieldRef(Owner, Scalar) = struct { owner: Type, scalar: Type, name: String };
 type TypedRelationPair(Src, Dest) = struct { from: String, to: String };
 
@@ -276,7 +282,7 @@ type RelationDecl = struct {
     id: String,
     target: Type,
     kind: RelationKind,
-    key: RelationKey,
+    key: DeclaredRelationKey,
     guard: Option(ScopePredicate),
 };
 
@@ -646,17 +652,18 @@ def column: Fn(String) -> Fn(property::FieldPropertyCtx, Option(ColumnMap)) -> C
     }
 };
 
-def key: Fn(Bool) -> Fn(property::FieldPropertyCtx, Option(KeyFlag)) -> KeyFlag = fn(value) {
+def key: Fn() -> Fn(property::FieldPropertyCtx, Option(KeyFlag)) -> KeyFlag = fn() {
     fn(ctx, previous) {
-        let result: KeyFlag = { value };
-        result
+        {}.ty!(KeyFlag)
     }
 };
 
 def measure: Fn(String, qb::AggregateFunction, Array(Type)) -> Fn(property::FieldPropertyCtx, Option(MeasureDef)) -> MeasureDef = fn(id, aggregate, requires) {
     fn(ctx, previous) {
-        let result: MeasureDef = { id, aggregate, input: MeasureInput::All, requires };
-        result
+        let spec: MeasureSpec = { id, aggregate, input: MeasureInput::All, requires };
+        {measures: match previous {
+            Some(existing) => array::push(existing.measures, spec), None => [spec],
+        }}
     }
 };
 
@@ -716,8 +723,10 @@ def measure_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option(M
 # The input mode is model knowledge, not a per-query caller choice.
 def distinct_measure: Fn(String, qb::AggregateFunction, Array(Type)) -> Fn(property::FieldPropertyCtx, Option(MeasureDef)) -> MeasureDef = fn(id, aggregate, requires) {
     fn(ctx, previous) {
-        let result: MeasureDef = { id, aggregate, input: MeasureInput::Distinct, requires };
-        result
+        let spec: MeasureSpec = { id, aggregate, input: MeasureInput::Distinct, requires };
+        {measures: match previous {
+            Some(existing) => array::push(existing.measures, spec), None => [spec],
+        }}
     }
 };
 
@@ -886,37 +895,7 @@ def union_source: Fn(String, Array(UnionBranchDecl)) -> Fn(td::TypeDesc, Option(
     }
 };
 
-# Single-column-equality relation sugar: `from_field` is a canonical field
-# index on the declaring entity, `to_field` on the target entity.
-def relation: Fn(Type, RelationKind, Int, Int) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, from_field, to_field) {
-    fn(ctx, previous) {
-        let pair: RelationPair = { from: from_field, to: to_field };
-        let entry: RelationDecl = { id: "", target, kind, key: RelationKey::Eq(pair), guard: None };
-        let relations = match previous {
-            Some(p) => array::push(p.relations, entry),
-            None => [entry],
-        };
-        let result: RelationDef = { relations };
-        result
-    }
-};
-
-# Relation with a structured key: `RelationKey.Eq(pair)`, `RelationKey.And(...)` or `RelationKey.Or(...)` over
-# column-equality pairs (conjunctive/disjunctive keys). Multiple annotations
-# fold by appending.
-def relation_key: Fn(Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(target, kind, key) {
-    fn(ctx, previous) {
-        let entry: RelationDecl = { id: "", target, kind, key, guard: None };
-        let relations = match previous {
-            Some(p) => array::push(p.relations, entry),
-            None => [entry],
-        };
-        let result: RelationDef = { relations };
-        result
-    }
-};
-
-def named_relation_key: Fn(String, Type, RelationKind, RelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key) {
+def named_relation_key: Fn(String, Type, RelationKind, DeclaredRelationKey) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key) {
     fn(ctx, previous) {
         if id == "" { fail!("named relation requires a nonempty id") } else {
             let entry: RelationDecl = { id, target, kind, key, guard: None };
@@ -930,7 +909,7 @@ def named_relation_key: Fn(String, Type, RelationKind, RelationKey) -> Fn(td::Ty
     }
 };
 
-def named_guarded_relation_key: Fn(String, Type, RelationKind, RelationKey, ScopePredicate) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key, guard) {
+def named_guarded_relation_key: Fn(String, Type, RelationKind, DeclaredRelationKey, ScopePredicate) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, target, kind, key, guard) {
     fn(ctx, previous) {
         if id == "" { fail!("guarded relation requires a nonempty id") }
         else {
@@ -950,15 +929,48 @@ def named_typed_relation_key: for(Src, Dest) Fn(String, TypeOf(Src), TypeOf(Dest
             fail!("named typed relation requires a nonempty id and key", source, target, id)
         } else {
             let keys = array::map(pairs, fn(pair) {
-                RelationKey::FieldEq({from: pair.from, to: pair.to})
+                DeclaredRelationKey::FieldEq({from: pair.from, to: pair.to})
             });
-            let key = if array::length(keys) == 1 { keys[0] } else { RelationKey::And(keys) };
+            let key = if array::length(keys) == 1 { keys[0] } else { DeclaredRelationKey::And(keys) };
             let entry: RelationDecl = {id, target, kind, key, guard: None};
             let relations = match previous {
                 Some(p) => array::push(p.relations, entry),
                 None => [entry],
             };
             {relations}
+        }
+    }
+};
+
+def typed_relation: for(Src, Dest) Fn(TypeOf(Src), TypeOf(Dest), RelationKind, TypedRelationPair(Src, Dest)) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(source, target, kind, pair) {
+    fn(ctx, previous) {
+        if ctx != source { fail!("typed relation source differs from the annotated entity", ctx, source) }
+        else {
+            let entry: RelationDecl = {id: "", target, kind, key: DeclaredRelationKey::FieldEq({from: pair.from, to: pair.to}), guard: None};
+            {relations: match previous {
+                Some(p) => array::push(p.relations, entry), None => [entry],
+            }}
+        }
+    }
+};
+
+# Alternative paths share the same typed source and target. Each branch is a
+# nonempty conjunction; the resulting key uses the ordinary closed OR tree.
+def named_typed_relation_or_key: for(Src, Dest) Fn(String, TypeOf(Src), TypeOf(Dest), RelationKind, Array(Array(TypedRelationPair(Src, Dest)))) -> Fn(td::TypeDesc, Option(RelationDef)) -> RelationDef = fn(id, source, target, kind, branches) {
+    fn(ctx, previous) {
+        if ctx != source {
+            fail!("typed relation source differs from the annotated entity", ctx, source)
+        } else if id == "" || array::length(branches) < 2 || array::any(branches, fn(pairs) { array::length(pairs) == 0 }) {
+            fail!("typed OR relation requires an id and at least two nonempty branches", source, target, id)
+        } else {
+            let key = DeclaredRelationKey::Or(array::map(branches, fn(pairs) {
+                let keys = array::map(pairs, fn(pair) { DeclaredRelationKey::FieldEq({from: pair.from, to: pair.to}) });
+                if array::length(keys) == 1 { keys[0] } else { DeclaredRelationKey::And(keys) }
+            }));
+            let entry: RelationDecl = {id, target, kind, key, guard: None};
+            {relations: match previous {
+                Some(p) => array::push(p.relations, entry), None => [entry],
+            }}
         }
     }
 };
@@ -1090,10 +1102,7 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
         None => "",
     };
     let key = property::get_field_prop(owner, index, KeyFlag.type);
-    let is_key = match key {
-        Some(k) => k.value,
-        None => False,
-    };
+    let is_key = key != None;
     let result: FieldEntry = { index, name, column, is_key, ty: field_ty };
     result
 };
@@ -1320,8 +1329,9 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 } else {
                     let measure = property::get_field_prop(ty, field.index, MeasureDef.type);
                     match measure {
-                        Some(declared) => if declared.id == metric.id && declared.aggregate == metric.aggregate
-                            && declared.input == MeasureInput::All {
+                        Some(declared) => if array::any(declared.measures, fn(spec) {
+                            spec.id == metric.id && spec.aggregate == metric.aggregate && spec.input == MeasureInput::All
+                        }) {
                             ()
                         } else {
                             fail!("metric metadata disagrees with its lowerable measure", metric.id)
@@ -1427,20 +1437,20 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
     let fields = entity.fields;
     array::flat_map(fields, fn(f) {
         let plain = match property::get_field_prop(entity.entity_type, f.index, MeasureDef.type) {
-            Some(d) => do {
+            Some(d) => array::map(d.measures, fn(spec) {
                 let result: MeasureEntry = {
-                    id: d.id,
+                    id: spec.id,
                     entity: entity.index,
                     field: f.index,
-                    aggregate: d.aggregate,
-                    input: d.input,
-                    alias: d.id,
-                    requires: resolve_required(entities, d.requires),
+                    aggregate: spec.aggregate,
+                    input: spec.input,
+                    alias: spec.id,
+                    requires: resolve_required(entities, spec.requires),
                     predicate: None,
                     computed: None,
                 };
-                [result]
-            },
+                result
+            }),
             None => [],
         };
         let filtered = match property::get_field_prop(entity.entity_type, f.index, FilteredMeasureDef.type) {
@@ -2018,24 +2028,9 @@ def check_dimension_ids: Fn(Array(DimensionEntry)) -> Array(DimensionEntry) = fn
     } else { dimensions }
 };
 
-def resolve_relation_key: Fn(EntityEntry, EntityEntry, RelationKey) -> RelationKey = fn(from_entity, to_entity, key) {
+def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> RelationKey = fn(from_entity, to_entity, key) {
     match key {
-        RelationKey::Eq(pair) => do {
-            let from_field = match array::get(from_entity.fields, pair.from) {
-                Some(field) => field,
-                None => fail!("unknown relation source field index", from_entity.id, pair.from),
-            };
-            let to_field = match array::get(to_entity.fields, pair.to) {
-                Some(field) => field,
-                None => fail!("unknown relation target field index", to_entity.id, pair.to),
-            };
-            if from_field.column == "" || to_field.column == "" {
-                fail!("relation key fields require physical columns", from_entity.id, from_field.name, to_entity.id, to_field.name)
-            } else if from_field.ty != to_field.ty {
-                fail!("relation fields have different types", from_entity.id, from_field.name, to_entity.id, to_field.name)
-            } else { RelationKey::Eq(pair) }
-        },
-        RelationKey::FieldEq(pair) => do {
+        DeclaredRelationKey::FieldEq(pair) => do {
             let from_field = match array::find(from_entity.fields, fn(field) { field.name == pair.from }) {
                 Some(field) => field.index,
                 None => fail!("unknown relation source field", from_entity.id, pair.from),
@@ -2052,10 +2047,10 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, RelationKey) -> RelationK
             RelationKey::Eq({ from: from_field, to: to_field })
             }
         },
-        RelationKey::And(keys) => if array::length(keys) == 0 {
+        DeclaredRelationKey::And(keys) => if array::length(keys) == 0 {
             fail!("relation conjunction requires at least one key", from_entity.id, to_entity.id)
         } else { RelationKey::And(array::map(keys, fn(k) { resolve_relation_key(from_entity, to_entity, k) })) },
-        RelationKey::Or(keys) => if array::length(keys) == 0 {
+        DeclaredRelationKey::Or(keys) => if array::length(keys) == 0 {
             fail!("relation disjunction requires at least one key", from_entity.id, to_entity.id)
         } else { RelationKey::Or(array::map(keys, fn(k) { resolve_relation_key(from_entity, to_entity, k) })) },
     }
@@ -2064,7 +2059,6 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, RelationKey) -> RelationK
 def exists_pairs: Fn(RelationKey) -> Array(RelationPair) = fn(key) {
     match key {
         RelationKey::Eq(pair) => [pair],
-        RelationKey::FieldEq(_) => fail!("unresolved relation field key"),
         RelationKey::And(keys) => array::flat_map(keys, exists_pairs),
         RelationKey::Or(_) => fail!("safe relation identity requires conjunctive keys"),
     }
@@ -2755,7 +2749,6 @@ def relation_domain: Fn(PreparedPayload, String) -> RelationEntry = fn(payload, 
 def relation_shape: Fn(RelationKey) -> RelationShape = fn(key) {
     match key {
         RelationKey::Eq(_) => RelationShape::Equality,
-        RelationKey::FieldEq(_) => RelationShape::Equality,
         RelationKey::And(parts) => RelationShape::All(array::map(parts, relation_shape)),
         RelationKey::Or(parts) => RelationShape::Any(array::map(parts, relation_shape)),
     }
@@ -3355,7 +3348,6 @@ def graph_key_condition: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Sour
             let to_field = get_index(get_index(payload.entities, relation.to).fields, pair.to);
             qb::on_eq(qb::column_ref(from_source, from_field.column), qb::column_ref(to_source, to_field.column))
         },
-        RelationKey::FieldEq(_) => fail!("unresolved graph relation key", relation.id),
         RelationKey::And(parts) => qb::on_and(array::map(parts, fn(part) { graph_key_condition(payload, relation, from_source, to_source, part) })),
         RelationKey::Or(parts) => qb::on_or(array::map(parts, fn(part) { graph_key_condition(payload, relation, from_source, to_source, part) })),
     }
@@ -3450,7 +3442,6 @@ def graph_constraint_key: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Sou
                 qb::scalar(qb::ScalarFunction::Eq, [qb::column(from_source, from_field.column),
                     qb::column(to_source, to_field.column)])
             },
-            RelationKey::FieldEq(_) => fail!("unresolved graph constraint key", relation.id),
             RelationKey::And(parts) => qb::scalar(qb::ScalarFunction::And,
                 array::map(parts, fn(part) { graph_constraint_key(payload, relation, from_source, to_source, part) })),
             RelationKey::Or(parts) => qb::scalar(qb::ScalarFunction::Or,
@@ -3572,7 +3563,6 @@ def graph_correlation_pairs: Fn(PreparedPayload, RelationEntry, qb::Source, qb::
             graph_correlation_pairs(payload, relation, outer, inner, forward, part)
         })),
         RelationKey::Or(_) => fail!("unsupported graph existence key with alternative matches", relation.id),
-        RelationKey::FieldEq(_) => fail!("unresolved graph existence key", relation.id),
     }
 };
 
@@ -3590,7 +3580,6 @@ def graph_correlation_alternatives: Fn(PreparedPayload, RelationEntry, qb::Sourc
         RelationKey::Or(parts) => array::concat(array::map(parts, fn(part) {
             graph_correlation_alternatives(payload, relation, outer, inner, forward, part)
         })),
-        RelationKey::FieldEq(_) => fail!("unresolved graph existence key", relation.id),
     }
 };
 
@@ -4777,6 +4766,7 @@ pub use self::{
     ColumnMap,
     KeyFlag,
     MeasureDef,
+    MeasureSpec,
     FilteredMeasureDef,
     ComputedMeasureDef,
     DimensionDef,
@@ -4807,6 +4797,7 @@ pub use self::{
     RelationDecl,
     RelationPair,
     RelationFieldPair,
+    DeclaredRelationKey,
     RelationKey,
     EnumValueDef,
     RelationKind,
@@ -4885,13 +4876,13 @@ pub use self::{
     relation_alias,
     localized_relation,
     union_source,
-    relation,
-    relation_key,
     named_relation_key,
     named_guarded_relation_key,
     model_field,
     typed_relation_pair,
+    typed_relation,
     named_typed_relation_key,
+    named_typed_relation_or_key,
     business_link,
     guarded_business_link,
     enum_value,
