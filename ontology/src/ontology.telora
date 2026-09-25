@@ -4273,9 +4273,12 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         fail!("graph raw take requires grain-safe joins from the root; move multiplying relations into correlated EXISTS before selecting global top rows", request.root, unsafe_edge)
     } else if request.count != None && array::length(request.measures) > 0 {
         fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
-    } else if request.count_having != None && (request.count == None || request.group_by_identity != [request.root]
-        || array::any(request.select, fn(item) { item.node != request.root })) {
-        fail!("graph count threshold requires a count subject, complete root identity grouping and root-only dimensions", request.root)
+    } else if request.count_having != None && (request.count == None
+        || array::any(request.select, fn(item) { item.node != request.root })
+        || !(request.group_by_identity == [request.root]
+            || (request.count == Some(request.root) && array::length(request.group_by_identity) == 0
+                && array::length(request.select) > 0 && !request.include_empty))) {
+        fail!("graph count threshold requires root-only dimensions and either complete root identity or an explicit root-value group counting root rows", request.root)
     } else if let Some(spec) = array::find(request.measure_having, fn(spec) {
         !(request.group_by_identity == [request.root]
             && array::all(request.select, fn(item) { item.node == request.root }))
@@ -4583,13 +4586,26 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 },
             };
             let constraints = graph_constraints(raw_limit.0, payload, built.1, request.constraints);
+            let recognized_groups = array::fold(request.select, (constraints.0, []), fn(state, item) {
+                let dimension = match array::find(payload.dimensions, fn(entry) { entry.id == item.dimension }) {
+                    Some(entry) => entry,
+                    None => fail!("graph projection references an unknown dimension", item.node, item.dimension),
+                };
+                if request.count == Some(request.root) && array::length(request.group_by_identity) == 0
+                    && request.count_having != None && array::length(dimension.canonical_values) > 0 {
+                    let known = graph_any_of(state.0, payload, subject, built.1, [{node: item.node,
+                        dimension: item.dimension,
+                        values: array::map(dimension.canonical_values, fn(value) { FilterInput::Text(value.id) })}]);
+                    (known.0, array::concat([state.1, known.1]))
+                } else { state }
+            });
             let constrained = append_filter_terms(filtered.1,
-                array::concat([alternatives.1, constraints.1]));
+                array::concat([alternatives.1, constraints.1, recognized_groups.1]));
             let count_having = match request.count_having {
-                None => (constraints.0, []),
+                None => (recognized_groups.0, []),
                 Some(spec) => do {
                     let subject_id = match request.count { Some(id) => id, None => fail!("graph count threshold requires a count subject") };
-                    let bound = qb::bind(constraints.0, qb::Val::Int(spec.threshold));
+                    let bound = qb::bind(recognized_groups.0, qb::Val::Int(spec.threshold));
                     (bound.0, [qb::having_bound(graph_aggregate_op(spec.op), `\{subject_id}_count`, bound.1)])
                 },
             };
