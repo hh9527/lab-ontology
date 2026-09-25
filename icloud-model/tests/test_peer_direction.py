@@ -96,6 +96,21 @@ class PeerDirectionTest(unittest.TestCase):
         self.assertEqual(qualified("d"), [])
         self.assertEqual(qualified("c"), [("c",)])
 
+    def test_one_way_business_connection_only_traverses_a_to_z(self):
+        def downstream(owner_id):
+            return self.lower({
+                "op": "graph", "root": "owner",
+                "nodes": [{"id": "owner", "entity": "device"}, {"id": "next", "entity": "device"}],
+                "edges": [{"relation": "physical_link_downstream_device", "from": "owner", "to": "next"}],
+                "select": [{"node": "next", "dimension": "device_id"}],
+                "filters": [{"node": "owner", "dimension": "device_id", "op": "eq",
+                    "kind": "text", "value": owner_id}],
+            })
+
+        self.assertEqual(downstream("a"), [("c",)])
+        self.assertEqual(downstream("d"), [("a",)])
+        self.assertEqual(downstream("c"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
