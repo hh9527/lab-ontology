@@ -4238,25 +4238,33 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
                 fail!("graph top-per rank must be a plain authorized sample dimension on the named sample", spec.rank, spec.sample)
             } else if rank.computed || !rank.authorized || array::length(rank.scope) > 0 {
                 fail!("graph top-per rank must be a plain authorized unscoped sample dimension", spec.rank)
-            } else if array::length(rank.values) > 0 || array::length(rank.canonical_values) > 0
-                || rank.output_type == OutputType::Boolean {
-                fail!("graph top-per rank has no business ordering for canonical, enum or boolean values; choose a plain numeric, time or text sample dimension", spec.rank)
+            } else if array::length(rank.values) > 0 || rank.output_type == OutputType::Boolean
+                || (array::length(rank.canonical_values) > 0 && array::length(rank.canonical_order) == 0) {
+                fail!("graph top-per rank has no declared business ordering; choose an ordered dimension or declare canonical_order", spec.rank)
             } else {
                 let rank_field = get_index(sample_entity.fields, rank.field);
                 let owner_entity = get_index(payload.entities, owner.entity);
                 let partitions = array::map(graph_identity_columns(owner_entity, spec.owner), fn(column) {
                     qb::column(owner.source, column)
                 });
-                let rank_expr = qb::column(sample.source, rank_field.column);
+                let physical = qb::column(sample.source, rank_field.column);
+                let ranked = if array::length(rank.canonical_order) > 0 {
+                    let unknown = qb::bind(ctx, qb::Val::None);
+                    array::fold(array::enumerate(rank.canonical_order), (unknown.0, unknown.1), fn(state, pair) {
+                        let compared = canonical_compare_with_context(state.0, rank, physical, FilterOp::Eq, FilterInput::Text(pair.1));
+                        let ordinal = qb::bind(compared.0, qb::Val::Int(array::length(rank.canonical_order) - pair.0));
+                        (ordinal.0, qb::scalar_if(compared.1, ordinal.1, state.1))
+                    })
+                } else { (ctx, physical) };
                 let ordering = array::concat([
-                    [qb::order_by(qb::OrderKey::Expr(rank_expr), qb::Ordering::Desc)],
+                    [qb::order_by(qb::OrderKey::Expr(ranked.1), qb::Ordering::Desc)],
                     array::map(array::filter(graph_identity_columns(sample_entity, spec.sample), fn(column) {
                         column != rank_field.column
                     }), fn(column) {
                         qb::order_by(qb::OrderKey::Expr(qb::column(sample.source, column)), qb::Ordering::Asc)
                     }),
                 ]);
-                let bound = qb::bind(ctx, qb::Val::Int(spec.take));
+                let bound = qb::bind(ranked.0, qb::Val::Int(spec.take));
                 (bound.0, qb::partitioned_top_n_bound(partitions, ordering, bound.1))
             }
         }
@@ -4699,13 +4707,28 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                         qb::is_not_null(qb::column(instance.source, field.column))))
                 } else { state }
             });
-            let constrained = append_filter_terms(filtered.1,
-                array::concat([alternatives.1, constraints.1, recognized_groups.1]));
-            let count_having = match request.count_having {
+            let recognized_rank = match request.top_per {
+                Some(spec) => do {
+                    let dimension = match array::find(payload.dimensions, fn(entry) { entry.id == spec.rank }) {
+                        Some(entry) => entry,
+                        None => fail!("graph top-per rank references an unknown dimension", spec.rank),
+                    };
+                    if array::length(dimension.canonical_order) > 0 {
+                        let known = graph_any_of(recognized_groups.0, payload, subject, built.1, [{node: spec.sample,
+                            dimension: spec.rank,
+                            values: array::map(dimension.canonical_values, fn(value) { FilterInput::Text(value.id) })}]);
+                        (known.0, known.1)
+                    } else { (recognized_groups.0, []) }
+                },
                 None => (recognized_groups.0, []),
+            };
+            let constrained = append_filter_terms(filtered.1,
+                array::concat([alternatives.1, constraints.1, recognized_groups.1, recognized_rank.1]));
+            let count_having = match request.count_having {
+                None => (recognized_rank.0, []),
                 Some(spec) => do {
                     let subject_id = match request.count { Some(id) => id, None => fail!("graph count threshold requires a count subject") };
-                    let bound = qb::bind(recognized_groups.0, qb::Val::Int(spec.threshold));
+                    let bound = qb::bind(recognized_rank.0, qb::Val::Int(spec.threshold));
                     (bound.0, [qb::having_bound(graph_aggregate_op(spec.op), `\{subject_id}_count`, bound.1)])
                 },
             };
