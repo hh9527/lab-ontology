@@ -1,0 +1,65 @@
+use crate::model::{ payload };
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::sqlite as sqlite;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+def lower: Fn(std::value::Value) -> qb::Query = fn(value) {
+    sqlite::build_query(query_intent_ast_factory(payload, "public")(value))
+};
+
+pub def independent_kpi_qualifications_preserve_owner_grain: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[{"node":"device","dimension":"device_name"}], "count":"device",
+        "group_by_identity":["device"],
+        "exists":[
+            {"anchor":"device", "nodes":[{"id":"cpu","entity":"device_kpi"}],
+             "edges":[{"relation":"device_kpi_of_device","from":"cpu","to":"device"}],
+             "filters":[
+                 {"node":"cpu","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                 {"node":"cpu","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+             "having":[{"node":"cpu","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]},
+            {"anchor":"device", "nodes":[{"id":"ports","entity":"device_kpi"}],
+             "edges":[{"relation":"device_kpi_of_device","from":"ports","to":"device"}],
+             "filters":[
+                 {"node":"ports","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
+                 {"node":"ports","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-04 00:00:00"}],
+             "having":[{"node":"ports","measure":"port_count_sample_avg","op":"gt","kind":"number","value":20.0}]}
+        ]
+    }"#).unwrap!());
+    if string::contains(query.sql, "EXISTS (SELECT 1 FROM NetworkDeviceKPI AS cpu")
+        && string::contains(query.sql, "EXISTS (SELECT 1 FROM NetworkDeviceKPI AS ports")
+        && string::contains(query.sql, "HAVING avg(cpu.cpuUsage) > ?3")
+        && string::contains(query.sql, "HAVING avg(ports.portCount) > ?6")
+        && string::contains(query.sql, "device.id = cpu.resId AND device.tenant_id = cpu.tenantId")
+        && string::contains(query.sql, "device.id = ports.resId AND device.tenant_id = ports.tenantId")
+        && string::contains(query.sql, "GROUP BY device.name, device.id, device.tenant_id")
+        && query.bindings == [qb::Val::String("2025-01-01 00:00:00"), qb::Val::String("2025-01-04 00:00:00"),
+            qb::Val::Float(80.0), qb::Val::String("2025-02-01 00:00:00"),
+            qb::Val::String("2025-02-04 00:00:00"), qb::Val::Float(20.0)] { True }
+    else { fail!(`independent KPI qualification lost its identity, windows, or aggregates: \{query.sql}`, query.bindings) }
+});
+
+pub def qualification_rejects_unrelated_sample_relation: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[], "count":"device",
+        "exists":[{"anchor":"device", "nodes":[{"id":"cpu","entity":"device_kpi"}],
+            "edges":[{"relation":"server_current_alarm","from":"cpu","to":"device"}],
+            "having":[{"node":"cpu","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]}]
+    }"#).unwrap!())
+}, "graph existence edge role or target does not match declared relation");
+
+pub def qualification_rejects_wrong_measure_owner: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[], "count":"device",
+        "exists":[{"anchor":"device", "nodes":[{"id":"cpu","entity":"device_kpi"}],
+            "edges":[{"relation":"device_kpi_of_device","from":"cpu","to":"device"}],
+            "having":[{"node":"cpu","measure":"device_count","op":"gt","kind":"int","value":1}]}]
+    }"#).unwrap!())
+}, "graph aggregate measure does not belong to its sample node");

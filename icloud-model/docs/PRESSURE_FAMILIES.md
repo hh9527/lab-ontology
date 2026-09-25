@@ -1,5 +1,14 @@
 # Corpus pressure families (first pass)
 
+The reconnected relation-first `icloud-model/tests/graph.telora` first checks
+independent Device KPI qualifications using two correlated aggregate EXISTS,
+separate explicit UTC windows and the complete `(id, tenant_id)` owner identity.
+This validates the current graph Intent for qualification, not the legacy
+`qualify_metrics` API described later in this historical pressure log. The
+next gap is projecting a declared measure over a separate observation window
+after qualification: the current graph Intent projects dimensions or counts,
+not measures. That gap belongs in ontology, not a per-domain query template.
+
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes
 only when its representative intent has a valid Model-backed plan, adjacent
