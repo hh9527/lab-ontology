@@ -297,6 +297,9 @@ type CanonicalValueSpec = struct { id: String, label: String, wires: Array(Filte
 @prelude::property(PropertyTarget::Field)
 type CanonicalValuesDef = struct { values: Array(CanonicalValueSpec) };
 
+@prelude::property(PropertyTarget::Field)
+type CanonicalOrderDef = struct { ids: Array(String) };
+
 type CanonicalAlias = struct { id: String, label: String };
 @prelude::property(PropertyTarget::Field)
 type CanonicalAliasesDef = struct { aliases: Array(CanonicalAlias) };
@@ -489,6 +492,7 @@ type DimensionBrief = struct {
     input_kinds: Array(FilterInputKind),
     values: Array(EnumValueEntry),
     canonical_values: Array(CanonicalValueSpec),
+    canonical_order: Array(String),
     canonical_aliases: Array(CanonicalAlias),
     localized_values: Array(LocalizedCanonicalValue),
     scope: Array(DimensionScopeBrief),
@@ -508,6 +512,7 @@ type SubjectDimensionBrief = struct {
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
     values: Array(BusinessValueBrief),
+    canonical_order: Array(String),
     scope: Array(DimensionScopeBrief),
 };
 
@@ -569,6 +574,7 @@ type DimensionEntry = struct {
     input_kinds: Array(FilterInputKind),
     values: Array(EnumValueEntry),
     canonical_values: Array(CanonicalValueSpec),
+    canonical_order: Array(String),
     canonical_aliases: Array(CanonicalAlias),
     scope: Array(ScopePredicate),
 };
@@ -992,6 +998,13 @@ def canonical_values: Fn(Array(CanonicalValueSpec)) -> Fn(property::FieldPropert
         } else {
             { values }
         }
+    }
+};
+
+def canonical_order: Fn(Array(String)) -> Fn(property::FieldPropertyCtx, Option(CanonicalOrderDef)) -> CanonicalOrderDef = fn(ids) {
+    fn(ctx, previous) {
+        if previous != None { fail!("canonical business order must be declared once per field", ctx) }
+        else { {ids} }
     }
 };
 
@@ -1875,6 +1888,21 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
     }
 };
 
+def canonical_order_domain: Fn(Type, FieldEntry, Array(CanonicalValueSpec)) -> Array(String) = fn(owner, field, values) {
+    match property::get_field_prop(owner, field.index, CanonicalOrderDef.type) {
+        None => [],
+        Some(declared) => {
+            if array::length(values) == 0 || array::length(declared.ids) != array::length(values)
+                || !array::all(declared.ids, fn(id) {
+                    array::any(values, fn(value) { value.id == id })
+                        && array::length(array::filter(declared.ids, fn(other) { other == id })) == 1
+                }) {
+                fail!("canonical business order must name each declared canonical value exactly once", owner, field.name, declared.ids)
+            } else { declared.ids }
+        },
+    }
+};
+
 def canonical_alias_domain: Fn(Type, FieldEntry, Array(CanonicalValueSpec)) -> Array(CanonicalAlias) = fn(owner, field, values) {
     match property::get_field_prop(owner, field.index, CanonicalAliasesDef.type) {
         None => [],
@@ -1901,6 +1929,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     let fields = entity.fields;
     let orphan = array::find(fields, fn(f) {
         (property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
+            || property::get_field_prop(entity.entity_type, f.index, CanonicalOrderDef.type) != None
             || property::get_field_prop(entity.entity_type, f.index, CanonicalAliasesDef.type) != None)
             && property::get_field_prop(entity.entity_type, f.index, DimensionDef.type) == None
     });
@@ -1913,6 +1942,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         match d {
             Some(dd) => do {
                 let mapped = canonical_domain(entity.entity_type, f);
+                let order = canonical_order_domain(entity.entity_type, f, mapped);
                 let aliases = canonical_alias_domain(entity.entity_type, f, mapped);
                 let enumerated = value_domain(f.ty);
                 let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
@@ -1955,7 +1985,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         FilterInputKind::Number => OutputType::Number,
                         FilterInputKind::Bool => OutputType::Boolean,
                     };
-                    [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, aliases, field_scope(entity.entity_type, f.index))]
+                    [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index))]
                 }
             },
             None => [],
@@ -1964,15 +1994,15 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     let computed = array::flat_map(fields, fn(f) {
         let d = property::get_field_prop(entity.entity_type, f.index, ComputedDimensionDef.type);
         match d {
-            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, dd.output_type, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], field_scope(entity.entity_type, f.index))],
+            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, dd.output_type, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], [], field_scope(entity.entity_type, f.index))],
             None => [],
         }
     });
     if declared { array::concat([plain, computed]) } else { [] }
 };
 
-def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope) {
-    let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_aliases, scope };
+def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope) {
+    let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope };
     result
 };
 
@@ -2602,7 +2632,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         dataset: entity.id, field: field.name, computed: entry.computed,
         authorized: entry.authorized, filterable: entry.filterable,
         ops: entry.ops, input_kinds: entry.input_kinds, values: entry.values,
-        canonical_values: entry.canonical_values, canonical_aliases: entry.canonical_aliases,
+        canonical_values: entry.canonical_values, canonical_order: entry.canonical_order, canonical_aliases: entry.canonical_aliases,
         localized_values: localized_value_labels(entity.entity_type, field.index), scope}
 };
 
@@ -2633,7 +2663,7 @@ def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> Subject
             {id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
                 filterable: detail.filterable, ops: detail.ops,
-                input_kinds: detail.input_kinds, values, scope: detail.scope}
+                input_kinds: detail.input_kinds, values, canonical_order: detail.canonical_order, scope: detail.scope}
         }
     }
 };
@@ -4438,7 +4468,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 }
             });
             let row_projection = selected.1;
-            let ordered = array::map(request.order_by, fn(item) {
+            let ordered = array::fold(request.order_by, (selected.0, []), fn(state, item) {
                 let position = array::find(array::enumerate(request.select), fn(entry) {
                     entry.1.node == item.node && entry.1.dimension == item.dimension
                 });
@@ -4448,12 +4478,25 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                             Some(d) => d,
                             None => fail!("graph order references an unknown dimension", item.node, item.dimension),
                         };
-                        if array::length(dimension.canonical_values) > 0 || array::length(dimension.values) > 0
-                            || dimension.output_type == OutputType::Boolean {
+                        if (array::length(dimension.canonical_values) > 0 && array::length(dimension.canonical_order) == 0)
+                            || array::length(dimension.values) > 0 || dimension.output_type == OutputType::Boolean {
                             fail!("graph order dimension has no declared business ordering; use a plain ordered dimension or extend the Model with an explicit value order", item.node, item.dimension)
                         } else {
                             match get_index(row_projection, entry.0) {
-                                qb::SelectItem::NamedExpr(named) => qb::order_by(qb::OrderKey::Expr(named.expr), item.direction),
+                                qb::SelectItem::NamedExpr(named) => {
+                                    let ranked = if array::length(dimension.canonical_order) > 0 {
+                                        let instance = graph_instance(built.1, item.node);
+                                        let field = get_index(get_index(payload.entities, instance.entity).fields, dimension.field);
+                                        let unknown = qb::bind(state.0, qb::Val::None);
+                                        array::fold(array::enumerate(dimension.canonical_order), (unknown.0, unknown.1), fn(rank, pair) {
+                                            let compared = canonical_compare_with_context(rank.0, dimension,
+                                                qb::column(instance.source, field.column), FilterOp::Eq, FilterInput::Text(pair.1));
+                                            let ordinal = qb::bind(compared.0, qb::Val::Int(pair.0));
+                                            (ordinal.0, qb::scalar_if(compared.1, ordinal.1, rank.1))
+                                        })
+                                    } else { (state.0, named.expr) };
+                                    (ranked.0, array::push(state.1, qb::order_by(qb::OrderKey::Expr(ranked.1), item.direction)))
+                                },
                                 _ => fail!("graph order requires a projected dimension", item.node, item.dimension),
                             }
                         }
@@ -4462,8 +4505,8 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 }
             });
             let raw_order = match request.take {
-                None => ordered,
-                Some(_) => array::fold(built.1, ordered, fn(acc, instance) {
+                None => ordered.1,
+                Some(_) => array::fold(built.1, ordered.1, fn(acc, instance) {
                     let entity = get_index(payload.entities, instance.entity);
                     array::fold(graph_identity_columns(entity, instance.id), acc, fn(keys, column) {
                         let expr = qb::column(instance.source, column);
@@ -4472,7 +4515,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     })
                 }),
             };
-            let measures = array::fold(request.measures, (selected.0, [], []), fn(state, item) {
+            let measures = array::fold(request.measures, (ordered.0, [], []), fn(state, item) {
                 let projected = graph_measure_projection(state.0, payload, request, built.1, item, state.2);
                 (projected.0, array::push(state.1, projected.1), projected.2)
             });
@@ -4602,8 +4645,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     Some(entry) => entry,
                     None => fail!("graph projection references an unknown dimension", item.node, item.dimension),
                 };
-                if request.count == Some(request.root) && array::length(request.group_by_identity) == 0
-                    && array::length(request.select) > 0 && array::length(dimension.canonical_values) > 0 {
+                if (request.count == Some(request.root) && array::length(request.group_by_identity) == 0
+                    && array::length(request.select) > 0 && array::length(dimension.canonical_values) > 0)
+                    || (array::length(dimension.canonical_order) > 0 && array::any(request.order_by, fn(order) {
+                        order.node == item.node && order.dimension == item.dimension
+                    })) {
                     let known = graph_any_of(state.0, payload, subject, built.1, [{node: item.node,
                         dimension: item.dimension,
                         values: array::map(dimension.canonical_values, fn(value) { FilterInput::Text(value.id) })}]);
@@ -4780,6 +4826,7 @@ pub use self::{
     guarded_business_link,
     enum_value,
     canonical_values,
+    canonical_order,
     canonical_alias,
     localized_canonical_value,
     scope,
