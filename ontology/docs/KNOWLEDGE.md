@@ -6,6 +6,15 @@ prepared Model, authorized subject, and domain name and returns a pure
 equivalent unbound entry. No database connection or SQL backend is required.
 The response can be serialized with `std::json::stringify`.
 
+An entry `MainService` can mount separate `TransformService` slots for
+`doc.<domain>` and `index.<domain>`. Telora's collection routes by method and
+passes only `input` to the selected slot. Use
+`knowledge::knowledge_method_factory(payload, subject, domain, method)` in
+each slot's `init` to bind that method without expecting an envelope inside
+`transform`. The dog, spider, and world models mount these slots alongside
+their existing `transform` query service. No second copy of the Model is
+needed.
+
 Requests have exactly `method` and `input`:
 
 ```json
