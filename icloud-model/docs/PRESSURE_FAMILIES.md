@@ -15,6 +15,11 @@ either endpoint can be the querying device without making A/Z directional.
 An EXISTS beginning with this business link may now constrain its named peer
 and tenant nodes with the same Model-backed key rules. Its implicit physical
 link hub remains inaccessible as a named constraint endpoint.
+Correlated EXISTS constraints can also reference an already named outer graph
+node besides their anchor: the alarm/server/fan probe connects an inner Fan to
+an outer Tenant without introducing another tenant instance. The same scope
+works for a peer reached through a business link. Inner edges and filters still
+introduce or address only their own nodes; a mismatched relation role fails.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,
