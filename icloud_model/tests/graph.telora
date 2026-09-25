@@ -1,9 +1,10 @@
 use crate::model::{ payload };
-use ontology::intent::{ query_intent_ast_factory };
+use ontology::intent::{ query_intent_ast_factory, query_intent_ast_factory_with_context };
 use ontology::sqlite as sqlite;
 use ontology::postgres as postgres;
 use ontology::query as qb;
 use ontology::ontology as edsl;
+use ontology::time as time;
 use std::array as array;
 use std::json as json;
 use std::string as string;
@@ -98,6 +99,72 @@ pub def typed_existence_window_qualifies_without_multiplying_root: test::Test = 
             qb::Val::String("2025-02-01 00:00:00")] { True }
     else { fail!("typed existence window must stay correlated and parameterized", query) }
 });
+
+pub def request_time_is_bound_as_one_utc_instant_per_request: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{
+        "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
+        "edges":[],"select":[],"count":"alarm","time_windows":[{
+            "node":"alarm","dimension":"alarm_occur_utc_raw",
+            "start":{"kind":"utc_second","value":"2025-01-01 00:00:00"},
+            "end":{"ctx":"now"}}]
+    }"#).unwrap!();
+    let context = time::request_context(time::TimeValue::UtcSecond("2025-01-02 08:15:00"));
+    let lower = query_intent_ast_factory_with_context(payload, "public", context);
+    let first = lower(intent);
+    let second = lower(intent);
+    let sq = sqlite::build_query(first);
+    let pg = postgres::build_query(second);
+    if sq.bindings == [qb::Val::String("2025-01-01 00:00:00"),
+            qb::Val::String("2025-01-02 08:15:00")]
+        && pg.bindings == sq.bindings && string::contains(sq.sql, "alarm.OCCURUTC < ?2")
+        && string::contains(pg.sql, "\"alarm\".\"OCCURUTC\" < $2")
+        && !string::contains(sq.sql, "now(") && !string::contains(pg.sql, "now(") { True }
+    else { fail!("ctx.now must be a stable request binding in both dialects", sq, pg) }
+});
+
+pub def request_time_epoch_millis_is_not_a_plain_integer_filter: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{
+        "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
+        "edges":[],"select":[],"count":"device","time_windows":[{
+            "node":"device","dimension":"device_create_ms",
+            "start":{"kind":"epoch_millis","value":1727308800000},
+            "end":{"ctx":"now"}}]
+    }"#).unwrap!();
+    let context = time::request_context(time::TimeValue::EpochMillis(1727395200000));
+    let query = sqlite::build_query(query_intent_ast_factory_with_context(payload, "public", context)(intent));
+    if query.bindings == [qb::Val::Int(1727308800000), qb::Val::Int(1727395200000)]
+        && string::contains(query.sql, "device.createTime < ?2") { True }
+    else { fail!("epoch request clock must preserve millisecond input type", query) }
+});
+
+pub def request_time_reference_needs_explicit_context: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
+        "edges":[],"select":[],"count":"alarm","time_windows":[{
+            "node":"alarm","dimension":"alarm_occur_utc_raw",
+            "start":{"kind":"utc_second","value":"2025-01-01 00:00:00"},
+            "end":{"ctx":"now"}}]
+    }"#).unwrap!())
+}, "time boundary references ctx.now without a request time context");
+
+pub def request_time_cannot_be_local_wall_clock: test::Test = test::should_fail_with(fn() {
+    time::request_context(time::TimeValue::LocalDateTime("2025-01-02 08:15:00"))
+}, "request time must be an instant");
+
+pub def request_time_factory_rejects_unvalidated_date_context: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory_with_context(payload, "public", {now: time::TimeValue::Date("2025-01-02")})
+}, "request time must be an instant");
+
+pub def request_time_cannot_implicitly_change_encoding: test::Test = test::should_fail_with(fn() {
+    let context = time::request_context(time::TimeValue::EpochMillis(1735805700000));
+    query_intent_ast_factory_with_context(payload, "public", context)(json::parse(r#"{
+        "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
+        "edges":[],"select":[],"count":"alarm","time_windows":[{
+            "node":"alarm","dimension":"alarm_occur_utc_raw",
+            "start":{"kind":"utc_second","value":"2025-01-01 00:00:00"},
+            "end":{"ctx":"now"}}]
+    }"#).unwrap!())
+}, "time boundary does not match declared field encoding");
 
 pub def alarm_name_suffix_counts_only_matching_events: test::Test = test::should_ok(fn() {
     let intent = json::parse(r#"{"op":"graph","root":"alarm",

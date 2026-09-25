@@ -134,11 +134,20 @@ def parse_graph_filter: Fn(String, Value) -> edsl::GraphFilter = fn(subject, ite
     {node: as_string(field(obj, "node")), request}
 };
 
-def parse_time_value: Fn(Value) -> time::TimeValue = fn(value) {
+def parse_time_value: Fn(Option(time::RequestContext), Value) -> time::TimeValue = fn(context, value) {
     let obj = as_object(value);
-    graph_keys(obj, "time boundary", ["kind", "value"]);
-    let raw = field(obj, "value");
-    match as_string(field(obj, "kind")) {
+    match dict::get(obj, "ctx") {
+        Some(Value::String("now")) => if array::length(dict::keys(obj)) == 1 {
+            match context {
+                Some(request) => request.now,
+                None => fail!("time boundary references ctx.now without a request time context"),
+            }
+        } else { fail!("ctx.now boundary cannot contain other fields", obj) },
+        Some(value) => fail!("unsupported time context reference; use ctx.now", value),
+        None => do {
+            graph_keys(obj, "time boundary", ["kind", "value"]);
+            let raw = field(obj, "value");
+            match as_string(field(obj, "kind")) {
         "date" => time::TimeValue::Date(as_string(raw)),
         "local_datetime" => time::TimeValue::LocalDateTime(as_string(raw)),
         "utc_second" => time::TimeValue::UtcSecond(as_string(raw)),
@@ -148,17 +157,19 @@ def parse_time_value: Fn(Value) -> time::TimeValue = fn(value) {
             _ => fail!("epoch-millisecond boundary requires an integer", raw),
         },
         kind => fail!("unknown time boundary kind", kind),
+            }
+        },
     }
 };
 
-def parse_time_window: Fn(edsl::PreparedPayload, String, Value) -> Array(edsl::GraphFilter) =
-    fn(payload, subject, value) {
+def parse_time_window: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> Array(edsl::GraphFilter) =
+    fn(payload, subject, context, value) {
         let obj = as_object(value);
         graph_keys(obj, "time window", ["node", "dimension", "start", "end"]);
         let node = as_string(field(obj, "node"));
         let dimension = as_string(field(obj, "dimension"));
-        let window: time::Window = {start: parse_time_value(field(obj, "start")),
-            end: parse_time_value(field(obj, "end"))};
+        let window: time::Window = {start: parse_time_value(context, field(obj, "start")),
+            end: parse_time_value(context, field(obj, "end"))};
         array::map(time::window_filters(payload, subject, dimension, window), fn(request) {
             {node, request}
         })
@@ -180,7 +191,7 @@ def parse_graph_having: Fn(Value) -> edsl::GraphHaving = fn(item) {
         threshold: parse_input(as_string(field(obj, "kind")), field(obj, "value"))}
 };
 
-def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphExist = fn(payload, subject, item) {
+def parse_graph_existence: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> edsl::GraphExist = fn(payload, subject, context, item) {
     let obj = as_object(item);
     graph_keys(obj, "existence", ["anchor", "nodes", "edges", "constraints", "filters", "time_windows", "any_of", "having", "negated"]);
     let negated = match dict::get(obj, "negated") {
@@ -194,13 +205,13 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::Gra
         edges: array::map(as_array(field(obj, "edges")), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
         filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
-            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
+            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, context, value) })]),
         any_of: array::map(array_opt(obj, "any_of"), parse_graph_any_of),
         having: array::map(array_opt(obj, "having"), parse_graph_having),
         negated}
 };
 
-def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, obj) {
+def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Option(time::RequestContext), Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, context, obj) {
     if as_string(field(obj, "op")) != "graph" { fail!("aggregate pair operands must be graph intents") }
     else {
         graph_keys(obj, "request", ["op", "root", "row_grain", "distinct", "nodes", "edges", "constraints", "select", "measures", "measure_having", "filters", "time_windows", "any_of", "exists", "count", "count_value", "count_having", "count_groups", "include_empty", "group_by_identity", "top_per", "top_by_measure", "order_by", "take"]);
@@ -241,9 +252,9 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Val
             }),
             measure_having: array::map(array_opt(obj, "measure_having"), parse_graph_having),
             filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
-                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
+                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, context, value) })]),
             any_of: array::map(array_opt(obj, "any_of"), parse_graph_any_of),
-            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, value) }),
+            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, context, value) }),
             count: match dict::get(obj, "count") {
                 None => None,
                 Some(Value::None) => None,
@@ -354,7 +365,7 @@ def paired_group_operand: Fn(qb::Plan) -> qb::Plan = fn(plan) {
     {...plan, projection: array::concat([plan.projection, keys])}
 };
 
-def lower_graph_pair: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::QueryAst = fn(payload, subject, obj) {
+def lower_graph_pair: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Dict(Value)) -> qb::QueryAst = fn(payload, subject, context, obj) {
     graph_keys(obj, "aggregate pair", ["op", "left", "right", "count_groups"]);
     let count_groups = match dict::get(obj, "count_groups") {
         None => False,
@@ -362,8 +373,8 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::Quer
         Some(Value::False) => False,
         Some(value) => fail!("aggregate pair count_groups must be boolean", value),
     };
-    let left = lower_graph_object(qb::build_context(), payload, subject, as_object(field(obj, "left")));
-    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, as_object(field(obj, "right")));
+    let left = lower_graph_object(qb::build_context(), payload, subject, context, as_object(field(obj, "left")));
+    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, context, as_object(field(obj, "right")));
     if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
         fail!("aggregate pair operands each require one measure, grouping beginning with root identity, and no row ordering or count; qualify each population inside its own graph")
     } else if left.1.root != right.1.root
@@ -396,28 +407,41 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::Quer
     }
 };
 
-def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, intent) {
+def lower_intent_ast: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> qb::QueryAst = fn(payload, subject, context, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "graph" {
-        let lowered = lower_graph_object(qb::build_context(), payload, subject, obj);
+        let lowered = lower_graph_object(qb::build_context(), payload, subject, context, obj);
         let request = lowered.1;
         let plan = if request.count_groups { qb::QueryPlan::GroupCount(lowered.2) }
             else if request.distinct { qb::QueryPlan::DistinctRows(lowered.2) }
             else { qb::QueryPlan::Rows(lowered.2) };
         qb::finish(lowered.0, qb::validate_query_plan(plan))
-    } else if op == "graph_pair" { lower_graph_pair(payload, subject, obj) }
+    } else if op == "graph_pair" { lower_graph_pair(payload, subject, context, obj) }
     else { fail!("unsupported intent op; use graph or graph_pair with named nodes and relations", op) }
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
 
 def query_intent_lower_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> qb::Query = fn(payload, subject, to_query) {
-    fn(intent) { to_query(lower_intent_ast(payload, subject, intent)) }
+    fn(intent) { to_query(lower_intent_ast(payload, subject, None, intent)) }
 };
 
 def query_intent_ast_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::QueryAst = fn(payload, subject) {
-    fn(intent) { lower_intent_ast(payload, subject, intent) }
+    fn(intent) { lower_intent_ast(payload, subject, None, intent) }
 };
 
-pub use self::{ ToQuery, query_intent_lower_factory, query_intent_ast_factory };
+def query_intent_ast_factory_with_context: Fn(edsl::PreparedPayload, String, time::RequestContext) -> Fn(Value) -> qb::QueryAst =
+    fn(payload, subject, context) {
+        let checked = time::request_context(context.now);
+        fn(intent) { lower_intent_ast(payload, subject, Some(checked), intent) }
+    };
+
+def query_intent_lower_factory_with_context: Fn(edsl::PreparedPayload, String, ToQuery, time::RequestContext) -> Fn(Value) -> qb::Query =
+    fn(payload, subject, to_query, context) {
+        let checked = time::request_context(context.now);
+        fn(intent) { to_query(lower_intent_ast(payload, subject, Some(checked), intent)) }
+};
+
+pub use self::{ ToQuery, query_intent_lower_factory, query_intent_ast_factory,
+    query_intent_ast_factory_with_context, query_intent_lower_factory_with_context };
