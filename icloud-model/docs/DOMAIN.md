@@ -57,8 +57,12 @@ numeric fields cannot advertise text operations. IC's alarm CSN, local epoch-ms 
 interface sample values retain their typed inputs; canonical dimensions remain
 distinct because an integer physical wire such as PSU health intentionally
 accepts a textual business value resolved by its declared canonical mapping.
-Closed canonical domains publish exactly the Text business-input kind and Eq;
-closed enum domains likewise cannot advertise non-Eq operations. In particular,
+Closed canonical domains publish Text business inputs and explicitly declared
+Eq or Ne; IC alarm severity now declares all four source values (critical,
+major, minor, warning), so Ne(critical) retains all other declared severities.
+Unrecognized physical wires remain a source-data quality question rather than
+an additional valid business value inferred by the query engine.
+Closed enum domains likewise cannot advertise non-Eq operations. In particular,
 PSU health's physical integer wire is not a second agent-facing filter input.
 
 The additional site/frame/KPI carriers are pressure probes, not a transcription

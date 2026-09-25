@@ -133,6 +133,20 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
         self.assertEqual(all_alarms, [(7,)])
         self.assertEqual(no_site_alarms, [("3",)])
 
+    def test_noncritical_includes_minor_and_warning_but_not_unknown_wires(self):
+        self.db.executemany(
+            "INSERT INTO T_CURRENT_ALARM VALUES (?, ?, ?, ?, ?)",
+            [(6, "other", "red", "4", None), (7, "other", "red", "9", None)],
+        )
+        noncritical = self.lower({
+            "op": "graph", "root": "alarm",
+            "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "edges": [], "select": [], "count": "alarm",
+            "filters": [{"node": "alarm", "dimension": "alarm_severity",
+                "op": "ne", "kind": "text", "value": "critical"}],
+        })
+        self.assertEqual(noncritical, [(4,)])
+
 
 if __name__ == "__main__":
     unittest.main()
