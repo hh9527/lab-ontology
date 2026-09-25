@@ -14,6 +14,12 @@ pointed at `OCCURUTC` instead of `SEVERITY` in the real IC struct. Public
 and cannot drift when fields are inserted; an unknown name fails explicitly.
 Union branch physical column mapping retains its separate index-based contract.
 The alarm-to-device tenant key is still a pressure-model identity assumption.
+For devices with no matching alarms, Graph `include_empty` now projects
+`critical_alarm_count`, `major_alarm_count` and their computed sum as zero
+over the same nullable event source. This requires complete device identity
+grouping and a grain-safe child path; an empty KPI Sum/Avg is not silently
+converted to zero. The transform-service SQLite fixture checks the distinct
+event scopes, same-ID foreign tenants and zero-alarm device rows.
 Q0444-Q0446 add a second use of the same knowledge point: qualifying an owner
 by more than two critical/major alarms before independently observing KPI
 samples. Graph aggregate EXISTS/HAVING now resolves a filtered measure's
