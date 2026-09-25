@@ -12,6 +12,24 @@ use std::value::{ Value };
 
 def lower: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload, "resolver");
 
+@edsl::entity_id("unscoped_connection")
+@edsl::entity_source("unscoped_connections", "uc")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id"], None)
+@edsl::named_relation_key("unscoped_connection_endpoint", Device.type, edsl::RelationKind::FanOut,
+    edsl::RelationKey::Or([
+        edsl::RelationKey::FieldEq({from: "a_id", to: "id"}),
+        edsl::RelationKey::FieldEq({from: "z_id", to: "id"}),
+    ]))
+type UnscopedConnection = struct {
+    @edsl::column("a_id") a_id: String,
+    @edsl::column("id") @edsl::key(True) id: String,
+    @edsl::column("z_id") z_id: String,
+};
+
+def unscoped_payload: edsl::PreparedPayload = edsl::build_root("unscoped-count-pressure",
+    [Tenant.type, Site.type, Device.type, UnscopedConnection.type], payload.profile,
+    fn(subject) { subject == "resolver" });
+
 # Two independent sample populations share a composite owner, but must never
 # multiply one another before their aggregate thresholds are evaluated.
 @edsl::entity_id("sample_a")
@@ -1247,6 +1265,32 @@ pub def count_devices_by_tenant_including_empty_groups: test::Test = test::shoul
         True
     } else { fail!("empty-child count lost outer joins or root filter binding", sq, pg) }
 });
+
+pub def count_connections_per_device_with_complete_alternative_roles: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{"op":"graph","root":"device","include_empty":true,
+        "nodes":[{"id":"device","entity":"device"},{"id":"connection","entity":"connection"}],
+        "edges":[{"relation":"connection_endpoint","from":"connection","to":"device"}],
+        "select":[{"node":"device","dimension":"device_id"}],
+        "count":"connection","group_by_identity":["device"]}"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "LEFT JOIN connections AS connection")
+        && string::contains(sq.sql, "count(connection.id)")
+        && string::contains(sq.sql, "connection.a_device_id = device.id AND connection.tenant_id = device.tenant_id")
+        && string::contains(sq.sql, "connection.z_device_id = device.id AND connection.tenant_id = device.tenant_id")
+        && string::contains(sq.sql, "GROUP BY device.id, device.tenant_id")
+        && string::contains(pg.sql, "LEFT JOIN \"connections\" AS \"connection\"") { True }
+    else { fail!(`composite device grouping lost A/Z owner scope: \{sq.sql} / \{pg.sql}`) }
+});
+
+pub def count_connections_rejects_alternative_missing_tenant_identity: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(unscoped_payload, "resolver")(json::parse(r#"{
+        "op":"graph","root":"device","include_empty":true,
+        "nodes":[{"id":"device","entity":"device"},{"id":"connection","entity":"unscoped_connection"}],
+        "edges":[{"relation":"unscoped_connection_endpoint","from":"connection","to":"device"}],
+        "select":[{"node":"device","dimension":"device_id"}],
+        "count":"connection","group_by_identity":["device"]}"#).unwrap!())
+}, "graph cannot prove the non-root count subject has one row per root relationship");
 
 pub def empty_group_count_filters_nullable_child: test::Test = test::should_ok(fn() {
     let ast = lower(json::parse(r#"{
