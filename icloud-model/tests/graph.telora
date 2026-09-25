@@ -139,6 +139,32 @@ pub def unbounded_server_cpu_samples_cannot_implicitly_become_memory_measurement
         "order_by":[{"node":"sample","dimension":"server_kpi_ts_raw","direction":"asc"}]}"#).unwrap!())
 }, "declare row_grain association for explicit relationship rows");
 
+pub def server_root_cannot_bypass_sample_association_grain: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"server",
+        "nodes":[{"id":"server","entity":"server_device"},{"id":"sample","entity":"server_kpi"},
+                 {"id":"memory","entity":"server_memory"}],
+        "edges":[{"relation":"server_kpi_of_server","from":"sample","to":"server"},
+                 {"relation":"memory_parent_server","from":"memory","to":"server"}],
+        "select":[{"node":"memory","dimension":"server_memory_name"},
+                  {"node":"sample","dimension":"server_cpu_sample"},
+                  {"node":"sample","dimension":"server_kpi_ts_raw"}]}"#).unwrap!())
+}, "declare row_grain association for explicit relationship rows");
+
+pub def server_root_can_explicitly_project_memory_and_kpi_associations: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{"op":"graph","root":"server","row_grain":"association",
+        "nodes":[{"id":"server","entity":"server_device"},{"id":"sample","entity":"server_kpi"},
+                 {"id":"memory","entity":"server_memory"}],
+        "edges":[{"relation":"server_kpi_of_server","from":"sample","to":"server"},
+                 {"relation":"memory_parent_server","from":"memory","to":"server"}],
+        "select":[{"node":"server","dimension":"server_name"},
+                  {"node":"memory","dimension":"server_memory_name"},
+                  {"node":"sample","dimension":"server_cpu_sample"}]}"#).unwrap!());
+    if string::contains(query.sql, "JOIN ServerDeviceKPI AS sample")
+        && string::contains(query.sql, "JOIN PhysicalServerMemory AS memory")
+        && string::contains(query.sql, "sample.cpuUsage") { True }
+    else { fail!(`server-root association lost its sample/component roles: \{query.sql}`) }
+});
+
 pub def explicit_memory_sample_associations_are_not_component_metrics: test::Test = test::should_ok(fn() {
     let query = lower(json::parse(r#"{"op":"graph","root":"sample","row_grain":"association",
         "nodes":[{"id":"sample","entity":"server_kpi"},{"id":"server","entity":"server_device"},
@@ -310,7 +336,7 @@ pub def raw_trend_rejects_aggregate_grain_order: test::Test = test::should_fail_
 }, "graph dimension order requires raw rows");
 
 pub def site_device_value_set_requires_explicit_distinct: test::Test = test::should_ok(fn() {
-    let intent = json::parse(r#"{"op":"graph","root":"site","distinct":true,
+    let intent = json::parse(r#"{"op":"graph","root":"site","distinct":true,"row_grain":"association",
         "nodes":[{"id":"site","entity":"site"},{"id":"device","entity":"device"}],
         "edges":[{"relation":"device_located_at_site","from":"device","to":"site"}],
         "select":[{"node":"site","dimension":"site_name"},
@@ -396,7 +422,7 @@ pub def value_count_rejects_entity_count_mix: test::Test = test::should_fail_wit
 }, "graph count_value counts one declared dimension across matching rows");
 
 pub def site_device_rows_do_not_implicitly_deduplicate: test::Test = test::should_ok(fn() {
-    let query = lower(json::parse(r#"{"op":"graph","root":"site",
+    let query = lower(json::parse(r#"{"op":"graph","root":"site","row_grain":"association",
         "nodes":[{"id":"site","entity":"site"},{"id":"device","entity":"device"}],
         "edges":[{"relation":"device_located_at_site","from":"device","to":"site"}],
         "select":[{"node":"site","dimension":"site_name"},
@@ -1887,12 +1913,14 @@ pub def measure_projection_rejects_ambiguous_combined_count: test::Test = test::
 
 pub def ic_physical_link_peer_is_traversable_from_both_endpoints: test::Test = test::should_ok(fn() {
     let from_a = lower(json::parse(r#"{
-        "op":"graph", "root":"a", "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "op":"graph", "root":"a", "row_grain":"association", "distinct":true,
+        "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
         "edges":[{"relation":"physical_link_peer_device","from":"a","to":"z"}],
         "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
     }"#).unwrap!());
     let from_z = lower(json::parse(r#"{
-        "op":"graph", "root":"z", "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "op":"graph", "root":"z", "row_grain":"association", "distinct":true,
+        "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
         "edges":[{"relation":"physical_link_peer_device","from":"a","to":"z"}],
         "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
     }"#).unwrap!());
@@ -1906,7 +1934,7 @@ pub def ic_physical_link_peer_is_traversable_from_both_endpoints: test::Test = t
 });
 
 pub def ic_one_way_business_connection_is_a_to_z_only: test::Test = test::should_ok(fn() {
-    let intent = json::parse(r#"{"op":"graph","root":"a",
+    let intent = json::parse(r#"{"op":"graph","root":"a","row_grain":"association","distinct":true,
         "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
         "edges":[{"relation":"physical_link_downstream_device","from":"a","to":"z"}],
         "select":[{"node":"z","dimension":"device_id"}]}"#).unwrap!();
@@ -1929,20 +1957,21 @@ pub def ic_one_way_business_connection_rejects_reverse: test::Test = test::shoul
 
 pub def site_qualified_link_names_use_one_undirected_participation_relation: test::Test = test::should_ok(fn() {
     let intent = json::parse(r#"{"op":"graph","root":"link",
-        "nodes":[{"id":"link","entity":"physical_link"},{"id":"device","entity":"device"}],
-        "edges":[{"relation":"physical_link_attached_device","from":"link","to":"device"}],
+        "nodes":[{"id":"link","entity":"physical_link"}],"edges":[],
         "select":[{"node":"link","dimension":"physical_link_name"}],
-        "filters":[{"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"router"}],
-        "exists":[{"anchor":"device","nodes":[{"id":"site","entity":"site"}],
-            "edges":[{"relation":"device_located_at_site","from":"device","to":"site"}],
-            "filters":[{"node":"site","dimension":"site_type","op":"eq","kind":"text","value":"offline"}]}]
+        "exists":[{"anchor":"link","nodes":[{"id":"device","entity":"device"},{"id":"site","entity":"site"}],
+            "edges":[{"relation":"physical_link_attached_device","from":"link","to":"device"},
+                     {"relation":"device_located_at_site","from":"device","to":"site"}],
+            "filters":[{"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"router"},
+                       {"node":"site","dimension":"site_type","op":"eq","kind":"text","value":"offline"}]}]
     }"#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
-    if string::contains(sq.sql, "link.aNeResId = device.id AND link.tenantId = device.tenant_id")
+    if string::contains(sq.sql, "EXISTS (SELECT 1 FROM I_EntNetworkElement AS device")
+        && string::contains(sq.sql, "link.aNeResId = device.id AND link.tenantId = device.tenant_id")
         && string::contains(sq.sql, "link.zNeResId = device.id AND link.tenantId = device.tenant_id")
         && string::contains(sq.sql, "SELECT link.name AS link_physical_link_name")
-        && string::contains(sq.sql, "EXISTS (SELECT 1 FROM X_SITE_VIEW AS site")
+        && !string::contains(sq.sql, "JOIN I_EntNetworkElement")
         && string::contains(pg.sql, "\"link\".\"name\"")
         && sq.bindings == pg.bindings { True }
     else { fail!(`site-scoped link name lost A/Z, tenant or site predicate: \{sq.sql} / \{pg.sql}`) }

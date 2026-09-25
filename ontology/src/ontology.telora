@@ -3924,14 +3924,10 @@ def graph_multiplying_projection: Fn(GraphRequest, GraphEdge) -> Bool = fn(reque
     array::any(request.select, fn(item) { item.node == multiplying_node })
 };
 
-def graph_raw_sample_fanout: Fn(PreparedPayload, GraphRequest) -> Bool = fn(payload, request) {
+def graph_raw_row_fanout: Fn(PreparedPayload, GraphRequest) -> Bool = fn(payload, request) {
     request.count == None && request.count_value == None && array::length(request.measures) == 0
         && request.top_per == None && request.top_by_measure == None
         && !graph_count_subject_grain(payload, request, request.root).0
-        && match get_index(payload.entities, entity_by_id(payload, graph_node(request, request.root).entity)).dataset {
-            Some(dataset) => dataset.kind == DatasetKind::Metric || dataset.kind == DatasetKind::Event,
-            None => False,
-        }
 };
 
 def graph_grouped_child_chain_count: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, subject_id) {
@@ -4338,15 +4334,6 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         } else {
             fail!("graph raw take requires grain-safe joins from the root; move multiplying relations into correlated EXISTS before selecting global top rows", request.root, unsafe_edge)
         }
-    } else if graph_raw_sample_fanout(payload, request)
-        && !array::all(graph_unsafe_edges(payload, request, request.root).1, fn(edge) {
-            graph_multiplying_projection(request, edge)
-        }) {
-        fail!("graph raw sample joins multiply the root without projecting every related association; move unprojected relations into correlated EXISTS", request.root, graph_unsafe_edges(payload, request, request.root).1)
-    } else if graph_raw_sample_fanout(payload, request) && request.row_grain != GraphRowGrain::Association {
-        fail!("graph raw sample projection crosses a multiplying relation; declare row_grain association for explicit relationship rows, or use correlated EXISTS to retain root sample grain", request.root, graph_count_subject_grain(payload, request, request.root).1)
-    } else if request.row_grain == GraphRowGrain::Association && !graph_raw_sample_fanout(payload, request) {
-        fail!("graph association row grain requires a Metric/Event root and a projected multiplying relation; otherwise use root row grain", request.root)
     } else if request.count != None && array::length(request.measures) > 0 {
         fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
     } else if request.count_having != None && (request.count == None
@@ -4490,6 +4477,15 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             !array::any(graph_count_ancestors(request, counted), fn(id) { id == item.anchor })
         }) {
             fail!("unsupported graph include_empty existence outside counted instance lineage")
+        } else if graph_raw_row_fanout(payload, request)
+            && !array::all(graph_unsafe_edges(payload, request, request.root).1, fn(edge) {
+                graph_multiplying_projection(request, edge)
+            }) {
+            fail!("graph raw joins multiply root rows without projecting every related association; move unprojected relations into correlated EXISTS", request.root, graph_unsafe_edges(payload, request, request.root).1)
+        } else if graph_raw_row_fanout(payload, request) && request.row_grain != GraphRowGrain::Association {
+            fail!("graph raw projection crosses a multiplying relation; declare row_grain association for explicit relationship rows, or use correlated EXISTS to retain root row grain", request.root, graph_count_subject_grain(payload, request, request.root).1)
+        } else if request.row_grain == GraphRowGrain::Association && !graph_raw_row_fanout(payload, request) {
+            fail!("graph association row grain requires a projected multiplying relation; otherwise use root row grain", request.root)
         } else {
             let selected = array::fold(request.select, (built.0, []), fn(state, item) {
                 let instance = graph_instance(built.1, item.node);

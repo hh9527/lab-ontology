@@ -12,13 +12,18 @@ global sample TOP. The latter represents associations, not memory CPU samples.
 The composite memory ownership key remains a business pressure contract to
 validate against production data.
 Without `take`, the same SQL shape could still silently replicate every server
-CPU sample once per memory module. Raw Metric/Event-root Graph now defaults to
-`row_grain:"root"`: all joins must preserve the root grain or qualify it via
+CPU sample once per memory module. Raw Graph now defaults to
+`row_grain:"root"` for any root entity, event or metric: all joins must preserve the root grain or qualify it via
 EXISTS. `row_grain:"association"` explicitly opts into multiplicative rows
 only when every multiplying endpoint is projected; it rejects hidden extra
 FanOut joins, aggregates and global root TOP. A SQLite fixture distinguishes
 two samples from four explicit (memory,sample) associations and excludes a
-foreign-tenant memory sharing the same parent ID. The memory containment
+foreign-tenant memory sharing the same parent ID. Rooting at Server instead
+of ServerKpi is subject to the same rule and cannot bypass the sample/part
+association declaration. Site/Device and guarded peer output now declare
+association/value-set intent explicitly; filtering only Link identities by
+Device/Site or Device identities by Link roles uses correlated EXISTS instead
+of an implicit multiplying JOIN. The memory containment
 knowledge point explains that server KPI remains server-owned and can be
 reached from the exact `server_memory` topic. This marker describes result
 rows, not a memory-specific metric allocation.
