@@ -12,6 +12,9 @@ keys, including component tenant ownership, remain pressure-model contracts
 until verified against production mapping and identity scope. The physical
 link's two A/Z relations also declare an undirected business peer connection;
 either endpoint can be the querying device without making A/Z directional.
+An EXISTS beginning with this business link may now constrain its named peer
+and tenant nodes with the same Model-backed key rules. Its implicit physical
+link hub remains inaccessible as a named constraint endpoint.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,
