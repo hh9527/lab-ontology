@@ -320,8 +320,9 @@ type GraphEdge = struct { relation: String, from: String, to: String };
 type GraphSelect = struct { node: String, dimension: String };
 type GraphMeasureSelect = struct { node: String, measure: String };
 type GraphFilter = struct { node: String, request: FilterRequest };
+type GraphAnyOf = struct { node: String, dimension: String, values: Array(FilterInput) };
 type GraphHaving = struct { node: String, measure: String, op: FilterOp, threshold: FilterInput };
-type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), constraints: Array(GraphEdge), filters: Array(GraphFilter), having: Array(GraphHaving), negated: Bool };
+type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), constraints: Array(GraphEdge), filters: Array(GraphFilter), any_of: Array(GraphAnyOf), having: Array(GraphHaving), negated: Bool };
 type GraphTopPer = struct { owner: String, sample: String, rank: String, take: Int };
 type GraphRequest = struct {
     root: String,
@@ -331,6 +332,7 @@ type GraphRequest = struct {
     select: Array(GraphSelect),
     measures: Array(GraphMeasureSelect),
     filters: Array(GraphFilter),
+    any_of: Array(GraphAnyOf),
     exists: Array(GraphExist),
     count: Option(String),
     include_empty: Bool,
@@ -3236,6 +3238,32 @@ def graph_filters: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array
     (built.0, append_filter_terms(None, built.1))
 };
 
+def graph_any_of: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), Array(GraphAnyOf)) -> (qb::BuildCtx, Array(qb::Expr)) =
+    fn(ctx, payload, subject, instances, groups) {
+        array::fold(groups, (ctx, []), fn(state, group) {
+            if array::length(group.values) == 0 {
+                fail!("graph any_of requires at least one value", group.node, group.dimension)
+            } else {
+                let alternatives = array::fold(group.values, (state.0, []), fn(next, value) {
+                    let request: FilterRequest = {id: group.dimension, subject,
+                        op: FilterOp::Eq, input: value};
+                    let resolved = graph_filters(next.0, payload, instances, [{node: group.node, request}]);
+                    match resolved.1 {
+                        Some(expr) => (resolved.0, array::push(next.1, expr)),
+                        None => fail!("graph any_of value produced no predicate", group.node, group.dimension),
+                    }
+                });
+                let first = get_index(alternatives.1, 0);
+                let combined = array::fold(array::filter(array::enumerate(alternatives.1), fn(item) {
+                    item.0 > 0
+                }), first, fn(expr, item) {
+                    qb::scalar(qb::ScalarFunction::Or, [expr, item.1])
+                });
+                (alternatives.0, array::push(state.1, combined))
+            }
+        })
+    };
+
 def retarget_inner_expr: Fn(qb::Expr, String, String) -> qb::Expr = fn(expr, previous, fresh) {
     match expr {
         qb::Expr::Column(column) => qb::Expr::Column(if column.source == previous {
@@ -3299,7 +3327,7 @@ def graph_correlation_alternatives: Fn(PreparedPayload, RelationEntry, qb::Sourc
     }
 };
 
-def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, outer, anchor, spec, link) {
+def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, subject, outer, anchor, spec, link) {
     if array::length(spec.edges) == 0 { fail!("business link existence requires an edge", link.id) }
     else if array::length(spec.having) > 0 { fail!("graph aggregate existence requires a single Safe sample-to-owner relation", link.id) }
     else {
@@ -3385,11 +3413,13 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance)
                     }
                 });
                 let filtered = graph_filters(built.0, payload, built.1, spec.filters);
+                let alternatives = graph_any_of(filtered.0, payload, subject, built.1, spec.any_of);
                 let exists = qb::exists_path_alternatives(hub.1, correlation, built.2);
                 let constrained = append_filter_terms(filtered.1,
-                    graph_constraints(payload, array::concat([outer, built.1]), spec.constraints));
+                    array::concat([alternatives.1,
+                        graph_constraints(payload, array::concat([outer, built.1]), spec.constraints)]));
                 let exists = {...exists, filter: constrained};
-                (filtered.0, if spec.negated { qb::exists_not(exists) } else { exists })
+                (alternatives.0, if spec.negated { qb::exists_not(exists) } else { exists })
             }
         }
     }
@@ -3440,7 +3470,7 @@ def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Arr
     })
 };
 
-def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, instances, spec) {
+def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, subject, instances, spec) {
     let anchor = graph_instance(instances, spec.anchor);
     let count = array::length(spec.edges);
     if count == 0 || count != array::length(spec.nodes) {
@@ -3453,7 +3483,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
         match array::find(payload.business_links, fn(link) {
             get_index(spec.edges, 0).relation == link.id
         }) {
-            Some(link) => graph_link_existence(ctx, payload, instances, anchor, spec, link),
+            Some(link) => graph_link_existence(ctx, payload, subject, instances, anchor, spec, link),
             None => do {
         let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq)), Array(qb::Join)) = (ctx, [anchor], [], []);
         let built = array::fold(spec.edges, initial, fn(state, edge) {
@@ -3529,12 +3559,14 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
             }
         };
         let filtered = graph_filters(built.0, payload, built.1, spec.filters);
-        let aggregate = graph_aggregate_having(filtered.0, payload, first_instance, spec.having);
+        let alternatives = graph_any_of(filtered.0, payload, subject, built.1, spec.any_of);
+        let aggregate = graph_aggregate_having(alternatives.0, payload, first_instance, spec.having);
         let exists = if array::length(built.2) == 1 {
             qb::exists_path(first, get_index(built.2, 0), built.3)
         } else { qb::exists_path_alternatives(first, built.2, built.3) };
         let constrained = append_filter_terms(filtered.1,
-            graph_constraints(payload, array::concat([instances, built.1]), spec.constraints));
+            array::concat([alternatives.1,
+                graph_constraints(payload, array::concat([instances, built.1]), spec.constraints)]));
         let exists = {...exists, filter: constrained, grouping: grouped, having: aggregate.1};
         (aggregate.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },
@@ -3715,6 +3747,8 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         fail!("graph measure projection does not support an empty related population")
     } else if request.include_empty && array::length(request.constraints) > 0 {
         fail!("graph include_empty cannot apply constraint edges in WHERE without changing empty populations")
+    } else if request.include_empty && array::length(request.any_of) > 0 {
+        fail!("graph include_empty cannot apply any_of in WHERE without changing empty populations")
     } else if request.top_per != None && array::length(request.measures) > 0 {
         fail!("graph measure projection cannot rank raw rows with top_per")
     } else if let Some(unknown) = array::find(request.group_by_identity, fn(id) {
@@ -3807,7 +3841,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     let narrowed = if request.include_empty {
                         array::fold(array::filter(request.exists, fn(spec) { spec.anchor == new_node.id }),
                             (target.0, condition), fn(current, spec) {
-                                let result = graph_existence(current.0, payload, instances, spec);
+                                let result = graph_existence(current.0, payload, subject, instances, spec);
                                 (result.0, qb::on_and([current.1, qb::on_exists(result.1)]))
                             })
                     } else { (target.0, condition) };
@@ -3915,7 +3949,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 array::filter(request.exists, fn(spec) { spec.anchor == request.root })
             } else { request.exists };
             let existential = array::fold(outer_exists, (filtered.0, []), fn(state, spec) {
-                let result = graph_existence(state.0, payload, built.1, spec);
+                let result = graph_existence(state.0, payload, subject, built.1, spec);
                 (result.0, array::push(state.1, result.1))
             });
             let sources = array::concat([[root.1], array::map(built.2, fn(join) { join.source })]);
@@ -3926,13 +3960,15 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 },
                 None => (existential.0, None),
             };
-            let constrained = append_filter_terms(filtered.1, graph_constraints(payload, built.1, request.constraints));
+            let alternatives = graph_any_of(partitioned.0, payload, subject, built.1, request.any_of);
+            let constrained = append_filter_terms(filtered.1,
+                array::concat([alternatives.1, graph_constraints(payload, built.1, request.constraints)]));
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: constrained,
                 exists: existential.1, joins: built.2, grouping, having: [], ordering: [],
                 limit: None, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
-            (partitioned.0, qb::validate(plan, payload.profile))
+            (alternatives.0, qb::validate(plan, payload.profile))
         }
     }
 };
@@ -3996,6 +4032,7 @@ pub use self::{
     GraphSelect,
     GraphMeasureSelect,
     GraphFilter,
+    GraphAnyOf,
     GraphHaving,
     GraphTopPer,
     GraphExist,

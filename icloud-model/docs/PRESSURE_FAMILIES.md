@@ -20,6 +20,13 @@ node besides their anchor: the alarm/server/fan probe connects an inner Fan to
 an outer Tenant without introducing another tenant instance. The same scope
 works for a peer reached through a business link. Inner edges and filters still
 introduce or address only their own nodes; a mismatched relation role fails.
+Graph Intent also accepts a single-dimension `any_of` group in outer and
+correlated scopes. IC's alarm qualification expresses canonical `critical` OR
+`major`, ANDed with `uncleared`, without duplicating or counting event joins.
+Each candidate takes the normal Eq authorization, canonical-value lookup and
+parameter-binding path; raw severity wire codes, wrong node roles and empty
+groups fail. Outer `include_empty` rejects WHERE-based `any_of` rather than
+silently removing empty populations.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,
