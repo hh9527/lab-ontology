@@ -3832,12 +3832,11 @@ def graph_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity
 };
 
 # One owner-owned sample population may be repeated once per distinct context
-# identity, but only when both populations meet at that same complete owner.
+# identity. An optional owner-to-ancestor Safe join preserves that population.
 def graph_contextual_measure_grain: Fn(PreparedPayload, GraphRequest, String) -> Bool = fn(payload, request, sample_id) {
-    if sample_id == request.root || array::length(request.nodes) != 3 || array::length(request.edges) != 2
-        || request.count != None || request.include_empty
-        || !array::all(request.select, fn(item) { item.node == request.root
-            || array::any(request.edges, fn(edge) { edge.from == request.root && edge.to == item.node }) }) { False }
+    if sample_id == request.root || (array::length(request.nodes) != 3 && array::length(request.nodes) != 4)
+        || array::length(request.edges) != array::length(request.nodes) - 1
+        || request.count != None || request.include_empty { False }
     else {
         match array::find(request.edges, fn(edge) { edge.from == request.root && edge.to != sample_id }) {
             None => False,
@@ -3846,7 +3845,29 @@ def graph_contextual_measure_grain: Fn(PreparedPayload, GraphRequest, String) ->
                 let sample_edge = array::find(request.edges, fn(edge) {
                     edge.from == sample_id && edge.to == owner_id
                 });
+                let ancestor_edges = array::filter(request.edges, fn(edge) {
+                    edge != context_edge && !(edge.from == sample_id && edge.to == owner_id)
+                });
+                let ancestor_ok = if array::length(ancestor_edges) == 0 { array::length(request.nodes) == 3 }
+                else if array::length(ancestor_edges) != 1 || array::length(request.nodes) != 4 { False }
+                else {
+                    let edge = get_index(ancestor_edges, 0);
+                    if edge.from != owner_id || edge.to == request.root || edge.to == sample_id
+                        || edge.to == owner_id || array::any(payload.business_links, fn(link) { link.id == edge.relation }) { False }
+                    else {
+                        let owner = graph_node(request, owner_id);
+                        let ancestor = graph_node(request, edge.to);
+                        let target = get_index(payload.entities, entity_by_id(payload, ancestor.entity));
+                        let relation = relation_domain(payload, edge.relation);
+                        relation.from == entity_by_id(payload, owner.entity) && relation.to == target.index
+                            && relation.kind == RelationKind::Safe && conjunctive_identity_key(relation.key)
+                            && safe_relation_covers_target_identity(target, exists_pairs(relation.key))
+                    }
+                };
                 if request.group_by_identity != [request.root, owner_id]
+                    || !ancestor_ok
+                    || !array::all(request.select, fn(item) { item.node == request.root || item.node == owner_id
+                        || array::any(ancestor_edges, fn(edge) { edge.to == item.node }) })
                     || array::any(payload.business_links, fn(link) { link.id == context_edge.relation }) { False }
                 else { match sample_edge {
                     None => False,
