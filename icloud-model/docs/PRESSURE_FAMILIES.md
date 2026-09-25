@@ -32,6 +32,15 @@ Graph dimension projection now also uses the Model's declared output mapping:
 Grouped counts reuse that same CASE expression, so Device classification
 values with several declared physical wires form one business-value group.
 Unknown physical values map to NULL rather than masquerading as a known ID.
+Multi-hop aggregate EXISTS can now qualify a Device through Port and its
+Interface KPI samples: the per-port sample mean is grouped by Port's full
+declared identity, and a single qualifying port admits the Device without
+duplicating its count. Every edge reached from the sample must be forward
+Safe, so an additional Device-to-Site FanOut is rejected rather than
+multiplying KPI rows. Both SQLite and PostgreSQL render the same QueryAst
+with dialect-specific identifiers and placeholders. Port.id's asserted global
+identity and KPI.resId ownership remain IC pressure-model contracts, not
+production-verified keys.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,

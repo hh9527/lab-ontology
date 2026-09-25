@@ -3470,6 +3470,30 @@ def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Arr
     })
 };
 
+# A joined node may filter a sample aggregate only when each sample determines
+# at most one row of that node along the declared relation directions.
+def graph_aggregate_sample_grain: Fn(PreparedPayload, GraphExist, String) -> Option(GraphEdge) =
+    fn(payload, spec, sample) {
+        let checked = array::fold(spec.nodes, ([sample], None).ty!((Array(String), Option(GraphEdge))), fn(state, node) {
+            array::fold(spec.edges, state, fn(next, edge) {
+                let from_known = array::any(next.0, fn(id) { id == edge.from });
+                let to_known = array::any(next.0, fn(id) { id == edge.to });
+                if from_known == to_known { next }
+                else {
+                    let safe = match array::find(payload.business_links, fn(link) { link.id == edge.relation }) {
+                        Some(_) => False,
+                        None => from_known && relation_domain(payload, edge.relation).kind == RelationKind::Safe,
+                    };
+                    (array::push(next.0, if from_known { edge.to } else { edge.from }),
+                        if safe { next.1 } else { match next.1 { Some(_) => next.1, None => Some(edge) } })
+                }
+            })
+        });
+        if array::length(checked.0) != array::length(spec.nodes) + 1 {
+            fail!("graph aggregate sample is not connected to its owner", sample)
+        } else { checked.1 }
+    };
+
 def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, subject, instances, spec) {
     let anchor = graph_instance(instances, spec.anchor);
     let count = array::length(spec.edges);
@@ -3545,22 +3569,29 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
         });
         let first_instance = get_index(built.1, 1);
         let first = first_instance.source;
+        let sample = if array::length(spec.having) == 0 { first_instance }
+            else { graph_instance(built.1, get_index(spec.having, 0).node) };
         let grouped = if array::length(spec.having) == 0 { [] }
         else {
             let edge = get_index(spec.edges, 0);
-            let relation = relation_domain(payload, edge.relation);
-            if count != 1 || relation.kind != RelationKind::Safe
-                || relation.from != first_instance.entity || relation.to != anchor.entity
-                || edge.from != first_instance.id || edge.to != anchor.id
-                || array::length(built.2) != 1 {
-                fail!("graph aggregate existence requires a single Safe sample-to-owner relation", edge.relation)
+            if sample.id == anchor.id {
+                fail!("graph aggregate measure must belong to an introduced sample node", sample.id)
+            } else if let Some(unsafe_edge) = graph_aggregate_sample_grain(payload, spec, sample.id) {
+                fail!("graph aggregate sample may be multiplied by a relation", sample.id, unsafe_edge)
+            } else if sample.id != first_instance.id {
+                let entity = get_index(payload.entities, first_instance.entity);
+                array::map(graph_identity_columns(entity, first_instance.id), fn(column) {
+                    qb::column(first_instance.source, column)
+                })
+            } else if array::length(built.2) != 1 {
+                fail!("graph aggregate sample requires a single owner correlation", edge.relation)
             } else {
                 array::map(get_index(built.2, 0), fn(pair) { qb::Expr::Column(pair.right) })
             }
         };
         let filtered = graph_filters(built.0, payload, built.1, spec.filters);
         let alternatives = graph_any_of(filtered.0, payload, subject, built.1, spec.any_of);
-        let aggregate = graph_aggregate_having(alternatives.0, payload, first_instance, spec.having);
+        let aggregate = graph_aggregate_having(alternatives.0, payload, sample, spec.having);
         let exists = if array::length(built.2) == 1 {
             qb::exists_path(first, get_index(built.2, 0), built.3)
         } else { qb::exists_path_alternatives(first, built.2, built.3) };

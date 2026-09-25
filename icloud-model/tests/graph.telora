@@ -1,6 +1,7 @@
 use crate::model::{ payload };
 use ontology::intent::{ query_intent_ast_factory };
 use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
 use ontology::query as qb;
 use std::array as array;
 use std::json as json;
@@ -9,6 +10,20 @@ use std::test as test;
 
 def lower: Fn(std::value::Value) -> qb::Query = fn(value) {
     sqlite::build_query(query_intent_ast_factory(payload, "public")(value))
+};
+
+def port_kpi_intent: Fn() -> std::value::Value = fn() {
+    json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[], "count":"device",
+        "exists":[{"anchor":"device",
+            "nodes":[{"id":"port","entity":"port"},{"id":"sample","entity":"interface_kpi"}],
+            "edges":[{"relation":"port_belongs_to_device","from":"port","to":"device"},
+                     {"relation":"interface_kpi_of_port","from":"sample","to":"port"}],
+            "filters":[{"node":"port","dimension":"port_name","op":"eq","kind":"text","value":"uplink"}],
+            "having":[{"node":"sample","measure":"interface_tx","op":"gt","kind":"number","value":80.0}]
+        }]
+    }"#).unwrap!()
 };
 
 pub def independent_kpi_qualifications_preserve_owner_grain: test::Test = test::should_ok(fn() {
@@ -88,6 +103,37 @@ pub def qualified_device_observes_an_independent_kpi_window: test::Test = test::
         && array::length(query.bindings) == 5 { True }
     else { fail!(`qualified KPI observation lost measure grain or window: \{query.sql}`, query.bindings) }
 });
+
+pub def port_kpi_threshold_groups_samples_per_port: test::Test = test::should_ok(fn() {
+    let query = lower(port_kpi_intent());
+    if string::contains(query.sql, "EXISTS (SELECT 1 FROM I_EnterpriseNetworkLTP AS port")
+        && string::contains(query.sql, "INNER JOIN NetworkDeviceInterfaceKPI AS sample")
+        && string::contains(query.sql, "GROUP BY port.id")
+        && string::contains(query.sql, "HAVING avg(sample.ifOutPktSpeed) >") { True }
+    else { fail!(`port sample qualification lost its per-port grain: \{query.sql}`, query.bindings) }
+});
+
+pub def port_kpi_threshold_materializes_in_postgres: test::Test = test::should_ok(fn() {
+    let query = postgres::build_query(query_intent_ast_factory(payload, "public")(port_kpi_intent()));
+    if string::contains(query.sql, "GROUP BY \"port\".\"id\" HAVING avg(\"sample\".\"ifOutPktSpeed\") > $2")
+        && query.bindings == [qb::Val::String("uplink"), qb::Val::Float(80.0)] { True }
+    else { fail!(`PostgreSQL lost the per-port qualification: \{query.sql}`, query.bindings) }
+});
+
+pub def port_kpi_threshold_rejects_unrelated_fanout: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
+        "edges":[], "select":[], "count":"device",
+        "exists":[{"anchor":"device",
+            "nodes":[{"id":"port","entity":"port"},{"id":"sample","entity":"interface_kpi"},
+                     {"id":"site","entity":"site"}],
+            "edges":[{"relation":"port_belongs_to_device","from":"port","to":"device"},
+                     {"relation":"interface_kpi_of_port","from":"sample","to":"port"},
+                     {"relation":"device_located_at_site","from":"device","to":"site"}],
+            "having":[{"node":"sample","measure":"interface_tx","op":"gt","kind":"number","value":80.0}]
+        }]
+    }"#).unwrap!())
+}, "graph aggregate sample may be multiplied by a relation");
 
 pub def alarm_severity_alternatives_keep_one_device_grain: test::Test = test::should_ok(fn() {
     let query = lower(json::parse(r#"{
