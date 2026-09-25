@@ -57,8 +57,9 @@ correlated scopes. IC's alarm qualification expresses canonical `critical` OR
 `major`, ANDed with `uncleared`, without duplicating or counting event joins.
 Each candidate takes the normal Eq authorization, canonical-value lookup and
 parameter-binding path; raw severity wire codes, wrong node roles and empty
-groups fail. Outer `include_empty` rejects WHERE-based `any_of` rather than
-silently removing empty populations.
+groups fail. With `include_empty`, root `any_of` remains a WHERE qualification,
+while child `any_of` narrows that child's LEFT JOIN source so zero-count owners
+remain visible; the iCloud SQLite row fixture verifies this boundary.
 Graph dimension projection now also uses the Model's declared output mapping:
 `alarm_severity` returns stable `critical`/`major`, not physical `"1"`/`"2"`.
 Grouped counts reuse that same CASE expression, so Device classification
