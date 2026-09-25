@@ -1,5 +1,6 @@
 use crate::ontology as edsl;
 use std::array as array;
+use std::codec as codec;
 use std::dict as dict;
 use std::type_property as property;
 use std::value::{ Value };
@@ -15,6 +16,7 @@ type Point = struct {
     refs: Array(KnowledgeLink),
     grain: Array(String),
     time_roles: Array(edsl::TimeRoleBrief),
+    time_role: Option(edsl::TimeRoleBrief),
     dimension: Option(edsl::SubjectDimensionBrief),
     measure: Option(edsl::MeasureBrief),
     relation: Option(edsl::RelationBrief),
@@ -35,7 +37,7 @@ def traversable: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target
 
 def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(KnowledgeLink)) -> Point =
     fn(id, label, aliases, summary, refs) {
-        {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [],
+        {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [], time_role: None,
             dimension: None, measure: None, relation: None, metric: None, direction: None}
     };
 
@@ -47,6 +49,9 @@ def dataset_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Point = fn(p
     let id = target(edsl::KnowledgeKind::Dataset, "", brief.id);
     let dimensions = array::map(brief.dimension_ids, fn(name) {
         member(target(edsl::KnowledgeKind::Dimension, brief.id, name))
+    });
+    let fields = array::map(edsl::published_fields(payload, brief.id), fn(name) {
+        member(target(edsl::KnowledgeKind::Field, brief.id, name))
     });
     let measures = array::map(brief.measure_ids, fn(name) {
         member(target(edsl::KnowledgeKind::Measure, brief.id, name))
@@ -71,7 +76,7 @@ def dataset_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Point = fn(p
     }), fn(link) {
         member(target(edsl::KnowledgeKind::BusinessLink, payload.entities[link.hub].id, link.id))
     });
-    let refs = array::concat([dimensions, measures, metrics, times, relations, links]);
+    let refs = array::concat([fields, dimensions, measures, metrics, times, relations, links]);
     let item = point(id, brief.label, array::concat([brief.aliases, labels(brief.localized)]), brief.summary, refs);
     let entity = match array::find(payload.entities, fn(e) { e.id == brief.id }) {
         Some(e) => e, None => fail!("knowledge dataset disappeared from prepared model", brief.id),
@@ -96,14 +101,18 @@ def dimension_points: Fn(edsl::PreparedPayload, String, String) -> Array(Point) 
         member(target(edsl::KnowledgeKind::Value, detail.id, value.id))
     });
     let base = point(dimension, detail.label, array::concat([detail.aliases, labels(detail.localized)]),
-        detail.summary, array::concat([[member(parent)], value_refs]));
+        detail.summary, array::concat([[member(parent), member(target(edsl::KnowledgeKind::Field, detail.dataset, detail.field))], value_refs]));
     array::concat([[{...base, dimension: Some(detail), localized: detail.localized}], values])
 };
 
 def measure_point: Fn(edsl::PreparedPayload, String, String) -> Point = fn(payload, subject, id) {
     let detail = edsl::measure_domain_for_subject(payload, subject, id);
+    let field_refs = match detail.field {
+        Some(name) => [member(target(edsl::KnowledgeKind::Field, detail.dataset, name))], None => [],
+    };
     let refs = array::concat([
         [member(target(edsl::KnowledgeKind::Dataset, "", detail.dataset))],
+        field_refs,
         array::map(detail.required_dataset_ids, fn(dataset) {
             member(target(edsl::KnowledgeKind::Dataset, "", dataset))
         }),
@@ -134,6 +143,10 @@ def link_point: Fn(edsl::PreparedPayload, edsl::BusinessLinkEntry) -> Point = fn
 };
 
 def dataset_members: Fn(edsl::PreparedPayload, String, edsl::DatasetBrief) -> Array(Point) = fn(payload, subject, brief) {
+    let fields = array::map(edsl::published_fields(payload, brief.id), fn(name) {
+        point(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], "",
+            [member(target(edsl::KnowledgeKind::Dataset, "", brief.id))])
+    });
     let dimensions = array::flat_map(brief.dimension_ids, fn(id) { dimension_points(payload, subject, id) });
     let measures = array::map(brief.measure_ids, fn(id) { measure_point(payload, subject, id) });
     let relations = array::map(array::filter(payload.relations, fn(entry) {
@@ -145,20 +158,23 @@ def dataset_members: Fn(edsl::PreparedPayload, String, edsl::DatasetBrief) -> Ar
             [member(target(edsl::KnowledgeKind::Measure, brief.id, metric.id))]
         } else { [] };
         let base = point(target(edsl::KnowledgeKind::Metric, brief.id, metric.id), metric.id, [], "",
-            array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id))], measure_refs]));
+            array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id)),
+                member(target(edsl::KnowledgeKind::Field, brief.id, metric.field))], measure_refs]));
         {...base, metric: Some(metric)}
     }) });
     let times = array::map(brief.time_roles, fn(role) {
-        point(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], "",
-            array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id))],
+        let base = point(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], "",
+            array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id)),
+                member(target(edsl::KnowledgeKind::Field, brief.id, role.field))],
                 array::map(role.dimension_ids, fn(id) {
                     member(target(edsl::KnowledgeKind::Dimension, brief.id, id))
-                })]))
+                })]));
+        {...base, time_role: Some(role)}
     });
     let links = array::map(array::filter(payload.business_links, fn(link) {
         payload.entities[link.hub].id == brief.id
     }), fn(link) { link_point(payload, link) });
-    array::concat([dimensions, measures, relations, metric_points, times, links])
+    array::concat([fields, dimensions, measures, relations, metric_points, times, links])
 };
 
 def doc_text: Fn(edsl::PreparedPayload, edsl::KnowledgeTarget) -> Option(String) = fn(payload, id) {
@@ -292,6 +308,7 @@ def keys: Fn(Dict(Value), Array(String)) -> () = fn(fields, allowed) {
 def parse_kind: Fn(String) -> edsl::KnowledgeKind = fn(name) {
     match name {
         "dataset" => edsl::KnowledgeKind::Dataset,
+        "field" => edsl::KnowledgeKind::Field,
         "dimension" => edsl::KnowledgeKind::Dimension,
         "measure" => edsl::KnowledgeKind::Measure,
         "value" => edsl::KnowledgeKind::Value,
@@ -334,5 +351,9 @@ def serve: Fn(edsl::PreparedPayload, String, String, Value) -> KnowledgeResponse
     } else { fail!("unknown knowledge method for domain", method, domain) }
 };
 
+def serve_value: Fn(edsl::PreparedPayload, String, String, Value) -> Value = fn(payload, subject, domain, request) {
+    codec::encode(serve(payload, subject, domain, request))
+};
+
 pub use self::{ LinkKind, KnowledgeLink, Point, TopicEntry, DocResult, TopicPage, KnowledgeResponse,
-    map, topic_index, doc, by_target, page, serve };
+    map, topic_index, doc, by_target, page, serve, serve_value };

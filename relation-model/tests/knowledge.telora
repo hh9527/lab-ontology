@@ -2,7 +2,11 @@ use ontology::ontology as edsl;
 use ontology::knowledge as knowledge;
 use ontology::intent::{ query_intent_ast_factory };
 use ontology::query as qb;
+use ontology::sqlite as sqlite;
 use std::json as json;
+use std::codec as codec;
+use std::dict as dict;
+use std::value::{ Value };
 use std::array as array;
 use std::test as test;
 
@@ -23,6 +27,7 @@ def status_values: Array(edsl::CanonicalValueSpec) = [
 @edsl::dataset_alias("订单")
 @edsl::localized_dataset("zh-CN", "订单资料", "每个租户下的订单")
 @edsl::doc(order_status, "Status is the current lifecycle value")
+@edsl::doc({kind: edsl::KnowledgeKind::Field, owner: "order", id: "status"}, "Stored status field")
 @edsl::related_to(order_status, status_event)
 @edsl::related_to(order_status, unrelated)
 type Order = struct {
@@ -130,6 +135,26 @@ pub def declared_relation_is_navigable_but_related_doc_is_not: test::Test = test
     }
 });
 
+pub def discovered_relation_and_dimensions_lower_to_a_query: test::Test = test::should_ok(fn() {
+    let relation = knowledge::by_target(payload, "reader",
+        {kind: edsl::KnowledgeKind::Relation, owner: "status_event", id: "event_order"});
+    match relation {
+        knowledge::DocResult::Found(point) => if point.relation == None {
+            fail!("named relation detail is missing", point)
+        } else { () },
+        other => fail!("named relation cannot be discovered", other),
+    };
+    let ast = query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph", "root":"ev",
+        "nodes":[{"id":"ev","entity":"status_event"},{"id":"o","entity":"order"}],
+        "edges":[{"relation":"event_order","from":"ev","to":"o"}],
+        "select":[{"node":"ev","dimension":"event_time"},{"node":"o","dimension":"order_status"}]
+    }"#).unwrap!());
+    let query = sqlite::build_query(ast);
+    if query.bindings == [] { True }
+    else { fail!("discovered graph unexpectedly changed its bindings", query) }
+});
+
 pub def document_reference_does_not_make_a_query_relation: test::Test = test::should_fail_with(fn() {
     query_intent_ast_factory(payload, "reader")(json::parse(r#"{
         "op":"graph", "root":"o", "nodes":[{"id":"o","entity":"order"},{"id":"u","entity":"unrelated"}],
@@ -147,6 +172,38 @@ pub def every_visible_point_has_an_exact_topic_and_closed_references: test::Test
                 array::any(points, fn(other) { other.target == ref.target })
             })
     }) { True } else { fail!("a knowledge point is undiscoverable or references an invisible point") }
+});
+
+pub def published_field_is_distinct_from_dimension_and_hidden_column: test::Test = test::should_ok(fn() {
+    let points = knowledge::map(payload, "reader");
+    let field = {kind: edsl::KnowledgeKind::Field, owner: "order", id: "status"};
+    let hidden = {kind: edsl::KnowledgeKind::Field, owner: "order", id: "secret"};
+    let visible = array::find(points, fn(item) { item.target == field });
+    match visible {
+        Some(item) => if item.summary == "Stored status field"
+            && !array::any(points, fn(other) { other.target == hidden })
+            && array::any(points, fn(other) {
+                other.target == order_status && array::any(other.refs, fn(ref) { ref.target == field })
+            }) { True }
+            else { fail!("knowledge field is hidden or the private column leaked", item) },
+        None => fail!("published field missing from map"),
+    }
+});
+
+pub def event_time_role_retains_authoritative_clock_semantics: test::Test = test::should_ok(fn() {
+    let id = {kind: edsl::KnowledgeKind::TimeRole, owner: "status_event", id: "occurred_at"};
+    match knowledge::by_target(payload, "reader", id) {
+        knowledge::DocResult::Found(item) => match item.time_role {
+            Some(role) => if role.authoritative && role.semantics == edsl::TimeSemantics::Utc
+                && role.encoding == edsl::TimeEncoding::CanonicalUtcSecondText
+                && array::any(item.refs, fn(ref) {
+                    ref.target == {kind: edsl::KnowledgeKind::Field, owner: "status_event", id: "occurred_at"}
+                }) { True }
+                else { fail!("time role lost clock semantics or its field", item) },
+            None => fail!("time role details were not preserved", item),
+        },
+        other => fail!("event time role is undiscoverable", other),
+    }
 });
 
 pub def localized_topic_preserves_locale: test::Test = test::should_ok(fn() {
@@ -175,6 +232,46 @@ pub def service_index_pages_and_navigates_a_disambiguated_target: test::Test = t
                 && item.target == order_status { True }
             else { fail!("index pagination or target navigation failed", a, b, item) },
         other => fail!("unexpected service response", other),
+    }
+});
+
+pub def service_response_round_trips_through_json: test::Test = test::should_ok(fn() {
+    let result = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+        "method":"doc.foo", "input":{"topic":"订单状态"}
+    }"#).unwrap!());
+    let round_trip = json::parse(json::stringify(result)).unwrap!();
+    match codec::decode@[knowledge::KnowledgeResponse](round_trip).unwrap!() {
+        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Candidates(items)) =>
+            if array::length(items) == 2 && array::any(items, fn(item) { item.target == order_status }) {
+                True
+            } else { fail!("serialized knowledge response lost disambiguation", items) },
+        other => fail!("service response cannot be transported as JSON", other),
+    }
+});
+
+pub def service_response_has_stable_json_envelope: test::Test = test::should_ok(fn() {
+    let ambiguous = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+        "method":"doc.foo", "input":{"topic":"订单状态"}
+    }"#).unwrap!());
+    let missing = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+        "method":"doc.foo", "input":{"topic":"not-a-topic"}
+    }"#).unwrap!());
+    let index = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+        "method":"index.foo", "input":{"limit":1}
+    }"#).unwrap!());
+    match (ambiguous, missing, index) {
+        (Value::Object(a), Value::Object(b), Value::Object(c)) =>
+            match (dict::get(a, "Document"), dict::get(b, "Document"), dict::get(c, "Index")) {
+                (Some(Value::Object(candidate)), Some(Value::String("NotFound")), Some(Value::Object(page))) =>
+                    match (dict::get(candidate, "Candidates"), dict::get(page, "entries"), dict::get(page, "next_offset")) {
+                        (Some(Value::Array(items)), Some(Value::Array(entries)), Some(Value::Int(1))) =>
+                            if array::length(items) == 2 && array::length(entries) == 1 { True }
+                            else { fail!("knowledge response envelope lost candidates or page", items, entries) },
+                        other => fail!("knowledge response payload changed", other),
+                    },
+                other => fail!("knowledge response variant envelope changed", other),
+            },
+        other => fail!("knowledge responses are not JSON objects", other),
     }
 });
 
