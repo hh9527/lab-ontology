@@ -3926,21 +3926,24 @@ def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(
     fn(ctx, payload, request, instances, spec) {
         if !array::any(request.measures, fn(item) { item.node == spec.node && item.measure == spec.measure }) {
             fail!("graph aggregate top must reference a projected measure on its named node", spec.node, spec.measure)
-        } else if request.group_by_identity != [request.root]
-            || array::any(request.select, fn(item) { item.node != request.root }) {
-            fail!("graph aggregate top requires the root owner in group_by_identity and only root dimensions in select", request.root)
+        } else if !(request.group_by_identity == [request.root]
+            && array::all(request.select, fn(item) { item.node == request.root }))
+            && !graph_contextual_measure_grain(payload, request, spec.node) {
+            fail!("graph aggregate top requires complete root identity with root-only dimensions, or proven context and owner identities for a contextual measure", request.root, spec.node)
         } else if spec.take <= 0 || spec.take > qb::max_partition_take {
             fail!("graph aggregate top take must be positive and within the declared bound", spec.take)
         } else {
-            let owner = graph_instance(instances, request.root);
-            let entity = get_index(payload.entities, owner.entity);
             let alias = `\{spec.node}_\{spec.measure}`;
             let ranked = if spec.direction == qb::Ordering::Desc {
                 qb::desc_aggregate(alias)
             } else { qb::asc_aggregate(alias) };
-            let ordering = array::concat([[ranked], array::map(graph_identity_columns(entity, request.root), fn(column) {
-                qb::asc(qb::column(owner.source, column))
-            })]);
+            let ordering = array::fold(request.group_by_identity, [ranked], fn(ordered, id) {
+                let instance = graph_instance(instances, id);
+                let entity = get_index(payload.entities, instance.entity);
+                array::concat([ordered, array::map(graph_identity_columns(entity, id), fn(column) {
+                    qb::asc(qb::column(instance.source, column))
+                })])
+            });
             let limit = qb::take_bound(ctx, spec.take);
             (limit.0, ordering, limit.1)
         }
