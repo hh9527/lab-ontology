@@ -294,14 +294,76 @@ def topic_index: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(pay
     topic_index_from_points(map(payload, subject))
 };
 
+def named_topics: Fn(edsl::KnowledgeTarget, String, Array(String), Array(edsl::LocalizedKnowledgeText)) -> Array(TopicEntry) =
+    fn(id, label, aliases, localized) {
+        let names = array::concat([[id.id, label], aliases]);
+        array::map(array::filter(array::enumerate(names), fn(indexed) {
+            indexed.1 != "" && !array::any(array::filter(array::enumerate(names), fn(other) {
+                other.0 < indexed.0
+            }), fn(other) { other.1 == indexed.1 })
+        }), fn(indexed) {
+            let locale = match array::find(localized, fn(text) { text.label == indexed.1 }) {
+                Some(text) => Some(text.locale), None => None,
+            };
+            {topic: indexed.1, target: id, label, owner: id.owner, locale}
+        })
+    };
+
 # Lightweight request index; the service's index slot validates the full
 # catalog and reference closure once at initialization.
 def topic_index_from_model: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(payload, subject) {
     let datasets = edsl::knowledge_index_for_subject(payload, subject);
-    topic_index_from_points(array::concat([
-        array::map(datasets, fn(brief) { dataset_point(payload, brief) }),
-        array::flat_map(datasets, fn(brief) { dataset_members(payload, subject, brief) }),
-    ]))
+    let roots = array::flat_map(datasets, fn(brief) {
+        named_topics(target(edsl::KnowledgeKind::Dataset, "", brief.id), brief.label,
+            array::concat([brief.aliases, labels(brief.localized)]), brief.localized)
+    });
+    let members = array::flat_map(datasets, fn(brief) {
+        let fields = array::flat_map(edsl::published_fields(payload, brief.id), fn(name) {
+            named_topics(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], [])
+        });
+        let dimensions = array::flat_map(brief.dimension_ids, fn(id) {
+            let detail = edsl::dimension_detail_for_subject(payload, subject, id);
+            let base = named_topics(target(edsl::KnowledgeKind::Dimension, brief.id, id), detail.label,
+                array::concat([detail.aliases, labels(detail.localized)]), detail.localized);
+            let values = array::flat_map(detail.values, fn(value) {
+                let localized = array::map(value.localized, fn(text) {
+                    let item: edsl::LocalizedKnowledgeText = {locale: text.locale, label: text.label, summary: ""};
+                    item
+                });
+                named_topics(target(edsl::KnowledgeKind::Value, id, value.id), value.label,
+                    array::concat([value.aliases, labels(localized)]), localized)
+            });
+            array::concat([base, values])
+        });
+        let measures = array::flat_map(brief.measure_ids, fn(id) {
+            let detail = edsl::measure_domain_for_subject(payload, subject, id);
+            named_topics(target(edsl::KnowledgeKind::Measure, brief.id, id), detail.label,
+                array::concat([detail.aliases, labels(detail.localized)]), detail.localized)
+        });
+        let relations = array::flat_map(array::filter(payload.relations, fn(entry) {
+            entry.id != "" && payload.entities[entry.from].id == brief.id
+        }), fn(entry) {
+            let detail = edsl::relation_detail_for_subject(payload, subject, entry.id);
+            named_topics(target(edsl::KnowledgeKind::Relation, brief.id, entry.id), detail.label,
+                array::concat([detail.aliases, labels(detail.localized)]), detail.localized)
+        });
+        let entity = match array::find(payload.entities, fn(entry) { entry.id == brief.id }) {
+            Some(entry) => entry, None => fail!("knowledge dataset disappeared from prepared model", brief.id),
+        };
+        let metrics = array::flat_map(entity.metrics, fn(metric) {
+            named_topics(target(edsl::KnowledgeKind::Metric, brief.id, metric.id), metric.id, [], [])
+        });
+        let times = array::flat_map(brief.time_roles, fn(role) {
+            named_topics(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], [])
+        });
+        let links = array::flat_map(array::filter(payload.business_links, fn(link) {
+            payload.entities[link.hub].id == brief.id
+        }), fn(link) {
+            named_topics(target(edsl::KnowledgeKind::BusinessLink, brief.id, link.id), link.id, [], [])
+        });
+        array::concat([fields, dimensions, measures, relations, metrics, times, links])
+    });
+    array::concat([roots, members])
 };
 
 def prepare_catalog: Fn(edsl::PreparedPayload, String) -> Catalog = fn(payload, subject) {

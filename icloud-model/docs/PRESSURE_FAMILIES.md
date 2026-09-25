@@ -129,6 +129,17 @@ exceeded the runtime's single growth-operation limit. Small-model tests compare
 all topic entries and exact document output against the validated catalog;
 IC tests cover dataset, relation and filtered-measure details.
 
+With the expanded IC pressure model, a later measurement of `doc.ic` for
+topic `device` consumed 95.6 million request fuel and 19.1 MiB linear memory.
+Generating TopicEntry values directly from Prepared Model briefs rather than
+first materializing every detailed Point reduced that request to 68.3 million
+fuel and 10.4 MiB without changing the exact topic sequence, aliases, locale
+or candidates. The IC full-index equivalence test needs a 128 MiB test memory
+limit because it builds the validated and lightweight indexes simultaneously;
+ordinary `doc.ic` still runs within 64 MiB. Moving even the lightweight
+topic array into DocService initialization continues to hit the runtime's
+single growth-operation limit, so it remains request-local.
+
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes
 only when its representative intent has a valid Model-backed plan, adjacent
