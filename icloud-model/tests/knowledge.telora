@@ -25,21 +25,28 @@ pub def ic_device_kpi_measure_is_discoverable: test::Test = test::should_ok(fn()
     }
 });
 
-def kpi_measure_doc: Fn(String) -> edsl::MeasureBrief = fn(id) {
-    let input = Value::Object({target: Value::Object({kind: Value::String("measure"),
-        owner: Value::String("device_kpi"), id: Value::String(id)})});
+def kpi_measure_doc: Fn(String, String) -> edsl::MeasureBrief = fn(topic, id) {
+    let input = Value::Object({topic: Value::String(topic)});
     let document = knowledge::knowledge_method_factory(payload, "public", "ic", "doc.ic")(input);
     match codec::decode@[knowledge::KnowledgeResponse](document).unwrap!() {
-        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) => match point.measure {
-            Some(measure) => measure,
-            None => fail!("KPI document has no measure detail", id),
-        },
+        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
+            if point.target.kind != edsl::KnowledgeKind::Measure || point.target.owner != "device_kpi"
+                || point.target.id != id {
+                fail!("KPI topic resolved to another knowledge point", id, point.target)
+            } else { match point.measure {
+                Some(measure) => measure,
+                None => fail!("KPI document has no measure detail", id),
+            } },
+        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Candidates(candidates)) =>
+            fail!("KPI topic has multiple knowledge targets", id, array::map(candidates, fn(item) { item.target })),
+        knowledge::KnowledgeResponse::Document(knowledge::DocResult::NotFound) =>
+            fail!("KPI topic is not indexed", id),
         _ => fail!("KPI measure is not discoverable by doc.ic", id),
     }
 };
 
 pub def published_port_total_is_discoverable_as_sum: test::Test = test::should_ok(fn() {
-    let measure = kpi_measure_doc("port_count");
+    let measure = kpi_measure_doc("Total port count", "port_count");
     match measure.metric {
         Some(metric) => if measure.aggregate == Some(qb::AggregateFunction::Sum)
             && metric.role == edsl::MetricValueRole::DeclaredMetric { True }
@@ -49,7 +56,7 @@ pub def published_port_total_is_discoverable_as_sum: test::Test = test::should_o
 });
 
 pub def port_sample_average_is_discoverable_as_distinct_summary: test::Test = test::should_ok(fn() {
-    let measure = kpi_measure_doc("port_count_sample_avg");
+    let measure = kpi_measure_doc("Average port-count sample", "port_count_sample_avg");
     match measure.metric {
         Some(metric) => if measure.aggregate == Some(qb::AggregateFunction::Avg)
             && metric.role == edsl::MetricValueRole::SampleSummary
@@ -60,12 +67,27 @@ pub def port_sample_average_is_discoverable_as_distinct_summary: test::Test = te
 });
 
 pub def memory_usage_is_discoverable_as_declared_average: test::Test = test::should_ok(fn() {
-    let measure = kpi_measure_doc("memory_usage");
+    let measure = kpi_measure_doc("Average memory usage", "memory_usage");
     match measure.metric {
         Some(metric) => if measure.aggregate == Some(qb::AggregateFunction::Avg)
             && metric.role == edsl::MetricValueRole::DeclaredMetric
             && string::contains(measure.summary, "eligible device KPI samples") { True }
         else { fail!("declared memory usage lost Avg role", measure) },
         None => fail!("declared memory usage lost its role"),
+    }
+});
+
+pub def ambiguous_port_count_topic_returns_repairable_candidates: test::Test = test::should_ok(fn() {
+    let input = Value::Object({topic: Value::String("port_count")});
+    let document = knowledge::knowledge_method_factory(payload, "public", "ic", "doc.ic")(input);
+    match codec::decode@[knowledge::KnowledgeResponse](document).unwrap!() {
+        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Candidates(candidates)) =>
+            if array::any(candidates, fn(item) {
+                item.target.kind == edsl::KnowledgeKind::Measure && item.target.owner == "device_kpi"
+                    && item.target.id == "port_count" && item.label == "Total port count"
+            }) && array::any(candidates, fn(item) { item.target.kind == edsl::KnowledgeKind::Metric })
+                && array::any(candidates, fn(item) { item.target.kind == edsl::KnowledgeKind::Field }) { True }
+            else { fail!("ambiguous topic omitted the measure label or conflicting knowledge kinds", candidates) },
+        other => fail!("bare port_count must return exact-match candidates, not pick a measure", other),
     }
 });
