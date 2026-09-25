@@ -1,5 +1,18 @@
 # Corpus pressure families (first pass)
 
+The relation-first graph Intent now supports `constraints` between already
+introduced named nodes, both at the outer graph and inside correlated EXISTS.
+Unlike `edges`, these do not introduce joins: lowering resolves the complete
+declared relation key into a closed predicate. The alarm/server/fan pressure
+case uses the Safe alarm-to-server composite identity and a fan-to-server
+FanOut match, then constrains the fan and server to the same Tenant node inside
+EXISTS. Wrong relation roles, disconnected nodes, and constraints that would
+turn `include_empty` into a nonempty population are rejected. The IC physical
+keys, including component tenant ownership, remain pressure-model contracts
+until verified against production mapping and identity scope. The physical
+link's two A/Z relations also declare an undirected business peer connection;
+either endpoint can be the querying device without making A/Z directional.
+
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,
 separate explicit UTC windows and the complete `(id, tenant_id)` identity.

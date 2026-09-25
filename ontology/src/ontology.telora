@@ -321,12 +321,13 @@ type GraphSelect = struct { node: String, dimension: String };
 type GraphMeasureSelect = struct { node: String, measure: String };
 type GraphFilter = struct { node: String, request: FilterRequest };
 type GraphHaving = struct { node: String, measure: String, op: FilterOp, threshold: FilterInput };
-type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), filters: Array(GraphFilter), having: Array(GraphHaving), negated: Bool };
+type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), constraints: Array(GraphEdge), filters: Array(GraphFilter), having: Array(GraphHaving), negated: Bool };
 type GraphTopPer = struct { owner: String, sample: String, rank: String, take: Int };
 type GraphRequest = struct {
     root: String,
     nodes: Array(GraphNode),
     edges: Array(GraphEdge),
+    constraints: Array(GraphEdge),
     select: Array(GraphSelect),
     measures: Array(GraphMeasureSelect),
     filters: Array(GraphFilter),
@@ -3181,6 +3182,39 @@ def graph_instance: Fn(Array(GraphInstance), String) -> GraphInstance = fn(insta
     }
 };
 
+def graph_constraint_key: Fn(PreparedPayload, RelationEntry, qb::Source, qb::Source, RelationKey) -> qb::Expr =
+    fn(payload, relation, from_source, to_source, key) {
+        match key {
+            RelationKey::Eq(pair) => do {
+                let from_field = get_index(get_index(payload.entities, relation.from).fields, pair.from);
+                let to_field = get_index(get_index(payload.entities, relation.to).fields, pair.to);
+                qb::scalar(qb::ScalarFunction::Eq, [qb::column(from_source, from_field.column),
+                    qb::column(to_source, to_field.column)])
+            },
+            RelationKey::FieldEq(_) => fail!("unresolved graph constraint key", relation.id),
+            RelationKey::And(parts) => qb::scalar(qb::ScalarFunction::And,
+                array::map(parts, fn(part) { graph_constraint_key(payload, relation, from_source, to_source, part) })),
+            RelationKey::Or(parts) => qb::scalar(qb::ScalarFunction::Or,
+                array::map(parts, fn(part) { graph_constraint_key(payload, relation, from_source, to_source, part) })),
+        }
+    };
+
+def graph_constraints: Fn(PreparedPayload, Array(GraphInstance), Array(GraphEdge)) -> Array(qb::Expr) =
+    fn(payload, instances, edges) {
+        array::map(edges, fn(edge) {
+            if edge.from == edge.to { fail!("graph constraint requires two distinct named nodes", edge) }
+            else {
+                let from = graph_instance(instances, edge.from);
+                let to = graph_instance(instances, edge.to);
+                let relation = relation_domain(payload, edge.relation);
+                if relation.from != from.entity || relation.to != to.entity {
+                    fail!("graph constraint relation does not match its named node roles", edge,
+                        payload.entities[relation.from].id, payload.entities[relation.to].id)
+                } else { graph_constraint_key(payload, relation, from.source, to.source, relation.key) }
+            }
+        })
+    };
+
 def graph_filters: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array(GraphFilter)) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, instances, filters) {
     let built = array::fold(filters, (ctx, []), fn(state, spec) {
         let instance = graph_instance(instances, spec.node);
@@ -3267,6 +3301,7 @@ def graph_correlation_alternatives: Fn(PreparedPayload, RelationEntry, qb::Sourc
 
 def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, anchor, spec, link) {
     if array::length(spec.edges) == 0 { fail!("business link existence requires an edge", link.id) }
+    else if array::length(spec.constraints) > 0 { fail!("business link existence cannot attach graph constraints to implicit link nodes", link.id) }
     else if array::length(spec.having) > 0 { fail!("graph aggregate existence requires a single Safe sample-to-owner relation", link.id) }
     else {
         let edge = get_index(spec.edges, 0);
@@ -3497,7 +3532,8 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Gra
         let exists = if array::length(built.2) == 1 {
             qb::exists_path(first, get_index(built.2, 0), built.3)
         } else { qb::exists_path_alternatives(first, built.2, built.3) };
-        let exists = {...exists, filter: filtered.1, grouping: grouped, having: aggregate.1};
+        let constrained = append_filter_terms(filtered.1, graph_constraints(payload, built.1, spec.constraints));
+        let exists = {...exists, filter: constrained, grouping: grouped, having: aggregate.1};
         (aggregate.0, if spec.negated { qb::exists_not(exists) } else { exists })
             },
         }
@@ -3675,6 +3711,8 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
     } else if request.include_empty && array::length(request.measures) > 0 {
         fail!("graph measure projection does not support an empty related population")
+    } else if request.include_empty && array::length(request.constraints) > 0 {
+        fail!("graph include_empty cannot apply constraint edges in WHERE without changing empty populations")
     } else if request.top_per != None && array::length(request.measures) > 0 {
         fail!("graph measure projection cannot rank raw rows with top_per")
     } else if let Some(unknown) = array::find(request.group_by_identity, fn(id) {
@@ -3886,8 +3924,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 },
                 None => (existential.0, None),
             };
+            let constrained = append_filter_terms(filtered.1, graph_constraints(payload, built.1, request.constraints));
             let plan: qb::Plan = {
-                revision: payload.revision, sources, derived: None, projection, filter: filtered.1,
+                revision: payload.revision, sources, derived: None, projection, filter: constrained,
                 exists: existential.1, joins: built.2, grouping, having: [], ordering: [],
                 limit: None, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };

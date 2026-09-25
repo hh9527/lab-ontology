@@ -116,3 +116,95 @@ pub def measure_projection_rejects_ambiguous_combined_count: test::Test = test::
         "measures":[{"node":"device","measure":"device_count"}]
     }"#).unwrap!())
 }, "graph cannot combine row count with measure projection; choose one aggregation grain");
+
+pub def ic_physical_link_peer_is_traversable_from_both_endpoints: test::Test = test::should_ok(fn() {
+    let from_a = lower(json::parse(r#"{
+        "op":"graph", "root":"a", "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"physical_link_peer_device","from":"a","to":"z"}],
+        "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!());
+    let from_z = lower(json::parse(r#"{
+        "op":"graph", "root":"z", "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"physical_link_peer_device","from":"a","to":"z"}],
+        "select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!());
+    if string::contains(from_a.sql, "a_ne_res_id") && string::contains(from_a.sql, "z_ne_res_id")
+        && string::contains(from_a.sql, "tenantId") && string::contains(from_a.sql, " OR ")
+        && string::contains(from_z.sql, " OR ") { True }
+    else { fail!("IC bidirectional link lost A/Z or tenant ownership", from_a.sql, from_z.sql) }
+});
+
+pub def ic_peer_does_not_accept_an_unrelated_endpoint_relation: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"a", "nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],
+        "edges":[{"relation":"physical_link_belongs_to_tenant","from":"a","to":"z"}],
+        "select":[{"node":"z","dimension":"device_id"}]
+    }"#).unwrap!())
+}, "graph edge role or target does not match declared relation");
+
+pub def alarm_server_component_requires_shared_tenant: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
+        "op":"graph", "root":"alarm",
+        "nodes":[{"id":"alarm","entity":"current_alarm"},{"id":"server","entity":"server_device"}],
+        "edges":[{"relation":"server_current_alarm","from":"alarm","to":"server"}],
+        "select":[{"node":"alarm","dimension":"alarm_csn"}],
+        "exists":[{"anchor":"server",
+            "nodes":[{"id":"fan","entity":"server_fan"},{"id":"tenant","entity":"tenant"}],
+            "edges":[{"relation":"fan_parent_server","from":"fan","to":"server"},
+                     {"relation":"server_belongs_to_tenant","from":"server","to":"tenant"}],
+            "constraints":[{"relation":"fan_belongs_to_tenant","from":"fan","to":"tenant"}],
+            "filters":[{"node":"fan","dimension":"server_fan_manufacturer","op":"eq","kind":"text","value":"Huawei"}]
+        }]
+    }"#).unwrap!());
+    if string::contains(query.sql, "alarm.MEDN = server.id")
+        && string::contains(query.sql, "alarm.TENANTID = server.tenantId")
+        && string::contains(query.sql, "server.oriResId = fan.parentResId")
+        && string::contains(query.sql, "server.tenantId = tenant.TENANT_ID")
+        && string::contains(query.sql, "fan.tenantId = tenant.TENANT_ID") { True }
+    else { fail!(`component qualification lost tenant alignment: \{query.sql}`, query.bindings) }
+});
+
+pub def alarm_component_rejects_wrong_constraint_role: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"alarm",
+        "nodes":[{"id":"alarm","entity":"current_alarm"},{"id":"server","entity":"server_device"}],
+        "edges":[{"relation":"server_current_alarm","from":"alarm","to":"server"}],
+        "select":[{"node":"alarm","dimension":"alarm_csn"}],
+        "exists":[{"anchor":"server",
+            "nodes":[{"id":"fan","entity":"server_fan"},{"id":"tenant","entity":"tenant"}],
+            "edges":[{"relation":"fan_parent_server","from":"fan","to":"server"},
+                     {"relation":"server_belongs_to_tenant","from":"server","to":"tenant"}],
+            "constraints":[{"relation":"device_belongs_to_tenant","from":"fan","to":"tenant"}]
+        }]
+    }"#).unwrap!())
+}, "graph constraint relation does not match its named node roles");
+
+pub def constraint_rejects_unknown_node: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"server", "nodes":[{"id":"server","entity":"server_device"}],
+        "edges":[], "select":[], "count":"server",
+        "constraints":[{"relation":"server_belongs_to_tenant","from":"server","to":"missing"}]
+    }"#).unwrap!())
+}, "graph node is not connected to the root");
+
+pub def outer_constraint_preserves_named_relation_key: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
+        "op":"graph", "root":"server",
+        "nodes":[{"id":"server","entity":"server_device"},{"id":"tenant","entity":"tenant"}],
+        "edges":[{"relation":"server_belongs_to_tenant","from":"server","to":"tenant"}],
+        "constraints":[{"relation":"server_belongs_to_tenant","from":"server","to":"tenant"}],
+        "select":[{"node":"server","dimension":"server_name"}]
+    }"#).unwrap!());
+    if string::contains(query.sql, "WHERE server.tenantId = tenant.TENANT_ID") { True }
+    else { fail!(`outer constraint did not materialize its named key: \{query.sql}`) }
+});
+
+pub def empty_population_rejects_where_constraint: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"server",
+        "nodes":[{"id":"server","entity":"server_device"},{"id":"tenant","entity":"tenant"}],
+        "edges":[{"relation":"server_belongs_to_tenant","from":"server","to":"tenant"}],
+        "constraints":[{"relation":"server_belongs_to_tenant","from":"server","to":"tenant"}],
+        "include_empty":true, "select":[{"node":"server","dimension":"server_name"}]
+    }"#).unwrap!())
+}, "graph include_empty cannot apply constraint edges in WHERE without changing empty populations");
