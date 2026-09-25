@@ -50,6 +50,15 @@ tie-breakers. This ranking is distinct from latest-by-UTC-clock. Canonical,
 enum and Boolean dimensions have no declared business order and are rejected
 as ranks, with a repair-oriented diagnostic. The Q0401-style probe checks the
 ranking shape, not the full site, tenant or time-window conditions.
+Aggregate TOP is a different grain: Q0065-Q0067-style questions rank *owners*
+after averaging or summing their eligible samples. `top_by_measure` orders by
+an already selected Model measure, requires full root-owner identity grouping
+and root-only visible dimensions, then binds a capped LIMIT; complete owner
+keys stabilize ties. IC's Device CPU Avg probe supplies its UTC window
+externally and checks both SQLite and PostgreSQL. Missing owner identity, a
+measure not projected from its named node, sample-level dimensions and an
+out-of-range take are diagnosed. This does not infer a server/AP metric or a
+clock anchor.
 
 The reconnected relation-first `icloud-model/tests/graph.telora` checks two
 independent Device KPI qualifications with correlated aggregate EXISTS,

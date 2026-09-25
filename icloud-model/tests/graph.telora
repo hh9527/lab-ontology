@@ -104,6 +104,77 @@ pub def qualified_device_observes_an_independent_kpi_window: test::Test = test::
     else { fail!(`qualified KPI observation lost measure grain or window: \{query.sql}`, query.bindings) }
 });
 
+pub def top_devices_by_declared_cpu_average_keep_full_identity: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{
+        "op":"graph", "root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "group_by_identity":["device"],
+        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge",
+                    "kind":"text","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt",
+                    "kind":"text","value":"2025-01-08 00:00:00"}],
+        "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":5}
+    }"#).unwrap!();
+    let ast = query_intent_ast_factory(payload, "public")(intent);
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "GROUP BY device.name, device.id, device.tenant_id")
+        && string::contains(sq.sql, "ORDER BY avg(sample.cpuUsage) DESC, device.id ASC, device.tenant_id ASC LIMIT ?3")
+        && string::contains(pg.sql, "ORDER BY avg(\"sample\".\"cpuUsage\") DESC NULLS LAST")
+        && sq.bindings == [qb::Val::String("2025-01-01 00:00:00"),
+            qb::Val::String("2025-01-08 00:00:00"), qb::Val::Int(5)]
+        && pg.bindings == sq.bindings { True }
+    else { fail!("aggregate top-five lost device identity or external window", sq, pg) }
+});
+
+pub def aggregate_top_requires_owner_identity: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":5}
+    }"#).unwrap!())
+}, "graph aggregate top requires the root owner in group_by_identity");
+
+pub def aggregate_top_rejects_unprojected_measure: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}], "group_by_identity":["device"],
+        "top_by_measure":{"node":"sample","measure":"port_count_peak","direction":"desc","take":5}
+    }"#).unwrap!())
+}, "graph aggregate top must reference a projected measure on its named node");
+
+pub def aggregate_top_rejects_sample_dimension_projection: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"sample","dimension":"device_kpi_ts_raw"}],
+        "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "group_by_identity":["device"],
+        "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":5}
+    }"#).unwrap!())
+}, "graph aggregate top requires the root owner in group_by_identity and only root dimensions in select");
+
+pub def aggregate_top_rejects_unbounded_take: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph", "root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[], "measures":[{"node":"sample","measure":"cpu_usage"}],
+        "group_by_identity":["device"],
+        "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":1001}
+    }"#).unwrap!())
+}, "graph aggregate top take must be positive and within the declared bound");
+
 pub def port_kpi_threshold_groups_samples_per_port: test::Test = test::should_ok(fn() {
     let query = lower(port_kpi_intent());
     if string::contains(query.sql, "EXISTS (SELECT 1 FROM I_EnterpriseNetworkLTP AS port")

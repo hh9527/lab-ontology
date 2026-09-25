@@ -324,6 +324,7 @@ type GraphAnyOf = struct { node: String, dimension: String, values: Array(Filter
 type GraphHaving = struct { node: String, measure: String, op: FilterOp, threshold: FilterInput };
 type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), constraints: Array(GraphEdge), filters: Array(GraphFilter), any_of: Array(GraphAnyOf), having: Array(GraphHaving), negated: Bool };
 type GraphTopPer = struct { owner: String, sample: String, rank: String, take: Int };
+type GraphTopMeasure = struct { node: String, measure: String, direction: qb::Ordering, take: Int };
 type GraphRequest = struct {
     root: String,
     nodes: Array(GraphNode),
@@ -338,6 +339,7 @@ type GraphRequest = struct {
     include_empty: Bool,
     group_by_identity: Array(String),
     top_per: Option(GraphTopPer),
+    top_by_measure: Option(GraphTopMeasure),
 };
 
 # Filter operations. Comparison ops map to the closed query scalars
@@ -3763,6 +3765,30 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
     }
 };
 
+def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphTopMeasure) -> (qb::BuildCtx, Array(qb::OrderBy), qb::Expr) =
+    fn(ctx, payload, request, instances, spec) {
+        if !array::any(request.measures, fn(item) { item.node == spec.node && item.measure == spec.measure }) {
+            fail!("graph aggregate top must reference a projected measure on its named node", spec.node, spec.measure)
+        } else if request.group_by_identity != [request.root]
+            || array::any(request.select, fn(item) { item.node != request.root }) {
+            fail!("graph aggregate top requires the root owner in group_by_identity and only root dimensions in select", request.root)
+        } else if spec.take <= 0 || spec.take > qb::max_partition_take {
+            fail!("graph aggregate top take must be positive and within the declared bound", spec.take)
+        } else {
+            let owner = graph_instance(instances, request.root);
+            let entity = get_index(payload.entities, owner.entity);
+            let alias = `\{spec.node}_\{spec.measure}`;
+            let ranked = if spec.direction == qb::Ordering::Desc {
+                qb::desc_aggregate(alias)
+            } else { qb::asc_aggregate(alias) };
+            let ordering = array::concat([[ranked], array::map(graph_identity_columns(entity, request.root), fn(column) {
+                qb::asc(qb::column(owner.source, column))
+            })]);
+            let limit = qb::take_bound(ctx, spec.take);
+            (limit.0, ordering, limit.1)
+        }
+    };
+
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
@@ -3783,6 +3809,8 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         fail!("graph include_empty cannot apply constraint edges in WHERE without changing empty populations")
     } else if request.include_empty && array::length(request.any_of) > 0 {
         fail!("graph include_empty cannot apply any_of in WHERE without changing empty populations")
+    } else if request.top_per != None && request.top_by_measure != None {
+        fail!("graph cannot combine raw-sample top_per with aggregate top_by_measure")
     } else if request.top_per != None && array::length(request.measures) > 0 {
         fail!("graph measure projection cannot rank raw rows with top_per")
     } else if let Some(unknown) = array::find(request.group_by_identity, fn(id) {
@@ -3999,14 +4027,21 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 None => (existential.0, None),
             };
             let alternatives = graph_any_of(partitioned.0, payload, subject, built.1, request.any_of);
+            let top = match request.top_by_measure {
+                Some(spec) => do {
+                    let ranked = graph_top_by_measure(alternatives.0, payload, request, built.1, spec);
+                    (ranked.0, ranked.1, Some(ranked.2))
+                },
+                None => (alternatives.0, [], None),
+            };
             let constrained = append_filter_terms(filtered.1,
                 array::concat([alternatives.1, graph_constraints(payload, built.1, request.constraints)]));
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: constrained,
-                exists: existential.1, joins: built.2, grouping, having: [], ordering: [],
-                limit: None, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
+                exists: existential.1, joins: built.2, grouping, having: [], ordering: top.1,
+                limit: top.2, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
-            (alternatives.0, qb::validate(plan, payload.profile))
+            (top.0, qb::validate(plan, payload.profile))
         }
     }
 };
@@ -4073,6 +4108,7 @@ pub use self::{
     GraphAnyOf,
     GraphHaving,
     GraphTopPer,
+    GraphTopMeasure,
     GraphExist,
     GraphRequest,
     FilterOp,
