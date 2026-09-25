@@ -3380,16 +3380,18 @@ def retarget_inner_expr: Fn(qb::Expr, String, String) -> qb::Expr = fn(expr, pre
     }
 };
 
-def graph_nullable_source: Fn(qb::BuildCtx, PreparedPayload, EntityEntry, GraphNode, Array(GraphFilter)) -> (qb::BuildCtx, qb::Source) = fn(ctx, payload, entity, node, filters) {
+def graph_nullable_source: Fn(qb::BuildCtx, PreparedPayload, String, EntityEntry, GraphNode, Array(GraphFilter), Array(GraphAnyOf)) -> (qb::BuildCtx, qb::Source) = fn(ctx, payload, subject, entity, node, filters, groups) {
     let allocated = entity_source_at_with_context(ctx, payload, entity, node.id);
     let instance: GraphInstance = {id: node.id, entity: entity.index, source: allocated.1};
     let selected = array::filter(filters, fn(item) { item.node == node.id });
     let filtered = graph_filters(allocated.0, payload, [instance], selected);
+    let alternatives = graph_any_of(filtered.0, payload, subject, [instance],
+        array::filter(groups, fn(item) { item.node == node.id }));
     let combined = match filtered.1 {
-        Some(expr) => append_filter_terms(allocated.1.scope, [expr]),
-        None => allocated.1.scope,
+        Some(expr) => append_filter_terms(allocated.1.scope, array::concat([[expr], alternatives.1])),
+        None => append_filter_terms(allocated.1.scope, alternatives.1),
     };
-    (filtered.0, {...allocated.1, scope: combined})
+    (alternatives.0, {...allocated.1, scope: combined})
 };
 
 # EXISTS correlations require equality pairs, with the outer/hop source on the
@@ -4130,8 +4132,6 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         fail!("graph measure projection does not support an empty related population")
     } else if request.include_empty && array::length(request.constraints) > 0 {
         fail!("graph include_empty cannot apply constraint edges in WHERE without changing empty populations")
-    } else if request.include_empty && array::length(request.any_of) > 0 {
-        fail!("graph include_empty cannot apply any_of in WHERE without changing empty populations")
     } else if request.top_per != None && request.top_by_measure != None {
         fail!("graph cannot combine raw-sample top_per with aggregate top_by_measure")
     } else if request.top_per != None && array::length(request.measures) > 0 {
@@ -4148,6 +4148,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
     else if let Some(unknown) = array::find(request.filters, fn(item) {
         !array::any(request.nodes, fn(node) { node.id == item.node })
     }) { fail!("graph filter references an unknown node", unknown.node) }
+    else if let Some(unknown) = array::find(request.any_of, fn(item) {
+        !array::any(request.nodes, fn(node) { node.id == item.node })
+    }) { fail!("graph any_of references an unknown node", unknown.node) }
     else if request.include_empty && (request.count == None || request.count == Some(request.root)) {
         fail!("graph include_empty requires a non-root count subject")
     } else if request.include_empty && array::any(request.edges, fn(edge) {
@@ -4214,7 +4217,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     let new_node = if forward { to_node } else { from_node };
                     let new_entity = if forward { to_entity } else { from_entity };
                     let target = if request.include_empty {
-                        graph_nullable_source(state.0, payload, get_index(payload.entities, new_entity), new_node, request.filters)
+                        graph_nullable_source(state.0, payload, subject, get_index(payload.entities, new_entity), new_node, request.filters, request.any_of)
                     } else {
                         entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_node.id)
                     };
@@ -4380,7 +4383,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 },
                 None => (existential.0, None),
             };
-            let alternatives = graph_any_of(partitioned.0, payload, subject, built.1, request.any_of);
+            let alternatives = graph_any_of(partitioned.0, payload, subject, built.1,
+                if request.include_empty { array::filter(request.any_of, fn(item) { item.node == request.root }) }
+                else { request.any_of });
             let top = match request.top_by_measure {
                 Some(spec) => do {
                     let ranked = graph_top_by_measure(alternatives.0, payload, request, built.1, spec);
