@@ -1,5 +1,20 @@
 # Corpus pressure families (first pass)
 
+IC's severity predicates (Q0123-Q0131, Q0444-Q0446) motivate a paired
+critical/major count probe; the corpus SQL does not itself demand both columns.
+This probe exposed a Model/graph mismatch: the Model already
+declared aggregate-local filtered measures, but graph measure projection rejected
+them. Graph now carries the Model predicate into each aggregate's `FILTER`,
+retargeted to the named Alarm instance, without narrowing the other count's
+input population or changing the joined Device grain. Separate `critical` and
+`major` counts are discoverable with their own business descriptions and
+canonical predicate values. An initial numeric predicate field index silently
+pointed at `OCCURUTC` instead of `SEVERITY` in the real IC struct. Public
+`ScopePredicate.field` now names the model field, is validated at preparation,
+and cannot drift when fields are inserted; an unknown name fails explicitly.
+Union branch physical column mapping retains its separate index-based contract.
+The alarm-to-device tenant key is still a pressure-model identity assumption.
+
 The relation-first graph Intent now supports `constraints` between already
 introduced named nodes, both at the outer graph and inside correlated EXISTS.
 Unlike `edges`, these do not introduce joins: lowering resolves the complete

@@ -135,7 +135,7 @@ type ComputedDimensionDef = struct {
 };
 
 # Member-level: inherent row-range scope of a dimension member. Predicates
-# reference canonical field indexes of the member's own entity; the scope is
+# reference stable field names of the member's own entity; the scope is
 # merged with user filters in deterministic order at lowering time. Dynamic
 # values stay parameterized; contradictory scope/filter constraints fail.
 @prelude::property(PropertyTarget::Field)
@@ -208,12 +208,13 @@ type UnionColumnDecl = struct {
     field: Int,
     column: String,
 };
+type UnionFilterPredicate = struct { field: Int, op: FilterOp, input: FilterInput };
 
 type UnionBranchDecl = struct {
     table: String,
     alias: String,
     columns: Array(UnionColumnDecl),
-    filter: Option(ScopePredicate),
+    filter: Option(UnionFilterPredicate),
 };
 
 @prelude::property(PropertyTarget::Type)
@@ -364,10 +365,10 @@ type FilterInput = enum {
 };
 
 # A member's inherent row-range scope predicate: a constraint on one field of
-# the member's own entity (canonical field index, filter op, literal value).
+# the member's own entity (stable field name, filter op, literal value).
 # Scope predicates always lower to parameterized bindings.
 type ScopePredicate = struct {
-    field: Int,
+    field: String,
     op: FilterOp,
     input: FilterInput,
 };
@@ -412,7 +413,7 @@ type UnionBranchEntry = struct {
     table: String,
     alias: String,
     columns: Array(String),
-    filter: Option(ScopePredicate),
+    filter: Option(UnionFilterPredicate),
 };
 
 # Prepared union (derived) source: the logical alias and ordered branches.
@@ -1193,7 +1194,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 Some(f) => f,
                 None => fail!("entity scope references an unknown field", ty, p.field),
             };
-            {field: field.index, op: p.op, input: p.input}
+            {field: field.name, op: p.op, input: p.input}
         }),
         None => [],
     };
@@ -2364,7 +2365,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
     });
     let entity_scopes_validated = array::all(entities, fn(entity) {
         let resolutions = array::map(entity.scope, fn(predicate) {
-            let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+            let field = match array::find(entity.fields, fn(f) { f.name == predicate.field }) {
                 Some(f) => f,
                 None => fail!("entity scope references an unknown field", entity.id, predicate.field),
             };
@@ -2452,9 +2453,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         None => None,
     };
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
-        {field: match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
-            Some(f) => f.name, None => fail!("scope references an unknown field", entity.id, predicate.field),
-        }, op: predicate.op, input: predicate.input}
+        {field: predicate.field, op: predicate.op, input: predicate.input}
     });
     {id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
         aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
@@ -2546,7 +2545,7 @@ def measure_domain: Fn(PreparedPayload, String) -> MeasureBrief = fn(payload, id
     };
     let required_dataset_ids = array::map(measure.requires, fn(index) { get_index(payload.entities, index).id });
     let predicate = match measure.predicate {
-        Some(spec) => Some({field: get_index(entity.fields, spec.field).name, op: spec.op, input: spec.input}),
+        Some(spec) => Some({field: spec.field, op: spec.op, input: spec.input}),
         None => None,
     };
     let computed = measure.computed;
@@ -2676,9 +2675,7 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
             }), fn(rel) { rel.id }),
             time_roles,
             scope: array::map(entity.scope, fn(predicate) {
-                {field: match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
-                    Some(f) => f.name, None => fail!("entity scope references an unknown field", entity.id, predicate.field),
-                }, op: predicate.op, input: predicate.input}
+                {field: predicate.field, op: predicate.op, input: predicate.input}
             }),
         };
         result
@@ -2976,7 +2973,7 @@ def append_filter_terms: Fn(Option(qb::Expr), Array(qb::Expr)) -> Option(qb::Exp
 
 def resolve_scope_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry, ScopePredicate, Bool) -> (qb::BuildCtx, FilterResolution) = fn(ctx, payload, owner, predicate, require_authorized) {
     let entity = get_index(payload.entities, owner.entity);
-    let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+    let field = match array::find(entity.fields, fn(f) { f.name == predicate.field }) {
         Some(f) => f,
         None => fail!("scope references an unknown field", owner.id, predicate.field),
     };
@@ -3020,7 +3017,7 @@ def entity_source_at_with_context: Fn(qb::BuildCtx, PreparedPayload, EntityEntry
     let allocated = qb::source_with_hint(ctx, entity.table, hint);
     let original_alias = get_index(payload.entities, entity.index).alias;
     let scopes: (qb::BuildCtx, Array(qb::Expr)) = array::fold(entity.scope, (allocated.0, []), fn(state, predicate) {
-        let field = match array::find(entity.fields, fn(f) { f.index == predicate.field }) {
+        let field = match array::find(entity.fields, fn(f) { f.name == predicate.field }) {
             Some(f) => f,
             None => fail!("entity scope references an unknown field", entity.id, predicate.field),
         };
@@ -3118,7 +3115,7 @@ def resolve_measure_predicate_with_context: Fn(qb::BuildCtx, PreparedPayload, Me
         None => fail!("measure has no inherent predicate", entry.id),
         Some(pred) => do {
             let entity = get_index(payload.entities, entry.entity);
-            let field = match array::get(entity.fields, pred.field) {
+            let field = match array::find(entity.fields, fn(f) { f.name == pred.field }) {
                 Some(value) => value,
                 None => fail!("measure predicate references an unknown field", entry.id, pred.field),
             };
@@ -3689,8 +3686,8 @@ def graph_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity
     }
 };
 
-def graph_measure_projection: Fn(PreparedPayload, GraphRequest, Array(GraphInstance), GraphMeasureSelect) -> qb::SelectItem =
-    fn(payload, request, instances, selection) {
+def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphMeasureSelect) -> (qb::BuildCtx, qb::SelectItem) =
+    fn(ctx, payload, request, instances, selection) {
         let instance = graph_instance(instances, selection.node);
         let measure = match array::find(payload.measures, fn(entry) { entry.id == selection.measure }) {
             Some(entry) => entry,
@@ -3698,8 +3695,8 @@ def graph_measure_projection: Fn(PreparedPayload, GraphRequest, Array(GraphInsta
         };
         if measure.entity != instance.entity {
             fail!("graph projection measure does not belong to its named node", selection.node, selection.measure)
-        } else if measure.computed != None || measure.predicate != None || array::length(measure.requires) > 0 {
-            fail!("graph measure projection requires a plain measure without external dependencies", selection.node, selection.measure)
+        } else if measure.computed != None || array::length(measure.requires) > 0 {
+            fail!("graph measure projection requires a non-computed measure without external dependencies", selection.node, selection.measure)
         } else {
             let proof = graph_count_subject_grain(payload, request, selection.node);
             if !proof.0 {
@@ -3707,8 +3704,15 @@ def graph_measure_projection: Fn(PreparedPayload, GraphRequest, Array(GraphInsta
             } else {
                 let entity = get_index(payload.entities, instance.entity);
                 let field = get_index(entity.fields, measure.field);
-                qb::aggregate(measure.aggregate, qb::column(instance.source, field.column),
-                    measure.input == MeasureInput::Distinct, `\{selection.node}_\{selection.measure}`)
+                let filtered = match measure.predicate {
+                    None => (ctx, None),
+                    Some(_) => do {
+                        let resolved = resolve_measure_predicate_with_context(ctx, payload, measure);
+                        (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, instance.source.alias)))
+                    },
+                };
+                (filtered.0, qb::aggregate_filtered(measure.aggregate, qb::column(instance.source, field.column),
+                    measure.input == MeasureInput::Distinct, filtered.1, `\{selection.node}_\{selection.measure}`))
             }
         }
     };
@@ -3970,11 +3974,12 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     None => fail!("graph order requires a projected dimension on the named node", item.node, item.dimension),
                 }
             });
-            let measures = array::map(request.measures, fn(item) {
-                graph_measure_projection(payload, request, built.1, item)
+            let measures = array::fold(request.measures, (selected.0, []), fn(state, item) {
+                let projected = graph_measure_projection(state.0, payload, request, built.1, item);
+                (projected.0, array::push(state.1, projected.1))
             });
             let projection = match request.count {
-                None => array::concat([row_projection, measures]),
+                None => array::concat([row_projection, measures.1]),
                 Some(subject_id) => {
                     let grain = if subject_id == request.root {
                         (True, None)
@@ -4031,7 +4036,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
             let outer_filters = if request.include_empty {
                 array::filter(request.filters, fn(item) { item.node == request.root })
             } else { request.filters };
-            let filtered = graph_filters(selected.0, payload, built.1, outer_filters);
+            let filtered = graph_filters(measures.0, payload, built.1, outer_filters);
             let outer_exists = if request.include_empty {
                 array::filter(request.exists, fn(spec) { spec.anchor == request.root })
             } else { request.exists };
