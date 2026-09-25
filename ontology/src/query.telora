@@ -502,6 +502,7 @@ type QueryPlan = enum {
     SetCount(SetPlan),
     GroupCount(Plan),
     JoinedGroups(JoinedGroups),
+    JoinedGroupCount(JoinedGroups),
 };
 
 type QueryAst = struct { ctx: BuildCtx, plan: QueryPlan };
@@ -1651,6 +1652,8 @@ def validate_contextual_pagination: Fn(QueryPlan, BuildCtx) -> QueryPlan = fn(qu
         QueryPlan::SetCount(set) => QueryPlan::SetCount({...set,
             left: pagination_in_context(set.left, ctx), right: pagination_in_context(set.right, ctx)}),
         QueryPlan::JoinedGroups(joined) => QueryPlan::JoinedGroups({...joined,
+            left: pagination_in_context(joined.left, ctx), right: pagination_in_context(joined.right, ctx)}),
+        QueryPlan::JoinedGroupCount(joined) => QueryPlan::JoinedGroupCount({...joined,
             left: pagination_in_context(joined.left, ctx), right: pagination_in_context(joined.right, ctx)}),
     }
 };
@@ -2823,6 +2826,55 @@ def validate_set_operands: Fn(SetOpKind, Plan, Plan) -> (Plan, Plan) = fn(kind, 
     }
 };
 
+def validate_joined_groups: Fn(JoinedGroups) -> JoinedGroups = fn(joined) {
+    let left = validate_structure(joined.left);
+    let right = validate_structure(joined.right);
+    let left_names = array::map(left.projection, fn(item) {
+        match item {
+            SelectItem::NamedExpr(named) => named.alias,
+            SelectItem::Aggregate(call) => call.alias,
+            SelectItem::Computed(computed) => computed.alias,
+            _ => "",
+        }
+    });
+    let right_names = array::map(right.projection, fn(item) {
+        match item {
+            SelectItem::NamedExpr(named) => named.alias,
+            SelectItem::Aggregate(call) => call.alias,
+            SelectItem::Computed(computed) => computed.alias,
+            _ => "",
+        }
+    });
+    let outputs = array::concat([joined.left_outputs, joined.right_outputs]);
+    if array::length(joined.keys) == 0 || array::length(outputs) == 0
+        || array::length(joined.keys) != array::length(left.grouping)
+        || array::length(joined.keys) != array::length(right.grouping)
+        || !set_operand_embeddable(left) || !set_operand_embeddable(right) {
+        fail!("joined groups require grouped, embeddable operands, identity keys and visible outputs")
+    } else if !array::all(array::enumerate(joined.keys), fn(entry) {
+        let key = entry.1;
+        is_sql_identifier(key)
+            && count_in(left_names, key) == 1 && count_in(right_names, key) == 1
+            && array::length(array::filter(joined.keys, fn(other) { other == key })) == 1
+            && array::any(left.projection, fn(item) { match item {
+                SelectItem::NamedExpr(named) => named.alias == key && named.expr == left.grouping[entry.0],
+                _ => False,
+            } })
+            && array::any(right.projection, fn(item) { match item {
+                SelectItem::NamedExpr(named) => named.alias == key && named.expr == right.grouping[entry.0],
+                _ => False,
+            } })
+    }) { fail!("joined groups require uniquely projected grouping identity columns on both operands", joined.keys) }
+    else if !array::all(outputs, fn(name) {
+        is_sql_identifier(name)
+            && array::length(array::filter(outputs, fn(other) { other == name })) == 1
+            && !array::any(joined.keys, fn(key) { key == name })
+    }) || !array::all(joined.left_outputs, fn(name) { count_in(left_names, name) == 1 })
+        || !array::all(joined.right_outputs, fn(name) { count_in(right_names, name) == 1 }) {
+        fail!("joined groups output must name unique projected non-key columns on its operand")
+    } else { {...joined, left, right} }
+};
+
 def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
     match query_plan {
         QueryPlan::Rows(plan) => QueryPlan::Rows(validate_structure(plan)),
@@ -2843,54 +2895,8 @@ def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
                 QueryPlan::GroupCount(structured)
             }
         },
-        QueryPlan::JoinedGroups(joined) => {
-            let left = validate_structure(joined.left);
-            let right = validate_structure(joined.right);
-            let left_names = array::map(left.projection, fn(item) {
-                match item {
-                    SelectItem::NamedExpr(named) => named.alias,
-                    SelectItem::Aggregate(call) => call.alias,
-                    SelectItem::Computed(computed) => computed.alias,
-                    _ => "",
-                }
-            });
-            let right_names = array::map(right.projection, fn(item) {
-                match item {
-                    SelectItem::NamedExpr(named) => named.alias,
-                    SelectItem::Aggregate(call) => call.alias,
-                    SelectItem::Computed(computed) => computed.alias,
-                    _ => "",
-                }
-            });
-            let outputs = array::concat([joined.left_outputs, joined.right_outputs]);
-            if array::length(joined.keys) == 0 || array::length(outputs) == 0
-                || array::length(joined.keys) != array::length(left.grouping)
-                || array::length(joined.keys) != array::length(right.grouping)
-                || !set_operand_embeddable(left) || !set_operand_embeddable(right) {
-                fail!("joined groups require grouped, embeddable operands, identity keys and visible outputs")
-            } else if !array::all(array::enumerate(joined.keys), fn(entry) {
-                let key = entry.1;
-                is_sql_identifier(key)
-                    && count_in(left_names, key) == 1 && count_in(right_names, key) == 1
-                    && array::length(array::filter(joined.keys, fn(other) { other == key })) == 1
-                    && array::any(left.projection, fn(item) { match item {
-                        SelectItem::NamedExpr(named) => named.alias == key && named.expr == left.grouping[entry.0],
-                        _ => False,
-                    } })
-                    && array::any(right.projection, fn(item) { match item {
-                        SelectItem::NamedExpr(named) => named.alias == key && named.expr == right.grouping[entry.0],
-                        _ => False,
-                    } })
-            }) { fail!("joined groups require uniquely projected grouping identity columns on both operands", joined.keys) }
-            else if !array::all(outputs, fn(name) {
-                is_sql_identifier(name)
-                    && array::length(array::filter(outputs, fn(other) { other == name })) == 1
-                    && !array::any(joined.keys, fn(key) { key == name })
-            }) || !array::all(joined.left_outputs, fn(name) { count_in(left_names, name) == 1 })
-                || !array::all(joined.right_outputs, fn(name) { count_in(right_names, name) == 1 }) {
-                fail!("joined groups output must name unique projected non-key columns on its operand")
-            } else { QueryPlan::JoinedGroups({...joined, left, right}) }
-        },
+        QueryPlan::JoinedGroups(joined) => QueryPlan::JoinedGroups(validate_joined_groups(joined)),
+        QueryPlan::JoinedGroupCount(joined) => QueryPlan::JoinedGroupCount(validate_joined_groups(joined)),
     }
 };
 
