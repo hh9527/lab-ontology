@@ -325,6 +325,7 @@ type GraphHaving = struct { node: String, measure: String, op: FilterOp, thresho
 type GraphExist = struct { anchor: String, nodes: Array(GraphNode), edges: Array(GraphEdge), constraints: Array(GraphEdge), filters: Array(GraphFilter), any_of: Array(GraphAnyOf), having: Array(GraphHaving), negated: Bool };
 type GraphTopPer = struct { owner: String, sample: String, rank: String, take: Int };
 type GraphTopMeasure = struct { node: String, measure: String, direction: qb::Ordering, take: Int };
+type GraphOrder = struct { node: String, dimension: String, direction: qb::Ordering };
 type GraphRequest = struct {
     root: String,
     nodes: Array(GraphNode),
@@ -340,6 +341,7 @@ type GraphRequest = struct {
     group_by_identity: Array(String),
     top_per: Option(GraphTopPer),
     top_by_measure: Option(GraphTopMeasure),
+    order_by: Array(GraphOrder),
 };
 
 # Filter operations. Comparison ops map to the closed query scalars
@@ -3801,6 +3803,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
     }) { fail!("graph node instance ids must be nonempty and unique") }
     else if request.count == None && array::length(request.measures) == 0 && array::length(request.group_by_identity) > 0 {
         fail!("graph identity grouping requires an aggregate projection")
+    } else if array::length(request.order_by) > 0 && (request.count != None
+        || array::length(request.measures) > 0 || request.top_per != None || request.top_by_measure != None) {
+        fail!("graph dimension order requires raw rows; use aggregate top or sample top for aggregated or partitioned results")
     } else if request.count != None && array::length(request.measures) > 0 {
         fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
     } else if request.include_empty && array::length(request.measures) > 0 {
@@ -3949,6 +3954,18 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 }
             });
             let row_projection = selected.1;
+            let ordered = array::map(request.order_by, fn(item) {
+                let position = array::find(array::enumerate(request.select), fn(entry) {
+                    entry.1.node == item.node && entry.1.dimension == item.dimension
+                });
+                match position {
+                    Some(entry) => match get_index(row_projection, entry.0) {
+                        qb::SelectItem::NamedExpr(named) => qb::order_by(qb::OrderKey::Expr(named.expr), item.direction),
+                        _ => fail!("graph order requires a projected dimension", item.node, item.dimension),
+                    },
+                    None => fail!("graph order requires a projected dimension on the named node", item.node, item.dimension),
+                }
+            });
             let measures = array::map(request.measures, fn(item) {
                 graph_measure_projection(payload, request, built.1, item)
             });
@@ -4038,7 +4055,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 array::concat([alternatives.1, graph_constraints(payload, built.1, request.constraints)]));
             let plan: qb::Plan = {
                 revision: payload.revision, sources, derived: None, projection, filter: constrained,
-                exists: existential.1, joins: built.2, grouping, having: [], ordering: top.1,
+                exists: existential.1, joins: built.2, grouping, having: [], ordering: array::concat([top.1, ordered]),
                 limit: top.2, offset: None, partition: partitioned.1, scalar_comparisons: [], ranked_key_comparisons: [],
             };
             (top.0, qb::validate(plan, payload.profile))
@@ -4109,6 +4126,7 @@ pub use self::{
     GraphHaving,
     GraphTopPer,
     GraphTopMeasure,
+    GraphOrder,
     GraphExist,
     GraphRequest,
     FilterOp,
