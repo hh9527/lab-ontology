@@ -14,6 +14,14 @@ pointed at `OCCURUTC` instead of `SEVERITY` in the real IC struct. Public
 and cannot drift when fields are inserted; an unknown name fails explicitly.
 Union branch physical column mapping retains its separate index-based contract.
 The alarm-to-device tenant key is still a pressure-model identity assumption.
+Q0444-Q0446 add a second use of the same knowledge point: qualifying an owner
+by more than two critical/major alarms before independently observing KPI
+samples. Graph aggregate EXISTS/HAVING now resolves a filtered measure's
+inherent canonical predicate into that direct aggregate's local `FILTER`;
+the bound wire and threshold are distinct from the externally supplied KPI
+window. The IC graph probe uses the already declared Device/DeviceKpi carrier,
+not a claim that the heterogeneous-server model or its production ownership
+key is complete. A text threshold for the integer event count is diagnosed.
 
 The relation-first graph Intent now supports `constraints` between already
 introduced named nodes, both at the outer graph and inside correlated EXISTS.
