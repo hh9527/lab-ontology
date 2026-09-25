@@ -15,22 +15,26 @@ class SiteNameCountTest(unittest.TestCase):
     def test_count_of_distinct_names_does_not_count_sites_or_join_rows(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
-        db.execute("CREATE TABLE PhysicalServer (id TEXT, name TEXT, refParentSubnet TEXT, projectId TEXT)")
+        db.execute("CREATE TABLE PhysicalServer (id TEXT, assetNumber TEXT, classification TEXT, refParentSubnet TEXT, projectId TEXT)")
         db.execute("CREATE TABLE X_SITE_VIEW (SITE_ID TEXT, SITE_NAME TEXT)")
         db.executemany("INSERT INTO X_SITE_VIEW VALUES (?, ?)", [
             ("s1", "Shared"), ("s2", "Shared"), ("s3", "Other"), ("s4", None),
         ])
-        db.executemany("INSERT INTO PhysicalServer VALUES (?, ?, ?, ?)", [
-            ("a", "Kunlun A", "s1", "s1"),
-            ("b", "Kunlun A", "s2", "s3"),
-            ("c", "Different", "s4", "s4"),
+        db.executemany("INSERT INTO PhysicalServer VALUES (?, ?, ?, ?, ?)", [
+            ("a", "AN-000001", "ne.category.server.kunlun", "s1", "s1"),
+            ("b", "AN-000001", "ne.category.server.kunlun", "s2", "s3"),
+            ("c", "AN-000002", "ne.category.server.kunlun", "s4", "s4"),
+            ("d", "AN-000001", "ne.category.server.subrack", "s4", "s4"),
         ])
         intent = {
             "op": "graph", "root": "server",
             "nodes": [{"id": "server", "entity": "server_device"}, {"id": "site", "entity": "site"}],
             "edges": [{"relation": "server_located_at_site", "from": "server", "to": "site"}],
             "select": [], "count_value": {"node": "site", "dimension": "site_name"},
-            "filters": [{"node": "server", "dimension": "server_name", "op": "eq", "kind": "text", "value": "Kunlun A"}],
+            "filters": [
+                {"node": "server", "dimension": "server_asset_number", "op": "eq", "kind": "text", "value": "AN-000001"},
+                {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "kunlun"},
+            ],
         }
         result = subprocess.run(
             [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud-model"],
