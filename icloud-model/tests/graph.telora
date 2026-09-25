@@ -297,6 +297,61 @@ pub def independent_kpi_qualifications_preserve_owner_grain: test::Test = test::
     else { fail!(`independent KPI qualification lost its identity, windows, or aggregates: \{query.sql}`, query.bindings) }
 });
 
+pub def counted_high_samples_qualify_separate_peak_observation: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"observed","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"observed","to":"device"}],
+        "select":[{"node":"device","dimension":"device_name"}],
+        "measures":[{"node":"observed","measure":"port_count_peak"}],
+        "group_by_identity":["device"],
+        "filters":[{"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
+                   {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-03-01 00:00:00"}],
+        "exists":[{"anchor":"device","nodes":[{"id":"qualified","entity":"device_kpi"}],
+            "edges":[{"relation":"device_kpi_of_device","from":"qualified","to":"device"}],
+            "filters":[{"node":"qualified","dimension":"port_count_sample","op":"ge","kind":"int","value":95},
+                       {"node":"qualified","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                       {"node":"qualified","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+            "having":[{"node":"qualified","measure":"device_kpi_sample_count","op":"gt","kind":"int","value":2}]}]
+    }"#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "max(observed.portCount) AS observed_port_count_peak")
+        && string::contains(sq.sql, "EXISTS (SELECT 1 FROM NetworkDeviceKPI AS qualified")
+        && string::contains(sq.sql, "device.id = qualified.resId AND device.tenant_id = qualified.tenantId")
+        && string::contains(sq.sql, "HAVING count(qualified.resId) >")
+        && string::contains(sq.sql, "GROUP BY device.name, device.id, device.tenant_id")
+        && !string::contains(sq.sql, "JOIN NetworkDeviceKPI AS qualified")
+        && sq.bindings == [qb::Val::String("2025-02-01 00:00:00"), qb::Val::String("2025-03-01 00:00:00"),
+            qb::Val::Int(95), qb::Val::String("2025-01-01 00:00:00"), qb::Val::String("2025-01-04 00:00:00"), qb::Val::Int(2)]
+        && pg.bindings == sq.bindings { True }
+    else { fail!(`two-window sample COUNT and peak observation mixed populations: \{sq.sql} / \{pg.sql}`, sq.bindings, pg.bindings) }
+});
+
+pub def bounded_sample_count_can_include_zero_without_losing_owner_identity: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"}],"edges":[],
+        "select":[],"count":"device",
+        "exists":[{"anchor":"device","negated":true,
+            "nodes":[{"id":"sample","entity":"device_kpi"}],
+            "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+            "filters":[{"node":"sample","dimension":"port_count_sample","op":"ge","kind":"int","value":48},
+                       {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
+                       {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}],
+            "having":[{"node":"sample","measure":"device_kpi_sample_count","op":"gt","kind":"int","value":4}]}]
+    }"#).unwrap!();
+    let sq = lower(intent);
+    let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
+    if string::contains(sq.sql, "count(device.id)")
+        && string::contains(sq.sql, "NOT EXISTS (SELECT 1 FROM NetworkDeviceKPI AS sample")
+        && string::contains(sq.sql, "device.id = sample.resId AND device.tenant_id = sample.tenantId")
+        && string::contains(sq.sql, "HAVING count(sample.resId) >")
+        && !string::contains(sq.sql, "JOIN NetworkDeviceKPI")
+        && sq.bindings == [qb::Val::Int(48), qb::Val::String("2025-01-01 00:00:00"),
+            qb::Val::String("2025-01-08 00:00:00"), qb::Val::Int(4)]
+        && pg.bindings == sq.bindings { True }
+    else { fail!(`upper sample bound dropped zero-sample owners or mixed tenant identities: \{sq.sql} / \{pg.sql}`, sq.bindings, pg.bindings) }
+});
+
 pub def qualification_rejects_unrelated_sample_relation: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
         "op":"graph", "root":"device", "nodes":[{"id":"device","entity":"device"}],
