@@ -16,7 +16,9 @@ class PeerDirectionTest(unittest.TestCase):
         self.db = sqlite3.connect(":memory:")
         self.addCleanup(self.db.close)
         self.db.execute("CREATE TABLE I_EntNetworkElement (id TEXT, tenant_id TEXT)")
+        self.db.execute("CREATE TABLE X_TENANT_VIEW (TENANT_ID TEXT)")
         self.db.execute("CREATE TABLE EnterprisePhysicalLink (id TEXT, aNeResId TEXT, zNeResId TEXT, tenantId TEXT, direction TEXT)")
+        self.db.execute("INSERT INTO X_TENANT_VIEW VALUES ('red')")
         self.db.executemany("INSERT INTO I_EntNetworkElement VALUES (?, ?)", [
             ("a", "red"), ("b", "red"), ("c", "red"), ("d", "red"), ("b", "blue"),
         ])
@@ -32,8 +34,10 @@ class PeerDirectionTest(unittest.TestCase):
         result = subprocess.run(
             [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud-model"],
             input=json.dumps({"method": "transform", "input": intent}),
-            text=True, capture_output=True, cwd=MODEL, check=True,
+            text=True, capture_output=True, cwd=MODEL,
         )
+        if result.returncode:
+            self.fail(f"peer intent lowering failed: {result.stdout} {result.stderr}")
         query = json.loads(result.stdout)
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
         return self.db.execute(query["sql"], bindings).fetchall()
@@ -69,6 +73,28 @@ class PeerDirectionTest(unittest.TestCase):
                 {"node": "device", "dimension": "device_id", "op": "eq", "kind": "text", "value": "a"}],
         })
         self.assertEqual(rows, [("ac-oneway",)])
+
+    def test_peer_as_second_existence_edge_keeps_hub_guard(self):
+        def qualified(owner_id):
+            return self.lower({
+                "op": "graph", "root": "owner",
+                "nodes": [{"id": "owner", "entity": "device"}], "edges": [],
+                "select": [{"node": "owner", "dimension": "device_id"}],
+                "filters": [{"node": "owner", "dimension": "device_id", "op": "eq",
+                    "kind": "text", "value": owner_id}],
+                "exists": [{"anchor": "owner", "nodes": [
+                    {"id": "tenant", "entity": "tenant"}, {"id": "peer", "entity": "device"}],
+                    "edges": [
+                        {"relation": "device_belongs_to_tenant", "from": "owner", "to": "tenant"},
+                        {"relation": "physical_link_peer_device", "from": "owner", "to": "peer"},
+                    ],
+                    "filters": [{"node": "peer", "dimension": "device_id", "op": "eq",
+                        "kind": "text", "value": "a"}],
+                }],
+            })
+
+        self.assertEqual(qualified("d"), [])
+        self.assertEqual(qualified("c"), [("c",)])
 
 
 if __name__ == "__main__":
