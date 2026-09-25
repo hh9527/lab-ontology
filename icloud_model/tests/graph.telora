@@ -3,6 +3,7 @@ use ontology::intent::{ query_intent_ast_factory };
 use ontology::sqlite as sqlite;
 use ontology::postgres as postgres;
 use ontology::query as qb;
+use ontology::ontology as edsl;
 use std::array as array;
 use std::json as json;
 use std::string as string;
@@ -11,6 +12,92 @@ use std::test as test;
 def lower: Fn(std::value::Value) -> qb::Query = fn(value) {
     sqlite::build_query(query_intent_ast_factory(payload, "public")(value))
 };
+
+pub def typed_utc_window_binds_half_open_range_in_both_dialects: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload, "public")(json::parse(r#"{
+        "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
+        "edges":[],"select":[],"count":"alarm","time_windows":[{
+            "node":"alarm","dimension":"alarm_occur_utc_raw",
+            "start":{"kind":"utc_second","value":"2024-02-29 00:00:00"},
+            "end":{"kind":"utc_second","value":"2024-03-01 00:00:00"}}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "alarm.OCCURUTC >= ?1")
+        && string::contains(sq.sql, "alarm.OCCURUTC < ?2")
+        && string::contains(pg.sql, "\"alarm\".\"OCCURUTC\" >= $1")
+        && sq.bindings == [qb::Val::String("2024-02-29 00:00:00"), qb::Val::String("2024-03-01 00:00:00")]
+        && sq.bindings == pg.bindings { True }
+    else { fail!("typed UTC window must preserve raw-column filtering and bindings", sq, pg) }
+});
+
+pub def typed_epoch_window_preserves_millisecond_bounds: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
+        "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
+        "edges":[],"select":[],"count":"device","time_windows":[{
+            "node":"device","dimension":"device_create_ms",
+            "start":{"kind":"epoch_millis","value":1727308800000},
+            "end":{"kind":"epoch_millis","value":1727395200000}}]
+    }"#).unwrap!());
+    if query.bindings == [qb::Val::Int(1727308800000), qb::Val::Int(1727395200000)]
+        && string::contains(query.sql, "device.createTime >= ?1")
+        && string::contains(query.sql, "device.createTime < ?2") { True }
+    else { fail!("epoch window must bind raw millisecond values", query) }
+});
+
+pub def local_epoch_storage_has_distinct_epoch_logical_type: test::Test = test::should_ok(fn() {
+    let role = edsl::time_domain(payload, "device", "create_time");
+    if role.encoding == edsl::TimeEncoding::LocalEpochMillis
+        && edsl::time_logical_type(role) == edsl::TimeLogicalType::EpochMillis { True }
+    else { fail!("epoch milliseconds must be distinct from plain integers", role) }
+});
+
+pub def typed_window_rejects_encoding_mismatch: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
+        "edges":[],"select":[],"count":"device","time_windows":[{
+            "node":"device","dimension":"device_create_ms",
+            "start":{"kind":"utc_second","value":"2024-09-26 00:00:00"},
+            "end":{"kind":"utc_second","value":"2024-09-27 00:00:00"}}]
+    }"#).unwrap!())
+}, "time boundary does not match declared field encoding");
+
+pub def typed_window_rejects_reversed_bounds: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
+        "edges":[],"select":[],"count":"device","time_windows":[{
+            "node":"device","dimension":"device_create_ms",
+            "start":{"kind":"epoch_millis","value":1727395200000},
+            "end":{"kind":"epoch_millis","value":1727308800000}}]
+    }"#).unwrap!())
+}, "time window start must precede end");
+
+pub def plain_integer_cannot_filter_epoch_clock: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{
+        "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
+        "edges":[],"select":[{"node":"device","dimension":"device_create_ms"}],
+        "filters":[{"node":"device","dimension":"device_create_ms",
+            "op":"ge","kind":"int","value":1727308800000}]
+    }"#).unwrap!())
+}, "epoch-millisecond time field requires EpochMillis input");
+
+pub def typed_existence_window_qualifies_without_multiplying_root: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
+        "op":"graph","root":"server","nodes":[{"id":"server","entity":"server_device"}],
+        "edges":[],"select":[],"count":"server","exists":[{
+            "anchor":"server","nodes":[{"id":"alarm","entity":"current_alarm"}],
+            "edges":[{"relation":"server_current_alarm","from":"alarm","to":"server"}],
+            "time_windows":[{"node":"alarm","dimension":"alarm_occur_utc_raw",
+                "start":{"kind":"utc_second","value":"2025-01-01 00:00:00"},
+                "end":{"kind":"utc_second","value":"2025-02-01 00:00:00"}}]}]
+    }"#).unwrap!());
+    if string::contains(query.sql, "EXISTS (SELECT 1 FROM T_CURRENT_ALARM AS alarm")
+        && string::contains(query.sql, "alarm.OCCURUTC >= ?1")
+        && string::contains(query.sql, "alarm.OCCURUTC < ?2")
+        && query.bindings == [qb::Val::String("2025-01-01 00:00:00"),
+            qb::Val::String("2025-02-01 00:00:00")] { True }
+    else { fail!("typed existence window must stay correlated and parameterized", query) }
+});
 
 pub def alarm_name_suffix_counts_only_matching_events: test::Test = test::should_ok(fn() {
     let intent = json::parse(r#"{"op":"graph","root":"alarm",
@@ -92,8 +179,8 @@ pub def raw_kpi_trend_orders_by_declared_utc_clock: test::Test = test::should_ok
         "select":[{"node":"owner","dimension":"device_name"},
                   {"node":"sample","dimension":"device_kpi_ts_raw"},
                   {"node":"sample","dimension":"port_count_sample"}],
-        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}],
+        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}],
         "order_by":[{"node":"sample","dimension":"device_kpi_ts_raw","direction":"asc"}]
     }"#).unwrap!();
     let sqlite_query = lower(intent);
@@ -115,8 +202,8 @@ pub def named_server_alarm_qualifies_raw_memory_trend: test::Test = test::should
                   {"node":"sample","dimension":"server_memory_sample"},
                   {"node":"sample","dimension":"server_kpi_ts_raw"}],
         "filters":[{"node":"server","dimension":"server_class","op":"eq","kind":"text","value":"subrack"},
-                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-31 00:00:00"}],
+                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-31 00:00:00"}],
         "exists":[{"anchor":"server","nodes":[{"id":"alarm","entity":"current_alarm"}],
             "edges":[{"relation":"server_current_alarm","from":"alarm","to":"server"}],
             "filters":[{"node":"alarm","dimension":"alarm_name","op":"eq","kind":"text","value":"linkDown"}]}],
@@ -291,8 +378,8 @@ pub def major_alarm_count_qualifies_independent_server_power_trend: test::Test =
                   {"node":"sample","dimension":"server_average_power_sample"},
                   {"node":"sample","dimension":"server_kpi_ts_raw"}],
         "filters":[{"node":"server","dimension":"server_class","op":"eq","kind":"text","value":"taishan"},
-                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}],
+                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"server_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}],
         "exists":[{"anchor":"server","nodes":[{"id":"alarm","entity":"current_alarm"}],
             "edges":[{"relation":"server_current_alarm","from":"alarm","to":"server"}],
             "having":[{"node":"alarm","measure":"major_alarm_count","op":"gt","kind":"int","value":2}]}],
@@ -328,8 +415,8 @@ pub def global_raw_top_qualifies_frame_without_multiplying_kpi_rows: test::Test 
         "select":[{"node":"device","dimension":"device_name"},
                   {"node":"sample","dimension":"used_port_sample"}],
         "filters":[{"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"WAC"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
         "exists":[{"anchor":"device","nodes":[{"id":"frame","entity":"frame"}],
             "edges":[{"relation":"frame_belongs_to_device","from":"frame","to":"device"}],
             "filters":[{"node":"frame","dimension":"frame_oper_state","op":"eq","kind":"text","value":"normal"}]}],
@@ -628,8 +715,8 @@ pub def alarm_window_uses_authoritative_utc_clock: test::Test = test::should_ok(
     let intent = json::parse(r#"{"op":"graph","root":"alarm",
         "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],"select":[],
         "measures":[{"node":"alarm","measure":"alarm_count"}],
-        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"text","value":"2025-01-02 00:00:00"}]}"#).unwrap!();
+        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"utc_second","value":"2025-01-02 00:00:00"}]}"#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
     if string::contains(sq.sql, "alarm.OCCURUTC >= ?1")
@@ -649,7 +736,7 @@ pub def alarm_arrival_clock_cannot_replace_occurrence_window: test::Test = test:
 pub def alarm_window_accepts_leap_day: test::Test = test::should_ok(fn() {
     let query = lower(json::parse(r#"{"op":"graph","root":"alarm",
         "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],"select":[],"count":"alarm",
-        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"ge","kind":"text","value":"2024-02-29 00:00:00"}]}"#).unwrap!());
+        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"ge","kind":"utc_second","value":"2024-02-29 00:00:00"}]}"#).unwrap!());
     if query.bindings == [qb::Val::String("2024-02-29 00:00:00")] { True }
     else { fail!("leap day was not bound as the UTC window boundary", query) }
 });
@@ -657,25 +744,25 @@ pub def alarm_window_accepts_leap_day: test::Test = test::should_ok(fn() {
 pub def alarm_window_rejects_nonexistent_date: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"alarm",
         "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],"select":[],"count":"alarm",
-        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"ge","kind":"text","value":"2025-02-29 00:00:00"}]}"#).unwrap!())
+        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"ge","kind":"utc_second","value":"2025-02-29 00:00:00"}]}"#).unwrap!())
 }, "invalid canonical UTC second filter value");
 
 pub def alarm_window_rejects_noncanonical_clock: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"alarm",
         "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],"select":[],"count":"alarm",
-        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"text","value":"2025-01-01T00:00:00Z"}]}"#).unwrap!())
+        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"utc_second","value":"2025-01-01T00:00:00Z"}]}"#).unwrap!())
 }, "invalid canonical UTC second filter value");
 
 pub def alarm_window_rejects_invalid_hour: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"alarm",
         "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],"select":[],"count":"alarm",
-        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"text","value":"2025-01-01 24:00:00"}]}"#).unwrap!())
+        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"utc_second","value":"2025-01-01 24:00:00"}]}"#).unwrap!())
 }, "invalid canonical UTC second filter value");
 
 pub def alarm_window_rejects_invalid_month_day: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{"op":"graph","root":"alarm",
         "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],"select":[],"count":"alarm",
-        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"text","value":"2025-04-31 00:00:00"}]}"#).unwrap!())
+        "filters":[{"node":"alarm","dimension":"alarm_occur_utc_raw","op":"lt","kind":"utc_second","value":"2025-04-31 00:00:00"}]}"#).unwrap!())
 }, "invalid canonical UTC second filter value");
 
 pub def alarm_local_clock_cannot_replace_occurrence_window: test::Test = test::should_fail_with(fn() {
@@ -762,8 +849,8 @@ pub def critical_alarm_threshold_qualifies_independent_kpi_observation: test::Te
         "select":[{"node":"device","dimension":"device_name"}],
         "measures":[{"node":"observed","measure":"cpu_peak"}],
         "group_by_identity":["device"],
-        "filters":[{"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}],
+        "filters":[{"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}],
         "exists":[{"anchor":"device","nodes":[{"id":"alarm","entity":"current_alarm"}],
             "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
             "having":[{"node":"alarm","measure":"critical_alarm_count","op":"gt","kind":"int","value":2}]}]
@@ -799,8 +886,8 @@ pub def named_alarm_qualifies_independent_running_port_average: test::Test = tes
         "measures":[{"node":"sample","measure":"running_port_sample_avg"}],
         "group_by_identity":["device"],
         "filters":[{"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"LSW"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}],
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}],
         "exists":[{"anchor":"device","nodes":[{"id":"alarm","entity":"current_alarm"}],
             "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
             "filters":[{"node":"alarm","dimension":"alarm_name","op":"eq","kind":"text","value":"deviceOffline"}]}]
@@ -851,8 +938,8 @@ pub def site_scoped_interface_kpi_count_preserves_port_and_sample_grains: test::
         "exists":[
             {"anchor":"port","nodes":[{"id":"sample","entity":"interface_kpi"}],
              "edges":[{"relation":"interface_kpi_of_port","from":"sample","to":"port"}],
-             "filters":[{"node":"sample","dimension":"interface_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                        {"node":"sample","dimension":"interface_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}],
+             "filters":[{"node":"sample","dimension":"interface_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                        {"node":"sample","dimension":"interface_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"}],
              "having":[{"node":"sample","measure":"interface_out_errors","op":"lt","kind":"number","value":72.0}]},
             {"anchor":"port","nodes":[{"id":"owner","entity":"device"},
                                         {"id":"site","entity":"site"},{"id":"tenant","entity":"tenant"}],
@@ -885,8 +972,8 @@ pub def olt_summarizes_raw_samples_across_declared_onu_children: test::Test = te
         "select":[{"node":"olt","dimension":"pon_olt_name"}],
         "measures":[{"node":"sample","measure":"onu_receive_usage"}],
         "group_by_identity":["olt"],
-        "filters":[{"node":"sample","dimension":"onu_kpi_ts","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"onu_kpi_ts","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}]}
+        "filters":[{"node":"sample","dimension":"onu_kpi_ts","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"onu_kpi_ts","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}]}
     "#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
@@ -921,14 +1008,14 @@ pub def independent_kpi_qualifications_preserve_owner_grain: test::Test = test::
             {"anchor":"device", "nodes":[{"id":"cpu","entity":"device_kpi"}],
              "edges":[{"relation":"device_kpi_of_device","from":"cpu","to":"device"}],
              "filters":[
-                 {"node":"cpu","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                 {"node":"cpu","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+                 {"node":"cpu","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                 {"node":"cpu","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
              "having":[{"node":"cpu","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]},
             {"anchor":"device", "nodes":[{"id":"ports","entity":"device_kpi"}],
              "edges":[{"relation":"device_kpi_of_device","from":"ports","to":"device"}],
              "filters":[
-                 {"node":"ports","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
-                 {"node":"ports","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-04 00:00:00"}],
+                 {"node":"ports","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-02-01 00:00:00"},
+                 {"node":"ports","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-04 00:00:00"}],
              "having":[{"node":"ports","measure":"port_count_sample_avg","op":"gt","kind":"number","value":20.0}]}
         ]
     }"#).unwrap!());
@@ -952,13 +1039,13 @@ pub def counted_high_samples_qualify_separate_peak_observation: test::Test = tes
         "select":[{"node":"device","dimension":"device_name"}],
         "measures":[{"node":"observed","measure":"port_count_peak"}],
         "group_by_identity":["device"],
-        "filters":[{"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
-                   {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-03-01 00:00:00"}],
+        "filters":[{"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-02-01 00:00:00"},
+                   {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-03-01 00:00:00"}],
         "exists":[{"anchor":"device","nodes":[{"id":"qualified","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"qualified","to":"device"}],
             "filters":[{"node":"qualified","dimension":"port_count_sample","op":"ge","kind":"int","value":95},
-                       {"node":"qualified","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"qualified","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+                       {"node":"qualified","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"qualified","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
             "having":[{"node":"qualified","measure":"device_kpi_sample_count","op":"gt","kind":"int","value":2}]}]
     }"#).unwrap!();
     let sq = lower(intent);
@@ -983,8 +1070,8 @@ pub def bounded_sample_count_can_include_zero_without_losing_owner_identity: tes
             "nodes":[{"id":"sample","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
             "filters":[{"node":"sample","dimension":"port_count_sample","op":"ge","kind":"int","value":48},
-                       {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}],
+                       {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"}],
             "having":[{"node":"sample","measure":"device_kpi_sample_count","op":"gt","kind":"int","value":4}]}]
     }"#).unwrap!();
     let sq = lower(intent);
@@ -1029,13 +1116,13 @@ pub def qualified_device_observes_an_independent_kpi_window: test::Test = test::
         "measures":[{"node":"observed","measure":"port_count_sample_avg"}],
         "group_by_identity":["device"],
         "filters":[
-            {"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
-            {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-04 00:00:00"}],
+            {"node":"observed","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-02-01 00:00:00"},
+            {"node":"observed","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-04 00:00:00"}],
         "exists":[{"anchor":"device", "nodes":[{"id":"cpu","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"cpu","to":"device"}],
             "filters":[
-                {"node":"cpu","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                {"node":"cpu","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+                {"node":"cpu","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                {"node":"cpu","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
             "having":[{"node":"cpu","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]}]
     }"#).unwrap!());
     if string::contains(query.sql, "avg(observed.portCount) AS observed_port_count_sample_avg")
@@ -1054,9 +1141,9 @@ pub def top_devices_by_declared_cpu_average_keep_full_identity: test::Test = tes
         "measures":[{"node":"sample","measure":"cpu_usage"}],
         "group_by_identity":["device"],
         "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge",
-                    "kind":"text","value":"2025-01-01 00:00:00"},
+                    "kind":"utc_second","value":"2025-01-01 00:00:00"},
                    {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt",
-                    "kind":"text","value":"2025-01-08 00:00:00"}],
+                    "kind":"utc_second","value":"2025-01-08 00:00:00"}],
         "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":5}
     }"#).unwrap!();
     let ast = query_intent_ast_factory(payload, "public")(intent);
@@ -1084,8 +1171,8 @@ pub def tenant_industry_device_prefix_and_kpi_max_share_owner_grain: test::Test 
         "filters":[{"node":"tenant","dimension":"tenant_industry","op":"eq","kind":"text","value":"102"},
                    {"node":"device","dimension":"device_ip_address","op":"starts_with","kind":"text","value":"10.3.0.0"},
                    {"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"LSW"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-31 00:00:00"}]}"#).unwrap!();
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-31 00:00:00"}]}"#).unwrap!();
     let ast = query_intent_ast_factory(payload, "public")(intent);
     let sq = sqlite::build_query(ast);
     let pg = postgres::build_query(ast);
@@ -1112,8 +1199,8 @@ pub def projected_cpu_average_filters_same_sample_group: test::Test = test::shou
         "select":[{"node":"device","dimension":"device_name"}],
         "measures":[{"node":"sample","measure":"cpu_usage"}],
         "group_by_identity":["device"],
-        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
         "measure_having":[{"node":"sample","measure":"cpu_usage","op":"ge","kind":"number","value":80.0}]}
     "#).unwrap!();
     let sq = lower(intent);
@@ -1210,8 +1297,8 @@ pub def device_kpi_sum_in_each_frame_context: test::Test = test::should_ok(fn() 
         "select":[{"node":"frame","dimension":"frame_name"},{"node":"device","dimension":"device_name"}],
         "measures":[{"node":"sample","measure":"port_count"}],
         "group_by_identity":["frame","device"],
-        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}]}
+        "filters":[{"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}]}
     "#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
@@ -1259,8 +1346,8 @@ pub def normal_wac_frame_context_observes_device_cpu_peak: test::Test = test::sh
         "group_by_identity":["frame","device"],
         "filters":[{"node":"frame","dimension":"frame_oper_state","op":"eq","kind":"text","value":"normal"},
                    {"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"WAC"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}]}
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}]}
     "#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
@@ -1284,8 +1371,8 @@ pub def frame_context_ranks_device_kpi_by_complete_frame_and_owner_identity: tes
         "measures":[{"node":"sample","measure":"cpu_usage"}],
         "group_by_identity":["frame","device"],
         "filters":[{"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"LSW"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}],
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"sample","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"}],
         "exists":[{"anchor":"device","nodes":[{"id":"site","entity":"site"},
                                                   {"id":"tenant","entity":"tenant"}],
             "edges":[{"relation":"device_located_at_site","from":"device","to":"site"},
@@ -1384,10 +1471,10 @@ pub def independent_kpi_windows_cannot_share_a_joined_aggregate_population: test
         "measures":[{"node":"week","measure":"port_count"},
                     {"node":"month","measure":"port_count"}],
         "group_by_identity":["device"],
-        "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"},
-                   {"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                   {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}]}"#).unwrap!())
+        "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"},
+                   {"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                   {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}]}"#).unwrap!())
 }, "graph measure source may be multiplied by a joined relation");
 
 def independent_window_intent: Fn() -> std::value::Value = fn() {
@@ -1397,15 +1484,15 @@ def independent_window_intent: Fn() -> std::value::Value = fn() {
             "edges":[{"relation":"device_kpi_of_device","from":"week","to":"device"}],
             "select":[{"node":"device","dimension":"device_name"}],
             "measures":[{"node":"week","measure":"port_count"}],"group_by_identity":["device"],
-            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}]},
+            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"}]},
         "right":{"op":"graph","root":"device",
             "nodes":[{"id":"device","entity":"device"},{"id":"month","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"month","to":"device"}],
             "select":[{"node":"device","dimension":"device_name"}],
             "measures":[{"node":"month","measure":"port_count"}],"group_by_identity":["device"],
-            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
-                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-03-01 00:00:00"}]}}"#).unwrap!()
+            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-02-01 00:00:00"},
+                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-03-01 00:00:00"}]}}"#).unwrap!()
 };
 
 pub def independent_kpi_windows_join_only_complete_owner_groups: test::Test = test::should_ok(fn() {
@@ -1443,16 +1530,16 @@ pub def paired_kpi_thresholds_stay_inside_their_own_windows: test::Test = test::
             "edges":[{"relation":"device_kpi_of_device","from":"week","to":"device"}],
             "select":[{"node":"device","dimension":"device_name"}],
             "measures":[{"node":"week","measure":"port_count"}],"group_by_identity":["device"],
-            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}],
+            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"}],
             "measure_having":[{"node":"week","measure":"port_count","op":"gt","kind":"int","value":4}]},
         "right":{"op":"graph","root":"device",
             "nodes":[{"id":"device","entity":"device"},{"id":"month","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"month","to":"device"}],
             "select":[{"node":"device","dimension":"device_name"}],
             "measures":[{"node":"month","measure":"port_count"}],"group_by_identity":["device"],
-            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
-                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-03-01 00:00:00"}],
+            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-02-01 00:00:00"},
+                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-03-01 00:00:00"}],
             "measure_having":[{"node":"month","measure":"port_count","op":"gt","kind":"int","value":30}]}}"#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
@@ -1472,15 +1559,15 @@ pub def paired_kpi_thresholds_count_qualified_device_identities: test::Test = te
             "nodes":[{"id":"device","entity":"device"},{"id":"week","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"week","to":"device"}],
             "select":[],"measures":[{"node":"week","measure":"port_count"}],"group_by_identity":["device"],
-            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-08 00:00:00"}],
+            "filters":[{"node":"week","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"week","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-08 00:00:00"}],
             "measure_having":[{"node":"week","measure":"port_count","op":"gt","kind":"int","value":4}]},
         "right":{"op":"graph","root":"device",
             "nodes":[{"id":"device","entity":"device"},{"id":"month","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"month","to":"device"}],
             "select":[],"measures":[{"node":"month","measure":"port_count"}],"group_by_identity":["device"],
-            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-02-01 00:00:00"},
-                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-03-01 00:00:00"}],
+            "filters":[{"node":"month","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-02-01 00:00:00"},
+                       {"node":"month","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-03-01 00:00:00"}],
             "measure_having":[{"node":"month","measure":"port_count","op":"gt","kind":"int","value":30}]}}"#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
@@ -1503,15 +1590,15 @@ pub def router_count_uses_declared_sample_averages_for_both_kpi_thresholds: test
             "edges":[{"relation":"device_kpi_of_device","from":"memory","to":"device"}],
             "select":[],"measures":[{"node":"memory","measure":"memory_usage"}],"group_by_identity":["device"],
             "filters":[{"node":"device","dimension":"device_class","op":"eq","kind":"text","value":"router"},
-                       {"node":"memory","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"memory","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+                       {"node":"memory","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"memory","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
             "measure_having":[{"node":"memory","measure":"memory_usage","op":"ge","kind":"number","value":47.5}]},
         "right":{"op":"graph","root":"device",
             "nodes":[{"id":"device","entity":"device"},{"id":"ports","entity":"device_kpi"}],
             "edges":[{"relation":"device_kpi_of_device","from":"ports","to":"device"}],
             "select":[],"measures":[{"node":"ports","measure":"port_count_sample_avg"}],"group_by_identity":["device"],
-            "filters":[{"node":"ports","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"ports","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-01-04 00:00:00"}],
+            "filters":[{"node":"ports","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"ports","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-01-04 00:00:00"}],
             "measure_having":[{"node":"ports","measure":"port_count_sample_avg","op":"ge","kind":"number","value":48.0}]}}"#).unwrap!();
     let sq = lower(intent);
     let pg = postgres::build_query(query_intent_ast_factory(payload, "public")(intent));
@@ -1569,8 +1656,8 @@ pub def frame_context_pairs_independent_device_kpi_and_alarm_measures: test::Tes
                      {"relation":"device_kpi_of_device","from":"kpi","to":"device"}],
             "select":[{"node":"frame","dimension":"frame_name"},{"node":"device","dimension":"device_name"}],
             "measures":[{"node":"kpi","measure":"port_count"}],"group_by_identity":["frame","device"],
-            "filters":[{"node":"kpi","dimension":"device_kpi_ts_raw","op":"ge","kind":"text","value":"2025-01-01 00:00:00"},
-                       {"node":"kpi","dimension":"device_kpi_ts_raw","op":"lt","kind":"text","value":"2025-02-01 00:00:00"}],
+            "filters":[{"node":"kpi","dimension":"device_kpi_ts_raw","op":"ge","kind":"utc_second","value":"2025-01-01 00:00:00"},
+                       {"node":"kpi","dimension":"device_kpi_ts_raw","op":"lt","kind":"utc_second","value":"2025-02-01 00:00:00"}],
             "measure_having":[{"node":"kpi","measure":"port_count","op":"gt","kind":"int","value":10}]},
         "right":{"op":"graph","root":"frame",
             "nodes":[{"id":"frame","entity":"frame"},{"id":"device","entity":"device"},

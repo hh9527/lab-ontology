@@ -1,5 +1,6 @@
 use crate::ontology as edsl;
 use crate::query as qb;
+use crate::time as time;
 use std::array as array;
 use std::dict as dict;
 use std::value::{ Value };
@@ -85,6 +86,26 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
             Value::False => edsl::FilterInput::Bool(False),
             _ => fail!("bool filter requires a boolean value", value),
         },
+        "rfc3339" => match value {
+            Value::String(text) => edsl::FilterInput::Rfc3339(text),
+            _ => fail!("RFC3339 filter requires a string representation", value),
+        },
+        "epoch_millis" => match value {
+            Value::Int(ms) => edsl::FilterInput::EpochMillis(ms),
+            _ => fail!("EpochMillis filter requires an integer representation", value),
+        },
+        "date" => match value {
+            Value::String(text) => edsl::FilterInput::Date(text),
+            _ => fail!("Date filter requires a string representation", value),
+        },
+        "utc_second" => match value {
+            Value::String(text) => edsl::FilterInput::UtcSecond(text),
+            _ => fail!("UtcSecond filter requires a string representation", value),
+        },
+        "local_datetime" => match value {
+            Value::String(text) => edsl::FilterInput::LocalDateTime(text),
+            _ => fail!("LocalDateTime filter requires a string representation", value),
+        },
         _ => fail!("unsupported filter value kind", kind),
     }
 };
@@ -113,6 +134,36 @@ def parse_graph_filter: Fn(String, Value) -> edsl::GraphFilter = fn(subject, ite
     {node: as_string(field(obj, "node")), request}
 };
 
+def parse_time_value: Fn(Value) -> time::TimeValue = fn(value) {
+    let obj = as_object(value);
+    graph_keys(obj, "time boundary", ["kind", "value"]);
+    let raw = field(obj, "value");
+    match as_string(field(obj, "kind")) {
+        "date" => time::TimeValue::Date(as_string(raw)),
+        "local_datetime" => time::TimeValue::LocalDateTime(as_string(raw)),
+        "utc_second" => time::TimeValue::UtcSecond(as_string(raw)),
+        "rfc3339" => time::TimeValue::Rfc3339(as_string(raw)),
+        "epoch_millis" => match raw {
+            Value::Int(ms) => time::TimeValue::EpochMillis(ms),
+            _ => fail!("epoch-millisecond boundary requires an integer", raw),
+        },
+        kind => fail!("unknown time boundary kind", kind),
+    }
+};
+
+def parse_time_window: Fn(edsl::PreparedPayload, String, Value) -> Array(edsl::GraphFilter) =
+    fn(payload, subject, value) {
+        let obj = as_object(value);
+        graph_keys(obj, "time window", ["node", "dimension", "start", "end"]);
+        let node = as_string(field(obj, "node"));
+        let dimension = as_string(field(obj, "dimension"));
+        let window: time::Window = {start: parse_time_value(field(obj, "start")),
+            end: parse_time_value(field(obj, "end"))};
+        array::map(time::window_filters(payload, subject, dimension, window), fn(request) {
+            {node, request}
+        })
+    };
+
 def parse_graph_any_of: Fn(Value) -> edsl::GraphAnyOf = fn(item) {
     let obj = as_object(item);
     graph_keys(obj, "any_of", ["node", "dimension", "kind", "values"]);
@@ -129,9 +180,9 @@ def parse_graph_having: Fn(Value) -> edsl::GraphHaving = fn(item) {
         threshold: parse_input(as_string(field(obj, "kind")), field(obj, "value"))}
 };
 
-def parse_graph_existence: Fn(String, Value) -> edsl::GraphExist = fn(subject, item) {
+def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphExist = fn(payload, subject, item) {
     let obj = as_object(item);
-    graph_keys(obj, "existence", ["anchor", "nodes", "edges", "constraints", "filters", "any_of", "having", "negated"]);
+    graph_keys(obj, "existence", ["anchor", "nodes", "edges", "constraints", "filters", "time_windows", "any_of", "having", "negated"]);
     let negated = match dict::get(obj, "negated") {
         None => False,
         Some(Value::True) => True,
@@ -142,7 +193,8 @@ def parse_graph_existence: Fn(String, Value) -> edsl::GraphExist = fn(subject, i
         nodes: array::map(as_array(field(obj, "nodes")), parse_graph_node),
         edges: array::map(as_array(field(obj, "edges")), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-        filters: array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
+        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
+            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
         any_of: array::map(array_opt(obj, "any_of"), parse_graph_any_of),
         having: array::map(array_opt(obj, "having"), parse_graph_having),
         negated}
@@ -151,7 +203,7 @@ def parse_graph_existence: Fn(String, Value) -> edsl::GraphExist = fn(subject, i
 def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, obj) {
     if as_string(field(obj, "op")) != "graph" { fail!("aggregate pair operands must be graph intents") }
     else {
-        graph_keys(obj, "request", ["op", "root", "row_grain", "distinct", "nodes", "edges", "constraints", "select", "measures", "measure_having", "filters", "any_of", "exists", "count", "count_value", "count_having", "count_groups", "include_empty", "group_by_identity", "top_per", "top_by_measure", "order_by", "take"]);
+        graph_keys(obj, "request", ["op", "root", "row_grain", "distinct", "nodes", "edges", "constraints", "select", "measures", "measure_having", "filters", "time_windows", "any_of", "exists", "count", "count_value", "count_having", "count_groups", "include_empty", "group_by_identity", "top_per", "top_by_measure", "order_by", "take"]);
         let request: edsl::GraphRequest = {
             root: as_string(field(obj, "root")),
             row_grain: match dict::get(obj, "row_grain") {
@@ -188,9 +240,10 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Val
                 result
             }),
             measure_having: array::map(array_opt(obj, "measure_having"), parse_graph_having),
-            filters: array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
+            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
+                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
             any_of: array::map(array_opt(obj, "any_of"), parse_graph_any_of),
-            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(subject, value) }),
+            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, value) }),
             count: match dict::get(obj, "count") {
                 None => None,
                 Some(Value::None) => None,

@@ -1,0 +1,158 @@
+use crate::ontology as edsl;
+use crate::intent::{ query_intent_ast_factory };
+use crate::knowledge as knowledge;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use crate::time as time;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+@edsl::entity_id("dog")
+@edsl::entity_source("dogs", "dog")
+type Dog = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("date_of_birth")
+    @edsl::time_field(edsl::TimeSemantics::Date, edsl::TimeEncoding::DateText)
+    @edsl::dimension("birth_date", True, True,
+        [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::Date])
+    birth_date: String,
+    @edsl::column("created_at")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
+    @edsl::dimension("created_at", True, True,
+        [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::Rfc3339])
+    created_at: String,
+};
+
+@edsl::entity_id("legacy_clock")
+@edsl::entity_source("legacy_clocks", "legacy")
+@edsl::named_relation_key("bad_clock_join", Dog.type, edsl::RelationKind::FanOut,
+    edsl::DeclaredRelationKey::FieldEq({from: "timestamp_text", to: "created_at"}))
+type LegacyClock = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("timestamp_text")
+    timestamp_text: String,
+};
+
+@edsl::entity_source("bad_time_dimension", "bad")
+type BadTimeDimension = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("time")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
+    @edsl::dimension("bad_time", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    time: String,
+};
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project,
+        qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind, qb::Operator::Group,
+        qb::Operator::Aggregate],
+    allowed_join_kinds: [], allowed_aggregates: [qb::AggregateFunction::Count],
+    allowed_scalars: [qb::ScalarFunction::Ge, qb::ScalarFunction::Lt, qb::ScalarFunction::And],
+    allow_distinct: False,
+};
+
+def payload: edsl::PreparedPayload = edsl::build_root("time-contract", [Dog.type], profile,
+    fn(subject) { subject == "reader" });
+
+pub def date_window_preserves_date_semantics: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[{"node":"dog","dimension":"birth_date"}],
+        "time_windows":[{"node":"dog","dimension":"birth_date",
+            "start":{"kind":"date","value":"2024-02-29"},
+            "end":{"kind":"date","value":"2024-03-01"}}]
+    }"#).unwrap!());
+    let query = sqlite::build_query(ast);
+    if string::contains(query.sql, "dog.date_of_birth >= ?1")
+        && string::contains(query.sql, "dog.date_of_birth < ?2")
+        && query.bindings == [qb::Val::String("2024-02-29"), qb::Val::String("2024-03-01")] { True }
+    else { fail!("calendar dates must compare as declared date text", query) }
+});
+
+pub def invalid_calendar_date_fails_before_query: test::Test = test::should_fail_with(fn() {
+    time::window_filters(payload, "reader", "birth_date", {
+        start: time::TimeValue::Date("2025-02-29"), end: time::TimeValue::Date("2025-03-01")})
+}, "invalid calendar date boundary");
+
+pub def instant_cannot_filter_calendar_date: test::Test = test::should_fail_with(fn() {
+    time::window_filters(payload, "reader", "birth_date", {
+        start: time::TimeValue::UtcSecond("2024-02-29 00:00:00"),
+        end: time::TimeValue::UtcSecond("2024-03-01 00:00:00")})
+}, "time boundary does not match declared field encoding");
+
+pub def plain_filter_cannot_bypass_date_validation: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[{"node":"dog","dimension":"birth_date"}],
+        "filters":[{"node":"dog","dimension":"birth_date",
+            "op":"ge","kind":"text","value":"2025-02-29"}]
+    }"#).unwrap!())
+}, "calendar date filter requires Date input");
+
+pub def rfc3339_window_is_typed_even_when_stored_as_text: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
+        "time_windows":[{"node":"dog","dimension":"created_at",
+            "start":{"kind":"rfc3339","value":"2024-02-29T00:00:00Z"},
+            "end":{"kind":"rfc3339","value":"2024-03-01T00:00:00Z"}}]
+    }"#).unwrap!());
+    let query = sqlite::build_query(ast);
+    if string::contains(query.sql, "dog.created_at >= ?1")
+        && query.bindings == [qb::Val::String("2024-02-29T00:00:00Z"),
+            qb::Val::String("2024-03-01T00:00:00Z")] { True }
+    else { fail!("RFC3339 must retain its logical type until binding", query) }
+});
+
+pub def ordinary_text_cannot_filter_rfc3339_field: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+        "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
+        "filters":[{"node":"dog","dimension":"created_at","op":"ge",
+            "kind":"text","value":"2024-02-29T00:00:00Z"}]
+    }"#).unwrap!())
+}, "RFC3339 time field requires RFC3339 input");
+
+pub def offset_rfc3339_requires_normalization_before_binding: test::Test = test::should_fail_with(fn() {
+    time::window_filters(payload, "reader", "created_at", {
+        start: time::TimeValue::Rfc3339("2024-03-01T08:00:00+08:00"),
+        end: time::TimeValue::Rfc3339("2024-03-02T08:00:00+08:00")})
+}, "invalid canonical RFC3339 UTC second value");
+
+pub def rfc3339_preserves_four_digit_year_and_december: test::Test = test::should_ok(fn() {
+    if edsl::canonical_rfc3339("0001-12-31T23:59:59Z")
+        && edsl::calendar_date("2024-12-31")
+        && !edsl::canonical_rfc3339("2025-02-29T00:00:00Z") { True }
+    else { fail!("time validators lost a valid date or accepted a non-leap day") }
+});
+
+pub def relation_cannot_join_rfc3339_to_plain_string: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("incompatible-time-relation", [Dog.type, LegacyClock.type], profile,
+        fn(subject) { subject == "reader" })
+}, "relation fields have different logical time types or encodings");
+
+pub def time_dimension_cannot_declare_plain_text_input: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("wrong-time-input-kind", [BadTimeDimension.type], profile,
+        fn(subject) { subject == "reader" })
+}, "plain dimension filter input or operation disagrees with field type");
+
+pub def knowledge_exposes_logical_time_type_and_storage_encoding: test::Test = test::should_ok(fn() {
+    let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::TimeRole,
+        owner: "dog", id: "created_at"};
+    match knowledge::by_target(payload, "reader", target) {
+        knowledge::DocResult::Found(point) => match point.time_role {
+            Some(role) => if role.logical_type == edsl::TimeLogicalType::Rfc3339
+                && role.encoding == edsl::TimeEncoding::Rfc3339Text { True }
+                else { fail!("time knowledge lost logical or storage type", role) },
+            None => fail!("time knowledge has no role", point),
+        },
+        other => fail!("time role is not discoverable", other),
+    }
+});

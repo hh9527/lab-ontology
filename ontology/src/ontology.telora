@@ -20,6 +20,12 @@ use std::string as string;
 @regex::parse_by(regex::compile(r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2}) (?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})$"))
 type CanonicalUtcParts = struct { year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int };
 
+@regex::parse_by(regex::compile(r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})T(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})Z$"))
+type Rfc3339UtcParts = struct { year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int };
+
+@regex::parse_by(regex::compile(r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})$"))
+type CalendarDateParts = struct { year: Int, month: Int, day: Int };
+
 # SQL-facing scalar result of a declared Model projection. This knowledge is
 # checked before ontology lowering emits a set QueryPlan.
 type OutputType = enum { Text, Integer, Number, Boolean };
@@ -163,8 +169,9 @@ type EntityId = struct { id: String };
 # Dataset semantics are declared independently of the physical source. Grain
 # fields identify one logical row; time names the authoritative UTC instant.
 type DatasetKind = enum { Entity, Event, Metric };
-type TimeSemantics = enum { Utc, Local };
-type TimeEncoding = enum { CanonicalUtcSecondText, UtcEpochMillis, LocalText, LocalEpochMillis };
+type TimeSemantics = enum { Utc, Local, Date };
+type TimeLogicalType = enum { LocalDateTime, Date, Rfc3339, EpochMillis, UtcSecond };
+type TimeEncoding = enum { CanonicalUtcSecondText, UtcEpochMillis, LocalText, LocalEpochMillis, DateText, Rfc3339Text };
 @prelude::property(PropertyTarget::Field)
 type TimeField = struct { semantics: TimeSemantics, encoding: TimeEncoding };
 @prelude::property(PropertyTarget::Type)
@@ -376,13 +383,18 @@ type FilterOp = enum {
     Contains, NotContains, StartsWith, EndsWith,
 };
 
-type FilterInputKind = enum { Text, Number, Int, Bool };
+type FilterInputKind = enum { Text, Number, Int, Bool, Rfc3339, EpochMillis, Date, UtcSecond, LocalDateTime };
 
 type FilterInput = enum {
     Text(String),
     Number(Float),
     Int(Int),
     Bool(Bool),
+    Rfc3339(String),
+    EpochMillis(Int),
+    Date(String),
+    UtcSecond(String),
+    LocalDateTime(String),
 };
 
 # A member's inherent row-range scope predicate: a constraint on one field of
@@ -529,6 +541,7 @@ type MetricValueRole = enum { DeclaredMetric, SampleSummary };
 type TimeRoleBrief = struct {
     field: String,
     semantics: TimeSemantics,
+    logical_type: TimeLogicalType,
     encoding: TimeEncoding,
     authoritative: Bool,
     dimension_ids: Array(String),
@@ -809,8 +822,10 @@ def sample_aggregate: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(pr
 
 def time_field: Fn(TimeSemantics, TimeEncoding) -> Fn(property::FieldPropertyCtx, Option(TimeField)) -> TimeField = fn(semantics, encoding) {
     fn(ctx, previous) {
-        if (semantics == TimeSemantics::Utc) != (encoding == TimeEncoding::CanonicalUtcSecondText || encoding == TimeEncoding::UtcEpochMillis) {
-            fail!("UTC time semantics require a UTC encoding", ctx)
+        if (semantics == TimeSemantics::Utc && encoding != TimeEncoding::CanonicalUtcSecondText && encoding != TimeEncoding::UtcEpochMillis && encoding != TimeEncoding::Rfc3339Text)
+            || (semantics == TimeSemantics::Date && encoding != TimeEncoding::DateText)
+            || (semantics == TimeSemantics::Local && encoding != TimeEncoding::LocalText && encoding != TimeEncoding::LocalEpochMillis) {
+            fail!("time semantics and physical encoding do not match", ctx, semantics, encoding)
         } else {
         let result: TimeField = { semantics, encoding };
         result
@@ -1091,6 +1106,8 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
             TimeEncoding::UtcEpochMillis => Int.type,
             TimeEncoding::LocalText => String.type,
             TimeEncoding::LocalEpochMillis => Int.type,
+            TimeEncoding::DateText => String.type,
+            TimeEncoding::Rfc3339Text => String.type,
         };
         if field_ty != expected {
             fail!("time encoding disagrees with field type", name, role.encoding)
@@ -1154,6 +1171,11 @@ def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input
         FilterInput::Int(_) => field.ty == Int.type,
         FilterInput::Number(_) => field.ty == Float.type,
         FilterInput::Bool(_) => field.ty == Bool.type,
+        FilterInput::Rfc3339(_) => False,
+        FilterInput::EpochMillis(_) => False,
+        FilterInput::Date(_) => False,
+        FilterInput::UtcSecond(_) => False,
+        FilterInput::LocalDateTime(_) => False,
     }
 };
 
@@ -1300,6 +1322,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                             && match property::get_field_prop(ty, field.index, TimeField.type) {
                                 Some(role) => role.semantics == TimeSemantics::Utc
                                     && ((role.encoding == TimeEncoding::CanonicalUtcSecondText && field.ty == String.type)
+                                        || (role.encoding == TimeEncoding::Rfc3339Text && field.ty == String.type)
                                         || (role.encoding == TimeEncoding::UtcEpochMillis && field.ty == Int.type)),
                                 None => False,
                             }
@@ -1882,6 +1905,11 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
                             FilterInput::Int(_) => field.ty == Int.type,
                             FilterInput::Number(_) => False,
                             FilterInput::Bool(_) => False,
+                            FilterInput::Rfc3339(_) => False,
+                            FilterInput::EpochMillis(_) => False,
+                            FilterInput::Date(_) => False,
+                            FilterInput::UtcSecond(_) => False,
+                            FilterInput::LocalDateTime(_) => False,
                         }
                     })
                     && array::length(array::filter(mapping.values, fn(other) { other.id == v.id })) == 1
@@ -1962,15 +1990,32 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     None => False,
                 };
                 let valid_kind = if array::length(enumerated) > 0 { FilterInputKind::Text }
+                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                        Some(role) => role.encoding == TimeEncoding::LocalText,
+                        None => False,
+                    } { FilterInputKind::LocalDateTime }
+                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                        Some(role) => role.encoding == TimeEncoding::CanonicalUtcSecondText,
+                        None => False,
+                    } { FilterInputKind::UtcSecond }
+                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                        Some(role) => role.encoding == TimeEncoding::Rfc3339Text,
+                        None => False,
+                    } { FilterInputKind::Rfc3339 }
+                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                        Some(role) => role.encoding == TimeEncoding::DateText,
+                        None => False,
+                    } { FilterInputKind::Date }
+                    else if epoch { FilterInputKind::EpochMillis }
                     else if f.ty == String.type { FilterInputKind::Text }
                     else if f.ty == Int.type { FilterInputKind::Int }
                     else if f.ty == Float.type { FilterInputKind::Number }
                     else if f.ty == Bool.type { FilterInputKind::Bool }
                     else { fail!("plain dimension requires a String, Int, Float, Bool or closed enum field", entity.id, f.name) };
-                if epoch && (dd.input_kinds != [FilterInputKind::Int]
+                if epoch && (dd.input_kinds != [FilterInputKind::EpochMillis]
                     || array::any(dd.ops, fn(op) { is_text_op(op) })
                     || array::length(mapped) > 0) {
-                    fail!("epoch-millisecond time dimension requires numeric filters", entity.id, f.name)
+                    fail!("epoch-millisecond time dimension requires EpochMillis filters", entity.id, f.name)
                 } else if array::length(mapped) > 0 && array::length(enumerated) > 0 {
                     fail!("dimension cannot combine enum and canonical wire domains", entity.id, f.name)
                 } else if array::length(mapped) > 0 && (!dd.filterable
@@ -1983,7 +2028,9 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         || array::any(dd.ops, fn(op) { op != FilterOp::Eq })) {
                     fail!("enum dimension supports only text business values and Eq filters", entity.id, f.name)
                 } else if array::length(mapped) == 0 && (array::any(dd.input_kinds, fn(kind) {
-                    if f.ty == Int.type || f.ty == Float.type {
+                    if epoch || valid_kind == FilterInputKind::Rfc3339 || valid_kind == FilterInputKind::Date
+                        || valid_kind == FilterInputKind::UtcSecond || valid_kind == FilterInputKind::LocalDateTime { kind != valid_kind }
+                    else if f.ty == Int.type || f.ty == Float.type {
                         kind != FilterInputKind::Int && kind != FilterInputKind::Number
                     } else { kind != valid_kind }
                 })
@@ -1996,6 +2043,11 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         FilterInputKind::Int => OutputType::Integer,
                         FilterInputKind::Number => OutputType::Number,
                         FilterInputKind::Bool => OutputType::Boolean,
+                        FilterInputKind::Rfc3339 => OutputType::Text,
+                        FilterInputKind::EpochMillis => OutputType::Integer,
+                        FilterInputKind::Date => OutputType::Text,
+                        FilterInputKind::UtcSecond => OutputType::Text,
+                        FilterInputKind::LocalDateTime => OutputType::Text,
                     };
                     [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index))]
                 }
@@ -2043,6 +2095,15 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
                 fail!("relation key fields require physical columns", from_entity.id, pair.from, to_entity.id, pair.to)
             } else if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
                 fail!("relation fields have different types", pair.from, pair.to)
+            } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
+                property::get_field_prop(to_entity.entity_type, to_field, TimeField.type)) {
+                (None, None) => False,
+                (Some(left), Some(right)) => time_logical_type(left) != time_logical_type(right)
+                    || left.encoding != right.encoding,
+                _ => True,
+            } {
+                fail!("relation fields have different logical time types or encodings",
+                    from_entity.id, pair.from, to_entity.id, pair.to)
             } else {
             RelationKey::Eq({ from: from_field, to: to_field })
             }
@@ -2085,6 +2146,23 @@ def safe_relation_covers_target_identity: Fn(EntityEntry, Array(RelationPair)) -
     }
 };
 
+def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool = fn(entity, field, input) {
+    match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+        Some(role) => match (role.encoding, input) {
+            (TimeEncoding::CanonicalUtcSecondText, FilterInput::UtcSecond(value)) => canonical_utc_second(value),
+            (TimeEncoding::Rfc3339Text, FilterInput::Rfc3339(value)) => canonical_rfc3339(value),
+            (TimeEncoding::DateText, FilterInput::Date(value)) => calendar_date(value),
+            (TimeEncoding::UtcEpochMillis, FilterInput::EpochMillis(_)) => True,
+            (TimeEncoding::LocalEpochMillis, FilterInput::EpochMillis(_)) => True,
+            (TimeEncoding::LocalText, FilterInput::LocalDateTime(value)) => canonical_utc_second(value),
+            _ => False,
+        },
+        None => (field.ty == String.type && match input { FilterInput::Text(_) => True, _ => False })
+            || (field.ty == Int.type && match input { FilterInput::Int(_) => True, _ => False })
+            || (field.ty == Bool.type && match input { FilterInput::Bool(_) => True, _ => False }),
+    }
+};
+
 def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entities) {
     array::flat_map(entities, fn(entity) {
         let rd = property::get_type_prop(entity.entity_type, RelationDef.type);
@@ -2119,9 +2197,7 @@ def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entit
                     if field.column == "" { fail!("relation guard field requires a physical column", rel.id, pred.field) }
                     else if pred.op != FilterOp::Eq && pred.op != FilterOp::Ne {
                         fail!("relation guard supports only Eq or Ne", rel.id, pred.op)
-                    } else if !((field.ty == String.type && match pred.input { FilterInput::Text(_) => True, _ => False })
-                        || (field.ty == Int.type && match pred.input { FilterInput::Int(_) => True, _ => False })
-                        || (field.ty == Bool.type && match pred.input { FilterInput::Bool(_) => True, _ => False })) {
+                    } else if !guard_input_matches_field(entity, field, pred.input) {
                         fail!("relation guard value disagrees with source field type", rel.id, pred.field, pred.input)
                     } else { Some(pred) }
                 },
@@ -2213,9 +2289,7 @@ def prepare_source_guard: Fn(EntityEntry, String, Option(ScopePredicate)) -> Opt
             if field.column == "" { fail!("relation or business link guard field requires a physical column", id, pred.field) }
             else if pred.op != FilterOp::Eq && pred.op != FilterOp::Ne {
                 fail!("relation or business link guard supports only Eq or Ne", id, pred.op)
-            } else if !((field.ty == String.type && match pred.input { FilterInput::Text(_) => True, _ => False })
-                || (field.ty == Int.type && match pred.input { FilterInput::Int(_) => True, _ => False })
-                || (field.ty == Bool.type && match pred.input { FilterInput::Bool(_) => True, _ => False })) {
+            } else if !guard_input_matches_field(entity, field, pred.input) {
                 fail!("relation or business link guard value disagrees with source field type", id, pred.field, pred.input)
             } else { Some(pred) }
         },
@@ -2505,12 +2579,19 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
                         FilterInputKind::Text => FilterInput::Text(match time {
                             Some(role) => if !entry.computed && role.encoding == TimeEncoding::CanonicalUtcSecondText {
                                 "2024-01-01 00:00:00"
+                            } else if !entry.computed && role.encoding == TimeEncoding::DateText {
+                                "2024-01-01"
                             } else { "probe" },
                             None => "probe",
                         }),
                         FilterInputKind::Number => FilterInput::Number(1.0),
                         FilterInputKind::Int => FilterInput::Int(1),
                         FilterInputKind::Bool => FilterInput::Bool(True),
+                        FilterInputKind::Rfc3339 => FilterInput::Rfc3339("2024-01-01T00:00:00Z"),
+                        FilterInputKind::EpochMillis => FilterInput::EpochMillis(1704067200000),
+                        FilterInputKind::Date => FilterInput::Date("2024-01-01"),
+                        FilterInputKind::UtcSecond => FilterInput::UtcSecond("2024-01-01 00:00:00"),
+                        FilterInputKind::LocalDateTime => FilterInput::LocalDateTime("2024-01-01 00:00:00"),
                     }
                 })
             };
@@ -2691,6 +2772,17 @@ def time_domain: Fn(PreparedPayload, String, String) -> TimeField = fn(payload, 
     }
 };
 
+def time_logical_type: Fn(TimeField) -> TimeLogicalType = fn(role) {
+    match role.encoding {
+        TimeEncoding::DateText => TimeLogicalType::Date,
+        TimeEncoding::LocalText => TimeLogicalType::LocalDateTime,
+        TimeEncoding::CanonicalUtcSecondText => TimeLogicalType::UtcSecond,
+        TimeEncoding::UtcEpochMillis => TimeLogicalType::EpochMillis,
+        TimeEncoding::LocalEpochMillis => TimeLogicalType::EpochMillis,
+        TimeEncoding::Rfc3339Text => TimeLogicalType::Rfc3339,
+    }
+};
+
 def metric_domain: Fn(PreparedPayload, String) -> Array(MetricValueEntry) = fn(payload, id) {
     match array::find(payload.entities, fn(entry) { entry.id == id }) {
         Some(entry) => entry.metrics,
@@ -2812,6 +2904,7 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
                     else {
                         let brief: TimeRoleBrief = {
                             field: field.name, semantics: role.semantics,
+                            logical_type: time_logical_type(role),
                             encoding: role.encoding, authoritative, dimension_ids,
                         };
                         [brief]
@@ -2889,24 +2982,46 @@ def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(k
         FilterInput::Number(_) => FilterInputKind::Number,
         FilterInput::Int(_) => FilterInputKind::Int,
         FilterInput::Bool(_) => FilterInputKind::Bool,
+        FilterInput::Rfc3339(_) => FilterInputKind::Rfc3339,
+        FilterInput::EpochMillis(_) => FilterInputKind::EpochMillis,
+        FilterInput::Date(_) => FilterInputKind::Date,
+        FilterInput::UtcSecond(_) => FilterInputKind::UtcSecond,
+        FilterInput::LocalDateTime(_) => FilterInputKind::LocalDateTime,
     };
     array::any(kinds, fn(k) { k == kind })
+};
+
+def calendar_components: Fn(Int, Int, Int) -> Bool = fn(year, month, day) {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 => if leap { 29 } else { 28 },
+        4 => 30, 6 => 30, 9 => 30, 11 => 30,
+        1 => 31, 3 => 31, 5 => 31, 7 => 31, 8 => 31, 10 => 31, 12 => 31,
+        _ => 0,
+    };
+    year > 0 && day >= 1 && day <= days
+};
+
+def calendar_date: Fn(String) -> Bool = fn(value) {
+    match string::parse@[CalendarDateParts](value) {
+        Err(_) => False,
+        Ok(parts) => calendar_components(parts.year, parts.month, parts.day),
+    }
 };
 
 def canonical_utc_second: Fn(String) -> Bool = fn(value) {
     match string::parse@[CanonicalUtcParts](value) {
         Err(_) => False,
-        Ok(parts) => do {
-            let leap = parts.year % 4 == 0 && (parts.year % 100 != 0 || parts.year % 400 == 0);
-            let days = match parts.month {
-                2 => if leap { 29 } else { 28 },
-                4 => 30, 6 => 30, 9 => 30, 11 => 30,
-                1 => 31, 3 => 31, 5 => 31, 7 => 31, 8 => 31, 10 => 31, 12 => 31,
-                _ => 0,
-            };
-            parts.year > 0 && parts.day >= 1 && parts.day <= days
-                && parts.hour < 24 && parts.minute < 60 && parts.second < 60
-        },
+        Ok(parts) => calendar_components(parts.year, parts.month, parts.day)
+            && parts.hour < 24 && parts.minute < 60 && parts.second < 60,
+    }
+};
+
+def canonical_rfc3339: Fn(String) -> Bool = fn(value) {
+    match string::parse@[Rfc3339UtcParts](value) {
+        Err(_) => False,
+        Ok(parts) => calendar_components(parts.year, parts.month, parts.day)
+            && parts.hour < 24 && parts.minute < 60 && parts.second < 60,
     }
 };
 
@@ -2914,11 +3029,36 @@ def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bo
     let entity = get_index(payload.entities, entry.entity);
     let role = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
     match role {
-        Some(time) => if !entry.computed && time.encoding == TimeEncoding::CanonicalUtcSecondText {
-            match input {
-                FilterInput::Text(value) => if canonical_utc_second(value) { True }
-                    else { fail!("invalid canonical UTC second filter value", entry.id, value) },
-                _ => fail!("canonical UTC second filter requires text", entry.id, input),
+        Some(time) => if !entry.computed {
+            match time.encoding {
+                TimeEncoding::CanonicalUtcSecondText => match input {
+                    FilterInput::UtcSecond(value) => if canonical_utc_second(value) { True }
+                        else { fail!("invalid canonical UTC second filter value", entry.id, value) },
+                    _ => fail!("canonical UTC second filter requires UtcSecond input", entry.id, input),
+                },
+                TimeEncoding::DateText => match input {
+                    FilterInput::Date(value) => if calendar_date(value) { True }
+                        else { fail!("invalid calendar date filter value", entry.id, value) },
+                    _ => fail!("calendar date filter requires Date input", entry.id, input),
+                },
+                TimeEncoding::Rfc3339Text => match input {
+                    FilterInput::Rfc3339(value) => if canonical_rfc3339(value) { True }
+                        else { fail!("invalid canonical RFC3339 UTC second value", entry.id, value) },
+                    _ => fail!("RFC3339 time field requires RFC3339 input", entry.id, input),
+                },
+                TimeEncoding::UtcEpochMillis => match input {
+                    FilterInput::EpochMillis(_) => True,
+                    _ => fail!("epoch-millisecond time field requires EpochMillis input", entry.id, input),
+                },
+                TimeEncoding::LocalEpochMillis => match input {
+                    FilterInput::EpochMillis(_) => True,
+                    _ => fail!("epoch-millisecond time field requires EpochMillis input", entry.id, input),
+                },
+                TimeEncoding::LocalText => match input {
+                    FilterInput::LocalDateTime(value) => if canonical_utc_second(value) { True }
+                        else { fail!("invalid local datetime filter value", entry.id, value) },
+                    _ => fail!("local datetime field requires LocalDateTime input", entry.id, input),
+                },
             }
         } else { True },
         None => True,
@@ -2955,6 +3095,11 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
         FilterInput::Number(f) => qb::Val::Float(f),
         FilterInput::Int(i) => qb::Val::Int(i),
         FilterInput::Bool(b) => qb::Val::Bool(b),
+        FilterInput::Rfc3339(value) => qb::Val::String(value),
+        FilterInput::EpochMillis(value) => qb::Val::Int(value),
+        FilterInput::Date(value) => qb::Val::String(value),
+        FilterInput::UtcSecond(value) => qb::Val::String(value),
+        FilterInput::LocalDateTime(value) => qb::Val::String(value),
     }
 };
 
@@ -4775,6 +4920,7 @@ pub use self::{
     EntityId,
     DatasetKind,
     TimeSemantics,
+    TimeLogicalType,
     TimeEncoding,
     TimeField,
     DatasetSpec,
@@ -4906,6 +5052,10 @@ pub use self::{
     dimension_detail_for_subject,
     dataset_domain,
     time_domain,
+    time_logical_type,
+    calendar_date,
+    canonical_utc_second,
+    canonical_rfc3339,
     metric_domain,
     measure_domain,
     measure_domain_for_subject,

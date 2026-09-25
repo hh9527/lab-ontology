@@ -1,0 +1,72 @@
+# Time windows arrive resolved by the caller. This module checks their model
+# role and physical encoding before they become ordinary bound filters.
+use crate::ontology as edsl;
+use std::array as array;
+
+type TimeValue = enum {
+    Date(String),
+    LocalDateTime(String),
+    UtcSecond(String),
+    Rfc3339(String),
+    EpochMillis(Int),
+};
+
+type Window = struct { start: TimeValue, end: TimeValue };
+
+def input: Fn(edsl::TimeField, TimeValue, String) -> edsl::FilterInput = fn(role, value, dimension) {
+    match (role.encoding, value) {
+        (edsl::TimeEncoding::DateText, TimeValue::Date(text)) =>
+            if edsl::calendar_date(text) { edsl::FilterInput::Date(text) }
+            else { fail!("invalid calendar date boundary", dimension, text) },
+        (edsl::TimeEncoding::Rfc3339Text, TimeValue::Rfc3339(text)) =>
+            if edsl::canonical_rfc3339(text) { edsl::FilterInput::Rfc3339(text) }
+            else { fail!("invalid canonical RFC3339 UTC second value", dimension, text) },
+        (edsl::TimeEncoding::CanonicalUtcSecondText, TimeValue::UtcSecond(text)) =>
+            if edsl::canonical_utc_second(text) { edsl::FilterInput::UtcSecond(text) }
+            else { fail!("invalid canonical UTC second boundary", dimension, text) },
+        (edsl::TimeEncoding::UtcEpochMillis, TimeValue::EpochMillis(ms)) =>
+            edsl::FilterInput::EpochMillis(ms),
+        (edsl::TimeEncoding::LocalEpochMillis, TimeValue::EpochMillis(ms)) =>
+            edsl::FilterInput::EpochMillis(ms),
+        (edsl::TimeEncoding::LocalText, TimeValue::LocalDateTime(text)) =>
+            if edsl::canonical_utc_second(text) { edsl::FilterInput::LocalDateTime(text) }
+            else { fail!("invalid local datetime boundary", dimension, text) },
+        _ => fail!("time boundary does not match declared field encoding", dimension, role, value),
+    }
+};
+
+def before: Fn(TimeValue, TimeValue, String) -> Bool = fn(start, end, dimension) {
+    match (start, end) {
+        (TimeValue::EpochMillis(a), TimeValue::EpochMillis(b)) => a < b,
+        (TimeValue::UtcSecond(a), TimeValue::UtcSecond(b)) => a < b,
+        (TimeValue::Rfc3339(a), TimeValue::Rfc3339(b)) => a < b,
+        (TimeValue::Date(a), TimeValue::Date(b)) => if edsl::calendar_date(a) && edsl::calendar_date(b) { a < b }
+            else { fail!("invalid calendar date boundary", dimension, a, b) },
+        # A local clock cannot be compared across daylight-saving transitions
+        # without a zone and ambiguity policy supplied by the caller.
+        (TimeValue::LocalDateTime(_), TimeValue::LocalDateTime(_)) =>
+            fail!("local time window requires externally resolved instant boundaries", dimension),
+        _ => fail!("time window boundaries have different logical types", dimension, start, end),
+    }
+};
+
+def window_filters: Fn(edsl::PreparedPayload, String, String, Window) -> Array(edsl::FilterRequest) =
+    fn(payload, subject, dimension, window) {
+        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+        if !detail.filterable || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Ge })
+            || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Lt }) {
+            fail!("time dimension does not support half-open range filters", dimension)
+        } else {
+            let role = edsl::time_domain(payload, detail.dataset, detail.field);
+            let start = input(role, window.start, dimension);
+            let end = input(role, window.end, dimension);
+            if !before(window.start, window.end, dimension) {
+                fail!("time window start must precede end", dimension, window)
+            } else {
+                [{id: dimension, subject, op: edsl::FilterOp::Ge, input: start},
+                 {id: dimension, subject, op: edsl::FilterOp::Lt, input: end}]
+            }
+        }
+    };
+
+pub use self::{TimeValue, Window, window_filters};
