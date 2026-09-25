@@ -33,13 +33,15 @@ on the legacy `qualify_metrics` API described later in this historical log;
 they do not establish production KPI grain or clock encoding.
 
 `icloud-model/tests/knowledge.telora` also checks the 19-entity Prepared Model
-as one navigable catalog. The current `doc.ic`/`index.ic` TransformService
-works under the default request budget but reconstructs the catalog per
-request (roughly 359 million Wasm fuel for one indexed request on this model).
-Capturing the full catalog in both service slots exceeded the runtime's
-single growth-operation limit; a compact shared or lazily derived knowledge
-representation is a separate ontology scaling pressure, not an excuse to
-weaken visibility or graph-closure checks.
+as one navigable catalog. `IndexService` now retains only topic entries at
+initialization, preserving full catalog closure validation without retaining
+every detailed Point. A single `index.ic` page request fell from 361.7 million
+to about 1.5 million Wasm fuel (offset 0, limit 1); index construction still
+costs initialization work. `doc.ic` still reconstructs full details per
+request (roughly 362 million fuel for the Device document), a separate scaling
+pressure. Capturing full catalogs in service slots exceeded the runtime's
+single growth-operation limit; optimizing doc must not weaken visibility or
+graph-closure checks.
 
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes
