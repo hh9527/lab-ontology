@@ -199,6 +199,13 @@ bridge with the expected FIFO paths, then closed its stdin before sending an
 MCP request and reported `Connection closed`. The temporary configuration was
 reverted; the working OpenCode evaluation still uses loopback HTTP. No new
 question run or end-to-end stdio OpenCode claim follows from this check.
+The same failure occurred with OpenCode and the bridge both running on the
+host, using a temporary in-memory OpenCode configuration; it is not caused by
+bubblewrap mounts or PID isolation. A further PID-isolated OpenCode check of
+the existing HTTP route could not start its host listener in the current
+command sandbox (`listen EPERM`), so it provides no new evidence about that
+route. The isolated direct bridge check above remains the only new PID-boundary
+observation.
 
 The following hard acceptance points are **not yet met**: 05 still relabels a
 physical connection as downstream and once presented handwritten `UNION` SQL;
