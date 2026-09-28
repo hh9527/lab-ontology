@@ -11,11 +11,12 @@ An entry `MainService` can mount separate `TransformService` slots for
 passes only `input` to the selected slot. Use
 `knowledge::knowledge_info_method_factory(payload, subject)` and
 `knowledge::knowledge_index_method_factory(payload, subject)` in the respective
-slots' `init`; neither expects an envelope inside `transform`. The ic model
-mounts these alongside `ic/transform`. The dog, spider, and world models share
-the `example_models` entry instead: each has `<domain>/transform` and
-`<domain>/doc`, where `doc` accepts topic/target lookup or index pagination.
+slots' `init`; neither expects an envelope inside `transform`. Every model
+mounts `<domain>/index`, `<domain>/info`, and `<domain>/transform`. The ic model
+uses its own entry, while dog, spider, and world share `example_models`.
 No second copy of any Model is needed.
+The model-independent build, service, and agent workflow is in
+[USAGE.md](../../USAGE.md).
 
 Requests have exactly `method` and `input`:
 

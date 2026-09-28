@@ -34,9 +34,9 @@ class ExampleRoutesTest(unittest.TestCase):
                     "edges": [], "select": [], "count": node,
                 }})
                 self.assertIn(f"FROM {table} AS {node}", query["sql"])
-                page = self.call(f"{domain}/doc", {"limit": 1})["Index"]
+                page = self.call(f"{domain}/index", {"limit": 1})["Index"]
                 self.assertEqual(page["entries"][0]["topic"], first_topic)
-                point = self.call(f"{domain}/doc", {"topic": first_topic})["Document"]["Found"]
+                point = self.call(f"{domain}/info", {"topic": first_topic})["Document"]["Found"]
                 self.assertEqual(point["label"], first_topic)
 
 

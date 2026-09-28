@@ -3,14 +3,16 @@
 `example_models` packages the dog, spider, and world models in one Telora
 service collection. Each model keeps its own knowledge and lowering rules:
 
-| Model | Query | Knowledge |
-| --- | --- | --- |
-| Dog | `dog/transform` | `dog/doc` |
-| Spider | `spider/transform` | `spider/doc` |
-| World | `world/transform` | `world/doc` |
+| Model | Index | Detail | Query |
+| --- | --- | --- | --- |
+| Dog | `dog/index` | `dog/info` | `dog/transform` |
+| Spider | `spider/index` | `spider/info` | `spider/transform` |
+| World | `world/index` | `world/info` | `world/transform` |
 
 `<model>/transform` receives `{ "intent": ..., "ctx": ... }`; `ctx` is optional.
-`<model>/doc` accepts `{ "topic": "..." }` or `{ "target": ... }` for a
-knowledge point, and `{ "offset": 0, "limit": 50 }` (or `{}`) for the
-paginated knowledge index. The ic model remains in its own `icloud_model`
-entry with `ic/transform`, `ic/info`, and `ic/index`.
+`<model>/index` accepts `{ "offset": 0, "limit": 50 }` (or `{}`) for the
+paginated knowledge index. `<model>/info` accepts `{ "topic": "..." }` or
+`{ "target": ... }` for one knowledge point. The ic model has the same three
+routes under `ic/` in its own `icloud_model` entry.
+All domains use the same [service and agent guide](../USAGE.md) with their
+domain name and the separate Intent contract supplied by the host.
