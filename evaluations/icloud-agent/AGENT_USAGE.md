@@ -1,75 +1,19 @@
-# Ontology Service Usage
+# Ontology query service
 
-This file covers packaging, starting, and using an ontology-backed query
-service. Sections 1-3 apply to any model exposing the same three methods.
-Section 4 is this repository's domain inventory; an integrating application
-can replace or omit it. Run the build command from the repository root;
-the runner can start from any directory where the artifact is accessible.
-Sections 1-2 are for the trusted host, not the querying Agent.
+Use only the host-provided `ontology_index`, `ontology_info`, and `ontology_transform` tools for the `ic` domain. The host runs the service; do not run or inspect an artifact. The host supplies this guide and the question as attachments.
 
-## 1. Build a snapshot
+## Tool protocol and Intent syntax
 
-```sh
-bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm
-```
-
-`<module>` is a Telora workspace member with a `MainService`; it is not the
-domain name used in requests. The build initializes the service and embeds its
-ready state in the Wasm artifact. If a module declares external sources, provide
-all of them with `--source name=path` at build time. Initialization fuel,
-request fuel, and memory limits can be set with the corresponding CLI options
-when deployment requires them. Use a compatible `telora-run` version with the
-resulting experimental artifact.
-The `-C <module>` option selects the crate context when running from the
-repository root; invoking `build` from the root without it fails.
-
-## 2. Start the service
-
-```sh
-telora-run <artifact>.wasm --serve stdio+jsonl://
-telora-run <artifact>.wasm --serve http://127.0.0.1:8080
-```
-
-Keep this process running. Write one JSON request per line to stdin and read
-one JSON response per line from stdout. Do not mix other stdout text into this
-stream. A runner started without `--serve` reads one complete JSON request and
-exits after one response. `telora-run` executes the built artifact without
-the source tree, workspace configuration, or compiler; only the artifact and
-a compatible runner are needed at deployment.
-
-The models in this repository explicitly declare POST routes
-`/<domain>/index`, `/<domain>/info`, and `/<domain>/transform`. The HTTP body is
-the slot input, without the JSONL `method`/`input` envelope. For example:
-
-```sh
-curl -sS -X POST http://127.0.0.1:8080/ic/index \
-  -H 'Content-Type: application/json' -d '{"offset":0,"limit":50}'
-```
-
-`telora-run` has no authentication. Bind only to a host-private loopback or
-Unix socket, and expose these three operations to an Agent through a trusted
-tool adapter or authenticated gateway. The Agent environment must not mount
-the snapshot, runner, source tree, tests, or evaluator material, and must not
-have a shell or file tool that can read the host's deployment directory. Keep
-the gateway's credentials and runner command outside the Agent's context.
-Simply omitting the artifact path from the prompt is not isolation. A local
-tool process with unrestricted host filesystem access is not isolation either.
-Rate limits, request-size limits, access logging, and any SQL execution
-authorization belong to the host. `transform` only produces a Query; it does
-not execute it. `--serve` is the current CLI option; `--bind` belongs to older
-Telora documentation.
-
-## 3. Request protocol and agent workflow
-
-For JSONL, every request has exactly `method` and `input`. The method selects a
-slot; only `input` is passed to that slot. For HTTP, POST the same `input`
-directly to the matching path. The three methods for a domain are:
+Pass the following objects directly as tool arguments:
 
 ```json
-{"method":"<domain>/index","input":{"offset":0,"limit":50}}
-{"method":"<domain>/info","input":{"topic":"<exact topic>"}}
-{"method":"<domain>/info","input":{"target":{"kind":"dataset","owner":"","id":"<stable ID>"}}}
+{"offset":0,"limit":50}
+{"topic":"<exact topic>"}
+{"target":{"kind":"dataset","owner":"","id":"<stable ID>"}}
 ```
+
+The first object is for `ontology_index`; the latter two are alternatives for
+`ontology_info`. `ontology_transform` takes an `intent` and optional `ctx`.
 
 `index` returns a paginated catalog of visible knowledge points. Follow
 `next_offset` until the relevant area is found; do not treat the first page as
@@ -95,19 +39,18 @@ would change the answer, clarify the business meaning with the user in business
 terms. SQL and bindings are intermediate output for an authorized execution
 layer, not the basis for clarification or the final user-facing result.
 
-Submit an Intent with the same outer envelope:
+Submit an Intent to `ontology_transform`:
 
 ```text
-{"method":"<domain>/transform","input":{"intent":<Intent>}}
-{"method":"<domain>/transform","input":{"intent":<Intent>,"ctx":{"now":<epoch milliseconds>,"tz":<UTC offset minutes>}}}
+{"intent":<Intent>}
+{"intent":<Intent>,"ctx":{"now":<epoch milliseconds>,"tz":<UTC offset minutes>}}
 ```
 
 `ctx` is optional unless the Intent refers to request time; the host must
 supply `now` explicitly and calendar boundaries also need `tz`. The Agent must
 not infer either value from its own environment. If a required value is absent,
 ask for it before lowering. `ctx.tz` is a fixed offset, not a named timezone or
-daylight-saving rule. See
-[TIME.md](ontology/docs/TIME.md) for time value and window semantics. Knowledge
+daylight-saving rule. Knowledge
 discovery describes the Model; the generic Intent syntax is below. The Model
 and `transform` decide which combinations have valid business meaning.
 
@@ -217,7 +160,7 @@ The outer object accepts only `op`, `left`, `right`, and optional boolean
 `count_groups`. A successful pair does not prove that two similarly named
 display values are the same entity: the join uses the aligned identity keys.
 
-In JSONL service mode, responses use the `telora.service/v1` envelope. On
+Tool responses use the `telora.service/v1` envelope. On
 success, `ok.Index` contains `entries` and `next_offset`, `ok.Document` holds
 `Found`, `Candidates`, or `NotFound`, and `ok` from `transform` contains `sql`
 and `bindings`. A failure has `error: true` and structured `diagnostics`.
@@ -227,21 +170,3 @@ results. Pass both together to an authorized execution layer; never interpolate
 values into SQL. Present the resulting data to the user in an appropriate form.
 When no execution layer is available, state that only an intermediate Query was
 produced and do not invent results.
-
-## 4. Domains in this repository
-
-| Build module | Domain | Scope |
-| --- | --- | --- |
-| `example_models` | `dog` | Dog and breed example model |
-| `example_models` | `spider` | Student and school example model |
-| `example_models` | `world` | Geographic example model |
-| `icloud_model` | `ic` | iMaster Cloud modeling-pressure fixture |
-
-For example, one `example_models` snapshot serves the `dog`, `spider`, and
-`world` domains; `icloud_model` serves `ic` independently. Every domain
-exposes `<domain>/index`, `<domain>/info`, and `<domain>/transform`.
-Neither module requires external build sources, and neither collection
-declares HTTP routes. Both snapshot builds and `index` requests were checked
-with the commands above. The `ic` fixture is not a complete production domain
-model. A missing knowledge point or valid lowering path must not be filled in
-by guessing.

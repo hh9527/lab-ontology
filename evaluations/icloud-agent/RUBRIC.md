@@ -5,6 +5,10 @@ preserves the question's business meaning; a transform success alone is not
 enough. Credit useful knowledge discovery and structured feedback, and mark
 down fabricated stable IDs, physical-wire guesses, handwritten SQL, or claims
 of database results.
+Evaluate clarification by whether a business user can make the needed choice;
+internal IDs, SQL, and join descriptions are not required in the user-facing
+question. SQL and bindings are intermediate evidence for this evaluation, not
+the intended production answer.
 
 | Question | Expected decision | Critical checks |
 | --- | --- | --- |
@@ -13,9 +17,9 @@ of database results.
 | 03 | Lower only with a declared Max over the proper PON-port samples and a declared offline classification | Window is `[2025-03-01T12:00:00Z, 2025-03-31T12:00:00Z)`; caller-supplied now, not SQL `now()`; no Avg substitution. A Model gap is an acceptable finding. |
 | 04 | Reject any silent replacement of fan identities by server names, Server health by PSU health, or `warning` by another status | Original IC Q0184 SQL counted distinct server names and used health wire -1 (`error`), although the question requests fans with warning servers. The Model, not target SQL, defines the answer. |
 | 05 | Point out the contradictory direction requirement | The one-way business path is A-to-Z. A device at Z does not gain the A endpoint as downstream. Physical A/Z slots alone also do not make a bidirectional peer directed. |
-| 06 | Ask which population is intended, or explicitly reject the combined wording | Existing Tenant entities exclude orphan IDs; distinct non-null referenced IDs may include them. Neither is an interchangeable implementation of the other. |
+| 06 | Count distinct non-null referenced tenant IDs, including orphans, while naming the population accurately | The user's inclusion rule is explicit. Existing Tenant entities exclude orphan IDs, so an entity join is wrong; referring to an orphan ID as an existing Tenant entity is also inaccurate. Do not require clarification merely to rename an already specified population. |
 | 07 | Clarify whether zero-device sites count | `matched` means 1-4 qualifying devices; `all` means 0-4. A site satisfying both OR branches should not double-count its device. |
-| 08 | Clarify entity count versus distinct site-name count | Same-name Site identities can differ; source Q0014's `COUNT(DISTINCT SITE_NAME)` is not proof of the natural-language meaning. |
+| 08 | Count distinct Site identities unless the user asks about distinct names | "How many sites" denotes sites, not display labels. Same-name Site identities can differ; source Q0014's `COUNT(DISTINCT SITE_NAME)` is not proof that the user wants name cardinality. Ask only if the business context actually makes the count subject uncertain. |
 | 09 | Clarify window and metric semantics before final lowering | Rolling calendar month versus current calendar month versus 30 days; explicit now and timezone where calendar boundaries matter; whether alarms share the KPI window; raw-sample Max versus Max of another aggregate. Do not invent unsupported server KPI ownership. |
 
 Question provenance: `imaster-cloud/telora/tools/corpus_batch/results/baseline-s6/shapes.json`

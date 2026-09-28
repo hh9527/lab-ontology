@@ -75,3 +75,39 @@ external model provider. A separate isolated OpenCode startup check with a
 content-free `OK` prompt succeeded. No question content was sent in the
 blocked rerun. The four-question outcome remains unmeasured pending explicit
 authorization or a local model provider.
+
+## Service-boundary rerun with business-only questions
+
+The earlier `Connection closed` preparation result was superseded: the HTTP MCP
+adapter served actual OpenCode tool calls. The host kept the IC snapshot and
+`telora-run` outside a fresh bubblewrap filesystem for each question. The Agent
+could see only the generic guide, one business-only question, a restricted
+OpenCode configuration, and three MCP tools. The sandbox did not mount the
+repository, runner, or wasm. No database was attached. OpenCode 1.18.32 used
+`deepseek/deepseek-flash`; snapshot SHA-256 was
+`8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`,
+runner SHA-256 was
+`b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`.
+
+| Question | Observation | Business-semantic assessment |
+| --- | --- | --- |
+| 04 | Used Server's own `server_health=warning`, `server_class=subrack`, the complete Site name, and `fan_parent_server`; produced a parameterized fan count and explicitly withheld a numeric result. | Pass. No PSU-health substitution or artifact inspection. |
+| 06 | Counted distinct non-null Alarm tenant references with more than five uncleared alarms, including orphan IDs. Called them "tenant entities" in prose. | The query matches the explicit inclusion rule; terminology is inaccurate. The old rubric's mandatory clarification was wrong because the business population was specified. |
+| 08 | Used Kunlun and asset-number filters, then counted distinct `site_id` values through `server_located_at_site`. | Pass on the ordinary meaning of "how many sites". Requiring a distinct-name question would import corpus SQL into the user's request. No numeric result was invented. |
+| 09, initial guide | Found the Server KPI raw-sample Max but invented a request clock and a 30-day Alarm window, tried many unsupported time spellings, and presented a Query before confirming scope. | Fail. Legal lowering did not establish the requested time semantics. |
+| 09, generic time contract added | Finally withheld a Query and asked for the request clock, calendar-vs-rolling window, and global-vs-per-server peak. It still tried one invented `ctx.now` during exploration and did not ask whether the KPI samples share the Alarm window. | Partial. The final business clarification improved, but trace-level clock discipline and window-scope alignment remain unresolved. |
+
+The first four runs used the same cropped guide (SHA-256
+`1d5d6ad5633ff57b0c9c13a1fd93fc820099fc06d12c2c3734726fde5f20d9a5`)
+before its generic time-contract clarification; the fifth used guide SHA-256
+`1c12f0107252d279849c08db777fddb8aa8ff6300d35904e4c340cf2aaf1ebfc`.
+All five used one question per new OpenCode session. These are individual
+observations, not pass-rate estimates. The full nine-question business-only
+suite has not yet been rerun. In production SQL/bindings should be executed by
+the authorized backend and replaced by returned data in the user-facing answer.
+
+The updated source passed `check --only-types --lib --tests` in both `ontology`
+and `icloud_model`. `ontology/tests/ontology/intent` passed 15/15; IC
+`tests/knowledge` passed 24/24 with a 30000-million shared request-fuel budget.
+At 10000 million, the IC module exhausted fuel after 22 passes without an
+assertion failure.

@@ -6,6 +6,9 @@ Agent-facing guide, one `QUESTION.md`, and access to the three operations
 `ic/index`, `ic/info`, and `ic/transform` through a host-controlled tool adapter
 or authenticated gateway. The Agent's filesystem and shell must not be able
 to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
+For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.
+Supply the guide and question as host-selected attachments; disable the
+Agent's general file-reading tool entirely.
 The candidate guide should contain the generic Intent contract and Agent
 workflow from section 3 of root `USAGE.md`, with the host's three tool names or
 URLs; do not give the Agent build/start instructions or artifact paths.
@@ -21,6 +24,14 @@ The questions test three different outcomes: successful Model-backed lowering,
 refusal of a misleading or unsupported interpretation, and clarification of a
 materially ambiguous business request. A successful SQL response is not a
 universal passing condition. `RUBRIC.md` is for the evaluator, not the agent.
+Question files contain only the simulated business request; process instructions
+belong in the generic guide, not in the question. Evaluate the stated business
+purpose before applying a rubric: a corpus SQL shape or an awkward noun in the
+request must not force clarification when the intended population is explicit.
+SQL and bindings are observable intermediate artifacts in this evaluation;
+production answers should execute the Query and present the returned data.
+Clarification questions should explain the business choice, not ask the user
+to select an Intent field, SQL shape, or join path.
 
 The initial runs in `RESULTS.md` used the older artifact-and-runner candidate
 layout. Those observations remain a baseline, not a hard-isolation result;
