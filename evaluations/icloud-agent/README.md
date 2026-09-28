@@ -25,15 +25,20 @@ rule by calling one directly. Merely copying fewer files into an
 otherwise unrestricted working directory does not meet this evaluation's
 isolation requirement. Verify that the Agent process has no filesystem route
 back to the artifact before claiming a hard-isolated run.
-The adapter supports MCP over stdio, but this OpenCode 1.18.32 evaluation still
-uses its loopback HTTP mode. A local MCP bridge can forward stdio across two
+The adapter supports MCP over stdio, but this evaluation explicitly permits
+the loopback HTTP MCP endpoint for OpenCode 1.18.32. The host still runs
+`telora-run` over stdio and does not expose a second Telora listener. A local
+MCP bridge can forward stdio across two
 host-owned mode-0600 FIFOs without mounting the runner or artifact. Direct MCP
 initialization, tool listing, and knowledge lookup worked through that bridge
 inside a filesystem/PID-isolated sandbox. OpenCode's `local` MCP process,
 however, closed its stdin before sending any request and reported `Connection
-closed`; do not switch `opencode.json` to that route until its handshake works.
+closed`; stdio-only OpenCode access is not a gate for this evaluation.
 The bridge is an experimental transport component, not a completed replacement
-for the current loopback endpoint. Keep the source, runner, artifact, rubric,
+for the current loopback endpoint. The current `opencode.json` remote MCP entry
+has connected from a filesystem/PID-isolated OpenCode process; this verifies
+tool transport, not any business-question result. Keep the source, runner,
+artifact, rubric,
 and host process table outside the Agent sandbox; disabling Agent shell/file
 tools is additional defense, not a substitute for this isolation boundary.
 

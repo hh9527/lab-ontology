@@ -201,17 +201,26 @@ reverted; the working OpenCode evaluation still uses loopback HTTP. No new
 question run or end-to-end stdio OpenCode claim follows from this check.
 The same failure occurred with OpenCode and the bridge both running on the
 host, using a temporary in-memory OpenCode configuration; it is not caused by
-bubblewrap mounts or PID isolation. A further PID-isolated OpenCode check of
-the existing HTTP route could not start its host listener in the current
-command sandbox (`listen EPERM`), so it provides no new evidence about that
-route. The isolated direct bridge check above remains the only new PID-boundary
-observation.
+bubblewrap mounts or PID isolation. An initial attempt to test PID-isolated
+OpenCode on the HTTP route could not bind the loopback listener in the ordinary
+command sandbox (`listen EPERM`); the later authorized local-listener check
+below supersedes that limitation.
 A minimal standalone MCP stdio server with no ontology, FIFO, runner, or wasm
 dependency also answered `initialize` and `tools/list` correctly when called
 directly, yet OpenCode 1.18.32 reported the same pre-request `Connection
 closed` for it. The probe was removed after the check. This local MCP failure
 must be addressed in the OpenCode client or its runtime environment before a
 stdio-only OpenCode evaluation can replace the current endpoint.
+
+The current evaluation accepts the restricted loopback MCP entry; stdio-only
+OpenCode access is not a #15 acceptance gate. With the adapter hosted on
+`127.0.0.1:18016`, `opencode mcp list` reported `ontology connected` from a
+bubblewrap process with filesystem and PID namespaces isolated. A check using
+the same mount pattern found neither the snapshot nor source paths, and its
+`/proc` exposed only two sandbox PIDs. The host adapter continued to own the
+snapshot and persistent stdio `telora-run` child. This is a transport/isolation
+handshake only: no business question or Model knowledge was sent to the external
+model, and it does not replace the earlier nine-question semantic observations.
 
 The following hard acceptance points are **not yet met**: 05 still relabels a
 physical connection as downstream and once presented handwritten `UNION` SQL;
