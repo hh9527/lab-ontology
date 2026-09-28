@@ -177,7 +177,8 @@ for this transport change. The runner and snapshot remain host-side.
 The earlier bubblewrap runs disabled Agent shell/file tools and did not mount
 host artifacts, but they did not isolate the PID namespace; they do not prove
 resistance to a future arbitrary-code tool that inspects host process metadata.
-The new child-process transport has not been rerun through OpenCode.
+The new child-process transport has not been rerun on a business question
+through OpenCode; the tool handshake check below is narrower.
 
 ## MCP stdio boundary follow-up
 
@@ -231,3 +232,9 @@ its prose calls an orphan reference an existing Tenant entity. These are
 observed Agent semantic-alignment failures, not evidence that the legal
 ontology query paths should be deleted. No production data execution layer
 was part of this evaluation; generated SQL remains intermediate output.
+
+This evaluation wave stops at these observed limits. It does not add a second
+semantic-confirmation service or execution gate: that would introduce a
+separate workflow beyond knowledge discovery and Model-backed lowering.
+The unresolved Agent interpretations remain recorded as failed or partial
+results, not reclassified as passing cases.
