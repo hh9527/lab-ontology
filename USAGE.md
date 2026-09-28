@@ -169,7 +169,8 @@ Optional top-level graph fields and their shapes:
 
 An existence object has required `anchor` (an outer node instance ID),
 `nodes` (inner node objects), and `edges` (named edge objects connecting
-the anchor to inner nodes). It may also contain `constraints`, `filters`,
+the anchor to inner nodes). Its edges may be in any order but must form a
+tree rooted at `anchor`. It may also contain `constraints`, `filters`,
 `time_windows`, `any_of`, `having` (same shape as `measure_having`), and
 `negated` (boolean). `exists` qualifies outer entities without multiplying
 their rows; use it when a related one-to-many entity must only establish
