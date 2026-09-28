@@ -57,3 +57,19 @@ the same client could not see the host's snapshot path. This validates the
 transport and a possible filesystem boundary, not a complete Agent deployment
 or an OpenCode rerun. No new pass/fail score is assigned to questions 04, 06,
 08, or 09 yet.
+
+## Graph regression after nested edge normalization
+
+The full `icloud_model/tests/graph` module passed 192/192 cases with
+`--request-fuel 10000`. A run at 2000 million fuel reached 154 passes and
+then exhausted the shared module fuel budget; it did not report a failed
+assertion. This verifies the main and nested edge changes against the graph
+module, but it is not an Agent evaluation.
+
+The planned OpenCode rerun of questions 04, 06, 08, and 09 was blocked before
+the first question was sent: the execution permission review identified that
+the question and knowledge-service responses would leave the machine for an
+external model provider. A separate isolated OpenCode startup check with a
+content-free `OK` prompt succeeded. No question content was sent in the
+blocked rerun. The four-question outcome remains unmeasured pending explicit
+authorization or a local model provider.
