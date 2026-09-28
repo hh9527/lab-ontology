@@ -131,3 +131,38 @@ and `icloud_model`. `ontology/tests/ontology/intent` passed 15/15; IC
 `tests/knowledge` passed 24/24 with a 30000-million shared request-fuel budget.
 At 10000 million, the IC module exhausted fuel after 22 passes without an
 assertion failure.
+
+## Remaining business-only questions under the host-owned interface
+
+The same snapshot SHA-256 `8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`
+and no host time context were used for fresh isolated OpenCode sessions. Questions
+01, 02, 03, 05, and 07 initially used guide SHA-256
+`1ba7f982647125f781927ae252f4906490397ce778e3b53b24c254190664958a`.
+The adapter exposed only index, info, and context-free transform arguments.
+
+| Question | Observation | Assessment |
+| --- | --- | --- |
+| 01 | Lowered the Site-to-Device-to-Alarm path, not the Alarm's separate Site reference; grouped by Site identity, applied uncleared and `count_having > 5`, then `count_groups`. | Pass on Model-backed query meaning; no numeric data was claimed. |
+| 02 | Used `top_per` over complete Device identity, read both port values and timestamp from one latest KPI sample, and qualified Site through `exists`. | Pass; the first main-graph Site join was repaired after transform feedback. |
+| 03 | Used the declared GPON (`spl`) and offline values, PON-port raw-sample Max, and the explicit UTC-second window `[2025-03-01 12:00:00, 2025-03-31 12:00:00)`. | Pass. The caller supplied an absolute reference instant in the business request, so no Agent-supplied `ctx` was needed. |
+| 05 | Correctly discovered that the business downstream link is directed A-to-Z, then used undirected physical attachment to count the reverse endpoint as "downstream". | Fail: a legal physical-adjacency query was mislabeled as a different business relation. |
+| 07 | Produced a valid grouped query using an inner join, then noted that zero-device Sites would be excluded and asked whether they should count. | Fail on decision order: a result-changing choice was unresolved when it presented one branch as the Query. |
+
+A short domain-neutral guide clarification was added: a query for one possible
+reading is exploratory, and another Model concept must not be renamed to match
+the user's words. Fresh 05 and 07 runs used guide SHA-256
+`4e1f34d919e9fb9370de45502e8c156f784713161108b8f21355bd1787ceb614`.
+Neither failure was resolved. In 05, the Agent acknowledged the A-to-Z
+definition but presented A-to-Z and Z-to-A as two "downstream" branches and
+handwrote a `UNION` SQL that was not produced by transform. In 07, it again
+presented the inner-join Query before asking whether zero-device Sites count.
+The prompt change remains a general semantic rule, but these observations do
+not demonstrate that this Agent reliably follows it. They also show why a
+successful transform alone cannot certify alignment with a natural-language
+request. No new database result was generated in any of these sessions.
+
+The service's `include_empty:true` lowering was checked separately with the
+07 filters: it used `LEFT JOIN (SELECT * FROM HuaweiStorageDevice WHERE
+subClassName = ?1 AND runningStatus = ?2)` and `count(sd.id) < ?3`, so zero
+qualifying devices remain countable. The zero-site choice is a real business
+ambiguity, not a missing left-join lowering capability.

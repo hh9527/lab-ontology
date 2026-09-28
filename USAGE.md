@@ -92,8 +92,11 @@ repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
 the user's question. If the request or available knowledge leaves a choice that
 would change the answer, clarify the business meaning with the user in business
-terms. SQL and bindings are intermediate output for an authorized execution
-layer, not the basis for clarification or the final user-facing result.
+terms before presenting a query as the answer. A legal query for one possible
+reading is only exploratory; do not rename a different Model concept to make it
+appear to satisfy the original wording. SQL and bindings are intermediate output
+for an authorized execution layer, not the basis for clarification or the final
+user-facing result.
 
 Submit an Intent with the same outer envelope:
 
