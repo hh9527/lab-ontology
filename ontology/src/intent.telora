@@ -110,6 +110,60 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
     }
 };
 
+def inferred_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::FilterInput =
+    fn(payload, subject, dimension, value) {
+        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+        let candidates = array::filter(detail.input_kinds, fn(kind) {
+            match value {
+                Value::String(_) => kind == edsl::FilterInputKind::Text || kind == edsl::FilterInputKind::Date
+                    || kind == edsl::FilterInputKind::Rfc3339 || kind == edsl::FilterInputKind::UtcSecond
+                    || kind == edsl::FilterInputKind::LocalDateTime,
+                Value::Int(_) => kind == edsl::FilterInputKind::Int || kind == edsl::FilterInputKind::Number
+                    || kind == edsl::FilterInputKind::EpochMillis,
+                Value::Float(_) => kind == edsl::FilterInputKind::Number,
+                Value::True => kind == edsl::FilterInputKind::Bool,
+                Value::False => kind == edsl::FilterInputKind::Bool,
+                _ => False,
+            }
+        });
+        if array::length(candidates) == 0 { fail!("value does not match dimension input type", dimension, detail.input_kinds, value) }
+        else {
+            let chosen = if array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Int })
+                && array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Number })
+                && array::length(candidates) == 2 { edsl::FilterInputKind::Int }
+                else if array::length(candidates) == 1 { candidates[0] }
+                else { fail!("dimension input type is ambiguous for this value", dimension, candidates, value) };
+            match chosen {
+                edsl::FilterInputKind::Text => parse_input("text", value),
+                edsl::FilterInputKind::Int => parse_input("int", value),
+                edsl::FilterInputKind::Number => parse_input("number", value),
+                edsl::FilterInputKind::Bool => parse_input("bool", value),
+                edsl::FilterInputKind::Rfc3339 => parse_input("rfc3339", value),
+                edsl::FilterInputKind::EpochMillis => parse_input("epoch_millis", value),
+                edsl::FilterInputKind::Date => parse_input("date", value),
+                edsl::FilterInputKind::UtcSecond => parse_input("utc_second", value),
+                edsl::FilterInputKind::LocalDateTime => parse_input("local_datetime", value),
+            }
+        }
+    };
+
+def optional_input: Fn(edsl::PreparedPayload, String, String, Dict(Value), Value) -> edsl::FilterInput =
+    fn(payload, subject, dimension, obj, value) {
+        match dict::get(obj, "kind") {
+            Some(kind) => parse_input(as_string(kind), value),
+            None => inferred_input(payload, subject, dimension, value),
+        }
+    };
+
+def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(payload, measure, value) {
+    match edsl::measure_output_type(payload, measure) {
+        edsl::OutputType::Text => parse_input("text", value),
+        edsl::OutputType::Integer => parse_input("int", value),
+        edsl::OutputType::Number => parse_input("number", value),
+        edsl::OutputType::Boolean => parse_input("bool", value),
+    }
+};
+
 def parse_graph_node: Fn(Value) -> edsl::GraphNode = fn(item) {
     let obj = as_object(item);
     graph_keys(obj, "node", ["id", "entity"]);
@@ -123,53 +177,69 @@ def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
         from: as_string(field(obj, "from")), to: as_string(field(obj, "to"))}
 };
 
-def parse_graph_filter: Fn(String, Value) -> edsl::GraphFilter = fn(subject, item) {
+def parse_graph_filter: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> edsl::GraphFilter = fn(payload, subject, context, item) {
     let obj = as_object(item);
     graph_keys(obj, "filter", ["node", "dimension", "op", "kind", "value"]);
+    let dimension = as_string(field(obj, "dimension"));
+    let op = parse_op(as_string(field(obj, "op")));
+    let value = field(obj, "value");
+    let input = if value == Value::String("now") && dict::get(obj, "kind") == None {
+        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+        let temporal = array::any(detail.input_kinds, fn(kind) {
+            kind == edsl::FilterInputKind::EpochMillis || kind == edsl::FilterInputKind::Rfc3339
+                || kind == edsl::FilterInputKind::UtcSecond || kind == edsl::FilterInputKind::Date
+                || kind == edsl::FilterInputKind::LocalDateTime
+        });
+        if temporal {
+            let role = edsl::time_domain(payload, detail.dataset, detail.field);
+            match context {
+                Some(request) => time::now_filter(request, role, op, dimension),
+                None => fail!("now filter requires request ctx.now", dimension),
+            }
+        } else { inferred_input(payload, subject, dimension, value) }
+    } else { optional_input(payload, subject, dimension, obj, value) };
     let request: edsl::FilterRequest = {
-        id: as_string(field(obj, "dimension")), subject,
-        op: parse_op(as_string(field(obj, "op"))),
-        input: parse_input(as_string(field(obj, "kind")), field(obj, "value")),
+        id: dimension, subject, op, input,
     };
     {node: as_string(field(obj, "node")), request}
 };
 
-def parse_time_value: Fn(Option(time::RequestContext), Value) -> time::TimeValue = fn(context, value) {
-    let obj = as_object(value);
-    match as_string(field(obj, "kind")) {
-        "now" => do {
-            graph_keys(obj, "now boundary", ["kind", "as"]);
-            match context {
-                Some(request) => match dict::get(obj, "as") {
-                    None => request.now,
-                    Some(Value::String(target)) => time::utc_text_as(request.now, target),
-                    Some(other) => fail!("request time conversion target must be a string", other),
-                },
+def parse_time_value: Fn(Option(time::RequestContext), edsl::TimeField, Value) -> time::TimeValue =
+    fn(context, role, value) {
+        match value {
+            Value::String("now") => match context {
+                Some(request) => time::now_for(request, role),
                 None => fail!("now boundary requires request ctx.now"),
-            }
-        },
-        kind => do {
-            graph_keys(obj, "time boundary", ["kind", "value"]);
-            let raw = field(obj, "value");
-            match kind {
-        "date" => time::TimeValue::Date(as_string(raw)),
-        "local_datetime" => time::TimeValue::LocalDateTime(as_string(raw)),
-        "utc_second" => time::TimeValue::UtcSecond(as_string(raw)),
-        "rfc3339" => time::TimeValue::Rfc3339(as_string(raw)),
-        "epoch_millis" => match raw {
-            Value::Int(ms) => time::TimeValue::EpochMillis(ms),
-            _ => fail!("epoch-millisecond boundary requires an integer", raw),
-        },
-        kind => fail!("unknown time boundary kind", kind),
-            }
-        },
-    }
-};
+            },
+            Value::String(text) => match role.encoding {
+                edsl::TimeEncoding::DateText => time::TimeValue::Date(text),
+                edsl::TimeEncoding::Rfc3339Text => time::TimeValue::Rfc3339(text),
+                edsl::TimeEncoding::CanonicalUtcSecondText => time::TimeValue::UtcSecond(text),
+                edsl::TimeEncoding::LocalText => time::TimeValue::LocalDateTime(text),
+                _ => fail!("time boundary requires epoch milliseconds", role.encoding, value),
+            },
+            Value::Int(ms) => match role.encoding {
+                edsl::TimeEncoding::UtcEpochMillis => time::TimeValue::EpochMillis(ms),
+                edsl::TimeEncoding::LocalEpochMillis => time::TimeValue::EpochMillis(ms),
+                _ => fail!("time boundary requires text in the declared logical format", role.encoding, value),
+            },
+            _ => fail!("time boundary must be a typed field-compatible value or now", role.encoding, value),
+        }
+    };
 
 def request_context_from: Fn(Value) -> time::RequestContext = fn(value) {
     let obj = as_object(value);
-    graph_keys(obj, "request context", ["now"]);
-    time::request_context(parse_time_value(None, field(obj, "now")))
+    graph_keys(obj, "request context", ["now", "tz"]);
+    let now = match field(obj, "now") {
+        Value::Int(ms) => ms,
+        other => fail!("request ctx.now must be epoch milliseconds", other),
+    };
+    let tz = match dict::get(obj, "tz") {
+        None => None,
+        Some(Value::Int(minutes)) => Some(minutes),
+        Some(other) => fail!("request ctx.tz must be offset minutes", other),
+    };
+    time::request_context(now, tz)
 };
 
 def parse_time_window: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> Array(edsl::GraphFilter) =
@@ -178,27 +248,32 @@ def parse_time_window: Fn(edsl::PreparedPayload, String, Option(time::RequestCon
         graph_keys(obj, "time window", ["node", "dimension", "start", "end"]);
         let node = as_string(field(obj, "node"));
         let dimension = as_string(field(obj, "dimension"));
-        let window: time::Window = {start: parse_time_value(context, field(obj, "start")),
-            end: parse_time_value(context, field(obj, "end"))};
+        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+        let role = edsl::time_domain(payload, detail.dataset, detail.field);
+        let window: time::Window = {start: parse_time_value(context, role, field(obj, "start")),
+            end: parse_time_value(context, role, field(obj, "end"))};
         array::map(time::window_filters(payload, subject, dimension, window), fn(request) {
             {node, request}
         })
     };
 
-def parse_graph_any_of: Fn(Value) -> edsl::GraphAnyOf = fn(item) {
+def parse_graph_any_of: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphAnyOf = fn(payload, subject, item) {
     let obj = as_object(item);
     graph_keys(obj, "any_of", ["node", "dimension", "kind", "values"]);
-    let kind = as_string(field(obj, "kind"));
+    let dimension = as_string(field(obj, "dimension"));
     {node: as_string(field(obj, "node")), dimension: as_string(field(obj, "dimension")),
-        values: array::map(as_array(field(obj, "values")), fn(value) { parse_input(kind, value) })}
+        values: array::map(as_array(field(obj, "values")), fn(value) { optional_input(payload, subject, dimension, obj, value) })}
 };
 
-def parse_graph_having: Fn(Value) -> edsl::GraphHaving = fn(item) {
+def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
     let obj = as_object(item);
     graph_keys(obj, "aggregate threshold", ["node", "measure", "op", "kind", "value"]);
     {node: as_string(field(obj, "node")), measure: as_string(field(obj, "measure")),
         op: parse_op(as_string(field(obj, "op"))),
-        threshold: parse_input(as_string(field(obj, "kind")), field(obj, "value"))}
+        threshold: match dict::get(obj, "kind") {
+            Some(kind) => parse_input(as_string(kind), field(obj, "value")),
+            None => measure_input(payload, as_string(field(obj, "measure")), field(obj, "value")),
+        }}
 };
 
 def parse_graph_existence: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> edsl::GraphExist = fn(payload, subject, context, item) {
@@ -214,10 +289,10 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, String, Option(time::Reques
         nodes: array::map(as_array(field(obj, "nodes")), parse_graph_node),
         edges: array::map(as_array(field(obj, "edges")), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
+        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, context, value) }),
             array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, context, value) })]),
-        any_of: array::map(array_opt(obj, "any_of"), parse_graph_any_of),
-        having: array::map(array_opt(obj, "having"), parse_graph_having),
+        any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, subject, value) }),
+        having: array::map(array_opt(obj, "having"), fn(value) { parse_graph_having(payload, value) }),
         negated}
 };
 
@@ -260,10 +335,10 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Option(t
                 };
                 result
             }),
-            measure_having: array::map(array_opt(obj, "measure_having"), parse_graph_having),
-            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(subject, value) }),
+            measure_having: array::map(array_opt(obj, "measure_having"), fn(value) { parse_graph_having(payload, value) }),
+            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, context, value) }),
                 array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, context, value) })]),
-            any_of: array::map(array_opt(obj, "any_of"), parse_graph_any_of),
+            any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, subject, value) }),
             exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, context, value) }),
             count: match dict::get(obj, "count") {
                 None => None,
@@ -443,13 +518,13 @@ def query_intent_ast_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> 
 
 def query_intent_ast_factory_with_context: Fn(edsl::PreparedPayload, String, time::RequestContext) -> Fn(Value) -> qb::QueryAst =
     fn(payload, subject, context) {
-        let checked = time::request_context(context.now);
+        let checked = time::request_context(context.now, context.tz);
         fn(intent) { lower_intent_ast(payload, subject, Some(checked), intent) }
     };
 
 def query_intent_lower_factory_with_context: Fn(edsl::PreparedPayload, String, ToQuery, time::RequestContext) -> Fn(Value) -> qb::Query =
     fn(payload, subject, to_query, context) {
-        let checked = time::request_context(context.now);
+        let checked = time::request_context(context.now, context.tz);
         fn(intent) { to_query(lower_intent_ast(payload, subject, Some(checked), intent)) }
 };
 

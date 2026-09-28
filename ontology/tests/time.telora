@@ -67,8 +67,7 @@ pub def date_window_preserves_date_semantics: test::Test = test::should_ok(fn() 
         "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[{"node":"dog","dimension":"birth_date"}],
         "time_windows":[{"node":"dog","dimension":"birth_date",
-            "start":{"kind":"date","value":"2024-02-29"},
-            "end":{"kind":"date","value":"2024-03-01"}}]
+            "start":"2024-02-29", "end":"2024-03-01"}]
     }"#).unwrap!());
     let query = sqlite::build_query(ast);
     if string::contains(query.sql, "dog.date_of_birth >= ?1")
@@ -102,8 +101,7 @@ pub def rfc3339_window_is_typed_even_when_stored_as_text: test::Test = test::sho
         "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
         "time_windows":[{"node":"dog","dimension":"created_at",
-            "start":{"kind":"rfc3339","value":"2024-02-29T00:00:00Z"},
-            "end":{"kind":"rfc3339","value":"2024-03-01T00:00:00Z"}}]
+            "start":"2024-02-29T00:00:00Z", "end":"2024-03-01T00:00:00Z"}]
     }"#).unwrap!());
     let query = sqlite::build_query(ast);
     if string::contains(query.sql, "dog.created_at >= ?1")
@@ -112,28 +110,26 @@ pub def rfc3339_window_is_typed_even_when_stored_as_text: test::Test = test::sho
     else { fail!("RFC3339 must retain its logical type until binding", query) }
 });
 
-pub def request_utc_second_explicitly_converts_to_rfc3339: test::Test = test::should_ok(fn() {
+pub def request_epoch_millis_converts_to_rfc3339: test::Test = test::should_ok(fn() {
     let intent = json::parse(r#"{
         "op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[{"node":"dog","dimension":"created_at"}],"time_windows":[{"node":"dog","dimension":"created_at",
-            "start":{"kind":"rfc3339","value":"2024-02-29T00:00:00Z"},
-            "end":{"kind":"now","as":"rfc3339"}}]
+            "start":"2024-02-29T00:00:00Z", "end":"now"}]
     }"#).unwrap!();
-    let context = time::request_context(time::TimeValue::UtcSecond("2024-03-01 08:09:10"));
+    let context = time::request_context(1709280550000, None);
     let query = sqlite::build_query(query_intent_ast_factory_with_context(payload, "reader", context)(intent));
     if query.bindings == [qb::Val::String("2024-02-29T00:00:00Z"),
         qb::Val::String("2024-03-01T08:09:10Z")] { True }
-    else { fail!("explicit request clock spelling conversion lost its UTC instant", query) }
+    else { fail!("epoch clock conversion lost its UTC instant", query) }
 });
 
 pub def request_envelope_supplies_now_to_intent: test::Test = test::should_ok(fn() {
     let request = json::parse(r#"{
-        "ctx":{"now":{"kind":"utc_second","value":"2024-03-01 08:09:10"}},
+        "ctx":{"now":1709280550000,"tz":480},
         "intent":{"op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
             "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
             "time_windows":[{"node":"dog","dimension":"created_at",
-                "start":{"kind":"rfc3339","value":"2024-02-29T00:00:00Z"},
-                "end":{"kind":"now","as":"rfc3339"}}]}
+                "start":"2024-02-29T00:00:00Z", "end":"now"}]}
     }"#).unwrap!();
     let query = query_request_lower_factory(payload, "reader", sqlite::build_query)(request);
     if query.bindings == [qb::Val::String("2024-02-29T00:00:00Z"),
@@ -146,32 +142,65 @@ pub def request_envelope_requires_now_when_referenced: test::Test = test::should
         "intent":{"op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
             "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
             "time_windows":[{"node":"dog","dimension":"created_at",
-                "start":{"kind":"rfc3339","value":"2024-02-29T00:00:00Z"},
-                "end":{"kind":"now"}}]}
+                "start":"2024-02-29T00:00:00Z", "end":"now"}]}
     }"#).unwrap!())
 }, "now boundary requires request ctx.now");
 
 pub def intent_rejects_old_ctx_reference: test::Test = test::should_fail_with(fn() {
     query_request_lower_factory(payload, "reader", sqlite::build_query)(json::parse(r#"{
-        "ctx":{"now":{"kind":"rfc3339","value":"2024-03-01T08:09:10Z"}},
+        "ctx":{"now":1709280550000},
         "intent":{"op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
             "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
             "time_windows":[{"node":"dog","dimension":"created_at",
-                "start":{"kind":"rfc3339","value":"2024-02-29T00:00:00Z"},
+                "start":"2024-02-29T00:00:00Z",
                 "end":{"ctx":"now"}}]}
     }"#).unwrap!())
-}, "intent field is missing");
+}, "time boundary must be a typed field-compatible value or now");
 
-pub def request_rfc3339_explicitly_converts_to_utc_second: test::Test = test::should_ok(fn() {
-    match time::utc_text_as(time::TimeValue::Rfc3339("2024-03-01T08:09:10Z"), "utc_second") {
-        time::TimeValue::UtcSecond("2024-03-01 08:09:10") => True,
-        other => fail!("RFC3339 spelling conversion changed the instant", other),
+pub def kindless_date_filter_uses_model_logical_type: test::Test = test::should_ok(fn() {
+    let query = query_request_lower_factory(payload, "reader", sqlite::build_query)(json::parse(r#"{
+        "intent":{"op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+            "edges":[],"select":[{"node":"dog","dimension":"birth_date"}],
+            "filters":[{"node":"dog","dimension":"birth_date","op":"ge","value":"2024-02-29"}]}
+    }"#).unwrap!());
+    if query.bindings == [qb::Val::String("2024-02-29")] { True }
+    else { fail!("date filter did not use model logical type", query) }
+});
+
+pub def kindless_now_filter_uses_model_encoding_and_comparison: test::Test = test::should_ok(fn() {
+    let query = query_request_lower_factory(payload, "reader", sqlite::build_query)(json::parse(r#"{
+        "ctx":{"now":1709280550123},
+        "intent":{"op":"graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+            "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
+            "filters":[{"node":"dog","dimension":"created_at","op":"lt","value":"now"}]}
+    }"#).unwrap!());
+    if query.bindings == [qb::Val::String("2024-03-01T08:09:11Z")] { True }
+    else { fail!("millisecond clock was not rounded for a second-resolution comparison", query) }
+});
+
+pub def now_before_unix_epoch_rounds_toward_next_second: test::Test = test::should_ok(fn() {
+    let role = edsl::time_domain(payload, "dog", "created_at");
+    match time::now_for(time::request_context(-1, None), role) {
+        time::TimeValue::Rfc3339("1970-01-01T00:00:00Z") => True,
+        other => fail!("negative epoch millisecond ceiling was incorrect", other),
     }
 });
 
-pub def epoch_request_clock_cannot_convert_by_text_spelling: test::Test = test::should_fail_with(fn() {
-    time::utc_text_as(time::TimeValue::EpochMillis(1709280550000), "rfc3339")
-}, "only UTC text spellings can be converted");
+pub def exact_negative_epoch_second_uses_previous_calendar_day: test::Test = test::should_ok(fn() {
+    let role = edsl::time_domain(payload, "dog", "created_at");
+    match time::now_for(time::request_context(-1000, None), role) {
+        time::TimeValue::Rfc3339("1969-12-31T23:59:59Z") => True,
+        other => fail!("negative epoch second calendar conversion was incorrect", other),
+    }
+});
+
+pub def epoch_request_clock_converts_to_rfc3339: test::Test = test::should_ok(fn() {
+    let role = edsl::time_domain(payload, "dog", "created_at");
+    match time::now_for(time::request_context(1709280550000, None), role) {
+        time::TimeValue::Rfc3339("2024-03-01T08:09:10Z") => True,
+        other => fail!("epoch clock conversion changed the instant", other),
+    }
+});
 
 pub def ordinary_text_cannot_filter_rfc3339_field: test::Test = test::should_fail_with(fn() {
     query_intent_ast_factory(payload, "reader")(json::parse(r#"{
