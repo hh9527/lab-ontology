@@ -179,6 +179,27 @@ host artifacts, but they did not isolate the PID namespace; they do not prove
 resistance to a future arbitrary-code tool that inspects host process metadata.
 The new child-process transport has not been rerun through OpenCode.
 
+## MCP stdio boundary follow-up
+
+The evaluation adapter also supports MCP over stdio. A byte-only bridge can
+connect an isolated client to the host adapter through two private FIFOs,
+without mounting `telora-run` or the snapshot in the sandbox. A targeted
+bubblewrap check with filesystem and PID isolation returned
+MCP initialization, the three-tool list, and an `index` knowledge response
+over this channel. In the same mount profile, the snapshot and source paths
+were absent and the host process table was not visible. The host-side snapshot
+for this check was SHA-256
+`e720f4976c84054b82992348b315edc4d39a340bca36eec33e56c488a6fa7154`;
+the runner was SHA-256
+`b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`.
+The machine did not permit an isolated network namespace, so the check shared
+the network namespace, but no MCP or Telora listener was started in that check.
+OpenCode 1.18.32 loaded a temporary `local` MCP configuration and started the
+bridge with the expected FIFO paths, then closed its stdin before sending an
+MCP request and reported `Connection closed`. The temporary configuration was
+reverted; the working OpenCode evaluation still uses loopback HTTP. No new
+question run or end-to-end stdio OpenCode claim follows from this check.
+
 The following hard acceptance points are **not yet met**: 05 still relabels a
 physical connection as downstream and once presented handwritten `UNION` SQL;
 07 presents one population before resolving whether zero-device Sites count;

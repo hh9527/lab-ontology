@@ -2,10 +2,9 @@
 
 Use one numbered question at a time. The trusted host builds the snapshot;
 the MCP adapter starts one persistent `telora-run --serve stdio+jsonl://` child.
-Give the candidate only an
-Agent-facing guide, one `QUESTION.md`, and access to the three operations
-`ic/index`, `ic/info`, and `ic/transform` through a host-controlled tool adapter
-or authenticated gateway. The Agent's filesystem and shell must not be able
+Give the candidate only an Agent-facing guide, one `QUESTION.md`, and access
+to the three MCP tools `index`, `info`, and `transform` through the restricted
+host endpoint. The Agent's filesystem and shell must not be able
 to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
 The adapter accepts only an Intent from the Agent on `ontology_transform`;
 an optional request clock is provisioned by the host through
@@ -14,8 +13,8 @@ For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.
 Supply the guide and question as host-selected attachments; disable the
 Agent's general file-reading tool entirely.
 The candidate guide should contain the generic Intent contract and Agent
-workflow from section 3 of root `USAGE.md`, with the host's three tool names or
-URLs; do not give the Agent build/start instructions or artifact paths.
+workflow from section 3 of root `USAGE.md`, with the host's three tool names;
+do not give the Agent build/start instructions or artifact paths.
 
 Set `ONTOLOGY_EVAL_RUNNER` and `ONTOLOGY_EVAL_ARTIFACT` to absolute host paths
 before starting the adapter. It owns the child process and forwards only
@@ -26,11 +25,17 @@ rule by calling one directly. Merely copying fewer files into an
 otherwise unrestricted working directory does not meet this evaluation's
 isolation requirement. Verify that the Agent process has no filesystem route
 back to the artifact before claiming a hard-isolated run.
-The adapter itself also supports MCP over stdio. In this OpenCode setup a
-`local` MCP configuration would start it inside the Agent sandbox, where the
-host-only runner and artifact must remain unavailable. Keep the restricted
-remote MCP endpoint unless the host explicitly owns both ends of a stdio pipe
-across the isolation boundary.
+The adapter supports MCP over stdio, but this OpenCode 1.18.32 evaluation still
+uses its loopback HTTP mode. A local MCP bridge can forward stdio across two
+host-owned mode-0600 FIFOs without mounting the runner or artifact. Direct MCP
+initialization, tool listing, and knowledge lookup worked through that bridge
+inside a filesystem/PID-isolated sandbox. OpenCode's `local` MCP process,
+however, closed its stdin before sending any request and reported `Connection
+closed`; do not switch `opencode.json` to that route until its handshake works.
+The bridge is an experimental transport component, not a completed replacement
+for the current loopback endpoint. Keep the source, runner, artifact, rubric,
+and host process table outside the Agent sandbox; disabling Agent shell/file
+tools is additional defense, not a substitute for this isolation boundary.
 
 The questions test three different outcomes: successful Model-backed lowering,
 refusal of a misleading or unsupported interpretation, and clarification of a
