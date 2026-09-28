@@ -1,7 +1,12 @@
 import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
 
-const baseUrl = 'http://127.0.0.1:18015';
+const runnerPath = process.env.ONTOLOGY_EVAL_RUNNER;
+const artifactPath = process.env.ONTOLOGY_EVAL_ARTIFACT;
+if (!runnerPath?.startsWith('/') || !artifactPath?.startsWith('/')) {
+  throw new Error('ONTOLOGY_EVAL_RUNNER and ONTOLOGY_EVAL_ARTIFACT must be absolute host paths');
+}
 const requestContext = process.env.ONTOLOGY_EVAL_CTX_JSON
   ? JSON.parse(process.env.ONTOLOGY_EVAL_CTX_JSON)
   : undefined;
@@ -70,6 +75,39 @@ function error(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
+const runner = spawn(runnerPath, [
+  artifactPath, '--serve', 'stdio+jsonl://', '--request-fuel', '10000',
+  '--with-memory-limit', '512',
+], { stdio: ['pipe', 'pipe', 'inherit'] });
+const pending = [];
+let runnerError = null;
+
+function failPending(cause) {
+  runnerError = cause;
+  for (const request of pending.splice(0)) request.reject(cause);
+}
+
+createInterface({ input: runner.stdout, crlfDelay: Infinity }).on('line', (line) => {
+  const request = pending.shift();
+  if (!request) return;
+  try {
+    request.resolve({ body: line, ok: JSON.parse(line).error !== true });
+  } catch (cause) {
+    request.reject(cause);
+  }
+});
+runner.on('error', failPending);
+runner.on('close', (code) => failPending(new Error(`ontology runner exited (${code})`)));
+runner.stdin.on('error', failPending);
+
+function callService(name, input) {
+  return new Promise((resolve, reject) => {
+    if (runnerError) return reject(runnerError);
+    pending.push({ resolve, reject });
+    runner.stdin.write(`${JSON.stringify({ method: `ic/${name}`, input })}\n`);
+  });
+}
+
 async function handle(message) {
   if (message.id === undefined) return null;
   const id = message.id;
@@ -99,17 +137,11 @@ async function handle(message) {
         return error(id, -32602, 'transform accepts only an Intent; request context is host-owned');
       }
       try {
-        const response = await fetch(`${baseUrl}/ic/${name}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(name === 'transform' && requestContext !== undefined
-            ? { intent: input.intent, ctx: requestContext }
-            : input),
-          signal: AbortSignal.timeout(30000),
-        });
-        const body = await response.text();
+        const response = await callService(name, name === 'transform' && requestContext !== undefined
+          ? { intent: input.intent, ctx: requestContext }
+          : input);
         return reply(id, {
-          content: [{ type: 'text', text: body }],
+          content: [{ type: 'text', text: response.body }],
           isError: !response.ok,
         });
       } catch (cause) {
@@ -150,12 +182,16 @@ if (process.argv.includes('--http')) {
   }).listen(18016, '127.0.0.1');
 } else {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  for await (const line of lines) {
-    try {
-      const result = await handle(JSON.parse(line));
-      if (result !== null) process.stdout.write(`${JSON.stringify(result)}\n`);
-    } catch (cause) {
-      process.stderr.write(`invalid MCP message: ${cause.message}\n`);
+  try {
+    for await (const line of lines) {
+      try {
+        const result = await handle(JSON.parse(line));
+        if (result !== null) process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch (cause) {
+        process.stderr.write(`invalid MCP message: ${cause.message}\n`);
+      }
     }
+  } finally {
+    runner.stdin.end();
   }
 }

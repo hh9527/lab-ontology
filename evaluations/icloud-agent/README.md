@@ -1,7 +1,8 @@
 # IC ontology agent evaluation
 
-Use one numbered question at a time. The trusted host builds the snapshot and
-starts one persistent `telora-run` process. Give the candidate only an
+Use one numbered question at a time. The trusted host builds the snapshot;
+the MCP adapter starts one persistent `telora-run --serve stdio+jsonl://` child.
+Give the candidate only an
 Agent-facing guide, one `QUESTION.md`, and access to the three operations
 `ic/index`, `ic/info`, and `ic/transform` through a host-controlled tool adapter
 or authenticated gateway. The Agent's filesystem and shell must not be able
@@ -16,12 +17,20 @@ The candidate guide should contain the generic Intent contract and Agent
 workflow from section 3 of root `USAGE.md`, with the host's three tool names or
 URLs; do not give the Agent build/start instructions or artifact paths.
 
-The HTTP routes are POST `/ic/index`, `/ic/info`, and `/ic/transform`; the
-body is the slot input directly. `telora-run` provides no authentication, so
-its listener must stay host-private. Merely copying fewer files into an
+Set `ONTOLOGY_EVAL_RUNNER` and `ONTOLOGY_EVAL_ARTIFACT` to absolute host paths
+before starting the adapter. It owns the child process and forwards only
+`ic/index`, `ic/info`, and `ic/transform` JSONL requests. Do not mount the
+runner or artifact into the Agent sandbox. No separate Telora TCP or Unix
+listener is needed, so the Agent cannot bypass the adapter's host-owned context
+rule by calling one directly. Merely copying fewer files into an
 otherwise unrestricted working directory does not meet this evaluation's
 isolation requirement. Verify that the Agent process has no filesystem route
 back to the artifact before claiming a hard-isolated run.
+The adapter itself also supports MCP over stdio. In this OpenCode setup a
+`local` MCP configuration would start it inside the Agent sandbox, where the
+host-only runner and artifact must remain unavailable. Keep the restricted
+remote MCP endpoint unless the host explicitly owns both ends of a stdio pipe
+across the isolation boundary.
 
 The questions test three different outcomes: successful Model-backed lowering,
 refusal of a misleading or unsupported interpretation, and clarification of a

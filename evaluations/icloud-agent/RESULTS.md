@@ -166,3 +166,25 @@ The service's `include_empty:true` lowering was checked separately with the
 subClassName = ?1 AND runningStatus = ?2)` and `count(sd.id) < ?3`, so zero
 qualifying devices remain countable. The zero-site choice is a real business
 ambiguity, not a missing left-join lowering capability.
+
+## Current boundary and unmet acceptance
+
+The MCP adapter now owns a persistent `telora-run --serve stdio+jsonl://`
+child instead of connecting to a separately listening Telora service. A local
+JSONL check confirmed an `ic/index` response, a structured transform
+diagnostic, and rejection of Agent-supplied `ctx`; no OpenCode rerun was used
+for this transport change. The runner and snapshot remain host-side.
+The earlier bubblewrap runs disabled Agent shell/file tools and did not mount
+host artifacts, but they did not isolate the PID namespace; they do not prove
+resistance to a future arbitrary-code tool that inspects host process metadata.
+The new child-process transport has not been rerun through OpenCode.
+
+The following hard acceptance points are **not yet met**: 05 still relabels a
+physical connection as downstream and once presented handwritten `UNION` SQL;
+07 presents one population before resolving whether zero-device Sites count;
+09 has not consistently resolved calendar/rolling and Alarm/KPI time scope
+before presenting a Query; 06's query follows the explicit orphan-ID rule but
+its prose calls an orphan reference an existing Tenant entity. These are
+observed Agent semantic-alignment failures, not evidence that the legal
+ontology query paths should be deleted. No production data execution layer
+was part of this evaluation; generated SQL remains intermediate output.
