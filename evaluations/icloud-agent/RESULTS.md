@@ -206,6 +206,12 @@ the existing HTTP route could not start its host listener in the current
 command sandbox (`listen EPERM`), so it provides no new evidence about that
 route. The isolated direct bridge check above remains the only new PID-boundary
 observation.
+A minimal standalone MCP stdio server with no ontology, FIFO, runner, or wasm
+dependency also answered `initialize` and `tools/list` correctly when called
+directly, yet OpenCode 1.18.32 reported the same pre-request `Connection
+closed` for it. The probe was removed after the check. This local MCP failure
+must be addressed in the OpenCode client or its runtime environment before a
+stdio-only OpenCode evaluation can replace the current endpoint.
 
 The following hard acceptance points are **not yet met**: 05 still relabels a
 physical connection as downstream and once presented handwritten `UNION` SQL;
