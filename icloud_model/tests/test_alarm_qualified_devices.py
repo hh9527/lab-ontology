@@ -49,7 +49,7 @@ class AlarmQualifiedDevicesTest(unittest.TestCase):
         }
         result = subprocess.run(
             [str(TELORA), "run", "--request-fuel", "4000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": intent}),
+            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
         query = json.loads(result.stdout)

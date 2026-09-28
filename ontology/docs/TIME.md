@@ -39,25 +39,39 @@ declared time dimension, and the resulting SQL compares the original column
 with two allocated bindings (`>= start AND < end`). No database `now()` or
 column-side time transformation is used.
 
-An intent may use `{"ctx":"now"}` for either boundary when a trusted caller
-passes a `time::RequestContext` to `query_intent_ast_factory_with_context` or
-`query_intent_lower_factory_with_context`. `request_context(now)` validates
-that the supplied value is an absolute request clock, not a local wall time
-or calendar date. The supplied encoding must match the target field; a request
-clock in UTC text cannot silently become epoch milliseconds. One context is
-captured outside ontology per request and reused throughout the lowering,
-including `exists` subgraphs and both operands of `graph_pair`. Without a
-context, `ctx.now` fails; the existing context-free factories never read a
-system or database clock.
+The transform service receives a request envelope with an `intent` and an
+optional `ctx`. The caller supplies the request clock explicitly:
 
-`{"ctx":"now","as":"rfc3339"}` and `{"ctx":"now","as":"utc_second"}`
+```json
+{
+  "intent": {
+    "op": "graph", "root": "dog",
+    "nodes": [{"id": "dog", "entity": "dog"}], "edges": [],
+    "select": [{"node": "dog", "dimension": "created_at"}],
+    "time_windows": [{
+      "node": "dog", "dimension": "created_at",
+      "start": {"kind": "rfc3339", "value": "2025-01-01T00:00:00Z"},
+      "end": {"kind": "now"}
+    }]
+  },
+  "ctx": {"now": {"kind": "rfc3339", "value": "2025-01-02T08:15:00Z"}}
+}
+```
+
+An intent may use `{"kind":"now"}` for either time-window boundary. The
+request context is validated as an absolute instant, not a local wall time
+or calendar date. Its encoding must match the target field; a request clock
+in UTC text cannot silently become epoch milliseconds. One request context
+is reused throughout lowering, including `exists` subgraphs and both operands
+of `graph_pair`. When `now` is referenced but absent, lowering fails. Neither
+the service nor the context-free factories read a system or database clock.
+
+`{"kind":"now","as":"rfc3339"}` and `{"kind":"now","as":"utc_second"}`
 explicitly convert between the two validated UTC-second text spellings,
 preserving the instant and binding the converted value. This is not a timezone
 conversion; epoch milliseconds cannot use this text-spelling conversion.
 
-Telora's transform-service initialization context is long-lived, not a
-per-request clock. The current model services still expose context-free
-factories; a trusted platform adapter must call the context-aware factory for
-each request when it offers `ctx.now`. Named timezones, calendar arithmetic,
+Telora's transform-service initialization context is long-lived; the clock
+comes from each request envelope. Named timezones, calendar arithmetic,
 normalization across encodings, and column-side calendar calculations remain
 outside this initial contract.

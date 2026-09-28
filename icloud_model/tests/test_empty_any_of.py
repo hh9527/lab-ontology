@@ -40,7 +40,7 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
     def lower(self, intent):
         result = subprocess.run(
             [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": intent}),
+            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
             text=True,
             capture_output=True,
             cwd=MODEL,

@@ -35,7 +35,7 @@ class AlarmValueGroupTest(unittest.TestCase):
                     del intent["count_having"]
                 result = subprocess.run(
                     [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-                    input=json.dumps({"method": "ic/transform", "input": intent}),
+                    input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
                     text=True, capture_output=True, cwd=MODEL, check=True,
                 )
                 query = json.loads(result.stdout)
@@ -56,7 +56,7 @@ class AlarmValueGroupTest(unittest.TestCase):
         }
         result = subprocess.run(
             [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": intent}),
+            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
         query = json.loads(result.stdout)
@@ -80,7 +80,7 @@ class AlarmValueGroupTest(unittest.TestCase):
         }
         result = subprocess.run(
             [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": intent}),
+            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
         query = json.loads(result.stdout)
