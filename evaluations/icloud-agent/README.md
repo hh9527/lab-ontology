@@ -6,6 +6,9 @@ Agent-facing guide, one `QUESTION.md`, and access to the three operations
 `ic/index`, `ic/info`, and `ic/transform` through a host-controlled tool adapter
 or authenticated gateway. The Agent's filesystem and shell must not be able
 to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
+The adapter accepts only an Intent from the Agent on `ontology_transform`;
+an optional request clock is provisioned by the host through
+`ONTOLOGY_EVAL_CTX_JSON` and never accepted from Agent tool arguments.
 For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.
 Supply the guide and question as host-selected attachments; disable the
 Agent's general file-reading tool entirely.

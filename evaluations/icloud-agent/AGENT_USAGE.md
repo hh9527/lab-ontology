@@ -13,7 +13,8 @@ Pass the following objects directly as tool arguments:
 ```
 
 The first object is for `ontology_index`; the latter two are alternatives for
-`ontology_info`. `ontology_transform` takes an `intent` and optional `ctx`.
+`ontology_info`. `ontology_transform` takes an `intent`; request context is
+supplied by the host, not by this tool's caller.
 
 `index` returns a paginated catalog of visible knowledge points. Follow
 `next_offset` until the relevant area is found; do not treat the first page as
@@ -43,14 +44,15 @@ Submit an Intent to `ontology_transform`:
 
 ```text
 {"intent":<Intent>}
-{"intent":<Intent>,"ctx":{"now":<epoch milliseconds>,"tz":<UTC offset minutes>}}
 ```
 
-`ctx` is optional unless the Intent refers to request time; the host must
-supply `now` explicitly and calendar boundaries also need `tz`. The Agent must
-not infer either value from its own environment. If a required value is absent,
-ask for it before lowering. `ctx.tz` is a fixed offset, not a named timezone or
-daylight-saving rule. Knowledge
+The host supplies `ctx.now` as epoch milliseconds when an Intent refers to
+request time; calendar boundaries also need `ctx.tz` in UTC offset minutes.
+Do not infer either value from the Agent environment or pass a `ctx` field to
+the tool. If the host omits required context, report that the service lacks a
+reference time; ask a user only for business choices they can meaningfully
+make, in ordinary time terms rather than protocol fields. The offset is fixed,
+not a named timezone or daylight-saving rule. Knowledge
 discovery describes the Model; the generic Intent syntax is below. The Model
 and `transform` decide which combinations have valid business meaning.
 

@@ -2,6 +2,17 @@ import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 
 const baseUrl = 'http://127.0.0.1:18015';
+const requestContext = process.env.ONTOLOGY_EVAL_CTX_JSON
+  ? JSON.parse(process.env.ONTOLOGY_EVAL_CTX_JSON)
+  : undefined;
+if (requestContext !== undefined && (
+  requestContext === null || typeof requestContext !== 'object' || Array.isArray(requestContext) ||
+  !Number.isSafeInteger(requestContext.now) ||
+  (requestContext.tz !== undefined &&
+    (!Number.isInteger(requestContext.tz) || Math.abs(requestContext.tz) > 840))
+)) {
+  throw new Error('ONTOLOGY_EVAL_CTX_JSON must contain epoch-millisecond now and optional offset-minute tz');
+}
 const tools = [
   {
     name: 'index',
@@ -44,7 +55,6 @@ const tools = [
       type: 'object',
       properties: {
         intent: { type: 'object', additionalProperties: true },
-        ctx: { type: 'object', additionalProperties: true },
       },
       required: ['intent'],
       additionalProperties: false,
@@ -83,11 +93,18 @@ async function handle(message) {
       if (input === null || typeof input !== 'object' || Array.isArray(input)) {
         return error(id, -32602, 'tool input must be an object');
       }
+      if (name === 'transform' &&
+        (Object.keys(input).some((key) => key !== 'intent') ||
+          input.intent === null || typeof input.intent !== 'object' || Array.isArray(input.intent))) {
+        return error(id, -32602, 'transform accepts only an Intent; request context is host-owned');
+      }
       try {
         const response = await fetch(`${baseUrl}/ic/${name}`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(input),
+          body: JSON.stringify(name === 'transform' && requestContext !== undefined
+            ? { intent: input.intent, ctx: requestContext }
+            : input),
           signal: AbortSignal.timeout(30000),
         });
         const body = await response.text();

@@ -106,6 +106,26 @@ observations, not pass-rate estimates. The full nine-question business-only
 suite has not yet been rerun. In production SQL/bindings should be executed by
 the authorized backend and replaced by returned data in the user-facing answer.
 
+## Host-owned request context follow-up
+
+The MCP adapter now accepts only `intent` from the Agent for `transform`;
+`ctx` in Agent tool arguments is rejected even if the caller bypasses the tool
+schema. The host can inject a fixed context through `ONTOLOGY_EVAL_CTX_JSON`.
+Without host context, a fresh 09 run did not fabricate one: its final answer
+asked about the Alarm-versus-KPI window, but still asked the business user for
+`ctx.now` and `ctx.tz` protocol values. The guide now distinguishes unavailable
+host context from a business choice.
+
+With host context `{"now":1790553600000,"tz":480}` supplied only to the
+adapter, another fresh 09 run used the provided clock, identified the
+Alarm-versus-KPI time-scope ambiguity, and asked that question in business
+language. It also showed an illustrative Query before the choice was resolved
+and silently treated "one month" as 30 days. This is an improvement in the
+boundary and clarification, not full semantic success. The adapter's local
+JSON-RPC check rejected Agent-supplied `ctx` with code `-32602`; its tool list
+advertised only `intent` for transform. The other questions were not rerun
+against this revised adapter.
+
 The updated source passed `check --only-types --lib --tests` in both `ontology`
 and `icloud_model`. `ontology/tests/ontology/intent` passed 15/15; IC
 `tests/knowledge` passed 24/24 with a 30000-million shared request-fuel budget.
