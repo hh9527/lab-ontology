@@ -45,3 +45,15 @@ candidate directory. An initial attempt to use the repository-wide `USAGE.md`
 also failed because `telora-run` was not on `PATH`; it was not used as a
 semantic evaluation. The successful comparison retained the prior standalone
 guide and changed only the edge-order paragraph.
+
+## Service-boundary smoke check after the repairs
+
+The updated IC snapshot (SHA-256
+`5960ed744a634ef77217a3fa3b6e5a4dce28b6332a1b0d1445129d786f460904`)
+was built with `--snapshot --with-memory-limit 512`. The trusted host served
+it on loopback. A `bubblewrap` client with only `/usr`, `/lib`, `/lib64`,
+`/proc`, `/dev`, and an empty `/tmp` mounted successfully POSTed to `/ic/index`;
+the same client could not see the host's snapshot path. This validates the
+transport and a possible filesystem boundary, not a complete Agent deployment
+or an OpenCode rerun. No new pass/fail score is assigned to questions 04, 06,
+08, or 09 yet.

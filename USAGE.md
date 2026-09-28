@@ -92,6 +92,24 @@ and each input's declared logical type. Ask for clarification when the user's
 business meaning is materially ambiguous; do not silently choose a different
 metric, grain, or relationship.
 
+Before constructing Intent, identify the requested population and count
+subject, the entity owning each requested attribute, the named relation path,
+the treatment of unmatched related entities, and any time window or aggregate
+grain. Distinguish an entity count from a count of distinct labels or foreign
+key values: a reference value does not prove that the referenced entity
+exists. An attribute of a component does not automatically describe its
+parent. Use `info` to confirm those distinctions, including identity keys and
+measure definitions. If the Model only exposes a nearby concept, state the
+difference; do not silently substitute it.
+
+Ask only for unresolved choices that would materially change the result and
+cannot be determined from the question or Model. For time requests, distinguish
+rolling durations from calendar periods, identify which populations share a
+window, and determine whether a peak means a maximum raw sample or an
+aggregate of aggregates. Do not ask again for a constraint the user already
+gave or add extra filters. When `ctx.now` or `ctx.tz` is required but absent,
+request it rather than reading the Agent machine's clock.
+
 Submit an Intent with the same outer envelope:
 
 ```text
@@ -213,6 +231,10 @@ Inspect diagnostics and repair the Intent using the relevant knowledge points.
 Do not guess a missing relation, change the business meaning to obtain a
 successful query, or bypass lowering with handwritten SQL. If the Model cannot
 express the user's request, report that limitation. A successful `transform`
+proves only that the Intent is legal under the Model: compare the accepted
+Intent back to the original request's population, attribute owners, relation
+path, count subject, time scope, and aggregate definition before presenting
+it. If those differ, revise the Intent or explain the unresolved gap. It
 returns a parameterized Query
 (`sql` and `bindings`), not database results. Pass SQL and bindings together
 to an authorized execution layer; never interpolate values into SQL.
