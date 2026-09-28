@@ -1,11 +1,17 @@
 import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { statSync } from 'node:fs';
+import { transformResult } from './ontology-transform-receipt.mjs';
 
 const runnerPath = process.env.ONTOLOGY_EVAL_RUNNER;
 const artifactPath = process.env.ONTOLOGY_EVAL_ARTIFACT;
+const outputDir = process.env.ONTOLOGY_EVAL_OUTPUT_DIR;
 if (!runnerPath?.startsWith('/') || !artifactPath?.startsWith('/')) {
   throw new Error('ONTOLOGY_EVAL_RUNNER and ONTOLOGY_EVAL_ARTIFACT must be absolute host paths');
+}
+if (!outputDir?.startsWith('/') || !statSync(outputDir).isDirectory()) {
+  throw new Error('ONTOLOGY_EVAL_OUTPUT_DIR must be an existing absolute host directory');
 }
 const requestContext = process.env.ONTOLOGY_EVAL_CTX_JSON
   ? JSON.parse(process.env.ONTOLOGY_EVAL_CTX_JSON)
@@ -55,7 +61,7 @@ const tools = [
   },
   {
     name: 'transform',
-    description: 'Lower a Model-backed Intent to parameterized SQL or structured diagnostics.',
+    description: 'Validate and store a Model-backed Intent; return a receipt or structured diagnostics.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -91,7 +97,7 @@ createInterface({ input: runner.stdout, crlfDelay: Infinity }).on('line', (line)
   const request = pending.shift();
   if (!request) return;
   try {
-    request.resolve({ body: line, ok: JSON.parse(line).error !== true });
+    request.resolve(JSON.parse(line));
   } catch (cause) {
     request.reject(cause);
   }
@@ -137,12 +143,15 @@ async function handle(message) {
         return error(id, -32602, 'transform accepts only an Intent; request context is host-owned');
       }
       try {
-        const response = await callService(name, name === 'transform' && requestContext !== undefined
+        const result = await callService(name, name === 'transform' && requestContext !== undefined
           ? { intent: input.intent, ctx: requestContext }
           : input);
+        if (name === 'transform') {
+          return reply(id, transformResult(result, input.intent, requestContext, outputDir));
+        }
         return reply(id, {
-          content: [{ type: 'text', text: response.body }],
-          isError: !response.ok,
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+          isError: result?.error === true,
         });
       } catch (cause) {
         return reply(id, {

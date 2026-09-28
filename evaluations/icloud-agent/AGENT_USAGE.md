@@ -35,13 +35,21 @@ Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
-the user's question. If the request or available knowledge leaves a choice that
-would change the answer, clarify the business meaning with the user in business
-terms before presenting a query as the answer. A legal query for one possible
-reading is only exploratory; do not rename a different Model concept to make it
-appear to satisfy the original wording. SQL and bindings are intermediate output
-for an authorized execution layer, not the basis for clarification or the final
-user-facing result.
+the user's question. Before accepting the Intent as your answer, explain its
+business meaning back to yourself: who or what is counted or selected, which
+relationships, filters, time range and inclusions it uses, and what it leaves
+out. Compare that explanation with the user's words. Do not rename a different
+Model concept to make it appear to satisfy the request.
+
+When one reasonable interpretation is supported, submit its Intent and tell
+the user in ordinary business language what the accepted Intent means. Make
+any consequential assumption visible so the user can correct it. Ask a focused
+business question when the request cannot responsibly be interpreted, or when
+the alternatives have materially different meanings and no reasonable default.
+Do not require clarification just because another interpretation is possible.
+Never write SQL yourself or present a Query as the answer. The host retains
+SQL and bindings for its authorized execution layer; the Agent sees only an
+acceptance receipt or structured diagnostics.
 
 Submit an Intent to `ontology_transform`:
 
@@ -165,13 +173,10 @@ The outer object accepts only `op`, `left`, `right`, and optional boolean
 `count_groups`. A successful pair does not prove that two similarly named
 display values are the same entity: the join uses the aligned identity keys.
 
-Tool responses use the `telora.service/v1` envelope. On
-success, `ok.Index` contains `entries` and `next_offset`, `ok.Document` holds
-`Found`, `Candidates`, or `NotFound`, and `ok` from `transform` contains `sql`
-and `bindings`. A failure has `error: true` and structured `diagnostics`.
-Inspect diagnostics and repair the Intent using the relevant knowledge points.
-`transform` returns a parameterized Query (`sql` and `bindings`), not database
-results. Pass both together to an authorized execution layer; never interpolate
-values into SQL. Present the resulting data to the user in an appropriate form.
-When no execution layer is available, state that only an intermediate Query was
-produced and do not invent results.
+`index` and `info` expose knowledge points and references. A successful
+`transform` returns `{"accepted":true,"receipt":"<id>"}`; the host stores the
+submitted Intent and generated Query under that receipt. A failed transform
+returns structured diagnostics for repair. Neither response is a database
+result. In this evaluation there is no data execution layer: return the receipt
+and your business-language interpretation, not a fabricated number or SQL.
+When an execution layer is connected, present its returned data instead.

@@ -238,3 +238,68 @@ semantic-confirmation service or execution gate: that would introduce a
 separate workflow beyond knowledge discovery and Model-backed lowering.
 The unresolved Agent interpretations remain recorded as failed or partial
 results, not reclassified as passing cases.
+
+## Receipt-only evaluation protocol
+
+The evaluator and user subsequently revised the acceptance boundary. The
+candidate now submits an Intent to `ontology_transform`; the host stores the
+Intent, optional host context, and generated Query in a private JSON file and
+returns only an opaque receipt. The Agent must explain the accepted Intent in
+business language and compare that explanation with the request. A reasonable
+explicit interpretation can pass without guessing a hidden corpus-SQL shape or
+asking about every possible ambiguity. Model-invalid paths and unvalidated
+handwritten SQL remain unacceptable. Questions 05, 06, 07, and 09 in the rubric
+reflect this revised reading; older score rows above are historical, not new
+scores under this protocol.
+
+The receipt boundary passed a direct test and a smoke call against an existing
+IC snapshot: the successful MCP response contained only a receipt, while the
+mode-0600 host record contained the submitted Intent and SQL/bindings. A failed
+Intent returned structured diagnostics and created no record. No OpenCode
+business-question rerun or database execution has yet been performed under
+this protocol, so it does not establish an improved Agent pass rate.
+
+## Nine-question rerun with receipt-only tools
+
+This rerun used `deepseek/deepseek-flash`, one fresh isolated OpenCode session
+per question, IC snapshot SHA-256
+`8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`,
+and candidate guide SHA-256
+`4b759793b9ae30da36e5a7968bf5db23f44bb23364fd8734e7c0d1e68bebf9ae`.
+Only the guide, question, and restricted MCP configuration were mounted in
+each Agent's work area. The host kept the snapshot, runner, and mode-0600
+receipt files outside that filesystem. The adapter exposed no SQL/bindings to
+the Agent. All nine OpenCode runs exited successfully; no database was attached.
+The `transform` counts include rejected and exploratory submissions, not just
+the final cited receipt.
+
+| 题目 | transform 次数 | 按最终回执核对的观察 |
+| --- | ---: | --- |
+| 01 | 1 | 正确沿设备所属站点、设备告警路径统计未清除告警超过 5 条的站点；解释和 Intent 一致。 |
+| 02 | 4 | 按设备完整身份选最新一条 KPI 采样，从同一行读取两项端口值与时间；站点仅作存在性限定。 |
+| 03 | 19 | 使用离线 GPON、PON 端口原始样本 Max 和题面给出的绝对 30 天窗口；没有用 Avg 替代。 |
+| 04 | 2 | 统计风扇实体，使用服务器自身的 `server_health=warning`，没有偷换成 PSU 健康。 |
+| 05 | 20 | **不通过。** 回复声称 Z 端设备也会得到 A 端，但最终 Intent/SQL 只沿 A→Z；反向纳入规则未兑现。这是解释与实际查询的硬错位。 |
+| 06 | 1 | 按告警中的非空租户引用分组，不联接租户实体表；孤儿 ID 可计入，且解释明确了这一点。 |
+| 07 | 3 | 主回执只计 1–4 台，但明确声明 0 台未计入，并给出另一个经 transform 接受的 0–4 台回执。口径透明，可让用户纠正；默认选择偏离“少于 5”的通常含义。 |
+| 08 | 2 | 按昆仑服务器资产号过滤，沿服务器到站点关系按 Site ID 去重计数，未擅加在线条件。 |
+| 09 | 4 | 没有 host 时间时拒绝把无时间窗的探索回执当作答案，也没有自行编造 `now`。 |
+
+For a separate 09 rerun, the host supplied
+`{"now":1790598253999,"tz":480}` (2026-09-28 20:24:13 UTC+8). One transform
+was accepted. The Agent explained that only the critical-Alarm predicate was
+time-limited and the memory peak covered all available KPI samples. It chose
+`{"calendar":"month","offset":-1}` through `now`, which materialized as
+2026-08-01 00:00 through 2026-09-28 20:24 local time, nearly two months. The
+response mentioned a calendar-month boundary and offered a rolling-30-day
+alternative, but did not state these concrete dates. Thus its chosen scope is
+visible enough to invite correction, yet the time-range explanation remains
+less precise than the actual stored Intent. Neither run produced a data answer.
+
+The rerun supports the value of host-only Query persistence and business
+paraphrase, but does not prove that the Agent always checks its paraphrase
+against the submitted Intent: question 05 is a counterexample. Question 07
+shows an exposed, correctable assumption rather than a silent semantic swap.
+Question 09 shows that relative calendar boundaries should be explained as
+actual business dates when the host has resolved them. These are Agent/workflow
+findings; no new ontology lowering defect was established by this rerun.

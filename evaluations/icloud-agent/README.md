@@ -9,15 +9,23 @@ to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts
 The adapter accepts only an Intent from the Agent on `ontology_transform`;
 an optional request clock is provisioned by the host through
 `ONTOLOGY_EVAL_CTX_JSON` and never accepted from Agent tool arguments.
+On successful lowering it writes a mode-0600 JSON record containing the
+submitted Intent, host context (if any), and generated Query to the existing
+host-only directory named by `ONTOLOGY_EVAL_OUTPUT_DIR`. The tool returns only
+an acceptance receipt; the Agent cannot retrieve SQL or bindings through the
+three exposed tools. Failed lowering returns diagnostics and writes no record.
 For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.
 Supply the guide and question as host-selected attachments; disable the
 Agent's general file-reading tool entirely.
-The candidate guide should contain the generic Intent contract and Agent
-workflow from section 3 of root `USAGE.md`, with the host's three tool names;
-do not give the Agent build/start instructions or artifact paths.
+Use `AGENT_USAGE.md` as the candidate guide. It carries the generic Intent
+syntax from root `USAGE.md` but replaces the direct service's Query response
+with this adapter's receipt-only workflow. Do not give the Agent build/start
+instructions or artifact paths.
 
-Set `ONTOLOGY_EVAL_RUNNER` and `ONTOLOGY_EVAL_ARTIFACT` to absolute host paths
-before starting the adapter. It owns the child process and forwards only
+Set `ONTOLOGY_EVAL_RUNNER`, `ONTOLOGY_EVAL_ARTIFACT`, and
+`ONTOLOGY_EVAL_OUTPUT_DIR` to absolute host paths before starting the adapter.
+Create the output directory outside the Agent sandbox, with access limited to
+the trusted host and evaluator. It owns the child process and forwards only
 `ic/index`, `ic/info`, and `ic/transform` JSONL requests. Do not mount the
 runner or artifact into the Agent sandbox. No separate Telora TCP or Unix
 listener is needed, so the Agent cannot bypass the adapter's host-owned context
@@ -42,15 +50,16 @@ artifact, rubric,
 and host process table outside the Agent sandbox; disabling Agent shell/file
 tools is additional defense, not a substitute for this isolation boundary.
 
-The questions test three different outcomes: successful Model-backed lowering,
-refusal of a misleading or unsupported interpretation, and clarification of a
-materially ambiguous business request. A successful SQL response is not a
-universal passing condition. `RUBRIC.md` is for the evaluator, not the agent.
+The questions test Model-backed lowering, rejection of unsupported meanings,
+and business interpretation under ambiguity. A successful receipt alone is not
+a universal passing condition: compare the stored Intent and Query with the
+Agent's business-language explanation and the user's actual request.
+`RUBRIC.md` is for the evaluator, not the agent.
 Question files contain only the simulated business request; process instructions
 belong in the generic guide, not in the question. Evaluate the stated business
 purpose before applying a rubric: a corpus SQL shape or an awkward noun in the
 request must not force clarification when the intended population is explicit.
-SQL and bindings are observable intermediate artifacts in this evaluation;
+SQL and bindings are host-only intermediate artifacts in this evaluation;
 production answers should execute the Query and present the returned data.
 Clarification questions should explain the business choice, not ask the user
 to select an Intent field, SQL shape, or join path.
