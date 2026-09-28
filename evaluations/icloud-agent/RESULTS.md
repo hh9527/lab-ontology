@@ -60,8 +60,10 @@ or an OpenCode rerun. No new pass/fail score is assigned to questions 04, 06,
 
 ## Graph regression after nested edge normalization
 
-The full `icloud_model/tests/graph` module passed 192/192 cases with
-`--request-fuel 10000`. A run at 2000 million fuel reached 154 passes and
+The full `icloud_model/tests/graph` module passed 194/194 cases with
+`--request-fuel 10000` after stable sibling-edge normalization. The two new
+cases require identical SQL and bindings for permuted main-graph and nested
+EXISTS sibling edges. An earlier run at 2000 million fuel reached 154 passes and
 then exhausted the shared module fuel budget; it did not report a failed
 assertion. This verifies the main and nested edge changes against the graph
 module, but it is not an Agent evaluation.
