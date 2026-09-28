@@ -3916,7 +3916,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
             || array::length(array::filter(spec.nodes, fn(other) { other.id == node.id })) != 1
     }) { fail!("graph existence node ids must be distinct from outer graph instances") }
     else {
-        let spec: GraphExist = {...spec, edges: graph_ordered_edges(spec.anchor, spec.edges)};
+        let spec: GraphExist = {...spec, edges: graph_ordered_edges(payload, spec.anchor, spec.edges)};
         match array::find(payload.business_links, fn(link) {
             get_index(spec.edges, 0).relation == link.id
         }) {
@@ -4436,20 +4436,45 @@ def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(
         }
     };
 
-def graph_ordered_edges: Fn(String, Array(GraphEdge)) -> Array(GraphEdge) = fn(root, edges) {
+# An EXISTS anchored by a business link needs that link as its first path edge.
+# Otherwise choose a stable child order independent of the submitted edge order.
+def graph_edge_before: Fn(PreparedPayload, Array(String), GraphEdge, GraphEdge) -> Bool = fn(payload, known, left, right) {
+    let left_link = array::any(payload.business_links, fn(link) { link.id == left.relation });
+    let right_link = array::any(payload.business_links, fn(link) { link.id == right.relation });
+    let left_new = if array::any(known, fn(id) { id == left.from }) { left.to } else { left.from };
+    let right_new = if array::any(known, fn(id) { id == right.from }) { right.to } else { right.from };
+    if left_link != right_link { left_link }
+    else if left_new != right_new { left_new < right_new }
+    else if left.relation != right.relation { left.relation < right.relation }
+    else if left.from != right.from { left.from < right.from }
+    else { left.to < right.to }
+};
+
+def graph_ordered_edges: Fn(PreparedPayload, String, Array(GraphEdge)) -> Array(GraphEdge) = fn(payload, root, edges) {
     let initial: (Array(String), Array(Int)) = ([root], []);
     let ordered = array::fold(edges, initial, fn(state, unused) {
-        array::fold(array::enumerate(edges), state, fn(current, entry) {
+        let next: Option((Int, GraphEdge)) = array::fold(array::enumerate(edges), None, fn(best, entry) {
             let edge = entry.1;
-            let from_known = array::any(current.0, fn(id) { id == edge.from });
-            let to_known = array::any(current.0, fn(id) { id == edge.to });
-            if array::any(current.1, fn(index) { index == entry.0 }) || from_known == to_known {
-                current
+            let from_known = array::any(state.0, fn(id) { id == edge.from });
+            let to_known = array::any(state.0, fn(id) { id == edge.to });
+            if array::any(state.1, fn(index) { index == entry.0 }) || from_known == to_known {
+                best
             } else {
-                (array::push(current.0, if from_known { edge.to } else { edge.from }),
-                    array::push(current.1, entry.0))
+                match best {
+                    None => Some(entry),
+                    Some(previous) => if graph_edge_before(payload, state.0, edge, previous.1) { Some(entry) } else { best },
+                }
             }
-        })
+        });
+        match next {
+            None => state,
+            Some(entry) => do {
+                let edge = entry.1;
+                let from_known = array::any(state.0, fn(id) { id == edge.from });
+                (array::push(state.0, if from_known { edge.to } else { edge.from }),
+                    array::push(state.1, entry.0))
+            },
+        }
     });
     if array::length(ordered.1) != array::length(edges) {
         let unresolved = array::find(array::enumerate(edges), fn(entry) {
@@ -4477,7 +4502,7 @@ def graph_ordered_edges: Fn(String, Array(GraphEdge)) -> Array(GraphEdge) = fn(r
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
     let request: GraphRequest = {
         root: request.root, row_grain: request.row_grain, distinct: request.distinct,
-        nodes: request.nodes, edges: graph_ordered_edges(request.root, request.edges),
+        nodes: request.nodes, edges: graph_ordered_edges(payload, request.root, request.edges),
         constraints: request.constraints, select: request.select, measures: request.measures,
         filters: request.filters, any_of: request.any_of, exists: request.exists,
         count: request.count, count_value: request.count_value,
