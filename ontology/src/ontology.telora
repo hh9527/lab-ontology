@@ -4435,9 +4435,57 @@ def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(
         }
     };
 
+def graph_ordered_edges: Fn(String, Array(GraphEdge)) -> Array(GraphEdge) = fn(root, edges) {
+    let initial: (Array(String), Array(Int)) = ([root], []);
+    let ordered = array::fold(edges, initial, fn(state, unused) {
+        array::fold(array::enumerate(edges), state, fn(current, entry) {
+            let edge = entry.1;
+            let from_known = array::any(current.0, fn(id) { id == edge.from });
+            let to_known = array::any(current.0, fn(id) { id == edge.to });
+            if array::any(current.1, fn(index) { index == entry.0 }) || from_known == to_known {
+                current
+            } else {
+                (array::push(current.0, if from_known { edge.to } else { edge.from }),
+                    array::push(current.1, entry.0))
+            }
+        })
+    });
+    if array::length(ordered.1) != array::length(edges) {
+        let unresolved = array::find(array::enumerate(edges), fn(entry) {
+            !array::any(ordered.1, fn(index) { index == entry.0 })
+        });
+        match unresolved {
+            Some(entry) => do {
+                let edge = entry.1;
+                if array::any(ordered.0, fn(id) { id == edge.from })
+                    && array::any(ordered.0, fn(id) { id == edge.to }) {
+                    fail!("graph cycles and repeated instance edges are not supported", edge.relation, edge.to)
+                } else {
+                    fail!("graph edge is not connected to the root; connect one endpoint through another declared edge", root, edge.relation, edge.from, edge.to)
+                }
+            },
+            None => fail!("graph edge ordering failed"),
+        }
+    } else {
+        array::map(ordered.1, fn(index) { get_index(edges, index) })
+    }
+};
+
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
+    let request: GraphRequest = {
+        root: request.root, row_grain: request.row_grain, distinct: request.distinct,
+        nodes: request.nodes, edges: graph_ordered_edges(request.root, request.edges),
+        constraints: request.constraints, select: request.select, measures: request.measures,
+        filters: request.filters, any_of: request.any_of, exists: request.exists,
+        count: request.count, count_value: request.count_value,
+        count_having: request.count_having, measure_having: request.measure_having,
+        count_groups: request.count_groups, include_empty: request.include_empty,
+        group_by_identity: request.group_by_identity, top_per: request.top_per,
+        top_by_measure: request.top_by_measure, order_by: request.order_by,
+        take: request.take,
+    };
     if !payload.authorize(subject) { fail!("subject is not authorized for graph query", subject) }
     else if array::length(request.nodes) == 0 || (array::length(request.select) == 0
         && array::length(request.measures) == 0 && request.count == None && request.count_value == None) {
@@ -4580,9 +4628,6 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 } else if array::any(state.1, fn(item) { item.id == edge.from })
                     && array::any(state.1, fn(item) { item.id == edge.to }) {
                     fail!("graph cycles and repeated instance edges are not supported", edge.relation, edge.to)
-                } else if !array::any(state.1, fn(item) { item.id == edge.from })
-                    && !array::any(state.1, fn(item) { item.id == edge.to }) {
-                    fail!("graph edge has no endpoint connected to the root", edge.relation)
                 } else {
                     let forward = array::any(state.1, fn(item) { item.id == edge.from });
                     let new_node = if forward { to_node } else { from_node };

@@ -121,9 +121,9 @@ A graph Intent has five required fields, including empty arrays where needed:
 node has `id` (unique instance name within this graph) and `entity` (stable
 dataset ID). Each edge has `relation` (stable named relation ID), `from`, and
 `to` (node instance IDs); its direction and endpoint roles must match the
-Model. List `edges` in traversal order: start with an edge touching `root`,
-then add each next edge only after one of its endpoints is connected to the
-root. `select` contains objects `{"node":"...","dimension":"..."}`.
+Model. `edges` may be listed in any order, but must form one rooted tree;
+each edge must introduce one new node reachable from `root`. `select`
+contains objects `{"node":"...","dimension":"..."}`.
 For a count, `count` is the node instance ID to count, not a measure name.
 The required `select` array may be empty when `count` is present.
 
