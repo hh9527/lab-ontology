@@ -14,6 +14,8 @@ type TimeValue = enum {
 type Window = struct { start: TimeValue, end: TimeValue };
 
 type RequestContext = struct { now: Int, tz: Option(Int) };
+type CalendarUnit = enum { Day, Week, Month };
+type CivilDate = struct { year: Int, month: Int, day: Int };
 
 def request_context: Fn(Int, Option(Int)) -> RequestContext = fn(now, tz) {
     match tz {
@@ -30,12 +32,17 @@ def pad4: Fn(Int) -> String = fn(n) {
     else if n < 1000 { `0\{n}` } else { `\{n}` }
 };
 
+def floor_div: Fn(Int, Int) -> Int = fn(value, divisor) {
+    value / divisor - if value % divisor < 0 { 1 } else { 0 }
+};
+def floor_mod: Fn(Int, Int) -> Int = fn(value, divisor) {
+    value - floor_div(value, divisor) * divisor
+};
+
 # Civil-from-days uses a proleptic Gregorian calendar, anchored at 1970-01-01.
-def utc_second_parts: Fn(Int) -> String = fn(seconds) {
-    let day = seconds / 86400 - if seconds % 86400 < 0 { 1 } else { 0 };
-    let clock = seconds - day * 86400;
+def civil_from_days: Fn(Int) -> CivilDate = fn(day) {
     let shifted = day + 719468;
-    let era = shifted / 146097 - if shifted % 146097 < 0 { 1 } else { 0 };
+    let era = floor_div(shifted, 146097);
     let doe = shifted - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let year0 = yoe + era * 400;
@@ -44,8 +51,68 @@ def utc_second_parts: Fn(Int) -> String = fn(seconds) {
     let day_of_month = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = year0 + if month <= 2 { 1 } else { 0 };
-    if year < 1 || year > 9999 { fail!("request time is outside the supported four-digit UTC year range", seconds) }
-    else { `\{pad4(year)}-\{pad2(month)}-\{pad2(day_of_month)} \{pad2(clock / 3600)}:\{pad2(clock % 3600 / 60)}:\{pad2(clock % 60)}` }
+    if year < 1 || year > 9999 { fail!("calendar boundary is outside the supported four-digit year range", day) }
+    else { {year, month, day: day_of_month} }
+};
+
+def days_from_civil: Fn(Int, Int, Int) -> Int = fn(year, month, day) {
+    let adjusted = year - if month <= 2 { 1 } else { 0 };
+    let era = floor_div(adjusted, 400);
+    let yoe = adjusted - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
+};
+
+def date_text: Fn(CivilDate) -> String = fn(date) {
+    `\{pad4(date.year)}-\{pad2(date.month)}-\{pad2(date.day)}`
+};
+
+def utc_second_parts: Fn(Int) -> String = fn(seconds) {
+    let day = floor_div(seconds, 86400);
+    let clock = seconds - day * 86400;
+    let date = civil_from_days(day);
+    `\{date_text(date)} \{pad2(clock / 3600)}:\{pad2(clock % 3600 / 60)}:\{pad2(clock % 60)}`
+};
+
+def calendar_boundary: Fn(RequestContext, edsl::TimeField, CalendarUnit, Int) -> TimeValue =
+    fn(context, role, unit, offset) {
+        let tz = match context.tz {
+            Some(minutes) => minutes,
+            None => fail!("calendar boundary requires request ctx.tz offset minutes"),
+        };
+        if context.now < -62135683200000 || context.now >= 253402387200000 {
+            fail!("calendar request time is outside supported year range", context.now)
+        } else if offset < -3652059 || offset > 3652059 {
+            fail!("calendar period offset is outside supported range", unit, offset)
+        } else {
+            let local_day = floor_div(context.now + tz * 60000, 86400000);
+            let boundary_day = match unit {
+                CalendarUnit::Day => local_day + offset,
+                CalendarUnit::Week => local_day - floor_mod(local_day + 3, 7) + offset * 7,
+                CalendarUnit::Month => do {
+                    let date = civil_from_days(local_day);
+                    let month_index = date.year * 12 + date.month - 1 + offset;
+                    let year = floor_div(month_index, 12);
+                    let month = floor_mod(month_index, 12) + 1;
+                    if year < 1 || year > 9999 { fail!("calendar month offset is outside supported year range", offset) }
+                    else { days_from_civil(year, month, 1) }
+                },
+            };
+            let date = civil_from_days(boundary_day);
+            match role.encoding {
+                edsl::TimeEncoding::DateText => TimeValue::Date(date_text(date)),
+                edsl::TimeEncoding::LocalText => fail!("local wall-clock storage needs a declared fixed-offset policy", role.encoding),
+                _ => now_for({now: boundary_day * 86400000 - tz * 60000, tz: context.tz}, role),
+            }
+        }
+    };
+
+def fixed_delta: Fn(RequestContext, edsl::TimeField, Int) -> TimeValue = fn(context, role, delta) {
+    if context.now < -62135683200000 || context.now >= 253402387200000
+        || delta < -315569520000000 || delta > 315569520000000 {
+        fail!("fixed duration is outside the supported instant range", context.now, delta)
+    } else { now_for({now: context.now + delta, tz: context.tz}, role) }
 };
 
 def now_seconds: Fn(Int, edsl::FilterOp) -> Int = fn(ms, op) {
@@ -141,4 +208,5 @@ def window_filters: Fn(edsl::PreparedPayload, String, String, Window) -> Array(e
         }
     };
 
-pub use self::{TimeValue, Window, RequestContext, request_context, now_for, now_filter, window_filters};
+pub use self::{TimeValue, Window, RequestContext, CalendarUnit, request_context, now_for,
+    now_filter, calendar_boundary, fixed_delta, window_filters};

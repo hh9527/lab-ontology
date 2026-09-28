@@ -58,9 +58,8 @@ optional `ctx`. The caller supplies the request clock explicitly:
 ```
 
 `ctx.now` is a Unix epoch millisecond integer. `ctx.tz` is an optional fixed
-offset in minutes east of UTC, constrained to +/-840. It is validated now and
-reserved for future local calendar calculations; UTC instant conversion does
-not use it. Named zones and daylight saving are not yet supported. An intent
+offset in minutes east of UTC, constrained to +/-840. UTC instant conversion
+does not use it. An intent
 uses `"now"` in a time-window endpoint or time-dimension filter to refer to
 that request clock. The Model's time role
 determines whether it binds as epoch milliseconds, normalized RFC3339 UTC
@@ -69,6 +68,28 @@ not currently accept `now`. One request context is reused throughout lowering,
 including `exists` subgraphs and both operands of `graph_pair`. When `now` is
 referenced but absent, lowering fails. Neither the service nor the
 context-free factories read a system or database clock.
+
+Time-window endpoints also accept request-relative expressions:
+
+```json
+{"start": {"calendar": "day", "offset": -1}, "end": {"calendar": "day", "offset": 0}}
+```
+
+`calendar` is `day`, `week`, or `month`; `offset` is a required integer relative
+to the period containing `ctx.now`. Weeks begin on Monday. A month boundary is
+the first day of the target month, not a clamped day-of-month. These expressions
+require both `ctx.now` and `ctx.tz`; the fixed offset determines the local
+calendar date, then the boundary is converted to the Model field's declared
+date or UTC instant encoding. A separate `{ "delta_ms": -86400000 }` expression
+means an exact elapsed duration from `ctx.now`, not "yesterday" in the local
+calendar. Both forms bind values to the original column without SQL-side date
+functions. Unknown or mixed expression keys are rejected.
+
+`ctx.tz` is only a fixed offset, not a named timezone. Daylight-saving changes
+and ambiguous local times must be resolved by the caller; relative expressions
+on `LocalText` fields are not supported. Calendar results are limited to
+four-digit years. Column-side calendar calculations remain outside this
+contract until a concrete Model use case establishes their required semantics.
 
 For a whole-second text column, comparisons round the millisecond request
 clock to preserve the comparison over second-aligned values: `>=` and `<` use
@@ -82,5 +103,4 @@ JSON value remains ambiguous under the Model declaration, lowering fails.
 An explicit `kind` remains accepted on those inputs as a disambiguator.
 
 Telora's transform-service initialization context is long-lived; the clock
-comes from each request envelope. Calendar arithmetic, named timezones, and
-column-side calendar calculations remain outside this contract.
+comes from each request envelope.
