@@ -32,14 +32,16 @@ class PeerDirectionTest(unittest.TestCase):
 
     def lower(self, intent):
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000",
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000",
              "--with-memory-limit", "1024", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+            input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
             text=True, capture_output=True, cwd=MODEL,
         )
         if result.returncode:
             self.fail(f"peer intent lowering failed: {result.stdout} {result.stderr}")
-        query = json.loads(result.stdout)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["accepted"], response["results"])
+        query = response["queries"][0]
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
         return self.db.execute(query["sql"], bindings).fetchall()
 

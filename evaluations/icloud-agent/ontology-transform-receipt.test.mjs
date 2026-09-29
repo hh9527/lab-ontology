@@ -9,11 +9,15 @@ test('success stores all Intents and Queries in one private receipt', () => {
   const outputDir = mkdtempSync(join(tmpdir(), 'ontology-receipt-'));
   try {
     const intents = [{ op: 'graph', root: 'a' }, { op: 'graph', root: 'z' }];
-    const results = [
-      { error: false, ok: { sql: 'SELECT ?1', bindings: [7] } },
-      { error: false, ok: { sql: 'SELECT ?1', bindings: [9] } },
+    const queries = [
+      { sql: 'SELECT ?1', bindings: [7] },
+      { sql: 'SELECT ?1', bindings: [9] },
     ];
-    const result = transformResults(results, intents, outputDir);
+    const response = { error: false, ok: { accepted: true, queries, results: [
+      { index: 0, valid: true, diagnostics: [] },
+      { index: 1, valid: true, diagnostics: [] },
+    ] } };
+    const result = transformResults(response, intents, outputDir);
     const receipt = JSON.parse(result.content[0].text);
     assert.equal(result.isError, false);
     assert.equal(receipt.accepted, true);
@@ -25,8 +29,8 @@ test('success stores all Intents and Queries in one private receipt', () => {
     assert.equal(statSync(path).mode & 0o777, 0o600);
     assert.deepEqual(JSON.parse(readFileSync(path)), {
       items: [
-        { intent: intents[0], query: results[0].ok },
-        { intent: intents[1], query: results[1].ok },
+        { intent: intents[0], query: queries[0] },
+        { intent: intents[1], query: queries[1] },
       ],
     });
   } finally {
@@ -37,24 +41,24 @@ test('success stores all Intents and Queries in one private receipt', () => {
 test('one failed Intent returns indexed feedback and stores no partial bundle', () => {
   const outputDir = mkdtempSync(join(tmpdir(), 'ontology-receipt-'));
   try {
-    const diagnostic = { schema: 'telora.service/v1', error: true,
-      ok: { sql: 'SHOULD NOT LEAK', bindings: [] },
-      diagnostics: [{ message: 'unknown entity' }] };
-    const result = transformResults([
-      { error: false, ok: { sql: 'SELECT ?1', bindings: [7] } },
-      diagnostic,
-    ], [{ root: 'valid' }, { root: 'bad' }], outputDir);
+    const statuses = [
+      { index: 0, valid: true, diagnostics: [] },
+      { index: 1, valid: false, diagnostics: [{ message: 'unknown entity' }] },
+      { index: 2, valid: false, diagnostics: [{ message: 'unknown relation' }] },
+    ];
+    const result = transformResults(
+      { error: false, ok: { accepted: false, queries: null, results: statuses } },
+      [{ root: 'valid' }, { root: 'bad' }, { root: 'also bad' }], outputDir);
     assert.equal(result.isError, true);
     assert.deepEqual(JSON.parse(result.content[0].text), {
       accepted: false,
-      results: [
-        { index: 0, valid: true },
-        { index: 1, valid: false, diagnostics: diagnostic.diagnostics },
-      ],
+      results: statuses,
     });
     assert.deepEqual(readdirSync(outputDir), []);
-    assert.throws(() => transformResults([{ error: false, ok: { sql: 'SELECT 1' } }],
-      [{}], outputDir), /invalid transform response/);
+    assert.throws(() => transformResults({ error: false, ok: {
+      accepted: false, queries: [{ sql: 'SHOULD NOT LEAK', bindings: [] }],
+      results: [{ index: 0, valid: false, diagnostics: [] }],
+    } }, [{}], outputDir), /invalid transform response/);
     assert.deepEqual(readdirSync(outputDir), []);
   } finally {
     rmSync(outputDir, { recursive: true });

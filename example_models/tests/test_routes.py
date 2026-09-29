@@ -13,7 +13,7 @@ TELORA = MODEL.parent / "bin" / "telora"
 class ExampleRoutesTest(unittest.TestCase):
     def call(self, method, payload):
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "10000",
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "10000",
              "--initialization-fuel", "10000", "example_models"],
             input=json.dumps({"method": method, "input": payload}),
             text=True, capture_output=True, cwd=MODEL, check=True,
@@ -28,11 +28,13 @@ class ExampleRoutesTest(unittest.TestCase):
         ]
         for domain, entity, node, table, first_topic in cases:
             with self.subTest(domain=domain):
-                query = self.call(f"{domain}/transform", {"intent": {
+                response = self.call(f"{domain}/transform", {"intents": [{
                     "op": "graph", "root": node,
                     "nodes": [{"id": node, "entity": entity}],
                     "edges": [], "select": [], "count": node,
-                }})
+                }]})
+                self.assertTrue(response["accepted"], response["results"])
+                query = response["queries"][0]
                 self.assertIn(f"FROM {table} AS {node}", query["sql"])
                 page = self.call(f"{domain}/index", {"limit": 1})["Index"]
                 self.assertEqual(page["entries"][0]["topic"], first_topic)

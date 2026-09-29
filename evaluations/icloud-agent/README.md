@@ -9,8 +9,8 @@ to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts
 The adapter accepts one to five independent Intents in a single
 `ontology_transform` call; relative time must be resolved by the Agent from
 application or environment context before this call. No request clock is
-injected into the service. It calls the underlying single-Intent service for
-each plan. If all lower successfully, it writes one mode-0600 JSON record
+injected into the service. It forwards the entire batch to the underlying
+transform service in one call. If all lower successfully, it writes one mode-0600 JSON record
 containing the ordered Intents and generated Queries to the existing
 host-only directory named by `ONTOLOGY_EVAL_OUTPUT_DIR`. The tool returns only
 an acceptance receipt; the Agent cannot retrieve SQL or bindings through the

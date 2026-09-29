@@ -138,9 +138,8 @@ async function handle(message) {
       }
       try {
         if (name === 'transform') {
-          const results = await Promise.all(input.intents.map((intent) =>
-            callService(name, { intent })));
-          return reply(id, transformResults(results, input.intents, outputDir));
+          const result = await callService(name, input);
+          return reply(id, transformResults(result, input.intents, outputDir));
         }
         const result = await callService(name, input);
         return reply(id, {

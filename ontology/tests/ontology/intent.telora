@@ -1,10 +1,14 @@
-use crate::intent::{ query_intent_lower_factory, query_intent_ast_factory };
+use crate::intent::{ query_intent_lower_factory, query_intent_ast_factory, query_request_method_factory };
 use crate::ontology as edsl;
 use crate::knowledge as knowledge;
 use crate::query as qb;
 use crate::sqlite as sqlite;
 use crate::postgres as postgres;
 use std::json as json;
+use std::codec as codec;
+use std::diagnostics as diagnostics;
+use std::dict as dict;
+use std::value::{ Value };
 use std::array as array;
 use std::string as string;
 use std::test as test;
@@ -158,6 +162,96 @@ pub def backend_is_bound_at_factory_creation: test::Test = test::should_ok(fn() 
         && string::contains(sq.sql, "?1") && string::contains(pg.sql, "$1") {
         True
     } else { fail!("backend selection changed graph lowering or bindings", sq, pg) }
+});
+
+def batch_field: Fn(Value, String) -> Value = fn(value, key) {
+    match value {
+        Value::Object(obj) => match dict::get(obj, key) {
+            Some(found) => found,
+            None => fail!("batch response omitted a field", key),
+        },
+        _ => fail!("batch response is not an object", value),
+    }
+};
+
+pub def batch_single_query_matches_direct_lowering: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"order","nodes":[{"id":"order","entity":"orders"}],
+        "edges":[],"select":[{"node":"order","dimension":"OrderId"}],
+        "filters":[{"node":"order","dimension":"OrderRegion","op":"eq","value":"east"}]}"#).unwrap!();
+    let direct = query_intent_lower_factory(payload, "analyst", sqlite::build_query)(intent);
+    let result = query_request_method_factory(payload, "analyst", sqlite::build_query)(
+        Value::Object({"intents": Value::Array([intent])}));
+    let queries = match batch_field(result, "queries") {
+        Value::Array(items) => items,
+        other => fail!("valid batch omitted queries", other),
+    };
+    if batch_field(result, "accepted") == Value::True && array::length(queries) == 1
+        && queries[0] == codec::encode(direct) { True }
+    else { fail!("single batch query differs from direct lowering", result, direct) }
+});
+
+pub def batch_queries_keep_order_and_independent_bindings: test::Test = test::should_ok(fn() {
+    let result = query_request_method_factory(payload, "analyst", sqlite::build_query)(json::parse(r#"{
+        "intents":[
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[{"node":"a","dimension":"OrderId"}],
+             "filters":[{"node":"a","dimension":"OrderRegion","op":"eq","value":"east"}]},
+            {"op":"graph","root":"b","nodes":[{"id":"b","entity":"orders"}],"edges":[],
+             "select":[{"node":"b","dimension":"OrderId"}],
+             "filters":[{"node":"b","dimension":"OrderRegion","op":"eq","value":"west"}]}
+        ]
+    }"#).unwrap!());
+    let queries = match batch_field(result, "queries") {
+        Value::Array(items) => items,
+        other => fail!("valid batch omitted queries", other),
+    };
+    if batch_field(result, "accepted") == Value::True && array::length(queries) == 2
+        && batch_field(queries[0], "bindings") == Value::Array([Value::String("east")])
+        && batch_field(queries[1], "bindings") == Value::Array([Value::String("west")])
+        && string::contains(json::stringify(queries[0]), "?1")
+        && string::contains(json::stringify(queries[1]), "?1") { True }
+    else { fail!("batch queries lost order or independent bindings", result) }
+});
+
+pub def batch_collects_multiple_failures_without_partial_queries: test::Test = test::should_ok(fn() {
+    let result = query_request_method_factory(payload, "analyst", sqlite::build_query)(json::parse(r#"{
+        "intents":[
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[{"node":"a","dimension":"OrderId"}]},
+            {"op":"graph","root":"bad","nodes":[{"id":"bad","entity":"missing_entity"}],"edges":[],
+             "select":[{"node":"bad","dimension":"OrderId"}]},
+            {"op":"graph","root":"b","nodes":[{"id":"b","entity":"orders"}],"edges":[],
+             "select":[{"node":"b","dimension":"OrderId"}]},
+            {"op":"graph","root":"c","nodes":[{"id":"c","entity":"orders"},{"id":"d","entity":"customers"}],
+             "edges":[{"relation":"missing_relation","from":"c","to":"d"}],
+             "select":[{"node":"c","dimension":"OrderId"}]}
+        ]
+    }"#).unwrap!());
+    let statuses = match batch_field(result, "results") {
+        Value::Array(items) => items,
+        other => fail!("failed batch omitted statuses", other),
+    };
+    if batch_field(result, "accepted") == Value::False && batch_field(result, "queries") == Value::None
+        && array::length(statuses) == 4
+        && batch_field(statuses[0], "valid") == Value::True
+        && batch_field(statuses[1], "valid") == Value::False
+        && batch_field(statuses[2], "valid") == Value::True
+        && batch_field(statuses[3], "valid") == Value::False
+        && batch_field(statuses[3], "index") == Value::Int(3)
+        && string::contains(json::stringify(statuses[1]), "unknown")
+        && string::contains(json::stringify(statuses[3]), "unknown named relation") { True }
+    else { fail!("batch did not retain both indexed diagnostics", result) }
+});
+
+pub def batch_rejects_empty_and_over_limit: test::Test = test::should_ok(fn() {
+    let lower = query_request_method_factory(payload, "analyst", sqlite::build_query);
+    let empty = diagnostics::with_diagnostics(lower)(json::parse(r#"{"intents":[]}"#).unwrap!());
+    let too_many = diagnostics::with_diagnostics(lower)(json::parse(r#"{"intents":[{},{},{},{},{},{}]}"#).unwrap!());
+    match (empty, too_many) {
+        (Err(a), Err(b)) => if array::length(a) > 0 && array::length(b) > 0 { True }
+            else { fail!("batch bounds produced no diagnostics") },
+        _ => fail!("batch bounds were accepted"),
+    }
 });
 
 pub def raw_global_take_uses_bound_limit_and_identity_tie_breaker: test::Test = test::should_ok(fn() {

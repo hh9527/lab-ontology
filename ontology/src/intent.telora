@@ -2,6 +2,8 @@ use crate::ontology as edsl;
 use crate::query as qb;
 use crate::time as time;
 use std::array as array;
+use std::codec as codec;
+use std::diagnostics as diagnostics;
 use std::dict as dict;
 use std::value::{ Value };
 
@@ -576,14 +578,60 @@ def query_intent_ast_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> 
     fn(intent) { lower_intent_ast(payload, subject, intent) }
 };
 
-def query_request_lower_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> qb::Query =
+type BatchEvaluation = struct {
+    index: Int,
+    query: Option(qb::Query),
+    diagnostics: Array(diagnostics::Diagnostic),
+};
+type BatchStatus = struct {
+    index: Int,
+    valid: Bool,
+    diagnostics: Array(diagnostics::Diagnostic),
+};
+type BatchResponse = struct {
+    accepted: Bool,
+    results: Array(BatchStatus),
+    queries: Option(Array(qb::Query)),
+};
+
+def query_request_method_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> Value =
     fn(payload, subject, to_query) {
         fn(request) {
             let obj = as_object(request);
-            graph_keys(obj, "query request", ["intent"]);
-            to_query(lower_intent_ast(payload, subject, field(obj, "intent")))
+            match array::find(dict::keys(obj), fn(key) { key != "intents" }) {
+                Some(key) => fail!("query request contains unsupported key", key),
+                None => (),
+            };
+            let intents = as_array(field(obj, "intents"));
+            if array::length(intents) < 1 || array::length(intents) > 5 {
+                fail!("query request requires one to five independent intents", array::length(intents))
+            } else {
+                let assessed: Array(BatchEvaluation) = array::map(array::enumerate(intents), fn(entry) {
+                    let observed = diagnostics::with_diagnostics(fn(intent: Value) {
+                        to_query(lower_intent_ast(payload, subject, intent))
+                    })(entry.1);
+                    match observed {
+                        Ok((query, reports)) => {index: entry.0, query: Some(query), diagnostics: reports},
+                        Err(reports) => {index: entry.0, query: None, diagnostics: reports},
+                    }
+                });
+                let accepted = array::all(assessed, fn(item) { item.query != None });
+                let results: Array(BatchStatus) = array::map(assessed, fn(item) {
+                    {index: item.index, valid: item.query != None, diagnostics: item.diagnostics}
+                });
+                let queries = if accepted {
+                    Some(array::map(assessed, fn(item) {
+                        match item.query {
+                            Some(query) => query,
+                            None => fail!("accepted query batch has a failed item", item.index),
+                        }
+                    }))
+                } else { None };
+                let response: BatchResponse = {accepted, results, queries};
+                codec::encode(response)
+            }
         }
     };
 
 pub use self::{ ToQuery, query_intent_lower_factory, query_intent_ast_factory,
-    query_request_lower_factory };
+    query_request_method_factory };

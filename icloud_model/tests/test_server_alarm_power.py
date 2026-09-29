@@ -57,11 +57,13 @@ class ServerAlarmPowerTest(unittest.TestCase):
             "take": 10,
         }
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "4000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "4000", "--initialization-fuel", "3000", "icloud_model"],
+            input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
-        query = json.loads(result.stdout)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["accepted"], response["results"])
+        query = response["queries"][0]
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
         self.assertEqual(db.execute(query["sql"], bindings).fetchall(), [
             ("Taishan", 100.0, "2025-01-01 00:00:00"),

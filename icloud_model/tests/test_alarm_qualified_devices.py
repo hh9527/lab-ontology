@@ -48,11 +48,13 @@ class AlarmQualifiedDevicesTest(unittest.TestCase):
             }],
         }
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "4000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "4000", "--initialization-fuel", "3000", "icloud_model"],
+            input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
-        query = json.loads(result.stdout)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["accepted"], response["results"])
+        query = response["queries"][0]
         self.assertIn("EXISTS", query["sql"])
         self.assertNotIn("JOIN T_CURRENT_ALARM", query["sql"])
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}

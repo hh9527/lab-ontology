@@ -14,11 +14,13 @@ TELORA = MODEL.parent / "bin" / "telora"
 class SiteNameCountTest(unittest.TestCase):
     def lower(self, intent):
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
+            input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
-        query = json.loads(result.stdout)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["accepted"], response["results"])
+        query = response["queries"][0]
         return query["sql"], {str(index): value for index, value in enumerate(query["bindings"], 1)}
 
     def test_count_of_distinct_names_does_not_count_sites_or_join_rows(self):

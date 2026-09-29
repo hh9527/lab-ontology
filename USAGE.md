@@ -91,21 +91,28 @@ request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
 the user's question. Aim to serve the user's business purpose with one accepted
-Intent. When one plan is insufficient, you may offer up to five accepted Intents
-through separate `transform` calls. Explain in business terms what each result
+Intent. When one plan is insufficient, you may offer up to five independent
+Intents in one `transform` call. Explain in business terms what each result
 would show and how the separate results help answer the question. The service
-does not merge or deduplicate results across calls, so do not claim that it has.
+does not merge or deduplicate results across plans, so do not claim that it has.
 If no supported plan gives a useful answer, explain the limitation or ask a
 focused business question. Do not change the user's meaning just to obtain a
 successful transform. SQL and bindings are intermediate output for an
 authorized execution layer, not the basis for clarification or the final
 user-facing result.
 
-Submit an Intent with the same outer envelope:
+Submit one to five Intents with the same outer envelope. Even one Intent must
+be wrapped in an array:
 
 ```text
-{"method":"<domain>/transform","input":{"intent":<Intent>}}
+{"method":"<domain>/transform","input":{"intents":[<Intent>, ...]}}
 ```
+
+The response has `accepted`, `results`, and `queries`. Each `results` entry
+has a zero-based `index`, `valid`, and `diagnostics`. All Intents are checked
+even if an earlier one fails. Only when every Intent succeeds does `queries`
+contain one Query per Intent in the same order; otherwise `queries` is null.
+This is a batch of independent plans, not a union into one result set.
 
 The caller resolves relative time before submitting an Intent. Reference time
 and timezone may come from the application client or the Agent's environment;

@@ -34,11 +34,13 @@ class AlarmValueGroupTest(unittest.TestCase):
                 if not threshold:
                     del intent["count_having"]
                 result = subprocess.run(
-                    [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-                    input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+                    [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
+                    input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
                     text=True, capture_output=True, cwd=MODEL, check=True,
                 )
-                query = json.loads(result.stdout)
+                response = json.loads(result.stdout)
+                self.assertTrue(response["accepted"], response["results"])
+                query = response["queries"][0]
                 bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
                 self.assertEqual(sorted(db.execute(query["sql"], bindings).fetchall()), expected)
 
@@ -55,11 +57,13 @@ class AlarmValueGroupTest(unittest.TestCase):
             "count": "alarm",
         }
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
+            input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
-        query = json.loads(result.stdout)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["accepted"], response["results"])
+        query = response["queries"][0]
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
         self.assertEqual(sorted(db.execute(query["sql"], bindings).fetchall()), [
             ("cleared", 1), ("uncleared", 2),
@@ -79,11 +83,13 @@ class AlarmValueGroupTest(unittest.TestCase):
             "count": "alarm", "count_having": {"op": "gt", "value": 2},
         }
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
-            input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
+            [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
+            input=json.dumps({"method": "ic/transform", "input": {"intents": [intent]}}),
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
-        query = json.loads(result.stdout)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["accepted"], response["results"])
+        query = response["queries"][0]
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
         self.assertEqual(db.execute(query["sql"], bindings).fetchall(), [("add", 3)])
 
