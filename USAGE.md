@@ -11,10 +11,10 @@ This is the current external service and Intent contract. Model-author and
 QueryAst boundaries are documented in [ONTOLOGY.md](ontology/docs/ONTOLOGY.md)
 and [QUERY.md](ontology/docs/QUERY.md). The domain `docs/DOMAIN.md` files
 describe business vocabulary; their `docs/INTENT.md` files point back to this
-shared syntax. `goals/` and evaluation results record earlier experiments,
-not current API contracts. The checked-in `telora/docs/` directory is also
-an older language-documentation snapshot; its source-module imports and CLI
-examples are not the syntax used by this repository's current Telora binary.
+shared syntax. `goals/`, the disabled `lab-plan.toml`, and evaluation results
+record earlier experiments, not current API contracts. Telora language and
+CLI documentation belongs to the Telora project, not a copied directory in
+this repository.
 
 ## 1. Build a snapshot
 

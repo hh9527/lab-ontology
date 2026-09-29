@@ -1,8 +1,8 @@
 # Telora 任务参考
 
-根据本次任务需要，阅读 `telora/docs/TELORA.md`、`telora/docs/TELORA-CLI.md`、
-`telora/docs/WORKSPACE.md` 和 `telora/docs/EXEC-MODE.md`，结合根目录
-`telora-config.json`、`telora-lock.json`，理解所需语言能力和命令。
+本文件属于已停用的旧 Labflow 计划。随 lab-ontology 保存的 `telora/docs/`
+副本已删除；若重新启用计划，应从当前 Telora 项目读取匹配版本的文档，
+再结合本仓 `telora-config.json`、`telora-lock.json` 理解语言能力和命令。
 阅读与必要学习属于正式任务的准备工作，不单独发布工件或提交会话资质。
 实际检查仅使用当前 artifact 在计划中显式授予的命令。
 
