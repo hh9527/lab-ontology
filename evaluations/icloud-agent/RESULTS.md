@@ -400,5 +400,7 @@ unioned result.
 The question did not supply concrete device or tenant identifiers. The Agent
 bound literal strings `DEV-XXX` and `TEN-XXX` and only then asked for the real
 values. The receipt therefore demonstrates a valid query *shape*, not a query
-ready to return the requested device data. No database was executed, and this
-run does not establish behavior for every ambiguous request.
+ready to return the requested device data. The missing identifiers are a gap
+in the evaluation question, not a failure of the two-path decomposition. No
+database was executed, and this run does not establish behavior for every
+ambiguous request.
