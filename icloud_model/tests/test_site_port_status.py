@@ -56,7 +56,7 @@ class SitePortStatusTest(unittest.TestCase):
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
         response = json.loads(result.stdout)
-        self.assertTrue(response["accepted"], response["results"])
+        self.assertTrue(response["accepted"], response["diagnostics"])
         query = response["queries"][0]
         self.assertIn("EXISTS", query["sql"])
         self.assertNotIn("JOIN X_SITE_VIEW", query["sql"].split("EXISTS", 1)[0])

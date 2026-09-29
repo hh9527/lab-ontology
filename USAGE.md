@@ -117,11 +117,14 @@ be wrapped in an array:
 {"method":"<domain>/transform","input":{"intents":[<Intent>, ...]}}
 ```
 
-The response has `accepted`, `results`, and `queries`. Each `results` entry
-has a zero-based `index`, `valid`, and `diagnostics`. All Intents are checked
-even if an earlier one fails. Only when every Intent succeeds does `queries`
-contain one Query per Intent in the same order; otherwise `queries` is null.
-This is a batch of independent plans, not a union into one result set.
+The response has `accepted`, `diagnostics`, and `queries`. Each diagnostic
+entry has a zero-based `index` identifying its Intent and a `diagnostic`
+containing severity, message, labels and notes. The array is empty when no
+Intent produces a warning or error. All Intents are checked even if an earlier
+one fails. Only when every Intent succeeds does `queries` contain one Query per
+Intent in the same order; otherwise `queries` is null. A successful batch may
+still have warnings; read them before using its Queries. This is a batch of
+independent plans, not a union into one result set.
 
 The caller resolves relative time before submitting an Intent. Reference time
 and timezone may come from the application client or the Agent's environment;

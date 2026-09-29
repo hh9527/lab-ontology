@@ -19,7 +19,7 @@ class SiteNameCountTest(unittest.TestCase):
             text=True, capture_output=True, cwd=MODEL, check=True,
         )
         response = json.loads(result.stdout)
-        self.assertTrue(response["accepted"], response["results"])
+        self.assertTrue(response["accepted"], response["diagnostics"])
         query = response["queries"][0]
         return query["sql"], {str(index): value for index, value in enumerate(query["bindings"], 1)}
 

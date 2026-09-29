@@ -40,7 +40,7 @@ class PeerDirectionTest(unittest.TestCase):
         if result.returncode:
             self.fail(f"peer intent lowering failed: {result.stdout} {result.stderr}")
         response = json.loads(result.stdout)
-        self.assertTrue(response["accepted"], response["results"])
+        self.assertTrue(response["accepted"], response["diagnostics"])
         query = response["queries"][0]
         bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
         return self.db.execute(query["sql"], bindings).fetchall()

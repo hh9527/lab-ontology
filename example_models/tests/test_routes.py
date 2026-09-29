@@ -33,7 +33,7 @@ class ExampleRoutesTest(unittest.TestCase):
                     "nodes": [{"id": node, "entity": entity}],
                     "edges": [], "select": [], "count": node,
                 }]})
-                self.assertTrue(response["accepted"], response["results"])
+                self.assertTrue(response["accepted"], response["diagnostics"])
                 query = response["queries"][0]
                 self.assertIn(f"FROM {table} AS {node}", query["sql"])
                 page = self.call(f"{domain}/index", {"limit": 1})["Index"]

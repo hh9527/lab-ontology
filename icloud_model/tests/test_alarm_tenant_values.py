@@ -50,7 +50,7 @@ class AlarmTenantValuesTest(unittest.TestCase):
                     text=True, capture_output=True, cwd=MODEL, check=True,
                 )
                 response = json.loads(result.stdout)
-                self.assertTrue(response["accepted"], response["results"])
+                self.assertTrue(response["accepted"], response["diagnostics"])
                 query = response["queries"][0]
                 bindings = {str(index): value for index, value in enumerate(query["bindings"], 1)}
                 self.assertEqual(db.execute(query["sql"], bindings).fetchone(), (expected,))

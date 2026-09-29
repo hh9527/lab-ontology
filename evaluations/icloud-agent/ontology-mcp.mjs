@@ -50,7 +50,7 @@ const tools = [
   },
   {
     name: 'transform',
-    description: 'Validate and store one to five independent Model-backed Intents; return a grouped receipt or per-Intent diagnostics.',
+    description: 'Validate and store one to five independent Model-backed Intents; return a grouped receipt and indexed diagnostics.',
     inputSchema: {
       type: 'object',
       properties: {
