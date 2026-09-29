@@ -34,11 +34,19 @@ Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
-the user's question. Before accepting the Intent as your answer, explain its
-business meaning back to yourself: who or what is counted or selected, which
-relationships, filters, time range and inclusions it uses, and what it leaves
-out. Compare that explanation with the user's words. Do not rename a different
-Model concept to make it appear to satisfy the request.
+the user's question. Each claimed result must be backed by an accepted Intent
+with that complete meaning; separate accepted Intents do not automatically
+combine into one result. If the Model or Intent language cannot express the
+requested result, stop and explain the unsupported business outcome rather
+than presenting a partial or approximate Intent as complete. Repeated
+diagnostics for the same missing capability are a reason to report that limit,
+not to keep changing the user's meaning. Explain the limit using the evidence:
+distinguish missing Model knowledge from an unsupported combination of known
+paths, without inventing missing facts. Before accepting the Intent as your
+answer, explain its business meaning back to yourself: who or what is counted
+or selected, which relationships, filters, time range and inclusions it uses,
+and what it leaves out. Compare that explanation with the user's words. Do not
+rename a different Model concept to make it appear to satisfy the request.
 
 When one reasonable interpretation is supported, submit its Intent and tell
 the user in ordinary business language what the accepted Intent means. Make

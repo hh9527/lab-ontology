@@ -345,3 +345,36 @@ exited successfully. No SQL was executed against a database.
 一致。07 的默认口径仍偏离“少于 5 台”通常包含 0 台的理解，但遗漏已明说，
 可由用户纠正。新的时间契约消除了旧版 09 的相对边界/解释不一致，尚不能
 证明 Agent 总能选对业务时间口径。
+
+## Generic capability-stop prompt, question 05
+
+After the nine-question rerun, only the generic Agent workflow was changed.
+It now requires an accepted Intent for each complete claimed result, forbids
+treating separate receipts as an implicit combined result, and asks the Agent
+to stop when the full meaning cannot be expressed. A second generic sentence
+asks it to distinguish missing Model knowledge from unsupported composition of
+known paths. Neither guide mentions question 05, A/Z roles, or `UNION`.
+
+Both comparison runs used the same snapshot SHA-256
+`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`,
+model `deepseek/deepseek-flash`, question 05, host-owned receipt adapter, and
+fresh OpenCode sessions. The first candidate guide SHA-256 was
+`de8435cd215d75f0d4243cbf0291a39d367c122bfe91d3f1f5164e8a2e52a89a`;
+the second was
+`40f073556323bb7c1c733d0b5bd47ed1a4b205c441e6fe107d3cceabad84bd7d`.
+As in the previous rerun, these work directories were not newly proven to be
+filesystem/PID-isolated. Transcript durations are observed wall time, not a
+controlled latency benchmark.
+
+| Guide | transform calls | Transcript duration | Final behavior |
+| --- | ---: | ---: | --- |
+| Previous nine-question guide | 36 | ~9m 13s | Claimed two receipts plus a false single-Intent equivalent; the latter used `AND` across the two endpoint filters. |
+| Complete-result/stop rule | 9 | ~2m 21s | Stopped without claiming a complete Intent. It incorrectly attributed the limit partly to absent Model knowledge and suggested adding a flow field. |
+| Stop rule plus evidence-based attribution | 11 | ~2m 30s | Stopped without a complete-result claim and identified unsupported composition of known paths as the principal limit. |
+
+The second candidate still emphasized the conflict between the conventional
+directed meaning of "downstream" and the user's explicit reverse-end inclusion.
+It did not present a partial query as the requested result. This is a clear
+improvement in this one case, not proof that the rule will generalize or that
+prompting can replace the missing Intent set-operation capability. No database
+query was executed.

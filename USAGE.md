@@ -90,11 +90,19 @@ Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
-the user's question. If the request or available knowledge leaves a choice that
-would change the answer, clarify the business meaning with the user in business
-terms before presenting a query as the answer. A legal query for one possible
-reading is only exploratory; do not rename a different Model concept to make it
-appear to satisfy the original wording. SQL and bindings are intermediate output
+the user's question. Each claimed result must be backed by an accepted Intent
+with that complete meaning; separate accepted Intents do not automatically
+combine into one result. If the Model or Intent language cannot express the
+requested result, stop and explain the unsupported business outcome rather
+than presenting a partial or approximate Intent as complete. Repeated
+diagnostics for the same missing capability are a reason to report that limit,
+not to keep changing the user's meaning. Explain the limit using the evidence:
+distinguish missing Model knowledge from an unsupported combination of known
+paths, without inventing missing facts. If the request or available knowledge
+leaves a choice that would change the answer, clarify the business meaning in
+business terms before presenting a query as the answer. A legal query for one
+possible reading is only exploratory; do not rename a different Model concept
+to make it appear to satisfy the original wording. SQL and bindings are intermediate output
 for an authorized execution layer, not the basis for clarification or the final
 user-facing result.
 
