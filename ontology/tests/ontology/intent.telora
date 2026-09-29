@@ -260,9 +260,62 @@ pub def batch_collects_multiple_failures_without_partial_queries: test::Test = t
         && array::length(reports) == 2
         && batch_field(reports[0], "index") == Value::Int(1)
         && batch_field(reports[1], "index") == Value::Int(3)
-        && string::contains(json::stringify(batch_field(reports[0], "diagnostic")), "unknown")
-        && string::contains(json::stringify(batch_field(reports[1], "diagnostic")), "unknown named relation") { True }
+        && string::contains(json::stringify(batch_field(reports[0], "diagnostic")), "missing_entity")
+        && string::contains(json::stringify(batch_field(reports[1], "diagnostic")), "missing_relation") { True }
     else { fail!("batch did not retain both indexed diagnostics", result) }
+});
+
+pub def batch_diagnostics_name_offending_ids: test::Test = test::should_ok(fn() {
+    let result = query_request_method_factory(payload, "analyst", sqlite::build_query)(json::parse(r#"{
+        "intents":[
+            {"root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],"select":[]},
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[{"node":"a","dimension":"MissingDimension"}]},
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[],"measures":[{"node":"a","measure":"MissingMeasure"}]}
+        ]
+    }"#).unwrap!());
+    let reports = match batch_field(result, "diagnostics") {
+        Value::Array(items) => items,
+        other => fail!("failed batch omitted diagnostics", other),
+    };
+    if batch_field(result, "accepted") == Value::False
+        && array::length(reports) == 3
+        && string::contains(json::stringify(batch_field(reports[0], "diagnostic")), "intent field is missing: op")
+        && string::contains(json::stringify(batch_field(reports[1], "diagnostic")), "MissingDimension")
+        && string::contains(json::stringify(batch_field(reports[2], "diagnostic")), "MissingMeasure") {
+        True
+    } else { fail!("diagnostics omitted the IDs needed to repair each intent", result) }
+});
+
+pub def batch_parser_diagnostics_offer_local_repairs: test::Test = test::should_ok(fn() {
+    let result = query_request_method_factory(payload, "analyst", sqlite::build_query)(json::parse(r#"{
+        "intents":[
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[],"count":"a","bogus_key":true},
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[],"count":"a","filters":[{"node":"a","dimension":"OrderRegion","op":"eq","value":"east","foo":1}]},
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[{"node":"a"}]},
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[],"count":"a","filters":[{"node":"a","dimension":"OrderRegion","op":"Eq","value":"east"}]},
+            {"op":"graph","root":"a","nodes":[{"id":"a","entity":"orders"}],"edges":[],
+             "select":[],"count":"a","filters":[{"node":"a","dimension":"OrderRegion","op":"eq","kind":"weird","value":"east"}]}
+        ]
+    }"#).unwrap!());
+    let reports = match batch_field(result, "diagnostics") {
+        Value::Array(items) => items,
+        other => fail!("parser batch omitted diagnostics", other),
+    };
+    if batch_field(result, "accepted") == Value::False
+        && array::length(reports) == 5
+        && string::contains(json::stringify(batch_field(reports[0], "diagnostic")), "unsupported key bogus_key in request; allowed keys: op, root")
+        && string::contains(json::stringify(batch_field(reports[1], "diagnostic")), "unsupported key foo in filter; allowed keys: node, dimension, op, kind, value")
+        && string::contains(json::stringify(batch_field(reports[2], "diagnostic")), "intent field is missing: select[0].dimension; allowed keys: node, dimension")
+        && string::contains(json::stringify(batch_field(reports[3], "diagnostic")), "unsupported filter operator Eq; allowed: eq, ne")
+        && string::contains(json::stringify(batch_field(reports[4], "diagnostic")), "unsupported filter value kind weird; allowed: text, int") {
+        True
+    } else { fail!("parser diagnostics did not name local fixes", result) }
 });
 
 pub def batch_rejects_empty_and_over_limit: test::Test = test::should_ok(fn() {
@@ -304,7 +357,7 @@ pub def legacy_op_is_rejected: test::Test = test::should_fail_with(fn() {
     query_intent_ast_factory(payload, "analyst")(json::parse(r#"{
         "op":"list", "measures":[], "dimensions":["ComponentId"], "filters":[]
     }"#).unwrap!())
-}, "unsupported intent op; use graph, graph_pair or graph_union with named nodes and relations");
+}, "unsupported intent op list; use graph, graph_pair or graph_union with named nodes and relations");
 
 pub def graph_union_uses_one_query_and_shared_bindings: test::Test = test::should_ok(fn() {
     let ast = query_intent_ast_factory(payload, "analyst")(json::parse(r#"{
@@ -353,7 +406,7 @@ pub def graph_union_rejects_mismatched_result_shape: test::Test = test::should_f
                 "select":[{"node":"b","dimension":"OrderId"}]}}
         ]
     }"#).unwrap!())
-}, "graph union branch must select the same result dimensions in the same order as branch 1");
+}, "graph union branch 2 must select the same result dimensions in the same order as branch 1");
 
 pub def graph_union_accepts_three_branches_in_both_dialects: test::Test = test::should_ok(fn() {
     let ast = query_intent_ast_factory(payload, "analyst")(json::parse(r#"{
@@ -405,7 +458,7 @@ pub def graph_union_diagnoses_third_branch_shape: test::Test = test::should_fail
                 "select":[{"node":"c","dimension":"OrderId"},{"node":"c","dimension":"OrderRegion"}]}}
         ]
     }"#).unwrap!())
-}, "graph union branch must select the same result dimensions in the same order as branch 1");
+}, "graph union branch 3 must select the same result dimensions in the same order as branch 1");
 
 pub def graph_union_does_not_bypass_branch_relation_validation: test::Test = test::should_fail_with(fn() {
     query_intent_ast_factory(payload, "analyst")(json::parse(r#"{

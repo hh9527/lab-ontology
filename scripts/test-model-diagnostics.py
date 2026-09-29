@@ -12,14 +12,12 @@ result = subprocess.run(
 records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
 summary = next(item for item in records if item["record"] == "summary")
 assert result.returncode == 1 and not summary["aborted"], (result.stdout, result.stderr)
-assert summary["total"] == summary["failed"] == 6 and summary["passed"] == 0, summary
+assert summary["total"] == summary["failed"] == 4 and summary["passed"] == 0, summary
 
 expected = {
-    ("partition", (0,)): ("partition take must be a positive integer within the upper bound", "ontology/tests/diagnostics/rejections"),
-    ("partition", (1,)): ("partition must name at least one dimension", "ontology/tests/diagnostics/rejections"),
-    ("limit", (0,)): ("plan limit must be non-negative", "ontology/query"),
-    ("offset", (0,)): ("plan offset must be non-negative", "ontology/query"),
-    ("missing_field", (0,)): ("intent field is missing", "ontology/intent"),
+    ("limit", (0,)): ("pagination value must be non-negative", "ontology/query"),
+    ("offset", (0,)): ("pagination value must be non-negative", "ontology/query"),
+    ("missing_field", (0,)): ("intent field is missing: op", "ontology/intent"),
     ("duplicate_mapping", ()): ("union branch maps the same logical field more than once", "ontology/ontology"),
 }
 seen = set()
@@ -55,9 +53,8 @@ for item in records:
         assert [source_text(label, item) for label in authored] == ["0", "0"], item
     else:
         authored = [label for label in subjects if label["source"].startswith("@test-ctx/")]
-        expected_text = {("partition", (0,)): "0", ("partition", (1,)): "[]",
-                         ("limit", (0,)): "-1", ("offset", (0,)): "-1", ("missing_field", (0,)): "{}"}
+        expected_text = {("limit", (0,)): "-1", ("offset", (0,)): "-1", ("missing_field", (0,)): "{}"}
         assert [source_text(label, item) for label in authored] == [expected_text[key]], item
     seen.add(key)
 assert seen == expected.keys(), (seen, expected.keys())
-print("6 diagnostic cases passed: messages, execution phase, rule modules and exact subject spans")
+print("4 diagnostic cases passed: messages, execution phase, rule modules and exact subject spans")

@@ -5,6 +5,7 @@ use std::array as array;
 use std::codec as codec;
 use std::diagnostics as diagnostics;
 use std::dict as dict;
+use std::string as string;
 use std::value::{ Value };
 
 def as_object: Fn(Value) -> Dict(Value) = fn(value) {
@@ -28,10 +29,18 @@ def as_string: Fn(Value) -> String = fn(value) {
     }
 };
 
+# fail! subjects retain provenance, but actionable IDs must also appear in its message.
 def field: Fn(Dict(Value), String) -> Value = fn(obj, key) {
     match dict::get(obj, key) {
         Some(value) => value,
-        None => fail!("intent field is missing", obj, key),
+        None => fail!(`intent field is missing: \{key}`, obj, key),
+    }
+};
+
+def field_at: Fn(Dict(Value), String, String, Array(String)) -> Value = fn(obj, key, path, allowed) {
+    match dict::get(obj, key) {
+        Some(value) => value,
+        None => fail!(`intent field is missing: \{path}.\{key}; allowed keys: \{string::join(allowed, ", ")}`, obj, key),
     }
 };
 
@@ -47,7 +56,7 @@ def graph_keys: Fn(Dict(Value), String, Array(String)) -> () = fn(obj, context, 
     match array::find(dict::keys(obj), fn(key) {
         !array::any(allowed, fn(ok) { ok == key })
     }) {
-        Some(key) => fail!("graph intent contains unsupported key", context, key),
+        Some(key) => fail!(`graph intent contains unsupported key \{key} in \{context}; allowed keys: \{string::join(allowed, ", ")}`, context, key),
         None => (),
     }
 };
@@ -64,7 +73,7 @@ def parse_op: Fn(String) -> edsl::FilterOp = fn(op) {
         "not_contains" => edsl::FilterOp::NotContains,
         "starts_with" => edsl::FilterOp::StartsWith,
         "ends_with" => edsl::FilterOp::EndsWith,
-        _ => fail!("unsupported filter operator", op),
+        _ => fail!(`unsupported filter operator \{op}; allowed: eq, ne, gt, ge, lt, le, contains, not_contains, starts_with, ends_with`, op),
     }
 };
 
@@ -108,7 +117,7 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
             Value::String(text) => edsl::FilterInput::LocalDateTime(text),
             _ => fail!("LocalDateTime filter requires a string representation", value),
         },
-        _ => fail!("unsupported filter value kind", kind),
+        _ => fail!(`unsupported filter value kind \{kind}; allowed: text, int, number, bool, rfc3339, epoch_millis, date, utc_second, local_datetime`, kind),
     }
 };
 
@@ -128,13 +137,13 @@ def inferred_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::Fi
                 _ => False,
             }
         });
-        if array::length(candidates) == 0 { fail!("value does not match dimension input type", dimension, detail.input_kinds, value) }
+        if array::length(candidates) == 0 { fail!(`value does not match dimension \{dimension} input type; inspect its declared input kinds`, dimension, detail.input_kinds, value) }
         else {
             let chosen = if array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Int })
                 && array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Number })
                 && array::length(candidates) == 2 { edsl::FilterInputKind::Int }
                 else if array::length(candidates) == 1 { candidates[0] }
-                else { fail!("dimension input type is ambiguous for this value", dimension, candidates, value) };
+                else { fail!(`dimension \{dimension} input type is ambiguous for this value; specify kind explicitly`, dimension, candidates, value) };
             match chosen {
                 edsl::FilterInputKind::Text => parse_input("text", value),
                 edsl::FilterInputKind::Int => parse_input("int", value),
@@ -302,12 +311,13 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Val
             nodes: array::map(as_array(field(obj, "nodes")), parse_graph_node),
             edges: array::map(as_array(field(obj, "edges")), parse_graph_edge),
             constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-            select: array::map(as_array(field(obj, "select")), fn(value) {
-                let selection = as_object(value);
-                graph_keys(selection, "projection", ["node", "dimension"]);
+            select: array::map(array::enumerate(as_array(field(obj, "select"))), fn(entry) {
+                let selection = as_object(entry.1);
+                let path = `select[\{entry.0}]`;
+                graph_keys(selection, path, ["node", "dimension"]);
                 let result: edsl::GraphSelect = {
-                    node: as_string(field(selection, "node")),
-                    dimension: as_string(field(selection, "dimension")),
+                    node: as_string(field_at(selection, "node", path, ["node", "dimension"])),
+                    dimension: as_string(field_at(selection, "dimension", path, ["node", "dimension"])),
                 };
                 result
             }),
@@ -541,9 +551,9 @@ def lower_graph_union: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::Que
                     let branch = lower_union_branch(qb::independent_query_scope(state.0),
                         payload, subject, entry.1, entry.0 + 1);
                     if branch.1 != state.1 {
-                        fail!("graph union branch must return the same result entity as branch 1", entry.0 + 1, state.1, branch.1)
+                        fail!(`graph union branch \{entry.0 + 1} must return the same result entity as branch 1: expected \{state.1}, got \{branch.1}`, entry.0 + 1, state.1, branch.1)
                     } else if branch.2 != state.2 {
-                        fail!("graph union branch must select the same result dimensions in the same order as branch 1", entry.0 + 1, state.2, branch.2)
+                        fail!(`graph union branch \{entry.0 + 1} must select the same result dimensions in the same order as branch 1`, entry.0 + 1, state.2, branch.2)
                     } else { (branch.0, state.1, state.2, array::push(state.3, branch.3)) }
                 }
             });
@@ -565,7 +575,7 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst =
         qb::finish(lowered.0, qb::validate_query_plan(plan))
     } else if op == "graph_pair" { lower_graph_pair(payload, subject, obj) }
     else if op == "graph_union" { lower_graph_union(payload, subject, obj) }
-    else { fail!("unsupported intent op; use graph, graph_pair or graph_union with named nodes and relations", op) }
+    else { fail!(`unsupported intent op \{op}; use graph, graph_pair or graph_union with named nodes and relations`, op) }
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
@@ -598,12 +608,12 @@ def query_request_method_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> 
         fn(request) {
             let obj = as_object(request);
             match array::find(dict::keys(obj), fn(key) { key != "intents" }) {
-                Some(key) => fail!("query request contains unsupported key", key),
+                Some(key) => fail!(`query request contains unsupported key \{key}`, key),
                 None => (),
             };
             let intents = as_array(field(obj, "intents"));
             if array::length(intents) < 1 || array::length(intents) > 5 {
-                fail!("query request requires one to five independent intents", array::length(intents))
+                fail!(`query request requires one to five independent intents; got \{array::length(intents)}`, array::length(intents))
             } else {
                 let assessed: Array(BatchEvaluation) = array::map(array::enumerate(intents), fn(entry) {
                     let observed = diagnostics::with_diagnostics(fn(intent: Value) {
