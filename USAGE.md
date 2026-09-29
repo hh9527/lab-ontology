@@ -176,6 +176,16 @@ Optional top-level graph fields and their shapes:
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"asc|desc","take":<integer>}` |
 
+For aggregate Top-N, `select` names the visible dimensions and `measures`
+names the aggregate being ranked. With no `group_by_identity`, Top-N ranks
+groups of equal projected dimension values, provided the joined graph cannot
+multiply the measure's source rows. A declared `group_by_identity` instead
+keeps separate groups for the named entities: two entities with the same
+visible dimension value may occupy separate rows. If hidden identity keys can
+split visible groups, the transform reports a warning. Use identity grouping
+only when the business question is about individual entities, not dimension
+values such as types or categories.
+
 Time windows are `[start, end)` with concrete values in the dimension's declared
 logical type. `end:null` or an omitted `end` means `[start, None)`: no upper
 time predicate. It does not mean `now`; future-dated rows may match. Resolve

@@ -4409,28 +4409,43 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
     }
 };
 
-def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphTopMeasure) -> (qb::BuildCtx, Array(qb::OrderBy), qb::Expr) =
-    fn(ctx, payload, request, instances, spec) {
+def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), Array(qb::Expr), GraphTopMeasure) -> (qb::BuildCtx, Array(qb::OrderBy), qb::Expr) =
+    fn(ctx, payload, request, instances, visible_grouping, spec) {
+        let identity_keys = array::fold(request.group_by_identity, [], fn(keys, id) {
+            let instance = graph_instance(instances, id);
+            let entity = get_index(payload.entities, instance.entity);
+            array::concat([keys, array::map(graph_identity_columns(entity, id), fn(column) {
+                qb::column(instance.source, column)
+            })])
+        });
+        # A dimension group is rankable only when appended identity keys cannot
+        # refine its visible GROUP BY and joins preserve each measure source row.
+        let unsplit_group = array::length(visible_grouping) > 0
+            && array::all(identity_keys, fn(key) {
+                array::any(visible_grouping, fn(group) { group == key })
+            });
+        let dimension_group = unsplit_group
+            && graph_count_subject_grain(payload, request, spec.node).0;
+        # Root dimensions are functionally determined by a complete root identity.
+        let identity_group = request.group_by_identity == [request.root]
+            && array::all(request.select, fn(item) { item.node == request.root });
+        let contextual_group = graph_contextual_measure_grain(payload, request, spec.node);
         if !array::any(request.measures, fn(item) { item.node == spec.node && item.measure == spec.measure }) {
             fail!("graph aggregate top must reference a projected measure on its named node", spec.node, spec.measure)
-        } else if !(request.group_by_identity == [request.root]
-            && array::all(request.select, fn(item) { item.node == request.root }))
-            && !graph_contextual_measure_grain(payload, request, spec.node) {
-            fail!("graph aggregate top requires complete root identity with root-only dimensions, or proven context and owner identities for a contextual measure", request.root, spec.node)
+        } else if !dimension_group && !identity_group && !contextual_group {
+            fail!("graph aggregate top requires a visible dimension group not split by hidden identity keys and a grain-safe measure source, or a proven identity/contextual measure group", request.root, spec.node)
         } else if spec.take <= 0 || spec.take > qb::max_partition_take {
             fail!("graph aggregate top take must be positive and within the declared bound", spec.take)
         } else {
+            let notice: Option(Int) = if !unsplit_group && array::length(visible_grouping) > 0 {
+                warn!("graph aggregate top ranks identity groups, not the projected dimension groups; hidden identity keys may split the visible groups. Remove group_by_identity to rank dimension values when the measure source is grain-safe")
+            } else { None };
             let alias = `\{spec.node}_\{spec.measure}`;
             let ranked = if spec.direction == qb::Ordering::Desc {
                 qb::desc_aggregate(alias)
             } else { qb::asc_aggregate(alias) };
-            let ordering = array::fold(request.group_by_identity, [ranked], fn(ordered, id) {
-                let instance = graph_instance(instances, id);
-                let entity = get_index(payload.entities, instance.entity);
-                array::concat([ordered, array::map(graph_identity_columns(entity, id), fn(column) {
-                    qb::asc(qb::column(instance.source, column))
-                })])
-            });
+            let ordering = array::concat([[ranked], array::map(
+                if dimension_group { visible_grouping } else { identity_keys }, qb::asc)]);
             let limit = qb::take_bound(ctx, spec.take);
             (limit.0, ordering, limit.1)
         }
@@ -4885,7 +4900,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 else { request.any_of });
             let top = match request.top_by_measure {
                 Some(spec) => do {
-                    let ranked = graph_top_by_measure(alternatives.0, payload, request, built.1, spec);
+                    let ranked = graph_top_by_measure(alternatives.0, payload, request, built.1, visible_grouping, spec);
                     (ranked.0, ranked.1, Some(ranked.2))
                 },
                 None => (alternatives.0, [], None),

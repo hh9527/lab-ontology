@@ -5,6 +5,7 @@ use ontology::postgres as postgres;
 use ontology::query as qb;
 use ontology::ontology as edsl;
 use std::array as array;
+use std::diagnostics as diagnostics;
 use std::json as json;
 use std::string as string;
 use std::test as test;
@@ -1784,16 +1785,107 @@ pub def frame_context_threshold_rejects_multiplying_site_branch: test::Test = te
         "measure_having":[{"node":"sample","measure":"cpu_usage","op":"gt","kind":"number","value":80.0}]}"#).unwrap!())
 }, "graph measure threshold requires complete root identity with root-only dimensions, or proven context and owner identities");
 
-pub def aggregate_top_requires_owner_identity: test::Test = test::should_fail_with(fn() {
-    lower(json::parse(r#"{
+pub def dimension_group_top_accepts_grain_safe_sample_measure: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
         "op":"graph", "root":"device",
         "nodes":[{"id":"device","entity":"device"},{"id":"sample","entity":"device_kpi"}],
         "edges":[{"relation":"device_kpi_of_device","from":"sample","to":"device"}],
         "select":[{"node":"device","dimension":"device_name"}],
         "measures":[{"node":"sample","measure":"cpu_usage"}],
         "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":5}
-    }"#).unwrap!())
-}, "graph aggregate top requires complete root identity");
+    }"#).unwrap!());
+    if string::contains(query.sql, "GROUP BY device.name")
+        && !string::contains(query.sql, "GROUP BY device.name, device.id")
+        && string::contains(query.sql, "ORDER BY avg(sample.cpuUsage) DESC, device.name ASC LIMIT") { True }
+    else { fail!("sample average Top-N must rank visible name groups without device identity", query) }
+});
+
+pub def dimension_group_top_joins_alarm_measure_to_device_class: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"alarm",
+        "nodes":[{"id":"alarm","entity":"current_alarm"},{"id":"device","entity":"device"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
+        "select":[{"node":"device","dimension":"device_class"}],
+        "measures":[{"node":"alarm","measure":"alarm_count"}],
+        "top_by_measure":{"node":"alarm","measure":"alarm_count","direction":"desc","take":3}}"#).unwrap!();
+    let ast = query_intent_ast_factory(payload, "public")(intent);
+    let one_group = match ast.plan {
+        qb::QueryPlan::Rows(plan) => array::length(plan.grouping) == 1,
+        _ => False,
+    };
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if one_group && string::contains(sq.sql, "GROUP BY CASE WHEN")
+        && string::contains(sq.sql, "ORDER BY count(alarm.CSN) DESC")
+        && !string::contains(sq.sql, "alarm.CSN ASC")
+        && !string::contains(pg.sql, "\"alarm\".\"CSN\" ASC")
+        && sq.bindings == pg.bindings { True }
+    else { fail!("alarm count Top-N must rank device-class groups in both dialects", sq, pg) }
+});
+
+pub def dimension_group_top_accepts_alarm_severity_without_identity: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"alarm",
+        "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],
+        "select":[{"node":"alarm","dimension":"alarm_severity"}],
+        "measures":[{"node":"alarm","measure":"alarm_count"}],
+        "top_by_measure":{"node":"alarm","measure":"alarm_count","direction":"desc","take":3}}"#).unwrap!();
+    let ast = query_intent_ast_factory(payload, "public")(intent);
+    let one_group = match ast.plan {
+        qb::QueryPlan::Rows(plan) => array::length(plan.grouping) == 1,
+        _ => False,
+    };
+    let query = sqlite::build_query(ast);
+    if one_group && string::contains(query.sql, "ORDER BY count(alarm.CSN) DESC")
+        && !string::contains(query.sql, "alarm.CSN ASC") { True }
+    else { fail!("alarm severity Top-N must aggregate by severity alone", query) }
+});
+
+pub def dimension_group_top_warns_when_identity_splits_visible_group: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"alarm",
+        "nodes":[{"id":"alarm","entity":"current_alarm"}],"edges":[],
+        "select":[{"node":"alarm","dimension":"alarm_severity"}],
+        "measures":[{"node":"alarm","measure":"alarm_count"}],
+        "group_by_identity":["alarm"],
+        "top_by_measure":{"node":"alarm","measure":"alarm_count","direction":"desc","take":3}}"#).unwrap!();
+    match diagnostics::with_diagnostics(lower)(intent) {
+        Err(reports) => fail!("identity Top-N should remain valid with a grain warning", reports),
+        Ok((query, reports)) => if string::contains(query.sql, "alarm.CSN")
+            && array::any(reports, fn(report) {
+                report.severity == diagnostics::Severity::Warning
+                    && string::contains(report.message, "identity groups, not the projected dimension groups")
+            }) { True }
+        else { fail!("hidden identity split must be visible in diagnostics", query, reports) },
+    }
+});
+
+pub def dimension_group_top_warns_for_joined_device_identity: test::Test = test::should_ok(fn() {
+    let intent = json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"alarm","entity":"current_alarm"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"}],
+        "select":[{"node":"device","dimension":"device_class"}],
+        "measures":[{"node":"alarm","measure":"alarm_count"}],
+        "group_by_identity":["device"],
+        "top_by_measure":{"node":"alarm","measure":"alarm_count","direction":"desc","take":3}}"#).unwrap!();
+    match diagnostics::with_diagnostics(lower)(intent) {
+        Err(reports) => fail!("per-device Top-N should remain valid", reports),
+        Ok((query, reports)) => if string::contains(query.sql, "device.id")
+            && array::any(reports, fn(report) {
+                report.severity == diagnostics::Severity::Warning
+                    && string::contains(report.message, "identity groups, not the projected dimension groups")
+            }) { True }
+        else { fail!("per-device ranking must not masquerade as device-class ranking", query, reports) },
+    }
+});
+
+pub def dimension_group_top_rejects_multiplying_measure_source: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"graph","root":"device",
+        "nodes":[{"id":"device","entity":"device"},{"id":"alarm","entity":"current_alarm"},
+                 {"id":"sample","entity":"device_kpi"}],
+        "edges":[{"relation":"device_current_alarm","from":"alarm","to":"device"},
+                 {"relation":"device_kpi_of_device","from":"sample","to":"device"}],
+        "select":[{"node":"device","dimension":"device_class"}],
+        "measures":[{"node":"alarm","measure":"alarm_count"}],
+        "top_by_measure":{"node":"alarm","measure":"alarm_count","direction":"desc","take":3}}"#).unwrap!())
+}, "graph measure source may be multiplied by a joined relation");
 
 pub def aggregate_top_rejects_unprojected_measure: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
@@ -1816,7 +1908,7 @@ pub def aggregate_top_rejects_sample_dimension_projection: test::Test = test::sh
         "group_by_identity":["device"],
         "top_by_measure":{"node":"sample","measure":"cpu_usage","direction":"desc","take":5}
     }"#).unwrap!())
-}, "graph aggregate top requires complete root identity");
+}, "graph aggregate top requires a visible dimension group not split by hidden identity keys");
 
 pub def aggregate_top_rejects_unbounded_take: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
