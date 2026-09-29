@@ -67,7 +67,7 @@ type DimensionNote = struct { id: String, label: String, summary: String };
 type DimensionDescriptions = struct { notes: Array(DimensionNote) };
 
 type LocalizedKnowledgeText = struct { locale: String, label: String, summary: String };
-type KnowledgeKind = enum { Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
+type KnowledgeKind = enum { Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
 type KnowledgeTarget = struct { kind: KnowledgeKind, owner: String, id: String };
 type KnowledgeDoc = struct { target: KnowledgeTarget, text: String };
 type KnowledgeRelation = struct { source: KnowledgeTarget, target: KnowledgeTarget };
@@ -2066,6 +2066,27 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
 };
 
 def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope) {
+    let wire_shape = fn(kind: FilterInputKind) {
+        match kind {
+            FilterInputKind::Text => 1,
+            FilterInputKind::Rfc3339 => 1,
+            FilterInputKind::Date => 1,
+            FilterInputKind::UtcSecond => 1,
+            FilterInputKind::LocalDateTime => 1,
+            FilterInputKind::Int => 2,
+            FilterInputKind::EpochMillis => 2,
+            FilterInputKind::Number => 3,
+            FilterInputKind::Bool => 4,
+        }
+    };
+    if let Some(ambiguous) = array::find(array::enumerate(input_kinds), fn(item) {
+        array::any(array::enumerate(input_kinds), fn(other) {
+            other.0 > item.0 && (wire_shape(item.1) == wire_shape(other.1)
+                || (item.1 == FilterInputKind::Number && other.1 == FilterInputKind::EpochMillis)
+                || (item.1 == FilterInputKind::EpochMillis && other.1 == FilterInputKind::Number))
+        })
+    }) { fail!(`dimension \{id} declares indistinguishable input types; one JSON value must resolve to one logical type`, id, ambiguous) }
+    else { () };
     let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope };
     result
 };
@@ -2349,6 +2370,7 @@ def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Arra
 
 def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn(payload, target) {
     match target.kind {
+        KnowledgeKind::Schema => False,
         KnowledgeKind::Dataset => target.owner == "" && array::any(payload.entities, fn(e) { e.id == target.id }),
         KnowledgeKind::Field => array::any(payload.entities, fn(e) {
             e.id == target.owner && array::any(e.fields, fn(field) {
@@ -2988,7 +3010,7 @@ def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(k
         FilterInput::UtcSecond(_) => FilterInputKind::UtcSecond,
         FilterInput::LocalDateTime(_) => FilterInputKind::LocalDateTime,
     };
-    array::any(kinds, fn(k) { k == kind })
+    array::any(kinds, fn(k) { k == kind || (k == FilterInputKind::Number && kind == FilterInputKind::Int) })
 };
 
 def calendar_components: Fn(Int, Int, Int) -> Bool = fn(year, month, day) {
@@ -3120,10 +3142,7 @@ def canonical_compare_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, F
     } else {
         let matched = match array::find(entry.canonical_values, fn(v) { v.id == id }) {
             Some(value) => value,
-            None => do {
-                let valid_ids = string::join(array::map(entry.canonical_values, fn(value) { value.id }), ", ");
-                fail!(`unknown canonical value for dimension \{entry.id}: \{id}; valid IDs: \{valid_ids}; see doc topic \{entry.id}`, entry.id, input)
-            },
+            None => fail!(`unknown canonical value \{id} for dimension \{entry.id}; see info topic \{entry.id}`, entry.id, input),
         };
         let scalar = if op == FilterOp::Eq { qb::ScalarFunction::Eq } else { qb::ScalarFunction::Ne };
         let wires = array::fold(matched.wires, (ctx, None), fn(state, wire) {
@@ -3197,13 +3216,13 @@ def filter_value_on_base_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr
             } else if array::any(entry.values, fn(v) { v.value == s }) {
                 let bound = qb::bind(ctx, qb::Val::String(s));
                 (bound.0, qb::scalar(qb::ScalarFunction::Eq, [base, bound.1]))
-            } else { fail!("unknown enum value for dimension", entry.id, s) },
-            _ => fail!("invalid enum filter value for dimension", entry.id, input),
+            } else { fail!(`unknown enum value \{s} for dimension \{entry.id}; see info topic \{entry.id}`, entry.id, s) },
+            _ => fail!(`invalid enum filter value for dimension \{entry.id}; see info topic \{entry.id}`, entry.id, input),
         }
     } else if is_text_op(op) && match input { FilterInput::Text(_) => False, _ => True } {
         fail!("text filter operation requires a text input value", entry.id)
     } else if !filter_input_allowed(entry.input_kinds, input) {
-        fail!("invalid filter value for dimension", entry.id)
+        fail!(`invalid filter value for dimension \{entry.id}; see info topic \{entry.id}`, entry.id)
     } else {
         let bound = qb::bind(ctx, to_val(input));
         open_condition_with_context(bound.0, base, op, bound.1)
@@ -3243,13 +3262,13 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
                         } else if array::any(entry.values, fn(v) { v.value == s }) {
                             let bound = qb::bind(computed.0, qb::Val::String(s));
                             (bound.0, qb::scalar(qb::ScalarFunction::Eq, [base, bound.1]))
-                        } else { fail!("unknown enum value for dimension", req.subject, req.id, s) },
-                        _ => fail!("invalid enum filter value for dimension", req.subject, req.id, req.input),
+                        } else { fail!(`unknown enum value \{s} for dimension \{req.id}; see info topic \{req.id}`, req.subject, req.id, s) },
+                        _ => fail!(`invalid enum filter value for dimension \{req.id}; see info topic \{req.id}`, req.subject, req.id, req.input),
                     }
                 } else if is_text_op(req.op) && match req.input { FilterInput::Text(_) => False, _ => True } {
                     fail!("text filter operation requires a text input value", req.subject, req.id)
                 } else if !filter_input_allowed(entry.input_kinds, req.input) {
-                    fail!("invalid filter value for dimension", req.subject, req.id)
+                    fail!(`invalid filter value for dimension \{req.id}; see info topic \{req.id}`, req.subject, req.id)
                 } else {
                     let bound = qb::bind(computed.0, to_val(req.input));
                     open_condition_with_context(bound.0, base, req.op, bound.1)

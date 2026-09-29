@@ -44,6 +44,41 @@ def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(Knowle
             dimension: None, measure: None, relation: None, metric: None, direction: None, guard: None}
     };
 
+def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
+    target(edsl::KnowledgeKind::Schema, "", `syntax/\{id}`)
+};
+
+def syntax_points: Array(Point) = [
+    point(syntax_target("intent"), "Intent syntax", [],
+        "Submit {intents:[...]} with one to five independent intents. Each intent has op graph, graph_pair or graph_union. Values in filters are interpreted by their declared dimension or measure; do not supply an input kind.",
+        [member(syntax_target("graph")), member(syntax_target("graph_pair")), member(syntax_target("graph_union"))]),
+    point(syntax_target("graph"), "Graph intent", [],
+        "Required: op=graph, root node id, nodes, edges, select. Optional: row_grain=root|association, distinct, constraints, measures, measure_having, filters, time_windows, any_of, exists, count, count_value, count_having, count_groups, include_empty, group_by_identity, top_per, top_by_measure, order_by, take. A graph must project dimensions/measures or count an explicit subject. Entity, dimension, measure and relation IDs come from domain knowledge.",
+        [member(syntax_target("graph/node")), member(syntax_target("graph/edge")), member(syntax_target("graph/select")),
+            member(syntax_target("graph/filter")), member(syntax_target("graph/aggregate")),
+            member(syntax_target("graph/existence")), member(syntax_target("graph/order"))]),
+    point(syntax_target("graph/node"), "Graph node", [],
+        "Node: {id,entity}. id is a request-local node name; entity is a declared dataset ID. root names one node id.", []),
+    point(syntax_target("graph/edge"), "Graph edge", [],
+        "Edge or constraint: {relation,from,to}. relation is a declared relation ID; from and to name nodes. Only declared, directionally valid relations can be traversed.", []),
+    point(syntax_target("graph/select"), "Graph projection", [],
+        "select items are {node,dimension}; measures items are {node,measure}. count is a node id; count_value is {node,dimension}. group_by_identity is an array of node ids. Use declared IDs, not field or SQL names.", []),
+    point(syntax_target("graph/filter"), "Graph filter", [],
+        "filters items are {node,dimension,op,value}; any_of items are {node,dimension,values}. Operators: eq, ne, gt, ge, lt, le, contains, not_contains, starts_with, ends_with. The dimension declares allowed operators, logical input type and closed values. No kind field: use a JSON string, number or boolean compatible with the dimension. Resolve relative times before submission.", []),
+    point(syntax_target("graph/aggregate"), "Graph aggregate", [],
+        "measure_having and existence having items are {node,measure,op,value}; value follows the measure output type. count_having is {op,value} with integer value. count_groups and include_empty are booleans. An aggregate needs a semantically valid grain.", []),
+    point(syntax_target("graph/existence"), "Graph existence", [],
+        "exists items are {anchor,nodes,edges,constraints,filters,time_windows,any_of,having,negated}. anchor names an outer node. nodes/edges describe the correlated path; negated is optional boolean. Nested filters use the same filter syntax.", []),
+    point(syntax_target("graph/order"), "Graph ordering and time", [],
+        "order_by items are {node,dimension,direction} with direction asc|desc; take is an integer. top_per is {owner,sample,rank,take}; top_by_measure is {node,measure,direction,take}. time_windows items are {node,dimension,start,end}; end may be null or omitted for an open upper bound. Time values use the dimension's declared logical format.", []),
+    point(syntax_target("graph_pair"), "Graph pair", [],
+        "{op:graph_pair,left,right,count_groups?}. left and right are graph intents over the same root entity, matching selected dimensions and identity grouping. Each has exactly one measure; qualify each population inside its own graph.",
+        [traversable(syntax_target("graph"))]),
+    point(syntax_target("graph_union"), "Graph union", [],
+        "{op:graph_union,branches:[{result_node,graph},...]}. At least two graph branches return the same entity and selected dimensions in the same order. Each branch projects the complete result identity as raw unordered rows; union removes duplicates.",
+        [traversable(syntax_target("graph"))]),
+];
+
 def labels: Fn(Array(edsl::LocalizedKnowledgeText)) -> Array(String) = fn(texts) {
     array::map(texts, fn(entry) { entry.label })
 };
@@ -231,7 +266,7 @@ def target_key: Fn(edsl::KnowledgeTarget) -> String = fn(id) {
 # references are returned one point at a time. No topic string is a query id.
 def map: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(payload, subject) {
     let datasets = edsl::knowledge_index_for_subject(payload, subject);
-    let raw = array::concat([
+    let raw = array::concat([syntax_points,
         array::map(datasets, fn(brief) { dataset_point(payload, brief) }),
         array::flat_map(datasets, fn(brief) { dataset_members(payload, subject, brief) }),
     ]);
@@ -251,7 +286,7 @@ def map: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(payload, subject
         })
     }) { fail!("knowledge point references a point outside the visible model", dangling.target) }
     else if let Some(orphan) = array::find(raw, fn(item) {
-        item.target.kind != edsl::KnowledgeKind::Dataset
+        item.target.kind != edsl::KnowledgeKind::Dataset && item.target != syntax_target("intent")
             && dict::get(incoming, target_key(item.target)) == None
     }) { fail!("knowledge point is not reachable from its declaring model", orphan.target) }
     else {
@@ -366,7 +401,7 @@ def topic_index_from_model: Fn(edsl::PreparedPayload, String) -> Array(TopicEntr
         });
         array::concat([fields, dimensions, measures, relations, metrics, times, links])
     });
-    array::concat([roots, members])
+    array::concat([topic_index_from_points(syntax_points), roots, members])
 };
 
 def prepare_catalog: Fn(edsl::PreparedPayload, String) -> Catalog = fn(payload, subject) {
@@ -389,6 +424,12 @@ def doc_in_catalog: Fn(Catalog, String) -> DocResult = fn(catalog, topic) {
 
 def point_from_topics: Fn(edsl::PreparedPayload, String, Array(TopicEntry), edsl::KnowledgeTarget) -> DocResult = fn(payload, subject, topics, id) {
     if !array::any(topics, fn(entry) { entry.target == id }) { DocResult::NotFound }
+    else if id.kind == edsl::KnowledgeKind::Schema {
+        match array::find(syntax_points, fn(item) { item.target == id }) {
+            Some(item) => DocResult::Found(item),
+            None => fail!("knowledge schema topic has no point", id),
+        }
+    }
     else {
         let datasets = edsl::knowledge_index_for_subject(payload, subject);
         let brief = match array::find(datasets, fn(entry) {
@@ -487,6 +528,7 @@ def keys: Fn(Dict(Value), Array(String)) -> () = fn(fields, allowed) {
 };
 def parse_kind: Fn(String) -> edsl::KnowledgeKind = fn(name) {
     match name {
+        "schema" => edsl::KnowledgeKind::Schema,
         "dataset" => edsl::KnowledgeKind::Dataset,
         "field" => edsl::KnowledgeKind::Field,
         "dimension" => edsl::KnowledgeKind::Dimension,

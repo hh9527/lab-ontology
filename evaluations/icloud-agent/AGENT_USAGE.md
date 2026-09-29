@@ -104,11 +104,11 @@ Optional top-level graph fields and their shapes:
 | --- | --- |
 | `constraints` | Array of edge objects, same shape as `edges` |
 | `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
-| `filters` | Array of `{"node":"...","dimension":"...","op":"eq","value":...}`; optional `kind` |
+| `filters` | Array of `{"node":"...","dimension":"...","op":"eq","value":...}` |
 | `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` may be `null` or omitted |
-| `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}`; optional `kind` |
+| `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}` |
 | `exists` | Array of existence objects described below |
-| `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}`; optional `kind` |
+| `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}` |
 | `count` | Node instance ID string |
 | `count_value` | `{"node":"...","dimension":"..."}`, for distinct non-null value count |
 | `count_having` | `{"op":"...","value":<integer>}` |
@@ -136,10 +136,11 @@ objects; there is no fixed hop count in the Intent syntax.
 
 Filter operators are `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains`,
 `not_contains`, `starts_with`, and `ends_with`. The Model restricts which
-operators and value types each dimension permits. Omit `kind` when the Model
-uniquely determines it from the JSON value; otherwise use `text`, `int`,
-`number`, `bool`, `date`, `rfc3339`, `utc_second`, `local_datetime`, or
-`epoch_millis` as indicated by the knowledge point. Business-value filters
+operators and logical value types each dimension permits. Do not send `kind`:
+the target dimension or measure determines the logical type of its JSON value.
+Discover the Intent contract under `syntax/intent` and its linked topics in
+`<domain>/index` and `<domain>/info`. A diagnostic naming a topic can be
+resolved through `<domain>/info` to repair the Intent. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 
 ### One deduplicated entity set

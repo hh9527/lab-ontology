@@ -37,10 +37,10 @@ def field: Fn(Dict(Value), String) -> Value = fn(obj, key) {
     }
 };
 
-def field_at: Fn(Dict(Value), String, String, Array(String)) -> Value = fn(obj, key, path, allowed) {
+def field_at: Fn(Dict(Value), String, String) -> Value = fn(obj, key, path) {
     match dict::get(obj, key) {
         Some(value) => value,
-        None => fail!(`intent field is missing: \{path}.\{key}; allowed keys: \{string::join(allowed, ", ")}`, obj, key),
+        None => fail!(`intent field is missing: \{path}.\{key}; see info topic syntax/graph/select`, obj, key),
     }
 };
 
@@ -53,10 +53,20 @@ def array_opt: Fn(Dict(Value), String) -> Array(Value) = fn(obj, key) {
 };
 
 def graph_keys: Fn(Dict(Value), String, Array(String)) -> () = fn(obj, context, allowed) {
+    let topic = if context == "filter" || context == "any_of" || context == "time window" { "syntax/graph/filter" }
+        else if context == "node" { "syntax/graph/node" }
+        else if context == "edge" { "syntax/graph/edge" }
+        else if context == "measure projection" || context == "count_value" || string::contains(context, "select[") { "syntax/graph/select" }
+        else if context == "aggregate threshold" || context == "count threshold" { "syntax/graph/aggregate" }
+        else if context == "existence" { "syntax/graph/existence" }
+        else if context == "order" || context == "top-per" || context == "aggregate top" { "syntax/graph/order" }
+        else if context == "aggregate pair" { "syntax/graph_pair" }
+        else if context == "graph union" || string::contains(context, "graph union branch") { "syntax/graph_union" }
+        else { "syntax/graph" };
     match array::find(dict::keys(obj), fn(key) {
         !array::any(allowed, fn(ok) { ok == key })
     }) {
-        Some(key) => fail!(`graph intent contains unsupported key \{key} in \{context}; allowed keys: \{string::join(allowed, ", ")}`, context, key),
+        Some(key) => fail!(`graph intent contains unsupported key \{key} in \{context}; see info topic \{topic}`, context, key),
         None => (),
     }
 };
@@ -73,7 +83,7 @@ def parse_op: Fn(String) -> edsl::FilterOp = fn(op) {
         "not_contains" => edsl::FilterOp::NotContains,
         "starts_with" => edsl::FilterOp::StartsWith,
         "ends_with" => edsl::FilterOp::EndsWith,
-        _ => fail!(`unsupported filter operator \{op}; allowed: eq, ne, gt, ge, lt, le, contains, not_contains, starts_with, ends_with`, op),
+        _ => fail!(`unsupported filter operator \{op}; see info topic syntax/graph/filter`, op),
     }
 };
 
@@ -117,7 +127,7 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
             Value::String(text) => edsl::FilterInput::LocalDateTime(text),
             _ => fail!("LocalDateTime filter requires a string representation", value),
         },
-        _ => fail!(`unsupported filter value kind \{kind}; allowed: text, int, number, bool, rfc3339, epoch_millis, date, utc_second, local_datetime`, kind),
+        _ => fail!("internal filter input type is unsupported", kind),
     }
 };
 
@@ -137,13 +147,13 @@ def inferred_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::Fi
                 _ => False,
             }
         });
-        if array::length(candidates) == 0 { fail!(`value does not match dimension \{dimension} input type; inspect its declared input kinds`, dimension, detail.input_kinds, value) }
+        if array::length(candidates) == 0 { fail!(`value does not match dimension \{dimension} input type; see info topic \{dimension}`, dimension, detail.input_kinds, value) }
         else {
             let chosen = if array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Int })
                 && array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Number })
                 && array::length(candidates) == 2 { edsl::FilterInputKind::Int }
                 else if array::length(candidates) == 1 { candidates[0] }
-                else { fail!(`dimension \{dimension} input type is ambiguous for this value; specify kind explicitly`, dimension, candidates, value) };
+                else { fail!(`dimension \{dimension} has ambiguous declared input types; fix its Model definition`, dimension, candidates, value) };
             match chosen {
                 edsl::FilterInputKind::Text => parse_input("text", value),
                 edsl::FilterInputKind::Int => parse_input("int", value),
@@ -158,20 +168,15 @@ def inferred_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::Fi
         }
     };
 
-def optional_input: Fn(edsl::PreparedPayload, String, String, Dict(Value), Value) -> edsl::FilterInput =
-    fn(payload, subject, dimension, obj, value) {
-        match dict::get(obj, "kind") {
-            Some(kind) => parse_input(as_string(kind), value),
-            None => inferred_input(payload, subject, dimension, value),
-        }
-    };
-
 def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(payload, measure, value) {
-    match edsl::measure_output_type(payload, measure) {
-        edsl::OutputType::Text => parse_input("text", value),
-        edsl::OutputType::Integer => parse_input("int", value),
-        edsl::OutputType::Number => parse_input("number", value),
-        edsl::OutputType::Boolean => parse_input("bool", value),
+    match (edsl::measure_output_type(payload, measure), value) {
+        (edsl::OutputType::Text, Value::String(text)) => edsl::FilterInput::Text(text),
+        (edsl::OutputType::Integer, Value::Int(number)) => edsl::FilterInput::Int(number),
+        (edsl::OutputType::Number, Value::Int(number)) => edsl::FilterInput::Int(number),
+        (edsl::OutputType::Number, Value::Float(number)) => edsl::FilterInput::Number(number),
+        (edsl::OutputType::Boolean, Value::True) => edsl::FilterInput::Bool(True),
+        (edsl::OutputType::Boolean, Value::False) => edsl::FilterInput::Bool(False),
+        _ => fail!(`value does not match measure \{measure} output type; see info topic \{measure}`, measure, value),
     }
 };
 
@@ -190,11 +195,11 @@ def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
 
 def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphFilter = fn(payload, subject, item) {
     let obj = as_object(item);
-    graph_keys(obj, "filter", ["node", "dimension", "op", "kind", "value"]);
+    graph_keys(obj, "filter", ["node", "dimension", "op", "value"]);
     let dimension = as_string(field(obj, "dimension"));
     let op = parse_op(as_string(field(obj, "op")));
     let value = field(obj, "value");
-    let input = if value == Value::String("now") && dict::get(obj, "kind") == None {
+    let input = if value == Value::String("now") {
         let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
         let temporal = array::any(detail.input_kinds, fn(kind) {
             kind == edsl::FilterInputKind::EpochMillis || kind == edsl::FilterInputKind::Rfc3339
@@ -204,7 +209,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphF
         if temporal {
             fail!("resolve now to an absolute time value before submitting intent", dimension)
         } else { inferred_input(payload, subject, dimension, value) }
-    } else { optional_input(payload, subject, dimension, obj, value) };
+    } else { inferred_input(payload, subject, dimension, value) };
     let request: edsl::FilterRequest = {
         id: dimension, subject, op, input,
     };
@@ -253,21 +258,18 @@ def parse_time_window: Fn(edsl::PreparedPayload, String, Value) -> Array(edsl::G
 
 def parse_graph_any_of: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphAnyOf = fn(payload, subject, item) {
     let obj = as_object(item);
-    graph_keys(obj, "any_of", ["node", "dimension", "kind", "values"]);
+    graph_keys(obj, "any_of", ["node", "dimension", "values"]);
     let dimension = as_string(field(obj, "dimension"));
     {node: as_string(field(obj, "node")), dimension: as_string(field(obj, "dimension")),
-        values: array::map(as_array(field(obj, "values")), fn(value) { optional_input(payload, subject, dimension, obj, value) })}
+        values: array::map(as_array(field(obj, "values")), fn(value) { inferred_input(payload, subject, dimension, value) })}
 };
 
 def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
     let obj = as_object(item);
-    graph_keys(obj, "aggregate threshold", ["node", "measure", "op", "kind", "value"]);
+    graph_keys(obj, "aggregate threshold", ["node", "measure", "op", "value"]);
     {node: as_string(field(obj, "node")), measure: as_string(field(obj, "measure")),
         op: parse_op(as_string(field(obj, "op"))),
-        threshold: match dict::get(obj, "kind") {
-            Some(kind) => parse_input(as_string(kind), field(obj, "value")),
-            None => measure_input(payload, as_string(field(obj, "measure")), field(obj, "value")),
-        }}
+        threshold: measure_input(payload, as_string(field(obj, "measure")), field(obj, "value"))}
 };
 
 def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphExist = fn(payload, subject, item) {
@@ -316,8 +318,8 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Val
                 let path = `select[\{entry.0}]`;
                 graph_keys(selection, path, ["node", "dimension"]);
                 let result: edsl::GraphSelect = {
-                    node: as_string(field_at(selection, "node", path, ["node", "dimension"])),
-                    dimension: as_string(field_at(selection, "dimension", path, ["node", "dimension"])),
+                    node: as_string(field_at(selection, "node", path)),
+                    dimension: as_string(field_at(selection, "dimension", path)),
                 };
                 result
             }),

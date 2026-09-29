@@ -78,6 +78,70 @@ pub def key_backed_dataset_publishes_its_identity_grain: test::Test = test::shou
     }
 });
 
+pub def intent_syntax_is_discoverable_and_cross_referenced: test::Test = test::should_ok(fn() {
+    let indexed = knowledge::topic_index(payload, "analyst");
+    let root = knowledge::doc(payload, "analyst", "syntax/intent");
+    let filter = knowledge::doc(payload, "analyst", "syntax/graph/filter");
+    let index_response = knowledge::knowledge_index_method_factory(payload, "analyst")(
+        json::parse(r#"{"offset":0,"limit":20}"#).unwrap!());
+    let info_response = knowledge::knowledge_info_method_factory(payload, "analyst")(
+        json::parse(r#"{"topic":"syntax/graph/filter"}"#).unwrap!());
+    if !array::any(indexed, fn(entry) { entry.topic == "syntax/intent" }) {
+        fail!("Intent syntax is absent from the knowledge index")
+    } else if !string::contains(json::stringify(index_response), "syntax/intent")
+        || !string::contains(json::stringify(info_response), "No kind field") {
+        fail!("Intent syntax is absent from service index/info", index_response, info_response)
+    } else {
+        match (root, filter) {
+            (knowledge::DocResult::Found(a), knowledge::DocResult::Found(b)) =>
+                if array::any(a.refs, fn(ref) { ref.target.id == "syntax/graph" })
+                    && string::contains(b.summary, "No kind field") { True }
+                else { fail!("Intent syntax links or filter contract are missing", a, b) },
+            _ => fail!("Intent syntax topics cannot be resolved", root, filter),
+        }
+    }
+});
+
+@edsl::entity_id("numeric_samples")
+@edsl::entity_source("numeric_samples", "n")
+type NumericSample = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("amount")
+    @edsl::dimension("sample_amount", True, True, [edsl::FilterOp::Ge], [edsl::FilterInputKind::Number])
+    amount: Float,
+};
+
+pub def integer_json_value_is_accepted_by_number_dimension: test::Test = test::should_ok(fn() {
+    let numeric = edsl::build_root("numeric", [NumericSample.type], payload.profile, fn(subject) { subject == "analyst" });
+    let ast = query_intent_ast_factory(numeric, "analyst")(json::parse(r#"{
+        "op":"graph","root":"n","nodes":[{"id":"n","entity":"numeric_samples"}],
+        "edges":[],"select":[],"count":"n",
+        "filters":[{"node":"n","dimension":"sample_amount","op":"ge","value":5}]
+    }"#).unwrap!());
+    let query = sqlite::build_query(ast);
+    if query.bindings == [qb::Val::Int(5)] { True }
+    else { fail!("number dimension did not accept an integer JSON value", query) }
+});
+
+@edsl::entity_id("ambiguous_samples")
+@edsl::entity_source("ambiguous_samples", "a")
+type AmbiguousSample = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("value")
+    @edsl::computed_dimension("ambiguous_value", edsl::OutputType::Text, True, True,
+        [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text, edsl::FilterInputKind::Date],
+        fn(ctx, column) { (ctx, column) })
+    value: String,
+};
+
+pub def model_rejects_indistinguishable_input_types: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("ambiguous", [AmbiguousSample.type], payload.profile, fn(subject) { subject == "analyst" })
+}, "declares indistinguishable input types");
+
 pub def computed_measure_requires_arithmetic_profile_at_preparation: test::Test = test::should_fail_with(fn() {
     let restricted = {...payload.profile, allowed_scalars: array::filter(payload.profile.allowed_scalars,
         fn(op) { op != qb::ScalarFunction::Add })};
@@ -128,7 +192,7 @@ pub def component_alarm_named_graph: test::Test = test::should_ok(fn() {
         "exists":[{"anchor":"component","nodes":[{"id":"site","entity":"sites"},{"id":"alarm","entity":"alarms"}],
             "edges":[{"relation":"component_site","from":"component","to":"site"},
                      {"relation":"site_alarms","from":"site","to":"alarm"}],
-            "filters":[{"node":"alarm","dimension":"AlarmLevel","op":"eq","kind":"int","value":2}]}]
+            "filters":[{"node":"alarm","dimension":"AlarmLevel","op":"eq","value":2}]}]
     }"#).unwrap!());
     let sq = sqlite::build_query(ast);
     let pg = postgres::build_query(ast);
@@ -154,7 +218,7 @@ pub def backend_is_bound_at_factory_creation: test::Test = test::should_ok(fn() 
     let input = json::parse(r#"{
         "op":"graph", "root":"alarm", "nodes":[{"id":"alarm","entity":"alarms"}],
         "edges":[], "select":[{"node":"alarm","dimension":"AlarmLevel"}],
-        "filters":[{"node":"alarm","dimension":"AlarmLevel","op":"eq","kind":"int","value":42}]
+        "filters":[{"node":"alarm","dimension":"AlarmLevel","op":"eq","value":42}]
     }"#).unwrap!();
     let sq = query_intent_lower_factory(payload, "analyst", sqlite::build_query)(input);
     let pg = query_intent_lower_factory(payload, "analyst", postgres::build_query)(input);
@@ -309,11 +373,11 @@ pub def batch_parser_diagnostics_offer_local_repairs: test::Test = test::should_
     };
     if batch_field(result, "accepted") == Value::False
         && array::length(reports) == 5
-        && string::contains(json::stringify(batch_field(reports[0], "diagnostic")), "unsupported key bogus_key in request; allowed keys: op, root")
-        && string::contains(json::stringify(batch_field(reports[1], "diagnostic")), "unsupported key foo in filter; allowed keys: node, dimension, op, kind, value")
-        && string::contains(json::stringify(batch_field(reports[2], "diagnostic")), "intent field is missing: select[0].dimension; allowed keys: node, dimension")
-        && string::contains(json::stringify(batch_field(reports[3], "diagnostic")), "unsupported filter operator Eq; allowed: eq, ne")
-        && string::contains(json::stringify(batch_field(reports[4], "diagnostic")), "unsupported filter value kind weird; allowed: text, int") {
+        && string::contains(json::stringify(batch_field(reports[0], "diagnostic")), "unsupported key bogus_key in request; see info topic syntax/graph")
+        && string::contains(json::stringify(batch_field(reports[1], "diagnostic")), "unsupported key foo in filter; see info topic syntax/graph/filter")
+        && string::contains(json::stringify(batch_field(reports[2], "diagnostic")), "intent field is missing: select[0].dimension; see info topic syntax/graph/select")
+        && string::contains(json::stringify(batch_field(reports[3], "diagnostic")), "unsupported filter operator Eq; see info topic syntax/graph/filter")
+        && string::contains(json::stringify(batch_field(reports[4], "diagnostic")), "unsupported key kind in filter; see info topic syntax/graph/filter") {
         True
     } else { fail!("parser diagnostics did not name local fixes", result) }
 });
