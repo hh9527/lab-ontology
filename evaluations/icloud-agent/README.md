@@ -7,10 +7,10 @@ to the three MCP tools `index`, `info`, and `transform` through the restricted
 host endpoint. The Agent's filesystem and shell must not be able
 to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
 The adapter accepts only an Intent from the Agent on `ontology_transform`;
-an optional request clock is provisioned by the host through
-`ONTOLOGY_EVAL_CTX_JSON` and never accepted from Agent tool arguments.
+relative time must be resolved by the Agent from application or environment
+context before this call. No request clock is injected into the service.
 On successful lowering it writes a mode-0600 JSON record containing the
-submitted Intent, host context (if any), and generated Query to the existing
+submitted Intent and generated Query to the existing
 host-only directory named by `ONTOLOGY_EVAL_OUTPUT_DIR`. The tool returns only
 an acceptance receipt; the Agent cannot retrieve SQL or bindings through the
 three exposed tools. Failed lowering returns diagnostics and writes no record.
@@ -28,8 +28,8 @@ Create the output directory outside the Agent sandbox, with access limited to
 the trusted host and evaluator. It owns the child process and forwards only
 `ic/index`, `ic/info`, and `ic/transform` JSONL requests. Do not mount the
 runner or artifact into the Agent sandbox. No separate Telora TCP or Unix
-listener is needed, so the Agent cannot bypass the adapter's host-owned context
-rule by calling one directly. Merely copying fewer files into an
+listener is needed, so the Agent cannot bypass the restricted tools by calling
+one directly. Merely copying fewer files into an
 otherwise unrestricted working directory does not meet this evaluation's
 isolation requirement. Verify that the Agent process has no filesystem route
 back to the artifact before claiming a hard-isolated run.

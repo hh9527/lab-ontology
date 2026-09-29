@@ -177,7 +177,7 @@ def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
         from: as_string(field(obj, "from")), to: as_string(field(obj, "to"))}
 };
 
-def parse_graph_filter: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> edsl::GraphFilter = fn(payload, subject, context, item) {
+def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphFilter = fn(payload, subject, item) {
     let obj = as_object(item);
     graph_keys(obj, "filter", ["node", "dimension", "op", "kind", "value"]);
     let dimension = as_string(field(obj, "dimension"));
@@ -191,11 +191,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, String, Option(time::RequestCo
                 || kind == edsl::FilterInputKind::LocalDateTime
         });
         if temporal {
-            let role = edsl::time_domain(payload, detail.dataset, detail.field);
-            match context {
-                Some(request) => time::now_filter(request, role, op, dimension),
-                None => fail!("now filter requires request ctx.now", dimension),
-            }
+            fail!("resolve now to an absolute time value before submitting intent", dimension)
         } else { inferred_input(payload, subject, dimension, value) }
     } else { optional_input(payload, subject, dimension, obj, value) };
     let request: edsl::FilterRequest = {
@@ -204,13 +200,10 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, String, Option(time::RequestCo
     {node: as_string(field(obj, "node")), request}
 };
 
-def parse_time_value: Fn(Option(time::RequestContext), edsl::TimeField, Value) -> time::TimeValue =
-    fn(context, role, value) {
+def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
+    fn(role, value) {
         match value {
-            Value::String("now") => match context {
-                Some(request) => time::now_for(request, role),
-                None => fail!("now boundary requires request ctx.now"),
-            },
+            Value::String("now") => fail!("resolve now to an absolute time boundary before submitting intent"),
             Value::String(text) => match role.encoding {
                 edsl::TimeEncoding::DateText => time::TimeValue::Date(text),
                 edsl::TimeEncoding::Rfc3339Text => time::TimeValue::Rfc3339(text),
@@ -223,67 +216,25 @@ def parse_time_value: Fn(Option(time::RequestContext), edsl::TimeField, Value) -
                 edsl::TimeEncoding::LocalEpochMillis => time::TimeValue::EpochMillis(ms),
                 _ => fail!("time boundary requires text in the declared logical format", role.encoding, value),
             },
-            Value::Object(obj) => do {
-                graph_keys(obj, "time boundary", ["calendar", "offset", "delta_ms"]);
-                let request = match context {
-                    Some(request) => request,
-                    None => fail!("relative time boundary requires request ctx.now", value),
-                };
-                match (dict::get(obj, "calendar"), dict::get(obj, "delta_ms")) {
-                    (Some(Value::String(name)), None) => do {
-                        let unit = match name {
-                            "day" => time::CalendarUnit::Day,
-                            "week" => time::CalendarUnit::Week,
-                            "month" => time::CalendarUnit::Month,
-                            _ => fail!("unsupported calendar boundary unit", name),
-                        };
-                        let offset = match dict::get(obj, "offset") {
-                            Some(Value::Int(number)) => number,
-                            Some(other) => fail!("calendar boundary offset must be an integer", other),
-                            None => fail!("calendar boundary requires offset", value),
-                        };
-                        time::calendar_boundary(request, role, unit, offset)
-                    },
-                    (None, Some(Value::Int(delta))) => do {
-                        if dict::get(obj, "offset") != None {
-                            fail!("fixed duration boundary cannot have calendar offset", value)
-                        } else { time::fixed_delta(request, role, delta) }
-                    },
-                    (None, Some(other)) => fail!("delta_ms must be an integer", other),
-                    (Some(_), Some(_)) => fail!("time boundary cannot mix calendar and delta_ms", value),
-                    (Some(other), None) => fail!("calendar boundary unit must be a string", other),
-                    (None, None) => fail!("time boundary requires calendar or delta_ms", value),
-                }
-            },
-            _ => fail!("time boundary must be a field-compatible value, now, or relative expression", role.encoding, value),
+            Value::Object(_) => fail!("resolve relative time to an absolute boundary before submitting intent", value),
+            _ => fail!("time boundary must be a field-compatible absolute value", role.encoding, value),
         }
     };
 
-def request_context_from: Fn(Value) -> time::RequestContext = fn(value) {
-    let obj = as_object(value);
-    graph_keys(obj, "request context", ["now", "tz"]);
-    let now = match field(obj, "now") {
-        Value::Int(ms) => ms,
-        other => fail!("request ctx.now must be epoch milliseconds", other),
-    };
-    let tz = match dict::get(obj, "tz") {
-        None => None,
-        Some(Value::Int(minutes)) => Some(minutes),
-        Some(other) => fail!("request ctx.tz must be offset minutes", other),
-    };
-    time::request_context(now, tz)
-};
-
-def parse_time_window: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> Array(edsl::GraphFilter) =
-    fn(payload, subject, context, value) {
+def parse_time_window: Fn(edsl::PreparedPayload, String, Value) -> Array(edsl::GraphFilter) =
+    fn(payload, subject, value) {
         let obj = as_object(value);
         graph_keys(obj, "time window", ["node", "dimension", "start", "end"]);
         let node = as_string(field(obj, "node"));
         let dimension = as_string(field(obj, "dimension"));
         let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
         let role = edsl::time_domain(payload, detail.dataset, detail.field);
-        let window: time::Window = {start: parse_time_value(context, role, field(obj, "start")),
-            end: parse_time_value(context, role, field(obj, "end"))};
+        let window: time::Window = {start: parse_time_value(role, field(obj, "start")),
+            end: match dict::get(obj, "end") {
+                None => None,
+                Some(Value::None) => None,
+                Some(end) => Some(parse_time_value(role, end)),
+            }};
         array::map(time::window_filters(payload, subject, dimension, window), fn(request) {
             {node, request}
         })
@@ -308,7 +259,7 @@ def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = 
         }}
 };
 
-def parse_graph_existence: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> edsl::GraphExist = fn(payload, subject, context, item) {
+def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphExist = fn(payload, subject, item) {
     let obj = as_object(item);
     graph_keys(obj, "existence", ["anchor", "nodes", "edges", "constraints", "filters", "time_windows", "any_of", "having", "negated"]);
     let negated = match dict::get(obj, "negated") {
@@ -321,14 +272,14 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, String, Option(time::Reques
         nodes: array::map(as_array(field(obj, "nodes")), parse_graph_node),
         edges: array::map(as_array(field(obj, "edges")), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, context, value) }),
-            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, context, value) })]),
+        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, value) }),
+            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
         any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, subject, value) }),
         having: array::map(array_opt(obj, "having"), fn(value) { parse_graph_having(payload, value) }),
         negated}
 };
 
-def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Option(time::RequestContext), Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, context, obj) {
+def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, obj) {
     if as_string(field(obj, "op")) != "graph" { fail!("aggregate pair operands must be graph intents") }
     else {
         graph_keys(obj, "request", ["op", "root", "row_grain", "distinct", "nodes", "edges", "constraints", "select", "measures", "measure_having", "filters", "time_windows", "any_of", "exists", "count", "count_value", "count_having", "count_groups", "include_empty", "group_by_identity", "top_per", "top_by_measure", "order_by", "take"]);
@@ -368,10 +319,10 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Option(t
                 result
             }),
             measure_having: array::map(array_opt(obj, "measure_having"), fn(value) { parse_graph_having(payload, value) }),
-            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, context, value) }),
-                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, context, value) })]),
+            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, value) }),
+                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
             any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, subject, value) }),
-            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, context, value) }),
+            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, value) }),
             count: match dict::get(obj, "count") {
                 None => None,
                 Some(Value::None) => None,
@@ -482,7 +433,7 @@ def paired_group_operand: Fn(qb::Plan) -> qb::Plan = fn(plan) {
     {...plan, projection: array::concat([plan.projection, keys])}
 };
 
-def lower_graph_pair: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Dict(Value)) -> qb::QueryAst = fn(payload, subject, context, obj) {
+def lower_graph_pair: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::QueryAst = fn(payload, subject, obj) {
     graph_keys(obj, "aggregate pair", ["op", "left", "right", "count_groups"]);
     let count_groups = match dict::get(obj, "count_groups") {
         None => False,
@@ -490,8 +441,8 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, String, Option(time::RequestCont
         Some(Value::False) => False,
         Some(value) => fail!("aggregate pair count_groups must be boolean", value),
     };
-    let left = lower_graph_object(qb::build_context(), payload, subject, context, as_object(field(obj, "left")));
-    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, context, as_object(field(obj, "right")));
+    let left = lower_graph_object(qb::build_context(), payload, subject, as_object(field(obj, "left")));
+    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, as_object(field(obj, "right")));
     if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
         fail!("aggregate pair operands each require one measure, grouping beginning with root identity, and no row ordering or count; qualify each population inside its own graph")
     } else if left.1.root != right.1.root
@@ -524,55 +475,38 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, String, Option(time::RequestCont
     }
 };
 
-def lower_intent_ast: Fn(edsl::PreparedPayload, String, Option(time::RequestContext), Value) -> qb::QueryAst = fn(payload, subject, context, intent) {
+def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "graph" {
-        let lowered = lower_graph_object(qb::build_context(), payload, subject, context, obj);
+        let lowered = lower_graph_object(qb::build_context(), payload, subject, obj);
         let request = lowered.1;
         let plan = if request.count_groups { qb::QueryPlan::GroupCount(lowered.2) }
             else if request.distinct { qb::QueryPlan::DistinctRows(lowered.2) }
             else { qb::QueryPlan::Rows(lowered.2) };
         qb::finish(lowered.0, qb::validate_query_plan(plan))
-    } else if op == "graph_pair" { lower_graph_pair(payload, subject, context, obj) }
+    } else if op == "graph_pair" { lower_graph_pair(payload, subject, obj) }
     else { fail!("unsupported intent op; use graph or graph_pair with named nodes and relations", op) }
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
 
 def query_intent_lower_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> qb::Query = fn(payload, subject, to_query) {
-    fn(intent) { to_query(lower_intent_ast(payload, subject, None, intent)) }
+    fn(intent) { to_query(lower_intent_ast(payload, subject, intent)) }
 };
 
 def query_intent_ast_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::QueryAst = fn(payload, subject) {
-    fn(intent) { lower_intent_ast(payload, subject, None, intent) }
-};
-
-def query_intent_ast_factory_with_context: Fn(edsl::PreparedPayload, String, time::RequestContext) -> Fn(Value) -> qb::QueryAst =
-    fn(payload, subject, context) {
-        let checked = time::request_context(context.now, context.tz);
-        fn(intent) { lower_intent_ast(payload, subject, Some(checked), intent) }
-    };
-
-def query_intent_lower_factory_with_context: Fn(edsl::PreparedPayload, String, ToQuery, time::RequestContext) -> Fn(Value) -> qb::Query =
-    fn(payload, subject, to_query, context) {
-        let checked = time::request_context(context.now, context.tz);
-        fn(intent) { to_query(lower_intent_ast(payload, subject, Some(checked), intent)) }
+    fn(intent) { lower_intent_ast(payload, subject, intent) }
 };
 
 def query_request_lower_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> qb::Query =
     fn(payload, subject, to_query) {
         fn(request) {
             let obj = as_object(request);
-            graph_keys(obj, "query request", ["intent", "ctx"]);
-            let context = match dict::get(obj, "ctx") {
-                None => None,
-                Some(value) => Some(request_context_from(value)),
-            };
-            to_query(lower_intent_ast(payload, subject, context, field(obj, "intent")))
+            graph_keys(obj, "query request", ["intent"]);
+            to_query(lower_intent_ast(payload, subject, field(obj, "intent")))
         }
     };
 
 pub use self::{ ToQuery, query_intent_lower_factory, query_intent_ast_factory,
-    query_intent_ast_factory_with_context, query_intent_lower_factory_with_context,
     query_request_lower_factory };

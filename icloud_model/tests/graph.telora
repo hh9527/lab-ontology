@@ -1,10 +1,9 @@
 use crate::model::{ payload };
-use ontology::intent::{ query_intent_ast_factory, query_intent_ast_factory_with_context };
+use ontology::intent::{ query_intent_ast_factory };
 use ontology::sqlite as sqlite;
 use ontology::postgres as postgres;
 use ontology::query as qb;
 use ontology::ontology as edsl;
-use ontology::time as time;
 use std::array as array;
 use std::json as json;
 use std::string as string;
@@ -44,16 +43,13 @@ pub def typed_epoch_window_preserves_millisecond_bounds: test::Test = test::shou
     else { fail!("epoch window must bind raw millisecond values", query) }
 });
 
-pub def calendar_day_window_uses_real_icloud_epoch_field: test::Test = test::should_ok(fn() {
-    let intent = json::parse(r#"{
+pub def resolved_day_window_uses_real_icloud_epoch_field: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload, "public")(json::parse(r#"{
         "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
         "edges":[],"select":[],"count":"device","time_windows":[{
             "node":"device","dimension":"device_create_ms",
-            "start":{"calendar":"day","offset":-1},
-            "end":{"calendar":"day","offset":0}}]
-    }"#).unwrap!();
-    let context = time::request_context(1709294400000, Some(480));
-    let ast = query_intent_ast_factory_with_context(payload, "public", context)(intent);
+            "start":1709136000000, "end":1709222400000}]
+    }"#).unwrap!());
     let sq = sqlite::build_query(ast);
     let pg = postgres::build_query(ast);
     if sq.bindings == [qb::Val::Int(1709136000000), qb::Val::Int(1709222400000)]
@@ -114,68 +110,53 @@ pub def typed_existence_window_qualifies_without_multiplying_root: test::Test = 
     else { fail!("typed existence window must stay correlated and parameterized", query) }
 });
 
-pub def request_time_is_bound_as_one_utc_instant_per_request: test::Test = test::should_ok(fn() {
-    let intent = json::parse(r#"{
+pub def open_utc_window_binds_only_lower_boundary: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload, "public")(json::parse(r#"{
         "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
         "edges":[],"select":[],"count":"alarm","time_windows":[{
             "node":"alarm","dimension":"alarm_occur_utc_raw",
-            "start":"2025-01-01 00:00:00", "end":"now"}]
-    }"#).unwrap!();
-    let context = time::request_context(1735805700000, None);
-    let lower = query_intent_ast_factory_with_context(payload, "public", context);
-    let first = lower(intent);
-    let second = lower(intent);
-    let sq = sqlite::build_query(first);
-    let pg = postgres::build_query(second);
-    if sq.bindings == [qb::Val::String("2025-01-01 00:00:00"),
-            qb::Val::String("2025-01-02 08:15:00")]
-        && pg.bindings == sq.bindings && string::contains(sq.sql, "alarm.OCCURUTC < ?2")
-        && string::contains(pg.sql, "\"alarm\".\"OCCURUTC\" < $2")
-        && !string::contains(sq.sql, "now(") && !string::contains(pg.sql, "now(") { True }
-    else { fail!("now must be a stable request binding in both dialects", sq, pg) }
+            "start":"2025-01-01 00:00:00", "end":null}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.bindings == [qb::Val::String("2025-01-01 00:00:00")]
+        && pg.bindings == sq.bindings && string::contains(sq.sql, "alarm.OCCURUTC >= ?1")
+        && !string::contains(sq.sql, "alarm.OCCURUTC <")
+        && !string::contains(pg.sql, "\"alarm\".\"OCCURUTC\" <") { True }
+    else { fail!("open UTC window must not bind an upper boundary", sq, pg) }
 });
 
-pub def request_time_epoch_millis_is_not_a_plain_integer_filter: test::Test = test::should_ok(fn() {
-    let intent = json::parse(r#"{
+pub def open_epoch_window_preserves_millisecond_type: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
         "op":"graph","root":"device","nodes":[{"id":"device","entity":"device"}],
         "edges":[],"select":[],"count":"device","time_windows":[{
             "node":"device","dimension":"device_create_ms",
-            "start":1727308800000, "end":"now"}]
-    }"#).unwrap!();
-    let context = time::request_context(1727395200000, None);
-    let query = sqlite::build_query(query_intent_ast_factory_with_context(payload, "public", context)(intent));
-    if query.bindings == [qb::Val::Int(1727308800000), qb::Val::Int(1727395200000)]
-        && string::contains(query.sql, "device.createTime < ?2") { True }
-    else { fail!("epoch request clock must preserve millisecond input type", query) }
+            "start":1727308800000}]
+    }"#).unwrap!());
+    if query.bindings == [qb::Val::Int(1727308800000)]
+        && string::contains(query.sql, "device.createTime >= ?1")
+        && !string::contains(query.sql, "device.createTime <") { True }
+    else { fail!("open epoch window must preserve millisecond input type", query) }
 });
 
-pub def request_time_reference_needs_explicit_context: test::Test = test::should_fail_with(fn() {
+pub def relative_time_reference_requires_agent_resolution: test::Test = test::should_fail_with(fn() {
     lower(json::parse(r#"{
         "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
         "edges":[],"select":[],"count":"alarm","time_windows":[{
             "node":"alarm","dimension":"alarm_occur_utc_raw",
             "start":"2025-01-01 00:00:00", "end":"now"}]
     }"#).unwrap!())
-}, "now boundary requires request ctx.now");
+}, "resolve now to an absolute time boundary");
 
-pub def request_time_rejects_unbounded_timezone_offset: test::Test = test::should_fail_with(fn() {
-    time::request_context(1735805700000, Some(841))
-}, "request timezone offset must be within +/-840 minutes");
-
-pub def request_time_factory_rejects_unvalidated_timezone_context: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory_with_context(payload, "public", {now: 1735805700000, tz: Some(841)})
-}, "request timezone offset must be within +/-840 minutes");
-
-pub def request_time_converts_epoch_to_utc_seconds: test::Test = test::should_ok(fn() {
-    let context = time::request_context(1735805700000, None);
-    let query = sqlite::build_query(query_intent_ast_factory_with_context(payload, "public", context)(json::parse(r#"{
+pub def resolved_utc_seconds_bind_directly: test::Test = test::should_ok(fn() {
+    let query = lower(json::parse(r#"{
         "op":"graph","root":"alarm","nodes":[{"id":"alarm","entity":"current_alarm"}],
         "edges":[],"select":[],"count":"alarm","time_windows":[{
             "node":"alarm","dimension":"alarm_occur_utc_raw",
-            "start":"2025-01-01 00:00:00", "end":"now"}]
-    }"#).unwrap!()));
+            "start":"2025-01-01 00:00:00", "end":"2025-01-02 08:15:00"}]
+    }"#).unwrap!());
     if query.bindings == [qb::Val::String("2025-01-01 00:00:00"), qb::Val::String("2025-01-02 08:15:00")] { True }
-    else { fail!("epoch clock did not convert to UTC second binding", query) }
+    else { fail!("resolved UTC seconds did not bind directly", query) }
 });
 
 pub def alarm_name_suffix_counts_only_matching_events: test::Test = test::should_ok(fn() {

@@ -102,14 +102,14 @@ Submit an Intent with the same outer envelope:
 
 ```text
 {"method":"<domain>/transform","input":{"intent":<Intent>}}
-{"method":"<domain>/transform","input":{"intent":<Intent>,"ctx":{"now":<epoch milliseconds>,"tz":<UTC offset minutes>}}}
 ```
 
-`ctx` is optional unless the Intent refers to request time; the host must
-supply `now` explicitly and calendar boundaries also need `tz`. The Agent must
-not infer either value from its own environment. If a required value is absent,
-ask for it before lowering. `ctx.tz` is a fixed offset, not a named timezone or
-daylight-saving rule. See
+The caller resolves relative time before submitting an Intent. Reference time
+and timezone may come from the application client or the Agent's environment;
+neither is read by the service. Use concrete values in the dimension's declared
+logical type, and state the resulting business dates in the answer. If no
+reliable reference time or timezone is available, ask for the missing context.
+See
 [TIME.md](ontology/docs/TIME.md) for time value and window semantics. Knowledge
 discovery describes the Model; the generic Intent syntax is below. The Model
 and `transform` decide which combinations have valid business meaning.
@@ -142,7 +142,7 @@ Optional top-level graph fields and their shapes:
 | `constraints` | Array of edge objects, same shape as `edges` |
 | `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
 | `filters` | Array of `{"node":"...","dimension":"...","op":"eq","value":...}`; optional `kind` |
-| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}` |
+| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` may be `null` or omitted |
 | `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}`; optional `kind` |
 | `exists` | Array of existence objects described below |
 | `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}`; optional `kind` |
@@ -157,11 +157,12 @@ Optional top-level graph fields and their shapes:
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"asc|desc","take":<integer>}` |
 
-Time-window endpoints are `[start, end)` and accept a value of the dimension's
-declared logical type, `"now"`, `{"delta_ms":<integer>}` for elapsed time from
-request `now`, or `{"calendar":"day|week|month","offset":<integer>}` for a
-boundary relative to the period containing request `now`. Calendar boundaries
-require `ctx.tz`; a fixed offset cannot represent daylight-saving rules.
+Time windows are `[start, end)` with concrete values in the dimension's declared
+logical type. `end:null` or an omitted `end` means `[start, None)`: no upper
+time predicate. It does not mean `now`; future-dated rows may match. Resolve
+`now`, elapsed durations, calendar boundaries and timezone effects before
+submitting the Intent. The service rejects relative expressions and request
+`ctx`.
 
 An existence object has required `anchor` (an outer node instance ID),
 `nodes` (inner node objects), and `edges` (named edge objects connecting

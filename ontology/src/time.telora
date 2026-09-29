@@ -1,7 +1,6 @@
 # Time inputs are normalized against the Model's logical time role before binding.
 use crate::ontology as edsl;
 use std::array as array;
-use std::string as string;
 
 type TimeValue = enum {
     Date(String),
@@ -11,146 +10,7 @@ type TimeValue = enum {
     EpochMillis(Int),
 };
 
-type Window = struct { start: TimeValue, end: TimeValue };
-
-type RequestContext = struct { now: Int, tz: Option(Int) };
-type CalendarUnit = enum { Day, Week, Month };
-type CivilDate = struct { year: Int, month: Int, day: Int };
-
-def request_context: Fn(Int, Option(Int)) -> RequestContext = fn(now, tz) {
-    match tz {
-        Some(minutes) => if minutes < -840 || minutes > 840 {
-            fail!("request timezone offset must be within +/-840 minutes", minutes)
-        } else { {now, tz} },
-        None => {now, tz},
-    }
-};
-
-def pad2: Fn(Int) -> String = fn(n) { if n < 10 { `0\{n}` } else { `\{n}` } };
-def pad4: Fn(Int) -> String = fn(n) {
-    if n < 10 { `000\{n}` } else if n < 100 { `00\{n}` }
-    else if n < 1000 { `0\{n}` } else { `\{n}` }
-};
-
-def floor_div: Fn(Int, Int) -> Int = fn(value, divisor) {
-    value / divisor - if value % divisor < 0 { 1 } else { 0 }
-};
-def floor_mod: Fn(Int, Int) -> Int = fn(value, divisor) {
-    value - floor_div(value, divisor) * divisor
-};
-
-# Civil-from-days uses a proleptic Gregorian calendar, anchored at 1970-01-01.
-def civil_from_days: Fn(Int) -> CivilDate = fn(day) {
-    let shifted = day + 719468;
-    let era = floor_div(shifted, 146097);
-    let doe = shifted - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year0 = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day_of_month = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = year0 + if month <= 2 { 1 } else { 0 };
-    if year < 1 || year > 9999 { fail!("calendar boundary is outside the supported four-digit year range", day) }
-    else { {year, month, day: day_of_month} }
-};
-
-def days_from_civil: Fn(Int, Int, Int) -> Int = fn(year, month, day) {
-    let adjusted = year - if month <= 2 { 1 } else { 0 };
-    let era = floor_div(adjusted, 400);
-    let yoe = adjusted - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
-};
-
-def date_text: Fn(CivilDate) -> String = fn(date) {
-    `\{pad4(date.year)}-\{pad2(date.month)}-\{pad2(date.day)}`
-};
-
-def utc_second_parts: Fn(Int) -> String = fn(seconds) {
-    let day = floor_div(seconds, 86400);
-    let clock = seconds - day * 86400;
-    let date = civil_from_days(day);
-    `\{date_text(date)} \{pad2(clock / 3600)}:\{pad2(clock % 3600 / 60)}:\{pad2(clock % 60)}`
-};
-
-def calendar_boundary: Fn(RequestContext, edsl::TimeField, CalendarUnit, Int) -> TimeValue =
-    fn(context, role, unit, offset) {
-        let tz = match context.tz {
-            Some(minutes) => minutes,
-            None => fail!("calendar boundary requires request ctx.tz offset minutes"),
-        };
-        if context.now < -62135683200000 || context.now >= 253402387200000 {
-            fail!("calendar request time is outside supported year range", context.now)
-        } else if offset < -3652059 || offset > 3652059 {
-            fail!("calendar period offset is outside supported range", unit, offset)
-        } else {
-            let local_day = floor_div(context.now + tz * 60000, 86400000);
-            let boundary_day = match unit {
-                CalendarUnit::Day => local_day + offset,
-                CalendarUnit::Week => local_day - floor_mod(local_day + 3, 7) + offset * 7,
-                CalendarUnit::Month => do {
-                    let date = civil_from_days(local_day);
-                    let month_index = date.year * 12 + date.month - 1 + offset;
-                    let year = floor_div(month_index, 12);
-                    let month = floor_mod(month_index, 12) + 1;
-                    if year < 1 || year > 9999 { fail!("calendar month offset is outside supported year range", offset) }
-                    else { days_from_civil(year, month, 1) }
-                },
-            };
-            let date = civil_from_days(boundary_day);
-            match role.encoding {
-                edsl::TimeEncoding::DateText => TimeValue::Date(date_text(date)),
-                edsl::TimeEncoding::LocalText => fail!("local wall-clock storage needs a declared fixed-offset policy", role.encoding),
-                _ => now_for({now: boundary_day * 86400000 - tz * 60000, tz: context.tz}, role),
-            }
-        }
-    };
-
-def fixed_delta: Fn(RequestContext, edsl::TimeField, Int) -> TimeValue = fn(context, role, delta) {
-    if context.now < -62135683200000 || context.now >= 253402387200000
-        || delta < -315569520000000 || delta > 315569520000000 {
-        fail!("fixed duration is outside the supported instant range", context.now, delta)
-    } else { now_for({now: context.now + delta, tz: context.tz}, role) }
-};
-
-def now_seconds: Fn(Int, edsl::FilterOp) -> Int = fn(ms, op) {
-    let floor = ms / 1000 - if ms < 0 && ms % 1000 != 0 { 1 } else { 0 };
-    let ceil = floor + if ms % 1000 != 0 { 1 } else { 0 };
-    match op {
-        edsl::FilterOp::Ge => ceil,
-        edsl::FilterOp::Lt => ceil,
-        edsl::FilterOp::Gt => floor,
-        edsl::FilterOp::Le => floor,
-        edsl::FilterOp::Eq => if ms % 1000 == 0 { floor }
-            else { fail!("millisecond instant cannot be compared for equality with a second-resolution field", ms) },
-        edsl::FilterOp::Ne => if ms % 1000 == 0 { floor }
-            else { fail!("millisecond instant cannot be compared for equality with a second-resolution field", ms) },
-        _ => fail!("now requires a time comparison operator", op),
-    }
-};
-
-def now_for_op: Fn(RequestContext, edsl::TimeField, edsl::FilterOp) -> TimeValue = fn(context, role, op) {
-    match role.encoding {
-        edsl::TimeEncoding::UtcEpochMillis => TimeValue::EpochMillis(context.now),
-        edsl::TimeEncoding::LocalEpochMillis => TimeValue::EpochMillis(context.now),
-        edsl::TimeEncoding::CanonicalUtcSecondText => TimeValue::UtcSecond(utc_second_parts(now_seconds(context.now, op))),
-        edsl::TimeEncoding::Rfc3339Text => do {
-            let text = utc_second_parts(now_seconds(context.now, op));
-            let parts = string::split(text, " ");
-            TimeValue::Rfc3339(`\{parts[0]}T\{parts[1]}Z`)
-        },
-        _ => fail!("now cannot be used with this time field encoding", role.encoding),
-    }
-};
-
-def now_for: Fn(RequestContext, edsl::TimeField) -> TimeValue = fn(context, role) {
-    now_for_op(context, role, edsl::FilterOp::Ge)
-};
-
-def now_filter: Fn(RequestContext, edsl::TimeField, edsl::FilterOp, String) -> edsl::FilterInput =
-    fn(context, role, op, dimension) { input(role, now_for_op(context, role, op), dimension) };
+type Window = struct { start: TimeValue, end: Option(TimeValue) };
 
 def input: Fn(edsl::TimeField, TimeValue, String) -> edsl::FilterInput = fn(role, value, dimension) {
     match (role.encoding, value) {
@@ -192,21 +52,24 @@ def before: Fn(TimeValue, TimeValue, String) -> Bool = fn(start, end, dimension)
 def window_filters: Fn(edsl::PreparedPayload, String, String, Window) -> Array(edsl::FilterRequest) =
     fn(payload, subject, dimension, window) {
         let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
-        if !detail.filterable || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Ge })
-            || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Lt }) {
-            fail!("time dimension does not support half-open range filters", dimension)
+        if !detail.filterable || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Ge }) {
+            fail!("time dimension does not support lower-bound range filters", dimension)
         } else {
             let role = edsl::time_domain(payload, detail.dataset, detail.field);
             let start = input(role, window.start, dimension);
-            let end = input(role, window.end, dimension);
-            if !before(window.start, window.end, dimension) {
-                fail!("time window start must precede end", dimension, window)
-            } else {
-                [{id: dimension, subject, op: edsl::FilterOp::Ge, input: start},
-                 {id: dimension, subject, op: edsl::FilterOp::Lt, input: end}]
+            let lower: edsl::FilterRequest = {id: dimension, subject, op: edsl::FilterOp::Ge, input: start};
+            match window.end {
+                None => [lower],
+                Some(end) => if !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Lt }) {
+                    fail!("time dimension does not support upper-bound range filters", dimension)
+                } else if !before(window.start, end, dimension) {
+                    fail!("time window start must precede end", dimension, window)
+                } else {
+                    [lower, {id: dimension, subject, op: edsl::FilterOp::Lt,
+                        input: input(role, end, dimension)}]
+                },
             }
         }
     };
 
-pub use self::{TimeValue, Window, RequestContext, CalendarUnit, request_context, now_for,
-    now_filter, calendar_boundary, fixed_delta, window_filters};
+pub use self::{TimeValue, Window, window_filters};

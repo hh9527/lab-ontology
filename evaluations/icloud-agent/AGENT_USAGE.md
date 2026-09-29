@@ -13,8 +13,7 @@ Pass the following objects directly as tool arguments:
 ```
 
 The first object is for `ontology_index`; the latter two are alternatives for
-`ontology_info`. `ontology_transform` takes an `intent`; request context is
-supplied by the host, not by this tool's caller.
+`ontology_info`. `ontology_transform` takes only an `intent`.
 
 `index` returns a paginated catalog of visible knowledge points. Follow
 `next_offset` until the relevant area is found; do not treat the first page as
@@ -51,21 +50,22 @@ Never write SQL yourself or present a Query as the answer. The host retains
 SQL and bindings for its authorized execution layer; the Agent sees only an
 acceptance receipt or structured diagnostics.
 
+If the request uses relative time, obtain its reference time and timezone from
+the application context or your environment, then calculate concrete boundaries
+before submitting the Intent. Do not send `now`, relative calendar/delta
+expressions, or `ctx` to `ontology_transform`. In the business-language reverse
+explanation, state the concrete start and end times and the timezone used. An
+omitted upper boundary means no upper time restriction, not "until now". If
+the needed reference time or timezone is unavailable, ask for that context.
+
 Submit an Intent to `ontology_transform`:
 
 ```text
 {"intent":<Intent>}
 ```
 
-The host supplies `ctx.now` as epoch milliseconds when an Intent refers to
-request time; calendar boundaries also need `ctx.tz` in UTC offset minutes.
-Do not infer either value from the Agent environment or pass a `ctx` field to
-the tool. If the host omits required context, report that the service lacks a
-reference time; ask a user only for business choices they can meaningfully
-make, in ordinary time terms rather than protocol fields. The offset is fixed,
-not a named timezone or daylight-saving rule. Knowledge
-discovery describes the Model; the generic Intent syntax is below. The Model
-and `transform` decide which combinations have valid business meaning.
+Knowledge discovery describes the Model; the generic Intent syntax is below.
+The Model and `transform` decide which combinations have valid business meaning.
 
 ### Graph Intent syntax
 
@@ -95,7 +95,7 @@ Optional top-level graph fields and their shapes:
 | `constraints` | Array of edge objects, same shape as `edges` |
 | `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
 | `filters` | Array of `{"node":"...","dimension":"...","op":"eq","value":...}`; optional `kind` |
-| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}` |
+| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` may be `null` or omitted |
 | `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}`; optional `kind` |
 | `exists` | Array of existence objects described below |
 | `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}`; optional `kind` |
@@ -110,11 +110,9 @@ Optional top-level graph fields and their shapes:
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"asc|desc","take":<integer>}` |
 
-Time-window endpoints are `[start, end)` and accept a value of the dimension's
-declared logical type, `"now"`, `{"delta_ms":<integer>}` for elapsed time from
-request `now`, or `{"calendar":"day|week|month","offset":<integer>}` for a
-boundary relative to the period containing request `now`. Calendar boundaries
-require `ctx.tz`; a fixed offset cannot represent daylight-saving rules.
+Time windows use concrete values in the dimension's declared logical type.
+`end:null` or an omitted `end` means `[start, None)` with no upper predicate;
+it does not mean `now`. Relative expressions are rejected.
 
 An existence object has required `anchor` (an outer node instance ID),
 `nodes` (inner node objects), and `edges` (named edge objects connecting

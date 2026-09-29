@@ -13,17 +13,6 @@ if (!runnerPath?.startsWith('/') || !artifactPath?.startsWith('/')) {
 if (!outputDir?.startsWith('/') || !statSync(outputDir).isDirectory()) {
   throw new Error('ONTOLOGY_EVAL_OUTPUT_DIR must be an existing absolute host directory');
 }
-const requestContext = process.env.ONTOLOGY_EVAL_CTX_JSON
-  ? JSON.parse(process.env.ONTOLOGY_EVAL_CTX_JSON)
-  : undefined;
-if (requestContext !== undefined && (
-  requestContext === null || typeof requestContext !== 'object' || Array.isArray(requestContext) ||
-  !Number.isSafeInteger(requestContext.now) ||
-  (requestContext.tz !== undefined &&
-    (!Number.isInteger(requestContext.tz) || Math.abs(requestContext.tz) > 840))
-)) {
-  throw new Error('ONTOLOGY_EVAL_CTX_JSON must contain epoch-millisecond now and optional offset-minute tz');
-}
 const tools = [
   {
     name: 'index',
@@ -140,14 +129,12 @@ async function handle(message) {
       if (name === 'transform' &&
         (Object.keys(input).some((key) => key !== 'intent') ||
           input.intent === null || typeof input.intent !== 'object' || Array.isArray(input.intent))) {
-        return error(id, -32602, 'transform accepts only an Intent; request context is host-owned');
+        return error(id, -32602, 'transform accepts only an Intent');
       }
       try {
-        const result = await callService(name, name === 'transform' && requestContext !== undefined
-          ? { intent: input.intent, ctx: requestContext }
-          : input);
+        const result = await callService(name, input);
         if (name === 'transform') {
-          return reply(id, transformResult(result, input.intent, requestContext, outputDir));
+          return reply(id, transformResult(result, input.intent, outputDir));
         }
         return reply(id, {
           content: [{ type: 'text', text: JSON.stringify(result) }],
