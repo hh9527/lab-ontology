@@ -3,6 +3,10 @@
 This crate is an acceptance fixture derived from actual declarations in
 `imaster-cloud/telora/src/modeling/icloud`. It is not a production iCloud model
 and must not be presented as a complete interpretation of that domain.
+This document records modeling-pressure cases and assumptions, not the live
+service request contract. Use the root `USAGE.md` for the current Intent and
+batch protocol, and `ic/index` plus `ic/info` for the prepared Model's
+discoverable knowledge points.
 
 | Source fact | Current representation | Acceptance requirement |
 | --- | --- | --- |

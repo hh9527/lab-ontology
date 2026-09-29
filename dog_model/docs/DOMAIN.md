@@ -8,11 +8,11 @@ private implementation details and are intentionally absent here.
 ## Purpose
 
 The model exposes a closed vocabulary of *entities*, *measures*, and *dimensions*
-for a dog kennel / veterinary practice.  A resolver expresses an analytic request
-entirely in that vocabulary (see `INTENT.md`); the model deterministically lowers
-every well-formed request to a single parameterized SQL query with bound values.
-Requests may never contain SQL keywords, raw expressions, aliases, table or column
-names, or join fragments.
+for a dog kennel / veterinary practice. A resolver expresses an analytic request
+with the shared graph Intent contract (see `INTENT.md` and the root `USAGE.md`).
+Each accepted Intent lowers to one parameterized Query; the service can assess
+one to five independent Intents in one batch. Requests do not contain SQL
+fragments, physical table or column names, or caller-chosen SQL join paths.
 
 ## Entities and relationships
 

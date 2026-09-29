@@ -1,9 +1,9 @@
 # student transcripts tracking 领域模型 — DOMAIN.md
 
-本文是 `spider_model` Resolver 可读的知识包之一（与 `INTENT.md` 配套）。它只描述业务
-对象、领域词汇、概念关系、值域与统计口径。**不含**题目、标准答案、SQL、物理 schema 或
-Join 路径；物理映射属于 `spider_model/src/model.telora` 的私有实现。`INTENT.md` 定义
-输入 JSON 契约，本文词汇 id 是契约中引用 measure/dimension/entity 的稳定标识。
+本文描述 `spider_model` 的业务对象、领域词汇、概念关系、值域与统计口径。**不含**题目、
+标准答案、SQL、物理 schema 或 Join 路径；物理映射属于 `spider_model/src/model.telora`
+的私有实现。`INTENT.md` 指向根目录 `USAGE.md` 中的统一 JSON 契约；本文词汇 id 是
+Intent 中引用 dataset、measure、dimension 和 relation 的稳定标识。
 
 ## 业务对象
 

@@ -1,9 +1,8 @@
 # world_1 领域模型 — DOMAIN.md
 
-本文是 `world_model` Resolver 可读的知识包之一（与 `INTENT.md` 配套）。Resolver 经
-ontology 共享 closed Intent protocol 请求 lowering（`INTENT.md`）；本文提供业务对象、
-领域词汇与统计口径。**不含**题目、SQL、标准答案、物理 schema 或 Join 路径。物理映射
-在 `world_model/src/model.telora`（私有）。
+本文提供 `world_model` 的业务对象、领域词汇与统计口径。统一 graph Intent 与批次服务
+协议见根目录 `USAGE.md`（`INTENT.md` 提供领域入口）。**不含**题目、SQL、标准答案、
+物理 schema 或 Join 路径。物理映射在 `world_model/src/model.telora`（私有）。
 
 ## 业务对象
 

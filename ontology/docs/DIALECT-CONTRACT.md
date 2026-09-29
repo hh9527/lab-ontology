@@ -1,19 +1,20 @@
-# Shared QueryPlan and SQL dialects
+# Shared QueryAst and SQL dialects
 
-`ontology/intent` produces a validated `QueryPlan` without materializing SQL.
-The materializer is responsible for turning that same plan into a parameterized
-`Query`. At present only SQLite has a materializer; PostgreSQL is not yet a
-supported dialect. Adding it means passing the execution checks below, not
-simply producing syntactically plausible SQL.
+`ontology/intent` produces a validated `QueryAst` containing the immutable
+allocation context and a `QueryPlan`. Both `ontology/sqlite` and
+`ontology/postgres` expose `build_query(QueryAst) -> Query`. The SQLite
+renderer is used by the current example and icloud services. The PostgreSQL
+renderer exists but is not yet admitted as execution-equivalent across the
+full public AST; that requires the checks below, not merely plausible SQL.
 
 `ontology/postgres` has expression, Rows/DistinctRows, GroupCount and set candidate
 renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
 paging, derived UNION ALL sources and correlated EXISTS, including bounded
 linked and paired-endpoint bodies, scalar aggregate comparisons, ranked-key
-comparisons, and initial partitioned Top-N. Its candidate `QueryPlan` entry
-dispatches the same five validated result shapes as SQLite. Every rendering stage takes and returns
-an immutable context that allocates numbered bindings and collision-free
-internal aliases. The entry is not yet an admitted PostgreSQL dialect: Model
+comparisons, and initial partitioned Top-N. Its `QueryAst` entry
+dispatches the same validated result shapes as SQLite. Every rendering stage
+takes and returns an immutable context that carries allocated binding handles
+and allocates collision-free internal aliases. The entry is not yet an admitted PostgreSQL dialect: Model
 set output types are checked at ontology lowering, but full cross-dialect
 execution semantics remain unproven.
 The query AST validates set projection *shapes*, not Model output types.
@@ -22,10 +23,10 @@ emitting a set AST; a bare AST caller is responsible for its physical schema.
 SQLite can execute mixed-type sets that PostgreSQL rejects, so a model-derived
 set must never reach either renderer with mismatched output types.
 
-### Set projection type contract to complete
+### Set projection type contract
 
-Ontology must derive a positional *output* type for each model-derived set
-operand and reject different types before constructing `SetPlan`. Shapes
+Ontology derives a positional *output* type for each model-derived set
+operand and rejects different types before constructing `SetPlan`. Shapes
 (`Expr`, `Aggregate`, `Computed`) are not types. The query AST remains a closed
 structural vocabulary and does not inspect Model metadata or physical schema.
 In particular:
@@ -50,7 +51,8 @@ grouping key. Full cross-dialect query equivalence is still pending.
 
 ## Common contract
 
-- A query shape (`Rows`, `DistinctRows`, `SetRows`, `SetCount`, `GroupCount`)
+- A query shape (`Rows`, `DistinctRows`, `SetRows`, `SetCount`, `GroupCount`,
+  `JoinedGroups`, or `JoinedGroupCount`)
   and its validated `Plan` have one meaning regardless of dialect. A dialect
   cannot silently approximate an AST node, reinterpret an identity key, change
   the ordering of bindings, or apply session-dependent date/time semantics.
@@ -69,7 +71,7 @@ grouping key. Full cross-dialect query equivalence is still pending.
 
 | AST family | SQLite behavior in `query.telora` | Cross-dialect check |
 | --- | --- | --- |
-| Bind/column/source | `?`, unquoted identifiers | Number placeholders in final SQL order; quote PG identifiers without changing physical identity. Include nested scope bindings. |
+| Bind/column/source | `?n`, quoted identifiers as needed | Preserve allocated `$n` handles and physical identifier identity. Include nested scope bindings. |
 | Scalar text | `substr`, `instr`, `lower`, `length` | `instr` is one-based with zero for absence; `lower` currently folds ASCII A-Z only in default SQLite, while PG depends on collation. Use an explicitly equivalent collation/implementation and test non-ASCII and NULL. |
 | Relative UTC day | `strftime` with bound UTC anchor and bound integer duration | Keep the same canonical UTC second text and date bounds, not session timezone or implicit `now()`. Further calendar/epoch operations belong to #11. |
 | Aggregate/HAVING | `FILTER (WHERE ...)`, computed aggregate, parameterized threshold | Test NULL and empty-input results, distinct/filter interactions, calculated output and binding order. |

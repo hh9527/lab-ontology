@@ -57,7 +57,7 @@ The Agent resolves references such as "now", "three days ago", and calendar
 periods before submitting the Intent. Its reference time and timezone may
 come from the application client or its own environment. It should explain
 the resulting concrete dates and timezone to the user. The transform request
-contains only `intent`; `ctx`, `"now"`, `{"delta_ms":...}`, and
+contains only `intents` (an array of one to five); `ctx`, `"now"`, `{"delta_ms":...}`, and
 `{"calendar":...}` are rejected. The ontology does not read a clock or infer
 a timezone. The absolute Intent is replayable and has the same lowering at a
 later time.

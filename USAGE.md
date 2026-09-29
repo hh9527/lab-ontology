@@ -7,6 +7,13 @@ can replace or omit it. Run the build command from the repository root;
 the runner can start from any directory where the artifact is accessible.
 Sections 1-2 are for the trusted host, not the querying Agent.
 
+This is the current external service and Intent contract. Model-author and
+QueryAst boundaries are documented in [ONTOLOGY.md](ontology/docs/ONTOLOGY.md)
+and [QUERY.md](ontology/docs/QUERY.md). The domain `docs/DOMAIN.md` files
+describe business vocabulary; their `docs/INTENT.md` files point back to this
+shared syntax. `goals/` and evaluation results record earlier experiments,
+not current API contracts.
+
 ## 1. Build a snapshot
 
 ```sh
@@ -262,12 +269,15 @@ display values are the same entity: the join uses the aligned identity keys.
 
 In JSONL service mode, responses use the `telora.service/v1` envelope. On
 success, `ok.Index` contains `entries` and `next_offset`, `ok.Document` holds
-`Found`, `Candidates`, or `NotFound`, and `ok` from `transform` contains `sql`
-and `bindings`. A failure has `error: true` and structured `diagnostics`.
-Inspect diagnostics and repair the Intent using the relevant knowledge points.
-`transform` returns a parameterized Query (`sql` and `bindings`), not database
-results. Pass both together to an authorized execution layer; never interpolate
-values into SQL. Present the resulting data to the user in an appropriate form.
+`Found`, `Candidates`, or `NotFound`, and `ok` from `transform` contains the
+batch response described above. A rejected Intent is reported as
+`ok.accepted:false` with indexed diagnostics and `queries:null`; malformed
+requests and uncaptured service failures have `error:true` and top-level
+structured diagnostics. Inspect diagnostics and repair the Intent using the
+relevant knowledge points. Each accepted Query contains parameterized `sql`
+and `bindings`, not database results. Pass both together to an authorized
+execution layer; never interpolate values into SQL. Present the resulting data
+to the user in an appropriate form.
 When no execution layer is available, state that only an intermediate Query was
 produced and do not invent results.
 
@@ -283,8 +293,8 @@ produced and do not invent results.
 For example, one `example_models` snapshot serves the `dog`, `spider`, and
 `world` domains; `icloud_model` serves `ic` independently. Every domain
 exposes `<domain>/index`, `<domain>/info`, and `<domain>/transform`.
-Neither module requires external build sources, and neither collection
-declares HTTP routes. Both snapshot builds and `index` requests were checked
+Neither module requires external build sources. Both collections explicitly
+declare the HTTP POST routes listed above. Snapshot builds and `index` requests were checked
 with the commands above. The `ic` fixture is not a complete production domain
 model. A missing knowledge point or valid lowering path must not be filled in
 by guessing.

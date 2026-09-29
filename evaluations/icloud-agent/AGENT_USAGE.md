@@ -142,6 +142,28 @@ uniquely determines it from the JSON value; otherwise use `text`, `int`,
 `epoch_millis` as indicated by the knowledge point. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 
+### One deduplicated entity set
+
+Use `graph_union` when at least two independently valid graph paths must
+return one deduplicated population of the same entity:
+
+```text
+{"op":"graph_union","branches":[
+  {"result_node":"<node ID>","graph":<graph Intent>},
+  {"result_node":"<node ID>","graph":<graph Intent>}
+]}
+```
+
+Each branch has its own complete graph and names the node whose entity should
+appear in the result. All result nodes must denote the same dataset. Select
+the same dimensions in the same order in every branch, including plain
+dimensions for every field of the dataset's full identity grain. Identity
+fields remain visible result columns. Branches are raw-row plans; counts,
+measures, grouping, local ordering, Top-N, and pagination are not supported.
+The union deduplicates complete result rows, not merely display labels. It
+does not merge different entity types or reverse directed relations. For
+different result categories, submit separate Intents instead.
+
 ### Independent aggregate pair
 
 Use `graph_pair` when two measure populations must be aggregated separately

@@ -9,7 +9,10 @@ service collection. Each model keeps its own knowledge and lowering rules:
 | Spider | `spider/index` | `spider/info` | `spider/transform` |
 | World | `world/index` | `world/info` | `world/transform` |
 
-`<model>/transform` receives `{ "intent": ..., "ctx": ... }`; `ctx` is optional.
+`<model>/transform` receives `{ "intents": [<Intent>, ...] }` with one to five
+independent Intents. It returns indexed diagnostics for every item; `queries`
+contains the ordered Queries only when all Intents are accepted. Request `ctx`
+and a single `intent` key are not supported.
 `<model>/index` accepts `{ "offset": 0, "limit": 50 }` (or `{}`) for the
 paginated knowledge index. `<model>/info` accepts `{ "topic": "..." }` or
 `{ "target": ... }` for one knowledge point. The ic model has the same three
