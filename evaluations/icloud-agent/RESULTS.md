@@ -303,3 +303,45 @@ shows an exposed, correctable assumption rather than a silent semantic swap.
 Question 09 shows that relative calendar boundaries should be explained as
 actual business dates when the host has resolved them. These are Agent/workflow
 findings; no new ontology lowering defect was established by this rerun.
+
+## Agent-resolved-time branch rerun (2026-09-29)
+
+This run used `deepseek/deepseek-flash`, fresh OpenCode sessions, the
+`feat/agent-resolved-time` snapshot SHA-256
+`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`,
+and Agent guide SHA-256
+`2a2100e1cc8ac78eaecc251bbd49504aae81770c67194804b8cba64601400466`.
+The adapter retained Intent and Query in host-only receipts; the Agent saw only
+receipts or diagnostics. The Agent work directories contained only the guide,
+question, and restricted OpenCode configuration, but this run did **not**
+repeat the earlier bubblewrap filesystem/PID isolation check. It therefore
+measures behavior, not a newly proven hard-isolation boundary. All nine runs
+exited successfully. No SQL was executed against a database.
+
+| 题目 | transform 次数 | 最终观察 |
+| --- | ---: | --- |
+| 01 | 11 | 接受；按设备所属站点统计未清除告警超过 5 条的站点，解释与最终 Intent 一致。 |
+| 02 | 4 | 接受；每台防火墙取同一条最新 KPI 样本的两个端口值及时间。 |
+| 03 | 5 | 接受；以题面给定时刻展开为 `[2025-03-01 12:00:00, 2025-03-31 12:00:00)` UTC，取离线 GPON 端口原始采样 Max。 |
+| 04 | 2 | 接受；计数风扇实体，以父服务器自己的 warning 状态限定。 |
+| 05 | 36 | **不通过。** 得到 A→Z、Z→A 两个独立接受回执，但没有一个合并去重的结果；所称单 Intent 等价形式实际要求 A/Z 两端同时等于目标设备。 |
+| 06 | 2 | 接受；直接按告警中非空租户引用分组，孤儿租户 ID 可计入。 |
+| 07 | 4 | 部分；最终回执仍只计 1–4 台设备的站点，明确说明没有计入 0 台并请求确认。 |
+| 08 | 3 | 接受；按资产号及昆仑类型过滤服务器，按 Site ID 去重计数。 |
+| 09 | 3 | 接受；Agent 自行给出绝对 UTC 窗口并在解释中展开，未使用请求 `ctx`。 |
+
+05 的两个分支各自输出另一端设备名称，既未在一个 Query 中 `UNION`
+也未按设备身份跨分支去重。另一个接受回执
+`638169da-a881-45db-9afb-92906e7fe60b` 用两个 `any_of` 分别筛 A/Z
+节点；实际 SQL 是 `a.id = ? AND z.id = ?`，不是跨节点 OR，只能命中两端
+均为目标设备的自环。QueryAst 已有 `SetRows(SetOpKind::Union)` 和两个方言的
+物化，但公开 Intent 只接收 `graph`/`graph_pair`，缺少把两个合法 Graph
+结果按同一身份投影做去重并集的表达。预声明的实体 `union_source` 不解决
+请求时的两条关系路径合并。
+
+09 选取 UTC `[2026-08-29 00:00:00, 2026-09-29 00:00:00)`，同时约束告警
+发生时间和内存 KPI 样本时间，并明确说明 9 月 29 日当天不在窗口内。这是
+可见的业务假设，不是“最近一个月”的唯一口径；最终 Intent、SQL 和反向解释
+一致。07 的默认口径仍偏离“少于 5 台”通常包含 0 台的理解，但遗漏已明说，
+可由用户纠正。新的时间契约消除了旧版 09 的相对边界/解释不一致，尚不能
+证明 Agent 总能选对业务时间口径。
