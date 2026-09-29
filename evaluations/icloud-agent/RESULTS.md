@@ -383,3 +383,22 @@ The guide was subsequently revised to favor one Intent while allowing up to
 five separately accepted plans when that better serves the user's purpose.
 The comparisons above describe earlier guide versions, not a score for the
 revised multi-plan workflow.
+
+With the later MCP batch entry, question 05 was run once more using
+`deepseek/deepseek-flash`, the same IC snapshot SHA-256
+`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`,
+and candidate guide SHA-256
+`54bcce22ccc8c87c3b5ca0e24f569e8a4f64472bb6d1de154a9ca63c8694f43e`.
+The Agent submitted two Intents together and received one grouped receipt.
+The first filters one-way links where the selected device is at A and returns
+Z; the second filters the same link class where it is at Z and returns A.
+Each query projects device ID and name with within-query distinctness. The
+Agent explained the two business slices and explicitly noted that the service
+does not deduplicate across them. This is a useful decomposition, not a single
+unioned result.
+
+The question did not supply concrete device or tenant identifiers. The Agent
+bound literal strings `DEV-XXX` and `TEN-XXX` and only then asked for the real
+values. The receipt therefore demonstrates a valid query *shape*, not a query
+ready to return the requested device data. No database was executed, and this
+run does not establish behavior for every ambiguous request.
