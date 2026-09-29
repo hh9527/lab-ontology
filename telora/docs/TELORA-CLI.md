@@ -1,5 +1,8 @@
 # Telora CLI 指南
 
+> 历史快照：本文随 lab-ontology 保存，未同步到当前 Telora。下文命令可能已失效；
+> 请以当前 Telora CLI 的 `--help` 和本仓 [USAGE.md](../../USAGE.md) 为准。
+
 Telora CLI 及其运行时适配器共同充当运行时宿主（Host）：它们准备输入、执行 Entry
 效果并呈现诊断。
 

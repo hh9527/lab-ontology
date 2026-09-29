@@ -1,5 +1,8 @@
 # Telora 标准库指南
 
+> 历史快照：本文随 lab-ontology 保存，未同步到当前 Telora。源码导入、标准库与 CLI
+> 请以当前 Telora 仓库为准；本仓服务协议见 [USAGE.md](../../USAGE.md)。
+
 本文是公开标准库的模块地图，帮助程序作者找到承载某项能力的模块。语言用法见
 [`TELORA.md`](TELORA.md)，执行模式见 [`EXEC-MODE.md`](EXEC-MODE.md)，外部效果见
 [`EXEC-MODE.md`](EXEC-MODE.md)。

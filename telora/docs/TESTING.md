@@ -1,5 +1,8 @@
 # Telora 测试最佳实践
 
+> 历史快照：本文随 lab-ontology 保存，未同步到当前 Telora。测试命令和模块语法
+> 请以当前 Telora 仓库及其 CLI `--help` 为准。
+
 本文面向 Telora 程序作者和库作者，说明如何把语言契约写成可独立执行、可定位失败的
 测试。语言语义见 [语言设计](../docs/design/LANGUAGE.md)，命令和 JSONL 协议见
 [CLI 指南](TELORA-CLI.md)，测试模块的路径与可见性见 [Workspace 指南](WORKSPACE.md#test-root)。

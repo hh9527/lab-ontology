@@ -1,5 +1,8 @@
 # Telora 执行模式
 
+> 历史快照：本文随 lab-ontology 保存，未同步到当前 Telora。源码导入、CLI 与运行时接口
+> 请以当前 Telora 仓库和本仓 [USAGE.md](../../USAGE.md) 为准；不要将下文当作现行服务契约。
+
 Telora 从源码建立封闭 MIR，生成内存中的 Wasm，初始化后执行。无需中间制品落盘。
 
 | 命令 | 入口 | 行为 |

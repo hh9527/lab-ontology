@@ -1,5 +1,8 @@
 # Telora 语言教程
 
+> 历史快照：本文随 lab-ontology 保存，未同步到当前 Telora。下文的源码 `import`
+> 示例不适用于本仓正在使用的 `mod` 语法；请以当前 Telora 仓库为准。
+
 本文面向第一次使用 Telora 的程序作者和库作者，说明当前已经实现并经过验证的
 公开语言表面。完整语义以 [`../docs/design/LANGUAGE.md`](../docs/design/LANGUAGE.md)
 为准；本文没有说明的行为不能据此推断为存在。

@@ -1,5 +1,8 @@
 # Telora Workspace 与 Crate 指南
 
+> 历史快照：本文随 lab-ontology 保存，未同步到当前 Telora。下文的 `@src`/`import`
+> 路径说明不能用来配置本仓当前模块；请以当前 Telora 仓库为准。
+
 Telora workspace 把一组 crate、依赖来源和精确 lock 组织成可重复准备的模块世界。每条
 CLI 命令先发现 workspace，再准备完整 package graph，最后解析命令选中的模块。
 
