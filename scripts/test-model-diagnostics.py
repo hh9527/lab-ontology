@@ -23,8 +23,8 @@ expected = {
 seen = set()
 
 
-def source_text(label, case):
-    source = label["source"]
+def source_text(loc, case):
+    source = loc["source"]
     if source.startswith("@test-ctx/"):
         path = ROOT / "ontology/tests/diagnostics" / case["sources"][0]
     elif source.startswith("ontology/tests/"):
@@ -32,7 +32,7 @@ def source_text(label, case):
     else:
         path = ROOT / "ontology/src" / (source.removeprefix("ontology/") + ".telora")
     lines = path.read_bytes().splitlines(keepends=True)
-    location = label["location"]
+    location = loc["location"]
     start = sum(map(len, lines[:location["line"] - 1])) + location["column"]
     end = sum(map(len, lines[:location["end_line"] - 1])) + location["end_column"]
     return b"".join(lines)[start:end].decode()
@@ -44,17 +44,17 @@ for item in records:
     key = (item["test"], tuple(item["fixtures"]))
     message, rule = expected[key]
     assert item["phase"] == "execution" and item["message"] == message, item
-    labels = item["labels"]
-    assert any(label["primary"] and label["source"] == rule for label in labels), item
-    subjects = [label for label in labels if not label["primary"]]
+    locs = item["locs"]
+    assert locs and locs[0]["source"] == rule, item
+    subjects = locs[1:]
     if key[0] == "duplicate_mapping":
-        authored = [label for label in subjects if label["source"] == "ontology/tests/diagnostics/rejections"]
-        assert len(authored) == 2 and len({label["location"]["line"] for label in authored}) == 2, item
-        assert [source_text(label, item) for label in authored] == ["0", "0"], item
+        authored = [loc for loc in subjects if loc["source"] == "ontology/tests/diagnostics/rejections"]
+        assert len(authored) == 2 and len({loc["location"]["line"] for loc in authored}) == 2, item
+        assert [source_text(loc, item) for loc in authored] == ["0", "0"], item
     else:
-        authored = [label for label in subjects if label["source"].startswith("@test-ctx/")]
+        authored = [loc for loc in subjects if loc["source"].startswith("@test-ctx/")]
         expected_text = {("limit", (0,)): "-1", ("offset", (0,)): "-1", ("missing_field", (0,)): "{}"}
-        assert [source_text(label, item) for label in authored] == [expected_text[key]], item
+        assert [source_text(loc, item) for loc in authored] == [expected_text[key]], item
     seen.add(key)
 assert seen == expected.keys(), (seen, expected.keys())
-print("4 diagnostic cases passed: messages, execution phase, rule modules and exact subject spans")
+print("4 diagnostic cases passed: messages, rule-first locations and ordered subject spans")

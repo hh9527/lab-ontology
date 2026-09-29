@@ -119,9 +119,19 @@ be wrapped in an array:
 
 The response has `accepted`, `diagnostics`, and `queries`. Each diagnostic
 entry has a zero-based `index` identifying its Intent and a `diagnostic`
-containing severity, message, labels and notes. The array is empty when no
-Intent produces a warning or error. All Intents are checked even if an earlier
-one fails. Only when every Intent succeeds does `queries` contain one Query per
+containing `severity`, `message`, and ordered `locs`. For lowering failures
+raised with `fail!`, `locs[0]` is the rule location and `locs[1..]` are
+argument origins in order, including repeated origins. Source-file locations
+carry a source name and `start`/`end` positions: lines start at 1, and each
+`offset` is a zero-based UTF-8 byte offset within that line. Parsed request
+arguments also carry origins. Their internal source ID is `0` (reported as
+`<input>`); both points use `line: 0`, and each `offset` is a UTF-8 byte
+offset in the entire input. This keeps the same location shape without
+building a line index for dynamic input. Other diagnostics may use `locs[0]`
+for the offending input. The array is empty when no Intent produces a
+diagnostic.
+All Intents are checked even if an earlier one fails. Only when every Intent
+succeeds does `queries` contain one Query per
 Intent in the same order; otherwise `queries` is null. A successful batch may
 still have warnings; read them before using its Queries. This is a batch of
 independent plans, not a union into one result set.
