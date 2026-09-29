@@ -32,7 +32,8 @@ class PeerDirectionTest(unittest.TestCase):
 
     def lower(self, intent):
         result = subprocess.run(
-            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],
+            [str(TELORA), "run", "--request-fuel", "3000", "--initialization-fuel", "3000",
+             "--with-memory-limit", "1024", "icloud_model"],
             input=json.dumps({"method": "ic/transform", "input": {"intent": intent}}),
             text=True, capture_output=True, cwd=MODEL,
         )
@@ -47,7 +48,7 @@ class PeerDirectionTest(unittest.TestCase):
         edge = {"relation": "physical_link_peer_device", "from": "owner", "to": "peer"}
         owner_filter = {"node": "owner", "dimension": "device_id", "op": "eq", "kind": "text", "value": "a"}
         peers = self.lower({
-            "op": "graph", "root": "owner",
+            "op": "graph", "root": "owner", "row_grain": "association",
             "nodes": [root, {"id": "peer", "entity": "device"}], "edges": [edge],
             "select": [{"node": "peer", "dimension": "device_id"}], "filters": [owner_filter],
         })
@@ -99,7 +100,7 @@ class PeerDirectionTest(unittest.TestCase):
     def test_one_way_business_connection_only_traverses_a_to_z(self):
         def downstream(owner_id):
             return self.lower({
-                "op": "graph", "root": "owner",
+                "op": "graph", "root": "owner", "row_grain": "association",
                 "nodes": [{"id": "owner", "entity": "device"}, {"id": "next", "entity": "device"}],
                 "edges": [{"relation": "physical_link_downstream_device", "from": "owner", "to": "next"}],
                 "select": [{"node": "next", "dimension": "device_id"}],
@@ -110,6 +111,49 @@ class PeerDirectionTest(unittest.TestCase):
         self.assertEqual(downstream("a"), [("c",)])
         self.assertEqual(downstream("d"), [("a",)])
         self.assertEqual(downstream("c"), [])
+
+    def test_one_way_endpoint_inclusion_unions_unique_device_identities(self):
+        self.db.execute("ALTER TABLE I_EntNetworkElement ADD COLUMN name TEXT")
+        self.db.execute("UPDATE I_EntNetworkElement SET name = id")
+        self.db.execute(
+            "INSERT INTO EnterprisePhysicalLink VALUES (?, ?, ?, ?, ?)",
+            ("ac-duplicate", "a", "c", "red", "unidirectional"),
+        )
+
+        def branch(result, selected):
+            return {
+                "result_node": result,
+                "graph": {
+                    "op": "graph", "root": "link",
+                    "nodes": [
+                        {"id": "link", "entity": "physical_link"},
+                        {"id": "a", "entity": "device"},
+                        {"id": "z", "entity": "device"},
+                    ],
+                    "edges": [
+                        {"relation": "physical_link_a_device", "from": "link", "to": "a"},
+                        {"relation": "physical_link_z_device", "from": "link", "to": "z"},
+                    ],
+                    "select": [
+                        {"node": result, "dimension": "device_id"},
+                        {"node": result, "dimension": "device_tenant_id"},
+                        {"node": result, "dimension": "device_name"},
+                    ],
+                    "filters": [
+                        {"node": "link", "dimension": "physical_link_direction",
+                         "op": "eq", "value": "unidirectional"},
+                        {"node": selected, "dimension": "device_id", "op": "eq", "value": "a"},
+                        {"node": selected, "dimension": "device_tenant_id",
+                         "op": "eq", "value": "red"},
+                    ],
+                },
+            }
+
+        rows = self.lower({
+            "op": "graph_union",
+            "branches": [branch("z", "a"), branch("a", "z")],
+        })
+        self.assertEqual(sorted(rows), [("c", "red", "c"), ("d", "red", "d")])
 
 
 if __name__ == "__main__":

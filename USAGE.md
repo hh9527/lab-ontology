@@ -185,6 +185,35 @@ uniquely determines it from the JSON value; otherwise use `text`, `int`,
 `epoch_millis` as indicated by the knowledge point. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 
+### One deduplicated entity set
+
+Use `graph_union` when two independently valid graph paths must return one
+deduplicated population of the same entity:
+
+```text
+{"op":"graph_union","branches":[
+  {"result_node":"<node ID>","graph":<graph Intent>},
+  {"result_node":"<node ID>","graph":<graph Intent>}
+]}
+```
+
+Each `graph` is complete and follows its own declared relations, filters,
+authorization, and grain rules. Its `result_node` may differ from the root
+and from the other branch's result node. Both result nodes must name the same
+dataset. Select only dimensions of that result node, in the same dimension
+order on both branches, including plain dimensions for **every field of the
+dataset's declared identity grain**. This may be a composite identity.
+Identity fields are visible result columns in the current form. Other
+selected dimensions must be the same on both branches; SQL `UNION` then
+deduplicates complete result rows without merging distinct entity identities.
+
+`graph_union` currently accepts exactly two raw-row branches. A branch may
+qualify rows using `filters`, `exists`, and named graph edges, but cannot use
+counts, measures, identity grouping, local ordering, Top-N, or pagination.
+It cannot reverse a directed relation or turn two separately valid result
+types into one entity. Use separate accepted Intents when the user wants
+distinct result categories rather than one entity set.
+
 ### Independent aggregate pair
 
 Use `graph_pair` when two measure populations must be aggregated separately

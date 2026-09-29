@@ -280,7 +280,7 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::Gra
 };
 
 def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Dict(Value)) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, obj) {
-    if as_string(field(obj, "op")) != "graph" { fail!("aggregate pair operands must be graph intents") }
+    if as_string(field(obj, "op")) != "graph" { fail!("graph pair and union branches must be graph intents") }
     else {
         graph_keys(obj, "request", ["op", "root", "row_grain", "distinct", "nodes", "edges", "constraints", "select", "measures", "measure_having", "filters", "time_windows", "any_of", "exists", "count", "count_value", "count_having", "count_groups", "include_empty", "group_by_identity", "top_per", "top_by_measure", "order_by", "take"]);
         let request: edsl::GraphRequest = {
@@ -475,6 +475,76 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::Quer
     }
 };
 
+# A union returns one entity population, not an arbitrary mixture of rows.
+# Requiring its complete visible identity makes SQL's whole-row UNION distinct
+# equivalent to entity deduplication for the selected dimensions.
+def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, Int) -> String = fn(payload, request, result_node, branch) {
+    let node = edsl::graph_node(request, result_node);
+    if request.count != None || request.count_value != None || request.count_having != None
+        || request.count_groups || array::length(request.measures) > 0
+        || array::length(request.measure_having) > 0 || array::length(request.group_by_identity) > 0
+        || request.include_empty || request.top_per != None || request.top_by_measure != None
+        || array::length(request.order_by) > 0 || request.take != None {
+        fail!("graph union branch must return unordered raw entity rows without counts, measures or Top-N", branch)
+    } else if array::length(request.select) == 0 || !array::all(request.select, fn(item) { item.node == result_node }) {
+        fail!("graph union branch must select only dimensions of its result node", branch, result_node)
+    } else {
+        let entity = match array::find(payload.entities, fn(entry) { entry.id == node.entity }) {
+            Some(entry) => entry,
+            None => fail!("graph union result node has an unknown entity", branch, node.entity),
+        };
+        let grain = match entity.dataset {
+            Some(dataset) => dataset.grain,
+            None => if entity.key_field >= 0 { [entity.fields[entity.key_field].name] }
+                else { fail!("graph union result entity needs a declared identity", branch, node.entity) },
+        };
+        if !array::all(grain, fn(name) {
+            let field = match array::find(array::enumerate(entity.fields), fn(entry) { entry.1.name == name }) {
+                Some(entry) => entry.0,
+                None => fail!("graph union identity field is missing from the entity", branch, name),
+            };
+            array::any(request.select, fn(item) {
+                array::any(payload.dimensions, fn(dimension) {
+                    dimension.id == item.dimension && dimension.entity == entity.index
+                        && dimension.field == field && !dimension.computed
+                })
+            })
+        }) {
+            fail!("graph union branch must project every field of its complete result identity as a plain dimension", branch, node.entity, grain)
+        } else { node.entity }
+    }
+};
+
+def lower_graph_union: Fn(edsl::PreparedPayload, String, Dict(Value)) -> qb::QueryAst = fn(payload, subject, obj) {
+    graph_keys(obj, "graph union", ["op", "branches"]);
+    let branches = as_array(field(obj, "branches"));
+    if array::length(branches) != 2 {
+        fail!("graph union currently requires exactly two graph branches", array::length(branches))
+    } else {
+        let first = as_object(branches[0]);
+        let second = as_object(branches[1]);
+        graph_keys(first, "graph union branch 1", ["result_node", "graph"]);
+        graph_keys(second, "graph union branch 2", ["result_node", "graph"]);
+        let left_result = as_string(field(first, "result_node"));
+        let right_result = as_string(field(second, "result_node"));
+        let left = lower_graph_object(qb::build_context(), payload, subject, as_object(field(first, "graph")));
+        let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, as_object(field(second, "graph")));
+        let left_entity = union_graph_result(payload, left.1, left_result, 1);
+        let right_entity = union_graph_result(payload, right.1, right_result, 2);
+        let left_dimensions = array::map(left.1.select, fn(item) { item.dimension });
+        let right_dimensions = array::map(right.1.select, fn(item) { item.dimension });
+        if left_entity != right_entity {
+            fail!("graph union branches must return the same result entity", left_entity, right_entity)
+        } else if left_dimensions != right_dimensions {
+            fail!("graph union branch 2 must select the same result dimensions in the same order as branch 1", left_dimensions, right_dimensions)
+        } else {
+            qb::finish(right.0, qb::validate_query_plan(qb::QueryPlan::SetRows({
+                kind: qb::SetOpKind::Union, left: left.2, right: right.2
+            })))
+        }
+    }
+};
+
 def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
@@ -486,7 +556,8 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst =
             else { qb::QueryPlan::Rows(lowered.2) };
         qb::finish(lowered.0, qb::validate_query_plan(plan))
     } else if op == "graph_pair" { lower_graph_pair(payload, subject, obj) }
-    else { fail!("unsupported intent op; use graph or graph_pair with named nodes and relations", op) }
+    else if op == "graph_union" { lower_graph_union(payload, subject, obj) }
+    else { fail!("unsupported intent op; use graph, graph_pair or graph_union with named nodes and relations", op) }
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;

@@ -794,6 +794,15 @@ EXISTS 内部的 JOIN 不放大外层主体粒度，过滤值仍然参数化：
 
 关系 ID 必须由 Model 显式声明；不能用终点类型自动挑选路线。
 
+### 图分支的实体并集
+
+公开 Intent 的 `graph_union` 将两个独立合法的 `graph` 分支合成一个
+`QueryPlan::SetRows(Union)`。每个分支指定 `result_node`；两个节点可处于
+不同路径，但必须属于同一实体，按相同顺序投影相同维度，并显式投影完整的
+Model 身份字段。仅靠显示名或物理类型相同不足以证明可以合并。分支内的
+关系、授权及过滤仍各自经过普通 graph lowering；聚合、分支局部排序和限制
+不在这个入口中。当前只接受两个分支，身份字段会出现在结果中。
+
 ### 双端 hub（dual-end hub union slice）
 
 一个关系对象（hub）具有两个角色化端点：例如 `Pair` 行的 `left_member_id` 与
