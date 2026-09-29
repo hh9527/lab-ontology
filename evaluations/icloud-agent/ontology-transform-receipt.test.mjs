@@ -3,44 +3,58 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { transformResult } from './ontology-transform-receipt.mjs';
+import { transformResults } from './ontology-transform-receipt.mjs';
 
-test('success stores the complete Query without exposing it to the Agent', () => {
+test('success stores all Intents and Queries in one private receipt', () => {
   const outputDir = mkdtempSync(join(tmpdir(), 'ontology-receipt-'));
   try {
-    const intent = { op: 'graph', root: 's' };
-    const result = transformResult({ error: false, ok: { sql: 'SELECT ?1', bindings: [7] } },
-      intent, outputDir);
+    const intents = [{ op: 'graph', root: 'a' }, { op: 'graph', root: 'z' }];
+    const results = [
+      { error: false, ok: { sql: 'SELECT ?1', bindings: [7] } },
+      { error: false, ok: { sql: 'SELECT ?1', bindings: [9] } },
+    ];
+    const result = transformResults(results, intents, outputDir);
     const receipt = JSON.parse(result.content[0].text);
     assert.equal(result.isError, false);
     assert.equal(receipt.accepted, true);
+    assert.equal(receipt.count, 2);
     assert.match(receipt.receipt, /^[0-9a-f-]{36}$/);
     assert.doesNotMatch(JSON.stringify(result), /SELECT|bindings/);
     assert.deepEqual(readdirSync(outputDir), [`${receipt.receipt}.json`]);
     const path = join(outputDir, `${receipt.receipt}.json`);
     assert.equal(statSync(path).mode & 0o777, 0o600);
     assert.deepEqual(JSON.parse(readFileSync(path)), {
-      intent, query: { sql: 'SELECT ?1', bindings: [7] },
+      items: [
+        { intent: intents[0], query: results[0].ok },
+        { intent: intents[1], query: results[1].ok },
+      ],
     });
   } finally {
     rmSync(outputDir, { recursive: true });
   }
 });
 
-test('failure returns diagnostics and stores nothing', () => {
+test('one failed Intent returns indexed feedback and stores no partial bundle', () => {
   const outputDir = mkdtempSync(join(tmpdir(), 'ontology-receipt-'));
   try {
     const diagnostic = { schema: 'telora.service/v1', error: true,
       ok: { sql: 'SHOULD NOT LEAK', bindings: [] },
       diagnostics: [{ message: 'unknown entity' }] };
-    const result = transformResult(diagnostic, { root: 'bad' }, outputDir);
+    const result = transformResults([
+      { error: false, ok: { sql: 'SELECT ?1', bindings: [7] } },
+      diagnostic,
+    ], [{ root: 'valid' }, { root: 'bad' }], outputDir);
     assert.equal(result.isError, true);
     assert.deepEqual(JSON.parse(result.content[0].text), {
-      schema: diagnostic.schema, error: true, diagnostics: diagnostic.diagnostics,
+      accepted: false,
+      results: [
+        { index: 0, valid: true },
+        { index: 1, valid: false, diagnostics: diagnostic.diagnostics },
+      ],
     });
     assert.deepEqual(readdirSync(outputDir), []);
-    assert.throws(() => transformResult({ error: false, ok: { sql: 'SELECT 1' } },
-      {}, outputDir), /invalid transform response/);
+    assert.throws(() => transformResults([{ error: false, ok: { sql: 'SELECT 1' } }],
+      [{}], outputDir), /invalid transform response/);
     assert.deepEqual(readdirSync(outputDir), []);
   } finally {
     rmSync(outputDir, { recursive: true });

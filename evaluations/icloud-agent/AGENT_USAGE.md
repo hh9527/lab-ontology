@@ -13,7 +13,8 @@ Pass the following objects directly as tool arguments:
 ```
 
 The first object is for `ontology_index`; the latter two are alternatives for
-`ontology_info`. `ontology_transform` takes only an `intent`.
+`ontology_info`. `ontology_transform` takes an `intents` array of one to five
+independent Intents.
 
 `index` returns a paginated catalog of visible knowledge points. Follow
 `next_offset` until the relevant area is found; do not treat the first page as
@@ -34,23 +35,19 @@ Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
-the user's question. Each claimed result must be backed by an accepted Intent
-with that complete meaning; separate accepted Intents do not automatically
-combine into one result. If the Model or Intent language cannot express the
-requested result, stop and explain the unsupported business outcome rather
-than presenting a partial or approximate Intent as complete. Repeated
-diagnostics for the same missing capability are a reason to report that limit,
-not to keep changing the user's meaning. Explain the limit using the evidence:
-distinguish missing Model knowledge from an unsupported combination of known
-paths, without inventing missing facts. Before accepting the Intent as your
-answer, explain its business meaning back to yourself: who or what is counted
-or selected, which relationships, filters, time range and inclusions it uses,
-and what it leaves out. Compare that explanation with the user's words. Do not
-rename a different Model concept to make it appear to satisfy the request.
+the user's question. Aim to serve the user's business purpose with one accepted
+Intent. When one plan is insufficient, you may offer up to five accepted Intents
+in one `ontology_transform` call. Explain in business terms what each result
+would show and how the separate results help answer the question.
+The service does not merge or deduplicate results across plans, so do not claim
+that it has. If no supported plan gives a useful answer, explain the limitation
+or ask a focused business question. Do not change the user's meaning just to
+obtain a successful transform. Before answering, compare the business meaning
+of the accepted plan or plans with the user's request.
 
-When one reasonable interpretation is supported, submit its Intent and tell
-the user in ordinary business language what the accepted Intent means. Make
-any consequential assumption visible so the user can correct it. Ask a focused
+When one reasonable interpretation is supported, submit its plan or plans and
+tell the user in ordinary business language what each accepted Intent means.
+Make any consequential assumption visible so the user can correct it. Ask a focused
 business question when the request cannot responsibly be interpreted, or when
 the alternatives have materially different meanings and no reasonable default.
 Do not require clarification just because another interpretation is possible.
@@ -66,11 +63,16 @@ explanation, state the concrete start and end times and the timezone used. An
 omitted upper boundary means no upper time restriction, not "until now". If
 the needed reference time or timezone is unavailable, ask for that context.
 
-Submit an Intent to `ontology_transform`:
+Submit one or more Intents to `ontology_transform`:
 
 ```text
-{"intent":<Intent>}
+{"intents":[<Intent>, ...]}
 ```
+
+Even a single plan uses a one-element array. The tool returns one receipt only
+when all plans are accepted; otherwise it reports each plan's status and
+diagnostics by zero-based array index, without storing a partial bundle. In a
+failed batch, `valid:true` means that plan lowered, not that it was persisted.
 
 Knowledge discovery describes the Model; the generic Intent syntax is below.
 The Model and `transform` decide which combinations have valid business meaning.
@@ -180,9 +182,10 @@ The outer object accepts only `op`, `left`, `right`, and optional boolean
 display values are the same entity: the join uses the aligned identity keys.
 
 `index` and `info` expose knowledge points and references. A successful
-`transform` returns `{"accepted":true,"receipt":"<id>"}`; the host stores the
-submitted Intent and generated Query under that receipt. A failed transform
-returns structured diagnostics for repair. Neither response is a database
-result. In this evaluation there is no data execution layer: return the receipt
-and your business-language interpretation, not a fabricated number or SQL.
+`transform` returns `{"accepted":true,"receipt":"<id>","count":N}`; the host
+stores each submitted Intent and its generated Query under that grouped receipt.
+A failed transform returns indexed structured diagnostics for repair. Neither
+response is a database result. In this evaluation there is no data execution
+layer: return the receipt and your business-language interpretation of each
+planned result, not a fabricated number or SQL.
 When an execution layer is connected, present its returned data instead.

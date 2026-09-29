@@ -378,3 +378,8 @@ It did not present a partial query as the requested result. This is a clear
 improvement in this one case, not proof that the rule will generalize or that
 prompting can replace the missing Intent set-operation capability. No database
 query was executed.
+
+The guide was subsequently revised to favor one Intent while allowing up to
+five separately accepted plans when that better serves the user's purpose.
+The comparisons above describe earlier guide versions, not a score for the
+revised multi-plan workflow.

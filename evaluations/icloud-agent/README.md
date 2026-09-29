@@ -6,14 +6,17 @@ Give the candidate only an Agent-facing guide, one `QUESTION.md`, and access
 to the three MCP tools `index`, `info`, and `transform` through the restricted
 host endpoint. The Agent's filesystem and shell must not be able
 to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
-The adapter accepts only an Intent from the Agent on `ontology_transform`;
-relative time must be resolved by the Agent from application or environment
-context before this call. No request clock is injected into the service.
-On successful lowering it writes a mode-0600 JSON record containing the
-submitted Intent and generated Query to the existing
+The adapter accepts one to five independent Intents in a single
+`ontology_transform` call; relative time must be resolved by the Agent from
+application or environment context before this call. No request clock is
+injected into the service. It calls the underlying single-Intent service for
+each plan. If all lower successfully, it writes one mode-0600 JSON record
+containing the ordered Intents and generated Queries to the existing
 host-only directory named by `ONTOLOGY_EVAL_OUTPUT_DIR`. The tool returns only
 an acceptance receipt; the Agent cannot retrieve SQL or bindings through the
-three exposed tools. Failed lowering returns diagnostics and writes no record.
+three exposed tools. A failed plan returns indexed diagnostics for all plans
+and writes no partial record. Results are not merged or deduplicated across
+plans.
 For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.
 Supply the guide and question as host-selected attachments; disable the
 Agent's general file-reading tool entirely.

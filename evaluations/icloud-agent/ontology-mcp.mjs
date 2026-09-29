@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { transformResult } from './ontology-transform-receipt.mjs';
+import { transformResults } from './ontology-transform-receipt.mjs';
 
 const runnerPath = process.env.ONTOLOGY_EVAL_RUNNER;
 const artifactPath = process.env.ONTOLOGY_EVAL_ARTIFACT;
@@ -50,13 +50,16 @@ const tools = [
   },
   {
     name: 'transform',
-    description: 'Validate and store a Model-backed Intent; return a receipt or structured diagnostics.',
+    description: 'Validate and store one to five independent Model-backed Intents; return a grouped receipt or per-Intent diagnostics.',
     inputSchema: {
       type: 'object',
       properties: {
-        intent: { type: 'object', additionalProperties: true },
+        intents: {
+          type: 'array', minItems: 1, maxItems: 5,
+          items: { type: 'object', additionalProperties: true },
+        },
       },
-      required: ['intent'],
+      required: ['intents'],
       additionalProperties: false,
     },
   },
@@ -127,15 +130,19 @@ async function handle(message) {
         return error(id, -32602, 'tool input must be an object');
       }
       if (name === 'transform' &&
-        (Object.keys(input).some((key) => key !== 'intent') ||
-          input.intent === null || typeof input.intent !== 'object' || Array.isArray(input.intent))) {
-        return error(id, -32602, 'transform accepts only an Intent');
+        (Object.keys(input).some((key) => key !== 'intents') ||
+          !Array.isArray(input.intents) || input.intents.length < 1 ||
+          input.intents.length > 5 || input.intents.some((intent) =>
+            intent === null || typeof intent !== 'object' || Array.isArray(intent)))) {
+        return error(id, -32602, 'transform requires 1 to 5 Intents');
       }
       try {
-        const result = await callService(name, input);
         if (name === 'transform') {
-          return reply(id, transformResult(result, input.intent, outputDir));
+          const results = await Promise.all(input.intents.map((intent) =>
+            callService(name, { intent })));
+          return reply(id, transformResults(results, input.intents, outputDir));
         }
+        const result = await callService(name, input);
         return reply(id, {
           content: [{ type: 'text', text: JSON.stringify(result) }],
           isError: result?.error === true,
