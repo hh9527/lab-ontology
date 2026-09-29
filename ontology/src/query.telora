@@ -488,7 +488,7 @@ type Plan = struct {
 
 # Top-level result shape is part of the shared AST.  DISTINCT and set
 # operations cannot be inferred from a plain Plan's projection alone.
-type SetPlan = struct { kind: SetOpKind, left: Plan, right: Plan };
+type SetPlan = struct { kind: SetOpKind, operands: Array(Plan) };
 type JoinedGroups = struct {
     left: Plan,
     right: Plan,
@@ -1651,9 +1651,9 @@ def validate_contextual_pagination: Fn(QueryPlan, BuildCtx) -> QueryPlan = fn(qu
         QueryPlan::DistinctRows(plan) => QueryPlan::DistinctRows(pagination_in_context(plan, ctx)),
         QueryPlan::GroupCount(plan) => QueryPlan::GroupCount(pagination_in_context(plan, ctx)),
         QueryPlan::SetRows(set) => QueryPlan::SetRows({...set,
-            left: pagination_in_context(set.left, ctx), right: pagination_in_context(set.right, ctx)}),
+            operands: array::map(set.operands, fn(plan) { pagination_in_context(plan, ctx) })}),
         QueryPlan::SetCount(set) => QueryPlan::SetCount({...set,
-            left: pagination_in_context(set.left, ctx), right: pagination_in_context(set.right, ctx)}),
+            operands: array::map(set.operands, fn(plan) { pagination_in_context(plan, ctx) })}),
         QueryPlan::JoinedGroups(joined) => QueryPlan::JoinedGroups({...joined,
             left: pagination_in_context(joined.left, ctx), right: pagination_in_context(joined.right, ctx)}),
         QueryPlan::JoinedGroupCount(joined) => QueryPlan::JoinedGroupCount({...joined,
@@ -2796,36 +2796,42 @@ def set_operand_embeddable: Fn(Plan) -> Bool = fn(plan) {
 # Pure compatibility probe for set operands: both structurally valid, both
 # embeddable, non-zero equal projection arity, and positionally compatible
 # projection categories.  Never fails.
-def set_ok: Fn(SetOpKind, Plan, Plan) -> Bool = fn(kind, left, right) {
-    if !structure_ok(left) || !structure_ok(right) {
-        False
-    } else if !set_operand_embeddable(left) || !set_operand_embeddable(right) {
-        False
-    } else if array::length(left.projection) == 0 || array::length(right.projection) == 0 {
-        False
-    } else if array::length(left.projection) != array::length(right.projection) {
-        False
-    } else {
-        set_categories(left) == set_categories(right)
+def set_ok: Fn(SetOpKind, Array(Plan)) -> Bool = fn(kind, operands) {
+    if array::length(operands) < 2 { False }
+    else {
+        let first = operands[0];
+        array::length(first.projection) > 0 && array::all(operands, fn(plan) {
+            structure_ok(plan) && set_operand_embeddable(plan)
+                && array::length(plan.projection) == array::length(first.projection)
+                && set_categories(plan) == set_categories(first)
+        })
     }
 };
 
-# Both operands of a set operation must be independently embeddable and have
+# All operands of a set operation must be independently embeddable and have
 # compatible positional projection shapes. Dialect renderers decide the SQL syntax.
-def validate_set_operands: Fn(SetOpKind, Plan, Plan) -> (Plan, Plan) = fn(kind, left, right) {
-    let left_structured = validate_structure(left);
-    let right_structured = validate_structure(right);
-    if !set_operand_embeddable(left_structured) || !set_operand_embeddable(right_structured) {
-        fail!("set operation operand carries local ordering/limit/offset/partition that cannot be embedded", kind)
-    } else if array::length(left_structured.projection) == 0
-        || array::length(right_structured.projection) == 0 {
-        fail!("set operation operands must have a non-zero projection", kind)
-    } else if array::length(left_structured.projection) != array::length(right_structured.projection) {
-        fail!("set operation operand projection arity mismatch", kind)
-    } else if set_categories(left_structured) != set_categories(right_structured) {
-        fail!("set operation operands have positionally incompatible projection shapes", kind)
-    } else {
-        (left_structured, right_structured)
+def validate_set_operands: Fn(SetOpKind, Array(Plan)) -> Array(Plan) = fn(kind, operands) {
+    if array::length(operands) < 2 { fail!("set operation requires at least two operands", kind) }
+    else {
+        let structured = array::map(operands, validate_structure);
+        let first = structured[0];
+        if let Some(entry) = array::find(array::enumerate(structured), fn(entry) {
+            !set_operand_embeddable(entry.1)
+        }) {
+            fail!("set operation operand carries local ordering/limit/offset/partition that cannot be embedded", kind, entry.0 + 1)
+        } else if let Some(entry) = array::find(array::enumerate(structured), fn(entry) {
+            array::length(entry.1.projection) == 0
+        }) {
+            fail!("set operation operands must have a non-zero projection", kind, entry.0 + 1)
+        } else if let Some(entry) = array::find(array::enumerate(structured), fn(entry) {
+            array::length(entry.1.projection) != array::length(first.projection)
+        }) {
+            fail!("set operation operand projection arity mismatch", kind, entry.0 + 1)
+        } else if let Some(entry) = array::find(array::enumerate(structured), fn(entry) {
+            set_categories(entry.1) != set_categories(first)
+        }) {
+            fail!("set operation operands have positionally incompatible projection shapes", kind, entry.0 + 1)
+        } else { structured }
     }
 };
 
@@ -2883,12 +2889,10 @@ def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
         QueryPlan::Rows(plan) => QueryPlan::Rows(validate_structure(plan)),
         QueryPlan::DistinctRows(plan) => QueryPlan::DistinctRows(validate_distinct_plan(plan)),
         QueryPlan::SetRows(set) => {
-            let operands = validate_set_operands(set.kind, set.left, set.right);
-            QueryPlan::SetRows({kind: set.kind, left: operands.0, right: operands.1})
+            QueryPlan::SetRows({...set, operands: validate_set_operands(set.kind, set.operands)})
         },
         QueryPlan::SetCount(set) => {
-            let operands = validate_set_operands(set.kind, set.left, set.right);
-            QueryPlan::SetCount({kind: set.kind, left: operands.0, right: operands.1})
+            QueryPlan::SetCount({...set, operands: validate_set_operands(set.kind, set.operands)})
         },
         QueryPlan::GroupCount(plan) => {
             let structured = validate_structure(plan);

@@ -187,7 +187,7 @@ use the stable value ID, not its physical wire or localized label.
 
 ### One deduplicated entity set
 
-Use `graph_union` when two independently valid graph paths must return one
+Use `graph_union` when two or more independently valid graph paths must return one
 deduplicated population of the same entity:
 
 ```text
@@ -199,15 +199,15 @@ deduplicated population of the same entity:
 
 Each `graph` is complete and follows its own declared relations, filters,
 authorization, and grain rules. Its `result_node` may differ from the root
-and from the other branch's result node. Both result nodes must name the same
+and from other branches' result nodes. All result nodes must name the same
 dataset. Select only dimensions of that result node, in the same dimension
-order on both branches, including plain dimensions for **every field of the
+order across all branches, including plain dimensions for **every field of the
 dataset's declared identity grain**. This may be a composite identity.
 Identity fields are visible result columns in the current form. Other
-selected dimensions must be the same on both branches; SQL `UNION` then
+selected dimensions must be the same across branches; SQL `UNION` then
 deduplicates complete result rows without merging distinct entity identities.
 
-`graph_union` currently accepts exactly two raw-row branches. A branch may
+`graph_union` accepts at least two raw-row branches. A branch may
 qualify rows using `filters`, `exists`, and named graph edges, but cannot use
 counts, measures, identity grouping, local ordering, Top-N, or pagination.
 It cannot reverse a directed relation or turn two separately valid result
