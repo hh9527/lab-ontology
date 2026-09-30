@@ -2,6 +2,7 @@ use crate::ontology as edsl;
 use crate::query as qb;
 use crate::time as time;
 use std::array as array;
+use std::blame as blame;
 use std::codec as codec;
 use std::diagnostics as diagnostics;
 use std::dict as dict;
@@ -41,7 +42,7 @@ def field: Fn(Dict(Value), String) -> Value = fn(obj, key) {
 def field_at: Fn(Dict(Value), String, String) -> Value = fn(obj, key, path) {
     match dict::get(obj, key) {
         Some(value) => value,
-        None => fail!(`intent field is missing: \{path}.\{key}; see info topic syntax/graph/select`, obj, key),
+        None => fail!(`intent field is missing: \{path}.\{key}; see info topic syntax/graph/select; allowed keys: node, dimension`, obj, key),
     }
 };
 
@@ -67,7 +68,7 @@ def graph_keys: Fn(Dict(Value), String, Array(String)) -> () = fn(obj, context, 
     match array::find(dict::keys(obj), fn(key) {
         !array::any(allowed, fn(ok) { ok == key })
     }) {
-        Some(key) => fail!(`graph intent contains unsupported key \{key} in \{context}; see info topic \{topic}`, context, key),
+        Some(key) => fail!(`graph intent contains unsupported key \{key} in \{context}; see info topic \{topic}; allowed keys: \{string::join(allowed, ", ")}`, context, key),
         None => (),
     }
 };
@@ -84,7 +85,7 @@ def parse_op: Fn(String) -> edsl::FilterOp = fn(op) {
         "not_contains" => edsl::FilterOp::NotContains,
         "starts_with" => edsl::FilterOp::StartsWith,
         "ends_with" => edsl::FilterOp::EndsWith,
-        _ => fail!(`unsupported filter operator \{op}; see info topic syntax/graph/filter`, op),
+        _ => fail!(`unsupported filter operator \{op}; see info topic syntax/graph/filter; allowed operators: eq, ne, gt, ge, lt, le, contains, not_contains, starts_with, ends_with`, op),
     }
 };
 
@@ -184,23 +185,31 @@ def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput
 type RawGraphFilter = struct { node: String, dimension: String, op: String, value: Value };
 type RawGraphAnyOf = struct { node: String, dimension: String, values: Array(Value) };
 type RawGraphHaving = struct { node: String, measure: String, op: String, value: Value };
+type RawTimeWindow = struct { node: String, dimension: String, start: Value, end: Option(Value) };
+
+def decode_with_topic: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, topic) {
+    match codec::decode@[A](value) {
+        Ok(decoded) => decoded,
+        Err(error) => raise!(blame::with_context(error, `see info topic \{topic}`)),
+    }
+};
 
 def parse_graph_node: Fn(Value) -> edsl::GraphNode = fn(item) {
     let obj = as_object(item);
     graph_keys(obj, "node", ["id", "entity"]);
-    codec::decode@[edsl::GraphNode](item).unwrap!()
+    decode_with_topic@[edsl::GraphNode](item, "syntax/graph/node")
 };
 
 def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
     let obj = as_object(item);
     graph_keys(obj, "edge", ["relation", "from", "to"]);
-    codec::decode@[edsl::GraphEdge](item).unwrap!()
+    decode_with_topic@[edsl::GraphEdge](item, "syntax/graph/edge")
 };
 
 def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphFilter = fn(payload, subject, item) {
     let obj = as_object(item);
     graph_keys(obj, "filter", ["node", "dimension", "op", "value"]);
-    let raw = codec::decode@[RawGraphFilter](item).unwrap!();
+    let raw = decode_with_topic@[RawGraphFilter](item, "syntax/graph/filter");
     let dimension = raw.dimension;
     let op = parse_op(raw.op);
     let value = raw.value;
@@ -212,7 +221,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphF
                 || kind == edsl::FilterInputKind::LocalDateTime
         });
         if temporal {
-            fail!("resolve now to an absolute time value before submitting intent", dimension)
+            fail!("resolve now to an absolute time value before submitting intent; see info topic syntax/graph/filter", dimension, value)
         } else { inferred_input(payload, subject, dimension, value) }
     } else { inferred_input(payload, subject, dimension, value) };
     let request: edsl::FilterRequest = {
@@ -224,7 +233,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphF
 def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
     fn(role, value) {
         match value {
-            Value::String("now") => fail!("resolve now to an absolute time boundary before submitting intent"),
+            Value::String("now") => fail!("resolve now to an absolute time boundary before submitting intent; see info topic syntax/graph/filter", value),
             Value::String(text) => match role.encoding {
                 edsl::TimeEncoding::DateText => time::TimeValue::Date(text),
                 edsl::TimeEncoding::Rfc3339Text => time::TimeValue::Rfc3339(text),
@@ -246,25 +255,23 @@ def parse_time_window: Fn(edsl::PreparedPayload, String, Value) -> Array(edsl::G
     fn(payload, subject, value) {
         let obj = as_object(value);
         graph_keys(obj, "time window", ["node", "dimension", "start", "end"]);
-        let node = as_string(field(obj, "node"));
-        let dimension = as_string(field(obj, "dimension"));
-        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+        let raw = decode_with_topic@[RawTimeWindow](value, "syntax/graph/filter");
+        let detail = edsl::dimension_detail_for_subject(payload, subject, raw.dimension);
         let role = edsl::time_domain(payload, detail.dataset, detail.field);
-        let window: time::Window = {start: parse_time_value(role, field(obj, "start")),
-            end: match dict::get(obj, "end") {
+        let window: time::Window = {start: parse_time_value(role, raw.start),
+            end: match raw.end {
                 None => None,
-                Some(Value::None) => None,
                 Some(end) => Some(parse_time_value(role, end)),
             }};
-        array::map(time::window_filters(payload, subject, dimension, window), fn(request) {
-            {node, request}
+        array::map(time::window_filters(payload, subject, raw.dimension, window), fn(request) {
+            {node: raw.node, request}
         })
     };
 
 def parse_graph_any_of: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphAnyOf = fn(payload, subject, item) {
     let obj = as_object(item);
     graph_keys(obj, "any_of", ["node", "dimension", "values"]);
-    let raw = codec::decode@[RawGraphAnyOf](item).unwrap!();
+    let raw = decode_with_topic@[RawGraphAnyOf](item, "syntax/graph/filter");
     {node: raw.node, dimension: raw.dimension,
         values: array::map(raw.values, fn(value) { inferred_input(payload, subject, raw.dimension, value) })}
 };
@@ -272,7 +279,7 @@ def parse_graph_any_of: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphA
 def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
     let obj = as_object(item);
     graph_keys(obj, "aggregate threshold", ["node", "measure", "op", "value"]);
-    let raw = codec::decode@[RawGraphHaving](item).unwrap!();
+    let raw = decode_with_topic@[RawGraphHaving](item, "syntax/graph/aggregate");
     {node: raw.node, measure: raw.measure, op: parse_op(raw.op),
         threshold: measure_input(payload, raw.measure, raw.value)}
 };
