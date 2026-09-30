@@ -66,7 +66,7 @@ work still needed before declaring full cross-dialect support.
   require complete participant keys. A business link can mark endpoint roles
   as directed or undirected; a physical A/Z storage position alone does not
   imply business direction.
-- `@doc`, `@term`, descriptions, labels, localized text, and references enrich the
+- `@knowledge_doc`, `@term`, descriptions, labels, localized text, and references enrich the
   knowledge map without granting query access or creating traversal edges.
   Only a declared relation or business link authorizes graph traversal.
 - Time roles declare logical type and physical encoding. The caller supplies

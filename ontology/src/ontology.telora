@@ -197,7 +197,7 @@ type EntityId = struct { id: String };
 # fields identify one logical row; time names the authoritative UTC instant.
 type DatasetKind = enum { Entity, Event, Metric };
 type TimeSemantics = enum { Utc, Local, Date };
-type TimeLogicalType = enum { LocalDateTime, Date, Rfc3339, EpochMillis, UtcSecond };
+type TimeLogicalType = enum { LocalDateTime, Date, Rfc3339, EpochMillis, Utc1 };
 type TimeEncoding = enum { CanonicalUtcSecondText, UtcEpochMillis, LocalText, LocalEpochMillis, DateText, Rfc3339Text };
 @prelude::property(PropertyTarget::Field)
 type TimeField = struct { semantics: TimeSemantics, encoding: TimeEncoding };
@@ -420,7 +420,35 @@ type FilterOp = enum {
     Contains, NotContains, StartsWith, EndsWith,
 };
 
-type FilterInputKind = enum { Text, Number, Int, Bool, Rfc3339, EpochMillis, Date, UtcSecond, LocalDateTime };
+@prelude::property(PropertyTarget::Variant)
+type VariantDoc = struct { text: String };
+
+def doc: Fn(String) -> Fn(property::VariantPropertyCtx, Option(VariantDoc)) -> VariantDoc = fn(text) {
+    fn(ctx, previous) { {text} }
+};
+
+type FilterInputKind = enum {
+    Text, Number, Int, Bool, Rfc3339, EpochMillis, Date,
+    @doc("UTC time text with second precision. Format: YYYY-MM-DD HH:MM:SS, without a timezone suffix. Example: \"2026-09-20 16:00:00\".")
+    Utc1,
+    LocalDateTime,
+};
+
+type FilterInputDoc = struct { kind: FilterInputKind, text: String };
+
+def filter_input_docs: Fn(Array(FilterInputKind)) -> Array(FilterInputDoc) = fn(kinds) {
+    array::flat_map(kinds, fn(kind) {
+        let name = codec::encode(kind);
+        array::flat_map(td::variants(FilterInputKind.type), fn(variant) {
+            if Value::String(variant.name) != name { [] } else {
+                match property::get_variant_prop(FilterInputKind.type, variant.index, VariantDoc.type) {
+                    Some(note) => [{kind, text: note.text}],
+                    None => [],
+                }
+            }
+        })
+    })
+};
 
 type FilterInput = enum {
     Text(String),
@@ -430,7 +458,7 @@ type FilterInput = enum {
     Rfc3339(String),
     EpochMillis(Int),
     Date(String),
-    UtcSecond(String),
+    Utc1(String),
     LocalDateTime(String),
 };
 
@@ -547,6 +575,7 @@ type DimensionBrief = struct {
     filterable: Bool,
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
+    input_docs: Array(FilterInputDoc),
     values: Array(EnumValueEntry),
     canonical_values: Array(CanonicalValueSpec),
     canonical_order: Array(String),
@@ -568,6 +597,7 @@ type SubjectDimensionBrief = struct {
     filterable: Bool,
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
+    input_docs: Array(FilterInputDoc),
     values: Array(BusinessValueBrief),
     canonical_order: Array(String),
     scope: Array(DimensionScopeBrief),
@@ -894,7 +924,7 @@ def dataset_alias: Fn(String) -> Fn(td::TypeDesc, Option(DatasetAliasesDef)) -> 
     }
 };
 
-def doc: Fn(KnowledgeTarget, String) -> Fn(td::TypeDesc, Option(KnowledgeDocs)) -> KnowledgeDocs = fn(target, text) {
+def knowledge_doc: Fn(KnowledgeTarget, String) -> Fn(td::TypeDesc, Option(KnowledgeDocs)) -> KnowledgeDocs = fn(target, text) {
     fn(ctx, previous) {
         let entries = match previous { Some(value) => value.entries, None => [] };
         {entries: array::push(entries, {target, text})}
@@ -1221,7 +1251,7 @@ def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input
         FilterInput::Rfc3339(_) => False,
         FilterInput::EpochMillis(_) => False,
         FilterInput::Date(_) => False,
-        FilterInput::UtcSecond(_) => False,
+        FilterInput::Utc1(_) => False,
         FilterInput::LocalDateTime(_) => False,
     }
 };
@@ -1955,7 +1985,7 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
                             FilterInput::Rfc3339(_) => False,
                             FilterInput::EpochMillis(_) => False,
                             FilterInput::Date(_) => False,
-                            FilterInput::UtcSecond(_) => False,
+                            FilterInput::Utc1(_) => False,
                             FilterInput::LocalDateTime(_) => False,
                         }
                     })
@@ -2044,7 +2074,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
                         Some(role) => role.encoding == TimeEncoding::CanonicalUtcSecondText,
                         None => False,
-                    } { FilterInputKind::UtcSecond }
+                    } { FilterInputKind::Utc1 }
                     else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
                         Some(role) => role.encoding == TimeEncoding::Rfc3339Text,
                         None => False,
@@ -2076,7 +2106,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     fail!("enum dimension supports only text business values and Eq filters", entity.id, f.name)
                 } else if array::length(mapped) == 0 && (array::any(dd.input_kinds, fn(kind) {
                     if epoch || valid_kind == FilterInputKind::Rfc3339 || valid_kind == FilterInputKind::Date
-                        || valid_kind == FilterInputKind::UtcSecond || valid_kind == FilterInputKind::LocalDateTime { kind != valid_kind }
+                        || valid_kind == FilterInputKind::Utc1 || valid_kind == FilterInputKind::LocalDateTime { kind != valid_kind }
                     else if f.ty == Int.type || f.ty == Float.type {
                         kind != FilterInputKind::Int && kind != FilterInputKind::Number
                     } else { kind != valid_kind }
@@ -2093,7 +2123,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         FilterInputKind::Rfc3339 => OutputType::Text,
                         FilterInputKind::EpochMillis => OutputType::Integer,
                         FilterInputKind::Date => OutputType::Text,
-                        FilterInputKind::UtcSecond => OutputType::Text,
+                        FilterInputKind::Utc1 => OutputType::Text,
                         FilterInputKind::LocalDateTime => OutputType::Text,
                     };
                     [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index))]
@@ -2118,7 +2148,7 @@ def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb:
             FilterInputKind::Text => 1,
             FilterInputKind::Rfc3339 => 1,
             FilterInputKind::Date => 1,
-            FilterInputKind::UtcSecond => 1,
+            FilterInputKind::Utc1 => 1,
             FilterInputKind::LocalDateTime => 1,
             FilterInputKind::Int => 2,
             FilterInputKind::EpochMillis => 2,
@@ -2217,7 +2247,7 @@ def safe_relation_covers_target_identity: Fn(EntityEntry, Array(RelationPair)) -
 def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool = fn(entity, field, input) {
     match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
         Some(role) => match (role.encoding, input) {
-            (TimeEncoding::CanonicalUtcSecondText, FilterInput::UtcSecond(value)) => canonical_utc_second(value),
+            (TimeEncoding::CanonicalUtcSecondText, FilterInput::Utc1(value)) => canonical_utc_second(value),
             (TimeEncoding::Rfc3339Text, FilterInput::Rfc3339(value)) => canonical_rfc3339(value),
             (TimeEncoding::DateText, FilterInput::Date(value)) => calendar_date(value),
             (TimeEncoding::UtcEpochMillis, FilterInput::EpochMillis(_)) => True,
@@ -2640,7 +2670,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
                         FilterInputKind::Rfc3339 => FilterInput::Rfc3339("2024-01-01T00:00:00Z"),
                         FilterInputKind::EpochMillis => FilterInput::EpochMillis(1704067200000),
                         FilterInputKind::Date => FilterInput::Date("2024-01-01"),
-                        FilterInputKind::UtcSecond => FilterInput::UtcSecond("2024-01-01 00:00:00"),
+                        FilterInputKind::Utc1 => FilterInput::Utc1("2024-01-01 00:00:00"),
                         FilterInputKind::LocalDateTime => FilterInput::LocalDateTime("2024-01-01 00:00:00"),
                     }
                 })
@@ -2758,7 +2788,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         summary: match note { Some(n) => n.summary, None => "" },
         dataset: entity.id, field: field.name, computed: entry.computed,
         authorized: entry.authorized, filterable: entry.filterable,
-        ops: entry.ops, input_kinds: entry.input_kinds, values: entry.values,
+        ops: entry.ops, input_kinds: entry.input_kinds, input_docs: filter_input_docs(entry.input_kinds), values: entry.values,
         canonical_values: entry.canonical_values, canonical_order: entry.canonical_order, canonical_aliases: entry.canonical_aliases,
         localized_values: localized_value_labels(entity.entity_type, field.index), scope}
 };
@@ -2790,7 +2820,7 @@ def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> Subject
             {id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
                 filterable: detail.filterable, ops: detail.ops,
-                input_kinds: detail.input_kinds, values, canonical_order: detail.canonical_order, scope: detail.scope}
+                input_kinds: detail.input_kinds, input_docs: detail.input_docs, values, canonical_order: detail.canonical_order, scope: detail.scope}
         }
     }
 };
@@ -2826,7 +2856,7 @@ def time_logical_type: Fn(TimeField) -> TimeLogicalType = fn(role) {
     match role.encoding {
         TimeEncoding::DateText => TimeLogicalType::Date,
         TimeEncoding::LocalText => TimeLogicalType::LocalDateTime,
-        TimeEncoding::CanonicalUtcSecondText => TimeLogicalType::UtcSecond,
+        TimeEncoding::CanonicalUtcSecondText => TimeLogicalType::Utc1,
         TimeEncoding::UtcEpochMillis => TimeLogicalType::EpochMillis,
         TimeEncoding::LocalEpochMillis => TimeLogicalType::EpochMillis,
         TimeEncoding::Rfc3339Text => TimeLogicalType::Rfc3339,
@@ -3035,7 +3065,7 @@ def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(k
         FilterInput::Rfc3339(_) => FilterInputKind::Rfc3339,
         FilterInput::EpochMillis(_) => FilterInputKind::EpochMillis,
         FilterInput::Date(_) => FilterInputKind::Date,
-        FilterInput::UtcSecond(_) => FilterInputKind::UtcSecond,
+        FilterInput::Utc1(_) => FilterInputKind::Utc1,
         FilterInput::LocalDateTime(_) => FilterInputKind::LocalDateTime,
     };
     array::any(kinds, fn(k) { k == kind || (k == FilterInputKind::Number && kind == FilterInputKind::Int) })
@@ -3082,9 +3112,9 @@ def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bo
         Some(time) => if !entry.computed {
             match time.encoding {
                 TimeEncoding::CanonicalUtcSecondText => match input {
-                    FilterInput::UtcSecond(value) => if canonical_utc_second(value) { True }
+                    FilterInput::Utc1(value) => if canonical_utc_second(value) { True }
                         else { fail!("invalid canonical UTC second filter value", entry.id, value) },
-                    _ => fail!("canonical UTC second filter requires UtcSecond input", entry.id, input),
+                    _ => fail!("canonical UTC second filter requires Utc1 input", entry.id, input),
                 },
                 TimeEncoding::DateText => match input {
                     FilterInput::Date(value) => if calendar_date(value) { True }
@@ -3148,7 +3178,7 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
         FilterInput::Rfc3339(value) => qb::Val::String(value),
         FilterInput::EpochMillis(value) => qb::Val::Int(value),
         FilterInput::Date(value) => qb::Val::String(value),
-        FilterInput::UtcSecond(value) => qb::Val::String(value),
+        FilterInput::Utc1(value) => qb::Val::String(value),
         FilterInput::LocalDateTime(value) => qb::Val::String(value),
     }
 };
@@ -5032,6 +5062,9 @@ pub use self::{
     KnowledgeRelations,
     TermAnnotations,
     doc,
+    knowledge_doc,
+    VariantDoc,
+    FilterInputDoc,
     related_to,
     term,
     OutputType,

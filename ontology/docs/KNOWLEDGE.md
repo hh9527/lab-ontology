@@ -51,7 +51,7 @@ References are marked `Member`, `Traversable`, or `Related`. `Related` is docume
 it cannot establish a query edge. A relation's named endpoints, cardinality, and
 shape, a dataset's grain, and a time role's semantics, encoding, and
 authoritativeness come from the same prepared Model used for query lowering.
-`@doc` only changes explanatory text; it cannot grant visibility or create a
+`@knowledge_doc(target, text)` only changes explanatory text; it cannot grant visibility or create a
 query relation. Field points are limited to fields declared as grain, time
 roles, visible dimensions, measures, or metrics: a private physical column
 alone does not become a knowledge point. A field ID is not automatically a
@@ -60,6 +60,12 @@ or filtering in a strict query intent. A UTC time role tells the agent which
 clock and encoding the Model declares, but does not itself validate arbitrary
 timestamp literals or convert local calendar time to UTC (the separate time
 semantics contract in issue #11 covers those operations).
+
+Dimension detail includes `input_kinds` and `input_docs` (entries with `kind`
+and `text`). Input documentation comes from `@doc(text)` on the corresponding
+`FilterInputKind` variant. `Utc1` documents the accepted UTC text format and a
+copyable example once; every dimension using it exposes that same description.
+The annotation supplies explanatory text and does not change input validation.
 
 The formal domain concepts are the knowledge nodes listed in `Index`.
 `Terminology` (key `"terminology"`) is supplemental language assistance, not a

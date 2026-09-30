@@ -10,9 +10,15 @@ Relation keys likewise reject incompatible time and plain fields.
 | --- | --- | --- | --- |
 | `date` | `DateText` | String | Valid `YYYY-MM-DD` |
 | `rfc3339` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
-| `utc_second` | `CanonicalUtcSecondText` | String | UTC `YYYY-MM-DD HH:MM:SS` |
+| `Utc1` | `CanonicalUtcSecondText` | String | UTC `YYYY-MM-DD HH:MM:SS` |
 | `local_datetime` | `LocalText` | String | Local `YYYY-MM-DD HH:MM:SS` |
 | `epoch_millis` | `UtcEpochMillis` or `LocalEpochMillis` | Int | Unix epoch milliseconds |
+
+`Utc1` replaces the misleading `UtcSecond` name in logical types and typed
+input variants. It accepts text, not an integer. Its `@edsl::doc(text)`
+description is automatically exposed in Dimension `detail.input_docs`,
+including the example `"2026-09-20 16:00:00"`. Physical encoding names and
+the accepted timestamp spelling remain unchanged.
 
 The RFC3339 input currently accepts only normalized UTC seconds: offsets and
 fractions must be resolved before submitting the Intent. Fixed-width UTC text
