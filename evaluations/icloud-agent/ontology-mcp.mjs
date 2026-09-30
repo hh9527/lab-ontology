@@ -16,27 +16,26 @@ if (!outputDir?.startsWith('/') || !statSync(outputDir).isDirectory()) {
 const tools = [
   {
     name: 'index',
-    description: 'List ontology knowledge topics with pagination.',
+    description: 'List every visible ontology knowledge key with its names and summary.',
     inputSchema: {
       type: 'object',
-      properties: {
-        offset: { type: 'integer', minimum: 0 },
-        limit: { type: 'integer', minimum: 1 },
-      },
+      properties: {},
       additionalProperties: false,
     },
   },
   {
     name: 'info',
-    description: 'Resolve an exact ontology topic or stable knowledge target.',
+    description: 'Get one ontology knowledge point by its exact index key.',
     inputSchema: {
       type: 'object',
       properties: {
-        topic: { type: 'string' },
-        target: {
+        key: {
           type: 'object',
           properties: {
-            kind: { type: 'string' },
+            kind: { type: 'string', enum: [
+              'Schema', 'Dataset', 'Field', 'Dimension', 'Measure', 'Value',
+              'Relation', 'BusinessLink', 'TimeRole', 'Metric',
+            ] },
             owner: { type: 'string' },
             id: { type: 'string' },
           },
@@ -44,7 +43,7 @@ const tools = [
           additionalProperties: false,
         },
       },
-      oneOf: [{ required: ['topic'] }, { required: ['target'] }],
+      required: ['key'],
       additionalProperties: false,
     },
   },

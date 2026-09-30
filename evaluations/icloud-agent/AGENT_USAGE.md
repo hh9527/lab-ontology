@@ -7,28 +7,25 @@ Use only the host-provided `ontology_index`, `ontology_info`, and `ontology_tran
 Pass the following objects directly as tool arguments:
 
 ```json
-{"offset":0,"limit":50}
-{"topic":"<exact topic>"}
-{"target":{"kind":"Dataset","owner":"","id":"<stable ID>"}}
+{}
+{"key":{"kind":"Dataset","owner":"","id":"<stable ID>"}}
 ```
 
-The first object is for `ontology_index`; the latter two are alternatives for
-`ontology_info`. `ontology_transform` takes an `intents` array of one to five
+The first object is for `ontology_index`; the second is for `ontology_info`.
+`ontology_transform` takes an `intents` array of one to five
 independent Intents.
 
-`index` returns a paginated catalog of visible knowledge points. Follow
-`next_offset` until the relevant area is found; do not treat the first page as
-the entire Model. `info` resolves a topic by exact Unicode matching or a
-target by its kind, owner, and stable ID. A topic may return `Candidates`:
-inspect them and request the intended target explicitly. Follow references to
+`index` returns the complete flat catalog of visible knowledge points, one
+entry per key, with a label, aliases and short summary. Pass an entry's `key` unchanged
+to `info` for the full point. Follow its references' `target` values as keys to
 check entity grain, dimensions, measures, business values, time roles, and
 named relations. A `Related` link explains knowledge but does not authorize a
 query traversal. Labels, translations, aliases, and physical column names are
 not substitutes for stable Intent IDs.
 
-Targets returned by `index` or `info` can be passed back to `info` unchanged,
-including the PascalCase `kind` (for example, `Dataset`). The complete target
-shape and kind choices are available at `syntax/knowledge/target`.
+Keys use the declared `KnowledgeTarget` shape, including the PascalCase `kind`
+(for example, `Dataset`). The key contract itself is listed in `index` under
+`{kind:"Schema",owner:"",id:"syntax/knowledge/target"}`.
 
 Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
@@ -139,8 +136,8 @@ operators and logical value types each dimension permits. Do not send `kind`:
 the target dimension or measure determines the logical type of its JSON value.
 Typed predicate inputs and canonical wires shown by `info` are Model facts,
 not JSON Intent value syntax.
-Discover the Intent contract under `syntax/intent` and its linked topics in
-`<domain>/index` and `<domain>/info`. A diagnostic naming a topic can be
+Discover the Intent contract under the `syntax/intent` key and its linked points
+in `<domain>/index` and `<domain>/info`. A diagnostic naming an info key can be
 resolved through `<domain>/info` to repair the Intent. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 

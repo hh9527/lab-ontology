@@ -52,7 +52,7 @@ the slot input, without the JSONL `method`/`input` envelope. For example:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8080/ic/index \
-  -H 'Content-Type: application/json' -d '{"offset":0,"limit":50}'
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
 `telora-run` has no authentication. Bind only to a host-private loopback or
@@ -75,24 +75,21 @@ slot; only `input` is passed to that slot. For HTTP, POST the same `input`
 directly to the matching path. The three methods for a domain are:
 
 ```json
-{"method":"<domain>/index","input":{"offset":0,"limit":50}}
-{"method":"<domain>/info","input":{"topic":"<exact topic>"}}
-{"method":"<domain>/info","input":{"target":{"kind":"Dataset","owner":"","id":"<stable ID>"}}}
+{"method":"<domain>/index","input":{}}
+{"method":"<domain>/info","input":{"key":{"kind":"Dataset","owner":"","id":"<stable ID>"}}}
 ```
 
-`index` returns a paginated catalog of visible knowledge points. Follow
-`next_offset` until the relevant area is found; do not treat the first page as
-the entire Model. `info` resolves a topic by exact Unicode matching or a
-target by its kind, owner, and stable ID. A topic may return `Candidates`:
-inspect them and request the intended target explicitly. Follow references to
+`index` returns the complete flat catalog of visible knowledge points, one
+entry per key, with a label, aliases and short summary. Pass an entry's `key` unchanged
+to `info` for the full point. Follow its references' `target` values as keys to
 check entity grain, dimensions, measures, business values, time roles, and
 named relations. A `Related` link explains knowledge but does not authorize a
 query traversal. Labels, translations, aliases, and physical column names are
 not substitutes for stable Intent IDs.
 
-Targets returned by `index` or `info` can be passed back to `info` unchanged,
-including the PascalCase `kind` (for example, `Dataset`). The complete target
-shape and kind choices are available at `syntax/knowledge/target`.
+Keys use the declared `KnowledgeTarget` shape, including the PascalCase `kind`
+(for example, `Dataset`). The key contract itself is listed in `index` under
+`{kind:"Schema",owner:"",id:"syntax/knowledge/target"}`.
 
 Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
@@ -221,8 +218,8 @@ operators and logical value types each dimension permits. Do not send `kind`:
 the target dimension or measure determines the logical type of its JSON value.
 Typed predicate inputs and canonical wires shown by `info` are Model facts,
 not JSON Intent value syntax.
-Discover the Intent contract under `syntax/intent` and its linked topics in
-`<domain>/index` and `<domain>/info`. A diagnostic naming a topic can be
+Discover the Intent contract under the `syntax/intent` key and its linked points
+in `<domain>/index` and `<domain>/info`. A diagnostic naming an info key can be
 resolved through `<domain>/info` to repair the Intent. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 
@@ -295,8 +292,8 @@ The outer object accepts only `op`, `left`, `right`, and optional boolean
 display values are the same entity: the join uses the aligned identity keys.
 
 In JSONL service mode, responses use the `telora.service/v1` envelope. On
-success, `ok.Index` contains `entries` and `next_offset`, `ok.Document` holds
-`Found`, `Candidates`, or `NotFound`, and `ok` from `transform` contains the
+success, `ok.Index` contains the complete `entries` list, `ok.Document` holds
+`Found` or `NotFound`, and `ok` from `transform` contains the
 batch response described above. A rejected Intent is reported as
 `ok.accepted:false` with indexed diagnostics and `queries:null`; malformed
 requests and uncaptured service failures have `error:true` and top-level

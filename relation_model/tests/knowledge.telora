@@ -98,25 +98,30 @@ def profile: qb::PlanProfile = {
 def payload: edsl::PreparedPayload = edsl::build_root("doc-pressure", [Order.type, StatusEvent.type, Unrelated.type],
     profile, fn(subject) { subject == "reader" });
 
-pub def topic_collision_returns_contextual_candidates: test::Test = test::should_ok(fn() {
-    match knowledge::doc(payload, "reader", "订单状态") {
-        knowledge::DocResult::Candidates(items) => if array::length(items) == 2
-            && array::any(items, fn(item) { item.target == order_status })
-            && array::any(items, fn(item) { item.target == status_event }) { True }
-            else { fail!("topic ambiguity lost its contextual candidates", items) },
-        other => fail!("ambiguous topic was guessed", other),
+pub def shared_aliases_have_distinct_keys: test::Test = test::should_ok(fn() {
+    let index = knowledge::index_entries(knowledge::map(payload, "reader"));
+    let status = knowledge::by_target(payload, "reader", order_status);
+    let event = knowledge::by_target(payload, "reader", status_event);
+    match (status, event) {
+        (knowledge::DocResult::Found(a), knowledge::DocResult::Found(b)) =>
+            if array::any(index.entries, fn(entry) { entry.key == order_status })
+                && array::any(index.entries, fn(entry) { entry.key == status_event })
+                && array::any(a.aliases, fn(name) { name == "订单状态" })
+                && array::any(b.aliases, fn(name) { name == "订单状态" }) { True }
+            else { fail!("shared alias collapsed distinct knowledge keys", a, b) },
+        other => fail!("shared alias lost a knowledge point", other),
     }
 });
 
-pub def exact_topic_and_private_dimension: test::Test = test::should_ok(fn() {
-    let missing = knowledge::doc(payload, "reader", " 订单状态");
-    let secret = knowledge::doc(payload, "reader", "隐私状态");
-    if missing == knowledge::DocResult::NotFound && secret == knowledge::DocResult::NotFound { True }
-    else { fail!("topic matching was normalized or private dimension leaked", missing, secret) }
+pub def private_dimension_is_not_addressable: test::Test = test::should_ok(fn() {
+    let secret = knowledge::by_target(payload, "reader",
+        {kind: edsl::KnowledgeKind::Dimension, owner: "order", id: "private_status"});
+    if secret == knowledge::DocResult::NotFound { True }
+    else { fail!("private dimension leaked through its key", secret) }
 });
 
 pub def local_document_has_separate_structural_and_semantic_links: test::Test = test::should_ok(fn() {
-    match knowledge::doc(payload, "reader", "order_status") {
+    match knowledge::by_target(payload, "reader", order_status) {
         knowledge::DocResult::Found(point) => if point.summary == "Status is the current lifecycle value"
             && array::any(point.refs, fn(ref) { ref.target == status_event && ref.kind == knowledge::LinkKind::Related })
             && array::any(point.refs, fn(ref) { ref.target == unrelated && ref.kind == knowledge::LinkKind::Related })
@@ -210,30 +215,28 @@ pub def explanatory_doc_does_not_change_query_lowering: test::Test = test::shoul
 
 pub def every_visible_point_has_an_exact_topic_and_closed_references: test::Test = test::should_ok(fn() {
     let points = knowledge::map(payload, "reader");
-    let topics = knowledge::topic_index(payload, "reader");
+    let entries = knowledge::index_entries(points).entries;
     if array::all(points, fn(point) {
-        array::any(topics, fn(entry) { entry.target == point.target && entry.topic == point.target.id })
+        array::length(array::filter(entries, fn(entry) { entry.key == point.target })) == 1
             && array::all(point.refs, fn(ref) {
                 array::any(points, fn(other) { other.target == ref.target })
             })
-    }) { True } else { fail!("a knowledge point is undiscoverable or references an invisible point") }
+    }) { True } else { fail!("a knowledge point is not indexed exactly once or references an invisible point") }
 });
 
 pub def on_demand_doc_matches_validated_catalog: test::Test = test::should_ok(fn() {
     let doc = knowledge::knowledge_info_method_factory(payload, "reader");
     let inputs = [
-        json::parse(r#"{"topic":"订单状态"}"#).unwrap!(),
-        json::parse(r#"{"topic":"订单资料"}"#).unwrap!(),
-        json::parse(r#"{"target":{"kind":"Dimension","owner":"order","id":"order_status"}}"#).unwrap!(),
-        json::parse(r#"{"target":{"kind":"Relation","owner":"status_event","id":"event_order"}}"#).unwrap!(),
-        json::parse(r#"{"topic":"not-a-topic"}"#).unwrap!(),
+        json::parse(r#"{"key":{"kind":"Dataset","owner":"","id":"order"}}"#).unwrap!(),
+        json::parse(r#"{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}"#).unwrap!(),
+        json::parse(r#"{"key":{"kind":"Relation","owner":"status_event","id":"event_order"}}"#).unwrap!(),
+        json::parse(r#"{"key":{"kind":"Dataset","owner":"","id":"missing"}}"#).unwrap!(),
     ];
-    if knowledge::topic_index_from_model(payload, "reader") == knowledge::topic_index(payload, "reader")
-        && array::all(inputs, fn(input) {
+    if array::all(inputs, fn(input) {
             doc(input) == knowledge::serve_value(payload, "reader", "foo",
                 Value::Object({method: Value::String("foo/info"), input}))
         }) { True }
-    else { fail!("on-demand document changed an exact topic, target, alias or reference") }
+    else { fail!("bound info differs from the same knowledge catalog") }
 });
 
 pub def published_field_is_distinct_from_dimension_and_hidden_column: test::Test = test::should_ok(fn() {
@@ -288,69 +291,62 @@ pub def business_alias_is_not_a_strict_dimension_id: test::Test = test::should_f
     }"#).unwrap!())
 }, "unknown dimension");
 
-pub def localized_topic_preserves_locale: test::Test = test::should_ok(fn() {
-    let entries = array::filter(knowledge::topic_index(payload, "reader"), fn(entry) {
-        entry.topic == "订单资料"
-    });
-    if array::length(entries) == 1 && entries[0].locale == Some("zh-CN")
-    { True } else { fail!("topic candidate lost its declaring context", entries) }
+pub def localized_name_stays_in_knowledge_detail: test::Test = test::should_ok(fn() {
+    match knowledge::by_target(payload, "reader", {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "order"}) {
+        knowledge::DocResult::Found(point) =>
+            if array::any(point.localized, fn(text) { text.label == "订单资料" && text.locale == "zh-CN" }) { True }
+            else { fail!("localized name lost its declaring context", point) },
+        other => fail!("localized dataset key is not addressable", other),
+    }
 });
 
-pub def service_index_pages_and_navigates_a_disambiguated_target: test::Test = test::should_ok(fn() {
-    let first = knowledge::serve(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/index", "input":{"offset":0,"limit":2}
-    }"#).unwrap!());
-    let second = knowledge::serve(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/index", "input":{"offset":2,"limit":2}
+pub def service_index_lists_unique_keys_and_info_navigates: test::Test = test::should_ok(fn() {
+    let index = knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+        "method":"foo/index", "input":{}
     }"#).unwrap!());
     let point = knowledge::serve(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"target":{"kind":"Dimension","owner":"order","id":"order_status"}}
+        "method":"foo/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}
     }"#).unwrap!());
-    match (first, second, point) {
-        (knowledge::KnowledgeResponse::Index(a), knowledge::KnowledgeResponse::Index(b),
+    match (index, point) {
+        (knowledge::KnowledgeResponse::Index(a),
             knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(item))) =>
-            if array::length(a.entries) == 2 && a.next_offset == Some(2)
-                && array::length(b.entries) == 2 && a.entries[0] != b.entries[0]
+            if array::length(a.entries) == array::length(knowledge::map(payload, "reader"))
+                && array::length(array::filter(a.entries, fn(entry) { entry.key == order_status })) == 1
                 && item.target == order_status { True }
-            else { fail!("index pagination or target navigation failed", a, b, item) },
+            else { fail!("flat index or exact key navigation failed", a, item) },
         other => fail!("unexpected service response", other),
     }
 });
 
 pub def service_response_round_trips_through_json: test::Test = test::should_ok(fn() {
     let result = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"topic":"订单状态"}
+        "method":"foo/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}
     }"#).unwrap!());
     let round_trip = json::parse(json::stringify(result)).unwrap!();
     match codec::decode@[knowledge::KnowledgeResponse](round_trip).unwrap!() {
-        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Candidates(items)) =>
-            if array::length(items) == 2 && array::any(items, fn(item) { item.target == order_status }) {
-                True
-            } else { fail!("serialized knowledge response lost disambiguation", items) },
+        knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(item)) =>
+            if item.target == order_status { True }
+            else { fail!("serialized knowledge response lost its key", item) },
         other => fail!("service response cannot be transported as JSON", other),
     }
 });
 
 pub def service_response_has_stable_json_envelope: test::Test = test::should_ok(fn() {
-    let ambiguous = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"topic":"订单状态"}
+    let found = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+        "method":"foo/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}
     }"#).unwrap!());
     let missing = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"topic":"not-a-topic"}
+        "method":"foo/info", "input":{"key":{"kind":"Dataset","owner":"","id":"missing"}}
     }"#).unwrap!());
     let index = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/index", "input":{"limit":1}
+        "method":"foo/index", "input":{}
     }"#).unwrap!());
-    match (ambiguous, missing, index) {
+    match (found, missing, index) {
         (Value::Object(a), Value::Object(b), Value::Object(c)) =>
             match (dict::get(a, "Document"), dict::get(b, "Document"), dict::get(c, "Index")) {
-                (Some(Value::Object(candidate)), Some(Value::String("NotFound")), Some(Value::Object(page))) =>
-                    match (dict::get(candidate, "Candidates"), dict::get(page, "entries"), dict::get(page, "next_offset")) {
-                        (Some(Value::Array(items)), Some(Value::Array(entries)), Some(Value::Int(1))) =>
-                            if array::length(items) == 2 && array::length(entries) == 1 { True }
-                            else { fail!("knowledge response envelope lost candidates or page", items, entries) },
-                        other => fail!("knowledge response payload changed", other),
-                    },
+                (Some(Value::Object(point)), Some(Value::String("NotFound")), Some(Value::Object(list))) =>
+                    if dict::get(point, "Found") != None && dict::get(list, "entries") != None { True }
+                    else { fail!("knowledge response lost its flat index or exact point", point, list) },
                 other => fail!("knowledge response variant envelope changed", other),
             },
         other => fail!("knowledge responses are not JSON objects", other),
@@ -359,7 +355,7 @@ pub def service_response_has_stable_json_envelope: test::Test = test::should_ok(
 
 pub def service_does_not_expose_hidden_target: test::Test = test::should_ok(fn() {
     match knowledge::serve(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"target":{"kind":"Dimension","owner":"order","id":"private_status"}}
+        "method":"foo/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"private_status"}}
     }"#).unwrap!()) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::NotFound) => True,
         other => fail!("hidden target leaked through direct lookup", other),
@@ -368,13 +364,13 @@ pub def service_does_not_expose_hidden_target: test::Test = test::should_ok(fn()
 
 pub def service_rejects_wrong_domain: test::Test = test::should_fail_with(fn() {
     knowledge::serve(payload, "reader", "foo", json::parse(r#"{
-        "method":"bar/info", "input":{"topic":"order_status"}
+        "method":"bar/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}
     }"#).unwrap!())
 }, "unknown knowledge method for domain");
 
 pub def service_rejects_extra_request_fields: test::Test = test::should_fail_with(fn() {
     knowledge::serve(payload, "reader", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"topic":"order_status", "guess":true}
+        "method":"foo/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}, "guess":true}
     }"#).unwrap!())
 }, "knowledge request contains unsupported field");
 
@@ -387,10 +383,10 @@ pub def service_rejects_unauthorized_subject: test::Test = test::should_fail_wit
 pub def bound_service_keeps_its_model_subject_and_domain: test::Test = test::should_ok(fn() {
     let service = knowledge::knowledge_service_factory(payload, "reader", "foo");
     let first = service(json::parse(r#"{
-        "method":"foo/info", "input":{"topic":"order_status"}
+        "method":"foo/info", "input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}
     }"#).unwrap!());
     let second = service(json::parse(r#"{
-        "method":"foo/index", "input":{"limit":1}
+        "method":"foo/index", "input":{}
     }"#).unwrap!());
     match (first, second) {
         (Value::Object(found), Value::Object(index)) =>

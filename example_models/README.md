@@ -13,9 +13,9 @@ service collection. Each model keeps its own knowledge and lowering rules:
 independent Intents. It returns indexed diagnostics for every item; `queries`
 contains the ordered Queries only when all Intents are accepted. Request `ctx`
 and a single `intent` key are not supported.
-`<model>/index` accepts `{ "offset": 0, "limit": 50 }` (or `{}`) for the
-paginated knowledge index. `<model>/info` accepts `{ "topic": "..." }` or
-`{ "target": ... }` for one knowledge point. The ic model has the same three
+`<model>/index` accepts `{}` and returns one flat entry per visible knowledge
+key. `<model>/info` accepts `{ "key": {"kind":"Dataset","owner":"","id":"..."} }`
+for one knowledge point. The ic model has the same three
 routes under `ic/` in its own `icloud_model` entry.
 All domains use the same [service and agent guide](../USAGE.md) with their
 domain name and the separate Intent contract supplied by the host.

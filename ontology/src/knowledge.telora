@@ -26,11 +26,10 @@ type Point = struct {
     direction: Option(edsl::LinkDirection),
     guard: Option(edsl::ScopePredicate),
 };
-type TopicEntry = struct { topic: String, target: edsl::KnowledgeTarget, label: String, owner: String, locale: Option(String) };
-type DocResult = enum { NotFound, Found(Point), Candidates(Array(TopicEntry)) };
-type TopicPage = struct { entries: Array(TopicEntry), next_offset: Option(Int) };
-type KnowledgeResponse = enum { Index(TopicPage), Document(DocResult) };
-type Catalog = struct { points: Array(Point), topics: Array(TopicEntry) };
+type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: Array(String), summary: String };
+type KnowledgeIndex = struct { entries: Array(IndexEntry) };
+type DocResult = enum { NotFound, Found(Point) };
+type KnowledgeResponse = enum { Index(KnowledgeIndex), Document(DocResult) };
 
 def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
     {kind, owner, id}
@@ -51,7 +50,7 @@ def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
 
 def syntax_points: Array(Point) = [
     point(syntax_target("knowledge/target"), "Knowledge target", [],
-        "info accepts either {topic:<exact topic>} or {target:{kind,owner,id}}. A target returned by index or info can be passed back unchanged. kind is the declared KnowledgeKind enum: Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric. owner and id are exact stable identifiers from the returned target.", []),
+        "index returns one entry per visible knowledge point with key, label, aliases and summary. info accepts {key:{kind,owner,id}}; pass an index entry's key or a document reference's target unchanged. kind is the declared KnowledgeKind enum: Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric. owner and id are exact stable identifiers. Names and aliases describe knowledge but are not keys.", []),
     point(syntax_target("intent"), "Intent syntax", [],
         "Submit {intents:[...]} with one to five independent intents. Each intent has op Graph, GraphPair or GraphUnion. Values in filters are interpreted by their declared dimension or measure; do not supply an input kind.",
         [member(syntax_target("graph")), member(syntax_target("graph_pair")), member(syntax_target("graph_union")),
@@ -318,194 +317,123 @@ def map: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(payload, subject
     }
 };
 
-def topic_index_from_points: Fn(Array(Point)) -> Array(TopicEntry) = fn(points) {
-    array::flat_map(points, fn(item) {
-        let names = array::concat([[item.target.id, item.label], item.aliases]);
-        array::map(array::filter(array::enumerate(names), fn(indexed) {
-            indexed.1 != "" && !array::any(array::filter(array::enumerate(names), fn(other) {
-                other.0 < indexed.0
-            }), fn(other) { other.1 == indexed.1 })
-        }), fn(indexed) {
-            let locale = match array::find(item.localized, fn(text) { text.label == indexed.1 }) {
-                Some(text) => Some(text.locale), None => None,
-            };
-            {topic: indexed.1, target: item.target, label: item.label, owner: item.target.owner, locale}
-        })
-    })
+def index_entries: Fn(Array(Point)) -> KnowledgeIndex = fn(points) {
+    {entries: array::map(points, fn(item) {
+        {key: item.target, label: item.label, aliases: item.aliases, summary: item.summary}
+    })}
 };
 
-def topic_index: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(payload, subject) {
-    topic_index_from_points(map(payload, subject))
+def index_entry: Fn(edsl::KnowledgeTarget, String, Array(String), String) -> IndexEntry = fn(key, label, aliases, summary) {
+    {key, label, aliases, summary}
 };
 
-def named_topics: Fn(edsl::KnowledgeTarget, String, Array(String), Array(edsl::LocalizedKnowledgeText)) -> Array(TopicEntry) =
-    fn(id, label, aliases, localized) {
-        let names = array::concat([[id.id, label], aliases]);
-        array::map(array::filter(array::enumerate(names), fn(indexed) {
-            indexed.1 != "" && !array::any(array::filter(array::enumerate(names), fn(other) {
-                other.0 < indexed.0
-            }), fn(other) { other.1 == indexed.1 })
-        }), fn(indexed) {
-            let locale = match array::find(localized, fn(text) { text.label == indexed.1 }) {
-                Some(text) => Some(text.locale), None => None,
-            };
-            {topic: indexed.1, target: id, label, owner: id.owner, locale}
-        })
-    };
-
-# Lightweight request index; the service's index slot validates the full
-# catalog and reference closure once at initialization.
-def topic_index_from_model: Fn(edsl::PreparedPayload, String) -> Array(TopicEntry) = fn(payload, subject) {
+def index_from_model: Fn(edsl::PreparedPayload, String) -> KnowledgeIndex = fn(payload, subject) {
     let datasets = edsl::knowledge_index_for_subject(payload, subject);
-    let roots = array::flat_map(datasets, fn(brief) {
-        named_topics(target(edsl::KnowledgeKind::Dataset, "", brief.id), brief.label,
-            array::concat([brief.aliases, labels(brief.localized)]), brief.localized)
+    let roots = array::map(datasets, fn(brief) {
+        index_entry(target(edsl::KnowledgeKind::Dataset, "", brief.id), brief.label,
+            array::concat([brief.aliases, labels(brief.localized)]), brief.summary)
     });
     let members = array::flat_map(datasets, fn(brief) {
-        let fields = array::flat_map(edsl::published_fields(payload, brief.id), fn(name) {
-            named_topics(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], [])
+        let fields = array::map(edsl::published_fields(payload, brief.id), fn(name) {
+            index_entry(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], "")
         });
         let dimensions = array::flat_map(brief.dimension_ids, fn(id) {
             let detail = edsl::dimension_detail_for_subject(payload, subject, id);
-            let base = named_topics(target(edsl::KnowledgeKind::Dimension, brief.id, id), detail.label,
-                array::concat([detail.aliases, labels(detail.localized)]), detail.localized);
-            let values = array::flat_map(detail.values, fn(value) {
-                let localized = array::map(value.localized, fn(text) {
-                    let item: edsl::LocalizedKnowledgeText = {locale: text.locale, label: text.label, summary: ""};
-                    item
-                });
-                named_topics(target(edsl::KnowledgeKind::Value, id, value.id), value.label,
-                    array::concat([value.aliases, labels(localized)]), localized)
-            });
-            array::concat([base, values])
+            array::concat([[index_entry(target(edsl::KnowledgeKind::Dimension, brief.id, id),
+                detail.label, array::concat([detail.aliases, labels(detail.localized)]), detail.summary)],
+                array::map(detail.values, fn(value) {
+                index_entry(target(edsl::KnowledgeKind::Value, id, value.id), value.label,
+                    array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]), "")
+            })])
         });
-        let measures = array::flat_map(brief.measure_ids, fn(id) {
+        let measures = array::map(brief.measure_ids, fn(id) {
             let detail = edsl::measure_domain_for_subject(payload, subject, id);
-            named_topics(target(edsl::KnowledgeKind::Measure, brief.id, id), detail.label,
-                array::concat([detail.aliases, labels(detail.localized)]), detail.localized)
+            index_entry(target(edsl::KnowledgeKind::Measure, brief.id, id), detail.label,
+                array::concat([detail.aliases, labels(detail.localized)]), detail.summary)
         });
-        let relations = array::flat_map(array::filter(payload.relations, fn(entry) {
+        let relations = array::map(array::filter(payload.relations, fn(entry) {
             entry.id != "" && payload.entities[entry.from].id == brief.id
         }), fn(entry) {
             let detail = edsl::relation_detail_for_subject(payload, subject, entry.id);
-            named_topics(target(edsl::KnowledgeKind::Relation, brief.id, entry.id), detail.label,
-                array::concat([detail.aliases, labels(detail.localized)]), detail.localized)
+            index_entry(target(edsl::KnowledgeKind::Relation, brief.id, entry.id), detail.label,
+                array::concat([detail.aliases, labels(detail.localized)]), detail.summary)
         });
         let entity = match array::find(payload.entities, fn(entry) { entry.id == brief.id }) {
             Some(entry) => entry, None => fail!("knowledge dataset disappeared from prepared model", brief.id),
         };
-        let metrics = array::flat_map(entity.metrics, fn(metric) {
-            named_topics(target(edsl::KnowledgeKind::Metric, brief.id, metric.id), metric.id, [], [])
+        let metrics = array::map(entity.metrics, fn(metric) {
+            index_entry(target(edsl::KnowledgeKind::Metric, brief.id, metric.id), metric.id, [], "")
         });
-        let times = array::flat_map(brief.time_roles, fn(role) {
-            named_topics(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], [])
+        let times = array::map(brief.time_roles, fn(role) {
+            index_entry(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], "")
         });
-        let links = array::flat_map(array::filter(payload.business_links, fn(link) {
+        let links = array::map(array::filter(payload.business_links, fn(link) {
             payload.entities[link.hub].id == brief.id
         }), fn(link) {
-            named_topics(target(edsl::KnowledgeKind::BusinessLink, brief.id, link.id), link.id, [], [])
+            index_entry(target(edsl::KnowledgeKind::BusinessLink, brief.id, link.id), link.id, [], "")
         });
         array::concat([fields, dimensions, measures, relations, metrics, times, links])
     });
-    array::concat([topic_index_from_points(syntax_points), roots, members])
-};
-
-def prepare_catalog: Fn(edsl::PreparedPayload, String) -> Catalog = fn(payload, subject) {
-    let points = map(payload, subject);
-    {points, topics: topic_index_from_points(points)}
-};
-
-def doc_in_catalog: Fn(Catalog, String) -> DocResult = fn(catalog, topic) {
-    let candidates = array::filter(catalog.topics, fn(entry) { entry.topic == topic });
-    if array::length(candidates) == 0 { DocResult::NotFound }
-    else if array::length(candidates) > 1 { DocResult::Candidates(candidates) }
-    else {
-        let candidate = candidates[0];
-        match array::find(catalog.points, fn(point) { point.target == candidate.target }) {
-            Some(item) => DocResult::Found(item),
-            None => fail!("knowledge topic has no point in prepared model", candidate),
+    let docs = array::flat_map(payload.entities, fn(entity) {
+        match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+            Some(declared) => declared.entries, None => [],
         }
-    }
-};
-
-def point_from_topics: Fn(edsl::PreparedPayload, String, Array(TopicEntry), edsl::KnowledgeTarget) -> DocResult = fn(payload, subject, topics, id) {
-    if !array::any(topics, fn(entry) { entry.target == id }) { DocResult::NotFound }
-    else if id.kind == edsl::KnowledgeKind::Schema {
-        match array::find(syntax_points, fn(item) { item.target == id }) {
-            Some(item) => DocResult::Found(item),
-            None => fail!("knowledge schema topic has no point", id),
+    });
+    {entries: array::map(array::concat([index_entries(syntax_points).entries, roots, members]), fn(entry) {
+        match array::find(docs, fn(note) { note.target == entry.key }) {
+            Some(note) => {...entry, summary: note.text}, None => entry,
         }
-    }
-    else {
-        let datasets = edsl::knowledge_index_for_subject(payload, subject);
-        let brief = match array::find(datasets, fn(entry) {
-            if id.kind == edsl::KnowledgeKind::Dataset { entry.id == id.id }
-            else if id.kind == edsl::KnowledgeKind::Value {
-                array::any(entry.dimension_ids, fn(name) { name == id.owner })
-            } else { entry.id == id.owner }
-        }) {
-            Some(entry) => entry,
-            None => fail!("knowledge topic owner disappeared from prepared model", id),
-        };
-        let raw = if id.kind == edsl::KnowledgeKind::Dataset { dataset_point(payload, brief) }
-        else { match array::find(dataset_members(payload, subject, brief), fn(item) { item.target == id }) {
-            Some(item) => item,
-            None => fail!("knowledge topic has no point in prepared model", id),
-        } };
-        let docs = array::flat_map(payload.entities, fn(entity) {
-            match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
-                Some(declared) => declared.entries, None => [],
-            }
-        });
-        let related = array::flat_map(payload.entities, fn(entity) {
-            match property::get_type_prop(entity.entity_type, edsl::KnowledgeRelations.type) {
-                Some(declared) => declared.entries, None => [],
-            }
-        });
-        let refs = array::concat([raw.refs, array::map(array::filter(related, fn(ref) {
-            ref.source == id && array::any(topics, fn(entry) { entry.target == ref.target })
-        }), fn(ref) { {target: ref.target, kind: LinkKind::Related} })]);
-        let summary = match array::find(docs, fn(note) { note.target == id }) {
-            Some(note) => note.text, None => raw.summary,
-        };
-        DocResult::Found({...raw, refs, summary})
-    }
+    })}
 };
 
-def doc_in_topics: Fn(edsl::PreparedPayload, String, Array(TopicEntry), String) -> DocResult = fn(payload, subject, topics, topic) {
-    let candidates = array::filter(topics, fn(entry) { entry.topic == topic });
-    if array::length(candidates) == 0 { DocResult::NotFound }
-    else if array::length(candidates) > 1 { DocResult::Candidates(candidates) }
-    else { point_from_topics(payload, subject, topics, candidates[0].target) }
-};
-
-# Exact codepoint match: no trimming, case folding, language inference or
-# automatic disambiguation. A missing topic returns a value, not a fallback.
-def doc: Fn(edsl::PreparedPayload, String, String) -> DocResult = fn(payload, subject, topic) {
-    doc_in_catalog(prepare_catalog(payload, subject), topic)
-};
+def point_from_model: Fn(edsl::PreparedPayload, String, KnowledgeIndex, edsl::KnowledgeTarget) -> DocResult =
+    fn(payload, subject, index, key) {
+        if !array::any(index.entries, fn(entry) { entry.key == key }) { DocResult::NotFound }
+        else if key.kind == edsl::KnowledgeKind::Schema {
+            match array::find(syntax_points, fn(item) { item.target == key }) {
+                Some(item) => DocResult::Found(item),
+                None => fail!("knowledge schema key has no point", key),
+            }
+        } else {
+            let datasets = edsl::knowledge_index_for_subject(payload, subject);
+            let brief = match array::find(datasets, fn(entry) {
+                if key.kind == edsl::KnowledgeKind::Dataset { entry.id == key.id }
+                else if key.kind == edsl::KnowledgeKind::Value {
+                    array::any(entry.dimension_ids, fn(name) { name == key.owner })
+                } else { entry.id == key.owner }
+            }) {
+                Some(entry) => entry,
+                None => fail!("knowledge key owner disappeared from prepared model", key),
+            };
+            let raw = if key.kind == edsl::KnowledgeKind::Dataset { dataset_point(payload, brief) }
+            else { match array::find(dataset_members(payload, subject, brief), fn(item) { item.target == key }) {
+                Some(item) => item,
+                None => fail!("knowledge key has no point in prepared model", key),
+            } };
+            let docs = array::flat_map(payload.entities, fn(entity) {
+                match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+                    Some(declared) => declared.entries, None => [],
+                }
+            });
+            let related = array::flat_map(payload.entities, fn(entity) {
+                match property::get_type_prop(entity.entity_type, edsl::KnowledgeRelations.type) {
+                    Some(declared) => declared.entries, None => [],
+                }
+            });
+            let refs = array::concat([raw.refs, array::map(array::filter(related, fn(ref) {
+                ref.source == key && array::any(index.entries, fn(entry) { entry.key == ref.target })
+            }), fn(ref) { {target: ref.target, kind: LinkKind::Related} })]);
+            let summary = match array::find(docs, fn(note) { note.target == key }) {
+                Some(note) => note.text, None => raw.summary,
+            };
+            DocResult::Found({...raw, refs, summary})
+        }
+    };
 
 def by_target: Fn(edsl::PreparedPayload, String, edsl::KnowledgeTarget) -> DocResult = fn(payload, subject, id) {
     match array::find(map(payload, subject), fn(item) { item.target == id }) {
         Some(item) => DocResult::Found(item), None => DocResult::NotFound,
     }
-};
-
-def page_entries: Fn(Array(TopicEntry), Int, Int) -> TopicPage = fn(entries, offset, limit) {
-    if offset < 0 || limit < 1 || limit > 100 { fail!("knowledge index requires nonnegative offset and limit in 1..100", offset, limit) }
-    else {
-        let selected = array::map(array::filter(array::enumerate(entries), fn(item) {
-            item.0 >= offset && item.0 - offset < limit
-        }), fn(item) { item.1 });
-        let next_offset = if offset < array::length(entries) && limit < array::length(entries) - offset {
-            Some(offset + limit)
-        } else { None };
-        {entries: selected, next_offset}
-    }
-};
-
-def page: Fn(edsl::PreparedPayload, String, Int, Int) -> TopicPage = fn(payload, subject, offset, limit) {
-    page_entries(topic_index(payload, subject), offset, limit)
 };
 
 def object: Fn(Value) -> Dict(Value) = fn(value) {
@@ -521,12 +449,6 @@ def text_field: Fn(Dict(Value), String) -> String = fn(fields, key) {
         Value::String(value) => value, other => fail!("knowledge request field must be a string", key, other),
     }
 };
-def int_field: Fn(Dict(Value), String, Int) -> Int = fn(fields, key, fallback) {
-    match dict::get(fields, key) {
-        None => fallback, Some(Value::Int(value)) => value,
-        Some(other) => fail!("knowledge request field must be an integer", key, other),
-    }
-};
 def keys: Fn(Dict(Value), Array(String)) -> () = fn(fields, allowed) {
     match array::find(dict::keys(fields), fn(key) { !array::any(allowed, fn(name) { name == key }) }) {
         Some(key) => fail!("knowledge request contains unsupported field", key), None => (),
@@ -535,43 +457,30 @@ def keys: Fn(Dict(Value), Array(String)) -> () = fn(fields, allowed) {
 def parse_target: Fn(Value) -> edsl::KnowledgeTarget = fn(value) {
     match codec::decode@[edsl::KnowledgeTarget](value) {
         Ok(decoded) => decoded,
-        Err(error) => raise!(blame::with_context(error, "see info topic syntax/knowledge/target")),
+        Err(error) => raise!(blame::with_context(error, "see knowledge key Schema//syntax/knowledge/target")),
     }
 };
 
-# The caller binds a domain to its prepared model and subject. Input is
-# validated before looking up a point; topic text never enters query lowering.
-def serve_catalog: Fn(Catalog, String, Value) -> KnowledgeResponse = fn(catalog, domain, request) {
+# The caller binds a domain to its prepared model and subject.
+def serve_catalog: Fn(edsl::PreparedPayload, String, KnowledgeIndex, String, Value) -> KnowledgeResponse =
+    fn(payload, subject, index, domain, request) {
     if domain == "" { fail!("knowledge domain must not be empty") } else { () };
     let envelope = object(request);
     keys(envelope, ["method", "input"]);
     let method = text_field(envelope, "method");
     let input = object(required(envelope, "input"));
     if method == `\{domain}/index` {
-        keys(input, ["offset", "limit"]);
-        KnowledgeResponse::Index(page_entries(catalog.topics, int_field(input, "offset", 0), int_field(input, "limit", 50)))
+        keys(input, []);
+        KnowledgeResponse::Index(index)
     } else if method == `\{domain}/info` {
-        let topic = dict::get(input, "topic");
-        let id = dict::get(input, "target");
-        match (topic, id) {
-            (Some(Value::String(name)), None) => do {
-                keys(input, ["topic"]);
-                KnowledgeResponse::Document(doc_in_catalog(catalog, name))
-            },
-            (None, Some(value)) => do {
-                keys(input, ["target"]);
-                let target = parse_target(value);
-                KnowledgeResponse::Document(match array::find(catalog.points, fn(item) { item.target == target }) {
-                    Some(point) => DocResult::Found(point), None => DocResult::NotFound,
-                })
-            },
-            _ => fail!("knowledge doc requires exactly one topic string or target", input),
-        }
+        keys(input, ["key"]);
+        let key = parse_target(required(input, "key"));
+        KnowledgeResponse::Document(point_from_model(payload, subject, index, key))
     } else { fail!("unknown knowledge method for domain", method, domain) }
 };
 
 def serve: Fn(edsl::PreparedPayload, String, String, Value) -> KnowledgeResponse = fn(payload, subject, domain, request) {
-    serve_catalog(prepare_catalog(payload, subject), domain, request)
+    serve_catalog(payload, subject, index_from_model(payload, subject), domain, request)
 };
 
 def serve_value: Fn(edsl::PreparedPayload, String, String, Value) -> Value = fn(payload, subject, domain, request) {
@@ -580,44 +489,32 @@ def serve_value: Fn(edsl::PreparedPayload, String, String, Value) -> Value = fn(
 
 def knowledge_service_factory: Fn(edsl::PreparedPayload, String, String) -> Fn(Value) -> Value =
     fn(payload, subject, domain) {
-        fn(request) { serve_value(payload, subject, domain, request) }
+        let index = index_from_model(payload, subject);
+        fn(request) { codec::encode(serve_catalog(payload, subject, index, domain, request)) }
     };
 
 # The collection selects the slot; this handler receives only its input.
 def knowledge_info_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> Value =
     fn(payload, subject) {
         fn(input) {
-                let fields = object(input);
-                let topic = dict::get(fields, "topic");
-                let id = dict::get(fields, "target");
-                let document = match (topic, id) {
-                    (Some(Value::String(name)), None) => do {
-                        keys(fields, ["topic"]);
-                        let topics = topic_index_from_model(payload, subject);
-                        doc_in_topics(payload, subject, topics, name)
-                    },
-                    (None, Some(value)) => do {
-                        keys(fields, ["target"]);
-                        let topics = topic_index_from_model(payload, subject);
-                        point_from_topics(payload, subject, topics, parse_target(value))
-                    },
-                    _ => fail!("knowledge info requires exactly one topic string or target", input),
-                };
-                codec::encode(KnowledgeResponse::Document(document))
+            let fields = object(input);
+            keys(fields, ["key"]);
+            let key = parse_target(required(fields, "key"));
+            codec::encode(KnowledgeResponse::Document(point_from_model(payload, subject,
+                index_from_model(payload, subject), key)))
         }
     };
 
 def knowledge_index_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> Value =
     fn(payload, subject) {
-        let topics = topic_index(payload, subject);
+        let index = index_from_model(payload, subject);
         fn(input) {
             let fields = object(input);
-            keys(fields, ["offset", "limit"]);
-            codec::encode(KnowledgeResponse::Index(page_entries(topics,
-                int_field(fields, "offset", 0), int_field(fields, "limit", 50))))
+            keys(fields, []);
+            codec::encode(KnowledgeResponse::Index(index))
         }
     };
 
-pub use self::{ LinkKind, KnowledgeLink, Point, TopicEntry, DocResult, TopicPage, KnowledgeResponse,
-    map, topic_index, topic_index_from_model, topic_index_from_points, doc, by_target, page, serve, serve_value,
+pub use self::{ LinkKind, KnowledgeLink, Point, IndexEntry, KnowledgeIndex, DocResult, KnowledgeResponse,
+    map, index_entries, index_from_model, by_target, serve, serve_value,
     knowledge_service_factory, knowledge_info_method_factory, knowledge_index_method_factory };

@@ -155,33 +155,14 @@ on the legacy `qualify_metrics` API described later in this historical log;
 they do not establish production KPI grain or clock encoding.
 
 `icloud_model/tests/knowledge.telora` also checks the 19-entity Prepared Model
-as one navigable catalog. `IndexService` now retains only topic entries at
-initialization, preserving full catalog closure validation without retaining
-every detailed Point. A single `ic/index` page request fell from 361.7 million
-to about 1.5 million Wasm fuel (offset 0, limit 1); index construction still
-costs initialization work. `ic/info` now derives topic entries from the Prepared
-Model without rebuilding the validated full Point graph, then materializes the
-addressed dataset's members and selects the target point with its declared
-docs/related references.
-The Device document fell from about 375 million to 79 million request fuel at
-the default 64 MiB limit; `ic/index` remains about 1.5 million. The index slot
-still validates the full catalog and reference closure at initialization;
-`ic/info` depends on that paired service slot and uses the same subject and
-Prepared Model. Caching a second full catalog/topic graph in the doc slot
-exceeded the runtime's single growth-operation limit. Small-model tests compare
-all topic entries and exact document output against the validated catalog;
-IC tests cover dataset, relation and filtered-measure details.
-
-With the expanded IC pressure model, a later measurement of `ic/info` for
-topic `device` consumed 95.6 million request fuel and 19.1 MiB linear memory.
-Generating TopicEntry values directly from Prepared Model briefs rather than
-first materializing every detailed Point reduced that request to 68.3 million
-fuel and 10.4 MiB without changing the exact topic sequence, aliases, locale
-or candidates. The IC full-index equivalence test needs a 128 MiB test memory
-limit because it builds the validated and lightweight indexes simultaneously;
-ordinary `ic/info` still runs within 64 MiB. Moving even the lightweight
-topic array into DocService initialization continues to hit the runtime's
-single growth-operation limit, so it remains request-local.
+as one navigable catalog. `IndexService` retains a lightweight flat list with
+one `{key,label,aliases,summary}` entry per visible point. `ic/info` validates an exact
+key against a lightweight request-local list, then materializes only the
+addressed dataset's knowledge with its declared docs and related references.
+The index and detail paths use the same Prepared Model and subject. This keeps
+`DocService` from retaining a second catalog, which previously exceeded a
+runtime memory-growth limit. Earlier topic-pagination fuel measurements no
+longer describe the current protocol.
 
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes

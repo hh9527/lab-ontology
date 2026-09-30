@@ -21,33 +21,27 @@ The model-independent build, service, and agent workflow is in
 Requests have exactly `method` and `input`:
 
 ```json
-{"method":"foo/index","input":{"offset":0,"limit":50}}
-{"method":"foo/info","input":{"topic":"Order status"}}
-{"method":"foo/info","input":{"target":{"kind":"Dimension","owner":"order","id":"order_status"}}}
+{"method":"foo/index","input":{}}
+{"method":"foo/info","input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}}
 ```
 
 `foo` is the domain bound by the host, not a hard-coded Model name. The
-index is ordered by Model declarations, contains every visible knowledge
-point under at least its stable ID, and returns `entries` plus `next_offset`
-(null at the end). Offset defaults to 0; limit defaults to 50 and must be
-between 1 and 100. Offsets refer to the same prepared Model revision and
-subject; a host should keep both stable across page requests.
+index is ordered by Model declarations and returns every visible knowledge
+point exactly once as `{key,label,aliases,summary}`. It is one complete flat list,
+without pagination or a cursor.
 
-`topic` compares Unicode codepoints exactly against declared IDs, labels,
-aliases, and localized labels: no trimming, case folding, language guessing,
-or fuzzy search. A document lookup returns `NotFound`, `Found(point)`, or
-`Candidates(entries)` when the topic is ambiguous. Each candidate carries
-its kind, owning dataset, stable ID, display label, and optional locale.
-Follow a candidate or any point reference via `input.target` unchanged.
+`info` looks up a unique key and returns `Found(point)` or `NotFound`. Pass a
+key from the index or a point reference's `target` to `input.key` unchanged.
+Labels, aliases and localizations are descriptions, not lookup keys.
 Target kinds use the declared enum spelling: `Schema`, `Dataset`, `Field`,
 `Dimension`, `Measure`, `Value`, `Relation`, `BusinessLink`, `TimeRole`, and
 `Metric`. The `owner` is empty for datasets;
 for canonical values it is their dimension ID, otherwise their dataset ID.
 Unknown and invisible targets both return `NotFound`.
 
-Responses use Telora's `codec::encode` representation: `{"Index":{...}}`
-or `{"Document":{"Found":{...}}}`, `{"Document":{"Candidates":[...]}}`,
-and `{"Document":"NotFound"}`. A point carries typed details and references
+Responses use Telora's `codec::encode` representation: `{"Index":{"entries":[...]}}`
+or `{"Document":{"Found":{...}}}` and `{"Document":"NotFound"}`.
+A point carries typed details and references
 marked `Member`, `Traversable`, or `Related`. `Related` is documentation-only;
 it cannot establish a query edge. A relation's named endpoints, kind, and
 shape, a dataset's grain, and a time role's semantics, encoding, and
@@ -62,7 +56,7 @@ clock and encoding the Model declares, but does not itself validate arbitrary
 timestamp literals or convert local calendar time to UTC (the separate time
 semantics contract in issue #11 covers those operations).
 
-Requests with unknown keys, conflicting topic/target, wrong types, invalid
-pagination, or another domain's method fail with a structured diagnostic.
-Authorization is checked when generating the map, including direct target
-lookups; the host must not share an authorized response with another subject.
+Requests with unsupported fields, a missing or malformed key, wrong types, or
+another domain's method fail with a structured diagnostic. Authorization is
+checked when generating the index and resolving keys; the host must not share
+an authorized response with another subject.
