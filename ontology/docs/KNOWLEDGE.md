@@ -60,3 +60,7 @@ Requests with unsupported fields, a missing or malformed key, wrong types, or
 another domain's method fail with a structured diagnostic. Authorization is
 checked when generating the index and resolving keys; the host must not share
 an authorized response with another subject.
+The request envelope and both method inputs are decoded from declared records;
+shape diagnostics include the offending JSON path and an `info` key for the
+corresponding contract (`syntax/knowledge/request`, `syntax/knowledge/index`,
+or `syntax/knowledge/info`).

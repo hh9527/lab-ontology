@@ -26,6 +26,9 @@ not substitutes for stable Intent IDs.
 Keys use the declared `KnowledgeTarget` shape, including the PascalCase `kind`
 (for example, `Dataset`). The key contract itself is listed in `index` under
 `{kind:"Schema",owner:"",id:"syntax/knowledge/target"}`.
+The request shapes are indexed under `syntax/knowledge/request`,
+`syntax/knowledge/index`, and `syntax/knowledge/info`. A shape diagnostic
+includes the offending JSON path and a key that can be passed to `info`.
 
 Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to

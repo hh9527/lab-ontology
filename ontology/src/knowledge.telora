@@ -30,6 +30,9 @@ type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: A
 type KnowledgeIndex = struct { entries: Array(IndexEntry) };
 type DocResult = enum { NotFound, Found(Point) };
 type KnowledgeResponse = enum { Index(KnowledgeIndex), Document(DocResult) };
+type KnowledgeRequest = struct { method: String, input: Value };
+type IndexInput = struct {};
+type InfoInput = struct { key: edsl::KnowledgeTarget };
 
 def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
     {kind, owner, id}
@@ -51,10 +54,19 @@ def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
 def syntax_points: Array(Point) = [
     point(syntax_target("knowledge/target"), "Knowledge target", [],
         "index returns one entry per visible knowledge point with key, label, aliases and summary. info accepts {key:{kind,owner,id}}; pass an index entry's key or a document reference's target unchanged. kind is the declared KnowledgeKind enum: Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric. owner and id are exact stable identifiers. Names and aliases describe knowledge but are not keys.", []),
+    point(syntax_target("knowledge/request"), "Knowledge request", [],
+        "The unbound knowledge service accepts exactly {method,input}. method is <domain>/index or <domain>/info; input follows that method's declared shape. A mounted service slot receives only input, without this envelope.",
+        [member(syntax_target("knowledge/index")), member(syntax_target("knowledge/info"))]),
+    point(syntax_target("knowledge/index"), "Knowledge index request", [],
+        "index input is exactly {}. The response contains one flat entry per visible knowledge point with key, label, aliases and summary; it has no pagination or cursor.",
+        [member(syntax_target("knowledge/target"))]),
+    point(syntax_target("knowledge/info"), "Knowledge info request", [],
+        "info input is exactly {key:{kind,owner,id}}. Use a key from index or a document reference's target unchanged. Unknown or invisible keys return NotFound.",
+        [member(syntax_target("knowledge/target"))]),
     point(syntax_target("intent"), "Intent syntax", [],
         "Submit {intents:[...]} with one to five independent intents. Each intent has op Graph, GraphPair or GraphUnion. Values in filters are interpreted by their declared dimension or measure; do not supply an input kind.",
         [member(syntax_target("graph")), member(syntax_target("graph_pair")), member(syntax_target("graph_union")),
-            member(syntax_target("knowledge/target"))]),
+            member(syntax_target("knowledge/target")), member(syntax_target("knowledge/request"))]),
     point(syntax_target("graph"), "Graph intent", [],
         "Required: op=Graph, root node id, nodes, edges, select. Optional: row_grain=Root|Association, distinct, constraints, measures, measure_having, filters, time_windows, any_of, exists, count, count_value, count_having, count_groups, include_empty, group_by_identity, top_per, top_by_measure, order_by, take. A graph must project dimensions/measures or count an explicit subject. Entity, dimension, measure and relation IDs come from domain knowledge.",
         [member(syntax_target("graph/node")), member(syntax_target("graph/edge")), member(syntax_target("graph/select")),
@@ -436,28 +448,11 @@ def by_target: Fn(edsl::PreparedPayload, String, edsl::KnowledgeTarget) -> DocRe
     }
 };
 
-def object: Fn(Value) -> Dict(Value) = fn(value) {
-    match value { Value::Object(fields) => fields, _ => fail!("knowledge request must be an object", value) }
-};
-def required: Fn(Dict(Value), String) -> Value = fn(fields, key) {
-    match dict::get(fields, key) {
-        Some(value) => value, None => fail!("knowledge request field is missing", key),
-    }
-};
-def text_field: Fn(Dict(Value), String) -> String = fn(fields, key) {
-    match required(fields, key) {
-        Value::String(value) => value, other => fail!("knowledge request field must be a string", key, other),
-    }
-};
-def keys: Fn(Dict(Value), Array(String)) -> () = fn(fields, allowed) {
-    match array::find(dict::keys(fields), fn(key) { !array::any(allowed, fn(name) { name == key }) }) {
-        Some(key) => fail!("knowledge request contains unsupported field", key), None => (),
-    }
-};
-def parse_target: Fn(Value) -> edsl::KnowledgeTarget = fn(value) {
-    match codec::decode@[edsl::KnowledgeTarget](value) {
+def decode_request: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, contract) {
+    match codec::decode@[A](value) {
         Ok(decoded) => decoded,
-        Err(error) => raise!(blame::with_context(error, "see knowledge key Schema//syntax/knowledge/target")),
+        Err(error) => raise!(blame::with_context(error,
+            `see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", contract)}`)),
     }
 };
 
@@ -465,18 +460,14 @@ def parse_target: Fn(Value) -> edsl::KnowledgeTarget = fn(value) {
 def serve_catalog: Fn(edsl::PreparedPayload, String, KnowledgeIndex, String, Value) -> KnowledgeResponse =
     fn(payload, subject, index, domain, request) {
     if domain == "" { fail!("knowledge domain must not be empty") } else { () };
-    let envelope = object(request);
-    keys(envelope, ["method", "input"]);
-    let method = text_field(envelope, "method");
-    let input = object(required(envelope, "input"));
-    if method == `\{domain}/index` {
-        keys(input, []);
+    let envelope = decode_request@[KnowledgeRequest](request, "syntax/knowledge/request");
+    if envelope.method == `\{domain}/index` {
+        let decoded = decode_request@[IndexInput](envelope.input, "syntax/knowledge/index");
         KnowledgeResponse::Index(index)
-    } else if method == `\{domain}/info` {
-        keys(input, ["key"]);
-        let key = parse_target(required(input, "key"));
-        KnowledgeResponse::Document(point_from_model(payload, subject, index, key))
-    } else { fail!("unknown knowledge method for domain", method, domain) }
+    } else if envelope.method == `\{domain}/info` {
+        let input = decode_request@[InfoInput](envelope.input, "syntax/knowledge/info");
+        KnowledgeResponse::Document(point_from_model(payload, subject, index, input.key))
+    } else { fail!(`unknown knowledge method for domain; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/knowledge/request")}`, envelope.method, domain) }
 };
 
 def serve: Fn(edsl::PreparedPayload, String, String, Value) -> KnowledgeResponse = fn(payload, subject, domain, request) {
@@ -497,11 +488,9 @@ def knowledge_service_factory: Fn(edsl::PreparedPayload, String, String) -> Fn(V
 def knowledge_info_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> Value =
     fn(payload, subject) {
         fn(input) {
-            let fields = object(input);
-            keys(fields, ["key"]);
-            let key = parse_target(required(fields, "key"));
+            let request = decode_request@[InfoInput](input, "syntax/knowledge/info");
             codec::encode(KnowledgeResponse::Document(point_from_model(payload, subject,
-                index_from_model(payload, subject), key)))
+                index_from_model(payload, subject), request.key)))
         }
     };
 
@@ -509,8 +498,7 @@ def knowledge_index_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Valu
     fn(payload, subject) {
         let index = index_from_model(payload, subject);
         fn(input) {
-            let fields = object(input);
-            keys(fields, []);
+            let decoded = decode_request@[IndexInput](input, "syntax/knowledge/index");
             codec::encode(KnowledgeResponse::Index(index))
         }
     };
