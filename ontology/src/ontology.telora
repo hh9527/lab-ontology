@@ -13,11 +13,13 @@ use crate::query as qb;
 use std::array as array;
 use std::codec as codec;
 use std::json as json;
+use std::value::{ Value };
 use std::type_desc as td;
 use std::type_property as property;
 use std::prelude as prelude;
 use std::regex as regex;
 use std::string as string;
+use std::uri as uri;
 
 @regex::parse_by(regex::compile(r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2}) (?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})$"))
 type CanonicalUtcParts = struct { year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int };
@@ -69,21 +71,37 @@ type DimensionNote = struct { id: String, label: String, summary: String };
 type DimensionDescriptions = struct { notes: Array(DimensionNote) };
 
 type LocalizedKnowledgeText = struct { locale: String, label: String, summary: String };
-type KnowledgeKind = enum { Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
+type KnowledgeKind = enum { Index, Concepts, Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
 type KnowledgeTarget = struct { kind: KnowledgeKind, owner: String, id: String };
+def knowledge_key: Fn(KnowledgeTarget) -> String = fn(target) {
+    if target.kind == KnowledgeKind::Index { "index" }
+    else if target.kind == KnowledgeKind::Concepts { "concepts" }
+    else {
+        let kind = match codec::encode(target.kind) {
+            Value::String(name) => name,
+            other => fail!("knowledge type must encode as a name", other),
+        };
+        let owner = uri::encode_component(target.owner);
+        let id = string::join(array::map(string::split(target.id, "/"), uri::encode_component), "/");
+        if owner == "" { `\{kind}/\{id}` } else { `\{kind}/\{owner}/\{id}` }
+    }
+};
 def knowledge_key_hint: Fn(KnowledgeKind, String, String) -> String = fn(kind, owner, id) {
     let key: KnowledgeTarget = {kind, owner, id};
-    json::stringify(codec::encode(key))
+    json::stringify(Value::String(knowledge_key(key)))
 };
 def syntax_key_hint: Fn(String) -> String = fn(id) {
     knowledge_key_hint(KnowledgeKind::Schema, "", id)
 };
 type KnowledgeDoc = struct { target: KnowledgeTarget, text: String };
 type KnowledgeRelation = struct { source: KnowledgeTarget, target: KnowledgeTarget };
+type ConceptAnnotation = struct { term: String, description: String, target: KnowledgeTarget };
 @prelude::property(PropertyTarget::Type)
 type KnowledgeDocs = struct { entries: Array(KnowledgeDoc) };
 @prelude::property(PropertyTarget::Type)
 type KnowledgeRelations = struct { entries: Array(KnowledgeRelation) };
+@prelude::property(PropertyTarget::Type)
+type ConceptAnnotations = struct { entries: Array(ConceptAnnotation) };
 type LocalizedMemberText = struct { kind: MemberAliasKind, id: String, text: LocalizedKnowledgeText };
 @prelude::property(PropertyTarget::Field)
 type LocalizedMemberTexts = struct { notes: Array(LocalizedMemberText) };
@@ -879,6 +897,16 @@ def related_to: Fn(KnowledgeTarget, KnowledgeTarget) -> Fn(td::TypeDesc, Option(
         {entries: array::push(entries, {source, target})}
     }
 };
+
+def concept: Fn(String, String, KnowledgeTarget) -> Fn(td::TypeDesc, Option(ConceptAnnotations)) -> ConceptAnnotations =
+    fn(term, description, target) {
+        fn(ctx, previous) {
+            let entry: ConceptAnnotation = {term, description, target};
+            {entries: match previous {
+                Some(declared) => array::push(declared.entries, entry), None => [entry],
+            }}
+        }
+    };
 
 def relation_description: Fn(String, String, String) -> Fn(td::TypeDesc, Option(RelationDescriptions)) -> RelationDescriptions = fn(id, label, summary) {
     fn(ctx, previous) {
@@ -2379,6 +2407,8 @@ def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Arra
 
 def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn(payload, target) {
     match target.kind {
+        KnowledgeKind::Index => False,
+        KnowledgeKind::Concepts => False,
         KnowledgeKind::Schema => False,
         KnowledgeKind::Dataset => target.owner == "" && array::any(payload.entities, fn(e) { e.id == target.id }),
         KnowledgeKind::Field => array::any(payload.entities, fn(e) {
@@ -2471,7 +2501,22 @@ def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
     });
     if let Some(duplicate) = array::find(refs, fn(item) {
         array::length(array::filter(refs, fn(other) { other == item })) > 1
-    }) { fail!("duplicate knowledge reference", duplicate) } else { True }
+    }) { fail!("duplicate knowledge reference", duplicate) } else { () };
+    let concepts = array::flat_map(payload.entities, fn(entity) {
+        let entries = match property::get_type_prop(entity.entity_type, ConceptAnnotations.type) {
+            Some(declared) => declared.entries, None => [],
+        };
+        array::map(entries, fn(item) {
+            if item.term == "" || item.description == "" || !knowledge_owned_by(payload, entity, item.target) {
+                fail!("concept annotation requires a term, description and declared target owned by its entity", entity.id, item)
+            } else { item }
+        })
+    });
+    if let Some(duplicate) = array::find(concepts, fn(item) {
+        array::length(array::filter(concepts, fn(other) {
+            other.term == item.term && other.target == item.target
+        })) > 1
+    }) { fail!("duplicate concept term for knowledge target", duplicate) } else { True }
 };
 
 def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> PreparedPayload = fn(revision, entity_types, profile, authorize) {
@@ -5015,13 +5060,17 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
 pub use self::{
     KnowledgeKind,
     KnowledgeTarget,
+    knowledge_key,
     knowledge_key_hint,
     KnowledgeDoc,
     KnowledgeRelation,
+    ConceptAnnotation,
     KnowledgeDocs,
     KnowledgeRelations,
+    ConceptAnnotations,
     doc,
     related_to,
+    concept,
     OutputType,
     ColumnMap,
     KeyFlag,

@@ -3,7 +3,7 @@
 Use one numbered question at a time. The trusted host builds the snapshot;
 the MCP adapter starts one persistent `telora-run --serve stdio+jsonl://` child.
 Give the candidate only an Agent-facing guide, one `QUESTION.md`, and access
-to the three MCP tools `index`, `info`, and `transform` through the restricted
+to the two MCP tools `info` and `transform` through the restricted
 host endpoint. The Agent's filesystem and shell must not be able
 to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
 The adapter accepts one to five independent Intents in a single
@@ -14,7 +14,7 @@ transform service in one call. If all lower successfully, it writes one mode-060
 containing the ordered Intents and generated Queries to the existing
 host-only directory named by `ONTOLOGY_EVAL_OUTPUT_DIR`. The tool returns only
 an acceptance receipt; the Agent cannot retrieve SQL or bindings through the
-three exposed tools. A failed plan returns indexed diagnostics for all plans
+two exposed tools. A failed plan returns indexed diagnostics for all plans
 and writes no partial record. Results are not merged or deduplicated across
 plans.
 For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.

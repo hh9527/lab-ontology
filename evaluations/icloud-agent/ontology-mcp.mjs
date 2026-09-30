@@ -16,23 +16,11 @@ if (!outputDir?.startsWith('/') || !statSync(outputDir).isDirectory()) {
 const tools = [
   {
     name: 'info',
-    description: 'Get a knowledge point by exact key. Start with {kind:"Schema",owner:"",id:"index"} for the complete catalog.',
+    description: 'Get a knowledge node by its opaque string key. Start with "index", then follow returned keys unchanged.',
     inputSchema: {
       type: 'object',
       properties: {
-        key: {
-          type: 'object',
-          properties: {
-            kind: { type: 'string', enum: [
-              'Schema', 'Dataset', 'Field', 'Dimension', 'Measure', 'Value',
-              'Relation', 'BusinessLink', 'TimeRole', 'Metric',
-            ] },
-            owner: { type: 'string' },
-            id: { type: 'string' },
-          },
-          required: ['kind', 'owner', 'id'],
-          additionalProperties: false,
-        },
+        key: { type: 'string' },
       },
       required: ['key'],
       additionalProperties: false,

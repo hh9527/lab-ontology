@@ -52,7 +52,7 @@ the slot input, without the JSONL `method`/`input` envelope. For example:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8080/ic/info \
-  -H 'Content-Type: application/json' -d '{"key":{"kind":"Schema","owner":"","id":"index"}}'
+  -H 'Content-Type: application/json' -d '{"key":"index"}'
 ```
 
 `telora-run` has no authentication. Bind only to a host-private loopback or
@@ -75,23 +75,25 @@ slot; only `input` is passed to that slot. For HTTP, POST the same `input`
 directly to the matching path. The knowledge and query methods are:
 
 ```json
-{"method":"<domain>/info","input":{"key":{"kind":"Schema","owner":"","id":"index"}}}
-{"method":"<domain>/info","input":{"key":{"kind":"Dataset","owner":"","id":"<stable ID>"}}}
+{"method":"<domain>/info","input":{"key":"index"}}
+{"method":"<domain>/info","input":{"key":"<key returned by index or links>"}}
 ```
 
 The `index` topic returns the complete flat catalog of visible knowledge points, one
 entry per key, with a label, aliases and short summary. Pass an entry's `key` unchanged
-to `info` for the full point. Follow its references' `target` values as keys to
+to `info` for the full point. Follow its `links[].key` values unchanged to
 check entity grain, dimensions, measures, business values, time roles, and
 named relations. A `Related` link explains knowledge but does not authorize a
 query traversal. Labels, translations, aliases, and physical column names are
 not substitutes for stable Intent IDs.
 
-Keys use the declared `KnowledgeTarget` shape, including the PascalCase `kind`
-(for example, `Dataset`). The key contract itself is listed in the index topic under
-`{kind:"Schema",owner:"",id:"syntax/knowledge/target"}`.
-The request shapes are indexed under `syntax/knowledge/request` and
-`syntax/knowledge/info`. A shape diagnostic
+Every knowledge node has `{key,type,description,links,detail}`. The string key
+is opaque: do not construct it from a type or business ID, split it, or decode it.
+The response `type` determines the `detail` shape. The `Index` node has its flat
+catalog in `detail.entries`; the `Concepts` node collects Model-declared aliases,
+local names and concept terms with keys of associated nodes. A term may refer to
+multiple nodes; read their details before choosing its business meaning.
+Use index entries to discover the knowledge key and request contracts as well. A shape diagnostic
 includes the offending JSON path and a key that can be passed to `info`.
 
 Use the index topic and `info` to discover the Model, then express the user's business
@@ -221,7 +223,7 @@ operators and logical value types each dimension permits. Do not send `kind`:
 the target dimension or measure determines the logical type of its JSON value.
 Typed predicate inputs and canonical wires shown by `info` are Model facts,
 not JSON Intent value syntax.
-Discover the Intent contract under the `syntax/intent` key and its linked points
+Find the Intent syntax entry in the index and follow its returned key and links
 through `<domain>/info`. A diagnostic naming an info key can be
 resolved through `<domain>/info` to repair the Intent. Business-value filters
 use the stable value ID, not its physical wire or localized label.
@@ -295,8 +297,8 @@ The outer object accepts only `op`, `left`, `right`, and optional boolean
 display values are the same entity: the join uses the aligned identity keys.
 
 In JSONL service mode, responses use the `telora.service/v1` envelope. On
-success, `ok.Document` holds `Found` or `NotFound`; the Found index point contains
-the complete `entries` list. `ok` from `transform` contains the
+success, `ok.Document` holds `Found` or `NotFound`; the Found Index node contains
+the complete `detail.entries` list. `ok` from `transform` contains the
 batch response described above. A rejected Intent is reported as
 `ok.accepted:false` with indexed diagnostics and `queries:null`; malformed
 requests and uncaptured service failures have `error:true` and top-level

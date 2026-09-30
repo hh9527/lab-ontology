@@ -13,7 +13,7 @@ service collection. Each model keeps its own knowledge and lowering rules:
 independent Intents. It returns indexed diagnostics for every item; `queries`
 contains the ordered Queries only when all Intents are accepted. Request `ctx`
 and a single `intent` key are not supported.
-`<model>/info` accepts `{ "key": {"kind":"Schema","owner":"","id":"index"} }`
+`<model>/info` accepts `{ "key": "index" }`
 to return the complete flat catalog, or another exact key for one knowledge
 point. The ic model has the same two
 routes under `ic/` in its own `icloud_model` entry.
