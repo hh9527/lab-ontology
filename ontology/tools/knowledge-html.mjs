@@ -25,7 +25,7 @@ export function renderKnowledge(nodes) {
     const { key, type, description, links, detail } = node;
     for (const item of links) checkLink(item.key);
     let content;
-    if (type === 'Index' || type === 'Concepts') {
+    if (type === 'Index' || type === 'Terminology') {
       if (!Array.isArray(detail.entries)) throw new Error(`${type} requires detail.entries`);
       content = `<table><thead><tr><th>${type === 'Index' ? 'Node' : 'Term'}</th><th>Description</th><th>Key</th></tr></thead><tbody>` +
         detail.entries.map((entry) => {

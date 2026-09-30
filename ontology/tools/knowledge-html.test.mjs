@@ -6,12 +6,12 @@ const node = (key, type = 'Dataset', detail = {}, links = []) => ({
   key, type, description: { label: '<script>unsafe</script>', aliases: ['A&B'], localized: [], summary: '"quoted"' }, links, detail,
 });
 
-test('one generic template renders index, concepts and domain nodes using opaque keys', () => {
+test('one generic template renders index, terminology and domain nodes using opaque keys', () => {
   const key = 'Dimension/设备%2F位置/状态?#';
   const target = node(key);
   const nodes = [
     node('index', 'Index', { entries: [{ key, type: target.type, description: target.description }] }, [{ type: 'Member', key }]),
-    node('concepts', 'Concepts', { entries: [{ term: '业务说法', description: '<img onerror=bad>', key }] }, [{ type: 'Related', key }]),
+    node('terminology', 'Terminology', { entries: [{ term: '业务说法', description: '<img onerror=bad>', key }] }, [{ type: 'Related', key }]),
     target,
   ];
   const html = renderKnowledge(nodes);

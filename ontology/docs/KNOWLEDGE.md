@@ -39,7 +39,7 @@ Responses use Telora's `codec::encode` representation:
 `{"Document":{"Found":{...}}}` or `{"Document":"NotFound"}`. The Found
 node has exactly `{key,type,description,links,detail}`. `description` contains
 label, aliases, localized text and summary; `links` contains `{type,key}` pairs.
-Node types include `Index`, `Concepts`, `Schema`, `Dataset`, `Field`, `Dimension`,
+Node types include `Index`, `Terminology`, `Schema`, `Dataset`, `Field`, `Dimension`,
 `Measure`, `Value`, `Relation`, `BusinessLink`, `TimeRole`, and `Metric`.
 The response type determines `detail`: Index has `entries`; Dataset has `id`,
 grain and time roles; Field has `id` and `dataset`; Value has its canonical `id`
@@ -61,14 +61,18 @@ clock and encoding the Model declares, but does not itself validate arbitrary
 timestamp literals or convert local calendar time to UTC (the separate time
 semantics contract in issue #11 covers those operations).
 
-`Concepts` has `detail.entries` of `{term,description,key}`. Entries derive from
+The formal domain concepts are the knowledge nodes listed in `Index`.
+`Terminology` (key `"terminology"`) is supplemental language assistance, not a
+second concept system. It has `detail.entries` of `{term,description,key}`. Entries derive from
 existing alias/localization properties and optional entity-level
-`@concept(term, description, target)` annotations. A term can associate with
+`@term(term, description, target)` annotations. A term can associate with
 multiple nodes; this is discovery information, not an assertion of synonymy.
 Explicit annotations describe a point owned by the declaring entity and take
 precedence over an automatically derived alias for the same term and target.
-Hidden targets and their terms are excluded. Concepts links never create a
-query relationship or change an Intent's legality.
+Hidden targets and their terms are excluded. Terminology links never create a
+query relationship or change an Intent's legality. The agent interprets these
+associations; no automatic substitution occurs. Intent accepts only the
+Model-defined canonical business IDs, never aliases or terminology terms.
 
 Requests with unsupported fields, a missing or malformed key, wrong types, or
 another domain's method fail with a structured diagnostic. Authorization is

@@ -26,9 +26,12 @@ not substitutes for stable Intent IDs.
 Every knowledge node has `{key,type,description,links,detail}`. The string key
 is opaque: do not construct it from a type or business ID, split it, or decode it.
 The response `type` determines the `detail` shape. The `Index` node has its flat
-catalog in `detail.entries`; the `Concepts` node collects Model-declared aliases,
-local names and concept terms with keys of associated nodes. A term may refer to
-multiple nodes; read their details before choosing its business meaning.
+catalog in `detail.entries`; the `Terminology` node collects Model-declared aliases,
+local names and common expressions with keys of associated nodes. The index
+already lists the formal domain concepts; terminology is only supplemental
+language assistance, not a second concept system or automatic substitution.
+A term may refer to multiple nodes; interpret the user's meaning, read those
+nodes, and use only Model-defined canonical business IDs in Intent.
 Use index entries to discover the knowledge key and request contracts as well. A shape diagnostic
 includes the offending JSON path and a key that can be passed to `info`.
 
