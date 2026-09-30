@@ -19,15 +19,17 @@ projection of authorized plain dimensions, forward and reverse navigation of
 declared edges, and ordered correlated existence/absence paths of arbitrary
 length. It
 also accepts `count: "<root instance>"` instead of `select` when every outer
-JOIN follows a forward Safe edge; otherwise counting the root requires EXISTS
+JOIN reaches an endpoint declared `One` or `Optional`; otherwise counting the root requires EXISTS
 so that matching children cannot multiply its rows. It counts the root key
 without reducing a composite grain to one guessed DISTINCT column. It
 also supports grouping by root dimensions while counting a non-root child
 when every edge in the outer join tree is functional when traversed from that
 child. Grouping dimensions may name any declared graph instance because the
-same proof prevents joins from duplicating the counted subject. Reverse Safe chains and forward FanOut edges whose keys cover the
-complete parent identity provide this proof, including multi-hop paths.
-Matching only a shared tenant does not prove site identity, so counting
+same proof prevents joins from duplicating the counted subject. Each relation
+declares `{from,to}` cardinalities using `One`, `Optional`, `Many0`, or `Many1`.
+Forward traversal reads `to`, reverse traversal reads `from`; these trusted
+Model contracts establish grain preservation independently of key shape.
+The shared-tenant relation declares multiple matches, so counting
 same-tenant devices as children of a particular site is rejected. Branches
 that can duplicate the counted child remain unproven and are rejected; the
 diagnostic identifies the first offending named edge and distinguishes a
@@ -45,7 +47,10 @@ rejected. Identity fields in a single key or any position of a composite
 dataset grain must be non-nullable, or the Model fails preparation before an
 intent can count rows. Composite identity is declared once with
 `@dataset(DatasetKind::Entity, ["reading_id", "tenant_id"], None)`, not by
-marking both fields `@key`; a Safe relation to it must match every grain field.
+marking both fields `@key`. Cardinality does not require a relation key to cover
+every identity field. Model authors remain responsible for the declared
+association, including tenant alignment; business-link identity comparisons
+continue to require complete participant keys.
 It
 rejects missing edges, role mismatches and disconnected nodes. Reverse
 navigation reads the same edge from its other endpoint; it does
@@ -85,8 +90,8 @@ construction with a diagnostic identifying the edge, role, or missing proof.
 | From device `d`, follow `device_site` to site `s`, then `site_tenant` to tenant `t`; test existence without changing the grain of `d`. | Follow `device_site` to a tenant instance: invalid target type at that edge. |
 | From device `d`, test existence of a connection via the reverse of `connection_a` and project/count devices at the explicit `d` grain. | Join all matching connections and count rows as devices: grain amplification, require an explicit count subject. |
 | A connection endpoint and its Device share `tenant_id` as well as device ID. | Join only on device ID while omitting tenant ID: incomplete declared identity key. |
-| Declare Device identity as the composite `(id, tenant_id)` grain and join both fields. | Declare an ID-only `Safe` endpoint relation to Device: Model preparation rejects its incomplete target identity. |
-| Join a child to a composite-grain Reading using both reading ID and tenant ID. | Declare the same relation `Safe` using only reading ID: incomplete target identity; mark both fields `@key` instead of declaring a composite grain: ambiguous representative key. |
+| Declare Device identity as `(id, tenant_id)` and use the pressure model's tenant-aligned endpoint keys. A different model may declare a trusted single-target relation on other keys. | Use an incomplete endpoint key for a business link that compares participant identities. |
+| Declare a composite-grain Reading and a trusted single-target child relation, including one using a non-identity key. | Mark both fields `@key` instead of declaring a composite grain: ambiguous representative key. |
 | Check existence through `connection_endpoint`, matching A or Z with complete tenant identity, and continue along another named edge. | Connect the same edge to Site instead of Device: invalid relation endpoint role. |
 | Traverse the declared symmetric `connected_device` relation from either endpoint. | Infer symmetry solely from A/Z endpoint declarations: missing business link proof. |
 | Traverse the declared directed `upstream_device` relation from A to Z. | Traverse Z to A without an inverse declaration: direction violation. |

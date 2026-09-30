@@ -48,9 +48,22 @@ work still needed before declaring full cross-dialect support.
   dimension. The declared operators and input kinds constrain Intent values.
 - Canonical values map source encodings to stable business IDs. Labels and
   aliases aid discovery; a Query Intent still uses stable IDs.
-- Named relation declarations include endpoint types, join keys, and grain
-  classification (`Safe` or `FanOut`). Composite identities must be covered
-  by the appropriate relation keys. A business link can mark endpoint roles
+- Named relation declarations include endpoint types, join keys, and a
+  `RelationCardinality {from,to}`. Each endpoint specifies how many records on
+  that side match one record on the other side: `One` (1..1), `Optional` (0..1),
+  `Many0` (0..N), or `Many1` (1..N). For Device -> Site, `{from: Many0, to: One}`
+  means each device has exactly one site and each site has zero or more devices.
+  Cardinality is a trusted Model contract, independent of the Eq/And/Or key.
+  A forward traversal reads `to`; a reverse traversal reads `from`. `One` and
+  `Optional` preserve grain, including on an Or key; both Many variants may
+  multiply rows. Preparation checks fields, scalar/time types and guards, but
+  does not re-prove cardinality from identity keys or inspect runtime data.
+  The lower bound documents required participation; it does not rewrite joins
+  or suppress filters. Inner joins still select matching records, while the
+  existing `include_empty` mode determines left-join behavior.
+  Entity identities remain necessary for identity grouping, entity counts and
+  set-result alignment. Business-link endpoint identity comparisons still
+  require complete participant keys. A business link can mark endpoint roles
   as directed or undirected; a physical A/Z storage position alone does not
   imply business direction.
 - `@doc`, `@term`, descriptions, labels, localized text, and references enrich the

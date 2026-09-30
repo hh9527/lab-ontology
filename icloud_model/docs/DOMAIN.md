@@ -8,6 +8,16 @@ service request contract. Use the root `USAGE.md` for the current Intent and
 batch protocol, and `ic/info` for the prepared Model's
 discoverable knowledge points.
 
+Relations now declare `cardinality: {from,to}` with `One`, `Optional`, `Many0`,
+and `Many1`. The older Safe/FanOut terms in the pressure history below describe
+single-target versus potentially multiple-target traversals. Existing Safe
+declarations were migrated to `{from: Many0, to: Optional}`; FanOut OR and
+component declarations retain `{from: Many0, to: Many0}`. No new unique-site
+business assumption was introduced. Cardinality is trusted independently of
+key shape; historical identity-key rejection examples are not current
+cardinality admission rules. Complete keys remain required when comparing
+business-link participant identities.
+
 | Source fact | Current representation | Acceptance requirement |
 | --- | --- | --- |
 | Network device identity includes resource ID and tenant ID | Entity dataset grain `(id, tenant_id)`; the KPI ownership relation maps both fields | Grouped KPI observations retain both keys as hidden GROUP BY dimensions so namesake devices remain distinct while only requested labels and metrics are projected. |

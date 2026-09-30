@@ -1,0 +1,169 @@
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::knowledge as knowledge;
+use std::test as test;
+use std::json as json;
+use std::array as array;
+use std::string as string;
+use std::value::{ Value };
+use crate::model::{ payload };
+
+@edsl::entity_id("target")
+@edsl::entity_source("targets", "target")
+type Target = struct {
+    @edsl::column("id") @edsl::key()
+    @edsl::dimension("target_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    id: String,
+};
+
+@edsl::entity_id("source")
+@edsl::entity_source("sources", "source")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id"], None)
+# The source guarantees that its two references resolve to the same target,
+# and that each target belongs to exactly one source. The join remains OR.
+@edsl::named_typed_relation_or_key("one_pair", Source.type, Target.type,
+    {from: edsl::Cardinality::One, to: edsl::Cardinality::One}, [
+    [edsl::typed_relation_pair(edsl::model_field(Source.type, String.type, "first"), edsl::model_field(Target.type, String.type, "id"))],
+    [edsl::typed_relation_pair(edsl::model_field(Source.type, String.type, "second"), edsl::model_field(Target.type, String.type, "id"))],
+])
+@edsl::named_relation_key("optional_pair", Target.type,
+    {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Optional},
+    edsl::DeclaredRelationKey::FieldEq({from: "first", to: "id"}))
+@edsl::named_relation_key("optional_or_pair", Target.type,
+    {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Optional},
+    edsl::DeclaredRelationKey::Or([
+        edsl::DeclaredRelationKey::FieldEq({from: "first", to: "id"}),
+        edsl::DeclaredRelationKey::FieldEq({from: "second", to: "id"}),
+    ]))
+@edsl::named_relation_key("many0_pair", Target.type,
+    {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Many0},
+    edsl::DeclaredRelationKey::Or([
+        edsl::DeclaredRelationKey::FieldEq({from: "first", to: "id"}),
+        edsl::DeclaredRelationKey::FieldEq({from: "second", to: "id"}),
+    ]))
+@edsl::named_relation_key("many1_pair", Target.type,
+    {from: edsl::Cardinality::Many1, to: edsl::Cardinality::Many1},
+    edsl::DeclaredRelationKey::Or([
+        edsl::DeclaredRelationKey::FieldEq({from: "first", to: "id"}),
+        edsl::DeclaredRelationKey::FieldEq({from: "second", to: "id"}),
+    ]))
+type Source = struct {
+    @edsl::column("id") @edsl::key()
+    @edsl::dimension("source_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::measure("source_count", qb::AggregateFunction::Count, [])
+    id: String,
+    @edsl::column("first") first: String,
+    @edsl::column("second") second: String,
+};
+
+def profile: qb::PlanProfile = payload.profile <~ {
+    allowed_operators: array::concat([payload.profile.allowed_operators,
+        [qb::Operator::Having, qb::Operator::Order, qb::Operator::Limit, qb::Operator::Partition]]),
+};
+def model: edsl::PreparedPayload = edsl::build_root("endpoint-cardinality",
+    [Source.type, Target.type], profile, fn(subject) { subject == "resolver" });
+
+def request: Fn(String, String, String) -> Value = fn(relation, root, counted) {
+    json::parse(`{"op":"Graph","root":"\{root}","nodes":[{"id":"s","entity":"source"},{"id":"t","entity":"target"}],"edges":[{"relation":"\{relation}","from":"s","to":"t"}],"select":[],"count":"\{counted}"}`).unwrap!()
+};
+def lower: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(model, "resolver");
+
+def existence_request: Fn(Int) -> Value = fn(minimum) {
+    json::parse(`{"op":"Graph","root":"t","nodes":[{"id":"t","entity":"target"}],"edges":[],"select":[],"count":"t","exists":[{"anchor":"t","nodes":[{"id":"s","entity":"source"}],"edges":[{"relation":"optional_or_pair","from":"s","to":"t"}],"having":[{"node":"s","measure":"source_count","op":"Ge","value":\{minimum}}]}]}`).unwrap!()
+};
+
+pub def one_or_preserves_both_endpoint_grains: test::Test = test::should_ok(fn() {
+    let forward = sqlite::build_query(lower(request("one_pair", "s", "s")));
+    let reverse = postgres::build_query(lower(request("one_pair", "t", "t")));
+    if string::contains(forward.sql, " OR ") && string::contains(forward.sql, "count(s.id)")
+        && string::contains(reverse.sql, " OR ") && string::contains(reverse.sql, "count(\"t\".\"id\")") {
+        True
+    } else { fail!("endpoint cardinality changed OR matching or count grain", forward, reverse) }
+});
+
+pub def optional_preserves_both_endpoint_grains: test::Test = test::should_ok(fn() {
+    sqlite::build_query(lower(request("optional_pair", "s", "s")));
+    sqlite::build_query(lower(request("optional_pair", "t", "t")))
+});
+
+pub def many0_forward_rejects_source_count: test::Test = test::should_fail_with(fn() {
+    lower(request("many0_pair", "s", "s"))
+}, "may multiply s");
+
+pub def many0_reverse_reads_optional_source_endpoint: test::Test = test::should_ok(fn() {
+    sqlite::build_query(lower(request("many0_pair", "t", "t")))
+});
+
+pub def many1_forward_rejects_source_count: test::Test = test::should_fail_with(fn() {
+    lower(request("many1_pair", "s", "s"))
+}, "may multiply s");
+
+pub def many1_reverse_rejects_target_count: test::Test = test::should_fail_with(fn() {
+    lower(request("many1_pair", "t", "t"))
+}, "may multiply t");
+
+pub def one_or_allows_measure_and_aggregate_existence: test::Test = test::should_ok(fn() {
+    let aggregate = lower(json::parse(r#"{"op":"Graph","root":"s",
+        "nodes":[{"id":"s","entity":"source"},{"id":"t","entity":"target"}],
+        "edges":[{"relation":"one_pair","from":"s","to":"t"}],
+        "select":[{"node":"t","dimension":"target_id"}],
+        "measures":[{"node":"s","measure":"source_count"}]}"#).unwrap!());
+    let existence = lower(existence_request(1));
+    sqlite::build_query(aggregate);
+    postgres::build_query(existence)
+});
+
+pub def one_or_allows_per_owner_sample_ranking: test::Test = test::should_ok(fn() {
+    let ast = lower(json::parse(r#"{"op":"Graph","root":"t",
+        "nodes":[{"id":"s","entity":"source"},{"id":"t","entity":"target"}],
+        "edges":[{"relation":"one_pair","from":"s","to":"t"}],
+        "select":[{"node":"s","dimension":"source_id"}],
+        "top_per":{"owner":"t","sample":"s","rank":"source_id","take":1}}"#).unwrap!());
+    let sql = sqlite::build_query(ast).sql;
+    if string::contains(sql, "row_number()") && string::contains(sql, " OR ") { True }
+    else { fail!("per-owner ranking lost the declared single-target OR relation", sql) }
+});
+
+pub def one_or_allows_raw_reverse_projection_and_dimension_top: test::Test = test::should_ok(fn() {
+    let raw = lower(json::parse(r#"{"op":"Graph","root":"t",
+        "nodes":[{"id":"s","entity":"source"},{"id":"t","entity":"target"}],
+        "edges":[{"relation":"one_pair","from":"s","to":"t"}],
+        "select":[{"node":"s","dimension":"source_id"},{"node":"t","dimension":"target_id"}]}"#).unwrap!());
+    let top = lower(json::parse(r#"{"op":"Graph","root":"s",
+        "nodes":[{"id":"s","entity":"source"},{"id":"t","entity":"target"}],
+        "edges":[{"relation":"one_pair","from":"s","to":"t"}],
+        "select":[{"node":"t","dimension":"target_id"}],
+        "measures":[{"node":"s","measure":"source_count"}],
+        "top_by_measure":{"node":"s","measure":"source_count","direction":"Desc","take":1}}"#).unwrap!());
+    sqlite::build_query(raw);
+    postgres::build_query(top)
+});
+
+pub def optional_or_aggregate_keeps_one_nonempty_owner_group: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(lower(existence_request(0)));
+    if string::contains(query.sql, " OR ") && string::contains(query.sql, "GROUP BY ?1")
+        && query.bindings == [qb::Val::Int(1), qb::Val::Int(0)] {
+        True
+    } else { fail!("OR aggregate split reference groups or lost empty-match semantics", query) }
+});
+
+pub def many0_or_rejects_measure_multiplication: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"Graph","root":"s",
+        "nodes":[{"id":"s","entity":"source"},{"id":"t","entity":"target"}],
+        "edges":[{"relation":"many0_pair","from":"s","to":"t"}],"select":[],
+        "measures":[{"node":"s","measure":"source_count"}]}"#).unwrap!())
+}, "graph measure source may be multiplied");
+
+pub def knowledge_exposes_endpoint_cardinality: test::Test = test::should_ok(fn() {
+    let relation = edsl::relation_domain(model, "one_pair");
+    let info = knowledge::knowledge_info_method_factory(model, "resolver");
+    let node = info(json::parse(r#"{"key":"Relation/source/one_pair"}"#).unwrap!());
+    let text = json::stringify(node);
+    if relation.cardinality == {from: edsl::Cardinality::One, to: edsl::Cardinality::One}
+        && string::contains(text, "\"cardinality\":{\"from\":\"One\",\"to\":\"One\"}") {
+        True
+    } else { fail!("knowledge lost endpoint cardinality", node) }
+});

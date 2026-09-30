@@ -48,7 +48,7 @@ Metric and TimeRole also identify their owning dataset, and BusinessLink has
 `id`, `hub`, `direction`, and `guard`. Business IDs are explicit Model data,
 not something consumers should recover by parsing a knowledge key.
 References are marked `Member`, `Traversable`, or `Related`. `Related` is documentation-only;
-it cannot establish a query edge. A relation's named endpoints, kind, and
+it cannot establish a query edge. A relation's named endpoints, cardinality, and
 shape, a dataset's grain, and a time role's semantics, encoding, and
 authoritativeness come from the same prepared Model used for query lowering.
 `@doc` only changes explanatory text; it cannot grant visibility or create a

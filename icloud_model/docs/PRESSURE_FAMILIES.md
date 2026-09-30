@@ -1,5 +1,13 @@
 # Corpus pressure families (first pass)
 
+This document retains historical pressure probes, including removed Intent
+forms and the old Safe/FanOut vocabulary. The current relation contract is
+`RelationCardinality {from,to}` with `One`, `Optional`, `Many0`, and `Many1`;
+see `ontology/docs/ONTOLOGY.md`. Cardinality is a trusted Model declaration,
+not a consequence of identity-key coverage. Historical claims that a missing
+identity equality is always rejected no longer describe ordinary relations;
+business-link identity comparisons still require complete participant keys.
+
 Q0097/Q0098 mix physical memory names with server-owned CPU KPI samples.
 The pressure model now declares Memory -> Server containment and a server CPU
 sample, but no memory CPU metric: the corpus SQL duplicates each server sample
