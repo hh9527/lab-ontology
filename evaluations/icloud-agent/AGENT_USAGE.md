@@ -138,6 +138,8 @@ Filter operators are `Eq`, `Ne`, `Gt`, `Ge`, `Lt`, `Le`, `Contains`,
 `NotContains`, `StartsWith`, and `EndsWith`. The Model restricts which
 operators and logical value types each dimension permits. Do not send `kind`:
 the target dimension or measure determines the logical type of its JSON value.
+Typed predicate inputs and canonical wires shown by `info` are Model facts,
+not JSON Intent value syntax.
 Discover the Intent contract under `syntax/intent` and its linked topics in
 `<domain>/index` and `<domain>/info`. A diagnostic naming a topic can be
 resolved through `<domain>/info` to repair the Intent. Business-value filters
