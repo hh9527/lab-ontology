@@ -113,9 +113,9 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
     }
 };
 
-def inferred_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::FilterInput =
-    fn(payload, subject, dimension, value) {
-        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+def inferred_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput =
+    fn(payload, dimension, value) {
+        let detail = edsl::visible_dimension_detail(payload, dimension);
         let candidates = array::filter(detail.input_kinds, fn(kind) {
             match value {
                 Value::String(_) => kind == edsl::FilterInputKind::Text || kind == edsl::FilterInputKind::Date
@@ -150,7 +150,7 @@ def inferred_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::Fi
         }
     };
 
-def measure_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::FilterInput = fn(payload, subject, measure, value) {
+def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(payload, measure, value) {
     match (edsl::measure_output_type(payload, measure), value) {
         (edsl::OutputType::Text, Value::String(text)) => edsl::FilterInput::Text(text),
         (edsl::OutputType::Integer, Value::Int(number)) => edsl::FilterInput::Int(number),
@@ -159,7 +159,7 @@ def measure_input: Fn(edsl::PreparedPayload, String, String, Value) -> edsl::Fil
         (edsl::OutputType::Boolean, Value::True) => edsl::FilterInput::Bool(True),
         (edsl::OutputType::Boolean, Value::False) => edsl::FilterInput::Bool(False),
         _ => do {
-            let detail = edsl::measure_domain_for_subject(payload, subject, measure);
+            let detail = edsl::measure_detail(payload, measure);
             fail!(`value does not match measure \{measure} output type; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Measure, detail.dataset, measure)}`, measure, value)
         },
     }
@@ -232,13 +232,13 @@ def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
     decode_graph_shape@[edsl::GraphEdge](item, "edge")
 };
 
-def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphFilter = fn(payload, subject, item) {
+def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = fn(payload, item) {
     let raw = decode_graph_shape@[RawGraphFilter](item, "filter");
     let dimension = raw.dimension;
     let op = parse_op(raw.op);
     let value = raw.value;
     let input = if value == Value::String("now") {
-        let detail = edsl::dimension_detail_for_subject(payload, subject, dimension);
+        let detail = edsl::visible_dimension_detail(payload, dimension);
         let temporal = array::any(detail.input_kinds, fn(kind) {
             kind == edsl::FilterInputKind::EpochMillis || kind == edsl::FilterInputKind::Rfc3339
                 || kind == edsl::FilterInputKind::Utc1 || kind == edsl::FilterInputKind::Date
@@ -246,10 +246,10 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphF
         });
         if temporal {
             fail!(`resolve now to an absolute time value before submitting intent; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/graph/filter")}`, dimension, value)
-        } else { inferred_input(payload, subject, dimension, value) }
-    } else { inferred_input(payload, subject, dimension, value) };
+        } else { inferred_input(payload, dimension, value) }
+    } else { inferred_input(payload, dimension, value) };
     let request: edsl::FilterRequest = {
-        id: dimension, subject, op, input,
+        id: dimension, op, input,
     };
     {node: raw.node, request}
 };
@@ -266,8 +266,7 @@ def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
                 _ => fail!("time boundary requires epoch milliseconds", role.encoding, value),
             },
             Value::Int(ms) => match role.encoding {
-                edsl::TimeEncoding::UtcEpochMillis => time::TimeValue::EpochMillis(ms),
-                edsl::TimeEncoding::LocalEpochMillis => time::TimeValue::EpochMillis(ms),
+                edsl::TimeEncoding::EpochMillis => time::TimeValue::EpochMillis(ms),
                 _ => fail!("time boundary requires text in the declared logical format", role.encoding, value),
             },
             Value::Object(_) => fail!("resolve relative time to an absolute boundary before submitting intent", value),
@@ -275,34 +274,34 @@ def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
         }
     };
 
-def parse_time_window: Fn(edsl::PreparedPayload, String, Value) -> Array(edsl::GraphFilter) =
-    fn(payload, subject, value) {
+def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilter) =
+    fn(payload, value) {
         let raw = decode_graph_shape@[RawTimeWindow](value, "time window");
-        let detail = edsl::dimension_detail_for_subject(payload, subject, raw.dimension);
+        let detail = edsl::visible_dimension_detail(payload, raw.dimension);
         let role = edsl::time_domain(payload, detail.dataset, detail.field);
         let window: time::Window = {start: parse_time_value(role, raw.start),
             end: match raw.end {
                 None => None,
                 Some(end) => Some(parse_time_value(role, end)),
             }};
-        array::map(time::window_filters(payload, subject, raw.dimension, window), fn(request) {
+        array::map(time::window_filters(payload, raw.dimension, window), fn(request) {
             {node: raw.node, request}
         })
     };
 
-def parse_graph_any_of: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphAnyOf = fn(payload, subject, item) {
+def parse_graph_any_of: Fn(edsl::PreparedPayload, Value) -> edsl::GraphAnyOf = fn(payload, item) {
     let raw = decode_graph_shape@[RawGraphAnyOf](item, "any_of");
     {node: raw.node, dimension: raw.dimension,
-        values: array::map(raw.values, fn(value) { inferred_input(payload, subject, raw.dimension, value) })}
+        values: array::map(raw.values, fn(value) { inferred_input(payload, raw.dimension, value) })}
 };
 
-def parse_graph_having: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphHaving = fn(payload, subject, item) {
+def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
     let raw = decode_graph_shape@[RawGraphHaving](item, "aggregate threshold");
     {node: raw.node, measure: raw.measure, op: parse_op(raw.op),
-        threshold: measure_input(payload, subject, raw.measure, raw.value)}
+        threshold: measure_input(payload, raw.measure, raw.value)}
 };
 
-def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::GraphExist = fn(payload, subject, item) {
+def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist = fn(payload, item) {
     let raw = decode_graph_shape@[RawGraphExistEnvelope](item, "existence");
     let obj = as_object(item);
     let negated = match dict::get(obj, "negated") {
@@ -315,14 +314,14 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, String, Value) -> edsl::Gra
         nodes: array::map(as_array(raw.nodes), parse_graph_node),
         edges: array::map(as_array(raw.edges), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, value) }),
-            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
-        any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, subject, value) }),
-        having: array::map(array_opt(obj, "having"), fn(value) { parse_graph_having(payload, subject, value) }),
+        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, value) }),
+            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, value) })]),
+        any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, value) }),
+        having: array::map(array_opt(obj, "having"), fn(value) { parse_graph_having(payload, value) }),
         negated}
 };
 
-def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Value) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, subject, value) {
+def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, value) {
     let obj = as_object(value);
     let op = as_string(field(obj, "op"));
     if op != "Graph" { fail!("graph pair and union branches must be Graph intents", op) }
@@ -349,11 +348,11 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Value) -
             measures: array::map(array_opt(obj, "measures"), fn(value) {
                 decode_graph_shape@[edsl::GraphMeasureSelect](value, "measure projection")
             }),
-            measure_having: array::map(array_opt(obj, "measure_having"), fn(value) { parse_graph_having(payload, subject, value) }),
-            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, subject, value) }),
-                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, subject, value) })]),
-            any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, subject, value) }),
-            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, subject, value) }),
+            measure_having: array::map(array_opt(obj, "measure_having"), fn(value) { parse_graph_having(payload, value) }),
+            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, value) }),
+                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, value) })]),
+            any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, value) }),
+            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, value) }),
             count: match dict::get(obj, "count") {
                 None => None,
                 Some(Value::None) => None,
@@ -422,7 +421,7 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Value) -
                 },
             },
         };
-        let lowered = edsl::lower_graph(ctx, payload, subject, request);
+        let lowered = edsl::lower_graph(ctx, payload, request);
         (lowered.0, request, lowered.1)
     }
 };
@@ -442,7 +441,7 @@ def paired_group_operand: Fn(qb::Plan) -> qb::Plan = fn(plan) {
     {...plan, projection: array::concat([plan.projection, keys])}
 };
 
-def lower_graph_pair: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, value) {
+def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
     let raw = decode_graph_shape@[RawGraphPair](value, "aggregate pair");
     let obj = as_object(value);
     let count_groups = match dict::get(obj, "count_groups") {
@@ -451,8 +450,8 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst =
         Some(Value::False) => False,
         Some(value) => fail!("aggregate pair count_groups must be boolean", value),
     };
-    let left = lower_graph_object(qb::build_context(), payload, subject, raw.left);
-    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, subject, raw.right);
+    let left = lower_graph_object(qb::build_context(), payload, raw.left);
+    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, raw.right);
     if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
         fail!("aggregate pair operands each require one measure, grouping beginning with root identity, and no row ordering or count; qualify each population inside its own graph")
     } else if left.1.root != right.1.root
@@ -525,27 +524,27 @@ def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, In
     }
 };
 
-def lower_union_branch: Fn(qb::BuildCtx, edsl::PreparedPayload, String, Value, Int) -> (qb::BuildCtx, String, Array(String), qb::Plan) =
-    fn(ctx, payload, subject, value, index) {
+def lower_union_branch: Fn(qb::BuildCtx, edsl::PreparedPayload, Value, Int) -> (qb::BuildCtx, String, Array(String), qb::Plan) =
+    fn(ctx, payload, value, index) {
         let branch = decode_graph_shape@[RawUnionBranch](value, `graph union branch \{index}`);
-        let lowered = lower_graph_object(ctx, payload, subject, branch.graph);
+        let lowered = lower_graph_object(ctx, payload, branch.graph);
         let entity = union_graph_result(payload, lowered.1, branch.result_node, index);
         (lowered.0, entity, array::map(lowered.1.select, fn(item) { item.dimension }), lowered.2)
     };
 
-def lower_graph_union: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, value) {
+def lower_graph_union: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
     let union = decode_graph_shape@[RawGraphUnion](value, "graph union");
     let branches = union.branches;
     if array::length(branches) < 2 {
         fail!("graph union requires at least two graph branches", array::length(branches))
     } else {
-        let first = lower_union_branch(qb::build_context(), payload, subject, branches[0], 1);
+        let first = lower_union_branch(qb::build_context(), payload, branches[0], 1);
         let combined = array::fold(array::enumerate(branches),
             (first.0, first.1, first.2, [first.3]), fn(state, entry) {
                 if entry.0 == 0 { state }
                 else {
                     let branch = lower_union_branch(qb::independent_query_scope(state.0),
-                        payload, subject, entry.1, entry.0 + 1);
+                        payload, entry.1, entry.0 + 1);
                     if branch.1 != state.1 {
                         fail!(`graph union branch \{entry.0 + 1} must return the same result entity as branch 1: expected \{state.1}, got \{branch.1}`, entry.0 + 1, state.1, branch.1)
                     } else if branch.2 != state.2 {
@@ -559,29 +558,29 @@ def lower_graph_union: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst 
     }
 };
 
-def lower_intent_ast: Fn(edsl::PreparedPayload, String, Value) -> qb::QueryAst = fn(payload, subject, intent) {
+def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "Graph" {
-        let lowered = lower_graph_object(qb::build_context(), payload, subject, intent);
+        let lowered = lower_graph_object(qb::build_context(), payload, intent);
         let request = lowered.1;
         let plan = if request.count_groups { qb::QueryPlan::GroupCount(lowered.2) }
             else if request.distinct { qb::QueryPlan::DistinctRows(lowered.2) }
             else { qb::QueryPlan::Rows(lowered.2) };
         qb::finish(lowered.0, qb::validate_query_plan(plan))
-    } else if op == "GraphPair" { lower_graph_pair(payload, subject, intent) }
-    else if op == "GraphUnion" { lower_graph_union(payload, subject, intent) }
+    } else if op == "GraphPair" { lower_graph_pair(payload, intent) }
+    else if op == "GraphUnion" { lower_graph_union(payload, intent) }
     else { fail!(`unsupported intent op \{op}; use Graph, GraphPair or GraphUnion with named nodes and relations; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/intent")}`, op) }
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
 
-def query_intent_lower_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> qb::Query = fn(payload, subject, to_query) {
-    fn(intent) { to_query(lower_intent_ast(payload, subject, intent)) }
+def query_intent_lower_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> qb::Query = fn(payload, to_query) {
+    fn(intent) { to_query(lower_intent_ast(payload, intent)) }
 };
 
-def query_intent_ast_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> qb::QueryAst = fn(payload, subject) {
-    fn(intent) { lower_intent_ast(payload, subject, intent) }
+def query_intent_ast_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> qb::QueryAst = fn(payload) {
+    fn(intent) { lower_intent_ast(payload, intent) }
 };
 
 type BatchEvaluation = struct {
@@ -599,8 +598,8 @@ type BatchResponse = struct {
     queries: Option(Array(qb::Query)),
 };
 
-def query_request_method_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> Fn(Value) -> Value =
-    fn(payload, subject, to_query) {
+def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> Value =
+    fn(payload, to_query) {
         fn(request) {
             let parsed = decode_graph_shape@[RawQueryRequest](request, "query request");
             let intents = parsed.intents;
@@ -609,7 +608,7 @@ def query_request_method_factory: Fn(edsl::PreparedPayload, String, ToQuery) -> 
             } else {
                 let assessed: Array(BatchEvaluation) = array::map(array::enumerate(intents), fn(entry) {
                     let observed = diagnostics::with_diagnostics(fn(intent: Value) {
-                        to_query(lower_intent_ast(payload, subject, intent))
+                        to_query(lower_intent_ast(payload, intent))
                     })(entry.1);
                     match observed {
                         Ok((query, reports)) => {index: entry.0, query: Some(query), diagnostics: reports},

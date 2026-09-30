@@ -198,7 +198,7 @@ type EntityId = struct { id: String };
 type DatasetKind = enum { Entity, Event, Metric };
 type TimeSemantics = enum { Utc, Local, Date };
 type TimeLogicalType = enum { LocalDateTime, Date, Rfc3339, EpochMillis, Utc1 };
-type TimeEncoding = enum { CanonicalUtcSecondText, UtcEpochMillis, LocalText, LocalEpochMillis, DateText, Rfc3339Text };
+type TimeEncoding = enum { CanonicalUtcSecondText, EpochMillis, LocalText, DateText, Rfc3339Text };
 @prelude::property(PropertyTarget::Field)
 type TimeField = struct { semantics: TimeSemantics, encoding: TimeEncoding };
 @prelude::property(PropertyTarget::Type)
@@ -477,7 +477,6 @@ type MeasureInput = enum { All, Distinct };
 
 type FilterRequest = struct {
     id: String,
-    subject: String,
     op: FilterOp,
     input: FilterInput,
 };
@@ -585,7 +584,7 @@ type DimensionBrief = struct {
 };
 
 type BusinessValueBrief = struct { id: String, label: String, aliases: Array(String), localized: Array(LocalizedValueLabel) };
-type SubjectDimensionBrief = struct {
+type VisibleDimensionBrief = struct {
     id: String,
     label: String,
     aliases: Array(String),
@@ -718,7 +717,6 @@ type PreparedPayload = struct {
     business_links: Array(BusinessLinkEntry),
     native_pairs: Array(NativePairEntry),
     profile: qb::PlanProfile,
-    authorize: Fn(String) -> Bool,
 };
 
 # ---------------------------------------------------------------------------
@@ -889,9 +887,9 @@ def sample_aggregate: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(pr
 
 def time_field: Fn(TimeSemantics, TimeEncoding) -> Fn(property::FieldPropertyCtx, Option(TimeField)) -> TimeField = fn(semantics, encoding) {
     fn(ctx, previous) {
-        if (semantics == TimeSemantics::Utc && encoding != TimeEncoding::CanonicalUtcSecondText && encoding != TimeEncoding::UtcEpochMillis && encoding != TimeEncoding::Rfc3339Text)
+        if (semantics == TimeSemantics::Utc && encoding != TimeEncoding::CanonicalUtcSecondText && encoding != TimeEncoding::EpochMillis && encoding != TimeEncoding::Rfc3339Text)
             || (semantics == TimeSemantics::Date && encoding != TimeEncoding::DateText)
-            || (semantics == TimeSemantics::Local && encoding != TimeEncoding::LocalText && encoding != TimeEncoding::LocalEpochMillis) {
+            || (semantics == TimeSemantics::Local && encoding != TimeEncoding::LocalText && encoding != TimeEncoding::EpochMillis) {
             fail!("time semantics and physical encoding do not match", ctx, semantics, encoding)
         } else {
         let result: TimeField = { semantics, encoding };
@@ -1180,9 +1178,8 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
     if let Some(role) = property::get_field_prop(owner, index, TimeField.type) {
         let expected = match role.encoding {
             TimeEncoding::CanonicalUtcSecondText => String.type,
-            TimeEncoding::UtcEpochMillis => Int.type,
+            TimeEncoding::EpochMillis => Int.type,
             TimeEncoding::LocalText => String.type,
-            TimeEncoding::LocalEpochMillis => Int.type,
             TimeEncoding::DateText => String.type,
             TimeEncoding::Rfc3339Text => String.type,
         };
@@ -1400,7 +1397,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                                 Some(role) => role.semantics == TimeSemantics::Utc
                                     && ((role.encoding == TimeEncoding::CanonicalUtcSecondText && field.ty == String.type)
                                         || (role.encoding == TimeEncoding::Rfc3339Text && field.ty == String.type)
-                                        || (role.encoding == TimeEncoding::UtcEpochMillis && field.ty == Int.type)),
+                                        || (role.encoding == TimeEncoding::EpochMillis && field.ty == Int.type)),
                                 None => False,
                             }
                     }) {
@@ -2063,7 +2060,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 let aliases = canonical_alias_domain(entity.entity_type, f, mapped);
                 let enumerated = value_domain(f.ty);
                 let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
-                    Some(role) => role.encoding == TimeEncoding::LocalEpochMillis || role.encoding == TimeEncoding::UtcEpochMillis,
+                    Some(role) => role.encoding == TimeEncoding::EpochMillis,
                     None => False,
                 };
                 let valid_kind = if array::length(enumerated) > 0 { FilterInputKind::Text }
@@ -2250,8 +2247,7 @@ def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool 
             (TimeEncoding::CanonicalUtcSecondText, FilterInput::Utc1(value)) => canonical_utc_second(value),
             (TimeEncoding::Rfc3339Text, FilterInput::Rfc3339(value)) => canonical_rfc3339(value),
             (TimeEncoding::DateText, FilterInput::Date(value)) => calendar_date(value),
-            (TimeEncoding::UtcEpochMillis, FilterInput::EpochMillis(_)) => True,
-            (TimeEncoding::LocalEpochMillis, FilterInput::EpochMillis(_)) => True,
+            (TimeEncoding::EpochMillis, FilterInput::EpochMillis(_)) => True,
             (TimeEncoding::LocalText, FilterInput::LocalDateTime(value)) => canonical_utc_second(value),
             _ => False,
         },
@@ -2523,7 +2519,7 @@ def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
     }) { fail!("duplicate term for knowledge target", duplicate) } else { True }
 };
 
-def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> PreparedPayload = fn(revision, entity_types, profile, authorize) {
+def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn(revision, entity_types, profile) {
     let n = array::length(entity_types);
     let entities = check_entity_aliases(check_entity_ids(array::map(int_range(n), fn(i) {
         build_entity(get_index(entity_types, i), i)
@@ -2624,7 +2620,6 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile, Fn(String) -> Bool) -> 
         business_links,
         native_pairs,
         profile,
-        authorize,
     };
     let measure_profiles_validated = array::all(measures, fn(entry) {
         match entry.computed {
@@ -2800,12 +2795,10 @@ def dimension_detail: Fn(PreparedPayload, String) -> DimensionBrief = fn(payload
     }
 };
 
-def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> SubjectDimensionBrief = fn(payload, subject, id) {
-    if !payload.authorize(subject) {
-        fail!("subject is not authorized for dimension discovery", subject, id)
-    } else {
+def visible_dimension_detail: Fn(PreparedPayload, String) -> VisibleDimensionBrief = fn(payload, id) {
+
         let detail = dimension_detail(payload, id);
-        if !detail.authorized { fail!("dimension is not authorized for discovery", subject, id) }
+        if !detail.authorized { fail!("dimension is not authorized for discovery", id) }
         else {
             let values: Array(BusinessValueBrief) = if array::length(detail.canonical_values) > 0 {
                 array::map(detail.canonical_values, fn(value) { {id: value.id, label: value.label,
@@ -2822,7 +2815,7 @@ def dimension_detail_for_subject: Fn(PreparedPayload, String, String) -> Subject
                 filterable: detail.filterable, ops: detail.ops,
                 input_kinds: detail.input_kinds, input_docs: detail.input_docs, values, canonical_order: detail.canonical_order, scope: detail.scope}
         }
-    }
+
 };
 
 def dataset_domain: Fn(PreparedPayload, String) -> DatasetSpec = fn(payload, id) {
@@ -2857,8 +2850,7 @@ def time_logical_type: Fn(TimeField) -> TimeLogicalType = fn(role) {
         TimeEncoding::DateText => TimeLogicalType::Date,
         TimeEncoding::LocalText => TimeLogicalType::LocalDateTime,
         TimeEncoding::CanonicalUtcSecondText => TimeLogicalType::Utc1,
-        TimeEncoding::UtcEpochMillis => TimeLogicalType::EpochMillis,
-        TimeEncoding::LocalEpochMillis => TimeLogicalType::EpochMillis,
+        TimeEncoding::EpochMillis => TimeLogicalType::EpochMillis,
         TimeEncoding::Rfc3339Text => TimeLogicalType::Rfc3339,
     }
 };
@@ -2905,10 +2897,8 @@ def measure_domain: Fn(PreparedPayload, String) -> MeasureBrief = fn(payload, id
     result
 };
 
-def measure_domain_for_subject: Fn(PreparedPayload, String, String) -> MeasureBrief = fn(payload, subject, id) {
-    if !payload.authorize(subject) {
-        fail!("subject is not authorized for measure discovery", subject, id)
-    } else { measure_domain(payload, id) }
+def measure_detail: Fn(PreparedPayload, String) -> MeasureBrief = fn(payload, id) {
+    measure_domain(payload, id)
 };
 
 def relation_domain: Fn(PreparedPayload, String) -> RelationEntry = fn(payload, id) {
@@ -2935,12 +2925,8 @@ def relation_brief: Fn(PreparedPayload, RelationEntry) -> RelationBrief = fn(pay
         cardinality: entry.cardinality, shape: relation_shape(entry.key), guard: entry.guard}
 };
 
-def relation_detail_for_subject: Fn(PreparedPayload, String, String) -> RelationBrief = fn(payload, subject, id) {
-    if !payload.authorize(subject) {
-        fail!("subject is not authorized for relation discovery", subject, id)
-    } else {
-        relation_brief(payload, relation_domain(payload, id))
-    }
+def relation_detail: Fn(PreparedPayload, String) -> RelationBrief = fn(payload, id) {
+    relation_brief(payload, relation_domain(payload, id))
 };
 
 def entity_by_id: Fn(PreparedPayload, String) -> Int = fn(payload, id) {
@@ -3023,12 +3009,8 @@ def knowledge_index: Fn(PreparedPayload) -> Array(DatasetBrief) = fn(payload) {
     array::map(payload.entities, fn(entity) { dataset_brief(payload, entity, False) })
 };
 
-def knowledge_index_for_subject: Fn(PreparedPayload, String) -> Array(DatasetBrief) = fn(payload, subject) {
-    if !payload.authorize(subject) {
-        fail!("subject is not authorized for knowledge discovery", subject)
-    } else {
-        array::map(payload.entities, fn(entity) { dataset_brief(payload, entity, True) })
-    }
+def visible_knowledge_index: Fn(PreparedPayload) -> Array(DatasetBrief) = fn(payload) {
+    array::map(payload.entities, fn(entity) { dataset_brief(payload, entity, True) })
 };
 
 def dataset_relations: Fn(PreparedPayload, String) -> Array(RelationEntry) = fn(payload, id) {
@@ -3126,11 +3108,7 @@ def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bo
                         else { fail!("invalid canonical RFC3339 UTC second value", entry.id, value) },
                     _ => fail!("RFC3339 time field requires RFC3339 input", entry.id, input),
                 },
-                TimeEncoding::UtcEpochMillis => match input {
-                    FilterInput::EpochMillis(_) => True,
-                    _ => fail!("epoch-millisecond time field requires EpochMillis input", entry.id, input),
-                },
-                TimeEncoding::LocalEpochMillis => match input {
+                TimeEncoding::EpochMillis => match input {
                     FilterInput::EpochMillis(_) => True,
                     _ => fail!("epoch-millisecond time field requires EpochMillis input", entry.id, input),
                 },
@@ -3184,7 +3162,7 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
 };
 
 # Enum closed-domain filter resolution. A legal stable value keeps producing a
-# parameterized binding; unknown values fail atomically with the subject, the
+# parameterized binding; unknown values fail atomically with the the
 # dimension id and the dynamic JSON input value as evidence.
 
 
@@ -3297,15 +3275,14 @@ def filter_value_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry,
 def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(FilterRequest)) -> (qb::BuildCtx, Array(FilterResolution)) = fn(ctx, payload, requests) {
     let initial: (qb::BuildCtx, Array(FilterResolution)) = (ctx, []);
     array::fold(requests, initial, fn(state, req) {
-        if !payload.authorize(req.subject) { fail!("subject is not authorized for filter", req.subject, req.id) }
-        else {
+
             let entry = match array::find(payload.dimensions, fn(d) { d.id == req.id }) {
                 Some(d) => d,
-                None => fail!("unknown filter dimension", req.subject, req.id),
+                None => fail!("unknown filter dimension", req.id),
             };
-            if !entry.authorized { fail!("dimension is not authorized", req.subject, req.id) }
-            else if !entry.filterable { fail!("dimension has no filter capability", req.subject, req.id) }
-            else if !array::any(entry.ops, fn(op) { op == req.op }) { fail!("filter operation not supported for dimension", req.subject, req.id) }
+            if !entry.authorized { fail!("dimension is not authorized", req.id) }
+            else if !entry.filterable { fail!("dimension has no filter capability", req.id) }
+            else if !array::any(entry.ops, fn(op) { op == req.op }) { fail!("filter operation not supported for dimension", req.id) }
             else {
                 let valid_time = validate_time_filter(payload, entry, req.input);
                 let computed = dimension_expr(state.0, payload, entry);
@@ -3316,17 +3293,17 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
                 } else if array::length(entry.values) > 0 {
                     match req.input {
                         FilterInput::Text(s) => if req.op != FilterOp::Eq {
-                            fail!("enum dimension filter supports only Eq", req.subject, req.id, req.op)
+                            fail!("enum dimension filter supports only Eq", req.id, req.op)
                         } else if array::any(entry.values, fn(v) { v.value == s }) {
                             let bound = qb::bind(computed.0, qb::Val::String(s));
                             (bound.0, qb::scalar(qb::ScalarFunction::Eq, [base, bound.1]))
-                        } else { fail!(`unknown enum value \{s} for dimension \{req.id}; find its Dimension key in index`, req.subject, req.id, s) },
-                        _ => fail!(`invalid enum filter value for dimension \{req.id}; find its Dimension key in index`, req.subject, req.id, req.input),
+                        } else { fail!(`unknown enum value \{s} for dimension \{req.id}; find its Dimension key in index`, req.id, s) },
+                        _ => fail!(`invalid enum filter value for dimension \{req.id}; find its Dimension key in index`, req.id, req.input),
                     }
                 } else if is_text_op(req.op) && match req.input { FilterInput::Text(_) => False, _ => True } {
-                    fail!("text filter operation requires a text input value", req.subject, req.id)
+                    fail!("text filter operation requires a text input value", req.id)
                 } else if !filter_input_allowed(entry.input_kinds, req.input) {
-                    fail!(`invalid filter value for dimension \{req.id}; find its Dimension key in index`, req.subject, req.id)
+                    fail!(`invalid filter value for dimension \{req.id}; find its Dimension key in index`, req.id)
                 } else {
                     let bound = qb::bind(computed.0, to_val(req.input));
                     open_condition_with_context(bound.0, base, req.op, bound.1)
@@ -3334,7 +3311,7 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
                 let item: FilterResolution = {expr: resolved.1, entity: entry.entity, field: entry.field, op: req.op, input: req.input};
                 (resolved.0, array::push(state.1, item))
             }
-        }
+
     })
 };
 
@@ -3716,14 +3693,14 @@ def graph_filters: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array
     (built.0, append_filter_terms(None, built.1))
 };
 
-def graph_any_of: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), Array(GraphAnyOf)) -> (qb::BuildCtx, Array(qb::Expr)) =
-    fn(ctx, payload, subject, instances, groups) {
+def graph_any_of: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array(GraphAnyOf)) -> (qb::BuildCtx, Array(qb::Expr)) =
+    fn(ctx, payload, instances, groups) {
         array::fold(groups, (ctx, []), fn(state, group) {
             if array::length(group.values) == 0 {
                 fail!("graph any_of requires at least one value", group.node, group.dimension)
             } else {
                 let alternatives = array::fold(group.values, (state.0, []), fn(next, value) {
-                    let request: FilterRequest = {id: group.dimension, subject,
+                    let request: FilterRequest = {id: group.dimension,
                         op: FilterOp::Eq, input: value};
                     let resolved = graph_filters(next.0, payload, instances, [{node: group.node, request}]);
                     match resolved.1 {
@@ -3754,12 +3731,12 @@ def retarget_inner_expr: Fn(qb::Expr, String, String) -> qb::Expr = fn(expr, pre
     }
 };
 
-def graph_nullable_source: Fn(qb::BuildCtx, PreparedPayload, String, EntityEntry, GraphNode, Array(GraphFilter), Array(GraphAnyOf)) -> (qb::BuildCtx, qb::Source) = fn(ctx, payload, subject, entity, node, filters, groups) {
+def graph_nullable_source: Fn(qb::BuildCtx, PreparedPayload, EntityEntry, GraphNode, Array(GraphFilter), Array(GraphAnyOf)) -> (qb::BuildCtx, qb::Source) = fn(ctx, payload, entity, node, filters, groups) {
     let allocated = entity_source_at_with_context(ctx, payload, entity, node.id);
     let instance: GraphInstance = {id: node.id, entity: entity.index, source: allocated.1};
     let selected = array::filter(filters, fn(item) { item.node == node.id });
     let filtered = graph_filters(allocated.0, payload, [instance], selected);
-    let alternatives = graph_any_of(filtered.0, payload, subject, [instance],
+    let alternatives = graph_any_of(filtered.0, payload, [instance],
         array::filter(groups, fn(item) { item.node == node.id }));
     let combined = match filtered.1 {
         Some(expr) => append_filter_terms(allocated.1.scope, array::concat([[expr], alternatives.1])),
@@ -3805,7 +3782,7 @@ def graph_correlation_alternatives: Fn(PreparedPayload, RelationEntry, qb::Sourc
     }
 };
 
-def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, subject, outer, anchor, spec, link) {
+def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphInstance, GraphExist, BusinessLinkEntry) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, outer, anchor, spec, link) {
     if array::length(spec.edges) == 0 { fail!("business link existence requires an edge", link.id) }
     else if array::length(spec.having) > 0 { fail!("graph aggregate existence requires a single at-most-one sample-to-owner relation", link.id) }
     else {
@@ -3892,7 +3869,7 @@ def graph_link_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphI
                     }
                 });
                 let filtered = graph_filters(built.0, payload, built.1, spec.filters);
-                let alternatives = graph_any_of(filtered.0, payload, subject, built.1, spec.any_of);
+                let alternatives = graph_any_of(filtered.0, payload, built.1, spec.any_of);
                 let exists = qb::exists_path_alternatives(hub.1, correlation, built.2);
                 let constraints = graph_constraints(alternatives.0, payload, array::concat([outer, built.1]), spec.constraints);
                 let constrained = append_filter_terms(filtered.1,
@@ -3983,7 +3960,7 @@ def graph_aggregate_sample_grain: Fn(PreparedPayload, GraphExist, String) -> Opt
         } else { checked.1 }
     };
 
-def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, subject, instances, spec) {
+def graph_existence: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), GraphExist) -> (qb::BuildCtx, qb::Exists) = fn(ctx, payload, instances, spec) {
     let anchor = graph_instance(instances, spec.anchor);
     let count = array::length(spec.edges);
     if count == 0 || count != array::length(spec.nodes) {
@@ -3997,7 +3974,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
         match array::find(payload.business_links, fn(link) {
             get_index(spec.edges, 0).relation == link.id
         }) {
-            Some(link) => graph_link_existence(ctx, payload, subject, instances, anchor, spec, link),
+            Some(link) => graph_link_existence(ctx, payload, instances, anchor, spec, link),
             None => do {
         let initial: (qb::BuildCtx, Array(GraphInstance), Array(Array(qb::ColumnEq)), Array(qb::Join), Array(qb::Expr)) = (ctx, [anchor], [], [], []);
         let built = array::fold(spec.edges, initial, fn(state, edge) {
@@ -4088,7 +4065,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
             }
         };
         let filtered = graph_filters(grouped.0, payload, built.1, spec.filters);
-        let alternatives = graph_any_of(filtered.0, payload, subject, built.1, spec.any_of);
+        let alternatives = graph_any_of(filtered.0, payload, built.1, spec.any_of);
         let aggregate = graph_aggregate_having(alternatives.0, payload, sample, spec.having);
         let exists = if array::length(built.2) == 1 {
             qb::exists_path(first, get_index(built.2, 0), built.3)
@@ -4104,7 +4081,7 @@ def graph_existence: Fn(qb::BuildCtx, PreparedPayload, String, Array(GraphInstan
 };
 
 # Counting a subject is safe only if every joined instance is functionally
-# determined by it. Walk the declared tree from the subject, independently of
+# determined by it. Walk the declared tree from the independently of
 # the root-first order used to construct the SQL joins.
 def graph_unsafe_edges: Fn(PreparedPayload, GraphRequest, String) -> (Array(String), Array(GraphEdge)) = fn(payload, request, subject_id) {
     let initial: (Array(String), Array(GraphEdge)) = ([subject_id], []);
@@ -4588,7 +4565,7 @@ def graph_ordered_edges: Fn(PreparedPayload, String, Array(GraphEdge)) -> Array(
 
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
-def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, subject, request) {
+def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(ctx, payload, request) {
     let request: GraphRequest = {
         root: request.root, row_grain: request.row_grain, distinct: request.distinct,
         nodes: request.nodes, edges: graph_ordered_edges(payload, request.root, request.edges),
@@ -4601,8 +4578,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
         top_by_measure: request.top_by_measure, order_by: request.order_by,
         take: request.take,
     };
-    if !payload.authorize(subject) { fail!("subject is not authorized for graph query", subject) }
-    else if array::length(request.nodes) == 0 || (array::length(request.select) == 0
+    if array::length(request.nodes) == 0 || (array::length(request.select) == 0
         && array::length(request.measures) == 0 && request.count == None && request.count_value == None) {
         fail!("graph requires nodes and projections or an explicit count subject")
     } else if request.count_value != None && (request.count != None || array::length(request.select) > 0
@@ -4748,7 +4724,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     let new_node = if forward { to_node } else { from_node };
                     let new_entity = if forward { to_entity } else { from_entity };
                     let target = if request.include_empty {
-                        graph_nullable_source(state.0, payload, subject, get_index(payload.entities, new_entity), new_node, request.filters, request.any_of)
+                        graph_nullable_source(state.0, payload, get_index(payload.entities, new_entity), new_node, request.filters, request.any_of)
                     } else {
                         entity_source_at_with_context(state.0, payload, get_index(payload.entities, new_entity), new_node.id)
                     };
@@ -4760,7 +4736,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     let narrowed = if request.include_empty {
                         array::fold(array::filter(request.exists, fn(spec) { spec.anchor == new_node.id }),
                             condition, fn(current, spec) {
-                                let result = graph_existence(current.0, payload, subject, instances, spec);
+                                let result = graph_existence(current.0, payload, instances, spec);
                                 (result.0, qb::on_and([current.1, qb::on_exists(result.1)]))
                             })
                     } else { condition };
@@ -4950,7 +4926,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 array::filter(request.exists, fn(spec) { spec.anchor == request.root })
             } else { request.exists };
             let existential = array::fold(outer_exists, (filtered.0, []), fn(state, spec) {
-                let result = graph_existence(state.0, payload, subject, built.1, spec);
+                let result = graph_existence(state.0, payload, built.1, spec);
                 (result.0, array::push(state.1, result.1))
             });
             let sources = array::concat([[root.1], array::map(built.2, fn(join) { join.source })]);
@@ -4961,7 +4937,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                 },
                 None => (existential.0, None),
             };
-            let alternatives = graph_any_of(partitioned.0, payload, subject, built.1,
+            let alternatives = graph_any_of(partitioned.0, payload, built.1,
                 if request.include_empty { array::filter(request.any_of, fn(item) { item.node == request.root }) }
                 else { request.any_of });
             let top = match request.top_by_measure {
@@ -4985,7 +4961,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                     None => fail!("graph projection references an unknown dimension", item.node, item.dimension),
                 };
                 if array::length(dimension.canonical_values) > 0 {
-                    let known = graph_any_of(state.0, payload, subject, built.1, [{node: item.node,
+                    let known = graph_any_of(state.0, payload, built.1, [{node: item.node,
                         dimension: item.dimension,
                         values: array::map(dimension.canonical_values, fn(value) { FilterInput::Text(value.id) })}]);
                     (known.0, array::concat([state.1, known.1]))
@@ -5003,7 +4979,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, String, GraphRequest) -> (qb:
                         None => fail!(`graph top-per rank references an unknown dimension \{spec.rank}`, spec.rank),
                     };
                     if array::length(dimension.canonical_order) > 0 {
-                        let known = graph_any_of(recognized_groups.0, payload, subject, built.1, [{node: spec.sample,
+                        let known = graph_any_of(recognized_groups.0, payload, built.1, [{node: spec.sample,
                             dimension: spec.rank,
                             values: array::map(dimension.canonical_values, fn(value) { FilterInput::Text(value.id) })}]);
                         (known.0, known.1)
@@ -5148,7 +5124,7 @@ pub use self::{
     DimensionEntry,
     DimensionBrief,
     TimeRoleBrief,
-    SubjectDimensionBrief,
+    VisibleDimensionBrief,
     BusinessValueBrief,
     RelationEntry,
     RelationShape,
@@ -5210,7 +5186,7 @@ pub use self::{
     dimension_domain,
     canonical_value_domain,
     dimension_detail,
-    dimension_detail_for_subject,
+    visible_dimension_detail,
     dataset_domain,
     time_domain,
     time_logical_type,
@@ -5219,12 +5195,12 @@ pub use self::{
     canonical_rfc3339,
     metric_domain,
     measure_domain,
-    measure_domain_for_subject,
+    measure_detail,
     relation_domain,
-    relation_detail_for_subject,
+    relation_detail,
     dataset_relations,
     knowledge_index,
-    knowledge_index_for_subject,
+    visible_knowledge_index,
     published_fields,
     combine_filters,
     get_index,

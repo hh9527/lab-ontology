@@ -24,6 +24,11 @@ type Dog = struct {
     @edsl::dimension("created_at", True, True,
         [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::Rfc3339])
     created_at: String,
+    @edsl::column("raw_clock")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    @edsl::dimension("raw_clock", True, True,
+        [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::EpochMillis])
+    raw_clock: Int,
 };
 
 @edsl::entity_id("legacy_clock")
@@ -58,11 +63,10 @@ def profile: qb::PlanProfile = {
     allow_distinct: False,
 };
 
-def payload: edsl::PreparedPayload = edsl::build_root("time-contract", [Dog.type], profile,
-    fn(subject) { subject == "reader" });
+def payload: edsl::PreparedPayload = edsl::build_root("time-contract", [Dog.type], profile);
 
 pub def date_window_preserves_date_semantics: test::Test = test::should_ok(fn() {
-    let query = sqlite::build_query(query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    let query = sqlite::build_query(query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[{"node":"dog","dimension":"birth_date"}],
         "time_windows":[{"node":"dog","dimension":"birth_date",
@@ -74,8 +78,34 @@ pub def date_window_preserves_date_semantics: test::Test = test::should_ok(fn() 
     else { fail!("calendar dates must compare as declared date text", query) }
 });
 
+pub def raw_clock_preserves_integer_boundary: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[],"count":"dog",
+        "filters":[{"node":"dog","dimension":"raw_clock","op":"Ge","value":123}]
+    }"#).unwrap!()));
+    if query.bindings == [qb::Val::Int(123)] { True }
+    else { fail!("epoch clock must preserve integer milliseconds", query) }
+});
+
+pub def epoch_clock_accepts_typed_window: test::Test = test::should_ok(fn() {
+    let filters = time::window_filters(payload, "raw_clock", {
+        start: time::TimeValue::EpochMillis(123), end: Some(time::TimeValue::EpochMillis(456))});
+    if filters[0].input == edsl::FilterInput::EpochMillis(123)
+        && filters[1].input == edsl::FilterInput::EpochMillis(456) { True }
+    else { fail!("epoch window changed its bounds", filters) }
+});
+
+pub def raw_clock_rejects_text_input: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[],"count":"dog",
+        "filters":[{"node":"dog","dimension":"raw_clock","op":"Ge","value":"2026-09-20 16:00:00"}]
+    }"#).unwrap!())
+}, "value does not match dimension raw_clock input type");
+
 pub def open_window_omits_upper_predicate_and_binding: test::Test = test::should_ok(fn() {
-    let lower = query_intent_ast_factory(payload, "reader");
+    let lower = query_intent_ast_factory(payload);
     let explicit = sqlite::build_query(lower(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
@@ -95,18 +125,18 @@ pub def open_window_omits_upper_predicate_and_binding: test::Test = test::should
 });
 
 pub def invalid_calendar_date_fails_before_query: test::Test = test::should_fail_with(fn() {
-    time::window_filters(payload, "reader", "birth_date", {
+    time::window_filters(payload, "birth_date", {
         start: time::TimeValue::Date("2025-02-29"), end: Some(time::TimeValue::Date("2025-03-01"))})
 }, "invalid calendar date boundary");
 
 pub def instant_cannot_filter_calendar_date: test::Test = test::should_fail_with(fn() {
-    time::window_filters(payload, "reader", "birth_date", {
+    time::window_filters(payload, "birth_date", {
         start: time::TimeValue::Utc1("2024-02-29 00:00:00"),
         end: Some(time::TimeValue::Utc1("2024-03-01 00:00:00"))})
 }, "time boundary does not match declared field encoding");
 
 pub def reversed_absolute_window_is_rejected: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[],"count":"dog",
         "time_windows":[{"node":"dog","dimension":"created_at",
@@ -115,7 +145,7 @@ pub def reversed_absolute_window_is_rejected: test::Test = test::should_fail_wit
 }, "time window start must precede end");
 
 pub def now_boundary_is_rejected: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[],"count":"dog",
         "time_windows":[{"node":"dog","dimension":"created_at",
@@ -124,7 +154,7 @@ pub def now_boundary_is_rejected: test::Test = test::should_fail_with(fn() {
 }, "resolve now to an absolute time boundary");
 
 pub def relative_boundary_is_rejected: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[],"count":"dog",
         "time_windows":[{"node":"dog","dimension":"created_at",
@@ -133,7 +163,7 @@ pub def relative_boundary_is_rejected: test::Test = test::should_fail_with(fn() 
 }, "resolve relative time to an absolute boundary");
 
 pub def query_request_rejects_context: test::Test = test::should_fail_with(fn() {
-    query_request_method_factory(payload, "reader", sqlite::build_query)(json::parse(r#"{
+    query_request_method_factory(payload, sqlite::build_query)(json::parse(r#"{
         "ctx":{"now":1709280550000},
         "intents":[{"op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
             "edges":[],"select":[],"count":"dog"}]
@@ -141,7 +171,7 @@ pub def query_request_rejects_context: test::Test = test::should_fail_with(fn() 
 }, "$.ctx: unknown field; see info key \"Schema/syntax/intent\"");
 
 pub def kindless_now_filter_is_rejected: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[],"count":"dog",
         "filters":[{"node":"dog","dimension":"created_at","op":"Lt","value":"now"}]
@@ -149,7 +179,7 @@ pub def kindless_now_filter_is_rejected: test::Test = test::should_fail_with(fn(
 }, "resolve now to an absolute time value");
 
 pub def rfc3339_field_rejects_noncanonical_text: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
         "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
         "filters":[{"node":"dog","dimension":"created_at","op":"Ge","value":"2024-02-29 00:00:00"}]
@@ -157,7 +187,7 @@ pub def rfc3339_field_rejects_noncanonical_text: test::Test = test::should_fail_
 }, "invalid canonical RFC3339 UTC second value");
 
 pub def offset_rfc3339_requires_normalization_before_binding: test::Test = test::should_fail_with(fn() {
-    time::window_filters(payload, "reader", "created_at", {
+    time::window_filters(payload, "created_at", {
         start: time::TimeValue::Rfc3339("2024-03-01T08:00:00+08:00"),
         end: Some(time::TimeValue::Rfc3339("2024-03-02T08:00:00+08:00"))})
 }, "invalid canonical RFC3339 UTC second value");
@@ -170,19 +200,17 @@ pub def rfc3339_preserves_four_digit_year_and_december: test::Test = test::shoul
 });
 
 pub def relation_cannot_join_rfc3339_to_plain_string: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("incompatible-time-relation", [Dog.type, LegacyClock.type], profile,
-        fn(subject) { subject == "reader" })
+    edsl::build_root("incompatible-time-relation", [Dog.type, LegacyClock.type], profile)
 }, "relation fields have different logical time types or encodings");
 
 pub def time_dimension_cannot_declare_plain_text_input: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("wrong-time-input-kind", [BadTimeDimension.type], profile,
-        fn(subject) { subject == "reader" })
+    edsl::build_root("wrong-time-input-kind", [BadTimeDimension.type], profile)
 }, "plain dimension filter input or operation disagrees with field type");
 
 pub def knowledge_exposes_logical_time_type_and_storage_encoding: test::Test = test::should_ok(fn() {
     let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::TimeRole,
         owner: "dog", id: "created_at"};
-    match knowledge::by_target(payload, "reader", target) {
+    match knowledge::by_target(payload, target) {
         knowledge::DocResult::Found(point) => match point.time_role {
             Some(role) => if role.logical_type == edsl::TimeLogicalType::Rfc3339
                 && role.encoding == edsl::TimeEncoding::Rfc3339Text { True }

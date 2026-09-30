@@ -1,5 +1,13 @@
 # iCloud model challenge
 
+This document describes the historical synthetic model in
+`tests/pressure_graph/model_fixture.telora`, exercised by `tests/pressure_graph.telora`.
+Its composite tenant keys, text alarm clocks and multiple-site assumptions
+are pressure contracts, not facts about the refreshed product model.
+For the current source-backed contract, see [SOURCE_REFRESH.md](SOURCE_REFRESH.md).
+Old encoding names and request forms below are historical; the current
+integer encoding is `EpochMillis`.
+
 This crate is an acceptance fixture derived from actual declarations in
 `imaster-cloud/telora/src/modeling/icloud`. It is not a production iCloud model
 and must not be presented as a complete interpretation of that domain.
@@ -98,8 +106,8 @@ not from a separately authored agent prompt.
 `measure_domain` resolves `alarm_count` to its event source and Count aggregate,
 and distinguishes the declared `port_count` Sum from `port_count_peak` Max;
 their labels and summaries are Model annotations validated during preparation.
-For agent-facing discovery, `knowledge_index_for_subject` checks the subject
-and omits dimensions that lowering would reject as unauthorized; privileged
+For agent-facing discovery, `visible_knowledge_index`
+omits dimensions that lowering would reject as unauthorized; internal
 callers retaining the complete payload can still inspect the full model.
 
 Acceptance is two-sided: each row requires a successful intent with a correct

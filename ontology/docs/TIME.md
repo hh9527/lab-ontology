@@ -12,7 +12,7 @@ Relation keys likewise reject incompatible time and plain fields.
 | `rfc3339` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
 | `Utc1` | `CanonicalUtcSecondText` | String | UTC `YYYY-MM-DD HH:MM:SS` |
 | `local_datetime` | `LocalText` | String | Local `YYYY-MM-DD HH:MM:SS` |
-| `epoch_millis` | `UtcEpochMillis` or `LocalEpochMillis` | Int | Unix epoch milliseconds |
+| `epoch_millis` | `EpochMillis` | Int | Unix epoch milliseconds |
 
 `Utc1` replaces the misleading `UtcSecond` name in logical types and typed
 input variants. It accepts text, not an integer. Its `@edsl::doc(text)`
@@ -23,9 +23,11 @@ the accepted timestamp spelling remain unchanged.
 The RFC3339 input currently accepts only normalized UTC seconds: offsets and
 fractions must be resolved before submitting the Intent. Fixed-width UTC text
 preserves chronological ordering under raw-column string comparison.
-`LocalEpochMillis` retains its historical Model name; its integer value is
-still an epoch-millisecond time value, not an ordinary integer. Local
-wall-clock text is distinct from an instant. Resolving an instant or a
+`EpochMillis` is an absolute instant measured from `1970-01-01T00:00:00Z`;
+its encoding does not depend on a timezone. A UTC/local business description
+does not change its integer representation. A shifted wall-clock integer
+would require a separately specified encoding. Local wall-clock text is
+distinct from an instant. Resolving an instant or a
 relative period into local wall-clock boundaries may require a timezone and
 ambiguity policy; this interface does not infer either.
 

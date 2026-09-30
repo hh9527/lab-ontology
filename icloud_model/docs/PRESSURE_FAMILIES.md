@@ -1,5 +1,10 @@
 # Corpus pressure families (first pass)
 
+All historical cases below refer to `tests/pressure_graph.telora` and its
+synthetic fixture `tests/pressure_graph/model_fixture.telora`. They do not
+establish the refreshed product schema. See [SOURCE_REFRESH.md](SOURCE_REFRESH.md)
+for current source contracts and exceptions.
+
 This document retains historical pressure probes, including removed Intent
 forms and the old Safe/FanOut vocabulary. The current relation contract is
 `RelationCardinality {from,to}` with `One`, `Optional`, `Many0`, and `Many1`;

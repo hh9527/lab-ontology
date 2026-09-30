@@ -1,14 +1,14 @@
 # Knowledge discovery
 
-`knowledge::knowledge_service_factory(payload, subject, domain)` binds a
-prepared Model, authorized subject, and domain name and returns a pure
+`knowledge::knowledge_service_factory(payload, domain)` binds a
+prepared Model and domain name and returns a pure
 `Fn(Value) -> Value` request handler. `knowledge::serve_value` is the
 equivalent unbound entry. No database connection or SQL backend is required.
 The response can be serialized with `std::json::stringify`.
 
 An entry `MainService` mounts a `TransformService` slot for `<domain>/info`.
 Telora's collection routes by method and passes only `input` to the selected
-slot. Use `knowledge::knowledge_info_method_factory(payload, subject)` in its
+slot. Use `knowledge::knowledge_info_method_factory(payload)` in its
 `init`; it does not expect an envelope inside `transform`. The deployed
 example domains mount `<domain>/info` and `<domain>/transform`. The ic model
 uses its own entry, while dog, spider, and world share `example_models`.
@@ -81,9 +81,9 @@ associations; no automatic substitution occurs. Intent accepts only the
 Model-defined canonical business IDs, never aliases or terminology terms.
 
 Requests with unsupported fields, a missing or malformed key, wrong types, or
-another domain's method fail with a structured diagnostic. Authorization is
-checked when generating the index and resolving keys; the host must not share
-an authorized response with another subject.
+another domain's method fail with a structured diagnostic. Model-declared
+dimension visibility is checked when generating the index and resolving keys.
+Identity authentication and access control belong to the host.
 The request envelope and info input are decoded from declared records;
 shape diagnostics include the offending JSON path and an `info` key for the
 corresponding contract (`syntax/knowledge/request` or `syntax/knowledge/info`).
@@ -100,5 +100,5 @@ node ontology/tools/knowledge-export.mjs http://127.0.0.1:8080/foo/info > /tmp/f
 node ontology/tools/knowledge-html.mjs /tmp/foo-knowledge.json > /tmp/foo-knowledge.html
 ```
 
-The static HTML is a view of the same authorized knowledge map, not a separate
-Model. Its file must be shared only with subjects allowed to see that map.
+The static HTML is a view of the same visible knowledge map, not a separate
+Model. Access to the artifact is controlled by the host.

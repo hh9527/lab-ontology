@@ -11,7 +11,7 @@ list of decorator parameters here.
 
 A domain defines typed datasets, dimensions, measures, values, time roles, and
 named relationships in a Telora module, then prepares them once with
-`edsl::build_root(revision, entity_types, profile, authorize)`. The resulting
+`edsl::build_root(revision, entity_types, profile)`. The resulting
 `PreparedPayload` is shared by query lowering and knowledge discovery. For a
 small complete declaration, see [`relation_model`](../../relation_model/src/model.telora);
 for a service mounting the same payload under knowledge and query methods, see
@@ -73,8 +73,8 @@ work still needed before declaring full cross-dialect support.
   concrete time boundaries; see [TIME.md](TIME.md).
 
 `build_root` validates declarations and produces the prepared vocabulary used
-by both `info` (starting at key `index`) and `transform`. Visibility and authorization are
-evaluated against the service's bound subject. Model annotations determine
+by both `info` (starting at key `index`) and `transform`. Dimension visibility
+is declared by the model; caller authentication belongs to the host. Model annotations determine
 which business meanings are legal; neither an Intent nor a renderer may add
 undeclared semantics.
 
@@ -87,10 +87,10 @@ item failure, `queries` is null and every item has an indexed status. Multiple
 Intents are separate plans, not a SQL union. `GraphUnion` is one Intent that
 produces one deduplicated result set under its own stricter shape rules.
 
-Internally, `query_intent_ast_factory(payload, subject)` returns a function
+Internally, `query_intent_ast_factory(payload)` returns a function
 from one Intent to a validated `QueryAst`. The direct
-`query_intent_lower_factory(payload, subject, to_query)` adds one backend
-renderer. `query_request_method_factory(payload, subject, to_query)` is the
+`query_intent_lower_factory(payload, to_query)` adds one backend
+renderer. `query_request_method_factory(payload, to_query)` is the
 batch-aware service boundary used by the example and icloud entries. These
 factories are distinct: the direct factories do not parse the service request
 object, while the method factory does.

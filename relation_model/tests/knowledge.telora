@@ -99,11 +99,11 @@ def profile: qb::PlanProfile = {
     allow_distinct: False,
 };
 def payload: edsl::PreparedPayload = edsl::build_root("doc-pressure", [Order.type, StatusEvent.type, Unrelated.type],
-    profile, fn(subject) { subject == "reader" });
+    profile);
 
 pub def utc1_input_documentation_is_discoverable: test::Test = test::should_ok(fn() {
-    let detail = edsl::dimension_detail_for_subject(payload, "reader", "event_time");
-    match knowledge::by_target(payload, "reader", {kind: edsl::KnowledgeKind::Dimension, owner: "status_event", id: "event_time"}) {
+    let detail = edsl::visible_dimension_detail(payload, "event_time");
+    match knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Dimension, owner: "status_event", id: "event_time"}) {
         knowledge::DocResult::Found(point) => match point.dimension {
             Some(found) => if detail.input_kinds == [edsl::FilterInputKind::Utc1]
                 && array::length(found.input_docs) == 1
@@ -118,14 +118,14 @@ pub def utc1_input_documentation_is_discoverable: test::Test = test::should_ok(f
 });
 
 pub def input_documentation_does_not_leak_to_other_kinds: test::Test = test::should_ok(fn() {
-    let detail = edsl::dimension_detail_for_subject(payload, "reader", "order_status");
+    let detail = edsl::visible_dimension_detail(payload, "order_status");
     if detail.input_docs == [] { () } else { fail!("unexpected input documentation", detail) }
 });
 
 pub def shared_aliases_have_distinct_keys: test::Test = test::should_ok(fn() {
-    let index = knowledge::index_entries(knowledge::map(payload, "reader"));
-    let status = knowledge::by_target(payload, "reader", order_status);
-    let event = knowledge::by_target(payload, "reader", status_event);
+    let index = knowledge::index_entries(knowledge::map(payload));
+    let status = knowledge::by_target(payload, order_status);
+    let event = knowledge::by_target(payload, status_event);
     match (status, event) {
         (knowledge::DocResult::Found(a), knowledge::DocResult::Found(b)) =>
             if array::any(index.entries, fn(entry) { entry.key == order_status })
@@ -138,14 +138,14 @@ pub def shared_aliases_have_distinct_keys: test::Test = test::should_ok(fn() {
 });
 
 pub def private_dimension_is_not_addressable: test::Test = test::should_ok(fn() {
-    let secret = knowledge::by_target(payload, "reader",
+    let secret = knowledge::by_target(payload,
         {kind: edsl::KnowledgeKind::Dimension, owner: "order", id: "private_status"});
     if secret == knowledge::DocResult::NotFound { True }
     else { fail!("private dimension leaked through its key", secret) }
 });
 
 pub def local_document_has_separate_structural_and_semantic_links: test::Test = test::should_ok(fn() {
-    match knowledge::by_target(payload, "reader", order_status) {
+    match knowledge::by_target(payload, order_status) {
         knowledge::DocResult::Found(point) => if point.summary == "Status is the current lifecycle value"
             && array::any(point.refs, fn(ref) { ref.target == status_event && ref.kind == knowledge::LinkKind::Related })
             && array::any(point.refs, fn(ref) { ref.target == unrelated && ref.kind == knowledge::LinkKind::Related })
@@ -158,7 +158,7 @@ pub def local_document_has_separate_structural_and_semantic_links: test::Test = 
 });
 
 pub def declared_relation_is_navigable_but_related_doc_is_not: test::Test = test::should_ok(fn() {
-    let graph = knowledge::map(payload, "reader");
+    let graph = knowledge::map(payload);
     let relation = array::find(graph, fn(point) {
         point.target.kind == edsl::KnowledgeKind::Relation && point.target.id == "event_order"
     });
@@ -172,7 +172,7 @@ pub def declared_relation_is_navigable_but_related_doc_is_not: test::Test = test
 });
 
 pub def discovered_relation_and_dimensions_lower_to_a_query: test::Test = test::should_ok(fn() {
-    let relation = knowledge::by_target(payload, "reader",
+    let relation = knowledge::by_target(payload,
         {kind: edsl::KnowledgeKind::Relation, owner: "status_event", id: "event_order"});
     match relation {
         knowledge::DocResult::Found(point) => if point.relation == None {
@@ -180,7 +180,7 @@ pub def discovered_relation_and_dimensions_lower_to_a_query: test::Test = test::
         } else { () },
         other => fail!("named relation cannot be discovered", other),
     };
-    let ast = query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    let ast = query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph", "root":"ev",
         "nodes":[{"id":"ev","entity":"status_event"},{"id":"o","entity":"order"}],
         "edges":[{"relation":"event_order","from":"ev","to":"o"}],
@@ -194,7 +194,7 @@ pub def discovered_relation_and_dimensions_lower_to_a_query: test::Test = test::
 });
 
 pub def document_reference_does_not_make_a_query_relation: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph", "root":"o", "nodes":[{"id":"o","entity":"order"},{"id":"u","entity":"unrelated"}],
         "edges":[{"relation":"documentation_link","from":"o","to":"u"}],
         "select":[{"node":"o","dimension":"order_status"}]
@@ -218,24 +218,24 @@ type UndocumentedCase = struct {
 };
 
 pub def docs_and_terms_do_not_change_query_lowering: test::Test = test::should_ok(fn() {
-    let with_doc = edsl::build_root("with-doc", [DocumentedCase.type], profile, fn(subject) { True });
-    let without_doc = edsl::build_root("without-doc", [UndocumentedCase.type], profile, fn(subject) { True });
+    let with_doc = edsl::build_root("with-doc", [DocumentedCase.type], profile);
+    let without_doc = edsl::build_root("without-doc", [UndocumentedCase.type], profile);
     let request = json::parse(r#"{
         "op":"Graph", "root":"dc", "nodes":[{"id":"dc","entity":"doc_case"}],
         "edges":[], "select":[{"node":"dc","dimension":"state"}]
     }"#).unwrap!();
-    let a = sqlite::build_query(query_intent_ast_factory(with_doc, "reader")(request));
-    let b = sqlite::build_query(query_intent_ast_factory(without_doc, "reader")(request));
-    let explained = knowledge::by_target(with_doc, "reader",
+    let a = sqlite::build_query(query_intent_ast_factory(with_doc)(request));
+    let b = sqlite::build_query(query_intent_ast_factory(without_doc)(request));
+    let explained = knowledge::by_target(with_doc,
         {kind: edsl::KnowledgeKind::Dimension, owner: "doc_case", id: "state"});
-    let bare = knowledge::by_target(without_doc, "reader",
+    let bare = knowledge::by_target(without_doc,
         {kind: edsl::KnowledgeKind::Dimension, owner: "doc_case", id: "state"});
     match (explained, bare) {
         (knowledge::DocResult::Found(x), knowledge::DocResult::Found(y)) =>
             if a == b && x.summary == "Documented state" && y.summary == ""
-                && string::contains(json::stringify(knowledge::knowledge_info_method_factory(with_doc, "reader")(
+                && string::contains(json::stringify(knowledge::knowledge_info_method_factory(with_doc)(
                     Value::Object({key: Value::String("terminology")}))), "状态含义")
-                && !string::contains(json::stringify(knowledge::knowledge_info_method_factory(without_doc, "reader")(
+                && !string::contains(json::stringify(knowledge::knowledge_info_method_factory(without_doc)(
                     Value::Object({key: Value::String("terminology")}))), "状态含义") { True }
             else { fail!("documentation changed the query or failed to change the description", a, b, x, y) },
         other => fail!("documentation affected knowledge point identity", other),
@@ -243,7 +243,7 @@ pub def docs_and_terms_do_not_change_query_lowering: test::Test = test::should_o
 });
 
 pub def every_visible_point_has_an_exact_topic_and_closed_references: test::Test = test::should_ok(fn() {
-    let points = knowledge::map(payload, "reader");
+    let points = knowledge::map(payload);
     let entries = knowledge::index_entries(points).entries;
     if array::all(points, fn(point) {
         array::length(array::filter(entries, fn(entry) { entry.key == point.target })) == 1
@@ -254,7 +254,7 @@ pub def every_visible_point_has_an_exact_topic_and_closed_references: test::Test
 });
 
 pub def on_demand_doc_matches_validated_catalog: test::Test = test::should_ok(fn() {
-    let doc = knowledge::knowledge_info_method_factory(payload, "reader");
+    let doc = knowledge::knowledge_info_method_factory(payload);
     let inputs = [
         json::parse(r#"{"key":"Dataset/order"}"#).unwrap!(),
         json::parse(r#"{"key":"Dimension/order/order_status"}"#).unwrap!(),
@@ -262,7 +262,7 @@ pub def on_demand_doc_matches_validated_catalog: test::Test = test::should_ok(fn
         json::parse(r#"{"key":"Dataset/missing"}"#).unwrap!(),
     ];
     if array::all(inputs, fn(input) {
-            doc(input) == knowledge::serve_value(payload, "reader", "foo",
+            doc(input) == knowledge::serve_value(payload, "foo",
                 Value::Object({method: Value::String("foo/info"), input}))
         }) { True }
     else { fail!("bound info differs from the same knowledge catalog") }
@@ -293,7 +293,7 @@ def encoded_type: for(A: codec::Encode) Fn(A) -> Value = fn(item) {
 };
 
 pub def terminology_derives_aliases_preserve_ambiguity_and_hide_private_targets: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload, "reader");
+    let info = knowledge::knowledge_info_method_factory(payload);
     let node = read_node(info, "terminology");
     let entries = codec::decode@[TerminologyDetail](node.detail).unwrap!().entries;
     if encoded_type(node) == Value::String("Terminology")
@@ -309,7 +309,7 @@ pub def terminology_derives_aliases_preserve_ambiguity_and_hide_private_targets:
 });
 
 pub def old_concepts_key_is_not_an_alternate_vocabulary: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload, "reader");
+    let info = knowledge::knowledge_info_method_factory(payload);
     match codec::decode@[knowledge::NodeResponse](info(Value::Object({key: Value::String("concepts")}))).unwrap!() {
         knowledge::NodeResponse::Document(knowledge::NodeResult::NotFound) => True,
         _ => fail!("removed concepts key must not resolve"),
@@ -317,7 +317,7 @@ pub def old_concepts_key_is_not_an_alternate_vocabulary: test::Test = test::shou
 });
 
 pub def index_and_links_resolve_opaque_keys_with_one_node_contract: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload, "reader");
+    let info = knowledge::knowledge_info_method_factory(payload);
     let index = read_node(info, "index");
     let entries = codec::decode@[CatalogDetail](index.detail).unwrap!().entries;
     if encoded_type(index) == Value::String("Index")
@@ -333,8 +333,8 @@ pub def index_and_links_resolve_opaque_keys_with_one_node_contract: test::Test =
 });
 
 pub def public_nodes_match_the_full_model_map: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload, "reader");
-    if array::all(knowledge::map(payload, "reader"), fn(point) {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    if array::all(knowledge::map(payload), fn(point) {
         let node = read_node(info, edsl::knowledge_key(point.target));
         codec::encode(node) == knowledge::node_value(point)
     }) { True }
@@ -342,7 +342,7 @@ pub def public_nodes_match_the_full_model_map: test::Test = test::should_ok(fn()
 });
 
 pub def opaque_keys_do_not_hide_canonical_intent_ids: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload, "reader");
+    let info = knowledge::knowledge_info_method_factory(payload);
     let entries = codec::decode@[CatalogDetail](read_node(info, "index").detail).unwrap!().entries;
     let order = match array::find(entries, fn(entry) { entry.description.label == "Order" }) {
         Some(entry) => read_node(info, entry.key), None => fail!("Order is not discoverable"),
@@ -356,7 +356,7 @@ pub def opaque_keys_do_not_hide_canonical_intent_ids: test::Test = test::should_
     }) { Some(entry) => read_node(info, entry.key), None => fail!("Status field is not discoverable") };
     let canonical = codec::decode@[knowledge::ValueDetail](paid.detail).unwrap!();
     let field = codec::decode@[knowledge::FieldDetail](status.detail).unwrap!();
-    let ast = query_intent_ast_factory(payload, "reader")(Value::Object({
+    let ast = query_intent_ast_factory(payload)(Value::Object({
         op: Value::String("Graph"), root: Value::String("o"),
         nodes: Value::Array([Value::Object({id: Value::String("o"), entity: Value::String(detail.id)})]),
         edges: Value::Array([]), select: Value::Array([Value::Object({node: Value::String("o"), dimension: Value::String(canonical.dimension)})]),
@@ -377,7 +377,7 @@ pub def path_like_keys_encode_components_without_collisions: test::Test = test::
 });
 
 pub def published_field_is_distinct_from_dimension_and_hidden_column: test::Test = test::should_ok(fn() {
-    let points = knowledge::map(payload, "reader");
+    let points = knowledge::map(payload);
     let field = {kind: edsl::KnowledgeKind::Field, owner: "order", id: "status"};
     let hidden = {kind: edsl::KnowledgeKind::Field, owner: "order", id: "secret"};
     let visible = array::find(points, fn(item) { item.target == field });
@@ -394,7 +394,7 @@ pub def published_field_is_distinct_from_dimension_and_hidden_column: test::Test
 
 pub def event_time_role_retains_authoritative_clock_semantics: test::Test = test::should_ok(fn() {
     let id = {kind: edsl::KnowledgeKind::TimeRole, owner: "status_event", id: "occurred_at"};
-    match knowledge::by_target(payload, "reader", id) {
+    match knowledge::by_target(payload, id) {
         knowledge::DocResult::Found(item) => match item.time_role {
             Some(role) => if role.authoritative && role.semantics == edsl::TimeSemantics::Utc
                 && role.encoding == edsl::TimeEncoding::CanonicalUtcSecondText
@@ -410,7 +410,7 @@ pub def event_time_role_retains_authoritative_clock_semantics: test::Test = test
 
 pub def local_display_time_is_not_the_authoritative_clock: test::Test = test::should_ok(fn() {
     let id = {kind: edsl::KnowledgeKind::TimeRole, owner: "status_event", id: "display_time"};
-    match knowledge::by_target(payload, "reader", id) {
+    match knowledge::by_target(payload, id) {
         knowledge::DocResult::Found(item) => match item.time_role {
             Some(role) => if !role.authoritative && role.semantics == edsl::TimeSemantics::Local
                 && role.encoding == edsl::TimeEncoding::LocalText { True }
@@ -422,14 +422,14 @@ pub def local_display_time_is_not_the_authoritative_clock: test::Test = test::sh
 });
 
 pub def business_alias_is_not_a_strict_dimension_id: test::Test = test::should_fail_with(fn() {
-    query_intent_ast_factory(payload, "reader")(json::parse(r#"{
+    query_intent_ast_factory(payload)(json::parse(r#"{
         "op":"Graph", "root":"o", "nodes":[{"id":"o","entity":"order"}],
         "edges":[], "select":[{"node":"o","dimension":"订单状态"}]
     }"#).unwrap!())
 }, "unknown dimension");
 
 pub def localized_name_stays_in_knowledge_detail: test::Test = test::should_ok(fn() {
-    match knowledge::by_target(payload, "reader", {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "order"}) {
+    match knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "order"}) {
         knowledge::DocResult::Found(point) =>
             if array::any(point.localized, fn(text) { text.label == "订单资料" && text.locale == "zh-CN" }) { True }
             else { fail!("localized name lost its declaring context", point) },
@@ -438,17 +438,17 @@ pub def localized_name_stays_in_knowledge_detail: test::Test = test::should_ok(f
 });
 
 pub def service_index_lists_unique_keys_and_info_navigates: test::Test = test::should_ok(fn() {
-    let index = knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    let index = knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"index"}
     }"#).unwrap!());
-    let point = knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    let point = knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dimension/order/order_status"}
     }"#).unwrap!());
     match (index, point) {
         (knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(a)),
             knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(item))) =>
             match a.entries {
-                Some(entries) => if array::length(entries) == array::length(knowledge::map(payload, "reader"))
+                Some(entries) => if array::length(entries) == array::length(knowledge::map(payload))
                     && array::length(array::filter(entries, fn(entry) { entry.key == order_status })) == 1
                     && item.target == order_status { True }
                     else { fail!("flat index or exact key navigation failed", a, item) },
@@ -459,7 +459,7 @@ pub def service_index_lists_unique_keys_and_info_navigates: test::Test = test::s
 });
 
 pub def service_response_round_trips_through_json: test::Test = test::should_ok(fn() {
-    let result = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+    let result = knowledge::serve_value(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dimension/order/order_status"}
     }"#).unwrap!());
     let round_trip = json::parse(json::stringify(result)).unwrap!();
@@ -472,13 +472,13 @@ pub def service_response_round_trips_through_json: test::Test = test::should_ok(
 });
 
 pub def service_response_has_stable_json_envelope: test::Test = test::should_ok(fn() {
-    let found = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+    let found = knowledge::serve_value(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dimension/order/order_status"}
     }"#).unwrap!());
-    let missing = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+    let missing = knowledge::serve_value(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dataset/missing"}
     }"#).unwrap!());
-    let index = knowledge::serve_value(payload, "reader", "foo", json::parse(r#"{
+    let index = knowledge::serve_value(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"index"}
     }"#).unwrap!());
     match (found, missing, index) {
@@ -494,7 +494,7 @@ pub def service_response_has_stable_json_envelope: test::Test = test::should_ok(
 });
 
 pub def service_does_not_expose_hidden_target: test::Test = test::should_ok(fn() {
-    match knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    match knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dimension/order/private_status"}
     }"#).unwrap!()) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::NotFound) => True,
@@ -503,43 +503,37 @@ pub def service_does_not_expose_hidden_target: test::Test = test::should_ok(fn()
 });
 
 pub def service_rejects_wrong_domain: test::Test = test::should_fail_with(fn() {
-    knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"bar/info", "input":{"key":"Dimension/order/order_status"}
     }"#).unwrap!())
 }, "unknown knowledge method for domain");
 
 pub def service_rejects_removed_index_method: test::Test = test::should_fail_with(fn() {
-    knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/index", "input":{}
     }"#).unwrap!())
 }, "unknown knowledge method for domain; see info key");
 
 pub def service_rejects_extra_request_fields: test::Test = test::should_fail_with(fn() {
-    knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dimension/order/order_status", "guess":true}
     }"#).unwrap!())
 }, "$.guess: unknown field; see info key");
 
 pub def service_rejects_extra_envelope_field: test::Test = test::should_fail_with(fn() {
-    knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":"index"}, "guess":true
     }"#).unwrap!())
 }, "$.guess: unknown field; see info key");
 
 pub def service_rejects_non_string_key: test::Test = test::should_fail_with(fn() {
-    knowledge::serve(payload, "reader", "foo", json::parse(r#"{
+    knowledge::serve(payload, "foo", json::parse(r#"{
         "method":"foo/info", "input":{"key":{"kind":"Dataset","owner":"","id":"order","guess":true}}
     }"#).unwrap!())
 }, "$.key: expected String; see info key");
 
-pub def service_rejects_unauthorized_subject: test::Test = test::should_fail_with(fn() {
-    knowledge::serve(payload, "intruder", "foo", json::parse(r#"{
-        "method":"foo/info", "input":{"key":"index"}
-    }"#).unwrap!())
-}, "subject is not authorized for knowledge discovery");
-
-pub def bound_service_keeps_its_model_subject_and_domain: test::Test = test::should_ok(fn() {
-    let service = knowledge::knowledge_service_factory(payload, "reader", "foo");
+pub def bound_service_keeps_its_model_and_domain: test::Test = test::should_ok(fn() {
+    let service = knowledge::knowledge_service_factory(payload, "foo");
     let first = service(json::parse(r#"{
         "method":"foo/info", "input":{"key":"Dimension/order/order_status"}
     }"#).unwrap!());
@@ -560,7 +554,7 @@ pub def bound_service_keeps_its_model_subject_and_domain: test::Test = test::sho
 type BadDoc = struct { @edsl::column("id") @edsl::key() id: String };
 
 pub def annotation_cannot_claim_another_entity_point: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("invalid-knowledge", [Order.type, BadDoc.type], profile, fn(subject) { True })
+    edsl::build_root("invalid-knowledge", [Order.type, BadDoc.type], profile)
 }, "knowledge doc must describe an existing point owned by its declaring entity");
 
 @edsl::entity_id("duplicate_doc")
@@ -570,7 +564,7 @@ pub def annotation_cannot_claim_another_entity_point: test::Test = test::should_
 type DuplicateDoc = struct { @edsl::column("id") @edsl::key() id: String };
 
 pub def duplicate_documentation_is_rejected: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("duplicate-knowledge", [DuplicateDoc.type], profile, fn(subject) { True })
+    edsl::build_root("duplicate-knowledge", [DuplicateDoc.type], profile)
 }, "duplicate knowledge doc target");
 
 @edsl::entity_id("bad_term")
@@ -579,7 +573,7 @@ pub def duplicate_documentation_is_rejected: test::Test = test::should_fail_with
 type BadTerm = struct { @edsl::column("id") @edsl::key() id: String };
 
 pub def term_cannot_claim_another_entity_point: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("invalid-term", [Order.type, StatusEvent.type, Unrelated.type, BadTerm.type], profile, fn(subject) { True })
+    edsl::build_root("invalid-term", [Order.type, StatusEvent.type, Unrelated.type, BadTerm.type], profile)
 }, "term annotation requires a term, description and declared target owned by its entity");
 
 @edsl::entity_id("duplicate_term")
@@ -589,7 +583,7 @@ pub def term_cannot_claim_another_entity_point: test::Test = test::should_fail_w
 type DuplicateTerm = struct { @edsl::column("id") @edsl::key() id: String };
 
 pub def duplicate_explicit_term_is_rejected: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("duplicate-term", [DuplicateTerm.type], profile, fn(subject) { True })
+    edsl::build_root("duplicate-term", [DuplicateTerm.type], profile)
 }, "duplicate term for knowledge target");
 
 @edsl::entity_id("invalid_ref")
@@ -599,5 +593,5 @@ pub def duplicate_explicit_term_is_rejected: test::Test = test::should_fail_with
 type InvalidRef = struct { @edsl::column("id") @edsl::key() id: String };
 
 pub def nonexistent_related_point_is_rejected: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("invalid-reference", [InvalidRef.type], profile, fn(subject) { True })
+    edsl::build_root("invalid-reference", [InvalidRef.type], profile)
 }, "knowledge reference must link distinct declared points from its owner");
