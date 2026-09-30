@@ -151,7 +151,7 @@ and `transform` decide which combinations have valid business meaning.
 A graph Intent has five required fields, including empty arrays where needed:
 
 ```json
-{"op":"graph","root":"item",
+{"op":"Graph","root":"item",
  "nodes":[{"id":"item","entity":"<dataset ID>"}],
  "edges":[],
  "select":[],"count":"item"}
@@ -173,7 +173,7 @@ Optional top-level graph fields and their shapes:
 | --- | --- |
 | `constraints` | Array of edge objects, same shape as `edges` |
 | `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
-| `filters` | Array of `{"node":"...","dimension":"...","op":"eq","value":...}` |
+| `filters` | Array of `{"node":"...","dimension":"...","op":"Eq","value":...}` |
 | `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` may be `null` or omitted |
 | `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}` |
 | `exists` | Array of existence objects described below |
@@ -183,11 +183,11 @@ Optional top-level graph fields and their shapes:
 | `count_having` | `{"op":"...","value":<integer>}` |
 | `count_groups`, `include_empty`, `distinct` | Boolean |
 | `group_by_identity` | Array of node instance ID strings |
-| `row_grain` | `"root"` or `"association"` |
-| `order_by` | Array of `{"node":"...","dimension":"...","direction":"asc|desc"}` |
+| `row_grain` | `"Root"` or `"Association"` |
+| `order_by` | Array of `{"node":"...","dimension":"...","direction":"Asc|Desc"}` |
 | `take` | Integer |
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
-| `top_by_measure` | `{"node":"...","measure":"...","direction":"asc|desc","take":<integer>}` |
+| `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |
 
 For aggregate Top-N, `select` names the visible dimensions and `measures`
 names the aggregate being ranked. With no `group_by_identity`, Top-N ranks
@@ -216,8 +216,8 @@ their rows; use it when a related one-to-many entity must only establish
 existence. The request may have multiple graph edges and multiple existence
 objects; there is no fixed hop count in the Intent syntax.
 
-Filter operators are `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains`,
-`not_contains`, `starts_with`, and `ends_with`. The Model restricts which
+Filter operators are `Eq`, `Ne`, `Gt`, `Ge`, `Lt`, `Le`, `Contains`,
+`NotContains`, `StartsWith`, and `EndsWith`. The Model restricts which
 operators and logical value types each dimension permits. Do not send `kind`:
 the target dimension or measure determines the logical type of its JSON value.
 Discover the Intent contract under `syntax/intent` and its linked topics in
@@ -227,17 +227,17 @@ use the stable value ID, not its physical wire or localized label.
 
 ### One deduplicated entity set
 
-Use `graph_union` when two or more independently valid graph paths must return one
+Use `GraphUnion` when two or more independently valid graph paths must return one
 deduplicated population of the same entity:
 
 ```text
-{"op":"graph_union","branches":[
+{"op":"GraphUnion","branches":[
   {"result_node":"<node ID>","graph":<graph Intent>},
   {"result_node":"<node ID>","graph":<graph Intent>}
 ]}
 ```
 
-Each `graph` is complete and follows its own declared relations, filters,
+Each `Graph` is complete and follows its own declared relations, filters,
 authorization, and grain rules. Its `result_node` may differ from the root
 and from other branches' result nodes. All result nodes must name the same
 dataset. Select only dimensions of that result node, in the same dimension
@@ -247,7 +247,7 @@ Identity fields are visible result columns in the current form. Other
 selected dimensions must be the same across branches; SQL `UNION` then
 deduplicates complete result rows without merging distinct entity identities.
 
-`graph_union` accepts at least two raw-row branches. A branch may
+`GraphUnion` accepts at least two raw-row branches. A branch may
 qualify rows using `filters`, `exists`, and named graph edges, but cannot use
 counts, measures, identity grouping, local ordering, Top-N, or pagination.
 It cannot reverse a directed relation or turn two separately valid result
@@ -256,15 +256,15 @@ distinct result categories rather than one entity set.
 
 ### Independent aggregate pair
 
-Use `graph_pair` when two measure populations must be aggregated separately
+Use `GraphPair` when two measure populations must be aggregated separately
 and then matched by their complete declared group identities:
 
 ```text
-{"op":"graph_pair","left":<graph Intent>,"right":<graph Intent>,
+{"op":"GraphPair","left":<graph Intent>,"right":<graph Intent>,
  "count_groups":false}
 ```
 
-`left` and `right` are complete `graph` Intents, each with its own nodes,
+`left` and `right` are complete `Graph` Intents, each with its own nodes,
 named edges, filters, existence qualifications, one measure projection, and
 optional `measure_having`. Each side is lowered and grouped independently;
 the resulting groups are inner-joined on every hidden identity field.
@@ -276,7 +276,7 @@ aligned visible dimensions and both measure values. With outer
 
 The two operands must satisfy all of these shape rules:
 
-1. Each has `op:"graph"`, exactly one `measures` entry, and
+1. Each has `op:"Graph"`, exactly one `measures` entry, and
    `group_by_identity` beginning with its `root` node ID.
 2. They use the same root node ID and dataset. Their `group_by_identity`
    arrays are identical, and every grouped node ID denotes the same dataset

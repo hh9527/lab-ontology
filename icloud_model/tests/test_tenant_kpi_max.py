@@ -34,7 +34,7 @@ class TenantDeviceKpiMaxTest(unittest.TestCase):
             ("router", "red", "2025-01-20 00:00:00", 300),
         ])
         intent = {
-            "op": "graph", "root": "device",
+            "op": "Graph", "root": "device",
             "nodes": [{"id": "device", "entity": "device"}, {"id": "tenant", "entity": "tenant"},
                       {"id": "sample", "entity": "device_kpi"}],
             "edges": [{"relation": "device_belongs_to_tenant", "from": "device", "to": "tenant"},
@@ -44,11 +44,11 @@ class TenantDeviceKpiMaxTest(unittest.TestCase):
             "measures": [{"node": "sample", "measure": "used_port_sample_max"}],
             "group_by_identity": ["device"],
             "filters": [
-                {"node": "tenant", "dimension": "tenant_industry", "op": "eq", "kind": "text", "value": "102"},
-                {"node": "device", "dimension": "device_ip_address", "op": "starts_with", "kind": "text", "value": "10.3.0.0"},
-                {"node": "device", "dimension": "device_class", "op": "eq", "kind": "text", "value": "LSW"},
-                {"node": "sample", "dimension": "device_kpi_ts_raw", "op": "ge", "kind": "text", "value": "2025-01-01 00:00:00"},
-                {"node": "sample", "dimension": "device_kpi_ts_raw", "op": "lt", "kind": "text", "value": "2025-01-31 00:00:00"},
+                {"node": "tenant", "dimension": "tenant_industry", "op": "Eq", "kind": "text", "value": "102"},
+                {"node": "device", "dimension": "device_ip_address", "op": "StartsWith", "kind": "text", "value": "10.3.0.0"},
+                {"node": "device", "dimension": "device_class", "op": "Eq", "kind": "text", "value": "LSW"},
+                {"node": "sample", "dimension": "device_kpi_ts_raw", "op": "Ge", "kind": "text", "value": "2025-01-01 00:00:00"},
+                {"node": "sample", "dimension": "device_kpi_ts_raw", "op": "Lt", "kind": "text", "value": "2025-01-31 00:00:00"},
             ],
         }
         result = subprocess.run(

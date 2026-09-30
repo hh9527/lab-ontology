@@ -22,9 +22,9 @@ class AlarmValueGroupTest(unittest.TestCase):
             (6, "unknown"), (7, "unknown"), (8, "unknown"),
         ])
         intent = {
-            "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "op": "Graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [{"node": "alarm", "dimension": "alarm_severity"}],
-            "count": "alarm", "count_having": {"op": "gt", "value": 2},
+            "count": "alarm", "count_having": {"op": "Gt", "value": 2},
         }
         for threshold, expected in [
             (True, [("critical", 3)]),
@@ -52,7 +52,7 @@ class AlarmValueGroupTest(unittest.TestCase):
             (1, 0), (2, 0), (3, 1), (4, 7), (5, 7),
         ])
         intent = {
-            "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "op": "Graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [{"node": "alarm", "dimension": "alarm_cleared"}],
             "count": "alarm",
         }
@@ -78,9 +78,9 @@ class AlarmValueGroupTest(unittest.TestCase):
             (6, 3), (7, 7), (8, 7), (9, 7), (10, 7),
         ])
         intent = {
-            "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "op": "Graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [{"node": "alarm", "dimension": "alarm_change_flag"}],
-            "count": "alarm", "count_having": {"op": "gt", "value": 2},
+            "count": "alarm", "count_having": {"op": "Gt", "value": 2},
         }
         result = subprocess.run(
             [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],

@@ -31,19 +31,19 @@ class AlarmQualifiedDevicesTest(unittest.TestCase):
             (5, "d3", "red", 0), (6, "d4", "red", 0),
         ])
         intent = {
-            "op": "graph", "root": "device",
+            "op": "Graph", "root": "device",
             "nodes": [{"id": "device", "entity": "device"},
                       {"id": "tenant", "entity": "tenant"}],
             "edges": [{"relation": "device_belongs_to_tenant", "from": "device", "to": "tenant"}],
             "select": [], "count": "device",
             "filters": [
-                {"node": "tenant", "dimension": "tenant_name", "op": "eq", "kind": "text", "value": "imastercloud24"},
-                {"node": "device", "dimension": "device_class", "op": "eq", "kind": "text", "value": "WAC"},
+                {"node": "tenant", "dimension": "tenant_name", "op": "Eq", "kind": "text", "value": "imastercloud24"},
+                {"node": "device", "dimension": "device_class", "op": "Eq", "kind": "text", "value": "WAC"},
             ],
             "exists": [{
                 "anchor": "device", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
                 "edges": [{"relation": "device_current_alarm", "from": "alarm", "to": "device"}],
-                "filters": [{"node": "alarm", "dimension": "alarm_cleared", "op": "eq",
+                "filters": [{"node": "alarm", "dimension": "alarm_cleared", "op": "Eq",
                              "kind": "text", "value": "uncleared"}],
             }],
         }

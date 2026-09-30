@@ -35,7 +35,7 @@ class ServerAlarmTrendTest(unittest.TestCase):
             ("same", "blue", "deviceOffline"), ("other", "red", "linkDown"),
         ])
         intent = {
-            "op": "graph", "root": "sample",
+            "op": "Graph", "root": "sample",
             "nodes": [{"id": "sample", "entity": "server_kpi"},
                       {"id": "server", "entity": "server_device"}],
             "edges": [{"relation": "server_kpi_of_server", "from": "sample", "to": "server"}],
@@ -43,14 +43,14 @@ class ServerAlarmTrendTest(unittest.TestCase):
                        {"node": "sample", "dimension": "server_memory_sample"},
                        {"node": "sample", "dimension": "server_kpi_ts_raw"}],
             "filters": [
-                {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "subrack"},
-                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "ge", "kind": "text", "value": "2025-01-01 00:00:00"},
-                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "lt", "kind": "text", "value": "2025-01-31 00:00:00"},
+                {"node": "server", "dimension": "server_class", "op": "Eq", "kind": "text", "value": "subrack"},
+                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "Ge", "kind": "text", "value": "2025-01-01 00:00:00"},
+                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "Lt", "kind": "text", "value": "2025-01-31 00:00:00"},
             ],
             "exists": [{"anchor": "server", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
                 "edges": [{"relation": "server_current_alarm", "from": "alarm", "to": "server"}],
-                "filters": [{"node": "alarm", "dimension": "alarm_name", "op": "eq", "kind": "text", "value": "linkDown"}]}],
-            "order_by": [{"node": "sample", "dimension": "server_kpi_ts_raw", "direction": "asc"}],
+                "filters": [{"node": "alarm", "dimension": "alarm_name", "op": "Eq", "kind": "text", "value": "linkDown"}]}],
+            "order_by": [{"node": "sample", "dimension": "server_kpi_ts_raw", "direction": "Asc"}],
         }
         result = subprocess.run(
             [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "3000", "--initialization-fuel", "3000", "icloud_model"],

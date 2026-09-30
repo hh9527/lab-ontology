@@ -48,42 +48,42 @@ class PeerDirectionTest(unittest.TestCase):
     def test_peer_join_and_exists_exclude_one_way_rows(self):
         root = {"id": "owner", "entity": "device"}
         edge = {"relation": "physical_link_peer_device", "from": "owner", "to": "peer"}
-        owner_filter = {"node": "owner", "dimension": "device_id", "op": "eq", "kind": "text", "value": "a"}
+        owner_filter = {"node": "owner", "dimension": "device_id", "op": "Eq", "kind": "text", "value": "a"}
         peers = self.lower({
-            "op": "graph", "root": "owner", "row_grain": "association",
+            "op": "Graph", "root": "owner", "row_grain": "Association",
             "nodes": [root, {"id": "peer", "entity": "device"}], "edges": [edge],
             "select": [{"node": "peer", "dimension": "device_id"}], "filters": [owner_filter],
         })
         self.assertEqual(sorted(peers), [("b",), ("c",)])
         qualified = self.lower({
-            "op": "graph", "root": "owner", "nodes": [root], "edges": [],
+            "op": "Graph", "root": "owner", "nodes": [root], "edges": [],
             "select": [{"node": "owner", "dimension": "device_id"}],
             "filters": [owner_filter],
             "exists": [{"anchor": "owner", "nodes": [{"id": "peer", "entity": "device"}],
                 "edges": [edge], "filters": [{"node": "peer", "dimension": "device_id",
-                    "op": "eq", "kind": "text", "value": "c"}]}],
+                    "op": "Eq", "kind": "text", "value": "c"}]}],
         })
         self.assertEqual(qualified, [("a",)])
 
     def test_one_way_link_still_has_its_named_a_endpoint(self):
         rows = self.lower({
-            "op": "graph", "root": "link",
+            "op": "Graph", "root": "link",
             "nodes": [{"id": "link", "entity": "physical_link"}, {"id": "device", "entity": "device"}],
             "edges": [{"relation": "physical_link_a_device", "from": "link", "to": "device"}],
             "select": [{"node": "link", "dimension": "physical_link_id"}],
             "filters": [{"node": "link", "dimension": "physical_link_direction",
-                "op": "eq", "kind": "text", "value": "unidirectional"},
-                {"node": "device", "dimension": "device_id", "op": "eq", "kind": "text", "value": "a"}],
+                "op": "Eq", "kind": "text", "value": "unidirectional"},
+                {"node": "device", "dimension": "device_id", "op": "Eq", "kind": "text", "value": "a"}],
         })
         self.assertEqual(rows, [("ac-oneway",)])
 
     def test_peer_as_second_existence_edge_keeps_hub_guard(self):
         def qualified(owner_id):
             return self.lower({
-                "op": "graph", "root": "owner",
+                "op": "Graph", "root": "owner",
                 "nodes": [{"id": "owner", "entity": "device"}], "edges": [],
                 "select": [{"node": "owner", "dimension": "device_id"}],
-                "filters": [{"node": "owner", "dimension": "device_id", "op": "eq",
+                "filters": [{"node": "owner", "dimension": "device_id", "op": "Eq",
                     "kind": "text", "value": owner_id}],
                 "exists": [{"anchor": "owner", "nodes": [
                     {"id": "tenant", "entity": "tenant"}, {"id": "peer", "entity": "device"}],
@@ -91,7 +91,7 @@ class PeerDirectionTest(unittest.TestCase):
                         {"relation": "device_belongs_to_tenant", "from": "owner", "to": "tenant"},
                         {"relation": "physical_link_peer_device", "from": "owner", "to": "peer"},
                     ],
-                    "filters": [{"node": "peer", "dimension": "device_id", "op": "eq",
+                    "filters": [{"node": "peer", "dimension": "device_id", "op": "Eq",
                         "kind": "text", "value": "a"}],
                 }],
             })
@@ -102,11 +102,11 @@ class PeerDirectionTest(unittest.TestCase):
     def test_one_way_business_connection_only_traverses_a_to_z(self):
         def downstream(owner_id):
             return self.lower({
-                "op": "graph", "root": "owner", "row_grain": "association",
+                "op": "Graph", "root": "owner", "row_grain": "Association",
                 "nodes": [{"id": "owner", "entity": "device"}, {"id": "next", "entity": "device"}],
                 "edges": [{"relation": "physical_link_downstream_device", "from": "owner", "to": "next"}],
                 "select": [{"node": "next", "dimension": "device_id"}],
-                "filters": [{"node": "owner", "dimension": "device_id", "op": "eq",
+                "filters": [{"node": "owner", "dimension": "device_id", "op": "Eq",
                     "kind": "text", "value": owner_id}],
             })
 
@@ -126,7 +126,7 @@ class PeerDirectionTest(unittest.TestCase):
             return {
                 "result_node": result,
                 "graph": {
-                    "op": "graph", "root": "link",
+                    "op": "Graph", "root": "link",
                     "nodes": [
                         {"id": "link", "entity": "physical_link"},
                         {"id": "a", "entity": "device"},
@@ -143,16 +143,16 @@ class PeerDirectionTest(unittest.TestCase):
                     ],
                     "filters": [
                         {"node": "link", "dimension": "physical_link_direction",
-                         "op": "eq", "value": "unidirectional"},
-                        {"node": selected, "dimension": "device_id", "op": "eq", "value": "a"},
+                         "op": "Eq", "value": "unidirectional"},
+                        {"node": selected, "dimension": "device_id", "op": "Eq", "value": "a"},
                         {"node": selected, "dimension": "device_tenant_id",
-                         "op": "eq", "value": "red"},
+                         "op": "Eq", "value": "red"},
                     ],
                 },
             }
 
         rows = self.lower({
-            "op": "graph_union",
+            "op": "GraphUnion",
             "branches": [branch("z", "a"), branch("a", "z")],
         })
         self.assertEqual(sorted(rows), [("c", "red", "c"), ("d", "red", "d")])

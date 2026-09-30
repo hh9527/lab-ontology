@@ -22,10 +22,10 @@ class AlarmSuffixTest(unittest.TestCase):
             (5, None), (6, "Equipment Other"),
         ])
         intent = {
-            "op": "graph", "root": "alarm",
+            "op": "Graph", "root": "alarm",
             "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [], "count": "alarm",
-            "filters": [{"node": "alarm", "dimension": "alarm_name", "op": "ends_with",
+            "filters": [{"node": "alarm", "dimension": "alarm_name", "op": "EndsWith",
                          "kind": "text", "value": "Alarm"}],
         }
         result = subprocess.run(

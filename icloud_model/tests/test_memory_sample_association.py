@@ -33,7 +33,7 @@ class MemorySampleAssociationTest(unittest.TestCase):
             ("m3", "blue", "parent", "OTHER"),
         ])
         intent = {
-            "op": "graph", "root": "sample", "row_grain": "association",
+            "op": "Graph", "root": "sample", "row_grain": "Association",
             "nodes": [{"id": "sample", "entity": "server_kpi"},
                       {"id": "server", "entity": "server_device"},
                       {"id": "memory", "entity": "server_memory"}],
@@ -42,10 +42,10 @@ class MemorySampleAssociationTest(unittest.TestCase):
             "select": [{"node": "memory", "dimension": "server_memory_name"},
                        {"node": "sample", "dimension": "server_cpu_sample"},
                        {"node": "sample", "dimension": "server_kpi_ts_raw"}],
-            "filters": [{"node": "server", "dimension": "server_class", "op": "eq",
+            "filters": [{"node": "server", "dimension": "server_class", "op": "Eq",
                          "kind": "text", "value": "taishan"}],
-            "order_by": [{"node": "sample", "dimension": "server_kpi_ts_raw", "direction": "asc"},
-                         {"node": "memory", "dimension": "server_memory_name", "direction": "asc"}],
+            "order_by": [{"node": "sample", "dimension": "server_kpi_ts_raw", "direction": "Asc"},
+                         {"node": "memory", "dimension": "server_memory_name", "direction": "Asc"}],
         }
         result = subprocess.run(
             [str(TELORA), "run", "--with-memory-limit", "1024", "--request-fuel", "4000", "--initialization-fuel", "3000", "icloud_model"],

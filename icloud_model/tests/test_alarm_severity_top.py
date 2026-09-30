@@ -25,7 +25,7 @@ class AlarmSeverityTopTest(unittest.TestCase):
             (5, "device", "blue", "3"), (6, "device", "blue", "1"),
         ])
         intent = {
-            "op": "graph", "root": "device",
+            "op": "Graph", "root": "device",
             "nodes": [{"id": "device", "entity": "device"},
                       {"id": "alarm", "entity": "current_alarm"}],
             "edges": [{"relation": "device_current_alarm", "from": "alarm", "to": "device"}],

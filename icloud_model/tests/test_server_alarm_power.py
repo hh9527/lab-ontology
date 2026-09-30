@@ -38,7 +38,7 @@ class ServerAlarmPowerTest(unittest.TestCase):
             (9, "other", "red", "2"),
         ])
         intent = {
-            "op": "graph", "root": "sample",
+            "op": "Graph", "root": "sample",
             "nodes": [{"id": "sample", "entity": "server_kpi"},
                       {"id": "server", "entity": "server_device"}],
             "edges": [{"relation": "server_kpi_of_server", "from": "sample", "to": "server"}],
@@ -46,14 +46,14 @@ class ServerAlarmPowerTest(unittest.TestCase):
                        {"node": "sample", "dimension": "server_average_power_sample"},
                        {"node": "sample", "dimension": "server_kpi_ts_raw"}],
             "filters": [
-                {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "taishan"},
-                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "ge", "kind": "text", "value": "2025-01-01 00:00:00"},
-                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "lt", "kind": "text", "value": "2025-02-01 00:00:00"},
+                {"node": "server", "dimension": "server_class", "op": "Eq", "kind": "text", "value": "taishan"},
+                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "Ge", "kind": "text", "value": "2025-01-01 00:00:00"},
+                {"node": "sample", "dimension": "server_kpi_ts_raw", "op": "Lt", "kind": "text", "value": "2025-02-01 00:00:00"},
             ],
             "exists": [{"anchor": "server", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
                 "edges": [{"relation": "server_current_alarm", "from": "alarm", "to": "server"}],
-                "having": [{"node": "alarm", "measure": "major_alarm_count", "op": "gt", "kind": "int", "value": 2}]}],
-            "order_by": [{"node": "sample", "dimension": "server_kpi_ts_raw", "direction": "asc"}],
+                "having": [{"node": "alarm", "measure": "major_alarm_count", "op": "Gt", "kind": "int", "value": 2}]}],
+            "order_by": [{"node": "sample", "dimension": "server_kpi_ts_raw", "direction": "Asc"}],
             "take": 10,
         }
         result = subprocess.run(

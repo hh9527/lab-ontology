@@ -35,16 +35,16 @@ class TenantFanServerCountTest(unittest.TestCase):
             ("parent", "blue", "Other"),
         ])
         intent = {
-            "op": "graph", "root": "tenant",
+            "op": "Graph", "root": "tenant",
             "nodes": [{"id": "tenant", "entity": "tenant"}, {"id": "server", "entity": "server_device"}],
             "edges": [{"relation": "server_belongs_to_tenant", "from": "server", "to": "tenant"}],
             "select": [{"node": "tenant", "dimension": "tenant_name"}],
             "count": "server", "group_by_identity": ["tenant"],
-            "filters": [{"node": "tenant", "dimension": "tenant_name", "op": "eq", "kind": "text", "value": "target"},
-                        {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "rack"}],
+            "filters": [{"node": "tenant", "dimension": "tenant_name", "op": "Eq", "kind": "text", "value": "target"},
+                        {"node": "server", "dimension": "server_class", "op": "Eq", "kind": "text", "value": "rack"}],
             "exists": [{"anchor": "server", "nodes": [{"id": "fan", "entity": "server_fan"}],
                 "edges": [{"relation": "fan_parent_server", "from": "fan", "to": "server"}],
-                "filters": [{"node": "fan", "dimension": "server_fan_manufacturer", "op": "eq",
+                "filters": [{"node": "fan", "dimension": "server_fan_manufacturer", "op": "Eq",
                              "kind": "text", "value": "Huawei"}]}],
         }
         result = subprocess.run(

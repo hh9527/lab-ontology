@@ -35,7 +35,7 @@ class SitePortStatusTest(unittest.TestCase):
             ("p6", "red", "router", "eth", "active"),
         ])
         intent = {
-            "op": "graph", "root": "port",
+            "op": "Graph", "root": "port",
             "nodes": [{"id": "port", "entity": "port"}], "edges": [],
             "select": [{"node": "port", "dimension": "port_name"},
                        {"node": "port", "dimension": "port_oper_status"}],
@@ -44,9 +44,9 @@ class SitePortStatusTest(unittest.TestCase):
                 "nodes": [{"id": "device", "entity": "device"}, {"id": "site", "entity": "site"}],
                 "edges": [{"relation": "port_belongs_to_device", "from": "port", "to": "device"},
                           {"relation": "device_located_at_site", "from": "device", "to": "site"}],
-                "filters": [{"node": "device", "dimension": "device_class", "op": "eq",
+                "filters": [{"node": "device", "dimension": "device_class", "op": "Eq",
                              "kind": "text", "value": "AP"},
-                            {"node": "site", "dimension": "site_type", "op": "eq",
+                            {"node": "site", "dimension": "site_type", "op": "Eq",
                              "kind": "text", "value": "online"}],
             }],
         }

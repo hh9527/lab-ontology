@@ -29,7 +29,7 @@ class ExampleRoutesTest(unittest.TestCase):
         for domain, entity, node, table, first_topic in cases:
             with self.subTest(domain=domain):
                 response = self.call(f"{domain}/transform", {"intents": [{
-                    "op": "graph", "root": node,
+                    "op": "Graph", "root": node,
                     "nodes": [{"id": node, "entity": entity}],
                     "edges": [], "select": [], "count": node,
                 }]})

@@ -25,7 +25,7 @@ class LinkPortContainmentTest(unittest.TestCase):
                              ("not_contains", {"other", "empty"})]:
             with self.subTest(op=op):
                 intent = {
-                    "op": "graph", "root": "link",
+                    "op": "Graph", "root": "link",
                     "nodes": [{"id": "link", "entity": "physical_link"}],
                     "edges": [], "select": [{"node": "link", "dimension": "physical_link_id"}],
                     "filters": [{"node": "link", "dimension": "physical_link_z_port_name",

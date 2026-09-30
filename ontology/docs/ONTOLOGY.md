@@ -69,11 +69,11 @@ undeclared semantics.
 
 ## Lowering boundary
 
-The public service accepts one to five independent `graph`, `graph_pair`, or
-`graph_union` Intents under `{"intents":[...]}`. It processes each item in its
+The public service accepts one to five independent `Graph`, `GraphPair`, or
+`GraphUnion` Intents under `{"intents":[...]}`. It processes each item in its
 own diagnostic scope. The batch is accepted only when all items lower; on any
 item failure, `queries` is null and every item has an indexed status. Multiple
-Intents are separate plans, not a SQL union. `graph_union` is one Intent that
+Intents are separate plans, not a SQL union. `GraphUnion` is one Intent that
 produces one deduplicated result set under its own stricter shape rules.
 
 Internally, `query_intent_ast_factory(payload, subject)` returns a function

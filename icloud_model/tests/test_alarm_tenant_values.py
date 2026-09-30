@@ -24,22 +24,22 @@ class AlarmTenantValuesTest(unittest.TestCase):
         db.executemany("INSERT INTO T_CURRENT_ALARM VALUES (?, ?, ?)", rows)
 
         count_ids = {
-            "op": "graph", "root": "alarm",
+            "op": "Graph", "root": "alarm",
             "nodes": [{"id": "alarm", "entity": "current_alarm"}], "edges": [],
             "select": [{"node": "alarm", "dimension": "alarm_tenant_id"}],
-            "filters": [{"node": "alarm", "dimension": "alarm_cleared", "op": "eq",
+            "filters": [{"node": "alarm", "dimension": "alarm_cleared", "op": "Eq",
                          "kind": "text", "value": "uncleared"}],
-            "count": "alarm", "count_having": {"op": "gt", "value": 5},
+            "count": "alarm", "count_having": {"op": "Gt", "value": 5},
             "count_groups": True,
         }
         count_entities = {
-            "op": "graph", "root": "tenant",
+            "op": "Graph", "root": "tenant",
             "nodes": [{"id": "tenant", "entity": "tenant"},
                       {"id": "alarm", "entity": "current_alarm"}],
             "edges": [{"relation": "alarm_belongs_to_tenant", "from": "alarm", "to": "tenant"}],
             "select": [{"node": "tenant", "dimension": "tenant_name"}],
             "filters": count_ids["filters"], "count": "alarm",
-            "group_by_identity": ["tenant"], "count_having": {"op": "gt", "value": 5},
+            "group_by_identity": ["tenant"], "count_having": {"op": "Gt", "value": 5},
             "count_groups": True,
         }
         for intent, expected in [(count_ids, 2), (count_entities, 1)]:

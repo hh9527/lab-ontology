@@ -54,7 +54,7 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
 
     def test_counts_only_selected_alarms_without_losing_empty_devices(self):
         intent = {
-            "op": "graph",
+            "op": "Graph",
             "root": "device",
             "include_empty": True,
             "nodes": [
@@ -83,7 +83,7 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
 
     def test_filtered_and_computed_counts_keep_zero_groups(self):
         intent = {
-            "op": "graph",
+            "op": "Graph",
             "root": "device",
             "include_empty": True,
             "nodes": [
@@ -114,18 +114,18 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
             [(6, "other", "red", "1", "3"), (7, "other", "red", "2", "site-a")],
         )
         site_counts = self.lower({
-            "op": "graph", "root": "site", "include_empty": True,
+            "op": "Graph", "root": "site", "include_empty": True,
             "nodes": [{"id": "site", "entity": "site"}, {"id": "alarm", "entity": "current_alarm"}],
             "edges": [{"relation": "alarm_site_reference", "from": "alarm", "to": "site"}],
             "select": [{"node": "site", "dimension": "site_id"}],
             "count": "alarm", "group_by_identity": ["site"],
         })
         all_alarms = self.lower({
-            "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "op": "Graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [], "count": "alarm",
         })
         no_site_alarms = self.lower({
-            "op": "graph", "root": "site", "nodes": [{"id": "site", "entity": "site"}],
+            "op": "Graph", "root": "site", "nodes": [{"id": "site", "entity": "site"}],
             "edges": [], "select": [{"node": "site", "dimension": "site_id"}],
             "exists": [{"anchor": "site", "negated": True,
                 "nodes": [{"id": "alarm", "entity": "current_alarm"}],
@@ -141,11 +141,11 @@ class EmptyAlarmAlternativesTest(unittest.TestCase):
             [(6, "other", "red", "4", None), (7, "other", "red", "9", None)],
         )
         noncritical = self.lower({
-            "op": "graph", "root": "alarm",
+            "op": "Graph", "root": "alarm",
             "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [], "count": "alarm",
             "filters": [{"node": "alarm", "dimension": "alarm_severity",
-                "op": "ne", "kind": "text", "value": "critical"}],
+                "op": "Ne", "kind": "text", "value": "critical"}],
         })
         self.assertEqual(noncritical, [(4,)])
 

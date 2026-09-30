@@ -30,14 +30,14 @@ class PsuAlarmOwnershipTest(unittest.TestCase):
             ("second", "red", -2), ("second", "red", -2),
         ])
         intent = {
-            "op": "graph", "root": "alarm",
+            "op": "Graph", "root": "alarm",
             "nodes": [{"id": "alarm", "entity": "current_alarm"},
                       {"id": "server", "entity": "server_device"}],
             "edges": [{"relation": "server_current_alarm", "from": "alarm", "to": "server"}],
             "select": [{"node": "alarm", "dimension": "alarm_csn"}],
             "exists": [{"anchor": "server", "nodes": [{"id": "psu", "entity": "server_psu"}],
                 "edges": [{"relation": "psu_parent_server", "from": "psu", "to": "server"}],
-                "filters": [{"node": "psu", "dimension": "server_psu_health", "op": "eq",
+                "filters": [{"node": "psu", "dimension": "server_psu_health", "op": "Eq",
                              "kind": "text", "value": "unknown"}]}],
         }
         result = subprocess.run(

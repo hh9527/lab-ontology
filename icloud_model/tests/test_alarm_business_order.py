@@ -20,7 +20,7 @@ class AlarmBusinessOrderTest(unittest.TestCase):
             (1, "1"), (2, "2"), (3, "other"), (4, None),
         ])
         intent = {
-            "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+            "op": "Graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
             "edges": [], "select": [
                 {"node": "alarm", "dimension": "alarm_csn"},
                 {"node": "alarm", "dimension": "alarm_severity"},
@@ -57,12 +57,12 @@ class AlarmBusinessOrderTest(unittest.TestCase):
         ]:
             with self.subTest(direction=direction, take=take):
                 intent = {
-                    "op": "graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
+                    "op": "Graph", "root": "alarm", "nodes": [{"id": "alarm", "entity": "current_alarm"}],
                     "edges": [], "select": [
                         {"node": "alarm", "dimension": "alarm_csn"},
                         {"node": "alarm", "dimension": "alarm_severity"},
                     ],
-                    "filters": [{"node": "alarm", "dimension": "alarm_name", "op": "eq",
+                    "filters": [{"node": "alarm", "dimension": "alarm_name", "op": "Eq",
                                  "kind": "text", "value": "Communication Alarm"}],
                     "order_by": [{"node": "alarm", "dimension": "alarm_severity", "direction": direction}],
                 }

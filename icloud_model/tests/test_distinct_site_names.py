@@ -38,13 +38,13 @@ class SiteNameCountTest(unittest.TestCase):
             ("d", "AN-000001", "ne.category.server.subrack", "s4", "s4"),
         ])
         intent = {
-            "op": "graph", "root": "server",
+            "op": "Graph", "root": "server",
             "nodes": [{"id": "server", "entity": "server_device"}, {"id": "site", "entity": "site"}],
             "edges": [{"relation": "server_located_at_site", "from": "server", "to": "site"}],
             "select": [], "count_value": {"node": "site", "dimension": "site_name"},
             "filters": [
-                {"node": "server", "dimension": "server_asset_number", "op": "eq", "kind": "text", "value": "AN-000001"},
-                {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "kunlun"},
+                {"node": "server", "dimension": "server_asset_number", "op": "Eq", "kind": "text", "value": "AN-000001"},
+                {"node": "server", "dimension": "server_class", "op": "Eq", "kind": "text", "value": "kunlun"},
             ],
         }
         sql, bindings = self.lower(intent)
@@ -59,7 +59,7 @@ class SiteNameCountTest(unittest.TestCase):
             ("ne.category.switch",), ("unknown-from-source",), (None,),
         ])
         sql, bindings = self.lower({
-            "op": "graph", "root": "device",
+            "op": "Graph", "root": "device",
             "nodes": [{"id": "device", "entity": "device"}], "edges": [], "select": [],
             "count_value": {"node": "device", "dimension": "device_class"},
         })

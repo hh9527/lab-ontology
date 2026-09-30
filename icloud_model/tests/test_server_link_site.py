@@ -34,10 +34,10 @@ class ServerLinkSiteTest(unittest.TestCase):
             ("wrong-class", "other", "unrelated", "red", 99),
         ])
         intent = {
-            "op": "graph", "root": "link",
+            "op": "Graph", "root": "link",
             "nodes": [{"id": "link", "entity": "physical_link"}], "edges": [],
             "select": [], "count": "link",
-            "filters": [{"node": "link", "dimension": "physical_link_type", "op": "eq", "kind": "text", "value": "manual"}],
+            "filters": [{"node": "link", "dimension": "physical_link_type", "op": "Eq", "kind": "text", "value": "manual"}],
             "exists": [{
                 "anchor": "link",
                 "nodes": [{"id": "server", "entity": "server_device"}, {"id": "site", "entity": "site"}],
@@ -46,9 +46,9 @@ class ServerLinkSiteTest(unittest.TestCase):
                     {"relation": "server_located_at_site", "from": "server", "to": "site"},
                 ],
                 "filters": [
-                    {"node": "server", "dimension": "server_class", "op": "eq", "kind": "text", "value": "rack"},
-                    {"node": "server", "dimension": "server_ip_address", "op": "eq", "kind": "text", "value": "103.0.1.2"},
-                    {"node": "site", "dimension": "site_name", "op": "eq", "kind": "text", "value": "Q0350-site"},
+                    {"node": "server", "dimension": "server_class", "op": "Eq", "kind": "text", "value": "rack"},
+                    {"node": "server", "dimension": "server_ip_address", "op": "Eq", "kind": "text", "value": "103.0.1.2"},
+                    {"node": "site", "dimension": "site_name", "op": "Eq", "kind": "text", "value": "Q0350-site"},
                 ],
             }],
         }
