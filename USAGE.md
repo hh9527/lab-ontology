@@ -77,7 +77,7 @@ directly to the matching path. The three methods for a domain are:
 ```json
 {"method":"<domain>/index","input":{"offset":0,"limit":50}}
 {"method":"<domain>/info","input":{"topic":"<exact topic>"}}
-{"method":"<domain>/info","input":{"target":{"kind":"dataset","owner":"","id":"<stable ID>"}}}
+{"method":"<domain>/info","input":{"target":{"kind":"Dataset","owner":"","id":"<stable ID>"}}}
 ```
 
 `index` returns a paginated catalog of visible knowledge points. Follow
@@ -90,10 +90,9 @@ named relations. A `Related` link explains knowledge but does not authorize a
 query traversal. Labels, translations, aliases, and physical column names are
 not substitutes for stable Intent IDs.
 
-Response targets encode their kinds as enum names (for example, `Dataset`);
-`info` target input expects the corresponding lowercase spelling (for
-example, `dataset`). Convert `BusinessLink` to `business_link` and
-`TimeRole` to `time_role`; preserve the returned owner and ID exactly.
+Targets returned by `index` or `info` can be passed back to `info` unchanged,
+including the PascalCase `kind` (for example, `Dataset`). The complete target
+shape and kind choices are available at `syntax/knowledge/target`.
 
 Use `index` and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to

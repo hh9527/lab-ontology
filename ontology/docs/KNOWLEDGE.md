@@ -23,7 +23,7 @@ Requests have exactly `method` and `input`:
 ```json
 {"method":"foo/index","input":{"offset":0,"limit":50}}
 {"method":"foo/info","input":{"topic":"Order status"}}
-{"method":"foo/info","input":{"target":{"kind":"dimension","owner":"order","id":"order_status"}}}
+{"method":"foo/info","input":{"target":{"kind":"Dimension","owner":"order","id":"order_status"}}}
 ```
 
 `foo` is the domain bound by the host, not a hard-coded Model name. The
@@ -38,9 +38,10 @@ aliases, and localized labels: no trimming, case folding, language guessing,
 or fuzzy search. A document lookup returns `NotFound`, `Found(point)`, or
 `Candidates(entries)` when the topic is ambiguous. Each candidate carries
 its kind, owning dataset, stable ID, display label, and optional locale.
-Follow a candidate or any point reference via `input.target`. Target kinds
-are `dataset`, `field`, `dimension`, `measure`, `value`, `relation`,
-`business_link`, `time_role`, and `metric`. The `owner` is empty for datasets;
+Follow a candidate or any point reference via `input.target` unchanged.
+Target kinds use the declared enum spelling: `Schema`, `Dataset`, `Field`,
+`Dimension`, `Measure`, `Value`, `Relation`, `BusinessLink`, `TimeRole`, and
+`Metric`. The `owner` is empty for datasets;
 for canonical values it is their dimension ID, otherwise their dataset ID.
 Unknown and invisible targets both return `NotFound`.
 
