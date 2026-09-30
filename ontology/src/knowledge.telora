@@ -9,6 +9,7 @@ use std::value::{ Value };
 
 type LinkKind = enum { Member, Traversable, Related };
 type KnowledgeLink = struct { target: edsl::KnowledgeTarget, kind: LinkKind };
+type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: Array(String), summary: String };
 type Point = struct {
     target: edsl::KnowledgeTarget,
     label: String,
@@ -25,13 +26,12 @@ type Point = struct {
     metric: Option(edsl::MetricValueEntry),
     direction: Option(edsl::LinkDirection),
     guard: Option(edsl::ScopePredicate),
+    entries: Option(Array(IndexEntry)),
 };
-type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: Array(String), summary: String };
 type KnowledgeIndex = struct { entries: Array(IndexEntry) };
 type DocResult = enum { NotFound, Found(Point) };
-type KnowledgeResponse = enum { Index(KnowledgeIndex), Document(DocResult) };
+type KnowledgeResponse = enum { Document(DocResult) };
 type KnowledgeRequest = struct { method: String, input: Value };
-type IndexInput = struct {};
 type InfoInput = struct { key: edsl::KnowledgeTarget };
 
 def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
@@ -44,7 +44,8 @@ def traversable: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target
 def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(KnowledgeLink)) -> Point =
     fn(id, label, aliases, summary, refs) {
         {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [], time_role: None,
-            dimension: None, measure: None, relation: None, metric: None, direction: None, guard: None}
+            dimension: None, measure: None, relation: None, metric: None, direction: None, guard: None,
+            entries: None}
     };
 
 def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
@@ -52,17 +53,16 @@ def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
 };
 
 def syntax_points: Array(Point) = [
+    point(target(edsl::KnowledgeKind::Schema, "", "index"), "Knowledge index", [],
+        "The complete flat catalog of visible knowledge points. Read this topic through info with key {kind:Schema,owner:\"\",id:index}; each entry has a key, label, aliases and summary. Pass an entry's key unchanged to info.", []),
     point(syntax_target("knowledge/target"), "Knowledge target", [],
-        "index returns one entry per visible knowledge point with key, label, aliases and summary. info accepts {key:{kind,owner,id}}; pass an index entry's key or a document reference's target unchanged. kind is the declared KnowledgeKind enum: Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric. owner and id are exact stable identifiers. Names and aliases describe knowledge but are not keys.", []),
+        "The index topic contains one entry per visible knowledge point with key, label, aliases and summary. info accepts {key:{kind,owner,id}}; pass an index entry's key or a document reference's target unchanged. kind is the declared KnowledgeKind enum: Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric. owner and id are exact stable identifiers. Names and aliases describe knowledge but are not keys.", []),
     point(syntax_target("knowledge/request"), "Knowledge request", [],
-        "The unbound knowledge service accepts exactly {method,input}. method is <domain>/index or <domain>/info; input follows that method's declared shape. A mounted service slot receives only input, without this envelope.",
-        [member(syntax_target("knowledge/index")), member(syntax_target("knowledge/info"))]),
-    point(syntax_target("knowledge/index"), "Knowledge index request", [],
-        "index input is exactly {}. The response contains one flat entry per visible knowledge point with key, label, aliases and summary; it has no pagination or cursor.",
-        [member(syntax_target("knowledge/target"))]),
+        "The unbound knowledge service accepts exactly {method,input}. method is <domain>/info; input follows the declared info shape. A mounted service slot receives only input, without this envelope.",
+        [member(syntax_target("knowledge/info"))]),
     point(syntax_target("knowledge/info"), "Knowledge info request", [],
-        "info input is exactly {key:{kind,owner,id}}. Use a key from index or a document reference's target unchanged. Unknown or invisible keys return NotFound.",
-        [member(syntax_target("knowledge/target"))]),
+        "info input is exactly {key:{kind,owner,id}}. Start with {kind:Schema,owner:\"\",id:index} for the complete catalog. Use a key from its entries or a document reference's target unchanged. Unknown or invisible keys return NotFound.",
+        [member(syntax_target("knowledge/target")), member(target(edsl::KnowledgeKind::Schema, "", "index"))]),
     point(syntax_target("intent"), "Intent syntax", [],
         "Submit {intents:[...]} with one to five independent intents. Each intent has op Graph, GraphPair or GraphUnion. Values in filters are interpreted by their declared dimension or measure; do not supply an input kind.",
         [member(syntax_target("graph")), member(syntax_target("graph_pair")), member(syntax_target("graph_union")),
@@ -279,8 +279,7 @@ def target_key: Fn(edsl::KnowledgeTarget) -> String = fn(id) {
     json::stringify(codec::encode(id))
 };
 
-# Every node is addressable by stable id or declared label, but details and
-# references are returned one point at a time. No topic string is a query id.
+# Validate that every visible point is reachable and its references are closed.
 def map: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(payload, subject) {
     let datasets = edsl::knowledge_index_for_subject(payload, subject);
     let raw = array::concat([syntax_points,
@@ -304,6 +303,7 @@ def map: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(payload, subject
     }) { fail!("knowledge point references a point outside the visible model", dangling.target) }
     else if let Some(orphan) = array::find(raw, fn(item) {
         item.target.kind != edsl::KnowledgeKind::Dataset && item.target != syntax_target("intent")
+            && item.target != target(edsl::KnowledgeKind::Schema, "", "index")
             && dict::get(incoming, target_key(item.target)) == None
     }) { fail!("knowledge point is not reachable from its declaring model", orphan.target) }
     else {
@@ -401,7 +401,12 @@ def index_from_model: Fn(edsl::PreparedPayload, String) -> KnowledgeIndex = fn(p
 def point_from_model: Fn(edsl::PreparedPayload, String, KnowledgeIndex, edsl::KnowledgeTarget) -> DocResult =
     fn(payload, subject, index, key) {
         if !array::any(index.entries, fn(entry) { entry.key == key }) { DocResult::NotFound }
-        else if key.kind == edsl::KnowledgeKind::Schema {
+        else if key == target(edsl::KnowledgeKind::Schema, "", "index") {
+            match array::find(syntax_points, fn(item) { item.target == key }) {
+                Some(item) => DocResult::Found({...item, entries: Some(index.entries)}),
+                None => fail!("knowledge index point disappeared", key),
+            }
+        } else if key.kind == edsl::KnowledgeKind::Schema {
             match array::find(syntax_points, fn(item) { item.target == key }) {
                 Some(item) => DocResult::Found(item),
                 None => fail!("knowledge schema key has no point", key),
@@ -443,9 +448,7 @@ def point_from_model: Fn(edsl::PreparedPayload, String, KnowledgeIndex, edsl::Kn
     };
 
 def by_target: Fn(edsl::PreparedPayload, String, edsl::KnowledgeTarget) -> DocResult = fn(payload, subject, id) {
-    match array::find(map(payload, subject), fn(item) { item.target == id }) {
-        Some(item) => DocResult::Found(item), None => DocResult::NotFound,
-    }
+    point_from_model(payload, subject, index_from_model(payload, subject), id)
 };
 
 def decode_request: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, contract) {
@@ -461,10 +464,7 @@ def serve_catalog: Fn(edsl::PreparedPayload, String, KnowledgeIndex, String, Val
     fn(payload, subject, index, domain, request) {
     if domain == "" { fail!("knowledge domain must not be empty") } else { () };
     let envelope = decode_request@[KnowledgeRequest](request, "syntax/knowledge/request");
-    if envelope.method == `\{domain}/index` {
-        let decoded = decode_request@[IndexInput](envelope.input, "syntax/knowledge/index");
-        KnowledgeResponse::Index(index)
-    } else if envelope.method == `\{domain}/info` {
+    if envelope.method == `\{domain}/info` {
         let input = decode_request@[InfoInput](envelope.input, "syntax/knowledge/info");
         KnowledgeResponse::Document(point_from_model(payload, subject, index, input.key))
     } else { fail!(`unknown knowledge method for domain; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/knowledge/request")}`, envelope.method, domain) }
@@ -487,22 +487,14 @@ def knowledge_service_factory: Fn(edsl::PreparedPayload, String, String) -> Fn(V
 # The collection selects the slot; this handler receives only its input.
 def knowledge_info_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> Value =
     fn(payload, subject) {
+        let index = index_from_model(payload, subject);
         fn(input) {
             let request = decode_request@[InfoInput](input, "syntax/knowledge/info");
             codec::encode(KnowledgeResponse::Document(point_from_model(payload, subject,
-                index_from_model(payload, subject), request.key)))
-        }
-    };
-
-def knowledge_index_method_factory: Fn(edsl::PreparedPayload, String) -> Fn(Value) -> Value =
-    fn(payload, subject) {
-        let index = index_from_model(payload, subject);
-        fn(input) {
-            let decoded = decode_request@[IndexInput](input, "syntax/knowledge/index");
-            codec::encode(KnowledgeResponse::Index(index))
+                index, request.key)))
         }
     };
 
 pub use self::{ LinkKind, KnowledgeLink, Point, IndexEntry, KnowledgeIndex, DocResult, KnowledgeResponse,
     map, index_entries, index_from_model, by_target, serve, serve_value,
-    knowledge_service_factory, knowledge_info_method_factory, knowledge_index_method_factory };
+    knowledge_service_factory, knowledge_info_method_factory };

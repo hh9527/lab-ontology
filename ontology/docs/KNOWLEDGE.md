@@ -6,13 +6,11 @@ prepared Model, authorized subject, and domain name and returns a pure
 equivalent unbound entry. No database connection or SQL backend is required.
 The response can be serialized with `std::json::stringify`.
 
-An entry `MainService` can mount separate `TransformService` slots for
-`<domain>/info` and `<domain>/index`. Telora's collection routes by method and
-passes only `input` to the selected slot. Use
-`knowledge::knowledge_info_method_factory(payload, subject)` and
-`knowledge::knowledge_index_method_factory(payload, subject)` in the respective
-slots' `init`; neither expects an envelope inside `transform`. The deployed
-example domains mount `<domain>/index`, `<domain>/info`, and `<domain>/transform`. The ic model
+An entry `MainService` mounts a `TransformService` slot for `<domain>/info`.
+Telora's collection routes by method and passes only `input` to the selected
+slot. Use `knowledge::knowledge_info_method_factory(payload, subject)` in its
+`init`; it does not expect an envelope inside `transform`. The deployed
+example domains mount `<domain>/info` and `<domain>/transform`. The ic model
 uses its own entry, while dog, spider, and world share `example_models`.
 No second copy of any Model is needed.
 The model-independent build, service, and agent workflow is in
@@ -21,14 +19,14 @@ The model-independent build, service, and agent workflow is in
 Requests have exactly `method` and `input`:
 
 ```json
-{"method":"foo/index","input":{}}
+{"method":"foo/info","input":{"key":{"kind":"Schema","owner":"","id":"index"}}}
 {"method":"foo/info","input":{"key":{"kind":"Dimension","owner":"order","id":"order_status"}}}
 ```
 
 `foo` is the domain bound by the host, not a hard-coded Model name. The
-index is ordered by Model declarations and returns every visible knowledge
-point exactly once as `{key,label,aliases,summary}`. It is one complete flat list,
-without pagination or a cursor.
+index topic is ordered by Model declarations and contains every visible knowledge
+point exactly once as `{key,label,aliases,summary}` in its `entries` field. It is
+one complete flat list, without pagination or a cursor.
 
 `info` looks up a unique key and returns `Found(point)` or `NotFound`. Pass a
 key from the index or a point reference's `target` to `input.key` unchanged.
@@ -39,8 +37,9 @@ Target kinds use the declared enum spelling: `Schema`, `Dataset`, `Field`,
 for canonical values it is their dimension ID, otherwise their dataset ID.
 Unknown and invisible targets both return `NotFound`.
 
-Responses use Telora's `codec::encode` representation: `{"Index":{"entries":[...]}}`
-or `{"Document":{"Found":{...}}}` and `{"Document":"NotFound"}`.
+Responses use Telora's `codec::encode` representation:
+`{"Document":{"Found":{...}}}` or `{"Document":"NotFound"}`. The Found
+index point carries the complete `entries` list.
 A point carries typed details and references
 marked `Member`, `Traversable`, or `Related`. `Related` is documentation-only;
 it cannot establish a query edge. A relation's named endpoints, kind, and
@@ -60,7 +59,6 @@ Requests with unsupported fields, a missing or malformed key, wrong types, or
 another domain's method fail with a structured diagnostic. Authorization is
 checked when generating the index and resolving keys; the host must not share
 an authorized response with another subject.
-The request envelope and both method inputs are decoded from declared records;
+The request envelope and info input are decoded from declared records;
 shape diagnostics include the offending JSON path and an `info` key for the
-corresponding contract (`syntax/knowledge/request`, `syntax/knowledge/index`,
-or `syntax/knowledge/info`).
+corresponding contract (`syntax/knowledge/request` or `syntax/knowledge/info`).

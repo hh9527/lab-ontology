@@ -29,7 +29,7 @@ Set `ONTOLOGY_EVAL_RUNNER`, `ONTOLOGY_EVAL_ARTIFACT`, and
 `ONTOLOGY_EVAL_OUTPUT_DIR` to absolute host paths before starting the adapter.
 Create the output directory outside the Agent sandbox, with access limited to
 the trusted host and evaluator. It owns the child process and forwards only
-`ic/index`, `ic/info`, and `ic/transform` JSONL requests. Do not mount the
+`ic/info` and `ic/transform` JSONL requests. Do not mount the
 runner or artifact into the Agent sandbox. No separate Telora TCP or Unix
 listener is needed, so the Agent cannot bypass the restricted tools by calling
 one directly. Merely copying fewer files into an

@@ -15,17 +15,8 @@ if (!outputDir?.startsWith('/') || !statSync(outputDir).isDirectory()) {
 }
 const tools = [
   {
-    name: 'index',
-    description: 'List every visible ontology knowledge key with its names and summary.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false,
-    },
-  },
-  {
     name: 'info',
-    description: 'Get one ontology knowledge point by its exact index key.',
+    description: 'Get a knowledge point by exact key. Start with {kind:"Schema",owner:"",id:"index"} for the complete catalog.',
     inputSchema: {
       type: 'object',
       properties: {

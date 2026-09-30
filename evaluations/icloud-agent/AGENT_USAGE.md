@@ -1,21 +1,21 @@
 # Ontology query service
 
-Use only the host-provided `ontology_index`, `ontology_info`, and `ontology_transform` tools for the `ic` domain. The host runs the service; do not run or inspect an artifact. The host supplies this guide and the question as attachments.
+Use only the host-provided `ontology_info` and `ontology_transform` tools for the `ic` domain. The host runs the service; do not run or inspect an artifact. The host supplies this guide and the question as attachments.
 
 ## Tool protocol and Intent syntax
 
 Pass the following objects directly as tool arguments:
 
 ```json
-{}
+{"key":{"kind":"Schema","owner":"","id":"index"}}
 {"key":{"kind":"Dataset","owner":"","id":"<stable ID>"}}
 ```
 
-The first object is for `ontology_index`; the second is for `ontology_info`.
+Both objects are for `ontology_info`; the first retrieves the index topic.
 `ontology_transform` takes an `intents` array of one to five
 independent Intents.
 
-`index` returns the complete flat catalog of visible knowledge points, one
+The index topic returns the complete flat catalog of visible knowledge points, one
 entry per key, with a label, aliases and short summary. Pass an entry's `key` unchanged
 to `info` for the full point. Follow its references' `target` values as keys to
 check entity grain, dimensions, measures, business values, time roles, and
@@ -24,13 +24,13 @@ query traversal. Labels, translations, aliases, and physical column names are
 not substitutes for stable Intent IDs.
 
 Keys use the declared `KnowledgeTarget` shape, including the PascalCase `kind`
-(for example, `Dataset`). The key contract itself is listed in `index` under
+(for example, `Dataset`). The key contract itself is listed in the index topic under
 `{kind:"Schema",owner:"",id:"syntax/knowledge/target"}`.
-The request shapes are indexed under `syntax/knowledge/request`,
-`syntax/knowledge/index`, and `syntax/knowledge/info`. A shape diagnostic
+The request shapes are indexed under `syntax/knowledge/request` and
+`syntax/knowledge/info`. A shape diagnostic
 includes the offending JSON path and a key that can be passed to `info`.
 
-Use `index` and `info` to discover the Model, then express the user's business
+Use the index topic and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
@@ -140,7 +140,7 @@ the target dimension or measure determines the logical type of its JSON value.
 Typed predicate inputs and canonical wires shown by `info` are Model facts,
 not JSON Intent value syntax.
 Discover the Intent contract under the `syntax/intent` key and its linked points
-in `<domain>/index` and `<domain>/info`. A diagnostic naming an info key can be
+through `<domain>/info`. A diagnostic naming an info key can be
 resolved through `<domain>/info` to repair the Intent. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 

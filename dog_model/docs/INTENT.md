@@ -1,6 +1,6 @@
 # Dog model query interface
 
-The dog model is served as `dog/index`, `dog/info`, and `dog/transform` by
+The dog model is served as `dog/info` and `dog/transform` by
 [`example_models`](../../example_models/README.md). Its domain vocabulary is
 declared in [DOMAIN.md](DOMAIN.md); the current service envelope and shared
 `graph` / `graph_pair` / `graph_union` Intent contract are in
@@ -8,7 +8,7 @@ declared in [DOMAIN.md](DOMAIN.md); the current service envelope and shared
 Intent syntax.
 
 Discover stable dataset, dimension, measure, value, and relation IDs through
-`dog/index` and `dog/info` before constructing a graph. A node's `entity` is
+the index topic at `dog/info` and then other exact keys before constructing a graph. A node's `entity` is
 the dataset ID, and an edge's `relation` is a named Model relation ID; neither
 is a physical SQL name. For example, the Model declares `Dog` as a dataset,
 while a particular graph node may name that dataset instance `dog`. Related

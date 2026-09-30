@@ -1,13 +1,13 @@
 # Spider model query interface
 
-The spider model is served as `spider/index`, `spider/info`, and
-`spider/transform` by [`example_models`](../../example_models/README.md).
+The spider model is served as `spider/info` and `spider/transform` by
+[`example_models`](../../example_models/README.md).
 Its domain vocabulary is described in [DOMAIN.md](DOMAIN.md). The current
 service envelope and shared `graph` / `graph_pair` / `graph_union` Intent
 contract are in [USAGE.md](../../USAGE.md); there is no spider-specific
 parser or legacy `list/count/aggregate` request path.
 
-Use `spider/index` and `spider/info` to find the Model's exact stable IDs,
+Use the index topic at `spider/info`, then exact keys to find the Model's stable IDs,
 declared grain, named relations, dimensions, measures, and permitted filters.
 A graph names dataset instances in `nodes` and explicitly names authorized
 relations in `edges`. It may qualify a root through `exists` without

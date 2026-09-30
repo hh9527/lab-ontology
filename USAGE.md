@@ -47,16 +47,16 @@ the source tree, workspace configuration, or compiler; only the artifact and
 a compatible runner are needed at deployment.
 
 The models in this repository explicitly declare POST routes
-`/<domain>/index`, `/<domain>/info`, and `/<domain>/transform`. The HTTP body is
+`/<domain>/info` and `/<domain>/transform`. The HTTP body is
 the slot input, without the JSONL `method`/`input` envelope. For example:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8080/ic/index \
-  -H 'Content-Type: application/json' -d '{}'
+curl -sS -X POST http://127.0.0.1:8080/ic/info \
+  -H 'Content-Type: application/json' -d '{"key":{"kind":"Schema","owner":"","id":"index"}}'
 ```
 
 `telora-run` has no authentication. Bind only to a host-private loopback or
-Unix socket, and expose these three operations to an Agent through a trusted
+Unix socket, and expose these two operations to an Agent through a trusted
 tool adapter or authenticated gateway. The Agent environment must not mount
 the snapshot, runner, source tree, tests, or evaluator material, and must not
 have a shell or file tool that can read the host's deployment directory. Keep
@@ -72,14 +72,14 @@ Telora documentation.
 
 For JSONL, every request has exactly `method` and `input`. The method selects a
 slot; only `input` is passed to that slot. For HTTP, POST the same `input`
-directly to the matching path. The three methods for a domain are:
+directly to the matching path. The knowledge and query methods are:
 
 ```json
-{"method":"<domain>/index","input":{}}
+{"method":"<domain>/info","input":{"key":{"kind":"Schema","owner":"","id":"index"}}}
 {"method":"<domain>/info","input":{"key":{"kind":"Dataset","owner":"","id":"<stable ID>"}}}
 ```
 
-`index` returns the complete flat catalog of visible knowledge points, one
+The `index` topic returns the complete flat catalog of visible knowledge points, one
 entry per key, with a label, aliases and short summary. Pass an entry's `key` unchanged
 to `info` for the full point. Follow its references' `target` values as keys to
 check entity grain, dimensions, measures, business values, time roles, and
@@ -88,13 +88,13 @@ query traversal. Labels, translations, aliases, and physical column names are
 not substitutes for stable Intent IDs.
 
 Keys use the declared `KnowledgeTarget` shape, including the PascalCase `kind`
-(for example, `Dataset`). The key contract itself is listed in `index` under
+(for example, `Dataset`). The key contract itself is listed in the index topic under
 `{kind:"Schema",owner:"",id:"syntax/knowledge/target"}`.
-The request shapes are indexed under `syntax/knowledge/request`,
-`syntax/knowledge/index`, and `syntax/knowledge/info`. A shape diagnostic
+The request shapes are indexed under `syntax/knowledge/request` and
+`syntax/knowledge/info`. A shape diagnostic
 includes the offending JSON path and a key that can be passed to `info`.
 
-Use `index` and `info` to discover the Model, then express the user's business
+Use the index topic and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to
 repair the Intent without changing the requested business meaning. Lowering
 success establishes that an Intent is legal under the Model, not that it answers
@@ -222,7 +222,7 @@ the target dimension or measure determines the logical type of its JSON value.
 Typed predicate inputs and canonical wires shown by `info` are Model facts,
 not JSON Intent value syntax.
 Discover the Intent contract under the `syntax/intent` key and its linked points
-in `<domain>/index` and `<domain>/info`. A diagnostic naming an info key can be
+through `<domain>/info`. A diagnostic naming an info key can be
 resolved through `<domain>/info` to repair the Intent. Business-value filters
 use the stable value ID, not its physical wire or localized label.
 
@@ -295,8 +295,8 @@ The outer object accepts only `op`, `left`, `right`, and optional boolean
 display values are the same entity: the join uses the aligned identity keys.
 
 In JSONL service mode, responses use the `telora.service/v1` envelope. On
-success, `ok.Index` contains the complete `entries` list, `ok.Document` holds
-`Found` or `NotFound`, and `ok` from `transform` contains the
+success, `ok.Document` holds `Found` or `NotFound`; the Found index point contains
+the complete `entries` list. `ok` from `transform` contains the
 batch response described above. A rejected Intent is reported as
 `ok.accepted:false` with indexed diagnostics and `queries:null`; malformed
 requests and uncaptured service failures have `error:true` and top-level
@@ -319,9 +319,9 @@ produced and do not invent results.
 
 For example, one `example_models` snapshot serves the `dog`, `spider`, and
 `world` domains; `icloud_model` serves `ic` independently. Every domain
-exposes `<domain>/index`, `<domain>/info`, and `<domain>/transform`.
+exposes `<domain>/info` and `<domain>/transform`.
 Neither module requires external build sources. Both collections explicitly
-declare the HTTP POST routes listed above. Snapshot builds and `index` requests were checked
+declare the HTTP POST routes listed above. Snapshot builds and index-topic requests were checked
 with the commands above. The `ic` fixture is not a complete production domain
 model. A missing knowledge point or valid lowering path must not be filled in
 by guessing.

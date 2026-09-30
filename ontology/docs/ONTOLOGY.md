@@ -14,7 +14,7 @@ named relationships in a Telora module, then prepares them once with
 `edsl::build_root(revision, entity_types, profile, authorize)`. The resulting
 `PreparedPayload` is shared by query lowering and knowledge discovery. For a
 small complete declaration, see [`relation_model`](../../relation_model/src/model.telora);
-for a service mounting the same payload under three methods, see
+for a service mounting the same payload under knowledge and query methods, see
 [`example_models`](../../example_models/src/lib.telora).
 
 ```telora
@@ -29,8 +29,6 @@ def lower: Fn(Value) -> Value =
     intent::query_request_method_factory(payload, "public", sqlite::build_query);
 def info: Fn(Value) -> Value =
     knowledge::knowledge_info_method_factory(payload, "public");
-def index: Fn(Value) -> Value =
-    knowledge::knowledge_index_method_factory(payload, "public");
 ```
 
 The selected SQL backend is supplied when constructing the lowering function.
