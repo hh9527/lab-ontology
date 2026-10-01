@@ -1,0 +1,255 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::intent::{ query_intent_ast_factory };
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+def values: Array(edsl::CanonicalValueSpec) = [
+    {id: "LoadBalancer", label: "Load balancer", wires: [edsl::FilterInput::Text("lb"), edsl::FilterInput::Text("ne.category.lb")]},
+    {id: "Other", label: "Other device", wires: [edsl::FilterInput::Text("other")]},
+];
+
+@edsl::entity_id("devices")
+@edsl::entity_source("devices", "d")
+type Device = struct {
+    @edsl::column("id")
+    @edsl::key()
+    @edsl::measure("total", qb::AggregateFunction::Count, [])
+    @edsl::filtered_measure("unrecognized", qb::AggregateFunction::Count, [],
+        {field: "class", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Unknowns})
+    id: Int,
+    @edsl::column("class")
+    @edsl::dimension("class", True, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(values)
+    @edsl::half_open()
+    class: String,
+    @edsl::column("name")
+    @edsl::dimension("name", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    name: String,
+};
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate, qb::Operator::Filter,
+        qb::Operator::Group, qb::Operator::Order],
+    allowed_join_kinds: [], allowed_aggregates: [qb::AggregateFunction::Count],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::If,
+        qb::ScalarFunction::And, qb::ScalarFunction::Or, qb::ScalarFunction::Not,
+        qb::ScalarFunction::IsNotNull, qb::ScalarFunction::Add],
+    allow_distinct: True,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("half-open", [Device.type], profile);
+def ast: Fn(String) -> qb::QueryAst = fn(extra) {
+    query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"x","nodes":[{"id":"x","entity":"devices"}],"edges":[],\{extra}}`).unwrap!())
+};
+def plan: Fn(qb::QueryAst) -> qb::Plan = fn(query) {
+    match query.plan { qb::QueryPlan::Rows(p) => p, other => fail!("expected rows", other) }
+};
+
+# A small expression evaluator exercises the generated AST with SQL NULL logic;
+# no database execution or SQL parser is involved.
+def eval: Fn(qb::Expr, Array(qb::Val), qb::Val) -> qb::Val = fn(expr, bindings, raw) {
+    match expr {
+        qb::Expr::Column(_) => raw,
+        qb::Expr::AllocatedBind(b) => bindings[b.index - 1],
+        qb::Expr::Scalar(call) => do {
+            let args = array::map(call.args, fn(arg) { eval(arg, bindings, raw) });
+            match call.function {
+                qb::ScalarFunction::If => if args[0] == qb::Val::Bool(True) { args[1] } else { args[2] },
+                qb::ScalarFunction::Eq => if args[0] == qb::Val::None || args[1] == qb::Val::None { qb::Val::None } else { qb::Val::Bool(args[0] == args[1]) },
+                qb::ScalarFunction::Ne => if args[0] == qb::Val::None || args[1] == qb::Val::None { qb::Val::None } else { qb::Val::Bool(args[0] != args[1]) },
+                qb::ScalarFunction::IsNotNull => qb::Val::Bool(args[0] != qb::Val::None),
+                qb::ScalarFunction::Not => match args[0] { qb::Val::Bool(b) => qb::Val::Bool(!b), _ => qb::Val::None },
+                qb::ScalarFunction::And => if array::any(args, fn(a) { a == qb::Val::Bool(False) }) { qb::Val::Bool(False) }
+                    else if array::any(args, fn(a) { a == qb::Val::None }) { qb::Val::None } else { qb::Val::Bool(True) },
+                qb::ScalarFunction::Or => if array::any(args, fn(a) { a == qb::Val::Bool(True) }) { qb::Val::Bool(True) }
+                    else if array::any(args, fn(a) { a == qb::Val::None }) { qb::Val::None } else { qb::Val::Bool(False) },
+                _ => fail!("unexpected scalar in half-open expression", call),
+            }
+        },
+    }
+};
+
+def accepted: Fn(String, Array(qb::Val)) -> Bool = fn(filter, expected) {
+    let query = ast(`"select":[],"count":"x","filters":[{"node":"x","dimension":"class",\{filter}}]`);
+    let predicate = match plan(query).filter { Some(expr) => expr, None => fail!("filter missing") };
+    let raws = [qb::Val::String("lb"), qb::Val::String("ne.category.lb"), qb::Val::String("other"), qb::Val::String("LoadBalancer"), qb::Val::String("new"), qb::Val::String(""), qb::Val::None];
+    let actual = array::filter(raws, fn(raw) { eval(predicate, query.ctx.bindings, raw) == qb::Val::Bool(True) });
+    if actual == expected { True } else { fail!("wrong half-open filter semantics", filter, actual, expected) }
+};
+
+pub def known_eq_uses_all_wires: test::Test = test::should_ok(fn() {
+    accepted(r#""op":"Eq","value":"LoadBalancer""#, [qb::Val::String("lb"), qb::Val::String("ne.category.lb")])
+});
+pub def known_ne_includes_unknowns_excludes_null: test::Test = test::should_ok(fn() {
+    accepted(r#""op":"Ne","value":"LoadBalancer""#, [qb::Val::String("other"), qb::Val::String("LoadBalancer"), qb::Val::String("new"), qb::Val::String("")])
+});
+pub def exact_unknown_can_equal_known_id: test::Test = test::should_ok(fn() {
+    accepted(r#""op":"Eq","value":{"unknown":"LoadBalancer"}"#, [qb::Val::String("LoadBalancer")])
+});
+pub def exact_unknown_ne_includes_known_values: test::Test = test::should_ok(fn() {
+    accepted(r#""op":"Ne","value":{"unknown":"new"}"#, [qb::Val::String("lb"), qb::Val::String("ne.category.lb"), qb::Val::String("other"), qb::Val::String("LoadBalancer"), qb::Val::String("")])
+});
+pub def all_unknowns_is_complement_of_every_wire: test::Test = test::should_ok(fn() {
+    accepted(r#""op":"Eq","value":{"unknowns":true}"#, [qb::Val::String("LoadBalancer"), qb::Val::String("new"), qb::Val::String("")])
+});
+pub def unknowns_ne_is_known_domain: test::Test = test::should_ok(fn() {
+    accepted(r#""op":"Ne","value":{"unknowns":true}"#, [qb::Val::String("lb"), qb::Val::String("ne.category.lb"), qb::Val::String("other")])
+});
+pub def known_wire_is_not_an_unknown: test::Test = test::should_fail_with(fn() {
+    ast(r#""select":[],"count":"x","filters":[{"node":"x","dimension":"class","op":"Eq","value":{"unknown":"ne.category.lb"}}]"#)
+}, "Unknown requires an unrecognized wire");
+pub def unlisted_business_id_is_rejected: test::Test = test::should_fail_with(fn() {
+    ast(r#""select":[],"count":"x","filters":[{"node":"x","dimension":"class","op":"Eq","value":"new"}]"#)
+}, "unknown canonical value new");
+pub def unknown_input_rejects_extra_keys: test::Test = test::should_fail_with(fn() {
+    ast(r#""select":[],"filters":[{"node":"x","dimension":"class","op":"Eq","value":{"unknown":"new","unknowns":true}}]"#)
+}, "unknown input requires exactly one tag");
+
+pub def projection_and_grouping_preserve_tags_and_null: test::Test = test::should_ok(fn() {
+    let query = ast(r#""select":[{"node":"x","dimension":"class"}],"count":"x""#);
+    let p = plan(query);
+    let expressions = array::flat_map(p.projection, fn(item) { match item { qb::SelectItem::NamedExpr(n) => [n.expr], _ => [] } });
+    let pairs = array::map([qb::Val::String("lb"), qb::Val::String("ne.category.lb"), qb::Val::String("LoadBalancer"), qb::Val::String("new"), qb::Val::String("other"), qb::Val::None], fn(raw) {
+        array::map(expressions, fn(expr) { eval(expr, query.ctx.bindings, raw) })
+    });
+    let expected = [
+        [qb::Val::String("LoadBalancer"), qb::Val::String("Known")],
+        [qb::Val::String("LoadBalancer"), qb::Val::String("Known")],
+        [qb::Val::String("LoadBalancer"), qb::Val::String("Unknown")],
+        [qb::Val::String("new"), qb::Val::String("Unknown")],
+        [qb::Val::String("Other"), qb::Val::String("Known")],
+        [qb::Val::None, qb::Val::None],
+    ];
+    let sq = sqlite::build_query(query);
+    let pg = postgres::build_query(query);
+    if pairs == expected && p.grouping == expressions && p.filter == None
+        && string::contains(sq.sql, "x_class__kind") && string::contains(pg.sql, "x_class__kind") { True }
+    else { fail!("half-open result lost tag, original wire or NULL", pairs, p, sq, pg) }
+});
+
+pub def any_of_accepts_known_and_tagged_unknown: test::Test = test::should_ok(fn() {
+    let query = ast(r#""select":[],"count":"x","any_of":[{"node":"x","dimension":"class","values":["LoadBalancer",{"unknown":"new"}]}]"#);
+    let predicate = match plan(query).filter { Some(expr) => expr, None => fail!("filter missing") };
+    let raws = [qb::Val::String("lb"), qb::Val::String("ne.category.lb"), qb::Val::String("new"), qb::Val::String("other"), qb::Val::None];
+    let flags = array::map(raws, fn(raw) { eval(predicate, query.ctx.bindings, raw) == qb::Val::Bool(True) });
+    if flags == [True, True, True, False, False] { True } else { fail!("wrong any_of", flags) }
+});
+
+pub def distinct_count_separates_known_and_unknown: test::Test = test::should_ok(fn() {
+    let query = ast(r#""select":[],"count_value":{"node":"x","dimension":"class"}"#);
+    let p = plan(query);
+    let sq = sqlite::build_query(query);
+    let pg = postgres::build_query(query);
+    let operands = array::map(p.internal_measures, fn(item) { match item {
+        qb::SelectItem::Aggregate(a) => array::map([qb::Val::String("lb"), qb::Val::String("ne.category.lb"), qb::Val::String("LoadBalancer"), qb::Val::None], fn(raw) { eval(a.arg, query.ctx.bindings, raw) }),
+        _ => fail!("expected count operand", item),
+    } });
+    if operands == [[qb::Val::String("LoadBalancer"), qb::Val::String("LoadBalancer"), qb::Val::None, qb::Val::None],
+        [qb::Val::None, qb::Val::None, qb::Val::String("LoadBalancer"), qb::Val::None]]
+        && string::contains(sq.sql, " + ") && string::contains(pg.sql, " + ") { True }
+    else { fail!("distinct count merged branches", operands, sq, pg) }
+});
+
+pub def discovery_exposes_unknown_contract: test::Test = test::should_ok(fn() {
+    let detail = edsl::visible_dimension_detail(payload, "class");
+    if detail.half_open && array::length(detail.values) == 2 && string::contains(detail.value_contract, "unknowns")
+        && string::contains(detail.value_contract, "__kind") { True }
+    else { fail!("half-open discovery contract missing", detail) }
+});
+
+pub def later_plain_projection_orders_correct_column: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(ast(r#""select":[{"node":"x","dimension":"class"},{"node":"x","dimension":"name"}],"order_by":[{"node":"x","dimension":"name","direction":"Asc"}]"#));
+    if string::contains(query.sql, "ORDER BY x.name ASC") { True } else { fail!("expanded projection shifted order index", query) }
+});
+
+pub def filtered_measure_supports_unknown_branch: test::Test = test::should_ok(fn() {
+    let query = ast(r#""select":[],"measures":[{"node":"x","measure":"unrecognized"}]"#);
+    let p = plan(query);
+    let predicate = match p.projection[0] { qb::SelectItem::Aggregate(a) => match a.filter {
+        Some(expr) => expr, None => fail!("missing aggregate filter")
+    }, _ => fail!("expected aggregate") };
+    let flags = array::map([qb::Val::String("lb"), qb::Val::String("other"), qb::Val::String("new"), qb::Val::None], fn(raw) {
+        eval(predicate, query.ctx.bindings, raw) == qb::Val::Bool(True)
+    });
+    if flags == [False, False, True, False] { True } else { fail!("unknown measure lost domain boundary", flags) }
+});
+
+pub def paired_groups_publish_tag_column: test::Test = test::should_ok(fn() {
+    let graph = r#""op":"Graph","root":"x","nodes":[{"id":"x","entity":"devices"}],"edges":[],"select":[{"node":"x","dimension":"class"}],"group_by_identity":["x"]"#;
+    let query = query_intent_ast_factory(payload)(json::parse(`{"op":"GraphPair","left":{\{graph},"measures":[{"node":"x","measure":"total"}]},"right":{\{graph},"measures":[{"node":"x","measure":"unrecognized"}]}}`).unwrap!());
+    let sq = sqlite::build_query(query);
+    let pg = postgres::build_query(query);
+    match query.plan {
+        qb::QueryPlan::JoinedGroups(p) => if p.left_outputs == ["x_class", "x_class__kind", "x_total"]
+            && array::length(p.keys) == 3 && string::contains(sq.sql, "x_class__kind")
+            && string::contains(pg.sql, "x_class__kind")
+            && string::contains(sq.sql, " IS NULL AND ") && string::contains(pg.sql, " IS NULL AND ") { True }
+            else { fail!("paired grouping lost tag", p, sq, pg) },
+        other => fail!("expected paired groups", other),
+    }
+});
+
+@edsl::entity_id("missing_values")
+@edsl::entity_source("missing_values", "m")
+type MissingValues = struct {
+    @edsl::column("class")
+    @edsl::dimension("class", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::half_open()
+    class: String,
+};
+pub def half_open_requires_known_values: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("missing-values", [MissingValues.type], profile)
+}, "half-open domain requires a String dimension with canonical_values");
+
+@edsl::entity_id("ordered_unknowns")
+@edsl::entity_source("ordered_unknowns", "o")
+type OrderedUnknowns = struct {
+    @edsl::column("class")
+    @edsl::dimension("class", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(values)
+    @edsl::canonical_order(["LoadBalancer", "Other"])
+    @edsl::half_open()
+    class: String,
+};
+pub def unknown_business_rank_is_not_invented: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("ordered-unknowns", [OrderedUnknowns.type], profile)
+}, "half-open domain cannot declare a closed canonical_order");
+
+pub def profile_must_support_unknown_complement: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("missing-not", [Device.type], {...profile,
+        allowed_scalars: array::filter(profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::Not })})
+}, "half-open domain requires Not, IsNotNull, And and Or");
+
+@edsl::entity_id("closed")
+@edsl::entity_source("closed", "c")
+type Closed = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("class")
+    @edsl::dimension("closed_class", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values(values)
+    class: String,
+};
+pub def closed_domain_rejects_unknown_input: test::Test = test::should_fail_with(fn() {
+    let closed = edsl::build_root("closed", [Closed.type], profile);
+    query_intent_ast_factory(closed)(json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"closed"}],"edges":[],"select":[],"count":"c","filters":[{"node":"c","dimension":"closed_class","op":"Eq","value":{"unknown":"new"}}]}"#).unwrap!())
+}, "tagged unknown input requires a half-open domain");
+
+@edsl::entity_id("integer_half_open")
+@edsl::entity_source("integer_half_open", "i")
+type IntegerHalfOpen = struct {
+    @edsl::column("class")
+    @edsl::dimension("int_class", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::canonical_values([{id: "One", label: "One", wires: [edsl::FilterInput::Int(1)]}])
+    @edsl::half_open()
+    class: Int,
+};
+pub def half_open_requires_string_storage: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("integer-half-open", [IntegerHalfOpen.type], profile)
+}, "half-open domain requires a String dimension with canonical_values");

@@ -48,6 +48,8 @@ work still needed before declaring full cross-dialect support.
   dimension. The declared operators and input kinds constrain Intent values.
 - Canonical values map source encodings to stable business IDs. Labels and
   aliases aid discovery; a Query Intent still uses stable IDs.
+  `@half_open()` adds an explicit Unknown branch retaining unrecognized strings;
+  see [HALF-OPEN.md](HALF-OPEN.md) for tagged inputs, result columns and grouping.
 - Named relation declarations include endpoint types, join keys, and a
   `RelationCardinality {from,to}`. Each endpoint specifies how many records on
   that side match one record on the other side: `One` (1..1), `Optional` (0..1),

@@ -116,36 +116,51 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
 def inferred_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput =
     fn(payload, dimension, value) {
         let detail = edsl::visible_dimension_detail(payload, dimension);
-        let candidates = array::filter(detail.input_kinds, fn(kind) {
-            match value {
-                Value::String(_) => kind == edsl::FilterInputKind::Text || kind == edsl::FilterInputKind::Date
-                    || kind == edsl::FilterInputKind::Rfc3339 || kind == edsl::FilterInputKind::Utc1
-                    || kind == edsl::FilterInputKind::LocalDateTime,
-                Value::Int(_) => kind == edsl::FilterInputKind::Int || kind == edsl::FilterInputKind::Number
-                    || kind == edsl::FilterInputKind::EpochMillis,
-                Value::Float(_) => kind == edsl::FilterInputKind::Number,
-                Value::True => kind == edsl::FilterInputKind::Bool,
-                Value::False => kind == edsl::FilterInputKind::Bool,
-                _ => False,
+        if let Value::Object(obj) = value {
+            if !detail.half_open { fail!("tagged unknown input requires a half-open domain", dimension, value) }
+            else if array::length(dict::keys(obj)) != 1 { fail!("unknown input requires exactly one tag", dimension, value) }
+            else {
+                match dict::get(obj, "unknown") {
+                    Some(Value::String(raw)) => edsl::FilterInput::Unknown(raw),
+                    Some(_) => fail!("unknown raw value must be a string", dimension, value),
+                    None => match dict::get(obj, "unknowns") {
+                        Some(Value::True) => edsl::FilterInput::Unknowns,
+                        _ => fail!("expected unknown string or unknowns true", dimension, value),
+                    },
+                }
             }
-        });
-        if array::length(candidates) == 0 { fail!(`value does not match dimension \{dimension} input type; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Dimension, detail.dataset, dimension)}`, dimension, detail.input_kinds, value) }
-        else {
-            let chosen = if array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Int })
-                && array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Number })
-                && array::length(candidates) == 2 { edsl::FilterInputKind::Int }
-                else if array::length(candidates) == 1 { candidates[0] }
-                else { fail!(`dimension \{dimension} has ambiguous declared input types; fix its Model definition`, dimension, candidates, value) };
-            match chosen {
-                edsl::FilterInputKind::Text => parse_input("text", value),
-                edsl::FilterInputKind::Int => parse_input("int", value),
-                edsl::FilterInputKind::Number => parse_input("number", value),
-                edsl::FilterInputKind::Bool => parse_input("bool", value),
-                edsl::FilterInputKind::Rfc3339 => parse_input("rfc3339", value),
-                edsl::FilterInputKind::EpochMillis => parse_input("epoch_millis", value),
-                edsl::FilterInputKind::Date => parse_input("date", value),
-                edsl::FilterInputKind::Utc1 => parse_input("utc_second", value),
-                edsl::FilterInputKind::LocalDateTime => parse_input("local_datetime", value),
+        } else {
+            let candidates = array::filter(detail.input_kinds, fn(kind) {
+                match value {
+                    Value::String(_) => kind == edsl::FilterInputKind::Text || kind == edsl::FilterInputKind::Date
+                        || kind == edsl::FilterInputKind::Rfc3339 || kind == edsl::FilterInputKind::Utc1
+                        || kind == edsl::FilterInputKind::LocalDateTime,
+                    Value::Int(_) => kind == edsl::FilterInputKind::Int || kind == edsl::FilterInputKind::Number
+                        || kind == edsl::FilterInputKind::EpochMillis,
+                    Value::Float(_) => kind == edsl::FilterInputKind::Number,
+                    Value::True => kind == edsl::FilterInputKind::Bool,
+                    Value::False => kind == edsl::FilterInputKind::Bool,
+                    _ => False,
+                }
+            });
+            if array::length(candidates) == 0 { fail!(`value does not match dimension \{dimension} input type; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Dimension, detail.dataset, dimension)}`, dimension, detail.input_kinds, value) }
+            else {
+                let chosen = if array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Int })
+                    && array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Number })
+                    && array::length(candidates) == 2 { edsl::FilterInputKind::Int }
+                    else if array::length(candidates) == 1 { candidates[0] }
+                    else { fail!(`dimension \{dimension} has ambiguous declared input types; fix its Model definition`, dimension, candidates, value) };
+                match chosen {
+                    edsl::FilterInputKind::Text => parse_input("text", value),
+                    edsl::FilterInputKind::Int => parse_input("int", value),
+                    edsl::FilterInputKind::Number => parse_input("number", value),
+                    edsl::FilterInputKind::Bool => parse_input("bool", value),
+                    edsl::FilterInputKind::Rfc3339 => parse_input("rfc3339", value),
+                    edsl::FilterInputKind::EpochMillis => parse_input("epoch_millis", value),
+                    edsl::FilterInputKind::Date => parse_input("date", value),
+                    edsl::FilterInputKind::Utc1 => parse_input("utc_second", value),
+                    edsl::FilterInputKind::LocalDateTime => parse_input("local_datetime", value),
+                }
             }
         }
     };
@@ -441,6 +456,17 @@ def paired_group_operand: Fn(qb::Plan) -> qb::Plan = fn(plan) {
     {...plan, projection: array::concat([plan.projection, keys])}
 };
 
+def same_group_expr: Fn(qb::BuildCtx, qb::Expr, qb::Expr) -> Bool = fn(ctx, left, right) {
+    match (left, right) {
+        (qb::Expr::Column(a), qb::Expr::Column(b)) => a == b,
+        (qb::Expr::AllocatedBind(a), qb::Expr::AllocatedBind(b)) => ctx.bindings[a.index - 1] == ctx.bindings[b.index - 1],
+        (qb::Expr::Scalar(a), qb::Expr::Scalar(b)) => a.function == b.function
+            && array::length(a.args) == array::length(b.args)
+            && array::all(array::enumerate(a.args), fn(arg) { same_group_expr(ctx, arg.1, b.args[arg.0]) }),
+        _ => False,
+    }
+};
+
 def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
     let raw = decode_graph_shape@[RawGraphPair](value, "aggregate pair");
     let obj = as_object(value);
@@ -466,11 +492,18 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
             edsl::graph_node(left.1, item.node).entity == edsl::graph_node(right.1, item.node).entity
         }) {
         fail!("aggregate pair operands must use the same node instance ids and entities for every grouped and selected node; align group_by_identity and node ids", left.1.group_by_identity, right.1.group_by_identity)
-    } else if left.2.grouping != right.2.grouping {
+    } else if array::length(left.2.grouping) != array::length(right.2.grouping)
+        || !array::all(array::enumerate(left.2.grouping), fn(group) {
+            same_group_expr(right.0, group.1, right.2.grouping[group.0])
+        }) {
         fail!("aggregate pair operands must group by the same complete declared identities", left.1.group_by_identity)
     } else {
         let keys = array::map(array::enumerate(left.2.grouping), fn(entry) { `__q_key_\{entry.0}` });
-        let visible = array::map(left.1.select, fn(item) { `\{item.node}_\{item.dimension}` });
+        let visible = array::flat_map(left.1.select, fn(item) {
+            let alias = `\{item.node}_\{item.dimension}`;
+            if edsl::visible_dimension_detail(payload, item.dimension).half_open { [alias, `\{alias}__kind`] }
+            else { [alias] }
+        });
         let left_measure = left.1.measures[0];
         let right_measure = right.1.measures[0];
         let joined: qb::JoinedGroups = {
