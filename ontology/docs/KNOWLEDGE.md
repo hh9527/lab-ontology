@@ -67,6 +67,19 @@ and `text`). Input documentation comes from `@doc(text)` on the corresponding
 copyable example once; every dimension using it exposes that same description.
 The annotation supplies explanatory text and does not change input validation.
 
+Dataset detail also has `references: [{id,fields}]` (alternative complete
+unique addresses) and `field_roles: [{field,roles}]`. Field detail has `roles`
+and `reference_ids`. Roles are Appellation, Reference, Classification and
+Metric; they do not grant query access. Reference membership derives from
+type-level declarations, and formal metrics derive Metric. Hidden fields and
+incomplete visible references are excluded. Dataset links lead to the shared
+`syntax/model/field_roles` contract. See [FIELD-ROLES.md](FIELD-ROLES.md).
+
+For repeated typed lookups, `knowledge_lookup_factory(payload)` prepares one
+catalog and returns `Fn(KnowledgeTarget) -> DocResult`, with the same documents
+and visibility as `by_target(payload, target)`. The service factories already
+prepare their catalog once. This avoids rebuilding the full index per lookup.
+
 The formal domain concepts are the knowledge nodes listed in `Index`.
 `Terminology` (key `"terminology"`) is supplemental language assistance, not a
 second concept system. It has `detail.entries` of `{term,description,key}`. Entries derive from

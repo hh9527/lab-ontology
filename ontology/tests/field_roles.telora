@@ -1,0 +1,246 @@
+use crate::ontology as edsl;
+use crate::knowledge as knowledge;
+use crate::intent::{ query_intent_ast_factory };
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::test as test;
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate, qb::Operator::Filter,
+        qb::Operator::Group],
+    allowed_join_kinds: [], allowed_aggregates: [qb::AggregateFunction::Count, qb::AggregateFunction::Avg],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::And], allow_distinct: True,
+};
+
+@edsl::entity_id("devices")
+@edsl::entity_source("devices", "d")
+@edsl::dataset(edsl::DatasetKind::Entity, ["tenant", "device"], None)
+@edsl::reference("local", ["tenant", "device"])
+@edsl::reference("global", ["uuid"])
+type Device = struct {
+    @edsl::column("tenant_id")
+    @edsl::dimension("tenant", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    tenant: String,
+    @edsl::column("device_id")
+    @edsl::dimension("device", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    device: String,
+    @edsl::column("uuid")
+    @edsl::dimension("uuid", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    uuid: String,
+    @edsl::column("name")
+    @edsl::dimension("display", True, False, [], [edsl::FilterInputKind::Text])
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    display: String,
+    @edsl::column("kind")
+    @edsl::dimension("category", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::field_role(edsl::FieldRole::Classification)
+    category: String,
+    @edsl::column("cpu")
+    @edsl::dimension("cpu", True, False, [], [])
+    @edsl::field_role(edsl::FieldRole::Metric)
+    cpu: Float,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("roles", [Device.type], profile);
+def detail: edsl::DatasetBrief = edsl::visible_knowledge_index(payload)[0];
+def role: Fn(edsl::DatasetBrief, String, edsl::FieldRole) -> Bool = fn(brief, name, expected) {
+    array::any(brief.field_roles, fn(field) { field.field == name && array::any(field.roles, fn(r) { r == expected }) })
+};
+
+pub def reference_sets_are_alternative_complete_addresses: test::Test = test::should_ok(fn() {
+    let local: edsl::ReferenceSpec = {id: "local", fields: ["tenant", "device"]};
+    let global: edsl::ReferenceSpec = {id: "global", fields: ["uuid"]};
+    if detail.references == [local, global] && !array::any(detail.references, fn(ref) { ref.fields == ["device"] }) { True }
+    else { fail!("composite reference was flattened or truncated", detail.references) }
+});
+pub def roles_can_overlap_and_do_not_depend_on_field_names: test::Test = test::should_ok(fn() {
+    if role(detail, "display", edsl::FieldRole::Appellation)
+        && role(detail, "category", edsl::FieldRole::Classification)
+        && role(detail, "cpu", edsl::FieldRole::Metric)
+        && role(detail, "uuid", edsl::FieldRole::Appellation)
+        && role(detail, "uuid", edsl::FieldRole::Reference)
+        && !role(detail, "display", edsl::FieldRole::Reference) { True }
+    else { fail!("roles lost declaration semantics", detail.field_roles) }
+});
+pub def reference_does_not_replace_grain_or_key: test::Test = test::should_ok(fn() {
+    if payload.entities[0].key_field == -1
+        && payload.entities[0].dataset == Some({kind: edsl::DatasetKind::Entity, grain: ["tenant", "device"], utc_time: None})
+        && detail.references[1].fields == ["uuid"] { True }
+    else { fail!("reference changed count identity", payload.entities[0]) }
+});
+pub def public_dataset_and_field_documents_expose_roles: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    let dataset = codec::decode@[knowledge::NodeResponse](info(json::parse(r#"{"key":"Dataset/devices"}"#).unwrap!())).unwrap!();
+    let field = codec::decode@[knowledge::NodeResponse](info(json::parse(r#"{"key":"Field/devices/uuid"}"#).unwrap!())).unwrap!();
+    match (dataset, field) {
+        (knowledge::NodeResponse::Document(knowledge::NodeResult::Found(d)), knowledge::NodeResponse::Document(knowledge::NodeResult::Found(f))) => do {
+            let dd = codec::decode@[knowledge::DatasetDetail](d.detail).unwrap!();
+            let fd = codec::decode@[knowledge::FieldDetail](f.detail).unwrap!();
+            if dd.references == detail.references && dd.field_roles == detail.field_roles
+                && fd.reference_ids == ["global"] && fd.roles == [edsl::FieldRole::Appellation, edsl::FieldRole::Reference] { True }
+            else { fail!("public role contract is incomplete", dd, fd) }
+        },
+        other => fail!("role documents missing", other),
+    }
+});
+
+pub def role_semantics_are_discoverable_from_dataset: test::Test = test::should_ok(fn() {
+    match knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "devices"}) {
+        knowledge::DocResult::Found(p) => if array::any(p.refs, fn(ref) { ref.target.id == "syntax/model/field_roles" }) {
+            match knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/model/field_roles"}) {
+                knowledge::DocResult::Found(_) => True,
+                other => fail!("role contract missing", other),
+            }
+        } else { fail!("dataset has no role contract link", p) },
+        other => fail!("dataset missing", other),
+    }
+});
+pub def reference_membership_is_discovered_on_each_field: test::Test = test::should_ok(fn() {
+    let point = knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Field, owner: "devices", id: "tenant"});
+    match point {
+        knowledge::DocResult::Found(p) => if p.roles == [edsl::FieldRole::Reference]
+            && p.references == [detail.references[0]] { True } else { fail!("reference membership missing", p) },
+        other => fail!("field missing", other),
+    }
+});
+
+pub def cached_lookup_preserves_document_and_visibility: test::Test = test::should_ok(fn() {
+    let lookup = knowledge::knowledge_lookup_factory(payload);
+    let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Field, owner: "devices", id: "uuid"};
+    let missing: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Field, owner: "devices", id: "missing"};
+    if lookup(target) == knowledge::by_target(payload, target)
+        && lookup(missing) == knowledge::DocResult::NotFound { True }
+    else { fail!("cached lookup differs from single lookup") }
+});
+pub def roles_do_not_infer_filter_capability: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"display"}],"filters":[{"node":"d","dimension":"display","op":"Eq","value":"core"}]}"#).unwrap!())
+}, "dimension has no filter capability");
+pub def roles_do_not_change_query_bindings: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"display"}],"filters":[{"node":"d","dimension":"tenant","op":"Eq","value":"T1"},{"node":"d","dimension":"device","op":"Eq","value":"D001"}]}"#).unwrap!()));
+    if query.bindings == [qb::Val::String("T1"), qb::Val::String("D001")] { True }
+    else { fail!("roles changed query lowering", query) }
+});
+
+@edsl::entity_id("private")
+@edsl::entity_source("private", "p")
+@edsl::reference("partial", ["visible", "hidden"])
+@edsl::reference("public", ["visible"])
+type Private = struct {
+    @edsl::column("visible")
+    @edsl::dimension("visible", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    visible: String,
+    @edsl::column("hidden")
+    @edsl::dimension("hidden", False, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    hidden: String,
+    @edsl::column("only_role")
+    @edsl::field_role(edsl::FieldRole::Classification)
+    only_role: String,
+};
+pub def discovery_never_truncates_private_references: test::Test = test::should_ok(fn() {
+    let p = edsl::build_root("private-roles", [Private.type], profile);
+    let public = edsl::visible_knowledge_index(p)[0];
+    let internal = edsl::knowledge_index(p)[0];
+    if public.references == [{id: "public", fields: ["visible"]}]
+        && public.field_roles == [{field: "visible", roles: [edsl::FieldRole::Reference]}]
+        && array::length(internal.references) == 2 && array::length(internal.field_roles) == 3
+        && edsl::published_fields(p, "private") == ["visible"] { True }
+    else { fail!("private role leaked or partial reference published", public, internal) }
+});
+
+@edsl::entity_id("metrics")
+@edsl::entity_source("metrics", "m")
+@edsl::dataset(edsl::DatasetKind::Metric, ["ts"], Some("ts"))
+type Metric = struct {
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    ts: Int,
+    @edsl::column("cpu")
+    @edsl::measure("cpu", qb::AggregateFunction::Avg, [])
+    @edsl::metric_value("cpu", qb::AggregateFunction::Avg, Some("%"))
+    @edsl::field_role(edsl::FieldRole::Metric)
+    cpu: Float,
+    @edsl::column("memory")
+    @edsl::measure("memory", qb::AggregateFunction::Avg, [])
+    @edsl::metric_value("memory", qb::AggregateFunction::Avg, Some("%"))
+    memory: Float,
+};
+pub def formal_metrics_derive_role_without_duplication: test::Test = test::should_ok(fn() {
+    let p = edsl::build_root("metric-roles", [Metric.type], profile);
+    let brief = edsl::visible_knowledge_index(p)[0];
+    if brief.field_roles == [{field: "cpu", roles: [edsl::FieldRole::Metric]}, {field: "memory", roles: [edsl::FieldRole::Metric]}]
+        && p.entities[0].metrics[0].unit == Some("%") { True }
+    else { fail!("metric role duplicated or unit lost", brief, p.entities[0].metrics) }
+});
+
+@edsl::entity_source("bad", "b")
+@edsl::reference("", ["id"])
+type EmptyId = struct { id: String };
+pub def empty_reference_id_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [EmptyId.type], profile)
+}, "reference requires a nonempty id and field set");
+@edsl::entity_source("bad", "b")
+@edsl::reference("id", [])
+type EmptySet = struct { id: String };
+pub def empty_reference_set_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [EmptySet.type], profile)
+}, "reference requires a nonempty id and field set");
+@edsl::entity_source("bad", "b")
+@edsl::reference("id", ["missing"])
+type MissingField = struct { id: String };
+pub def unknown_reference_field_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [MissingField.type], profile)
+}, "unknown reference field");
+@edsl::entity_source("bad", "b")
+@edsl::reference("id", ["id", "id"])
+type DuplicateField = struct { id: String };
+pub def duplicate_reference_field_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [DuplicateField.type], profile)
+}, "duplicate reference field");
+@edsl::entity_source("bad", "b")
+@edsl::reference("id", ["id"])
+@edsl::reference("id", ["other"])
+type DuplicateId = struct { id: String, other: String };
+pub def duplicate_reference_id_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [DuplicateId.type], profile)
+}, "duplicate reference id");
+@edsl::entity_source("bad", "b")
+@edsl::reference("first", ["id", "tenant"])
+@edsl::reference("second", ["tenant", "id"])
+type DuplicateSet = struct { id: String, tenant: String };
+pub def equivalent_reference_sets_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [DuplicateSet.type], profile)
+}, "duplicate reference field set");
+@edsl::entity_source("bad", "b")
+@edsl::reference("id", ["id"])
+type Nullable = struct { id: Option(String) };
+pub def nullable_reference_field_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [Nullable.type], profile)
+}, "reference field cannot be nullable");
+@edsl::entity_source("bad", "b")
+@edsl::reference("id", ["id"])
+type Complex = struct { id: Array(String) };
+pub def complex_reference_field_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [Complex.type], profile)
+}, "reference field requires a scalar or closed enum type");
+@edsl::entity_source("bad", "b")
+type DirectReferenceRole = struct {
+    @edsl::field_role(edsl::FieldRole::Reference)
+    id: String,
+};
+pub def reference_role_cannot_be_declared_independently: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [DirectReferenceRole.type], profile)
+}, "Reference role must be derived from a type-level reference");
+@edsl::entity_source("bad", "b")
+type DuplicateRole = struct {
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    id: String,
+};
+pub def duplicate_role_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [DuplicateRole.type], profile)
+}, "duplicate field role");
