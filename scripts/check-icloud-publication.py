@@ -18,6 +18,7 @@ def main():
     keys += [f"Dataset/{row['id']}" for row in report["datasets"]]
     keys += [f"Relation/{row['from_dataset']}/{row['id']}" for row in report["relations"]]
     keys += ["TimeRole/current_alarm/occur_utc", "Dimension/current_alarm/alarm_severity"]
+    keys += ["Dimension/device/device_class"]
     requests = [{"method": "ic/info", "input": {"key": key}} for key in keys]
     graph = {
         "op": "Graph", "root": "alarm",
@@ -29,6 +30,16 @@ def main():
                      "op": "Eq", "value": "critical"}],
     }
     requests.append({"method": "ic/transform", "input": {"intents": [graph]}})
+    device = {
+        "op": "Graph", "root": "device",
+        "nodes": [{"id": "device", "entity": "device"}], "edges": [],
+        "select": [{"node": "device", "dimension": "device_class"}], "count": "device",
+    }
+    exact_unknown = {**device, "select": [], "filters": [
+        {"node": "device", "dimension": "device_class", "op": "Eq",
+         "value": {"unknown": "FutureDevice"}},
+    ]}
+    requests.append({"method": "ic/transform", "input": {"intents": [device, exact_unknown]}})
     process = subprocess.run(
         [str(root / "bin/telora-run"), str(args.artifact.resolve()),
          "--serve", "stdio+jsonl://", "--request-fuel", "100000",
@@ -57,7 +68,9 @@ def main():
         detail = nodes[key]["detail"]
         assert detail["cardinality"] == relation["cardinality"], (key, detail)
     assert nodes["TimeRole/current_alarm/occur_utc"]["detail"]["encoding"] == "EpochMillis"
-    result = responses[-1]
+    detail = nodes["Dimension/device/device_class"]["detail"]
+    assert detail["half_open"] and "unknowns" in detail["value_contract"], detail
+    result = responses[-2]
     assert result["accepted"] and len(result["queries"]) == 1, result
     query = result["queries"][0]
     assert "alarm.OCCURUTC >=" in query["sql"] and "alarm.OCCURUTC <" in query["sql"], query
@@ -67,9 +80,15 @@ def main():
         assert all(set(value) == {"Int"} for value in bindings), bindings
         bindings = [value["Int"] for value in bindings]
     assert sorted(bindings) == [1, 1709136000000, 1709222400000], bindings
+    result = responses[-1]
+    assert result["accepted"] and len(result["queries"]) == 2, result
+    grouped, unknown = result["queries"]
+    assert "device_device_class__kind" in grouped["sql"] and "WHERE" not in grouped["sql"], grouped
+    assert unknown["bindings"] == ["FutureDevice"], unknown
     print(json.dumps({"index_entries": len(entries), "dataset_documents": 50,
                       "relation_documents": len(report["relations"]),
-                      "clock_encoding": "EpochMillis", "query": "passed"}, indent=2))
+                      "clock_encoding": "EpochMillis", "query": "passed",
+                      "half_open": "passed"}, indent=2))
 
 
 if __name__ == "__main__":

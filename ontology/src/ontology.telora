@@ -338,6 +338,16 @@ type CanonicalValueSpec = struct { id: String, label: String, wires: Array(Filte
 type CanonicalValuesDef = struct { values: Array(CanonicalValueSpec) };
 
 @prelude::property(PropertyTarget::Field)
+type HalfOpenDef = struct {};
+
+def half_open: Fn() -> Fn(property::FieldPropertyCtx, Option(HalfOpenDef)) -> HalfOpenDef = fn() {
+    fn(ctx, previous) {
+        if previous != None { fail!("half-open domain must be declared once", ctx) }
+        else { {} }
+    }
+};
+
+@prelude::property(PropertyTarget::Field)
 type CanonicalOrderDef = struct { ids: Array(String) };
 
 type CanonicalAlias = struct { id: String, label: String };
@@ -451,6 +461,8 @@ def filter_input_docs: Fn(Array(FilterInputKind)) -> Array(FilterInputDoc) = fn(
 };
 
 type FilterInput = enum {
+    Unknown(String),
+    Unknowns,
     Text(String),
     Number(Float),
     Int(Int),
@@ -562,6 +574,8 @@ type MeasureBrief = struct {
 
 type DimensionScopeBrief = struct { field: String, op: FilterOp, input: FilterInput };
 type DimensionBrief = struct {
+    half_open: Bool,
+    value_contract: String,
     id: String,
     label: String,
     aliases: Array(String),
@@ -585,6 +599,8 @@ type DimensionBrief = struct {
 
 type BusinessValueBrief = struct { id: String, label: String, aliases: Array(String), localized: Array(LocalizedValueLabel) };
 type VisibleDimensionBrief = struct {
+    half_open: Bool,
+    value_contract: String,
     id: String,
     label: String,
     aliases: Array(String),
@@ -649,6 +665,7 @@ type MeasureEntry = struct {
 };
 
 type DimensionEntry = struct {
+    half_open: Bool,
     id: String,
     entity: Int,
     field: Int,
@@ -1240,6 +1257,8 @@ def branch_mapping_ok: Fn(Array(FieldEntry), UnionBranchDecl) -> Array(String) =
 
 def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input) {
     match input {
+        FilterInput::Unknown(_) => False,
+        FilterInput::Unknowns => False,
         FilterInput::Text(value) => field.ty == String.type
             || array::any(value_domain(field.ty), fn(entry) { entry.value == value }),
         FilterInput::Int(_) => field.ty == Int.type,
@@ -1984,6 +2003,8 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
                             FilterInput::Date(_) => False,
                             FilterInput::Utc1(_) => False,
                             FilterInput::LocalDateTime(_) => False,
+                            FilterInput::Unknown(_) => False,
+                            FilterInput::Unknowns => False,
                         }
                     })
                     && array::length(array::filter(mapping.values, fn(other) { other.id == v.id })) == 1
@@ -2042,7 +2063,8 @@ def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
 def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(entity) {
     let fields = entity.fields;
     let orphan = array::find(fields, fn(f) {
-        (property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
+        (property::get_field_prop(entity.entity_type, f.index, HalfOpenDef.type) != None
+            || property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
             || property::get_field_prop(entity.entity_type, f.index, CanonicalOrderDef.type) != None
             || property::get_field_prop(entity.entity_type, f.index, CanonicalAliasesDef.type) != None)
             && property::get_field_prop(entity.entity_type, f.index, DimensionDef.type) == None
@@ -2056,7 +2078,14 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         match d {
             Some(dd) => do {
                 let mapped = canonical_domain(entity.entity_type, f);
+                let half_open = property::get_field_prop(entity.entity_type, f.index, HalfOpenDef.type) != None;
+                if half_open && (f.ty != String.type || array::length(mapped) == 0) {
+                    fail!("half-open domain requires a String dimension with canonical_values", entity.id, f.name)
+                } else { () };
                 let order = canonical_order_domain(entity.entity_type, f, mapped);
+                if half_open && array::length(order) > 0 {
+                    fail!("half-open domain cannot declare a closed canonical_order: unknown values have no business rank", entity.id, f.name)
+                } else { () };
                 let aliases = canonical_alias_domain(entity.entity_type, f, mapped);
                 let enumerated = value_domain(f.ty);
                 let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
@@ -2123,7 +2152,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         FilterInputKind::Utc1 => OutputType::Text,
                         FilterInputKind::LocalDateTime => OutputType::Text,
                     };
-                    [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index))]
+                    [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index), half_open)]
                 }
             },
             None => [],
@@ -2132,14 +2161,14 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
     let computed = array::flat_map(fields, fn(f) {
         let d = property::get_field_prop(entity.entity_type, f.index, ComputedDimensionDef.type);
         match d {
-            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, dd.output_type, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], [], field_scope(entity.entity_type, f.index))],
+            Some(dd) => [dimension_entry(entity.index, f.index, dd.id, dd.output_type, True, dd.build, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, [], [], [], [], field_scope(entity.entity_type, f.index), False)],
             None => [],
         }
     });
     if declared { array::concat([plain, computed]) } else { [] }
 };
 
-def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate)) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope) {
+def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate), Bool) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open) {
     let wire_shape = fn(kind: FilterInputKind) {
         match kind {
             FilterInputKind::Text => 1,
@@ -2161,7 +2190,7 @@ def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb:
         })
     }) { fail!(`dimension \{id} declares indistinguishable input types; one JSON value must resolve to one logical type`, id, ambiguous) }
     else { () };
-    let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope };
+    let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open };
     result
 };
 
@@ -2576,6 +2605,13 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
             || (array::length(d.canonical_values) > 1 && array::any(d.ops, fn(op) { op == FilterOp::Ne }))
     });
     let uses_canonical = array::any(dimensions, fn(d) { array::length(d.canonical_values) > 0 });
+    let uses_half_open = array::any(dimensions, fn(d) { d.half_open });
+    if uses_half_open && (!array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Not })
+        || !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::IsNotNull })
+        || !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::And })
+        || !array::any(profile.allowed_scalars, fn(op) { op == qb::ScalarFunction::Or })) {
+        fail!("half-open domain requires Not, IsNotNull, And and Or in the query profile")
+    } else { () };
     let uses_canonical_ne = array::any(dimensions, fn(d) {
         array::length(d.canonical_values) > 0 && array::any(d.ops, fn(op) { op == FilterOp::Ne })
     });
@@ -2777,7 +2813,9 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
         {field: predicate.field, op: predicate.op, input: predicate.input}
     });
-    {id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
+    {half_open: entry.half_open, value_contract: if entry.half_open {
+        "Known: use a listed business ID string. Unknown: use {\"unknown\":\"raw value\"}; known wires are rejected. All unknowns: use {\"unknowns\":true}. Eq/Ne exclude NULL. Projection returns <node>_<dimension> plus <node>_<dimension>__kind (Known, Unknown, or NULL); group by both columns. Other is an ordinary known concept."
+    } else { "" }, id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
         aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
         localized: localized_member_texts(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
         summary: match note { Some(n) => n.summary, None => "" },
@@ -2810,7 +2848,7 @@ def visible_dimension_detail: Fn(PreparedPayload, String) -> VisibleDimensionBri
             } else {
                 array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: [], localized: []} })
             };
-            {id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
+            {half_open: detail.half_open, value_contract: detail.value_contract, id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
                 filterable: detail.filterable, ops: detail.ops,
                 input_kinds: detail.input_kinds, input_docs: detail.input_docs, values, canonical_order: detail.canonical_order, scope: detail.scope}
@@ -3028,7 +3066,7 @@ def dimension_output_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEn
     if array::length(entry.canonical_values) == 0 {
         physical
     } else {
-        let unknown = qb::bind(physical.0, qb::Val::None);
+        let unknown = if entry.half_open { physical } else { qb::bind(physical.0, qb::Val::None) };
         array::fold(entry.canonical_values, unknown, fn(state, value) {
             let compared = canonical_compare_with_context(state.0, entry, physical.1, FilterOp::Eq, FilterInput::Text(value.id));
             let label = qb::bind(compared.0, qb::Val::String(value.id));
@@ -3040,6 +3078,8 @@ def dimension_output_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEn
 
 def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(kinds, input) {
     let kind: FilterInputKind = match input {
+        FilterInput::Unknown(_) => fail!("Unknown requires a half-open canonical domain", input),
+        FilterInput::Unknowns => fail!("Unknowns requires a half-open canonical domain", input),
         FilterInput::Text(_) => FilterInputKind::Text,
         FilterInput::Number(_) => FilterInputKind::Number,
         FilterInput::Int(_) => FilterInputKind::Int,
@@ -3148,7 +3188,10 @@ def is_text_op: Fn(FilterOp) -> Bool = fn(op) {
 # Convert a runtime filter value into the query ScalarValue used at codec
 # boundaries and by HAVING thresholds.
 def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
+    # Tagged domain inputs must be lowered through canonical_compare_with_context.
     match input {
+        FilterInput::Unknown(_) => fail!("Unknown is not a scalar wire", input),
+        FilterInput::Unknowns => fail!("Unknowns is not a scalar wire", input),
         FilterInput::Text(s) => qb::Val::String(s),
         FilterInput::Number(f) => qb::Val::Float(f),
         FilterInput::Int(i) => qb::Val::Int(i),
@@ -3169,6 +3212,50 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
 # Construction-time variant: validation precedes allocation for each request,
 # and each generated predicate carries handles registered in the returned ctx.
 def canonical_compare_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, FilterOp, FilterInput) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base, op, input) {
+    match input {
+        FilterInput::Unknown(raw) => do {
+            if !entry.half_open || known_wire(entry, raw) { fail!("Unknown requires an unrecognized wire in a half-open domain", entry.id, raw) }
+            else if op != FilterOp::Eq && op != FilterOp::Ne { fail!("half-open domain supports only Eq or Ne", entry.id, op) }
+            else {
+                let bound = qb::bind(ctx, qb::Val::String(raw));
+                (bound.0, qb::scalar(if op == FilterOp::Eq { qb::ScalarFunction::Eq } else { qb::ScalarFunction::Ne }, [base, bound.1]))
+            }
+        },
+        FilterInput::Unknowns => do {
+            if !entry.half_open { fail!("Unknowns requires a half-open domain", entry.id) }
+            else if op != FilterOp::Eq && op != FilterOp::Ne { fail!("half-open domain supports only Eq or Ne", entry.id, op) }
+            else {
+                let known = canonical_known_with_context(ctx, entry, base);
+                (known.0, if op == FilterOp::Ne { known.1 }
+                    else { qb::scalar(qb::ScalarFunction::And, [qb::is_not_null(base), qb::scalar(qb::ScalarFunction::Not, [known.1])]) })
+            }
+        },
+        _ => canonical_known_compare_with_context(ctx, entry, base, op, input),
+    }
+};
+
+def known_wire: Fn(DimensionEntry, String) -> Bool = fn(entry, raw) {
+    array::any(entry.canonical_values, fn(value) { array::any(value.wires, fn(wire) { wire == FilterInput::Text(raw) }) })
+};
+
+def canonical_known_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base) {
+    let known = array::fold(entry.canonical_values, (ctx, None), fn(state, value) {
+        let equal = canonical_known_compare_with_context(state.0, entry, base, FilterOp::Eq, FilterInput::Text(value.id));
+        (equal.0, Some(match state.1 { None => equal.1, Some(prev) => qb::scalar(qb::ScalarFunction::Or, [prev, equal.1]) }))
+    });
+    (known.0, match known.1 { Some(expr) => expr, None => fail!("empty canonical domain", entry.id) })
+};
+
+def dimension_kind_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry) -> (qb::BuildCtx, qb::Expr) = fn(ctx, payload, entry) {
+    let physical = dimension_expr(ctx, payload, entry);
+    let known = canonical_known_with_context(physical.0, entry, physical.1);
+    let k = qb::bind(known.0, qb::Val::String("Known"));
+    let u = qb::bind(k.0, qb::Val::String("Unknown"));
+    let n = qb::bind(u.0, qb::Val::None);
+    (n.0, qb::scalar_if(known.1, k.1, qb::scalar_if(qb::is_not_null(physical.1), u.1, n.1)))
+};
+
+def canonical_known_compare_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, FilterOp, FilterInput) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base, op, input) {
     let id = match input {
         FilterInput::Text(value) => value,
         _ => fail!("canonical dimension requires a text business value", entry.id, input),
@@ -3194,7 +3281,7 @@ def canonical_compare_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, F
             Some(expr) => expr,
             None => fail!("canonical value has no physical wires", entry.id, id),
         };
-        if op == FilterOp::Eq { (wires.0, compared) }
+        if op == FilterOp::Eq || entry.half_open { (wires.0, compared) }
         else {
             let known = array::fold(entry.canonical_values, (wires.0, None), fn(state, value) {
                 let equal = canonical_compare_with_context(state.0, entry, base, FilterOp::Eq, FilterInput::Text(value.id));
@@ -3340,6 +3427,8 @@ def combine_filters: Fn(Array(qb::Expr)) -> Option(qb::Expr) = fn(exprs) {
 def any_of_value_ok: Fn(DimensionEntry, FilterInput) -> Bool = fn(entry, value) {
     if array::length(entry.canonical_values) > 0 {
         match value {
+            FilterInput::Unknown(raw) => entry.half_open && !known_wire(entry, raw),
+            FilterInput::Unknowns => entry.half_open,
             FilterInput::Text(s) => array::any(entry.canonical_values, fn(v) { v.id == s }),
             _ => False,
         }
@@ -4785,9 +4874,15 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                 } else {
                     let output = dimension_output_with_context(state.0, payload, dimension);
                     let original = get_index(payload.entities, instance.entity).alias;
-                    (output.0, array::push(state.1, qb::named_expr_item(
+                    let projection = array::push(state.1, qb::named_expr_item(
                         retarget_inner_expr(output.1, original, instance.source.alias),
-                        `\{item.node}_\{item.dimension}`)))
+                        `\{item.node}_\{item.dimension}`));
+                    if dimension.half_open {
+                        let kind = dimension_kind_with_context(output.0, payload, dimension);
+                        (kind.0, array::push(projection, qb::named_expr_item(
+                            retarget_inner_expr(kind.1, original, instance.source.alias),
+                            `\{item.node}_\{item.dimension}__kind`)))
+                    } else { (output.0, projection) }
                 }
             });
             let row_projection = selected.1;
@@ -4805,8 +4900,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                             || array::length(dimension.values) > 0 || dimension.output_type == OutputType::Boolean {
                             fail!("graph order dimension has no declared business ordering; use a plain ordered dimension or extend the Model with an explicit value order", item.node, item.dimension)
                         } else {
-                            match get_index(row_projection, entry.0) {
-                                qb::SelectItem::NamedExpr(named) => {
+                            match array::find(row_projection, fn(projected) { match projected {
+                                qb::SelectItem::NamedExpr(named) => named.alias == `\{item.node}_\{item.dimension}`,
+                                _ => False,
+                            } }) {
+                                Some(qb::SelectItem::NamedExpr(named)) => {
                                     let ranked = if array::length(dimension.canonical_order) > 0 {
                                         let instance = graph_instance(built.1, item.node);
                                         let field = get_index(get_index(payload.entities, instance.entity).fields, dimension.field);
@@ -4842,11 +4940,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                 let projected = graph_measure_projection(state.0, payload, request, built.1, item, state.2);
                 (projected.0, array::push(state.1, projected.1), projected.2)
             });
-            let internal_measures = array::filter(measures.2, fn(item) {
+            let declared_internal_measures = array::filter(measures.2, fn(item) {
                 !array::any(measures.1, fn(visible) { graph_measure_alias(visible) == graph_measure_alias(item) })
             });
             let value_count = match request.count_value {
-                None => (measures.0, []),
+                None => (measures.0, [], []),
                 Some(item) => do {
                     let instance = graph_instance(built.1, item.node);
                     let dimension = match array::find(payload.dimensions, fn(d) { d.id == item.dimension }) {
@@ -4859,14 +4957,27 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                         fail!("graph count_value dimension is not authorized", item.node, item.dimension)
                     } else if dimension.computed || array::length(dimension.scope) > 0 {
                         fail!("graph count_value requires a plain unscoped dimension", item.node, item.dimension)
+                    } else if dimension.half_open {
+                        let physical = dimension_expr(measures.0, payload, dimension);
+                        let known = canonical_known_with_context(physical.0, dimension, physical.1);
+                        let output = dimension_output_with_context(known.0, payload, dimension);
+                        let n = qb::bind(output.0, qb::Val::None);
+                        let original = get_index(payload.entities, instance.entity).alias;
+                        let kexpr = retarget_inner_expr(qb::scalar_if(known.1, output.1, n.1), original, instance.source.alias);
+                        let uexpr = retarget_inner_expr(qb::scalar_if(known.1, n.1, physical.1), original, instance.source.alias);
+                        let alias = `\{item.node}_\{item.dimension}_count`;
+                        (n.0, [qb::computed_item(qb::ComputedOp::Add, `\{alias}__known`, `\{alias}__unknown`, alias)],
+                            [qb::aggregate(qb::AggregateFunction::Count, kexpr, True, `\{alias}__known`),
+                             qb::aggregate(qb::AggregateFunction::Count, uexpr, True, `\{alias}__unknown`)])
                     } else {
                         let output = dimension_output_with_context(measures.0, payload, dimension);
                         let original = get_index(payload.entities, instance.entity).alias;
                         let expr = retarget_inner_expr(output.1, original, instance.source.alias);
-                        (output.0, [qb::aggregate(qb::AggregateFunction::Count, expr, True, `\{item.node}_\{item.dimension}_count`)])
+                        (output.0, [qb::aggregate(qb::AggregateFunction::Count, expr, True, `\{item.node}_\{item.dimension}_count`)], [])
                     }
                 },
             };
+            let internal_measures = array::concat([declared_internal_measures, value_count.2]);
             let projection = match request.count {
                 None => array::concat([row_projection, measures.1, value_count.1]),
                 Some(subject_id) => {
@@ -4960,12 +5071,12 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                     Some(entry) => entry,
                     None => fail!("graph projection references an unknown dimension", item.node, item.dimension),
                 };
-                if array::length(dimension.canonical_values) > 0 {
+                if array::length(dimension.canonical_values) > 0 && !dimension.half_open {
                     let known = graph_any_of(state.0, payload, built.1, [{node: item.node,
                         dimension: item.dimension,
                         values: array::map(dimension.canonical_values, fn(value) { FilterInput::Text(value.id) })}]);
                     (known.0, array::concat([state.1, known.1]))
-                } else if request.count == Some(request.root) && array::length(request.group_by_identity) == 0 {
+                } else if !dimension.half_open && request.count == Some(request.root) && array::length(request.group_by_identity) == 0 {
                     let instance = graph_instance(built.1, item.node);
                     let field = get_index(get_index(payload.entities, instance.entity).fields, dimension.field);
                     (state.0, array::push(state.1,
@@ -5170,6 +5281,7 @@ pub use self::{
     guarded_business_link,
     enum_value,
     canonical_values,
+    half_open,
     canonical_order,
     canonical_alias,
     localized_canonical_value,
