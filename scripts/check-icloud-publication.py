@@ -19,6 +19,7 @@ def main():
     keys += [f"Relation/{row['from_dataset']}/{row['id']}" for row in report["relations"]]
     keys += ["TimeRole/current_alarm/occur_utc", "Dimension/current_alarm/alarm_severity"]
     keys += ["Dimension/device/device_class"]
+    keys += ["Field/device/name", "Field/device/id", "Field/device_kpi/cpu_usage"]
     requests = [{"method": "ic/info", "input": {"key": key}} for key in keys]
     graph = {
         "op": "Graph", "root": "alarm",
@@ -70,6 +71,12 @@ def main():
     assert nodes["TimeRole/current_alarm/occur_utc"]["detail"]["encoding"] == "EpochMillis"
     detail = nodes["Dimension/device/device_class"]["detail"]
     assert detail["half_open"] and "unknowns" in detail["value_contract"], detail
+    device_detail = nodes["Dataset/device"]["detail"]
+    assert device_detail["references"] == [{"id": "id", "fields": ["id"]}], device_detail
+    assert nodes["Field/device/name"]["detail"]["roles"] == ["Appellation"]
+    assert nodes["Field/device/id"]["detail"]["roles"] == ["Reference"]
+    assert nodes["Field/device/id"]["detail"]["reference_ids"] == ["id"]
+    assert nodes["Field/device_kpi/cpu_usage"]["detail"]["roles"] == ["Metric"]
     result = responses[-2]
     assert result["accepted"] and len(result["queries"]) == 1, result
     query = result["queries"][0]
@@ -88,7 +95,7 @@ def main():
     print(json.dumps({"index_entries": len(entries), "dataset_documents": 50,
                       "relation_documents": len(report["relations"]),
                       "clock_encoding": "EpochMillis", "query": "passed",
-                      "half_open": "passed"}, indent=2))
+                      "half_open": "passed", "field_roles": "passed"}, indent=2))
 
 
 if __name__ == "__main__":

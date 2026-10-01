@@ -207,6 +207,30 @@ type DatasetSpec = struct {
     grain: Array(String),
     utc_time: Option(String),
 };
+
+# Roles describe business use; they do not grant query access or define grain.
+type FieldRole = enum { Appellation, Reference, Classification, Metric };
+@prelude::property(PropertyTarget::Field)
+type FieldRolesDef = struct { roles: Array(FieldRole) };
+type ReferenceSpec = struct { id: String, fields: Array(String) };
+@prelude::property(PropertyTarget::Type)
+type ReferencesDef = struct { references: Array(ReferenceSpec) };
+type FieldRoleBrief = struct { field: String, roles: Array(FieldRole) };
+
+def field_role: Fn(FieldRole) -> Fn(property::FieldPropertyCtx, Option(FieldRolesDef)) -> FieldRolesDef = fn(role) {
+    fn(ctx, previous) {
+        let roles = match previous { Some(declared) => declared.roles, None => [] };
+        {roles: array::push(roles, role)}
+    }
+};
+
+# Every complete set is a trusted unique address within the declaring type.
+def reference: Fn(String, Array(String)) -> Fn(td::TypeDesc, Option(ReferencesDef)) -> ReferencesDef = fn(id, fields) {
+    fn(ctx, previous) {
+        let references = match previous { Some(declared) => declared.references, None => [] };
+        {references: array::push(references, {id, fields})}
+    }
+};
 @prelude::property(PropertyTarget::Type)
 type DatasetDescription = struct { label: String, summary: String };
 @prelude::property(PropertyTarget::Type)
@@ -532,6 +556,8 @@ type UnionEntry = struct {
 };
 
 type EntityEntry = struct {
+    references: Array(ReferenceSpec),
+    field_roles: Array(FieldRoleBrief),
     index: Int,
     id: String,
     entity_type: Type,
@@ -630,6 +656,8 @@ type TimeRoleBrief = struct {
 };
 
 type DatasetBrief = struct {
+    references: Array(ReferenceSpec),
+    field_roles: Array(FieldRoleBrief),
     id: String,
     label: String,
     aliases: Array(String),
@@ -1192,6 +1220,14 @@ def int_range: Fn(Int) -> Array(Int) = fn(n) {
 };
 
 def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, name, field_ty) {
+    let roles = match property::get_field_prop(owner, index, FieldRolesDef.type) {
+        Some(declared) => declared.roles, None => [],
+    };
+    if array::any(roles, fn(role) { role == FieldRole::Reference }) {
+        fail!("Reference role must be derived from a type-level reference", owner, name)
+    } else if array::any(roles, fn(role) { array::length(array::filter(roles, fn(other) { other == role })) > 1 }) {
+        fail!("duplicate field role", owner, name)
+    } else { () };
     if let Some(role) = property::get_field_prop(owner, index, TimeField.type) {
         let expected = match role.encoding {
             TimeEncoding::CanonicalUtcSecondText => String.type,
@@ -1344,6 +1380,49 @@ def nullable_identity_type: Fn(Type) -> Bool = fn(ty) {
     }
 };
 
+def collect_references: Fn(Type, Array(FieldEntry)) -> Array(ReferenceSpec) = fn(ty, fields) {
+    let references = match property::get_type_prop(ty, ReferencesDef.type) {
+        Some(declared) => declared.references, None => [],
+    };
+    array::map(references, fn(ref) {
+        if ref.id == "" || array::length(ref.fields) == 0 { fail!("reference requires a nonempty id and field set", ty, ref) }
+        else if array::length(array::filter(references, fn(other) { other.id == ref.id })) != 1 {
+            fail!("duplicate reference id", ty, ref.id)
+        } else { () };
+        array::map(ref.fields, fn(name) {
+            if array::length(array::filter(ref.fields, fn(other) { other == name })) != 1 {
+                fail!("duplicate reference field", ty, ref.id, name)
+            } else { () };
+            let field = match array::find(fields, fn(field) { field.name == name }) {
+                Some(field) => field, None => fail!("unknown reference field", ty, ref.id, name),
+            };
+            if nullable_identity_type(field.ty) { fail!("reference field cannot be nullable", ty, ref.id, name) }
+            else if field.ty != String.type && field.ty != Int.type && field.ty != Float.type && field.ty != Bool.type
+                && array::length(value_domain(field.ty)) == 0 {
+                fail!("reference field requires a scalar or closed enum type", ty, ref.id, name)
+            } else { () }
+        });
+        if array::length(array::filter(references, fn(other) {
+            array::length(other.fields) == array::length(ref.fields)
+                && array::all(other.fields, fn(name) { array::any(ref.fields, fn(field) { field == name }) })
+        })) != 1 { fail!("duplicate reference field set", ty, ref.id) } else { () };
+        ref
+    })
+};
+
+def field_roles_for: Fn(Type, FieldEntry, Array(ReferenceSpec)) -> Array(FieldRole) = fn(owner, field, references) {
+    let declared = match property::get_field_prop(owner, field.index, FieldRolesDef.type) {
+        Some(note) => note.roles, None => [],
+    };
+    let roles = if property::get_field_prop(owner, field.index, MetricValueSpec.type) != None
+        && !array::any(declared, fn(role) { role == FieldRole::Metric }) {
+        array::push(declared, FieldRole::Metric)
+    } else { declared };
+    if array::any(references, fn(ref) { array::any(ref.fields, fn(name) { name == field.name }) }) {
+        array::push(roles, FieldRole::Reference)
+    } else { roles }
+};
+
 def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     let src = property::get_type_prop(ty, EntitySource.type);
     let union_prop = property::get_type_prop(ty, UnionSourceDef.type);
@@ -1355,6 +1434,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     let fields = array::map(enumerated, fn(pair) {
         build_field(ty, pair.1.index, pair.1.name, pair.1.ty)
     });
+    let references = collect_references(ty, fields);
     let declared_keys = array::filter(fields, fn(f) { f.is_key });
     if array::length(declared_keys) > 1 {
         fail!("entity declares multiple key fields; use dataset grain for composite identity",
@@ -1483,6 +1563,10 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
     }) {
         fail!("duplicate metric value id", duplicate.id)
     } else { () };
+    let field_roles = array::flat_map(fields, fn(field) {
+        let roles = field_roles_for(ty, field, references);
+        if array::length(roles) == 0 { [] } else { [{field: field.name, roles}] }
+    });
     match (src, union_prop) {
         (Some(source), None) => do {
             if !qb::is_sql_identifier(source.table) {
@@ -1500,7 +1584,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 None => source.alias,
             };
             let handle = qb::source_with_hint(qb::build_context(), source.table, source.alias).1;
-            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, source: handle, key_field, fields, union: None, dataset: validated_dataset, metrics, description, scope: entity_scopes };
+            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, source: handle, key_field, fields, union: None, dataset: validated_dataset, metrics, description, scope: entity_scopes, references, field_roles };
             result
         },
         (None, Some(union_def)) => do {
@@ -1511,7 +1595,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 None => union.alias,
             };
             let handle = qb::source_with_hint(qb::build_context(), union.alias, union.alias).1;
-            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, source: handle, key_field, fields, union: Some(union), dataset: validated_dataset, metrics, description, scope: entity_scopes };
+            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, source: handle, key_field, fields, union: Some(union), dataset: validated_dataset, metrics, description, scope: entity_scopes, references, field_roles };
             result
         },
         _ => fail!("entity must declare exactly one of entity_source or union_source", ty),
@@ -2980,6 +3064,20 @@ def native_pair_domain: Fn(PreparedPayload, String) -> Array(NativePairEntry) = 
 };
 
 def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(payload, entity, authorized_only) {
+        let references = if authorized_only {
+            array::filter(entity.references, fn(ref) { array::all(ref.fields, fn(name) {
+                knowledge_target_declared(payload, {kind: KnowledgeKind::Field, owner: entity.id, id: name})
+            }) })
+        } else { entity.references };
+        let field_roles = array::flat_map(entity.field_roles, fn(field) {
+            if authorized_only && !knowledge_target_declared(payload,
+                {kind: KnowledgeKind::Field, owner: entity.id, id: field.field}) { [] }
+            else {
+                let roles = array::filter(field.roles, fn(role) { role != FieldRole::Reference
+                    || array::any(references, fn(ref) { array::any(ref.fields, fn(name) { name == field.field }) }) });
+                if array::length(roles) == 0 { [] } else { [{field: field.field, roles}] }
+            }
+        });
         let kind = match entity.dataset {
             Some(spec) => spec.kind,
             None => DatasetKind::Entity,
@@ -3017,6 +3115,7 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
             }
         });
         let result: DatasetBrief = {
+            references, field_roles,
             id: entity.id,
             label: description.label,
             aliases: match property::get_type_prop(entity.entity_type, DatasetAliasesDef.type) {
@@ -5183,6 +5282,9 @@ pub use self::{
     RelationDescriptions,
     RelationNote,
     DatasetBrief,
+    FieldRole,
+    FieldRoleBrief,
+    ReferenceSpec,
     UnionSourceDef,
     UnionBranchDecl,
     UnionColumnDecl,
@@ -5257,6 +5359,8 @@ pub use self::{
     dimension,
     computed_dimension,
     entity_source,
+    field_role,
+    reference,
     entity_id,
     dataset,
     metric_value,

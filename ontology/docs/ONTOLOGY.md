@@ -40,6 +40,10 @@ work still needed before declaring full cross-dialect support.
 
 ## Model declarations
 
+Attribute business roles and named unique reference sets are described in
+[FIELD-ROLES.md](FIELD-ROLES.md). They enrich discovery independently of query
+permissions, keys, grain and aggregate rules.
+
 - `@entity_id` and `@entity_source` name a dataset and its trusted physical
   source. `@dataset` can declare its kind and full identity grain; `@key()` is
   also used by models without an explicit dataset grain.
