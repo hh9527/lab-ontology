@@ -218,9 +218,84 @@ pub def equivalent_reference_sets_rejected: test::Test = test::should_fail_with(
 @edsl::entity_source("bad", "b")
 @edsl::reference("id", ["id"])
 type Nullable = struct { id: Option(String) };
-pub def nullable_reference_field_rejected: test::Test = test::should_fail_with(fn() {
-    edsl::build_root("bad", [Nullable.type], profile)
-}, "reference field cannot be nullable");
+pub def nullable_reference_field_supported: test::Test = test::should_ok(fn() {
+    let prepared = edsl::build_root("nullable", [Nullable.type], profile);
+    if prepared.entities[0].references == [{id: "id", fields: ["id"]}]
+        && prepared.entities[0].fields[0].nullable
+        && prepared.entities[0].key_field == -1 && prepared.entities[0].dataset == None { True }
+    else { fail!("nullable reference inferred total identity", prepared.entities[0]) }
+});
+
+@edsl::entity_id("frames")
+@edsl::entity_source("frames", "f")
+@edsl::reference("dn", ["dn"])
+@edsl::reference("local", ["tenant", "dn"])
+type OptionalFrame = struct {
+    @edsl::column("dn")
+    @edsl::dimension("dn", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    dn: Option(String),
+    @edsl::column("tenant")
+    @edsl::dimension("tenant", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    tenant: Option(String),
+    @edsl::column("name")
+    @edsl::measure("rows", qb::AggregateFunction::Count, [])
+    @edsl::dimension("name", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    name: String,
+};
+def optional_payload: edsl::PreparedPayload = edsl::build_root("optional", [OptionalFrame.type], profile);
+pub def optional_reference_discovery_preserves_complete_sets_and_nullability: test::Test = test::should_ok(fn() {
+    let lookup = knowledge::knowledge_lookup_factory(optional_payload);
+    let dataset = lookup({kind: edsl::KnowledgeKind::Dataset, owner: "", id: "frames"});
+    let dn = lookup({kind: edsl::KnowledgeKind::Field, owner: "frames", id: "dn"});
+    let name = lookup({kind: edsl::KnowledgeKind::Field, owner: "frames", id: "name"});
+    match (dataset, dn, name) {
+        (knowledge::DocResult::Found(d), knowledge::DocResult::Found(f), knowledge::DocResult::Found(n)) =>
+            if d.references == [{id: "dn", fields: ["dn"]}, {id: "local", fields: ["tenant", "dn"]}]
+                && f.nullable && !n.nullable && d.grain == [] { True }
+            else { fail!("optional reference discovery lost its contract", d, f, n) },
+        _ => fail!("optional reference discovery missing"),
+    }
+});
+pub def optional_field_uses_non_null_query_operand: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(query_intent_ast_factory(optional_payload)(json::parse(r#"{
+        "op":"Graph","root":"f","nodes":[{"id":"f","entity":"frames"}],
+        "edges":[],"select":[{"node":"f","dimension":"dn"}],
+        "filters":[{"node":"f","dimension":"dn","op":"Eq","value":"DN-A"}]
+    }"#).unwrap!()));
+    if query.bindings == [qb::Val::String("DN-A")] { True }
+    else { fail!("optional field changed query operand", query) }
+});
+pub def optional_field_wire_detail_exposes_nullability: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(optional_payload);
+    let response = codec::decode@[knowledge::NodeResponse](info(json::parse(r#"{"key":"Field/frames/dn"}"#).unwrap!())).unwrap!();
+    match response {
+        knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => do {
+            let detail = codec::decode@[knowledge::FieldDetail](node.detail).unwrap!();
+            if detail.nullable && detail.reference_ids == ["dn", "local"] { True }
+            else { fail!("wire detail lost nullability", detail) }
+        },
+        _ => fail!("optional field document missing"),
+    }
+});
+pub def optional_reference_does_not_enable_identity_grouping: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(optional_payload)(json::parse(r#"{
+        "op":"Graph","root":"f","nodes":[{"id":"f","entity":"frames"}],
+        "edges":[],"select":[{"node":"f","dimension":"name"}],
+        "measures":[{"node":"f","measure":"rows"}],"group_by_identity":["f"]
+    }"#).unwrap!())
+}, "graph identity requires a declared key or dataset grain");
+@edsl::entity_source("bad", "b")
+type OptionalKey = struct { @edsl::column("id") @edsl::key() id: Option(String) };
+pub def optional_key_remains_invalid: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [OptionalKey.type], profile)
+}, "key identity cannot be nullable");
+@edsl::entity_source("bad", "b")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id"], None)
+type OptionalGrain = struct { @edsl::column("id") id: Option(String) };
+pub def optional_grain_remains_invalid: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [OptionalGrain.type], profile)
+}, "dataset grain identity cannot be nullable");
 @edsl::entity_source("bad", "b")
 @edsl::reference("id", ["id"])
 type Complex = struct { id: Array(String) };

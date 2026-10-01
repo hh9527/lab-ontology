@@ -23,7 +23,7 @@ ENTITY = re.compile(
     r'@edsl::entity_source\("(?P<table>[^"]+)",[^\n]+\n.*?)'
     r'type (?P<type>\w+) = struct \{\n(?P<body>.*?)^\};', re.S | re.M,
 )
-FIELD = re.compile(r'@edsl::column\("([^"]+)"\).*?^    (\w+): (\w+),', re.S | re.M)
+FIELD = re.compile(r'@edsl::column\("([^"]+)"\).*?^    (\w+): (\w+(?:\(\w+\))?),', re.S | re.M)
 
 
 def text(value):

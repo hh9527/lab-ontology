@@ -20,6 +20,7 @@ def main():
     keys += ["TimeRole/current_alarm/occur_utc", "Dimension/current_alarm/alarm_severity"]
     keys += ["Dimension/device/device_class"]
     keys += ["Field/device/name", "Field/device/id", "Field/device_kpi/cpu_usage"]
+    keys += ["Field/frame/frame_dn", "Field/frame/name"]
     requests = [{"method": "ic/info", "input": {"key": key}} for key in keys]
     graph = {
         "op": "Graph", "root": "alarm",
@@ -77,6 +78,13 @@ def main():
     assert nodes["Field/device/id"]["detail"]["roles"] == ["Reference"]
     assert nodes["Field/device/id"]["detail"]["reference_ids"] == ["id"]
     assert nodes["Field/device_kpi/cpu_usage"]["detail"]["roles"] == ["Metric"]
+    frame = nodes["Dataset/frame"]["detail"]
+    assert frame["references"] == [{"id": "dn", "fields": ["frame_dn"]}], frame
+    assert frame["grain"] == [], frame
+    assert nodes["Field/frame/frame_dn"]["detail"]["nullable"] is True
+    assert nodes["Field/frame/name"]["detail"]["nullable"] is False
+    assert "Field/frame/id" not in indexed
+    assert "Dimension/frame/frame_id" not in indexed
     result = responses[-2]
     assert result["accepted"] and len(result["queries"]) == 1, result
     query = result["queries"][0]

@@ -53,7 +53,8 @@ without changing either address. Preparation does not inspect stored values
 to prove uniqueness, and this API does not implement address resolution.
 
 Reference ids and sets must be nonempty; ids are distinct per type; members
-must exist and be distinct. Nullable or nonscalar members fail preparation.
+must exist and be distinct. Members may be `T` or `Option(T)`, where T is
+a scalar or closed enum; nonscalar members fail preparation.
 Equivalent sets with reordered members are duplicates. Declaration order is
 preserved but does not assign priority. Direct field_role(Reference) fails:
 membership must come from a complete type-level reference.
@@ -63,10 +64,21 @@ authorization. Existing key/grain declarations are not implicitly converted
 into references. A supplied address must contain all members and valid non-NULL
 values; enforcing that input contract belongs to a future address consumer.
 
+`Option(T)` expresses field nullability directly in the type system. A
+reference with optional members is unique whenever all its members are
+present; a missing member makes the whole address unavailable. NULL is not
+an address value. Such a reference does not establish a total row identity:
+nullable fields remain forbidden as primary keys or dataset grain members.
+Types without a key or declared grain still support raw field queries and
+relation traversal; object counts and identity grouping require an independently
+declared total identity. Query preparation retains nullability while checking
+operands against T, including joins between T and Option(T).
+
 ## Discovery
 
 Dataset detail adds `references: [{id,fields}]` and
-`field_roles: [{field,roles}]`. Field detail adds `roles` and `reference_ids`.
+`field_roles: [{field,roles}]`. Field detail adds `roles`, `reference_ids`, and
+`nullable`, derived from the model field's `Option(T)` type.
 Members use model field names, not SQL columns or dimension ids. A model
 field name is not query vocabulary: an Agent still needs an authorized
 dimension or measure to retrieve its value.

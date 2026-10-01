@@ -115,3 +115,9 @@ node ontology/tools/knowledge-html.mjs /tmp/foo-knowledge.json > /tmp/foo-knowle
 
 The static HTML is a view of the same visible knowledge map, not a separate
 Model. Access to the artifact is controlled by the host.
+
+## Field nullability
+
+Field detail publishes `nullable`, derived from `Option(T)`. Reference
+uniqueness applies to complete non-NULL tuples; any missing member makes the
+reference unavailable. This does not imply a total query grain or primary key.

@@ -325,7 +325,7 @@ def model_field: for(Owner, Scalar) Fn(TypeOf(Owner), TypeOf(Scalar), String) ->
         Some(f) => f,
         None => fail!("model field reference does not exist on its owner", owner, name),
     };
-    if field.ty != scalar {
+    if field_value_type(field.ty) != scalar {
         fail!("model field reference has the wrong scalar type", owner, name, scalar)
     } else {
         {owner, scalar, name}
@@ -523,11 +523,12 @@ type FilterRequest = struct {
 # ---------------------------------------------------------------------------
 
 type FieldEntry = struct {
+    nullable: Bool,
     index: Int,
     name: String,
     column: String,
     is_key: Bool,
-    ty: Type,
+    ty: Type, # Non-null value type, with Option(T) retained in entity_type.
 };
 
 # One member of a closed enum value domain. `value` is the stable
@@ -1220,6 +1221,8 @@ def int_range: Fn(Int) -> Array(Int) = fn(n) {
 };
 
 def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, name, field_ty) {
+    let nullable = nullable_identity_type(field_ty);
+    let scalar = field_value_type(field_ty);
     let roles = match property::get_field_prop(owner, index, FieldRolesDef.type) {
         Some(declared) => declared.roles, None => [],
     };
@@ -1236,7 +1239,7 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
             TimeEncoding::DateText => String.type,
             TimeEncoding::Rfc3339Text => String.type,
         };
-        if field_ty != expected {
+        if scalar != expected {
             fail!("time encoding disagrees with field type", name, role.encoding)
         } else { () }
     } else { () };
@@ -1247,7 +1250,7 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
     };
     let key = property::get_field_prop(owner, index, KeyFlag.type);
     let is_key = key != None;
-    let result: FieldEntry = { index, name, column, is_key, ty: field_ty };
+    let result: FieldEntry = { index, name, column, is_key, ty: scalar, nullable };
     result
 };
 
@@ -1380,6 +1383,19 @@ def nullable_identity_type: Fn(Type) -> Bool = fn(ty) {
     }
 };
 
+# Query operands use the non-null value type; identity retains nullability.
+def field_value_type: Fn(Type) -> Type = fn(ty) {
+    if nullable_identity_type(ty) {
+        match array::find(td::variants(ty), fn(v) { v.name == "Some" }) {
+            Some(variant) => match variant.payload {
+                Some(payload) => payload,
+                None => fail!("optional field has no value type", ty),
+            },
+            None => fail!("optional field has no Some variant", ty),
+        }
+    } else { ty }
+};
+
 def collect_references: Fn(Type, Array(FieldEntry)) -> Array(ReferenceSpec) = fn(ty, fields) {
     let references = match property::get_type_prop(ty, ReferencesDef.type) {
         Some(declared) => declared.references, None => [],
@@ -1396,9 +1412,9 @@ def collect_references: Fn(Type, Array(FieldEntry)) -> Array(ReferenceSpec) = fn
             let field = match array::find(fields, fn(field) { field.name == name }) {
                 Some(field) => field, None => fail!("unknown reference field", ty, ref.id, name),
             };
-            if nullable_identity_type(field.ty) { fail!("reference field cannot be nullable", ty, ref.id, name) }
-            else if field.ty != String.type && field.ty != Int.type && field.ty != Float.type && field.ty != Bool.type
-                && array::length(value_domain(field.ty)) == 0 {
+            let scalar = field.ty;
+            if scalar != String.type && scalar != Int.type && scalar != Float.type && scalar != Bool.type
+                && array::length(value_domain(scalar)) == 0 {
                 fail!("reference field requires a scalar or closed enum type", ty, ref.id, name)
             } else { () }
         });
@@ -1440,7 +1456,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
         fail!("entity declares multiple key fields; use dataset grain for composite identity",
             ty, array::map(declared_keys, fn(f) { f.name }))
     } else { () };
-    if let Some(field) = array::find(fields, fn(f) { f.is_key && nullable_identity_type(f.ty) }) {
+    if let Some(field) = array::find(fields, fn(f) { f.is_key && f.nullable }) {
         fail!("key identity cannot be nullable", ty, field.name)
     } else { () };
     let entity_scopes: Array(ScopePredicate) = match property::get_type_prop(ty, EntityScopeDef.type) {
@@ -1479,7 +1495,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                         fail!("duplicate dataset grain field", name)
                     } else if !array::any(fields, fn(field) { field.name == name }) {
                         fail!("unknown dataset grain field", name)
-                    } else if array::any(fields, fn(field) { field.name == name && nullable_identity_type(field.ty) }) {
+                    } else if array::any(fields, fn(field) { field.name == name && field.nullable }) {
                         fail!("dataset grain identity cannot be nullable", ty, name)
                     } else {
                         array::push(seen, name)

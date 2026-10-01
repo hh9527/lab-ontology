@@ -84,9 +84,12 @@ def check(report, catalog, exceptions, aliases, metadata=None):
                         if not role or role["encoding"] != "EpochMillis":
                             errors.append(f"integer clock lacks provisional epoch encoding {entity['id']}.{raw['name']}")
             for column in fields.keys() - {raw["name"] for raw in source["fields"]}:
-                supplemental = exceptions["supplemental_fields"].get("Frame.id")
-                if not (entity["id"] == "frame" and supplemental and column == supplemental["column"]):
-                    errors.append(f"unproved physical column {entity['id']}.{column}")
+                errors.append(f"unproved physical column {entity['id']}.{column}")
+            for raw in source["fields"]:
+                field = fields.get(raw["name"])
+                if entity["id"] == "frame" and field is not None:
+                    if field.get("nullable") != (raw.get("nullable") == "Y"):
+                        errors.append(f"wrong nullability {entity['id']}.{raw['name']}")
     for relation in catalog["relations"]:
         source = by_name[relation["source"]]
         target = by_name[relation["target"]]

@@ -11,6 +11,7 @@ type LinkKind = enum { Member, Traversable, Related };
 type KnowledgeLink = struct { target: edsl::KnowledgeTarget, kind: LinkKind };
 type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: Array(String), summary: String };
 type Point = struct {
+    nullable: Bool,
     references: Array(edsl::ReferenceSpec),
     field_roles: Array(edsl::FieldRoleBrief),
     roles: Array(edsl::FieldRole),
@@ -43,7 +44,7 @@ type Node = struct { key: String, type: edsl::KnowledgeKind, description: Descri
 type NodeResult = enum { NotFound, Found(Node) };
 type NodeResponse = enum { Document(NodeResult) };
 type DatasetDetail = struct { id: String, grain: Array(String), time_roles: Array(edsl::TimeRoleBrief), references: Array(edsl::ReferenceSpec), field_roles: Array(edsl::FieldRoleBrief) };
-type FieldDetail = struct { id: String, dataset: String, roles: Array(edsl::FieldRole), reference_ids: Array(String) };
+type FieldDetail = struct { id: String, dataset: String, nullable: Bool, roles: Array(edsl::FieldRole), reference_ids: Array(String) };
 type ValueDetail = struct { id: String, dimension: String };
 type BusinessLinkDetail = struct { id: String, hub: String, direction: Option(edsl::LinkDirection), guard: Option(edsl::ScopePredicate) };
 
@@ -57,7 +58,7 @@ def traversable: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target
 def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(KnowledgeLink)) -> Point =
     fn(id, label, aliases, summary, refs) {
         {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [], time_role: None,
-            references: [], field_roles: [], roles: [],
+            references: [], field_roles: [], roles: [], nullable: False,
             dimension: None, measure: None, relation: None, metric: None, direction: None, guard: None,
             entries: None, terminology: None}
     };
@@ -68,7 +69,7 @@ def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
 
 def syntax_points: Array(Point) = [
     point(syntax_target("model/field_roles"), "Field roles and object references", [],
-        "Dataset detail.references contains named {id,fields} sets. Each complete set is a trusted unique address within that dataset; fields inside a set participate together, and different sets are alternative addresses. Do not treat one member of a composite set as a complete reference. Dataset detail.field_roles contains {field,roles}; Field detail has roles and reference_ids. Appellation participates in identity display and need not be unique; Reference participates in an explicitly declared unique address; Classification describes a category; Metric describes quantitative use. Roles may overlap. Formal metric declarations also derive Metric. Roles grant no query capabilities, do not change grain or keys, and imply no default display, URL, unit or aggregate. Only fully visible references are published. Query and report consumers must respect the separately declared capabilities.", []),
+        "Dataset detail.references contains named {id,fields} sets. Each complete non-NULL tuple is a trusted unique address within that dataset; fields inside a set participate together, and different sets are alternative addresses. Field detail.nullable is derived from Option(T). Any missing member makes the entire reference unavailable; NULL is not an address value. A nullable reference does not establish a total key or grain. Do not treat one member of a composite set as a complete reference. Dataset detail.field_roles contains {field,roles}; Field detail has roles and reference_ids. Appellation participates in identity display and need not be unique; Reference participates in an explicitly declared unique address; Classification describes a category; Metric describes quantitative use. Roles may overlap. Formal metric declarations also derive Metric. Roles grant no query capabilities, do not change grain or keys, and imply no default display, URL, unit or aggregate. Only fully visible references are published. Query and report consumers must respect the separately declared capabilities.", []),
     point(target(edsl::KnowledgeKind::Index, "", "index"), "Knowledge index", [],
         "The complete flat catalog of visible knowledge points. Read it through info with key \"index\" and pass each entry's opaque string key unchanged to info.",
         [member(target(edsl::KnowledgeKind::Terminology, "", "terminology"))]),
@@ -269,10 +270,16 @@ def link_point: Fn(edsl::PreparedPayload, edsl::BusinessLinkEntry) -> Point = fn
 };
 
 def dataset_members: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Array(Point) = fn(payload, brief) {
+    let entity = match array::find(payload.entities, fn(entity) { entity.id == brief.id }) {
+        Some(entity) => entity, None => fail!("published dataset missing", brief.id),
+    };
     let fields = array::map(edsl::published_fields(payload, brief.id), fn(name) {
         let item = point(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], "",
             [member(target(edsl::KnowledgeKind::Dataset, "", brief.id))]);
-        {...item, roles: match array::find(brief.field_roles, fn(field) { field.field == name }) {
+        let field = match array::find(entity.fields, fn(field) { field.name == name }) {
+            Some(field) => field, None => fail!("published field missing", brief.id, name),
+        };
+        {...item, nullable: field.nullable, roles: match array::find(brief.field_roles, fn(field) { field.field == name }) {
             Some(field) => field.roles, None => [],
         }, references: array::filter(brief.references, fn(ref) { array::any(ref.fields, fn(field) { field == name }) })}
     });
@@ -590,7 +597,7 @@ def node_value: Fn(Point) -> Value = fn(item) {
             })))]),
         edsl::KnowledgeKind::Dataset => codec::encode({id: item.target.id, grain: item.grain, time_roles: item.time_roles,
             references: item.references, field_roles: item.field_roles}.ty!(DatasetDetail)),
-        edsl::KnowledgeKind::Field => codec::encode({id: item.target.id, dataset: item.target.owner, roles: item.roles,
+        edsl::KnowledgeKind::Field => codec::encode({id: item.target.id, dataset: item.target.owner, nullable: item.nullable, roles: item.roles,
             reference_ids: array::map(item.references, fn(ref) { ref.id })}.ty!(FieldDetail)),
         edsl::KnowledgeKind::Value => codec::encode({id: item.target.id, dimension: item.target.owner}.ty!(ValueDetail)),
         edsl::KnowledgeKind::Dimension => match item.dimension {
