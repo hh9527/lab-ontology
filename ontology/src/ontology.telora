@@ -37,7 +37,7 @@ type Ipv4Parts = struct { a: Int, b: Int, c: Int, d: Int };
 type LogicalType = enum { Text, Ipv4 };
 def logical_type_ops: Fn(LogicalType) -> Array(FilterOp) = fn(kind) {
     match kind {
-        LogicalType::Ipv4 => [FilterOp::Eq, FilterOp::Ne],
+        LogicalType::Ipv4 => [FilterOp::Eq, FilterOp::Ne, FilterOp::InSubnet, FilterOp::NotInSubnet],
         LogicalType::Text => [FilterOp::Eq, FilterOp::Ne, FilterOp::Gt, FilterOp::Ge,
             FilterOp::Lt, FilterOp::Le, FilterOp::Contains, FilterOp::NotContains,
             FilterOp::StartsWith, FilterOp::EndsWith],
@@ -474,6 +474,7 @@ type GraphRequest = struct {
 type FilterOp = enum {
     Eq, Ne, Gt, Ge, Lt, Le,
     Contains, NotContains, StartsWith, EndsWith,
+    InSubnet, NotInSubnet,
 };
 
 @prelude::property(PropertyTarget::Variant)
@@ -484,7 +485,7 @@ def doc: Fn(String) -> Fn(property::VariantPropertyCtx, Option(VariantDoc)) -> V
 };
 
 type FilterInputKind = enum {
-    @doc("IPv4 address stored as canonical dotted decimal: four octets 0..255, no leading zeros. Equality is address equality, not text search. IPv6 and subnet operations are not supported by this type.")
+    @doc("IPv4 address stored as canonical dotted decimal: four octets 0..255, no leading zeros. Eq/Ne take an address; InSubnet/NotInSubnet take a canonical CIDR network with /0..32 and zero host bits. Read the shared IPv4 subnet contract for backend requirements. IPv6 is not supported.")
     Ipv4,
     Text, Number, Int, Bool, Rfc3339, EpochMillis, Date,
     @doc("UTC time text with second precision. Format: YYYY-MM-DD HH:MM:SS, without a timezone suffix. Example: \"2026-09-20 16:00:00\".")
@@ -509,6 +510,7 @@ def filter_input_docs: Fn(Array(FilterInputKind)) -> Array(FilterInputDoc) = fn(
 };
 
 type FilterInput = enum {
+    Ipv4Subnet(String),
     Ipv4(String),
     Unknown(String),
     Unknowns,
@@ -1331,6 +1333,7 @@ def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input
     if field.logical_type == Some(LogicalType::Ipv4) {
         match input { FilterInput::Ipv4(value) => canonical_ipv4(value), _ => False }
     } else { match input {
+        FilterInput::Ipv4Subnet(_) => False,
         FilterInput::Ipv4(_) => False,
         FilterInput::Unknown(_) => False,
         FilterInput::Unknowns => False,
@@ -2137,6 +2140,7 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
                             FilterInput::Text(s) => field.ty == String.type && s != "",
                             FilterInput::Int(_) => field.ty == Int.type,
                             FilterInput::Ipv4(_) => False,
+                            FilterInput::Ipv4Subnet(_) => False,
                             FilterInput::Number(_) => False,
                             FilterInput::Bool(_) => False,
                             FilterInput::Rfc3339(_) => False,
@@ -2237,7 +2241,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 if ipv4 && (array::length(mapped) > 0 || array::length(enumerated) > 0
                     || dd.input_kinds != [FilterInputKind::Ipv4]
                     || array::any(dd.ops, fn(op) { !array::any(logical_type_ops(LogicalType::Ipv4), fn(allowed) { allowed == op }) })) {
-                    fail!(`IPv4 dimension \{dd.id} requires Ipv4 input and only address Eq/Ne; see info key \{syntax_key_hint("model/logical_types")}`, entity.id, f.name, dd.id)
+                    fail!(`IPv4 dimension \{dd.id} requires Ipv4 input and declared address operations; see info key \{syntax_key_hint("syntax/model/logical_types")}`, entity.id, f.name, dd.id)
                 } else { () };
                 let valid_kind = if ipv4 { FilterInputKind::Ipv4 }
                     else if array::length(enumerated) > 0 { FilterInputKind::Text }
@@ -2318,6 +2322,9 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
 };
 
 def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate), Bool) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open) {
+    if array::any(ops, is_subnet_op) && input_kinds != [FilterInputKind::Ipv4] {
+        fail!(`subnet operations require an IPv4 dimension \{id}; see info key \{syntax_key_hint("syntax/model/logical_types")}`, id)
+    } else { () };
     let wire_shape = fn(kind: FilterInputKind) {
         match kind {
             FilterInputKind::Text => 1,
@@ -2370,7 +2377,7 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
             } else if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
                 fail!("relation fields have different types", pair.from, pair.to)
             } else if is_ipv4_field(from_entity.entity_type, from_field) != is_ipv4_field(to_entity.entity_type, to_field) {
-                fail!(`relation fields have different logical address types; see info key \{syntax_key_hint("model/logical_types")}`, pair.from, pair.to)
+                fail!(`relation fields have different logical address types; see info key \{syntax_key_hint("syntax/model/logical_types")}`, pair.from, pair.to)
             } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
                 property::get_field_prop(to_entity.entity_type, to_field, TimeField.type)) {
                 (None, None) => False,
@@ -2862,7 +2869,10 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
                 })
             };
             array::all(entry.ops, fn(op) {
-                array::all(inputs, fn(input) {
+                let arguments = if is_subnet_op(op) {
+                    array::map(["0.0.0.0/0", "128.0.0.0/1", "192.0.0.0/8", "192.0.0.0/9", "192.0.0.0/16", "192.0.0.0/17", "192.0.2.0/24", "192.0.2.0/25", "192.0.2.1/32"], fn(value) { FilterInput::Ipv4Subnet(value) })
+                } else { inputs };
+                array::all(arguments, fn(input) {
                     let built = filter_value_with_context(qb::build_context(), payload, entry, op, input);
                     if qb::predicate_profile_accepts(built.1, profile) { True }
                     else { fail!("declared dimension filter uses capabilities not allowed by the query profile", entry.id, op) }
@@ -3247,21 +3257,25 @@ def dimension_output_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEn
 
 
 def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(kinds, input) {
-    let kind: FilterInputKind = match input {
-        FilterInput::Ipv4(_) => FilterInputKind::Ipv4,
+    let kind: Option(FilterInputKind) = match input {
+        FilterInput::Ipv4Subnet(_) => None,
+        FilterInput::Ipv4(_) => Some(FilterInputKind::Ipv4),
         FilterInput::Unknown(_) => fail!("Unknown requires a half-open canonical domain", input),
         FilterInput::Unknowns => fail!("Unknowns requires a half-open canonical domain", input),
-        FilterInput::Text(_) => FilterInputKind::Text,
-        FilterInput::Number(_) => FilterInputKind::Number,
-        FilterInput::Int(_) => FilterInputKind::Int,
-        FilterInput::Bool(_) => FilterInputKind::Bool,
-        FilterInput::Rfc3339(_) => FilterInputKind::Rfc3339,
-        FilterInput::EpochMillis(_) => FilterInputKind::EpochMillis,
-        FilterInput::Date(_) => FilterInputKind::Date,
-        FilterInput::Utc1(_) => FilterInputKind::Utc1,
-        FilterInput::LocalDateTime(_) => FilterInputKind::LocalDateTime,
+        FilterInput::Text(_) => Some(FilterInputKind::Text),
+        FilterInput::Number(_) => Some(FilterInputKind::Number),
+        FilterInput::Int(_) => Some(FilterInputKind::Int),
+        FilterInput::Bool(_) => Some(FilterInputKind::Bool),
+        FilterInput::Rfc3339(_) => Some(FilterInputKind::Rfc3339),
+        FilterInput::EpochMillis(_) => Some(FilterInputKind::EpochMillis),
+        FilterInput::Date(_) => Some(FilterInputKind::Date),
+        FilterInput::Utc1(_) => Some(FilterInputKind::Utc1),
+        FilterInput::LocalDateTime(_) => Some(FilterInputKind::LocalDateTime),
     };
-    array::any(kinds, fn(k) { k == kind || (k == FilterInputKind::Number && kind == FilterInputKind::Int) })
+    match kind {
+        Some(kind) => array::any(kinds, fn(k) { k == kind || (k == FilterInputKind::Number && kind == FilterInputKind::Int) }),
+        None => False,
+    }
 };
 
 def calendar_components: Fn(Int, Int, Int) -> Bool = fn(year, month, day) {
@@ -3301,6 +3315,92 @@ def canonical_ipv4: Fn(String) -> Bool = fn(value) {
     match string::parse@[Ipv4Parts](value) {
         Ok(parts) => parts.a <= 255 && parts.b <= 255 && parts.c <= 255 && parts.d <= 255,
         Err(_) => False,
+    }
+};
+
+def is_subnet_op: Fn(FilterOp) -> Bool = fn(op) {
+    op == FilterOp::InSubnet || op == FilterOp::NotInSubnet
+};
+
+@regex::parse_by(regex::compile(r"^(?P<mask>0|[1-9][0-9]?)$"))
+type Ipv4Mask = struct { mask: Int };
+type Ipv4SubnetSpec = struct { prefix: String, upper: String, exact: Bool, pattern: Option(String) };
+def ipv4_subnet: Fn(String) -> Ipv4SubnetSpec = fn(value) {
+    let parts = string::split(value, "/");
+    if array::length(parts) != 2 || !canonical_ipv4(parts[0]) {
+        fail!(`invalid canonical IPv4 subnet \{value}; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value)
+    } else {
+        let octets = string::split(parts[0], ".");
+        let mask = match string::parse@[Ipv4Mask](parts[1]) {
+            Ok(parsed) => if parsed.mask <= 32 { parsed.mask } else { fail!(`IPv4 subnet mask must be 0..32; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value) },
+            Err(_) => fail!(`IPv4 subnet mask must be canonical 0..32; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value),
+        };
+        let parsed = match string::parse@[Ipv4Parts](parts[0]) {
+            Ok(address) => address,
+            Err(_) => fail!("invalid canonical IPv4 subnet", value),
+        };
+        let values = [parsed.a, parsed.b, parsed.c, parsed.d];
+        let whole = mask / 8;
+        let remainder = mask % 8;
+        let width = [256, 128, 64, 32, 16, 8, 4, 2][remainder];
+        let host_bits = array::any(int_range(4), fn(i) {
+            if i < whole { False } else if i == whole { values[i] % width != 0 } else { values[i] != 0 }
+        });
+        if host_bits { fail!(`IPv4 subnet network address contains host bits: \{value}; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value) }
+        else {
+            let prefix = string::join(array::map(int_range(whole), fn(i) { octets[i] }), ".");
+            let pattern = if remainder == 0 { None } else {
+                let fixed = array::map(int_range(whole), fn(i) { octets[i] });
+                let partial = `(\{string::join(array::map(int_range(width), fn(i) { `\{values[whole] + i}` }), "|")})`;
+                let tail = array::map(int_range(3 - whole), fn(i) { "[0-9]{1,3}" });
+                Some(`^\{string::join(array::concat([array::push(fixed, partial), tail]), "[.]")}$`)
+            };
+            {prefix: if whole > 0 && whole < 4 { `\{prefix}.` } else { prefix }, upper: `\{prefix}/`, exact: mask == 32, pattern}
+        }
+    }
+};
+
+def filter_argument_allowed: Fn(Array(FilterInputKind), FilterOp, FilterInput) -> Bool = fn(kinds, op, input) {
+    if is_subnet_op(op) { kinds == [FilterInputKind::Ipv4] && match input { FilterInput::Ipv4Subnet(_) => True, _ => False } }
+    else { filter_input_allowed(kinds, input) }
+};
+
+def subnet_condition: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, FilterOp, FilterInput) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base, op, input) {
+    if !filter_argument_allowed(entry.input_kinds, op, input) {
+        fail!(`subnet operation requires a typed IPv4 subnet for dimension \{entry.id}; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, entry.id, input)
+    } else {
+        let spec = match input { FilterInput::Ipv4Subnet(value) => ipv4_subnet(value), _ => fail!("missing subnet argument", input) };
+        let comparison = if op == FilterOp::InSubnet { qb::ScalarFunction::Eq } else { qb::ScalarFunction::Ne };
+        if spec.prefix == "" && spec.pattern == None {
+            # Self-comparison excludes NULL on both sides of the complement.
+            (ctx, qb::scalar(comparison, [base, base]))
+        } else {
+            if spec.exact {
+                let address = qb::bind(ctx, qb::Val::String(spec.prefix));
+                (address.0, qb::scalar(comparison, [base, address.1]))
+            }
+            else {
+                let prefix = if spec.prefix == "" { (ctx, qb::scalar(qb::ScalarFunction::Eq, [base, base])) } else {
+                    let lower = qb::bind(ctx, qb::Val::String(spec.prefix));
+                    # IPv4 prefixes end in ASCII '.', whose binary successor is '/'.
+                    let upper = qb::bind(lower.0, qb::Val::String(spec.upper));
+                    let binary = qb::scalar(qb::ScalarFunction::BinaryText, [base]);
+                    (upper.0, qb::scalar(qb::ScalarFunction::And, [
+                        qb::scalar(qb::ScalarFunction::Ge, [binary, lower.1]),
+                        qb::scalar(qb::ScalarFunction::Lt, [binary, upper.1]),
+                    ]))
+                };
+                let membership = match spec.pattern {
+                    None => prefix,
+                    Some(pattern) => {
+                        let bound = qb::bind(prefix.0, qb::Val::String(pattern));
+                        let exact = qb::scalar(qb::ScalarFunction::RegexMatch, [base, bound.1]);
+                        (bound.0, if spec.prefix == "" { exact } else { qb::scalar(qb::ScalarFunction::And, [prefix.1, exact]) })
+                    },
+                };
+                (membership.0, if op == FilterOp::InSubnet { membership.1 } else { qb::scalar(qb::ScalarFunction::Not, [membership.1]) })
+            }
+        }
     }
 };
 
@@ -3361,6 +3461,8 @@ def is_text_op: Fn(FilterOp) -> Bool = fn(op) {
         FilterOp::Ge => False,
         FilterOp::Lt => False,
         FilterOp::Le => False,
+        FilterOp::InSubnet => False,
+        FilterOp::NotInSubnet => False,
     }
 };
 
@@ -3378,8 +3480,9 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
         FilterInput::Unknown(_) => fail!("Unknown is not a scalar wire", input),
         FilterInput::Unknowns => fail!("Unknowns is not a scalar wire", input),
         FilterInput::Text(s) => qb::Val::String(s),
+        FilterInput::Ipv4Subnet(_) => fail!("IPv4 subnet is an operation argument, not a scalar address", input),
         FilterInput::Ipv4(value) => if canonical_ipv4(value) { qb::Val::String(value) }
-            else { fail!(`invalid canonical IPv4 address \{value}; see info key \{syntax_key_hint("model/logical_types")}`, value) },
+            else { fail!(`invalid canonical IPv4 address \{value}; see info key \{syntax_key_hint("syntax/model/logical_types")}`, value) },
         FilterInput::Number(f) => qb::Val::Float(f),
         FilterInput::Int(i) => qb::Val::Int(i),
         FilterInput::Bool(b) => qb::Val::Bool(b),
@@ -3517,7 +3620,8 @@ def open_condition_with_context: Fn(qb::BuildCtx, qb::Expr, FilterOp, qb::Expr) 
 };
 
 def filter_value_on_base_with_context: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, FilterOp, FilterInput) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base, op, input) {
-    if array::length(entry.canonical_values) > 0 {
+    if is_subnet_op(op) { subnet_condition(ctx, entry, base, op, input) }
+    else if array::length(entry.canonical_values) > 0 {
         canonical_compare_with_context(ctx, entry, base, op, input)
     } else if array::length(entry.values) > 0 {
         match input {
@@ -3562,6 +3666,7 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
                 let computed = dimension_expr(state.0, payload, entry);
                 let base = computed.1;
                 let resolved = if !valid_time { fail!("invalid time filter", entry.id) }
+                else if is_subnet_op(req.op) { subnet_condition(computed.0, entry, base, req.op, req.input) }
                 else if array::length(entry.canonical_values) > 0 {
                     canonical_compare_with_context(computed.0, entry, base, req.op, req.input)
                 } else if array::length(entry.values) > 0 {
@@ -3673,7 +3778,7 @@ def resolve_scope_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry
     } else if is_text_op(predicate.op) && match predicate.input { FilterInput::Text(_) => False, _ => True } {
         fail!("scope text operation requires a text input value", d.id)
     } else if array::length(d.canonical_values) == 0 && array::length(d.values) == 0
-        && !filter_input_allowed(d.input_kinds, predicate.input) {
+        && !filter_argument_allowed(d.input_kinds, predicate.op, predicate.input) {
         fail!("scope uses an invalid value for the dimension", d.id, predicate.input)
     } else {
         let resolved = filter_value_with_context(ctx, payload, d, predicate.op, predicate.input);

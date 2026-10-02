@@ -1,0 +1,114 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::intent as intent;
+use crate::knowledge as knowledge;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::json as json;
+use std::codec as codec;
+use std::array as array;
+use std::string as string;
+use std::test as test;
+use std::value::{Value};
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter],
+    allowed_join_kinds: [], allowed_aggregates: [],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Ge,
+        qb::ScalarFunction::Lt, qb::ScalarFunction::And, qb::ScalarFunction::Not,
+        qb::ScalarFunction::BinaryText, qb::ScalarFunction::RegexMatch], allow_distinct: False,
+};
+@edsl::entity_id("host") @edsl::entity_source("hosts", "h")
+type Host = struct {
+    @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4)
+    @edsl::dimension("ip", True, True,
+        [edsl::FilterOp::Eq, edsl::FilterOp::Ne, edsl::FilterOp::InSubnet, edsl::FilterOp::NotInSubnet],
+        [edsl::FilterInputKind::Ipv4]) ip: Option(String),
+    @edsl::column("raw")
+    @edsl::dimension("raw", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text]) raw: String,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("subnets", [Host.type], profile);
+def graph: Fn(String, String, String) -> qb::QueryAst = fn(dimension, op, value) {
+    intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"host"}],"edges":[],"select":[{"node":"h","dimension":"ip"}],"filters":[{"node":"h","dimension":\{json::stringify(codec::encode(dimension))},"op":\{json::stringify(codec::encode(op))},"value":\{json::stringify(codec::encode(value))}}]}`).unwrap!())
+};
+pub def networks: Array(String) = array::map(edsl::int_range(33), fn(mask) { `0.0.0.0/\{mask}` });
+type RuntimeCase = struct { network: String, queries: Array(qb::Query) };
+pub def runtime_cases: Value = codec::encode(array::map(
+    array::concat([networks, ["10.4.0.0/16", "10.4.16.0/20", "128.0.0.0/1", "10.4.2.128/25", "10.4.2.254/31", "10.4.2.3/32"]]),
+    fn(network) { let item: RuntimeCase = {network, queries: array::map(["InSubnet", "NotInSubnet"], fn(op) { sqlite::build_query(graph("ip", op, network)) })}; item }
+));
+pub def partial_mask_uses_bound_range_and_regex: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(graph("ip", "InSubnet", "10.4.16.0/20"));
+    if query.bindings == [qb::Val::String("10.4."), qb::Val::String("10.4/"),
+        qb::Val::String("^10[.]4[.](16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31)[.][0-9]{1,3}$")]
+        && string::contains(query.sql, "REGEXP") && !string::contains(query.sql, "LIKE") { True }
+    else { fail!("partial network must combine bound range and regex", query) }
+});
+pub def partial_host_bits_are_rejected: test::Test = test::should_fail_with(fn() {
+    graph("ip", "InSubnet", "10.4.17.0/20")
+}, "IPv4 subnet network address contains host bits");
+pub def leading_zero_mask_is_rejected: test::Test = test::should_fail_with(fn() {
+    graph("ip", "InSubnet", "10.4.0.0/016")
+}, "IPv4 subnet mask must be canonical 0..32");
+pub def missing_regex_profile_is_rejected_during_preparation: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("missing_regex", [Host.type], {...profile,
+        allowed_scalars: array::filter(profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::RegexMatch })})
+}, "declared dimension filter uses capabilities not allowed by the query profile");
+pub def all_supported_masks_materialize_in_both_dialects: test::Test = test::should_ok(fn() {
+    if array::all(networks, fn(network) {
+        array::all(["InSubnet", "NotInSubnet"], fn(op) {
+            let ast = graph("ip", op, network);
+            let sq = sqlite::build_query(ast);
+            let pg = postgres::build_query(ast);
+            sq.bindings == pg.bindings && !string::contains(sq.sql, network) && !string::contains(pg.sql, network)
+        })
+    }) { True } else { fail!("subnet literals escaped parameter binding") }
+});
+pub def prefix_keeps_the_octet_separator: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(graph("ip", "InSubnet", "10.4.0.0/16"));
+    if query.bindings == [qb::Val::String("10.4."), qb::Val::String("10.4/")]
+        && string::contains(query.sql, "COLLATE BINARY") && !string::contains(query.sql, "REGEXP") { True }
+    else { fail!("subnet must match complete octets, not arbitrary text", query) }
+});
+pub def exact_mask_uses_address_equality: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(graph("ip", "InSubnet", "10.4.2.3/32"));
+    if query.bindings == [qb::Val::String("10.4.2.3")] && !string::contains(query.sql, "instr(") { True }
+    else { fail!("/32 must use exact equality", query) }
+});
+pub def unsupported_mask_is_rejected: test::Test = test::should_fail_with(fn() {
+    graph("ip", "InSubnet", "10.4.0.0/33")
+}, "IPv4 subnet mask must be 0..32");
+pub def host_bits_are_not_silently_normalized: test::Test = test::should_fail_with(fn() {
+    graph("ip", "InSubnet", "10.4.2.3/16")
+}, "IPv4 subnet network address contains host bits");
+pub def zero_mask_requires_zero_network: test::Test = test::should_fail_with(fn() {
+    graph("ip", "NotInSubnet", "10.0.0.0/0")
+}, "IPv4 subnet network address contains host bits");
+pub def malformed_subnet_is_rejected: test::Test = test::should_fail_with(fn() {
+    graph("ip", "InSubnet", "10.04.0.0/16")
+}, "invalid canonical IPv4 subnet");
+pub def text_field_cannot_inherit_subnet_operations: test::Test = test::should_fail_with(fn() {
+    graph("raw", "InSubnet", "10.4.0.0/16")
+}, "subnet operation requires an IPv4 dimension");
+pub def subnet_cannot_be_used_as_a_scalar_address: test::Test = test::should_fail_with(fn() {
+    graph("ip", "Eq", "10.4.0.0/16")
+}, "invalid canonical IPv4 address");
+pub def scope_accepts_a_typed_network: test::Test = test::should_ok(fn() {
+    let built = edsl::resolve_scope_with_context(qb::build_context(), payload, payload.dimensions[0],
+        {field: "ip", op: edsl::FilterOp::InSubnet, input: edsl::FilterInput::Ipv4Subnet("10.4.0.0/16")}, True);
+    if built.1.input == edsl::FilterInput::Ipv4Subnet("10.4.0.0/16") { True }
+    else { fail!("scope erased subnet semantics", built.1) }
+});
+pub def type_only_support_does_not_grant_field_permission: test::Test = test::should_fail_with(fn() {
+    let limited = {...payload, dimensions: array::map(payload.dimensions, fn(d) { {...d, ops: [edsl::FilterOp::Eq]} })};
+    edsl::resolve_filters_with_context(qb::build_context(), limited,
+        [{id: "ip", op: edsl::FilterOp::InSubnet, input: edsl::FilterInput::Ipv4Subnet("10.4.0.0/16")}])
+}, "filter operation not supported for dimension");
+pub def subnet_contract_is_discoverable: test::Test = test::should_ok(fn() {
+    let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/model/ipv4_subnets"};
+    match knowledge::by_target(payload, target) {
+        knowledge::DocResult::Found(point) => string::contains(point.summary, "/24"),
+        _ => fail!("subnet diagnostic points to missing knowledge", target),
+    }
+});
