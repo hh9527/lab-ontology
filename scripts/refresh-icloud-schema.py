@@ -22,6 +22,7 @@ SCALARS = {
 }
 ENTITY = re.compile(
     r'(?P<header>@edsl::entity_id\("(?P<id>[^"]+)"\)\n'
+    r'(?:(?!@edsl::entity_id\(|type \w+ = struct)[^\n]*\n)*?'
     r'@edsl::entity_source\("(?P<table>[^"]+)",[^\n]+\n.*?)'
     r'type (?P<type>\w+) = struct \{\n(?P<body>.*?)^\};', re.S | re.M,
 )

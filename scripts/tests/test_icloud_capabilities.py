@@ -68,6 +68,25 @@ class SourceCapabilities(unittest.TestCase):
         after = [(m["id"], m["body"]) for m in reconcile.refresh.ENTITY.finditer(refreshed)]
         self.assertEqual(after, before)
 
+    def test_source_declarations_allow_intervening_knowledge_annotations(self):
+        model = '''@edsl::entity_id("orphan")
+type Orphan = struct {
+    id: String,
+};
+@edsl::entity_id("samples")
+@edsl::related_to({kind: edsl::KnowledgeKind::Measure, owner: "samples", id: "avg"},
+    {kind: edsl::KnowledgeKind::Dimension, owner: "samples", id: "value"})
+@edsl::entity_source("Samples", "samples")
+type Samples = struct {
+    @edsl::column("value")
+    value: Float,
+};
+'''
+        declarations = list(reconcile.refresh.ENTITY.finditer(model))
+        self.assertEqual([(item["id"], item["table"], item["type"]) for item in declarations],
+                         [("samples", "Samples", "Samples")])
+        self.assertIn("@edsl::related_to", declarations[0]["header"])
+
     def test_time_declarations_use_metadata_and_reviewed_conventions(self):
         sample = reconcile.refresh.new_field("foo", field("ts", "datetime"), "sample_time")
         self.assertIn("Rfc3339Text", sample)

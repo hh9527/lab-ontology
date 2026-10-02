@@ -78,19 +78,51 @@ pub def key_backed_dataset_publishes_its_identity_grain: test::Test = test::shou
     }
 });
 
+type CatalogEntry = struct { key: String, type: edsl::KnowledgeKind, label: String, from: Option(String), to: Option(String) };
+type CatalogDetail = struct { entries: Array(CatalogEntry), total: Int, revision: Option(String) };
+
+def catalog_entry_type: Fn(CatalogEntry) -> Value = fn(entry) {
+    match codec::encode(entry) {
+        Value::Object(fields) => match dict::get(fields, "type") {
+            Some(value) => value, None => fail!("catalog entry has no type", entry),
+        },
+        other => fail!("catalog entry must be an object", other),
+    }
+};
+
+def discover_entries: Fn(Fn(Value) -> Value, String) -> Array(CatalogEntry) = fn(info, key) {
+    let response = codec::decode@[knowledge::NodeResponse](info(Value::Object({key: Value::String(key)}))).unwrap!();
+    match response {
+        knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => {
+            let detail = codec::decode@[CatalogDetail](node.detail).unwrap!();
+            array::flat_map(detail.entries, fn(entry) {
+                if catalog_entry_type(entry) == Value::String("Directory") { discover_entries(info, entry.key) }
+                else { [entry] }
+            })
+        },
+        other => fail!("discovery directory is not addressable", key, other),
+    }
+};
+
 pub def intent_syntax_is_discoverable_and_cross_referenced: test::Test = test::should_ok(fn() {
     let indexed = knowledge::index_entries(knowledge::map(payload)).entries;
     let root = knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/intent"});
     let filter = knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/graph/filter"});
-    let index_response = knowledge::knowledge_info_method_factory(payload)(
-        json::parse(r#"{"key":"index"}"#).unwrap!());
-    let info_response = knowledge::knowledge_info_method_factory(payload)(
-        json::parse(r#"{"key":"Schema/syntax/graph/filter"}"#).unwrap!());
+    let info = knowledge::knowledge_info_method_factory(payload);
+    let discovered = discover_entries(info, "index");
+    let syntax_key = edsl::knowledge_key({kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/intent"});
+    let filter_key = match array::find(discovered, fn(entry) {
+        entry.key == edsl::knowledge_key({kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/graph/filter"})
+    }) {
+        Some(entry) => entry.key,
+        None => fail!("filter syntax is absent from directory discovery", discovered),
+    };
+    let info_response = info(Value::Object({key: Value::String(filter_key)}));
     if !array::any(indexed, fn(entry) { entry.key.id == "syntax/intent" }) {
         fail!("Intent syntax is absent from the knowledge index")
-    } else if !string::contains(json::stringify(index_response), "syntax/intent")
+    } else if !array::any(discovered, fn(entry) { entry.key == syntax_key })
         || !string::contains(json::stringify(info_response), "No kind field") {
-        fail!("Intent syntax is absent from the index topic or info", index_response, info_response)
+        fail!("Intent syntax is absent from directory discovery or info", discovered, info_response)
     } else {
         match (root, filter) {
             (knowledge::DocResult::Found(a), knowledge::DocResult::Found(b)) =>
