@@ -57,6 +57,20 @@ They are not approximated by text search. Existing iCloud IP columns remain
 unchanged until their representation and desired operations are established.
 Automatic type inference from field names is deliberately absent.
 
+For mixed or unproved source strings, a Model may expose a separate computed
+dimension using `canonical_ipv4_view`, Ipv4 inputs and Text output. This is an
+explicit partial conversion: canonical IPv4 text is retained; NULL, IPv6,
+leading zeros, invalid octets and other encodings become NULL. The original
+Text dimension is not retyped. The conversion uses bound regex validation and
+a bound NULL branch; it rejects trailing newlines across regex implementations.
+Its generated regex also uses `?` and negated character classes.
+
+Row-local computed dimensions can be projected, grouped and counted as distinct
+values without expanding rows. Their projection capabilities are checked at
+preparation even when filtering is disabled; normal graph grain, authorization,
+scope and logical-operation checks still apply. The conversion has a runtime
+validation cost and does not promise source-column range index access.
+
 ## Restricted subnet operations
 
 A field may declare InSubnet and/or NotInSubnet in ops. Intent passes a
@@ -104,7 +118,9 @@ Discovery links the logical-type and filter contracts to the subnet contract.
 Run the focused execution check from the repository root (Node with node:sqlite):
 
 ```sh
-bin/telora -C ontology eval @test/subnets:runtime_cases --request-fuel 10000 | node ontology/tests/subnets-runtime.mjs
+bin/telora -C ontology eval @test/subnets:runtime_cases --request-fuel 10000 > /tmp/subnets.json
+bin/telora -C ontology eval @test/subnets:runtime_views --request-fuel 10000 > /tmp/ipv4-views.json
+node ontology/tests/subnets-runtime.mjs /tmp/subnets.json /tmp/ipv4-views.json
 ```
 
 This executes the generated queries across all masks and address boundaries,

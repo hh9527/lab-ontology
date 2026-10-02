@@ -2322,6 +2322,11 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
 };
 
 def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate), Bool) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open) {
+    if array::any(input_kinds, fn(kind) { kind == FilterInputKind::Ipv4 })
+        && (input_kinds != [FilterInputKind::Ipv4] || output_type != OutputType::Text
+            || array::any(ops, fn(op) { !array::any(logical_type_ops(LogicalType::Ipv4), fn(allowed) { allowed == op }) })) {
+        fail!(`IPv4 dimension \{id} requires Ipv4 input, Text output and declared address operations; see info key \{syntax_key_hint("syntax/model/logical_types")}`, id, input_kinds, ops)
+    } else { () };
     if array::any(ops, is_subnet_op) && input_kinds != [FilterInputKind::Ipv4] {
         fail!(`subnet operations require an IPv4 dimension \{id}; see info key \{syntax_key_hint("syntax/model/logical_types")}`, id)
     } else { () };
@@ -2836,6 +2841,14 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
             },
         }
     });
+    let dimension_projection_profiles_validated = array::all(dimensions, fn(entry) {
+        if !entry.authorized { True }
+        else {
+            let output = dimension_output_with_context(qb::build_context(), payload, entry);
+            if qb::predicate_profile_accepts(output.1, profile) { True }
+            else { fail!("declared dimension projection uses capabilities not allowed by the query profile", entry.id) }
+        }
+    });
     let dimension_profiles_validated = array::all(dimensions, fn(entry) {
         if !entry.filterable { True }
         else {
@@ -2936,6 +2949,7 @@ def knowledge_graph: Fn(Array(Type)) -> (Array(EntityEntry), Array(RelationEntry
 
 type FilterResolution = struct {
     expr: qb::Expr,
+    dimension: String,
     entity: Int,
     field: Int,
     op: FilterOp,
@@ -3318,6 +3332,23 @@ def canonical_ipv4: Fn(String) -> Bool = fn(value) {
     }
 };
 
+# Explicit partial conversion: retain canonical IPv4 strings, otherwise NULL.
+# Unlike a logical_type annotation, this makes no claim about raw source encoding.
+def canonical_ipv4_view: Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr) = fn(ctx, base) {
+    let octet = "(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)";
+    let pattern = qb::bind(ctx, qb::Val::String(`^\{octet}[.]\{octet}[.]\{octet}[.]\{octet}$`));
+    # JavaScript '$' can match before a final newline. The second predicate
+    # makes the common-regex contract strict for every executor's end anchor.
+    let forbidden = qb::bind(pattern.0, qb::Val::String("[^0-9.]"));
+    let missing = qb::bind(forbidden.0, qb::Val::None);
+    (missing.0, qb::scalar(qb::ScalarFunction::If, [
+        qb::scalar(qb::ScalarFunction::And, [
+            qb::scalar(qb::ScalarFunction::RegexMatch, [base, pattern.1]),
+            qb::scalar(qb::ScalarFunction::Not, [qb::scalar(qb::ScalarFunction::RegexMatch, [base, forbidden.1])]),
+        ]), base, missing.1,
+    ]))
+};
+
 def is_subnet_op: Fn(FilterOp) -> Bool = fn(op) {
     op == FilterOp::InSubnet || op == FilterOp::NotInSubnet
 };
@@ -3687,7 +3718,7 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
                     let bound = qb::bind(computed.0, to_val(req.input));
                     open_condition_with_context(bound.0, base, req.op, bound.1)
                 };
-                let item: FilterResolution = {expr: resolved.1, entity: entry.entity, field: entry.field, op: req.op, input: req.input};
+                let item: FilterResolution = {expr: resolved.1, dimension: entry.id, entity: entry.entity, field: entry.field, op: req.op, input: req.input};
                 (resolved.0, array::push(state.1, item))
             }
 
@@ -3782,7 +3813,7 @@ def resolve_scope_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry
         fail!("scope uses an invalid value for the dimension", d.id, predicate.input)
     } else {
         let resolved = filter_value_with_context(ctx, payload, d, predicate.op, predicate.input);
-        let item: FilterResolution = {expr: resolved.1, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input};
+        let item: FilterResolution = {expr: resolved.1, dimension: d.id, entity: d.entity, field: d.field, op: predicate.op, input: predicate.input};
         (resolved.0, item)
     }
 };
@@ -3821,10 +3852,10 @@ def entity_source_at_with_context: Fn(qb::BuildCtx, PreparedPayload, EntityEntry
     (scopes.0, source)
 };
 
-# Two constraints on the same entity+field contradict each other only when both
-# are equality constraints with different literal values.
+# Different computed dimensions may share a physical field but transform it
+# differently. Only different equalities on the same semantic dimension conflict.
 def eq_conflict: Fn(FilterResolution, FilterResolution) -> Bool = fn(a, b) {
-    a.entity == b.entity && a.field == b.field && a.op == FilterOp::Eq && b.op == FilterOp::Eq && a.input != b.input
+    a.entity == b.entity && a.dimension == b.dimension && a.op == FilterOp::Eq && b.op == FilterOp::Eq && a.input != b.input
 };
 
 def find_internal_conflict: Fn(Array(FilterResolution)) -> Option(FilterResolution) = fn(list) {
@@ -5162,11 +5193,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                     fail!(`graph projection dimension \{item.dimension} does not belong to node \{item.node}`, item.node, item.dimension)
                 } else if !dimension.authorized {
                     fail!(`graph projection dimension \{item.dimension} is not authorized on node \{item.node}`, item.node, item.dimension)
-                } else if dimension.computed {
-                    fail!("unsupported graph computed dimension projection", item.node, item.dimension)
                 } else if array::length(dimension.scope) > 0 {
                     fail!("unsupported graph scoped dimension projection", item.node, item.dimension)
                 } else {
+                    # Expr has only columns, bindings and scalar calls: computed
+                    # projection is row-local and cannot introduce join fanout.
                     let output = dimension_output_with_context(state.0, payload, dimension);
                     let original = get_index(payload.entities, instance.entity).alias;
                     let projection = array::push(state.1, qb::named_expr_item(
@@ -5251,8 +5282,8 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                         fail!("graph count_value dimension does not belong to its named node", item.node, item.dimension)
                     } else if !dimension.authorized {
                         fail!("graph count_value dimension is not authorized", item.node, item.dimension)
-                    } else if dimension.computed || array::length(dimension.scope) > 0 {
-                        fail!("graph count_value requires a plain unscoped dimension", item.node, item.dimension)
+                    } else if array::length(dimension.scope) > 0 {
+                        fail!("graph count_value requires an unscoped dimension", item.node, item.dimension)
                     } else if dimension.half_open {
                         let physical = dimension_expr(measures.0, payload, dimension);
                         let known = canonical_known_with_context(physical.0, dimension, physical.1);
@@ -5607,6 +5638,7 @@ pub use self::{
     calendar_date,
     canonical_utc_second,
     canonical_rfc3339,
+    canonical_ipv4_view,
     metric_domain,
     measure_domain,
     measure_detail,

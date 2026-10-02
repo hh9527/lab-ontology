@@ -46,5 +46,27 @@ for (const network of ['10.4.0.0/16', '10.4.16.0/20']) {
   assert.ok(plan.some((step) => step.detail.includes('SEARCH')
     && step.detail.includes('ip>? AND ip<?')), JSON.stringify(plan));
 }
+if (process.argv[3]) {
+  const views = JSON.parse(readFileSync(process.argv[3], 'utf8'));
+  const invalid = ['010.4.16.1', '2001:db8::1', '10.4.256.1', '10.4.16.1:80',
+    '10.4.16.1 ', '10.4.16.1\n', '10.4.16.1\r\n', '10.4.16.1\u2028', 'garbage', ''];
+  for (const ip of invalid) insert.run(ip, ip);
+  const run = (q) => db.prepare(q.sql).all(...q.bindings);
+  const projected = run(views[0]).map((row) => row.h_ipv4_view);
+  assert.equal(projected.filter((v) => v === null).length, invalid.length + 1);
+  assert.deepEqual(projected.filter((v) => v !== null).sort(), [...samples].sort());
+  for (const [i, complement] of [false, true].entries()) {
+    const expected = [...samples].filter((ip) => {
+      const n = number(ip);
+      const inside = n >= number('10.4.16.0') && n < number('10.4.32.0');
+      return complement ? !inside : inside;
+    }).sort();
+    assert.deepEqual(run(views[i + 1]).map((row) => row.h_ipv4_view).sort(), expected);
+  }
+  assert.equal(run(views[3]).length, samples.size);
+  assert.equal(run(views[4]).length, 0);
+  assert.equal(Object.values(run(views[5])[0])[0], samples.size);
+  console.log('Passed partial IPv4 projection, subnet/complement, /0 and distinct-value count over mixed source data.');
+}
 db.close();
 console.log(`Passed ${cases.length * 2} generated SQLite queries, NULL/complement boundaries and 2 index range plans.`);

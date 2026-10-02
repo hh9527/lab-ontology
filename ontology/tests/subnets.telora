@@ -13,11 +13,11 @@ use std::value::{Value};
 
 def profile: qb::PlanProfile = {
     allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
-        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter],
-    allowed_join_kinds: [], allowed_aggregates: [],
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter, qb::Operator::Aggregate, qb::Operator::Group],
+    allowed_join_kinds: [], allowed_aggregates: [qb::AggregateFunction::Count],
     allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Ge,
         qb::ScalarFunction::Lt, qb::ScalarFunction::And, qb::ScalarFunction::Not,
-        qb::ScalarFunction::BinaryText, qb::ScalarFunction::RegexMatch], allow_distinct: False,
+        qb::ScalarFunction::BinaryText, qb::ScalarFunction::RegexMatch, qb::ScalarFunction::If], allow_distinct: True,
 };
 @edsl::entity_id("host") @edsl::entity_source("hosts", "h")
 type Host = struct {
@@ -28,6 +28,88 @@ type Host = struct {
     @edsl::column("raw")
     @edsl::dimension("raw", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text]) raw: String,
 };
+@edsl::entity_id("mixed_host") @edsl::entity_source("hosts", "mixed")
+type MixedHost = struct {
+    @edsl::column("raw") @edsl::key() raw: String,
+    @edsl::column("ip")
+    @edsl::dimension("stored_address", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::computed_dimension("ipv4_view", edsl::OutputType::Text, True, True,
+        [edsl::FilterOp::Eq, edsl::FilterOp::Ne, edsl::FilterOp::InSubnet, edsl::FilterOp::NotInSubnet],
+        [edsl::FilterInputKind::Ipv4], edsl::canonical_ipv4_view)
+    ip: Option(String),
+};
+def mixed_payload: edsl::PreparedPayload = edsl::build_root("mixed_subnets", [MixedHost.type], profile);
+def scoped_mixed_payload: edsl::PreparedPayload = {...mixed_payload,
+    dimensions: array::map(mixed_payload.dimensions, fn(dimension) {
+        {...dimension, scope: [{field: "ip", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("10.4.2.3")}]}
+    }),
+};
+def mixed_ast: Fn(String, String) -> qb::QueryAst = fn(op, value) {
+    let filter = if op == "" { "" } else {
+        `,"filters":[{"node":"h","dimension":"ipv4_view","op":\{json::stringify(codec::encode(op))},"value":\{json::stringify(codec::encode(value))}}]`
+    };
+    intent::query_intent_ast_factory(mixed_payload)(json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"mixed_host"}],"edges":[],"select":[{"node":"h","dimension":"ipv4_view"}]\{filter}}`).unwrap!())
+};
+pub def runtime_views: Value = codec::encode([
+    sqlite::build_query(mixed_ast("", "")),
+    sqlite::build_query(mixed_ast("InSubnet", "10.4.16.0/20")),
+    sqlite::build_query(mixed_ast("NotInSubnet", "10.4.16.0/20")),
+    sqlite::build_query(mixed_ast("InSubnet", "0.0.0.0/0")),
+    sqlite::build_query(mixed_ast("NotInSubnet", "0.0.0.0/0")),
+    sqlite::build_query(intent::query_intent_ast_factory(mixed_payload)(json::parse(r#"{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"mixed_host"}],"edges":[],"select":[],"count_value":{"node":"h","dimension":"ipv4_view"}}"#).unwrap!())),
+]);
+pub def equality_conflicts_are_about_dimensions_not_shared_physical_columns: test::Test = test::should_ok(fn() {
+    let query = intent::query_intent_ast_factory(scoped_mixed_payload)(json::parse(r#"{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"mixed_host"}],"edges":[],"select":[],"count":"h","filters":[{"node":"h","dimension":"ipv4_view","op":"Eq","value":"10.4.2.3"}]}"#).unwrap!());
+    string::contains(sqlite::build_query(query).sql, "WHERE")
+});
+@edsl::entity_id("contradictory") @edsl::entity_source("hosts", "contradictory")
+@edsl::entity_scope([
+    {field: "ip", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("10.4.2.3")},
+    {field: "ip", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("10.4.2.4")},
+])
+type ContradictoryHost = struct {
+    @edsl::column("ip")
+    @edsl::dimension("contradictory_address", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text]) ip: String,
+};
+pub def different_equalities_on_the_same_dimension_still_conflict: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("contradictory", [ContradictoryHost.type], profile)
+}, "entity scope has contradictory predicates");
+pub def distinct_value_count_accepts_a_row_local_computed_dimension: test::Test = test::should_ok(fn() {
+    let ast = intent::query_intent_ast_factory(mixed_payload)(json::parse(r#"{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"mixed_host"}],"edges":[],"select":[],"count_value":{"node":"h","dimension":"ipv4_view"}}"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.bindings == pg.bindings && string::contains(sq.sql, "count(DISTINCT CASE WHEN") { True }
+    else { fail!("computed value count did not count its logical non-NULL results", sq, pg) }
+});
+pub def computed_ipv4_view_uses_null_and_shared_bindings_in_both_dialects: test::Test = test::should_ok(fn() {
+    let ast = mixed_ast("InSubnet", "10.4.16.0/20");
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.bindings == pg.bindings && array::any(sq.bindings, fn(v) { v == qb::Val::None })
+        && string::contains(sq.sql, "CASE WHEN") && string::contains(pg.sql, " ~ ") { True }
+    else { fail!("IPv4 view must retain only valid addresses and share allocated bindings", sq, pg) }
+});
+@edsl::entity_id("bad_view") @edsl::entity_source("hosts", "bad_view")
+type BadView = struct {
+    @edsl::column("ip")
+    @edsl::computed_dimension("bad_ipv4_view", edsl::OutputType::Text, True, True,
+        [edsl::FilterOp::Contains], [edsl::FilterInputKind::Ipv4], edsl::canonical_ipv4_view)
+    ip: String,
+};
+pub def computed_view_cannot_invent_ipv4_text_operations: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad_view", [BadView.type], profile)
+}, "requires Ipv4 input, Text output and declared address operations");
+@edsl::entity_id("projection_only") @edsl::entity_source("hosts", "projection_only")
+type ProjectionOnly = struct {
+    @edsl::column("ip")
+    @edsl::computed_dimension("projection_only_ipv4", edsl::OutputType::Text, True, False,
+        [], [edsl::FilterInputKind::Ipv4], edsl::canonical_ipv4_view)
+    ip: String,
+};
+pub def projection_only_views_are_checked_during_preparation: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("projection_only", [ProjectionOnly.type], {...profile,
+        allowed_scalars: array::filter(profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::RegexMatch })})
+}, "declared dimension projection uses capabilities not allowed by the query profile");
 def payload: edsl::PreparedPayload = edsl::build_root("subnets", [Host.type], profile);
 def graph: Fn(String, String, String) -> qb::QueryAst = fn(dimension, op, value) {
     intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"host"}],"edges":[],"select":[{"node":"h","dimension":"ip"}],"filters":[{"node":"h","dimension":\{json::stringify(codec::encode(dimension))},"op":\{json::stringify(codec::encode(op))},"value":\{json::stringify(codec::encode(value))}}]}`).unwrap!())
