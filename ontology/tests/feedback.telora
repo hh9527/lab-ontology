@@ -1,0 +1,77 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::knowledge as knowledge;
+use std::json as json;
+use std::codec as codec;
+use std::diagnostics as diagnostics;
+use std::array as array;
+use std::string as string;
+use std::test as test;
+
+@edsl::entity_id("item")
+@edsl::entity_source("items", "i")
+type Item = struct {
+    @edsl::column("id") @edsl::key()
+    id: String,
+    @edsl::column("name")
+    @edsl::dimension("name", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    name: String,
+    @edsl::column("private")
+    @edsl::dimension("private", False, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    private: String,
+    @edsl::column("display")
+    @edsl::dimension("display", True, False, [], [edsl::FilterInputKind::Text])
+    display: String,
+};
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter],
+    allowed_join_kinds: [], allowed_aggregates: [], allowed_scalars: [qb::ScalarFunction::Eq], allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("feedback", [Item.type], profile);
+
+def rejection: Fn(String, edsl::FilterOp) -> String = fn(id, op) {
+    match diagnostics::with_diagnostics(fn(request: edsl::FilterRequest) {
+        edsl::resolve_filters_with_context(qb::build_context(), payload, [request])
+    })({id, op, input: edsl::FilterInput::Text("x")}) {
+        Err(reports) => reports[0].message,
+        _ => fail!("expected rejection", id, op),
+    }
+};
+pub def unsupported_operator_points_to_discoverable_vocabulary: test::Test = test::should_ok(fn() {
+    let message = rejection("name", edsl::FilterOp::Contains);
+    let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dimension, owner: "item", id: "name"};
+    match knowledge::by_target(payload, target) {
+        knowledge::DocResult::Found(point) =>
+            if string::contains(message, "name") && string::contains(message, "Contains")
+                && string::contains(message, edsl::knowledge_key_hint(target.kind, target.owner, target.id))
+                && !string::contains(message, "[\"Eq\"]")
+                && point.dimension != None { True }
+            else { fail!("diagnostic must refer to knowledge instead of inlining vocabulary", message) },
+        _ => fail!("diagnostic target is not discoverable", target),
+    }
+});
+pub def hidden_and_unknown_dimensions_point_only_to_index: test::Test = test::should_ok(fn() {
+    let hidden = rejection("private", edsl::FilterOp::Eq);
+    let unknown = rejection("missing", edsl::FilterOp::Eq);
+    if string::contains(hidden, "private") && string::contains(hidden, "\"index\"")
+        && !string::contains(hidden, "Dimension/item/private")
+        && string::contains(unknown, "missing") && string::contains(unknown, "\"index\"") { True }
+    else { fail!("visibility-safe discovery hints missing", hidden, unknown) }
+});
+pub def nonfilterable_dimension_points_to_its_contract: test::Test = test::should_ok(fn() {
+    let message = rejection("display", edsl::FilterOp::Eq);
+    if string::contains(message, "Dimension/item/display") { True }
+    else { fail!("filter capability rejection lacks knowledge pointer", message) }
+});
+pub def generic_contracts_are_in_the_knowledge_map: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    if array::all(["syntax/graph/aggregate", "syntax/graph/filter/capabilities", "syntax/graph/order/semantics"], fn(id) {
+        let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Schema, owner: "", id};
+        let key = edsl::knowledge_key(target);
+        match codec::decode@[knowledge::NodeResponse](info(json::parse(`{"key":\{edsl::knowledge_key_hint(target.kind, target.owner, target.id)}}`).unwrap!())).unwrap!() {
+            knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => node.key == key && node.description.summary != "",
+            _ => False,
+        }
+    }) { True } else { fail!("shared feedback contracts are not addressable") }
+});

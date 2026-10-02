@@ -203,6 +203,15 @@ split visible groups, the transform reports a warning. Use identity grouping
 only when the business question is about individual entities, not dimension
 values such as types or categories.
 
+For aggregate thresholds, discover the shared `Graph aggregate` knowledge
+node: it describes the supported identity and contextual sample populations.
+For filtering, `Declared filter capabilities` explains why the syntax's
+operator vocabulary does not override a dimension's declared `ops`.
+`Ordering and aggregate meaning` explains NULL placement and identity tie
+breakers, and why raw Top-N is not a substitute for grouped Min/Max.
+Find these nodes in `index` and pass their returned keys unchanged to `info`.
+Do not change the business meaning merely to make an Intent lower.
+
 Time windows are `[start, end)` with concrete values in the dimension's declared
 logical type. `end:null` or an omitted `end` means `[start, None)`: no upper
 time predicate. It does not mean `now`; future-dated rows may match. Resolve
