@@ -14,7 +14,7 @@ independent Intents. It returns indexed diagnostics for every item; `queries`
 contains the ordered Queries only when all Intents are accepted. Request `ctx`
 and a single `intent` key are not supported.
 `<model>/info` accepts `{ "key": "index" }`
-to return the complete flat catalog, or another exact key for one knowledge
+to return five discovery routes, or another returned key for one knowledge
 point. The ic model has the same two
 routes under `ic/` in its own `icloud_model` entry.
 All domains use the same [service and agent guide](../USAGE.md) with their

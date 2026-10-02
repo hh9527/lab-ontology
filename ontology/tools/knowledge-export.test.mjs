@@ -6,14 +6,16 @@ test('discovery follows opaque keys from the root, including cycles, without dup
   const key = '设备%2F位置/状态?#';
   const calls = [];
   const nodes = new Map([
-    ['index', { key: 'index', links: [{ type: 'Member', key }] }],
-    [key, { key, links: [{ type: 'Related', key: 'index' }] }],
+    ['index', { key: 'index', type: 'Index', detail: { entries: [{ key: 'directory', type: 'Directory', label: 'Objects' }] }, links: [] }],
+    ['directory', { key: 'directory', type: 'Directory', detail: { entries: [{ key, type: 'Dataset', label: 'Object', from: 'endpoint', to: key }] }, links: [] }],
+    [key, { key, type: 'Dataset', links: [{ type: 'Related', key: 'index' }] }],
+    ['endpoint', { key: 'endpoint', type: 'Dataset', links: [] }],
   ]);
   const result = await collectKnowledge(async (input) => {
     calls.push(input);
     return { Document: { Found: nodes.get(input.key) } };
   });
-  assert.deepEqual(calls, [{ key: 'index' }, { key }]);
+  assert.deepEqual(calls, [{ key: 'index' }, { key: 'directory' }, { key }, { key: 'endpoint' }]);
   assert.deepEqual(result, [...nodes.values()]);
 });
 

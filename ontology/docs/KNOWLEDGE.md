@@ -24,9 +24,18 @@ Requests have exactly `method` and `input`:
 ```
 
 `foo` is the domain bound by the host, not a hard-coded Model name. The
-index topic is ordered by Model declarations and contains every visible knowledge
-node exactly once as `{key,type,description}` in its `detail.entries` field. It is
-one complete flat list, without pagination or a cursor.
+index topic contains five discovery routes: datasets, relations, terminology,
+data types and query contracts. Index and Directory detail.entries enumerate
+`{key,type,label}` children; relation entries additionally carry from/to Dataset
+keys. Large directories split deterministically into binary branches with at most
+12 entries per leaf. Each list is complete, with no cursor or silent truncation.
+Entry keys naming a Directory lead to children; other entries name members.
+Dataset links lead to their member directory; values are discovered from dimensions.
+No visible node depends on having a business relationship to be discoverable.
+Directory detail.total counts leaf entries in that subtree, not synthetic
+directory nodes. Index total is its five top-level routes. Terminology total
+counts expression-to-target associations, not distinct words or concepts.
+Counts cover only visible knowledge. There is no extra done/next/has_more flag.
 
 `info` looks up a unique key and returns `Found(node)` or `NotFound`. Pass a
 key from the index or a node's `links[].key` to `input.key` unchanged.
@@ -39,9 +48,11 @@ Responses use Telora's `codec::encode` representation:
 `{"Document":{"Found":{...}}}` or `{"Document":"NotFound"}`. The Found
 node has exactly `{key,type,description,links,detail}`. `description` contains
 label, aliases, localized text and summary; `links` contains `{type,key}` pairs.
-Node types include `Index`, `Terminology`, `Schema`, `Dataset`, `Field`, `Dimension`,
+Node types include `Index`, `Directory`, `DataType`, `Terminology`, `Schema`, `Dataset`, `Field`, `Dimension`,
 `Measure`, `Value`, `Relation`, `BusinessLink`, `TimeRole`, and `Metric`.
-The response type determines `detail`: Index has `entries`; Dataset has `id`,
+The response type determines `detail`: Index and Directory have `entries`; DataType
+has its logical type `id` and a description of its value domain and restrictions.
+Logical capabilities do not grant field authorization. Dataset has `id`,
 grain and time roles; Field has `id` and `dataset`; Value has its canonical `id`
 and `dimension`. Other domain nodes preserve their corresponding Model brief;
 Metric and TimeRole also identify their owning dataset, and BusinessLink has
@@ -80,9 +91,11 @@ catalog and returns `Fn(KnowledgeTarget) -> DocResult`, with the same documents
 and visibility as `by_target(payload, target)`. The service factories already
 prepare their catalog once. This avoids rebuilding the full index per lookup.
 
-The formal domain concepts are the knowledge nodes listed in `Index`.
-`Terminology` (key `"terminology"`) is supplemental language assistance, not a
-second concept system. It has `detail.entries` of `{term,description,key}`. Entries derive from
+The formal domain concepts are the knowledge nodes discovered through the directory tree.
+The terminology route is supplemental language assistance, not a second concept
+system. Its bounded tree has Directory branches with entries `{key,type,label}`
+and Terminology leaves with entries `{term,description,key}`. Empty entries is a complete empty list;
+leaves have no child directories. Entries derive from
 existing alias/localization properties and optional entity-level
 `@term(term, description, target)` annotations. A term can associate with
 multiple nodes; this is discovery information, not an assertion of synonymy.
@@ -103,7 +116,8 @@ corresponding contract (`syntax/knowledge/request` or `syntax/knowledge/info`).
 
 ## Generic HTML map
 
-The exporter starts at `index` and follows opaque link keys through the info
+The exporter starts at `index` and follows directory entries (including relation
+endpoints), terminology targets, and semantic link keys through the info
 endpoint. It requires no domain-specific IDs or key parsing. The renderer
 consumes the resulting node array, escapes text and URL-encodes link keys,
 and rejects duplicate keys or dangling references:
@@ -112,6 +126,13 @@ and rejects duplicate keys or dangling references:
 node ontology/tools/knowledge-export.mjs http://127.0.0.1:8080/foo/info > /tmp/foo-knowledge.json
 node ontology/tools/knowledge-html.mjs /tmp/foo-knowledge.json > /tmp/foo-knowledge.html
 ```
+
+This replaces the former full flat `index` response. Consumers must follow
+`detail.entries` as well as semantic `links`; consumers that only followed links
+must migrate with the new snapshot. There is no legacy full-list endpoint.
+Directory keys name nodes in the current model, not revision-bound cursors.
+If a model is refreshed, restart discovery at index rather than retaining a
+directory position; revision/digest negotiation is a separate concern.
 
 The static HTML is a view of the same visible knowledge map, not a separate
 Model. Access to the artifact is controlled by the host.

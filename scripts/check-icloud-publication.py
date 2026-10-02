@@ -13,6 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path, help="prepared source_audit report")
     parser.add_argument("artifact", type=Path)
+    parser.add_argument("--discovery", type=Path, help="nodes from check-knowledge-discovery.mjs")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     report = json.loads(args.report.read_text())
@@ -74,11 +75,17 @@ def main():
         nodes[key] = document["Found"]
         assert nodes[key]["key"] == key, (key, nodes[key])
     entries = nodes["index"]["detail"]["entries"]
-    indexed = {entry["key"] for entry in entries}
-    assert len(indexed) == len(entries), "duplicate published index key"
-    assert len([entry for entry in entries if entry["type"] == "Dataset"]) == 50
-    for node in nodes.values():
-        assert all(link["key"] in indexed for link in node["links"]), node["key"]
+    assert len(entries) == 5 and len({entry["key"] for entry in entries}) == 5
+    assert nodes["index"]["links"] == []
+    discovered = json.loads(args.discovery.read_text()) if args.discovery else None
+    if discovered is not None:
+        indexed = {node["key"] for node in discovered}
+        assert len(indexed) == len(discovered), "duplicate discovered key"
+        assert all(key in indexed for key in nodes), "publication probe read an undiscovered node"
+        for node in nodes.values():
+            assert all(link["key"] in indexed for link in node["links"]), node["key"]
+        assert "Field/frame/id" not in indexed
+        assert "Dimension/frame/frame_id" not in indexed
     for relation in report["relations"]:
         key = f"Relation/{relation['from_dataset']}/{relation['id']}"
         detail = nodes[key]["detail"]
@@ -97,8 +104,6 @@ def main():
     assert frame["grain"] == [], frame
     assert nodes["Field/frame/frame_dn"]["detail"]["nullable"] is True
     assert nodes["Field/frame/name"]["detail"]["nullable"] is False
-    assert "Field/frame/id" not in indexed
-    assert "Dimension/frame/frame_id" not in indexed
     for dimension in report["dimensions"]:
         if not dimension["authorized"]:
             continue
@@ -133,7 +138,7 @@ def main():
     assert "CASE WHEN" in subnet["sql"] and "REGEXP" in subnet["sql"], subnet
     assert "10.4." in subnet["bindings"] and "10.4/" in subnet["bindings"], subnet
     assert nodes["Dimension/device/device__version"]["detail"]["ops"] == SEARCH_OPS
-    print(json.dumps({"index_entries": len(entries), "dataset_documents": 50,
+    print(json.dumps({"root_entries": len(entries), "discovered_nodes": len(discovered) if discovered is not None else None, "dataset_documents": 50,
                       "relation_documents": len(report["relations"]),
                       "clock_encoding": "EpochMillis", "query": "passed",
                       "dimension_documents": len(report["dimensions"]),

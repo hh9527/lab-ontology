@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { discoveryKeys } from './knowledge-export.mjs';
 
 const escape = (value) => String(value).replace(/[&<>"']/g, (char) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -23,15 +24,15 @@ export function renderKnowledge(nodes) {
   };
   const sections = nodes.map((node) => {
     const { key, type, description, links, detail } = node;
-    for (const item of links) checkLink(item.key);
+    for (const key of discoveryKeys(node)) checkLink(key);
     let content;
-    if (type === 'Index' || type === 'Terminology') {
+    if (['Index', 'Directory', 'Terminology'].includes(type)) {
       if (!Array.isArray(detail.entries)) throw new Error(`${type} requires detail.entries`);
-      content = `<table><thead><tr><th>${type === 'Index' ? 'Node' : 'Term'}</th><th>Description</th><th>Key</th></tr></thead><tbody>` +
+      content = '<table><thead><tr><th>Node / Term</th><th>Description / Endpoints</th><th>Key</th></tr></thead><tbody>' +
         detail.entries.map((entry) => {
           checkLink(entry.key);
-          return `<tr><td>${escape(type === 'Index' ? entry.description.label : entry.term)}</td>` +
-            `<td>${escape(type === 'Index' ? entry.description.summary : entry.description)}</td>` +
+          return `<tr><td>${escape(entry.label ?? entry.term)}</td>` +
+            `<td>${entry.from ? link(entry.from) + ' → ' + link(entry.to) : escape(entry.description ?? entry.type ?? '')}</td>` +
             `<td>${link(entry.key)}</td></tr>`;
         }).join('') + '</tbody></table>';
     } else {

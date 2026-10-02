@@ -79,9 +79,11 @@ directly to the matching path. The knowledge and query methods are:
 {"method":"<domain>/info","input":{"key":"<key returned by index or links>"}}
 ```
 
-The `index` topic returns the complete flat catalog of visible knowledge points, one
-entry per key, with a label, aliases and short summary. Pass an entry's `key` unchanged
-to `info` for the full point. Follow its `links[].key` values unchanged to
+The `index` topic returns five discovery routes: datasets, relations, terminology,
+data types and query contracts. Directory entries are `{key,type,label}`; relation
+entries also carry `from`/`to` dataset keys. Large directories lead to smaller
+directories, and each returned list is complete, never a truncated page. Pass an
+entry's `key` unchanged to `info`. Follow entries and `links[].key` values to
 check entity grain, dimensions, measures, business values, time roles, and
 named relations. A `Related` link explains knowledge but does not authorize a
 query traversal. Labels, translations, aliases, and physical column names are
@@ -89,10 +91,12 @@ not substitutes for stable Intent IDs.
 
 Every knowledge node has `{key,type,description,links,detail}`. The string key
 is opaque: do not construct it from a type or business ID, split it, or decode it.
-The response `type` determines the `detail` shape. The `Index` node has its flat
-catalog in `detail.entries`; the `Terminology` node collects Model-declared aliases,
-local names and common expressions with keys of associated nodes. The index
-already lists the formal domain concepts; terminology is only supplemental
+The response `type` determines the `detail` shape. `Index` and `Directory` enumerate
+their children in `detail.entries`, without repeating entries in links. Dataset
+links lead to member directories. The terminology route uses `Directory` branches
+and `Terminology` leaves with `{term,description,key}` entries derived from Model annotations. `DataType`
+describes logical values and operations; a field must still authorize an operation.
+The directory tree discovers the formal domain concepts; terminology is supplemental
 language assistance, not a second concept system or automatic substitution.
 A term may refer to multiple nodes; interpret the user's meaning, read those
 nodes, and use only Model-defined canonical business IDs in Intent.

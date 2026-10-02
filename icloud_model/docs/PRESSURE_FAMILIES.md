@@ -168,14 +168,13 @@ on the legacy `qualify_metrics` API described later in this historical log;
 they do not establish production KPI grain or clock encoding.
 
 `icloud_model/tests/knowledge.telora` also checks the 19-entity Prepared Model
-as one navigable catalog. `IndexService` retains a lightweight flat list with
-one `{key,label,aliases,summary}` entry per visible point. `ic/info` validates an exact
-key against a lightweight request-local list, then materializes only the
-addressed dataset's knowledge with its declared docs and related references.
-The index and detail paths use the same Prepared Model and subject. This keeps
-`DocService` from retaining a second catalog, which previously exceeded a
-runtime memory-growth limit. Earlier topic-pagination fuel measurements no
-longer describe the current protocol.
+as one navigable catalog. The current `ic/info` index exposes five bounded
+discovery routes; Dataset members and terminology are discovered through small
+directory leaves. The internal complete key catalog and directory key maps are
+prepared once for exact lookups; domain nodes are materialized on demand.
+The directory and detail paths use the same Prepared Model. Earlier full flat
+index and topic-pagination measurements describe historical implementations,
+not the current protocol. See `ontology/docs/KNOWLEDGE.md` and issue #42.
 
 The 449 questions and 161 textual templates in IC's `baseline-s6/shapes.json`
 are a source of semantic probes, not 449 acceptance targets. A family closes

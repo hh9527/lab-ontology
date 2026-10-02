@@ -269,10 +269,9 @@ pub def on_demand_doc_matches_validated_catalog: test::Test = test::should_ok(fn
 });
 
 type TermEntry = struct { term: String, description: String, key: String };
-type TerminologyDetail = struct { entries: Array(TermEntry) };
-type CatalogDescription = struct { label: String, aliases: Array(String), summary: String };
-type CatalogEntry = struct { key: String, type: edsl::KnowledgeKind, description: CatalogDescription };
-type CatalogDetail = struct { entries: Array(CatalogEntry) };
+type TerminologyDetail = struct { entries: Array(TermEntry), total: Int };
+type CatalogEntry = struct { key: String, type: edsl::KnowledgeKind, label: String, from: Option(String), to: Option(String) };
+type CatalogDetail = struct { entries: Array(CatalogEntry), total: Int };
 
 def read_node: Fn(Fn(Value) -> Value, String) -> knowledge::Node = fn(info, key) {
     match codec::decode@[knowledge::NodeResponse](info(Value::Object({key: Value::String(key)}))).unwrap!() {
@@ -290,6 +289,14 @@ def encoded_type: for(A: codec::Encode) Fn(A) -> Value = fn(item) {
         },
         other => fail!("knowledge node must be an object", other),
     }
+};
+
+def directory_entries: Fn(Fn(Value) -> Value, String) -> Array(CatalogEntry) = fn(info, key) {
+    let entries = codec::decode@[CatalogDetail](read_node(info, key).detail).unwrap!().entries;
+    array::flat_map(entries, fn(entry) {
+        if encoded_type(entry) == Value::String("Directory") { directory_entries(info, entry.key) }
+        else { [entry] }
+    })
 };
 
 pub def terminology_derives_aliases_preserve_ambiguity_and_hide_private_targets: test::Test = test::should_ok(fn() {
@@ -320,16 +327,32 @@ pub def index_and_links_resolve_opaque_keys_with_one_node_contract: test::Test =
     let info = knowledge::knowledge_info_method_factory(payload);
     let index = read_node(info, "index");
     let entries = codec::decode@[CatalogDetail](index.detail).unwrap!().entries;
-    if encoded_type(index) == Value::String("Index")
+    if encoded_type(index) == Value::String("Index") && array::length(entries) == 5
+        && array::length(index.links) == 0
         && array::any(entries, fn(entry) { entry.key == "terminology" && encoded_type(entry) == Value::String("Terminology") })
         && array::all(entries, fn(entry) {
             let node = read_node(info, entry.key);
             node.key == entry.key && encoded_type(node) == encoded_type(entry)
-                && node.description.label == entry.description.label
+                && node.description.label == entry.label
                 && array::all(node.links, fn(link) { read_node(info, link.key).key == link.key })
                 && array::length(array::filter(entries, fn(other) { other.key == entry.key })) == 1
         }) { True }
     else { fail!("root catalog and node links do not form a unique, self-discoverable map", index) }
+});
+
+pub def data_types_are_discovered_separately_from_query_contracts: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    let entries = directory_entries(info, "index");
+    let types = array::filter(entries, fn(entry) { encoded_type(entry) == Value::String("DataType") });
+    let utc = match array::find(types, fn(entry) { entry.label == "Utc1" }) {
+        Some(entry) => read_node(info, entry.key), None => fail!("Utc1 type is not discoverable"),
+    };
+    let role = read_node(info, edsl::knowledge_key({kind: edsl::KnowledgeKind::Dimension, owner: "status_event", id: "event_time"}.ty!(edsl::KnowledgeTarget)));
+    if array::length(types) == 10
+        && array::any(types, fn(entry) { entry.label == "Ipv4" })
+        && string::contains(utc.description.summary, "Not epoch seconds")
+        && array::any(role.links, fn(link) { link.key == utc.key }) { True }
+    else { fail!("types, temporal input meaning or dimension references are missing", types, utc, role) }
 });
 
 pub def public_nodes_match_the_full_model_map: test::Test = test::should_ok(fn() {
@@ -343,16 +366,20 @@ pub def public_nodes_match_the_full_model_map: test::Test = test::should_ok(fn()
 
 pub def opaque_keys_do_not_hide_canonical_intent_ids: test::Test = test::should_ok(fn() {
     let info = knowledge::knowledge_info_method_factory(payload);
-    let entries = codec::decode@[CatalogDetail](read_node(info, "index").detail).unwrap!().entries;
-    let order = match array::find(entries, fn(entry) { entry.description.label == "Order" }) {
+    let entries = directory_entries(info, "index");
+    let order = match array::find(entries, fn(entry) { entry.label == "Order" }) {
         Some(entry) => read_node(info, entry.key), None => fail!("Order is not discoverable"),
     };
     let detail = codec::decode@[knowledge::DatasetDetail](order.detail).unwrap!();
-    let paid = match array::find(entries, fn(entry) {
-        entry.description.label == "Paid" && encoded_type(entry) == Value::String("Value")
-    }) { Some(entry) => read_node(info, entry.key), None => fail!("Paid value is not discoverable") };
-    let status = match array::find(entries, fn(entry) {
-        entry.description.label == "status" && encoded_type(entry) == Value::String("Field")
+    let members = directory_entries(info, order.links[0].key);
+    let dimension = match array::find(members, fn(entry) { encoded_type(entry) == Value::String("Dimension") && entry.label == "order_status" }) {
+        Some(entry) => read_node(info, entry.key), None => fail!("Order status dimension is not discoverable"),
+    };
+    let paid = match array::find(array::map(dimension.links, fn(link) { read_node(info, link.key) }), fn(node) {
+        node.description.label == "Paid" && encoded_type(node) == Value::String("Value")
+    }) { Some(node) => node, None => fail!("Paid value is not discoverable") };
+    let status = match array::find(members, fn(entry) {
+        entry.label == "status" && encoded_type(entry) == Value::String("Field")
     }) { Some(entry) => read_node(info, entry.key), None => fail!("Status field is not discoverable") };
     let canonical = codec::decode@[knowledge::ValueDetail](paid.detail).unwrap!();
     let field = codec::decode@[knowledge::FieldDetail](status.detail).unwrap!();
@@ -448,10 +475,10 @@ pub def service_index_lists_unique_keys_and_info_navigates: test::Test = test::s
         (knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(a)),
             knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(item))) =>
             match a.entries {
-                Some(entries) => if array::length(entries) == array::length(knowledge::map(payload))
-                    && array::length(array::filter(entries, fn(entry) { entry.key == order_status })) == 1
+                Some(entries) => if array::length(entries) == 5
+                    && array::length(a.refs) == 0
                     && item.target == order_status { True }
-                    else { fail!("flat index or exact key navigation failed", a, item) },
+                    else { fail!("five-route index or exact key navigation failed", a, item) },
                 None => fail!("index topic has no entries", a),
             },
         other => fail!("unexpected service response", other),

@@ -10,7 +10,8 @@ test('one generic template renders index, terminology and domain nodes using opa
   const key = 'Dimension/设备%2F位置/状态?#';
   const target = node(key);
   const nodes = [
-    node('index', 'Index', { entries: [{ key, type: target.type, description: target.description }] }, [{ type: 'Member', key }]),
+    node('index', 'Index', { entries: [{ key: 'directory', type: 'Directory', label: '<script>unsafe</script>' }] }),
+    node('directory', 'Directory', { entries: [{ key, type: target.type, label: '<script>unsafe</script>', from: key, to: key }] }),
     node('terminology', 'Terminology', { entries: [{ term: '业务说法', description: '<img onerror=bad>', key }] }, [{ type: 'Related', key }]),
     target,
   ];
@@ -27,4 +28,5 @@ test('the rendered graph must have unique keys and closed references', () => {
   assert.throws(() => renderKnowledge([node('a'), node('a')]), /Duplicate/);
   assert.throws(() => renderKnowledge([node('a', 'Dataset', {}, [{ type: 'Related', key: 'missing' }])]), /Unresolved/);
   assert.throws(() => renderKnowledge([node('index', 'Index', { entries: [{ key: 'missing' }] })]), /Unresolved/);
+  assert.throws(() => renderKnowledge([node('index', 'Index', { entries: [{ key: 'index', from: 'missing', to: 'index' }] })]), /Unresolved/);
 });

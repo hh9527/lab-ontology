@@ -12,15 +12,29 @@ export async function collectKnowledge(info) {
       throw new Error(`Knowledge key did not resolve to a node: ${key}`);
     }
     nodes.push(node);
-    for (const link of node.links) {
-      if (typeof link.key !== 'string') throw new Error('Knowledge link requires a string key');
-      if (!seen.has(link.key)) {
-        seen.add(link.key);
-        pending.push(link.key);
+    for (const key of discoveryKeys(node)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        pending.push(key);
       }
     }
   }
   return nodes;
+}
+
+export function discoveryKeys(node) {
+  const keys = node.links.map(link => link.key);
+  if (['Index', 'Directory', 'Terminology'].includes(node.type)) {
+    for (const entry of node.detail.entries) {
+      keys.push(entry.key);
+      if ('from' in entry) keys.push(entry.from);
+      if ('to' in entry) keys.push(entry.to);
+    }
+  }
+  if (keys.some(key => typeof key !== 'string')) {
+    throw new Error('Knowledge references require opaque string keys');
+  }
+  return [...new Set(keys)];
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

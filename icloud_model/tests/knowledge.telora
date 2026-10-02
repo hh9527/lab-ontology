@@ -9,6 +9,24 @@ use std::string as string;
 use std::test as test;
 
 def lookup: Fn(edsl::KnowledgeTarget) -> knowledge::DocResult = knowledge::knowledge_lookup_factory(payload);
+def info_handler: Fn(Value) -> Value = knowledge::knowledge_info_method_factory(payload);
+def catalog_entries: Array(knowledge::IndexEntry) = knowledge::index_from_model(payload).entries;
+
+def discovered_refs: Fn(knowledge::Point) -> Array(knowledge::KnowledgeLink) = fn(point) {
+    let refs = match point.entries {
+        Some(entries) => array::map(entries, fn(entry) {
+            {target: entry.key, kind: knowledge::LinkKind::Member}.ty!(knowledge::KnowledgeLink)
+        }), None => point.refs,
+    };
+    array::flat_map(refs, fn(ref) {
+        if ref.target.kind == edsl::KnowledgeKind::Directory {
+            match lookup(ref.target) {
+                knowledge::DocResult::Found(directory) => discovered_refs(directory),
+                _ => fail!("returned member directory is not discoverable", ref.target),
+            }
+        } else { [ref] }
+    })
+};
 
 pub def frame_dn_is_nullable_reference_without_synthetic_identity: test::Test = test::should_ok(fn() {
     let frame = array::find(payload.entities, fn(entity) { entity.id == "frame" });
@@ -33,7 +51,7 @@ def key_input: Fn(edsl::KnowledgeKind, String, String) -> Value = fn(kind, owner
 };
 
 pub def device_publishes_identity_reference_and_roles: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload);
+    let info = info_handler;
     let response = codec::decode@[knowledge::NodeResponse](info(key_input(edsl::KnowledgeKind::Dataset, "", "device"))).unwrap!();
     match response {
         knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => do {
@@ -50,7 +68,7 @@ pub def device_publishes_identity_reference_and_roles: test::Test = test::should
 });
 
 pub def existing_device_metric_publishes_metric_role: test::Test = test::should_ok(fn() {
-    let response = codec::decode@[knowledge::NodeResponse](knowledge::knowledge_info_method_factory(payload)(
+    let response = codec::decode@[knowledge::NodeResponse](info_handler(
         key_input(edsl::KnowledgeKind::Field, "device_kpi", "cpu_usage"))).unwrap!();
     match response {
         knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => do {
@@ -101,8 +119,8 @@ pub def server_asset_and_site_path_are_discoverable_from_one_model: test::Test =
     let server: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dataset,
         owner: "", id: "server_device"};
     match lookup(server) {
-        knowledge::DocResult::Found(point) => if array::any(point.refs, fn(ref) { ref.target == asset })
-            && array::any(point.refs, fn(ref) { ref.target == relation }) {
+        knowledge::DocResult::Found(point) => if array::any(discovered_refs(point), fn(ref) { ref.target == asset })
+            && array::any(discovered_refs(point), fn(ref) { ref.target == relation }) {
             match lookup(asset) {
                 knowledge::DocResult::Found(dimension) => if dimension.dimension != None { True }
                     else { fail!("server asset dimension has no declared detail") },
@@ -135,7 +153,7 @@ pub def site_name_knowledge_keeps_its_complete_display_value: test::Test = test:
 });
 
 pub def server_class_localized_values_keep_subrack_distinct_from_enclosure: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload);
+    let info = info_handler;
     let subrack = checked_response(
         info(key_input(edsl::KnowledgeKind::Value, "server_class", "subrack")));
     let enclosure = checked_response(
@@ -156,11 +174,11 @@ pub def memory_knowledge_does_not_claim_server_cpu_ownership: test::Test = test:
     let memory: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "server_memory"};
     let relation: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Relation,
         owner: "server_memory", id: "memory_parent_server"};
-    let point = knowledge::knowledge_info_method_factory(payload)(
+    let point = info_handler(
         key_input(edsl::KnowledgeKind::Dataset, "", "server_memory"));
     match checked_response(point) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(dataset)) =>
-            if dataset.target == memory && array::any(dataset.refs, fn(ref) { ref.target == relation }) {
+            if dataset.target == memory && array::any(discovered_refs(dataset), fn(ref) { ref.target == relation }) {
                 match lookup(relation) {
                     knowledge::DocResult::Found(link) =>
                         if string::contains(link.summary, "not memory measurements") { True }
@@ -173,7 +191,7 @@ pub def memory_knowledge_does_not_claim_server_cpu_ownership: test::Test = test:
 });
 
 pub def alarm_tenant_reference_knowledge_distinguishes_existing_entities: test::Test = test::should_ok(fn() {
-    let dimension = knowledge::knowledge_info_method_factory(payload)(
+    let dimension = info_handler(
         key_input(edsl::KnowledgeKind::Dimension, "current_alarm", "alarm_tenant_id"));
     let relation: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Relation,
         owner: "current_alarm", id: "alarm_belongs_to_tenant"};
@@ -219,11 +237,11 @@ pub def alarm_name_suffix_is_discoverable_without_leaking_to_tenant_id: test::Te
 pub def device_tenant_count_path_is_discoverable: test::Test = test::should_ok(fn() {
     let tenant_relation: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Relation,
         owner: "device", id: "device_belongs_to_tenant"};
-    let response = knowledge::knowledge_info_method_factory(payload)(
+    let response = info_handler(
         key_input(edsl::KnowledgeKind::Dataset, "", "device"));
     match checked_response(response) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
-            if array::any(point.refs, fn(ref) { ref.target == tenant_relation }) { True }
+            if array::any(discovered_refs(point), fn(ref) { ref.target == tenant_relation }) { True }
             else { fail!("device dataset lost its tenant relation", point) },
         other => fail!("device topic cannot be discovered", other),
     }
@@ -232,11 +250,11 @@ pub def device_tenant_count_path_is_discoverable: test::Test = test::should_ok(f
 pub def alarm_device_count_path_is_discoverable: test::Test = test::should_ok(fn() {
     let alarm_relation: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Relation,
         owner: "current_alarm", id: "device_current_alarm"};
-    let response = knowledge::knowledge_info_method_factory(payload)(
+    let response = info_handler(
         key_input(edsl::KnowledgeKind::Dataset, "", "current_alarm"));
     match checked_response(response) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
-            if array::any(point.refs, fn(ref) { ref.target == alarm_relation }) { True }
+            if array::any(discovered_refs(point), fn(ref) { ref.target == alarm_relation }) { True }
             else { fail!("alarm dataset lost its device relation", point) },
         other => fail!("alarm topic cannot be discovered", other),
     }
@@ -261,12 +279,12 @@ pub def port_operational_state_and_device_path_are_discoverable: test::Test = te
         owner: "port", id: "port_oper_status"};
     let owner: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Relation,
         owner: "port", id: "port_belongs_to_device"};
-    let response = knowledge::knowledge_info_method_factory(payload)(
+    let response = info_handler(
         key_input(edsl::KnowledgeKind::Dataset, "", "port"));
     match checked_response(response) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
-            if array::any(point.refs, fn(ref) { ref.target == status })
-                && array::any(point.refs, fn(ref) { ref.target == owner }) { True }
+            if array::any(discovered_refs(point), fn(ref) { ref.target == status })
+                && array::any(discovered_refs(point), fn(ref) { ref.target == owner }) { True }
             else { fail!("port knowledge lost its status or device ownership", point) },
         other => fail!("port topic cannot be discovered", other),
     }
@@ -279,8 +297,8 @@ pub def physical_link_discloses_server_participation_separately_from_network_dev
     let device: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Relation,
         owner: "physical_link", id: "physical_link_attached_device"};
     match lookup(link) {
-        knowledge::DocResult::Found(point) => if array::any(point.refs, fn(ref) { ref.target == server })
-            && array::any(point.refs, fn(ref) { ref.target == device }) {
+        knowledge::DocResult::Found(point) => if array::any(discovered_refs(point), fn(ref) { ref.target == server })
+            && array::any(discovered_refs(point), fn(ref) { ref.target == device }) {
             match lookup(server) {
                 knowledge::DocResult::Found(relation) => if relation.relation != None { True }
                     else { fail!("server participation lacks relation detail") },
@@ -298,7 +316,7 @@ pub def undirected_peer_discloses_its_bidirectional_hub_guard: test::Test = test
         knowledge::DocResult::Found(point) => match point.guard {
             Some(pred) => if pred.field == "direction" && pred.op == edsl::FilterOp::Eq
                 && pred.input == edsl::FilterInput::Text("bidirectional")
-                && array::any(point.refs, fn(ref) { ref.target.kind == edsl::KnowledgeKind::Field
+                && array::any(discovered_refs(point), fn(ref) { ref.target.kind == edsl::KnowledgeKind::Field
                     && ref.target.owner == "physical_link" && ref.target.id == "direction" }) { True }
             else { fail!("peer knowledge lost bidirectional hub guard", point) },
             None => fail!("peer knowledge does not disclose its direction guard"),
@@ -308,7 +326,7 @@ pub def undirected_peer_discloses_its_bidirectional_hub_guard: test::Test = test
 });
 
 pub def peer_topic_doc_exposes_direction_guard: test::Test = test::should_ok(fn() {
-    let document = knowledge::knowledge_info_method_factory(payload)(
+    let document = info_handler(
         key_input(edsl::KnowledgeKind::BusinessLink, "physical_link", "physical_link_peer_device"));
     match checked_response(document) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
@@ -322,7 +340,7 @@ pub def peer_topic_doc_exposes_direction_guard: test::Test = test::should_ok(fn(
 });
 
 pub def downstream_topic_doc_exposes_one_way_guard: test::Test = test::should_ok(fn() {
-    let document = knowledge::knowledge_info_method_factory(payload)(
+    let document = info_handler(
         key_input(edsl::KnowledgeKind::BusinessLink, "physical_link", "physical_link_downstream_device"));
     match checked_response(document) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
@@ -343,7 +361,7 @@ pub def site_alarm_relation_discloses_its_guard: test::Test = test::should_ok(fn
             Some(detail) => match detail.guard {
                 Some(guard) => if guard.field == "strext13" && guard.op == edsl::FilterOp::Ne
                     && guard.input == edsl::FilterInput::Text("3")
-                    && array::any(point.refs, fn(ref) { ref.target.kind == edsl::KnowledgeKind::Field
+                    && array::any(discovered_refs(point), fn(ref) { ref.target.kind == edsl::KnowledgeKind::Field
                         && ref.target.owner == "current_alarm" && ref.target.id == "strext13" })
                     && match lookup({kind: edsl::KnowledgeKind::Field,
                         owner: "current_alarm", id: "strext13"}) {
@@ -386,7 +404,7 @@ pub def ic_device_kpi_measure_is_discoverable: test::Test = test::should_ok(fn()
 
 def kpi_measure_doc: Fn(String) -> edsl::MeasureBrief = fn(id) {
     let input = key_input(edsl::KnowledgeKind::Measure, "device_kpi", id);
-    let document = knowledge::knowledge_info_method_factory(payload)(input);
+    let document = info_handler(input);
     match checked_response(document) {
         knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(point)) =>
             if point.target.kind != edsl::KnowledgeKind::Measure || point.target.owner != "device_kpi"
@@ -460,7 +478,7 @@ def checked_response: Fn(Value) -> knowledge::KnowledgeResponse = fn(value) {
         knowledge::NodeResponse::Document(document) => match document {
             knowledge::NodeResult::NotFound => knowledge::KnowledgeResponse::Document(knowledge::DocResult::NotFound),
             knowledge::NodeResult::Found(node) => {
-                let entry = match array::find(knowledge::index_from_model(payload).entries,
+                let entry = match array::find(catalog_entries,
                     fn(entry) { edsl::knowledge_key(entry.key) == node.key }) {
                     Some(entry) => entry,
                     None => fail!("public knowledge key is absent from the catalog", node.key),
