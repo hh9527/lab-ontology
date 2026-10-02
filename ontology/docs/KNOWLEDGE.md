@@ -33,7 +33,8 @@ Entry keys naming a Directory lead to children; other entries name members.
 Dataset links lead to their member directory; values are discovered from dimensions.
 No visible node depends on having a business relationship to be discoverable.
 Directory detail.total counts leaf entries in that subtree, not synthetic
-directory nodes. Index total is its five top-level routes. Terminology total
+directory nodes. Index total is its five top-level routes; its `detail.revision`
+is the Prepared Model revision used by snapshot publication checks. Terminology total
 counts expression-to-target associations, not distinct words or concepts.
 Counts cover only visible knowledge. There is no extra done/next/has_more flag.
 

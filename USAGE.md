@@ -19,7 +19,8 @@ this repository.
 ## 1. Build a snapshot
 
 ```sh
-bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm
+node scripts/build-knowledge-snapshot.mjs --module <module> \
+  --domain <domain> --output <artifact>.wasm
 ```
 
 `<module>` is a Telora workspace member with a `MainService`; it is not the
@@ -29,8 +30,24 @@ all of them with `--source name=path` at build time. Initialization fuel,
 request fuel, and memory limits can be set with the corresponding CLI options
 when deployment requires them. Use a compatible `telora-run` version with the
 resulting experimental artifact.
-The `-C <module>` option selects the crate context when running from the
-repository root; invoking `build` from the root without it fails.
+The wrapper compiles with `--snapshot`, traverses the actual artifact's visible
+knowledge, and publishes only after checks pass. Repeat `--domain` for every
+domain in a collection (for example `dog`, `spider`, `world`). It writes
+`<artifact>.wasm.knowledge.json` (visible keys/types, counts, Model revisions and
+artifact SHA-256) and `<artifact>.wasm.knowledge-sizes.json` (full size rankings,
+largest entry/link, threshold and runtime verification results).
+The default node budget is 16,000 characters, measured exactly as
+`JSON.stringify({Document:{Found:node}}, null, 2).length`, not UTF-8 bytes.
+Use `--max-node-chars <number>` to set the deployment budget. Oversize fails
+before replacing any previous artifact; `--on-oversize warn` explicitly permits
+publication with a warning report. `--not-found <checks.json>` additionally
+checks hidden keys using a JSON array of `{domain,key}` requests.
+Use `--context <crate-directory>` if the crate context differs from its module
+name. The wrapper forwards repeated `--source` and fuel/memory options.
+`node scripts/check-knowledge-manifest.mjs <artifact>.wasm` verifies the artifact
+hash, revision, counts and real `info` samples after transport or deployment.
+Direct `bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm`
+is available for experiments, but bypasses these publication checks.
 
 ## 2. Start the service
 
@@ -92,7 +109,8 @@ not substitutes for stable Intent IDs.
 Every knowledge node has `{key,type,description,links,detail}`. The string key
 is opaque: do not construct it from a type or business ID, split it, or decode it.
 The response `type` determines the `detail` shape. `Index` and `Directory` enumerate
-their children in `detail.entries`, without repeating entries in links. Dataset
+their children in `detail.entries`, without repeating entries in links. Index
+also publishes the Model's `detail.revision`. Dataset
 links lead to member directories. The terminology route uses `Directory` branches
 and `Terminology` leaves with `{term,description,key}` entries derived from Model annotations. `DataType`
 describes logical values and operations; a field must still authorize an operation.
