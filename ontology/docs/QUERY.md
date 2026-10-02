@@ -51,6 +51,13 @@ the allocation context and validated plan into one `QueryAst`; neither
 unfinished `Ctx` nor `Plan` crosses the renderer boundary. The AST cannot
 contain raw SQL, arbitrary functions, or literal fragments.
 
+`JoinedGroups.rank` optionally ranks independently aggregated, inner-joined
+groups by right minus left with a bound limit of 1..1000. Renderers exclude
+NULL measures and break ties by all hidden grouping keys ascending, NULLS
+FIRST. Operands are cast to double precision before subtraction. Output
+columns remain unchanged. `JoinedGroupCount` rejects ranking. Model lowering
+checks numeric measure types, compatible units, and profile authorization.
+
 Model-backed type and grain checks belong to ontology lowering. The query
 module also validates structural invariants such as source visibility,
 expression shape, and closed operator use. A bare AST caller is responsible

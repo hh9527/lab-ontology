@@ -494,12 +494,14 @@ type Plan = struct {
 # Top-level result shape is part of the shared AST.  DISTINCT and set
 # operations cannot be inferred from a plain Plan's projection alone.
 type SetPlan = struct { kind: SetOpKind, operands: Array(Plan) };
+type JoinedGroupRank = struct { left_measure: String, right_measure: String, direction: Ordering, take: Expr };
 type JoinedGroups = struct {
     left: Plan,
     right: Plan,
     keys: Array(String),
     left_outputs: Array(String),
     right_outputs: Array(String),
+    rank: Option(JoinedGroupRank),
 };
 type QueryPlan = enum {
     Rows(Plan),
@@ -1661,8 +1663,11 @@ def validate_contextual_pagination: Fn(QueryPlan, BuildCtx) -> QueryPlan = fn(qu
             operands: array::map(set.operands, fn(plan) { pagination_in_context(plan, ctx) })}),
         QueryPlan::SetCount(set) => QueryPlan::SetCount({...set,
             operands: array::map(set.operands, fn(plan) { pagination_in_context(plan, ctx) })}),
-        QueryPlan::JoinedGroups(joined) => QueryPlan::JoinedGroups({...joined,
-            left: pagination_in_context(joined.left, ctx), right: pagination_in_context(joined.right, ctx)}),
+        QueryPlan::JoinedGroups(joined) => if match joined.rank {
+            Some(rank) => page_value_in_context(rank.take, ctx, True), None => True,
+        } { QueryPlan::JoinedGroups({...joined,
+            left: pagination_in_context(joined.left, ctx), right: pagination_in_context(joined.right, ctx)}) }
+        else { fail!("joined group rank take binding must contain an integer within its allowed range", joined.rank) },
         QueryPlan::JoinedGroupCount(joined) => QueryPlan::JoinedGroupCount({...joined,
             left: pagination_in_context(joined.left, ctx), right: pagination_in_context(joined.right, ctx)}),
     }
@@ -2888,7 +2893,23 @@ def validate_joined_groups: Fn(JoinedGroups) -> JoinedGroups = fn(joined) {
     }) || !array::all(joined.left_outputs, fn(name) { count_in(left_names, name) == 1 })
         || !array::all(joined.right_outputs, fn(name) { count_in(right_names, name) == 1 }) {
         fail!("joined groups output must name unique projected non-key columns on its operand")
-    } else { {...joined, left, right} }
+    } else if match joined.rank {
+        None => False,
+        Some(rank) => !page_value_ok(rank.take, True)
+            || !array::any(joined.left_outputs, fn(name) { name == rank.left_measure })
+            || !array::any(joined.right_outputs, fn(name) { name == rank.right_measure })
+            || !array::any(left.projection, fn(item) { match item {
+                SelectItem::Aggregate(call) => call.alias == rank.left_measure,
+                SelectItem::Computed(call) => call.alias == rank.left_measure,
+                _ => False,
+            } })
+            || !array::any(right.projection, fn(item) { match item {
+                SelectItem::Aggregate(call) => call.alias == rank.right_measure,
+                SelectItem::Computed(call) => call.alias == rank.right_measure,
+                _ => False,
+            } }),
+    } { fail!("joined group rank requires projected measure aliases and an allocated take binding", joined.rank) }
+    else { {...joined, left, right} }
 };
 
 def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
@@ -2910,7 +2931,9 @@ def validate_query_plan: Fn(QueryPlan) -> QueryPlan = fn(query_plan) {
             }
         },
         QueryPlan::JoinedGroups(joined) => QueryPlan::JoinedGroups(validate_joined_groups(joined)),
-        QueryPlan::JoinedGroupCount(joined) => QueryPlan::JoinedGroupCount(validate_joined_groups(joined)),
+        QueryPlan::JoinedGroupCount(joined) => if joined.rank != None {
+            fail!("joined group count cannot rank or truncate groups", joined.rank)
+        } else { QueryPlan::JoinedGroupCount(validate_joined_groups(joined)) },
     }
 };
 
@@ -3437,6 +3460,7 @@ pub use self::{
     Plan,
     SetPlan,
     JoinedGroups,
+    JoinedGroupRank,
     QueryPlan,
     QueryAst,
     finish,

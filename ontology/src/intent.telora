@@ -211,7 +211,8 @@ type RawGraphExistEnvelope = struct {
     negated: Option(Value),
 };
 type RawCountThreshold = struct { op: String, value: Value };
-type RawGraphPair = struct { op: String, left: Value, right: Value, count_groups: Option(Value) };
+type RawGraphPair = struct { op: String, left: Value, right: Value, count_groups: Option(Value), rank_by: Option(Value) };
+type RawPairRank = struct { op: String, direction: String, take: Int };
 type RawGraphUnion = struct { op: String, branches: Array(Value) };
 type RawUnionBranch = struct { result_node: String, graph: Value };
 type RawQueryRequest = struct { intents: Array(Value) };
@@ -498,14 +499,52 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
         });
         let left_measure = left.1.measures[0];
         let right_measure = right.1.measures[0];
+        let ranked = match raw.rank_by {
+            None => (right.0, None),
+            Some(value) => {
+                let rank = decode_graph_shape@[RawPairRank](value, "syntax/graph_pair");
+                if rank.op != "Subtract" { fail!("aggregate pair rank supports only Subtract (right - left)", rank.op) }
+                else if count_groups { fail!("aggregate pair rank_by cannot be combined with count_groups", value) }
+                else if rank.take <= 0 || rank.take > qb::max_partition_take {
+                    fail!("aggregate pair rank take must be a positive integer within the cap", rank.take)
+                } else { () };
+                let direction = match rank.direction {
+                    "Asc" => qb::Ordering::Asc, "Desc" => qb::Ordering::Desc,
+                    other => fail!("aggregate pair rank direction must be Asc or Desc", other),
+                };
+                let ltype = edsl::measure_output_type(payload, left_measure.measure);
+                let rtype = edsl::measure_output_type(payload, right_measure.measure);
+                if (ltype != edsl::OutputType::Integer && ltype != edsl::OutputType::Number)
+                    || (rtype != edsl::OutputType::Integer && rtype != edsl::OutputType::Number) {
+                    fail!("aggregate pair rank requires numeric measures", left_measure.measure, right_measure.measure)
+                } else { () };
+                let lmetric = edsl::measure_domain(payload, left_measure.measure).metric;
+                let rmetric = edsl::measure_domain(payload, right_measure.measure).metric;
+                if left_measure.measure != right_measure.measure && !match (lmetric, rmetric) {
+                    (Some(l), Some(r)) => l.unit != None && l.unit == r.unit,
+                    _ => False,
+                } { fail!("aggregate pair rank requires the same measure or matching declared units", left_measure.measure, right_measure.measure) }
+                else { () };
+                if !array::all([qb::Operator::Order, qb::Operator::Limit, qb::Operator::Scalar, qb::Operator::Filter], fn(op) {
+                    array::any(payload.profile.allowed_operators, fn(allowed) { allowed == op })
+                }) || !array::all([qb::ScalarFunction::Sub, qb::ScalarFunction::IsNotNull], fn(op) {
+                    array::any(payload.profile.allowed_scalars, fn(allowed) { allowed == op })
+                }) { fail!("aggregate pair ranking is not authorized by the model query profile", value) }
+                else { () };
+                let bound = qb::take_bound(right.0, rank.take);
+                (bound.0, Some({left_measure: `\{left_measure.node}_\{left_measure.measure}`,
+                    right_measure: `\{right_measure.node}_\{right_measure.measure}`, direction, take: bound.1}.ty!(qb::JoinedGroupRank)))
+            },
+        };
         let joined: qb::JoinedGroups = {
             left: paired_group_operand(left.2), right: paired_group_operand(right.2), keys,
             left_outputs: array::push(visible, `\{left_measure.node}_\{left_measure.measure}`),
             right_outputs: [`\{right_measure.node}_\{right_measure.measure}`],
+            rank: ranked.1,
         };
         let plan = if count_groups { qb::QueryPlan::JoinedGroupCount(joined) }
             else { qb::QueryPlan::JoinedGroups(joined) };
-        qb::finish(right.0, qb::validate_query_plan(plan))
+        qb::finish(ranked.0, qb::validate_query_plan(plan))
     }
 };
 

@@ -331,8 +331,25 @@ The two operands must satisfy all of these shape rules:
    `top_by_measure`, `order_by`, or `take`. Put measure thresholds in
    that operand's `measure_having`, not in the outer pair.
 
-The outer object accepts only `op`, `left`, `right`, and optional boolean
-`count_groups`. A successful pair does not prove that two similarly named
+To return the five largest increases, add this outer field:
+
+```json
+"rank_by": {"op":"Subtract","direction":"Desc","take":5}
+```
+
+Ranking uses **right minus left**, after independent aggregation and the
+identity join. `Asc` returns the largest decreases first. Both measures must
+be numeric; differing measure IDs must declare the same non-null unit.
+Groups with a NULL measure on either side are excluded. Ties use every
+hidden grouping key ascending, NULLS FIRST. `take` is a bound integer from
+1 to 1000. Arithmetic casts operands to double precision (`REAL` in SQLite,
+`DOUBLE PRECISION` in PostgreSQL), so large integers may lose precision.
+The output retains dimensions and both measures without a difference column.
+`rank_by` cannot combine with `count_groups:true`; that count continues to
+count all aligned groups, rather than a ranked subset.
+
+The outer object accepts `op`, `left`, `right`, optional boolean
+`count_groups`, and optional `rank_by`. A successful pair does not prove that two similarly named
 display values are the same entity: the join uses the aligned identity keys.
 
 In JSONL service mode, responses use the `telora.service/v1` envelope. On

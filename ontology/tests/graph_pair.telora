@@ -1,0 +1,177 @@
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::dict as dict;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+@edsl::entity_id("device")
+@edsl::entity_source("devices", "device")
+type Device = struct {
+    @edsl::column("id") @edsl::key()
+    id: String,
+    @edsl::column("name")
+    @edsl::dimension("name", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    name: String,
+};
+
+@edsl::entity_id("sample")
+@edsl::entity_source("samples", "sample")
+@edsl::dataset(edsl::DatasetKind::Metric, ["id"], Some("ts"))
+@edsl::named_relation_key("sample_device", Device.type, {from: edsl::Cardinality::Many0, to: edsl::Cardinality::One},
+    edsl::DeclaredRelationKey::FieldEq({from: "owner", to: "id"}))
+type Sample = struct {
+    @edsl::column("id") @edsl::key()
+    id: Int,
+    @edsl::column("owner")
+    owner: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    @edsl::dimension("time", True, True, [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::EpochMillis])
+    ts: Int,
+    @edsl::column("usage")
+    @edsl::measure("usage", qb::AggregateFunction::Avg, [])
+    @edsl::metric_value("usage", qb::AggregateFunction::Avg, Some("%"))
+    usage: Float,
+    @edsl::column("usage")
+    @edsl::measure("peak", qb::AggregateFunction::Max, [])
+    @edsl::metric_value("peak", qb::AggregateFunction::Max, Some("%"))
+    peak: Float,
+    @edsl::column("usage")
+    @edsl::measure("unitless", qb::AggregateFunction::Avg, [])
+    unitless: Float,
+    @edsl::column("bytes")
+    @edsl::measure("bytes", qb::AggregateFunction::Sum, [])
+    @edsl::metric_value("bytes", qb::AggregateFunction::Sum, Some("bytes"))
+    bytes: Int,
+    @edsl::column("label")
+    @edsl::measure("label", qb::AggregateFunction::Min, [])
+    label: String,
+};
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate, qb::Operator::Filter,
+        qb::Operator::Join, qb::Operator::Group, qb::Operator::Having, qb::Operator::Order, qb::Operator::Limit],
+    allowed_join_kinds: [qb::JoinKind::Inner],
+    allowed_aggregates: [qb::AggregateFunction::Avg, qb::AggregateFunction::Max, qb::AggregateFunction::Min, qb::AggregateFunction::Sum],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt,
+        qb::ScalarFunction::And, qb::ScalarFunction::Sub, qb::ScalarFunction::IsNotNull],
+    allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("pair-rank-v1", [Device.type, Sample.type], profile);
+def lower: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
+
+def graph: Fn(String, String, Int, Int) -> Value = fn(node, measure, start, end) {
+    json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"\{node}","entity":"sample"}],
+        "edges":[{"relation":"sample_device","from":"\{node}","to":"d"}],"select":[{"node":"d","dimension":"name"}],
+        "group_by_identity":["d"],"measures":[{"node":"\{node}","measure":"\{measure}"}],
+        "time_windows":[{"node":"\{node}","dimension":"time","start":\{start},"end":\{end}}]}`).unwrap!()
+};
+def rank: Fn(String, Int) -> Value = fn(direction, take) {
+    json::parse(`{"op":"Subtract","direction":"\{direction}","take":\{take}}`).unwrap!()
+};
+def pair: Fn(String, String, Value) -> Value = fn(left, right, ranking) {
+    Value::Object({op: Value::String("GraphPair"), left: graph("prev", left, 0, 10),
+        right: graph("curr", right, 10, 20), rank_by: ranking})
+};
+def patch: Fn(Value, Dict(Value)) -> Value = fn(value, changes) {
+    match value { Value::Object(fields) => Value::Object(dict::merge(fields, changes)), _ => fail!("expected object", value) }
+};
+
+pub def rank_is_bound_and_uses_right_minus_left_in_both_dialects: test::Test = test::should_ok(fn() {
+    let ast = lower(pair("usage", "usage", rank("Desc", 5)));
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    sq.bindings == [qb::Val::Int(0), qb::Val::Int(10), qb::Val::Int(10), qb::Val::Int(20), qb::Val::Int(5)]
+        && pg.bindings == sq.bindings
+        && string::contains(sq.sql, "CAST(__q_right.curr_usage AS REAL) - CAST(__q_left.prev_usage AS REAL)")
+        && string::contains(sq.sql, "__q_left.prev_usage IS NOT NULL AND __q_right.curr_usage IS NOT NULL")
+        && string::contains(sq.sql, "DESC, __q_left.__q_key_1 ASC NULLS FIRST")
+        && string::contains(sq.sql, "LIMIT ?5") && string::contains(pg.sql, "LIMIT $5")
+        && string::contains(pg.sql, "AS DOUBLE PRECISION")
+});
+pub def matching_declared_units_allow_different_measures: test::Test = test::should_ok(fn() {
+    lower(pair("usage", "peak", rank("Asc", 1000)))
+});
+pub def rank_rejects_different_units: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "bytes", rank("Desc", 5)))
+}, "matching declared units");
+pub def rank_rejects_unestablished_units: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "unitless", rank("Desc", 5)))
+}, "matching declared units");
+pub def rank_rejects_text_measures: test::Test = test::should_fail_with(fn() {
+    lower(pair("label", "label", rank("Desc", 5)))
+}, "requires numeric measures");
+pub def rank_rejects_zero_take: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", rank("Desc", 0)))
+}, "rank take must be a positive integer within the cap");
+pub def rank_rejects_excessive_take: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", rank("Desc", 1001)))
+}, "rank take must be a positive integer within the cap");
+pub def rank_rejects_count_groups: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {count_groups: Value::True}))
+}, "rank_by cannot be combined with count_groups");
+pub def rank_rejects_ratio: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", patch(rank("Desc", 5), {op: Value::String("Ratio")})))
+}, "supports only Subtract");
+pub def rank_rejects_unknown_direction: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", rank("Down", 5)))
+}, "direction must be Asc or Desc");
+pub def rank_does_not_allow_operand_top_n: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        left: patch(graph("prev", "usage", 0, 10), {
+            top_by_measure: json::parse(r#"{"node":"prev","measure":"usage","direction":"Desc","take":5}"#).unwrap!(),
+        }),
+    }))
+}, "aggregate pair operands each require one measure");
+pub def rank_rejects_invalid_ast_pagination_binding: test::Test = test::should_fail_with(fn() {
+    let ast = lower(pair("usage", "usage", rank("Desc", 5)));
+    sqlite::build_query({...ast, ctx: {...ast.ctx, bindings: [qb::Val::Int(0), qb::Val::Int(10), qb::Val::Int(10), qb::Val::Int(20), qb::Val::Int(1001)]}})
+}, "rank take binding must contain an integer within its allowed range");
+
+pub def rank_rejects_unknown_fields: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", patch(rank("Desc", 5), {extra: Value::True})))
+}, "unknown field");
+pub def rank_requires_profile_authorization: test::Test = test::should_fail_with(fn() {
+    let restricted = edsl::build_root("restricted", [Device.type, Sample.type],
+        {...profile, allowed_scalars: array::filter(profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::Sub })});
+    intent::query_intent_ast_factory(restricted)(pair("usage", "usage", rank("Desc", 5)))
+}, "not authorized");
+pub def rank_rejects_forged_measure_alias: test::Test = test::should_fail_with(fn() {
+    let ast = lower(pair("usage", "usage", rank("Desc", 5)));
+    match ast.plan {
+        qb::QueryPlan::JoinedGroups(joined) => match joined.rank {
+            Some(ranking) => postgres::build_query({...ast, plan: qb::QueryPlan::JoinedGroups({...joined,
+                rank: Some({...ranking, left_measure: "d_name"})})}),
+            _ => fail!("expected rank"),
+        },
+        _ => fail!("expected joined groups"),
+    }
+}, "requires projected measure aliases");
+pub def rank_rejects_forged_group_count: test::Test = test::should_fail_with(fn() {
+    let ast = lower(pair("usage", "usage", rank("Desc", 5)));
+    match ast.plan {
+        qb::QueryPlan::JoinedGroups(joined) => sqlite::build_query({...ast, plan: qb::QueryPlan::JoinedGroupCount(joined)}),
+        _ => fail!("expected joined groups"),
+    }
+}, "cannot rank or truncate groups");
+
+def unranked: Value = Value::Object({op: Value::String("GraphPair"),
+    left: graph("prev", "usage", 0, 10), right: graph("curr", "usage", 10, 20)});
+pub def execution_queries: Value = codec::encode(array::concat([array::map([("Desc", 2), ("Asc", 2), ("Desc", 1000)], fn(spec) {
+    sqlite::build_query(lower(pair("usage", "usage", rank(spec.0, spec.1))))
+}), [sqlite::build_query(lower(unranked)),
+    sqlite::build_query(lower(patch(unranked, {count_groups: Value::True}))),
+    sqlite::build_query(lower(patch(pair("usage", "usage", rank("Desc", 2)), {
+        left: patch(graph("prev", "usage", 0, 10), {
+            measure_having: json::parse(r#"[{"node":"prev","measure":"usage","op":"Ge","value":20.0}]"#).unwrap!(),
+        }),
+    }))),
+]]));
