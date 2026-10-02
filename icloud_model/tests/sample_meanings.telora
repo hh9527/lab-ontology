@@ -1,0 +1,112 @@
+use crate::model::{ payload };
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::ontology as edsl;
+use ontology::knowledge as knowledge;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+def ast: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload);
+def lookup: Fn(edsl::KnowledgeTarget) -> knowledge::DocResult = knowledge::knowledge_lookup_factory(payload);
+type SummaryCase = struct { entity: String, measures: Array(String), columns: Array(String) };
+
+pub def device_sample_meanings_lower_without_aggregate_override: test::Test = test::should_ok(fn() {
+    let plan = ast(json::parse(r#"{"op":"Graph","root":"d",
+        "nodes":[{"id":"d","entity":"device"},{"id":"k","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"k","to":"d"}],
+        "select":[{"node":"d","dimension":"device_name"}],"group_by_identity":["d"],
+        "measures":[{"node":"k","measure":"cpu_usage"},{"node":"k","measure":"cpu_peak"},
+            {"node":"k","measure":"device_cpu_sample_min"},{"node":"k","measure":"memory_usage"},
+            {"node":"k","measure":"memory_peak"},{"node":"k","measure":"device_memory_sample_min"},
+            {"node":"k","measure":"device_port_usage_min"}],
+        "time_windows":[{"node":"k","dimension":"device_kpi_ts_raw","start":"2025-01-01 00:00:00","end":"2025-01-02 00:00:00"}],
+        "measure_having":[{"node":"k","measure":"memory_peak","op":"Ge","value":90}],
+        "top_by_measure":{"node":"k","measure":"memory_peak","direction":"Desc","take":5}
+    }"#).unwrap!());
+    let sq = sqlite::build_query(plan);
+    let pg = postgres::build_query(plan);
+    if array::all(["avg(k.cpuUsage)", "max(k.cpuUsage)", "min(k.cpuUsage)",
+        "avg(k.memUsage)", "max(k.memUsage)", "min(k.memUsage)", "min(k.ifUtilizationRate)",
+        "GROUP BY d.name, d.id", "HAVING max(k.memUsage)", "ORDER BY max(k.memUsage) DESC"], fn(fragment) { string::contains(sq.sql, fragment) })
+        && string::contains(pg.sql, "min(\"k\".\"memUsage\")")
+        && sq.bindings == pg.bindings
+        && sq.bindings == [qb::Val::String("2025-01-01 00:00:00"), qb::Val::String("2025-01-02 00:00:00"), qb::Val::Int(5), qb::Val::Int(90)] { True }
+    else { fail!("declared sample statistics lost their meaning, identity or bindings", sq, pg) }
+});
+
+pub def raw_device_samples_support_trend_and_threshold_count: test::Test = test::should_ok(fn() {
+    let trend = sqlite::build_query(ast(json::parse(r#"{"op":"Graph","root":"k",
+        "nodes":[{"id":"k","entity":"device_kpi"}],"edges":[],
+        "select":[{"node":"k","dimension":"device_cpu_sample"},{"node":"k","dimension":"device_memory_sample"},
+            {"node":"k","dimension":"device_kpi_ts_raw"}],"take":20,
+        "order_by":[{"node":"k","dimension":"device_kpi_ts_raw","direction":"Asc"}]
+    }"#).unwrap!()));
+    let count = sqlite::build_query(ast(json::parse(r#"{"op":"Graph","root":"d",
+        "nodes":[{"id":"d","entity":"device"},{"id":"k","entity":"device_kpi"}],
+        "edges":[{"relation":"device_kpi_of_device","from":"k","to":"d"}],
+        "select":[{"node":"d","dimension":"device_name"}],"group_by_identity":["d"],"count":"k",
+        "filters":[{"node":"k","dimension":"device_cpu_sample","op":"Ge","value":90}],
+        "count_having":{"op":"Gt","value":2}
+    }"#).unwrap!()));
+    if string::contains(trend.sql, "k.cpuUsage AS") && string::contains(trend.sql, "k.memUsage AS")
+        && !string::contains(trend.sql, "avg(")
+        && string::contains(count.sql, "k.cpuUsage >= ?1")
+        && string::contains(count.sql, "count(k.resId)") && string::contains(count.sql, "HAVING count(k.resId) > ?2") { True }
+    else { fail!("raw trend and qualifying sample count were conflated with aggregate thresholds", trend, count) }
+});
+
+pub def server_and_bandwidth_extrema_are_declared_sample_statistics: test::Test = test::should_ok(fn() {
+    let cases: Array(SummaryCase) = [
+        {entity: "server_kpi", measures: ["server_cpu_peak", "server_cpu_sample_min", "server_memory_sample_min"], columns: ["max(k.cpuUsage)", "min(k.cpuUsage)", "min(k.memUsage)"]},
+        {entity: "interface_kpi", measures: ["interface_in_band_usage_min", "interface_out_band_usage_max"], columns: ["min(k.ifInBandRate)", "max(k.ifOutBandRate)"]},
+        {entity: "onu_kpi", measures: ["onu_receive_usage_min", "onu_receive_usage_max"], columns: ["min(k.ifInBandRate)", "max(k.ifInBandRate)"]},
+        {entity: "pon_port_kpi", measures: ["pon_port_receive_sample_min", "pon_port_receive_sample_max"], columns: ["min(k.ifInBandRate)", "max(k.ifInBandRate)"]},
+    ];
+    array::all(cases, fn(spec) {
+        let request = Value::Object({op: Value::String("Graph"), root: Value::String("k"),
+            nodes: Value::Array([Value::Object({id: Value::String("k"), entity: Value::String(spec.entity)})]),
+            edges: Value::Array([]), select: Value::Array([]), measures: Value::Array(array::map(spec.measures, fn(id) {
+                Value::Object({node: Value::String("k"), measure: Value::String(id)})
+            }))});
+        let query = sqlite::build_query(ast(request));
+        if array::all(spec.columns, fn(column) { string::contains(query.sql, column) }) { True }
+        else { fail!("sample summary changed its source column or aggregation", spec, query) }
+    })
+});
+
+pub def undefined_percentage_sum_is_not_silently_replaced: test::Test = test::should_fail_with(fn() {
+    ast(json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"}],
+        "edges":[],"select":[],"measures":[{"node":"k","measure":"device_memory_sample_sum"}]}"#).unwrap!())
+}, "unknown declared measure");
+
+pub def intent_cannot_override_a_declared_average: test::Test = test::should_fail_with(fn() {
+    ast(json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"}],
+        "edges":[],"select":[],"measures":[{"node":"k","measure":"memory_usage","aggregate":"Max"}]}"#).unwrap!())
+}, "unknown field");
+
+pub def average_knowledge_discovers_peak_minimum_and_raw_samples: test::Test = test::should_ok(fn() {
+    match lookup({kind: edsl::KnowledgeKind::Measure, owner: "device_kpi", id: "memory_usage"}) {
+        knowledge::DocResult::Found(point) => if edsl::measure_detail(payload, "memory_usage").aggregate == Some(qb::AggregateFunction::Avg)
+            && array::all(["memory_peak", "device_memory_sample_min", "device_memory_sample"], fn(id) {
+                array::any(point.refs, fn(ref) { ref.target.id == id && ref.kind == knowledge::LinkKind::Related })
+            }) && array::any(point.aliases, fn(alias) { alias == "设备内存平均使用率" }) { True }
+            else { fail!("average knowledge does not distinguish and discover alternative statistics", point) },
+        other => fail!("average knowledge missing", other),
+    }
+});
+
+pub def ambiguous_port_terms_preserve_three_distinct_business_meanings: test::Test = test::should_ok(fn() {
+    let targets = ["device_kpi__ifUtilizationRate", "interface_kpi__ifInBandRate", "pon_port_receive_sample"];
+    let device = edsl::visible_dimension_detail(payload, targets[0]);
+    let metric = match edsl::measure_detail(payload, "device_port_usage_min").metric {
+        Some(metric) => metric, None => fail!("source-value metric missing"),
+    };
+    if array::all(targets, fn(id) { array::any(edsl::visible_dimension_detail(payload, id).aliases, fn(alias) { alias == "端口利用率" }) })
+        && string::contains(device.summary, "does not define numerator") && metric.unit == None { True }
+    else { fail!("ambiguous terminology collapsed meanings or invented a formula/unit", device, metric) }
+});
