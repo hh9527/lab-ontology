@@ -64,7 +64,7 @@ try {
     assert.ok(node.description.aliases.length > 0);
     assert.ok(node.links.some(link => link.type === 'Related' && link.key.startsWith('Dimension/')));
   }
-  for (const index of [0, 1, 3]) {
+  for (const index of [0, 1, 2, 3]) {
     const spec = cases[index];
     const measure = spec[6].replace(/_avg$/, '_max');
     const original = intents[index];
@@ -83,10 +83,32 @@ try {
     assert.ok(maximum.description.summary.includes('Not a maximum of period averages'));
     assert.ok(average.links.some(link => link.key === maximum.key && link.type === 'Related'));
   }
+  for (const [index, spec] of cases.entries()) {
+    const measure = spec[6].replace(/_avg$/, '_min');
+    const original = intents[index];
+    const intent = { ...original, measures: [{ node: 'k', measure }],
+      measure_having: [{ node: 'k', measure, op: 'Ge', value: 80 }],
+      top_by_measure: { node: 'k', measure, direction: 'Desc', take: 5 } };
+    const result = await request('transform', { intents: [intent] });
+    assert.equal(result.accepted, true, JSON.stringify(result.diagnostics));
+    const query = result.queries[0];
+    const rows = db.prepare(query.sql).all(...query.bindings);
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.map(row => Object.values(row).find(value => typeof value === 'number')), [95, 80]);
+    const minimum = (await request('info', { key: `Measure/${spec[0]}/${measure}` })).Document.Found;
+    const average = (await request('info', { key: `Measure/${spec[0]}/${spec[6]}` })).Document.Found;
+    assert.equal(minimum.detail.aggregate, 'Min');
+    assert.ok(minimum.description.summary.includes('Missing observations are not covered'));
+    assert.ok(minimum.description.aliases.length > 0);
+    assert.ok(minimum.links.some(link => link.type === 'Related' && link.key.startsWith('Dimension/')));
+    assert.ok(average.links.some(link => link.key === minimum.key && link.type === 'Related'));
+    assert.ok(JSON.stringify(minimum).length <= 16000);
+    assert.ok(JSON.stringify(average).length <= 16000);
+  }
   console.log(JSON.stringify({ status: 'passed', populations: cases.length,
     verified: ['identity groups', 'mean versus peak', 'NULL handling', 'no effective-count weighting',
       'exclusive end', 'mean threshold and ranking', 'knowledge aliases and raw links',
-      'three distinct sample maxima and Avg discovery links'] }));
+      'four distinct sample maxima and minima with Avg discovery links'] }));
 } finally {
   clearTimeout(deadline);
   db.close();

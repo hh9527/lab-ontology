@@ -102,8 +102,8 @@ IDs, NULL and threshold meanings, and the unresolved device port-usage formula.
   bind only the prepared model and relevant backend/domain. Dimension
   visibility remains a model capability; authentication belongs to the host.
 - Source-only carriers expose raw fields without invented sample grains.
-  Reviewed online-rate Avg/Max measures additionally expose the arithmetic mean
-  or maximum of stored values, not time-weighted or effective-count-weighted rates. They do not
+  Online-rate Avg/Min/Max measures additionally expose the arithmetic mean or
+  extrema of stored values, not time-weighted or effective-count-weighted rates. They do not
   establish sample uniqueness or infer a numeric scale. Time formats follow the
   explicit convention above.
   UUID/IP use String, float/double

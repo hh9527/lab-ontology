@@ -377,4 +377,7 @@ Q0039/Q0329, Q0382 and Q0422 additionally establish maximum stored online-rate
 samples on NetworkDeviceOnlineKPI, NetworkDeviceKPI and PonDeviceOnlineKPI.
 Their separate Max IDs remain discoverable from Avg and link to the raw
 dimension. They do not mean maximum period-average rate or continuous uptime.
-Min and the PonDeviceKPI maximum remain undeclared pending reviewed demand.
+All four populations also publish Min and Max because their ordered numeric
+sample semantics are well-defined and have no explicit prohibition. Corpus
+cases are validation anchors, not admission requirements. Min does not prove
+continuous availability or SLA compliance and does not cover missing samples.

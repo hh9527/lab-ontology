@@ -23,10 +23,10 @@ node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
 | --- | --- | --- | --- | --- |
 | Device CPU | `device_cpu_sample` | `cpu_usage` | `cpu_peak` | `device_cpu_sample_min` |
 | Device memory | `device_memory_sample` | `memory_usage` | `memory_peak` | `device_memory_sample_min` |
-| Device online rate | `device_kpi__onlineRate` | `device_online_rate_avg` | `device_online_rate_max` | Not declared |
-| Network online-rate table | `source_NetworkDeviceOnlineKPI__onlineRate` | `network_online_rate_avg` | `network_online_rate_max` | Not declared |
-| PON device online rate | `source_PonDeviceKPI__onlineRate` | `pon_online_rate_avg` | Not declared | Not declared |
-| PON online-rate table | `source_PonDeviceOnlineKPI__onlineRate` | `pon_online_table_rate_avg` | `pon_online_table_rate_max` | Not declared |
+| Device online rate | `device_kpi__onlineRate` | `device_online_rate_avg` | `device_online_rate_max` | `device_online_rate_min` |
+| Network online-rate table | `source_NetworkDeviceOnlineKPI__onlineRate` | `network_online_rate_avg` | `network_online_rate_max` | `network_online_rate_min` |
+| PON device online rate | `source_PonDeviceKPI__onlineRate` | `pon_online_rate_avg` | `pon_online_rate_max` | `pon_online_rate_min` |
+| PON online-rate table | `source_PonDeviceOnlineKPI__onlineRate` | `pon_online_table_rate_avg` | `pon_online_table_rate_max` | `pon_online_table_rate_min` |
 | Server CPU | `server_cpu_sample` | `server_cpu_usage` | `server_cpu_peak` | `server_cpu_sample_min` |
 | Server memory | `server_memory_sample` | `server_memory_usage` | `server_memory_sample_max` | `server_memory_sample_min` |
 | Device port usage | `device_kpi__ifUtilizationRate` | `device_port_usage_avg` | `device_port_usage_max` | `device_port_usage_min` |
@@ -40,13 +40,17 @@ node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
   non-NULL stored rows. They are neither time-weighted nor weighted by
   `onlineRateEffcnt`; all-NULL groups have no average. Source descriptions do not
   establish a percentage unit or formula. The four tables are distinct sample
-  populations, not interchangeable sources. No online-rate Sum/Min is added.
-- Three reviewed online-rate maxima follow corpus Q0039/Q0329
-  (NetworkDeviceOnlineKPI), Q0382 (NetworkDeviceKPI) and Q0422
-  (PonDeviceOnlineKPI). Each is the maximum stored non-NULL sample, not the
-  maximum of period averages or evidence of continuous availability. No maximum
-  is declared for PonDeviceKPI without a reviewed use case.
-- Source online-rate carriers declare plain Avg measures without introducing
+  populations, not interchangeable sources. No online-rate Sum is added.
+- All four sources publish sample Min/Max. Ordered numeric samples give these
+  statistics a defined meaning; existing use cases validate examples but are
+  not an admission whitelist. Support follows Model semantics unless there is
+  an explicit reason to prohibit it.
+- Min/Max ignore NULL and return no value for all-NULL populations. They are
+  not extrema of period averages and do not prove continuous availability or
+  SLA compliance. Missing observations are not covered; no validity filtering
+  is inferred from onlineRateEffcnt. A sum of rates still lacks a declared
+  additive business meaning.
+- Source online-rate carriers declare plain Avg/Min/Max measures without introducing
   new sample uniqueness or metric dataset grains. Existing owner identities and
   declared relation cardinalities govern grouped queries; no tenant equality is
   invented beyond the original relation. Product device and PON identity is `id`.
