@@ -40,7 +40,7 @@ try {
       ['b', 100, 1], ['b', 0, 1], ['c', 95, 1], ['c', 95, 1], ['d', null, 1], ['missing-owner', 100, 1]]) {
       insert.run(id, '2026-09-15 00:00:00', value, effectiveCount);
     }
-    insert.run('a', '2026-10-01 00:00:00', 0, 1);
+    insert.run('a', '2026-10-01 00:00:00', 1000, 1);
   }
   const intents = cases.map(([entity, owner, relation, reverse, name, time, measure]) => ({
     op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
@@ -64,9 +64,29 @@ try {
     assert.ok(node.description.aliases.length > 0);
     assert.ok(node.links.some(link => link.type === 'Related' && link.key.startsWith('Dimension/')));
   }
+  for (const index of [0, 1, 3]) {
+    const spec = cases[index];
+    const measure = spec[6].replace(/_avg$/, '_max');
+    const original = intents[index];
+    const intent = { ...original, measures: [{ node: 'k', measure }],
+      measure_having: [{ node: 'k', measure, op: 'Ge', value: 99 }],
+      top_by_measure: { node: 'k', measure, direction: 'Desc', take: 5 } };
+    const result = await request('transform', { intents: [intent] });
+    assert.equal(result.accepted, true, JSON.stringify(result.diagnostics));
+    const query = result.queries[0];
+    const rows = db.prepare(query.sql).all(...query.bindings);
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.map(row => Object.values(row).find(value => typeof value === 'number')), [100, 100]);
+    const maximum = (await request('info', { key: `Measure/${spec[0]}/${measure}` })).Document.Found;
+    const average = (await request('info', { key: `Measure/${spec[0]}/${spec[6]}` })).Document.Found;
+    assert.equal(maximum.detail.aggregate, 'Max');
+    assert.ok(maximum.description.summary.includes('Not a maximum of period averages'));
+    assert.ok(average.links.some(link => link.key === maximum.key && link.type === 'Related'));
+  }
   console.log(JSON.stringify({ status: 'passed', populations: cases.length,
     verified: ['identity groups', 'mean versus peak', 'NULL handling', 'no effective-count weighting',
-      'exclusive end', 'mean threshold and ranking', 'knowledge aliases and raw links'] }));
+      'exclusive end', 'mean threshold and ranking', 'knowledge aliases and raw links',
+      'three distinct sample maxima and Avg discovery links'] }));
 } finally {
   clearTimeout(deadline);
   db.close();

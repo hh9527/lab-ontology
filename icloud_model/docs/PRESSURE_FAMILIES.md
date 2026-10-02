@@ -372,3 +372,9 @@ grain is needed. Numeric scale and weighting remain unspecified by the source;
 the Model explicitly declines rescaling, time weighting and onlineRateEffcnt
 weighting. `tests/online_rate.telora` checks all four paths and knowledge links,
 and rejects aggregate overrides and undefined sums.
+
+Q0039/Q0329, Q0382 and Q0422 additionally establish maximum stored online-rate
+samples on NetworkDeviceOnlineKPI, NetworkDeviceKPI and PonDeviceOnlineKPI.
+Their separate Max IDs remain discoverable from Avg and link to the raw
+dimension. They do not mean maximum period-average rate or continuous uptime.
+Min and the PonDeviceKPI maximum remain undeclared pending reviewed demand.
