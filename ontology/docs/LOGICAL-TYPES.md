@@ -11,7 +11,7 @@ Indexes, storage and query costs can motivate a field capability restriction.
 The current API does not inspect database indexes or infer permissions from
 them. An Eq-only Text dimension is not evidence that Contains lacks a meaning
 for Text. Conversely, String storage does not give every logical type Text
-operations. The existing time declarations distinguish Rfc3339, Utc1, Date,
+operations. The existing time declarations distinguish DatetimeUtc, DateUtc,
 LocalDateTime and EpochMillis under the same principle.
 
 ## IPv4 acceptance slice

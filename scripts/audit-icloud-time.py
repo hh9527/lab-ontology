@@ -25,9 +25,9 @@ def basis(field, encoding):
     if encoding == "DateText" and pattern == "YYYY-MM-DD":
         return {"kind": "SourceDatePattern", "requires_confirmation": False,
                 "evidence": "dte.time.format.pattern=YYYY-MM-DD"}
-    if encoding == "CanonicalUtcSecondText" and field["type"]["type"] == "datetime":
-        return {"kind": "ModelUtc1Assumption", "requires_confirmation": True,
-                "evidence": "Modeling convention: source datetime String uses UTC YYYY-MM-DD HH:MM:SS"}
+    if encoding == "Rfc3339Text" and field["type"]["type"] == "datetime":
+        return {"kind": "DatetimeUtcContract", "requires_confirmation": False,
+                "evidence": "Source datetime; confirmed UTC semantics; SQLite contract YYYY-MM-DDTHH:MM:SSZ (#44)"}
     if encoding == "EpochMillis":
         description = field.get("description", "").lower()
         if "in milliseconds" in description:
@@ -48,6 +48,10 @@ def audit(report, catalog):
         roles = {role["field"]: role for role in dataset["time_roles"]}
         for field in dataset["fields"]:
             raw = raw_fields[field["column"]]
+            if raw["type"]["type"] == "datetime" and (
+                    not field["time"] or field["time"]["encoding"] != "Rfc3339Text"
+                    or field["time"]["semantics"] != "Utc"):
+                errors.append(f"source datetime requires DatetimeUtc/Rfc3339Text: {dataset['id']}.{field['name']}")
             if not field["time"] and not is_source_time(raw):
                 continue
             dims = [dim for dim in report["dimensions"] if dim["dataset"] == dataset["id"]

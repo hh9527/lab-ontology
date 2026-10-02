@@ -38,16 +38,16 @@ try {
     const insert = db.prepare(`INSERT INTO ${table} VALUES (?, ?, ?, ?)`);
     for (const [id, value, effectiveCount] of [['a', 100, 1000], ['a', 80, 1], ['a', null, 1],
       ['b', 100, 1], ['b', 0, 1], ['c', 95, 1], ['c', 95, 1], ['d', null, 1], ['missing-owner', 100, 1]]) {
-      insert.run(id, '2026-09-15 00:00:00', value, effectiveCount);
+      insert.run(id, '2026-09-15T00:00:00Z', value, effectiveCount);
     }
-    insert.run('a', '2026-10-01 00:00:00', 1000, 1);
+    insert.run('a', '2026-10-01T00:00:00Z', 1000, 1);
   }
   const intents = cases.map(([entity, owner, relation, reverse, name, time, measure]) => ({
     op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
     edges: [{ relation, from: reverse ? 'k' : 'd', to: reverse ? 'd' : 'k' }],
     select: [{ node: 'd', dimension: name }], group_by_identity: ['d'],
     measures: [{ node: 'k', measure }],
-    time_windows: [{ node: 'k', dimension: time, start: '2026-09-01 00:00:00', end: '2026-10-01 00:00:00' }],
+    time_windows: [{ node: 'k', dimension: time, start: '2026-09-01T00:00:00Z', end: '2026-10-01T00:00:00Z' }],
     measure_having: [{ node: 'k', measure, op: 'Ge', value: 90 }],
     top_by_measure: { node: 'k', measure, direction: 'Desc', take: 5 },
   }));

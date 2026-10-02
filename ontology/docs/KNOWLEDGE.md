@@ -75,7 +75,7 @@ semantics contract in issue #11 covers those operations).
 
 Dimension detail includes `input_kinds` and `input_docs` (entries with `kind`
 and `text`). Input documentation comes from `@doc(text)` on the corresponding
-`FilterInputKind` variant. `Utc1` documents the accepted UTC text format and a
+`FilterInputKind` variant. `DatetimeUtc` documents the accepted UTC text format and a
 copyable example once; every dimension using it exposes that same description.
 The annotation supplies explanatory text and does not change input validation.
 

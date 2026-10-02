@@ -172,6 +172,11 @@ See
 discovery describes the Model; the generic Intent syntax is below. The Model
 and `transform` decide which combinations have valid business meaning.
 
+The current iCloud time types are `DatetimeUtc` (RFC3339 UTC seconds,
+`YYYY-MM-DDTHH:MM:SSZ`), `DateUtc` (`YYYY-MM-DD`), and `EpochMillis` (JSON
+integer milliseconds). The former space-separated UTC input is rejected;
+deploy a rebuilt snapshot and discover the current types through `info`.
+
 ### Graph Intent syntax
 
 A graph Intent has five required fields, including empty arrays where needed:

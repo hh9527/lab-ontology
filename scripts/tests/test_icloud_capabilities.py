@@ -70,11 +70,11 @@ class SourceCapabilities(unittest.TestCase):
 
     def test_time_declarations_use_metadata_and_reviewed_conventions(self):
         sample = reconcile.refresh.new_field("foo", field("ts", "datetime"), "sample_time")
-        self.assertIn("CanonicalUtcSecondText", sample)
-        self.assertIn("FilterInputKind::Utc1", sample)
+        self.assertIn("Rfc3339Text", sample)
+        self.assertIn("FilterInputKind::DatetimeUtc", sample)
         date = reconcile.refresh.new_field("foo", field("date", properties={"dte.time.format.pattern": "YYYY-MM-DD"}), "date")
         self.assertIn("TimeEncoding::DateText", date)
-        self.assertIn("FilterInputKind::Date", date)
+        self.assertIn("FilterInputKind::DateUtc", date)
         clock = reconcile.refresh.new_field("foo", field("timestamp", "long", columnType="timestamp"), "timestamp")
         self.assertIn("TODO: Confirm source integer clock unit", clock)
         self.assertIn("FilterInputKind::EpochMillis", clock)
@@ -96,13 +96,31 @@ class SourceCapabilities(unittest.TestCase):
                     count += 1
         self.assertGreater(count, 0)
 
+    def test_datetime_utc_audit_contract_and_legacy_rejection(self):
+        raw = field("ts", "datetime")
+        catalog = {"datasets": [{"table": "foo", "fields": [raw]}]}
+        role = {"field": "ts", "encoding": "Rfc3339Text", "semantics": "Utc", "logical_type": "DatetimeUtc"}
+        declaration = {"encoding": "Rfc3339Text", "semantics": "Utc"}
+        report = {"revision": "foo-v1", "datasets": [{"id": "foo", "table": "foo", "time_roles": [role],
+            "fields": [{"name": "ts", "column": "ts", "scalar": "String", "time": declaration}]}],
+            "dimensions": [{"id": "ts", "dataset": "foo", "column": "ts", "authorized": True,
+                "computed": False, "filterable": True, "ops": ["Ge", "Lt"],
+                "input_kinds": ["DatetimeUtc"], "half_open": False}]}
+        self.assertEqual(time_audit.audit(report, catalog)["errors"], [])
+        self.assertFalse(time_audit.basis(raw, "Rfc3339Text")["requires_confirmation"])
+        declaration["encoding"] = "CanonicalUtcSecondText"
+        self.assertTrue(any("source datetime requires DatetimeUtc" in error
+                            for error in time_audit.audit(report, catalog)["errors"]))
+
     def test_time_coverage_rejects_missing_roles_and_unreviewed_exclusions(self):
         catalog = {"datasets": [{"table": "foo", "fields": [field("ts", "datetime")]}]}
         report = {"revision": "foo-v1", "datasets": [{"id": "foo", "table": "foo", "time_roles": [],
             "fields": [{"name": "ts", "column": "ts", "scalar": "String", "time": None}]}], "dimensions": []}
-        self.assertIn("undeclared source time", time_audit.audit(report, catalog)["errors"][0])
+        self.assertTrue(any("undeclared source time" in error for error in time_audit.audit(report, catalog)["errors"]))
         report["datasets"][0]["fields"][0]["time"] = {"encoding": "CanonicalUtcSecondText", "semantics": "Utc"}
-        self.assertIn("unreviewed window exclusion", time_audit.audit(report, catalog)["errors"][0])
+        errors = time_audit.audit(report, catalog)["errors"]
+        self.assertTrue(any("unreviewed window exclusion" in error for error in errors))
+        self.assertTrue(any("source datetime requires DatetimeUtc" in error for error in errors))
 
 
 if __name__ == "__main__":

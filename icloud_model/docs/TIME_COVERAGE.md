@@ -5,9 +5,11 @@ Model contract, not requests for an Agent to confirm modeling assumptions.
 
 ## Declarations
 
-- Source `datetime` stored as String uses Utc1: UTC `YYYY-MM-DD HH:MM:SS`.
-  This is the agreed modeling convention, not a discovered storage fact.
-- Source `dte.time.format.pattern=YYYY-MM-DD` establishes Date. This covers
+- Source `datetime` KPI clocks use DatetimeUtc with confirmed UTC semantics.
+  SQLite stores normalized `YYYY-MM-DDTHH:MM:SSZ`; PostgreSQL uses timestamptz
+  with UTC input/output. This replaces the #41 Utc1 assumption under #44.
+  Logical metadata alone does not establish timezone or physical encoding.
+- Source `dte.time.format.pattern=YYYY-MM-DD` establishes DateUtc. This covers
   backup-power and power-supply manufacturing dates, and the PON manufacture
   date shared by its three model roles.
 - Integer clocks use the existing EpochMillis convention. Every declaration
@@ -28,6 +30,7 @@ bin/telora -C icloud_model eval @src/source_audit:report \
   --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024 \
   > /tmp/icloud-prepared.json
 python3 scripts/audit-icloud-time.py /tmp/icloud-prepared.json
+node scripts/check-icloud-time.mjs bin/icloud_model.snapshot.wasm
 python3 -m unittest discover -s scripts/tests
 bin/telora -C icloud_model test time_coverage \
   --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048
@@ -36,7 +39,8 @@ bin/telora -C icloud_model test time_coverage \
 `data/time_coverage.json` records every visible dataset, including datasets with
 no temporal columns. For each clock it reports the declared role, published role,
 logical input, authorized operators, window disposition, and evidence/confirmation
-status. Undeclared source times and unreviewed exclusions fail the audit.
+status. Undeclared source times, unreviewed exclusions, and datetime clocks
+that disagree with the DatetimeUtc/Rfc3339Text contract fail the audit.
 The source catalog and the compiled Prepared Model are compared; the report
 does not infer a runtime logical type from a field name or physical SQL type.
 

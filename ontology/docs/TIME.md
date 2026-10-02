@@ -8,17 +8,23 @@ Relation keys likewise reject incompatible time and plain fields.
 
 | Logical input | Declared encoding | Physical binding | Accepted spelling |
 | --- | --- | --- | --- |
-| `Date` | `DateText` | String | Valid `YYYY-MM-DD` |
-| `Rfc3339` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
-| `Utc1` | `CanonicalUtcSecondText` | String | UTC `YYYY-MM-DD HH:MM:SS` |
+| `DateUtc` | `DateText` | String | Valid `YYYY-MM-DD` |
+| `DatetimeUtc` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
 | `LocalDateTime` | `LocalText` | String | Local `YYYY-MM-DD HH:MM:SS` |
 | `EpochMillis` | `EpochMillis` | Int | Unix epoch milliseconds |
 
-`Utc1` replaces the misleading `UtcSecond` name in logical types and typed
-input variants. It accepts text, not an integer. Its `@edsl::doc(text)`
-description is automatically exposed in Dimension `detail.input_docs`,
-including the example `"2026-09-20 16:00:00"`. Physical encoding names and
-the accepted timestamp spelling remain unchanged.
+`DatetimeUtc` replaces the former `Utc1` and `Rfc3339` logical inputs.
+The space-separated UTC spelling is no longer accepted. `Rfc3339Text`
+names the physical encoding, not a second logical type. Dimension
+`detail.input_docs` publishes the normalized format and a concrete example.
+
+The iCloud contract uses three logical types: `DatetimeUtc`, `DateUtc`, and
+`EpochMillis`. PostgreSQL columns use `timestamptz` (UTC input/output), `date`,
+and `bigint`, respectively. SQLite uses normalized ISO-Z text, date text,
+and INTEGER. A PostgreSQL timestamptz stores an instant, not the original
+timezone; the host must serialize returned timestamps in UTC.
+`DateUtc` is a UTC calendar date with no time of day. Extract dates from
+instants in UTC. Date-only source values keep their declared calendar date.
 
 The RFC3339 input currently accepts only normalized UTC seconds: offsets and
 fractions must be resolved before submitting the Intent. Fixed-width UTC text
