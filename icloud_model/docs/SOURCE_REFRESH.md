@@ -101,8 +101,11 @@ IDs, NULL and threshold meanings, and the unresolved device port-usage formula.
 - The fixed subject/authorize layer is removed. Query and discovery factories
   bind only the prepared model and relevant backend/domain. Dimension
   visibility remains a model capability; authentication belongs to the host.
-- Source-only carriers expose raw fields without invented sample grains,
-  aggregation meanings. Time formats follow the explicit convention above.
+- Source-only carriers expose raw fields without invented sample grains.
+  Reviewed online-rate Avg measures additionally expose the arithmetic mean of
+  stored values, not time-weighted or effective-count-weighted rates. They do not
+  establish sample uniqueness or infer a numeric scale. Time formats follow the
+  explicit convention above.
   UUID/IP use String, float/double
   use Float, integer/long use Int. Nullability remains recorded in the catalog;
   runtime scalar types describe the non-null value, not a NOT NULL assertion.

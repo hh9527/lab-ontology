@@ -1,6 +1,6 @@
 # Source-backed sample statistics
 
-This describes the current product Model (`icloud-source-v4`), not the historical
+This describes the current product Model (`icloud-source-v5`), not the historical
 pressure fixture. Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 
@@ -12,10 +12,21 @@ rejected. The engine cannot compare an Intent to natural-language requirements
 that were never supplied to it. Lowering success proves Model legality, not that
 the Agent chose the user's intended statistic.
 
+Online-rate regression commands (after publishing the current IC snapshot):
+
+```sh
+bin/telora -C icloud_model test online_rate --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048
+node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
+```
+
 | Population | Raw dimension | Average | Maximum sample | Minimum sample |
 | --- | --- | --- | --- | --- |
 | Device CPU | `device_cpu_sample` | `cpu_usage` | `cpu_peak` | `device_cpu_sample_min` |
 | Device memory | `device_memory_sample` | `memory_usage` | `memory_peak` | `device_memory_sample_min` |
+| Device online rate | `device_kpi__onlineRate` | `device_online_rate_avg` | Not declared | Not declared |
+| Network online-rate table | `source_NetworkDeviceOnlineKPI__onlineRate` | `network_online_rate_avg` | Not declared | Not declared |
+| PON device online rate | `source_PonDeviceKPI__onlineRate` | `pon_online_rate_avg` | Not declared | Not declared |
+| PON online-rate table | `source_PonDeviceOnlineKPI__onlineRate` | `pon_online_table_rate_avg` | Not declared | Not declared |
 | Server CPU | `server_cpu_sample` | `server_cpu_usage` | `server_cpu_peak` | `server_cpu_sample_min` |
 | Server memory | `server_memory_sample` | `server_memory_usage` | `server_memory_sample_max` | `server_memory_sample_min` |
 | Device port usage | `device_kpi__ifUtilizationRate` | `device_port_usage_avg` | `device_port_usage_max` | `device_port_usage_min` |
@@ -25,6 +36,15 @@ the Agent chose the user's intended statistic.
 | PON port receive bandwidth | `pon_port_receive_sample` | `pon_port_receive_usage` | `pon_port_receive_sample_max` | `pon_port_receive_sample_min` |
 
 - A trend projects raw samples and sample timestamps, without aggregation.
+- Online-rate averages preserve the reported numeric scale and average eligible
+  non-NULL stored rows. They are neither time-weighted nor weighted by
+  `onlineRateEffcnt`; all-NULL groups have no average. Source descriptions do not
+  establish a percentage unit or formula. The four tables are distinct sample
+  populations, not interchangeable sources. No online-rate Sum/Max/Min is added.
+- Source online-rate carriers declare plain Avg measures without introducing
+  new sample uniqueness or metric dataset grains. Existing owner identities and
+  declared relation cardinalities govern grouped queries; no tenant equality is
+  invented beyond the original relation. Product device and PON identity is `id`.
 - Average is the arithmetic mean of eligible stored samples, not a time-weighted
   mean. Maximum/minimum operate on those samples, not on period averages.
 - Aggregates ignore NULL. An empty/all-NULL population has no Avg/Min/Max value,

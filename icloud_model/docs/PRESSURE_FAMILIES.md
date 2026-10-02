@@ -360,3 +360,15 @@ The executable fixture includes duplicate eligible sites, a wrong-tenant
 site, an interface without samples, and same-name interfaces. A plain site
 JOIN would turn one qualified interface into two counted rows; treating the
 pre-aggregate predicate as HAVING alone would change the qualifying set.
+
+## Online-rate mean qualification and ranking (#43)
+
+The online-rate query family requires a per-owner arithmetic mean, not a highest
+raw sample. Four distinct populations publish Avg: NetworkDeviceKPI,
+NetworkDeviceOnlineKPI, PonDeviceKPI and PonDeviceOnlineKPI. The existing owner
+relations support complete owner identity grouping, an externally resolved
+half-open window, mean HAVING and mean Top-N. No new ontology operator or sample
+grain is needed. Numeric scale and weighting remain unspecified by the source;
+the Model explicitly declines rescaling, time weighting and onlineRateEffcnt
+weighting. `tests/online_rate.telora` checks all four paths and knowledge links,
+and rejects aggregate overrides and undefined sums.

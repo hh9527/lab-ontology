@@ -1,0 +1,78 @@
+use crate::model::{ payload };
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::ontology as edsl;
+use ontology::knowledge as knowledge;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+type Case = struct { entity: String, owner: String, relation: String, name: String,
+    time: String, raw: String, measure: String };
+def cases: Array(Case) = [
+    {entity: "device_kpi", owner: "device", relation: "device_kpi_of_device", name: "device_name",
+        time: "device_kpi_ts_raw", raw: "device_kpi__onlineRate", measure: "device_online_rate_avg"},
+    {entity: "source_NetworkDeviceOnlineKPI", owner: "device", relation: "source_EntNetworkElement_NetworkDeviceOnlineKPI", name: "device_name",
+        time: "source_NetworkDeviceOnlineKPI__ts", raw: "source_NetworkDeviceOnlineKPI__onlineRate", measure: "network_online_rate_avg"},
+    {entity: "source_PonDeviceKPI", owner: "pon_device", relation: "source_EntPonElementAssociationPonDeviceKPI", name: "pon_name",
+        time: "source_PonDeviceKPI__ts", raw: "source_PonDeviceKPI__onlineRate", measure: "pon_online_rate_avg"},
+    {entity: "source_PonDeviceOnlineKPI", owner: "pon_device", relation: "source_EntPonElement_PonDeviceOnlineKPI", name: "pon_name",
+        time: "source_PonDeviceOnlineKPI__ts", raw: "source_PonDeviceOnlineKPI__onlineRate", measure: "pon_online_table_rate_avg"},
+];
+def ast: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload);
+def plan: Fn(Case) -> qb::QueryAst = fn(spec) {
+    let edge = if spec.entity == "device_kpi" {
+        `{"relation":"\{spec.relation}","from":"k","to":"d"}`
+    } else { `{"relation":"\{spec.relation}","from":"d","to":"k"}` };
+    ast(json::parse(`{"op":"Graph","root":"d",
+        "nodes":[{"id":"d","entity":"\{spec.owner}"},{"id":"k","entity":"\{spec.entity}"}],
+        "edges":[\{edge}],"select":[{"node":"d","dimension":"\{spec.name}"}],
+        "group_by_identity":["d"],"measures":[{"node":"k","measure":"\{spec.measure}"}],
+        "time_windows":[{"node":"k","dimension":"\{spec.time}","start":"2026-09-01 00:00:00","end":"2026-10-01 00:00:00"}],
+        "measure_having":[{"node":"k","measure":"\{spec.measure}","op":"Ge","value":90}],
+        "top_by_measure":{"node":"k","measure":"\{spec.measure}","direction":"Desc","take":5}}
+    `).unwrap!())
+};
+
+pub def four_populations_support_identity_mean_threshold_and_ranking: test::Test = test::should_ok(fn() {
+    array::all(cases, fn(spec) {
+        let p = plan(spec);
+        let sq = sqlite::build_query(p);
+        let pg = postgres::build_query(p);
+        if string::contains(sq.sql, "avg(") && string::contains(sq.sql, ".onlineRate)")
+            && string::contains(sq.sql, "GROUP BY d.name, d.id")
+            && string::contains(sq.sql, "HAVING avg(") && string::contains(sq.sql, "ORDER BY avg(")
+            && string::contains(sq.sql, ".ts >= ?1") && string::contains(sq.sql, ".ts < ?2")
+            && !string::contains(sq.sql, "onlineRateEffcnt") && !string::contains(sq.sql, "max(")
+            && string::contains(pg.sql, ".\"onlineRate\")") && sq.bindings == pg.bindings
+            && sq.bindings == [qb::Val::String("2026-09-01 00:00:00"), qb::Val::String("2026-10-01 00:00:00"), qb::Val::Int(5), qb::Val::Int(90)] { True }
+        else { fail!("online-rate mean lost its population, identity, window or declared statistic", spec, sq, pg) }
+    })
+});
+
+pub def online_mean_knowledge_links_raw_samples_and_explains_limits: test::Test = test::should_ok(fn() {
+    array::all(cases, fn(spec) {
+        match knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Measure, owner: spec.entity, id: spec.measure}) {
+            knowledge::DocResult::Found(point) => if edsl::measure_detail(payload, spec.measure).aggregate == Some(qb::AggregateFunction::Avg)
+                && array::length(point.aliases) > 0
+                && string::contains(point.summary, "NULL") && string::contains(point.summary, "onlineRateEffcnt")
+                && array::any(point.refs, fn(ref) { ref.kind == knowledge::LinkKind::Related && ref.target.id == spec.raw }) { True }
+                else { fail!("online-rate mean knowledge is incomplete", spec, point) },
+            other => fail!("online-rate mean knowledge missing", spec, other),
+        }
+    })
+});
+
+pub def mean_cannot_be_reinterpreted_as_peak: test::Test = test::should_fail_with(fn() {
+    ast(json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"}],"edges":[],
+        "select":[],"measures":[{"node":"k","measure":"device_online_rate_avg","aggregate":"Max"}]}"#).unwrap!())
+}, "unknown field");
+
+pub def undefined_online_sum_remains_rejected: test::Test = test::should_fail_with(fn() {
+    ast(json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"}],"edges":[],
+        "select":[],"measures":[{"node":"k","measure":"device_online_rate_sum"}]}"#).unwrap!())
+}, "unknown declared measure");
