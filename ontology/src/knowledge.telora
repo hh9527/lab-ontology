@@ -11,6 +11,7 @@ type LinkKind = enum { Member, Traversable, Related };
 type KnowledgeLink = struct { target: edsl::KnowledgeTarget, kind: LinkKind };
 type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: Array(String), summary: String };
 type Point = struct {
+    logical_type: Option(edsl::LogicalType),
     nullable: Bool,
     references: Array(edsl::ReferenceSpec),
     field_roles: Array(edsl::FieldRoleBrief),
@@ -44,7 +45,7 @@ type Node = struct { key: String, type: edsl::KnowledgeKind, description: Descri
 type NodeResult = enum { NotFound, Found(Node) };
 type NodeResponse = enum { Document(NodeResult) };
 type DatasetDetail = struct { id: String, grain: Array(String), time_roles: Array(edsl::TimeRoleBrief), references: Array(edsl::ReferenceSpec), field_roles: Array(edsl::FieldRoleBrief) };
-type FieldDetail = struct { id: String, dataset: String, nullable: Bool, roles: Array(edsl::FieldRole), reference_ids: Array(String) };
+type FieldDetail = struct { id: String, dataset: String, nullable: Bool, logical_type: Option(edsl::LogicalType), roles: Array(edsl::FieldRole), reference_ids: Array(String) };
 type ValueDetail = struct { id: String, dimension: String };
 type BusinessLinkDetail = struct { id: String, hub: String, direction: Option(edsl::LinkDirection), guard: Option(edsl::ScopePredicate) };
 
@@ -58,7 +59,7 @@ def traversable: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target
 def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(KnowledgeLink)) -> Point =
     fn(id, label, aliases, summary, refs) {
         {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [], time_role: None,
-            references: [], field_roles: [], roles: [], nullable: False,
+            references: [], field_roles: [], roles: [], nullable: False, logical_type: None,
             dimension: None, measure: None, relation: None, metric: None, direction: None, guard: None,
             entries: None, terminology: None}
     };
@@ -68,6 +69,8 @@ def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
 };
 
 def syntax_points: Array(Point) = [
+    point(syntax_target("model/logical_types"), "Logical types and field capabilities", [],
+        "Physical storage is not the logical value domain. Time fields distinguish Rfc3339, Utc1, Date, LocalDateTime and EpochMillis even when their storage is String or Int. Explicit logical_type(Ipv4) uses canonical dotted-decimal String storage with four octets 0..255 and no leading zeros; it is not Text. Only address Eq/Ne are currently defined, no lexical ordering, Contains, IPv6, CIDR or implicit conversion to Text. Noncanonical stored addresses violate the declared storage contract; preparation does not scan data. The field's published ops may narrow the type's operations, but cannot give a type an undefined operation. Index availability and cost are field/physical capability considerations, not a reason to reinterpret address semantics. Names of fields do not infer their types; raw unknown-format source columns remain Text until their representation is established. Logical types grant no filter or projection authorization.", []),
     point(syntax_target("model/field_roles"), "Field roles and object references", [],
         "Dataset detail.references contains named {id,fields} sets. Each complete non-NULL tuple is a trusted unique address within that dataset; fields inside a set participate together, and different sets are alternative addresses. Field detail.nullable is derived from Option(T). Any missing member makes the entire reference unavailable; NULL is not an address value. A nullable reference does not establish a total key or grain. Do not treat one member of a composite set as a complete reference. Dataset detail.field_roles contains {field,roles}; Field detail has roles and reference_ids. Appellation participates in identity display and need not be unique; Reference participates in an explicitly declared unique address; Classification describes a category; Metric describes quantitative use. Roles may overlap. Formal metric declarations also derive Metric. Roles grant no query capabilities, do not change grain or keys, and imply no default display, URL, unit or aggregate. Only fully visible references are published. Query and report consumers must respect the separately declared capabilities.", []),
     point(target(edsl::KnowledgeKind::Index, "", "index"), "Knowledge index", [],
@@ -80,7 +83,7 @@ def syntax_points: Array(Point) = [
         "The Index node contains one entry per visible knowledge node in detail.entries. info accepts {key:<opaque string>}; pass an index entry's key or a node link's key unchanged. Keys are path-like but opaque: do not split, decode or construct them. Names and aliases describe knowledge but are not keys.",
         [member(syntax_target("knowledge/node"))]),
     point(syntax_target("knowledge/node"), "Knowledge node contract", [],
-        "Every Found node is {key,type,description,links,detail}. description is {label,aliases,localized,summary}; localized items are {locale,label,summary}. links are {type,key}, with Member for structural membership, Related for discovery-only associations and Traversable for declared relation endpoints. A link does not replace Intent validation. type determines detail: Index has entries [{key,type,description:{label,aliases,summary}}]; Terminology has entries [{term,description,key}]; Dataset has {id,grain,time_roles,references,field_roles}; Field has {id,dataset,roles,reference_ids}; Value has {id,dimension}; Dimension, Measure and Relation preserve their corresponding Model details; TimeRole and Metric also identify their owning dataset; BusinessLink has {id,hub,direction,guard}; Schema has an empty detail object. Canonical business IDs are explicit detail fields, never inferred from a knowledge key. Unknown or hidden keys return NotFound.",
+        "Every Found node is {key,type,description,links,detail}. description is {label,aliases,localized,summary}; localized items are {locale,label,summary}. links are {type,key}, with Member for structural membership, Related for discovery-only associations and Traversable for declared relation endpoints. A link does not replace Intent validation. type determines detail: Index has entries [{key,type,description:{label,aliases,summary}}]; Terminology has entries [{term,description,key}]; Dataset has {id,grain,time_roles,references,field_roles}; Field has {id,dataset,nullable,logical_type,roles,reference_ids}; Value has {id,dimension}; Dimension, Measure and Relation preserve their corresponding Model details; TimeRole and Metric also identify their owning dataset; BusinessLink has {id,hub,direction,guard}; Schema has an empty detail object. Canonical business IDs are explicit detail fields, never inferred from a knowledge key. Unknown or hidden keys return NotFound.",
         [member(target(edsl::KnowledgeKind::Index, "", "index")), member(target(edsl::KnowledgeKind::Terminology, "", "terminology"))]),
     point(syntax_target("knowledge/request"), "Knowledge request", [],
         "The unbound knowledge service accepts exactly {method,input}. method is <domain>/info; input follows the declared info shape. A mounted service slot receives only input, without this envelope.",
@@ -286,7 +289,9 @@ def dataset_members: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Array(Poin
         let field = match array::find(entity.fields, fn(field) { field.name == name }) {
             Some(field) => field, None => fail!("published field missing", brief.id, name),
         };
-        {...item, nullable: field.nullable, roles: match array::find(brief.field_roles, fn(field) { field.field == name }) {
+        {...item, nullable: field.nullable, logical_type: field.logical_type,
+            refs: if field.logical_type != None { array::push(item.refs, member(syntax_target("model/logical_types"))) } else { item.refs },
+            roles: match array::find(brief.field_roles, fn(field) { field.field == name }) {
             Some(field) => field.roles, None => [],
         }, references: array::filter(brief.references, fn(ref) { array::any(ref.fields, fn(field) { field == name }) })}
     });
@@ -604,7 +609,7 @@ def node_value: Fn(Point) -> Value = fn(item) {
             })))]),
         edsl::KnowledgeKind::Dataset => codec::encode({id: item.target.id, grain: item.grain, time_roles: item.time_roles,
             references: item.references, field_roles: item.field_roles}.ty!(DatasetDetail)),
-        edsl::KnowledgeKind::Field => codec::encode({id: item.target.id, dataset: item.target.owner, nullable: item.nullable, roles: item.roles,
+        edsl::KnowledgeKind::Field => codec::encode({id: item.target.id, dataset: item.target.owner, nullable: item.nullable, logical_type: item.logical_type, roles: item.roles,
             reference_ids: array::map(item.references, fn(ref) { ref.id })}.ty!(FieldDetail)),
         edsl::KnowledgeKind::Value => codec::encode({id: item.target.id, dimension: item.target.owner}.ty!(ValueDetail)),
         edsl::KnowledgeKind::Dimension => match item.dimension {

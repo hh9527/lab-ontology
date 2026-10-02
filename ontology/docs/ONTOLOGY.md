@@ -77,6 +77,9 @@ permissions, keys, grain and aggregate rules.
   Only a declared relation or business link authorizes graph traversal.
 - Time roles declare logical type and physical encoding. The caller supplies
   concrete time boundaries; see [TIME.md](TIME.md).
+- Logical scalar types define value and operation semantics independently of
+  physical storage and a dimension's capability subset. See
+  [LOGICAL-TYPES.md](LOGICAL-TYPES.md) for the initial IPv4 contract.
 
 `build_root` validates declarations and produces the prepared vocabulary used
 by both `info` (starting at key `index`) and `transform`. Dimension visibility

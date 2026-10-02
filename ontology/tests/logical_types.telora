@@ -1,0 +1,130 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::intent as intent;
+use crate::knowledge as knowledge;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::json as json;
+use std::array as array;
+use std::string as string;
+use std::codec as codec;
+use std::test as test;
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter, qb::Operator::Order],
+    allowed_join_kinds: [], allowed_aggregates: [],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne], allow_distinct: False,
+};
+@edsl::entity_id("host") @edsl::entity_source("hosts", "h")
+type Host = struct {
+    @edsl::column("id") @edsl::key() id: String,
+    @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4)
+    @edsl::dimension("ip", True, True, [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Ipv4])
+    ip: Option(String),
+    @edsl::column("raw")
+    @edsl::dimension("raw", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    raw: String,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("logical", [Host.type], profile);
+def graph: Fn(String, String, String) -> qb::QueryAst = fn(dimension, op, value) {
+    intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"host"}],"edges":[],"select":[{"node":"h","dimension":"ip"}],"filters":[{"node":"h","dimension":\{json::stringify(codec::encode(dimension))},"op":\{json::stringify(codec::encode(op))},"value":\{json::stringify(codec::encode(value))}}]}`).unwrap!())
+};
+pub def canonical_ipv4_domain: test::Test = test::should_ok(fn() {
+    if array::all(["0.0.0.0", "255.255.255.255", "192.0.2.1"], edsl::canonical_ipv4)
+        && array::all(["256.0.0.1", "01.2.3.4", "1.2.3", "1.2.3.4.5", "-1.2.3.4", "::1", "1.2.3.4/24", " 1.2.3.4", "1.2.3.4\n"], fn(v) { !edsl::canonical_ipv4(v) }) { True }
+    else { fail!("canonical IPv4 accepts non-address text") }
+});
+pub def inferred_address_is_bound_for_both_dialects: test::Test = test::should_ok(fn() {
+    let ast = graph("ip", "Eq", "192.0.2.1");
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.bindings == [qb::Val::String("192.0.2.1")] && pg.bindings == sq.bindings
+        && !string::contains(sq.sql, "192.0.2.1") && !string::contains(pg.sql, "192.0.2.1") { True }
+    else { fail!("address literal escaped the AST binding path", sq, pg) }
+});
+pub def invalid_address_is_rejected: test::Test = test::should_fail_with(fn() {
+    graph("ip", "Eq", "10.4")
+}, "invalid canonical IPv4 address");
+pub def plain_text_does_not_become_an_address: test::Test = test::should_ok(fn() {
+    sqlite::build_query(graph("raw", "Eq", "10.4")); True
+});
+pub def address_does_not_inherit_contains: test::Test = test::should_fail_with(fn() {
+    graph("ip", "Contains", "10.4")
+}, "filter operation not supported for dimension");
+pub def typed_text_cannot_compare_to_address: test::Test = test::should_fail_with(fn() {
+    edsl::resolve_filters_with_context(qb::build_context(), payload,
+        [{id: "ip", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("192.0.2.1")}])
+}, "invalid filter value for dimension");
+pub def address_does_not_inherit_lexical_order: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"host"}],"edges":[],"select":[{"node":"h","dimension":"ip"}],"order_by":[{"node":"h","dimension":"ip","direction":"Asc"}]}"#).unwrap!())
+}, "graph order dimension has no declared business ordering");
+pub def knowledge_preserves_logical_and_storage_distinction: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    match codec::decode@[knowledge::NodeResponse](info(json::parse(r#"{"key":"Field/host/ip"}"#).unwrap!())).unwrap!() {
+        knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => do {
+            let detail = codec::decode@[knowledge::FieldDetail](node.detail).unwrap!();
+            let dimension = edsl::visible_dimension_detail(payload, "ip");
+            if detail.logical_type == Some(edsl::LogicalType::Ipv4) && detail.nullable
+                && dimension.input_kinds == [edsl::FilterInputKind::Ipv4]
+                && array::length(dimension.input_docs) == 1 { True }
+            else { fail!("logical type was erased by storage or discovery", detail, dimension) }
+        },
+        _ => fail!("address field is not discoverable"),
+    }
+});
+@edsl::entity_source("bad", "b")
+type BadPattern = struct {
+    @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4)
+    @edsl::dimension("ip", True, True, [edsl::FilterOp::Contains], [edsl::FilterInputKind::Ipv4]) ip: String,
+};
+pub def declaration_cannot_grant_undefined_type_operation: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [BadPattern.type], profile)
+}, "IPv4 dimension");
+@edsl::entity_source("bad", "b")
+type BadStorage = struct { @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4) ip: Int };
+pub def physical_storage_is_validated: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [BadStorage.type], profile)
+}, "Text/Ipv4 logical type requires String storage");
+
+@edsl::entity_source("limited", "l")
+type Limited = struct {
+    @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4)
+    @edsl::dimension("limited", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Ipv4]) ip: String,
+};
+pub def field_capability_can_narrow_type_capability: test::Test = test::should_fail_with(fn() {
+    let prepared = edsl::build_root("limited", [Limited.type], profile);
+    edsl::resolve_filters_with_context(qb::build_context(), prepared,
+        [{id: "limited", op: edsl::FilterOp::Ne, input: edsl::FilterInput::Ipv4("192.0.2.1")}])
+}, "filter operation not supported for dimension");
+
+@edsl::entity_source("raw", "r")
+type RawPeer = struct { @edsl::column("ip") ip: String };
+@edsl::entity_source("address", "a")
+@edsl::named_relation_key("wrong", RawPeer.type,
+    {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional},
+    edsl::DeclaredRelationKey::FieldEq({from: "ip", to: "ip"}))
+type AddressPeer = struct { @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4) ip: String };
+pub def relations_do_not_equate_addresses_with_text: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("wrong", [AddressPeer.type, RawPeer.type], profile)
+}, "relation fields have different logical address types");
+
+pub def scope_preserves_typed_address: test::Test = test::should_ok(fn() {
+    let built = edsl::resolve_scope_with_context(qb::build_context(), payload, payload.dimensions[0],
+        {field: "ip", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Ipv4("192.0.2.1")}, True);
+    if built.1.input == edsl::FilterInput::Ipv4("192.0.2.1") { True }
+    else { fail!("scope erased address type", built.1) }
+});
+pub def scope_rejects_text_for_address: test::Test = test::should_fail_with(fn() {
+    edsl::resolve_scope_with_context(qb::build_context(), payload, payload.dimensions[0],
+        {field: "ip", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("192.0.2.1")}, True)
+}, "scope uses an invalid value for the dimension");
+
+@edsl::entity_source("maximum", "m")
+type AddressMax = struct {
+    @edsl::column("ip") @edsl::logical_type(edsl::LogicalType::Ipv4)
+    @edsl::measure("max", qb::AggregateFunction::Max, []) ip: String,
+};
+pub def addresses_do_not_inherit_text_aggregates: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad", [AddressMax.type], profile)
+}, "IPv4 measures support Count only");

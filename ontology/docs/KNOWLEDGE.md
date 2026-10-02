@@ -121,3 +121,10 @@ Model. Access to the artifact is controlled by the host.
 Field detail publishes `nullable`, derived from `Option(T)`. Reference
 uniqueness applies to complete non-NULL tuples; any missing member makes the
 reference unavailable. This does not imply a total query grain or primary key.
+
+Field detail also publishes an optional explicit `logical_type` (Text or
+Ipv4); null means no explicit logical_type annotation, not proof of Text
+semantics. Time semantics continue to be described by TimeRole documents.
+Annotated fields link to the shared logical-types contract. Dimension ops
+describe field capabilities, while input_kinds/input_docs describe accepted
+logical values; neither is inferred from a SQL column name.

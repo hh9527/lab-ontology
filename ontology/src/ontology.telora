@@ -30,6 +30,28 @@ type Rfc3339UtcParts = struct { year: Int, month: Int, day: Int, hour: Int, minu
 @regex::parse_by(regex::compile(r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})$"))
 type CalendarDateParts = struct { year: Int, month: Int, day: Int };
 
+@regex::parse_by(regex::compile(r"^(?P<a>0|[1-9][0-9]{0,2})\.(?P<b>0|[1-9][0-9]{0,2})\.(?P<c>0|[1-9][0-9]{0,2})\.(?P<d>0|[1-9][0-9]{0,2})$"))
+type Ipv4Parts = struct { a: Int, b: Int, c: Int, d: Int };
+
+# Semantic type, independent of String storage and per-dimension capabilities.
+type LogicalType = enum { Text, Ipv4 };
+def logical_type_ops: Fn(LogicalType) -> Array(FilterOp) = fn(kind) {
+    match kind {
+        LogicalType::Ipv4 => [FilterOp::Eq, FilterOp::Ne],
+        LogicalType::Text => [FilterOp::Eq, FilterOp::Ne, FilterOp::Gt, FilterOp::Ge,
+            FilterOp::Lt, FilterOp::Le, FilterOp::Contains, FilterOp::NotContains,
+            FilterOp::StartsWith, FilterOp::EndsWith],
+    }
+};
+@prelude::property(PropertyTarget::Field)
+type LogicalFieldType = struct { kind: LogicalType };
+def logical_type: Fn(LogicalType) -> Fn(property::FieldPropertyCtx, Option(LogicalFieldType)) -> LogicalFieldType = fn(kind) {
+    fn(ctx, previous) {
+        if previous != None { fail!("duplicate logical field type", ctx, kind) }
+        else { {kind} }
+    }
+};
+
 # SQL-facing scalar result of a declared Model projection. This knowledge is
 # checked before ontology lowering emits a set QueryPlan.
 type OutputType = enum { Text, Integer, Number, Boolean };
@@ -462,6 +484,8 @@ def doc: Fn(String) -> Fn(property::VariantPropertyCtx, Option(VariantDoc)) -> V
 };
 
 type FilterInputKind = enum {
+    @doc("IPv4 address stored as canonical dotted decimal: four octets 0..255, no leading zeros. Equality is address equality, not text search. IPv6 and subnet operations are not supported by this type.")
+    Ipv4,
     Text, Number, Int, Bool, Rfc3339, EpochMillis, Date,
     @doc("UTC time text with second precision. Format: YYYY-MM-DD HH:MM:SS, without a timezone suffix. Example: \"2026-09-20 16:00:00\".")
     Utc1,
@@ -485,6 +509,7 @@ def filter_input_docs: Fn(Array(FilterInputKind)) -> Array(FilterInputDoc) = fn(
 };
 
 type FilterInput = enum {
+    Ipv4(String),
     Unknown(String),
     Unknowns,
     Text(String),
@@ -523,6 +548,7 @@ type FilterRequest = struct {
 # ---------------------------------------------------------------------------
 
 type FieldEntry = struct {
+    logical_type: Option(LogicalType),
     nullable: Bool,
     index: Int,
     name: String,
@@ -1223,6 +1249,10 @@ def int_range: Fn(Int) -> Array(Int) = fn(n) {
 def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, name, field_ty) {
     let nullable = nullable_identity_type(field_ty);
     let scalar = field_value_type(field_ty);
+    if property::get_field_prop(owner, index, LogicalFieldType.type) != None
+        && (scalar != String.type || property::get_field_prop(owner, index, TimeField.type) != None) {
+        fail!("Text/Ipv4 logical type requires String storage and cannot also declare a time encoding", owner, name)
+    } else { () };
     let roles = match property::get_field_prop(owner, index, FieldRolesDef.type) {
         Some(declared) => declared.roles, None => [],
     };
@@ -1250,7 +1280,10 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
     };
     let key = property::get_field_prop(owner, index, KeyFlag.type);
     let is_key = key != None;
-    let result: FieldEntry = { index, name, column, is_key, ty: scalar, nullable };
+    let logical_type = match property::get_field_prop(owner, index, LogicalFieldType.type) {
+        Some(declared) => Some(declared.kind), None => None,
+    };
+    let result: FieldEntry = { index, name, column, is_key, ty: scalar, nullable, logical_type };
     result
 };
 
@@ -1295,7 +1328,10 @@ def branch_mapping_ok: Fn(Array(FieldEntry), UnionBranchDecl) -> Array(String) =
 };
 
 def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input) {
-    match input {
+    if field.logical_type == Some(LogicalType::Ipv4) {
+        match input { FilterInput::Ipv4(value) => canonical_ipv4(value), _ => False }
+    } else { match input {
+        FilterInput::Ipv4(_) => False,
         FilterInput::Unknown(_) => False,
         FilterInput::Unknowns => False,
         FilterInput::Text(value) => field.ty == String.type
@@ -1308,7 +1344,7 @@ def union_filter_value_ok: Fn(FieldEntry, FilterInput) -> Bool = fn(field, input
         FilterInput::Date(_) => False,
         FilterInput::Utc1(_) => False,
         FilterInput::LocalDateTime(_) => False,
-    }
+    } }
 };
 
 def build_union_entry: Fn(Type, Array(FieldEntry), UnionSourceDef) -> UnionEntry = fn(ty, fields, spec) {
@@ -1812,6 +1848,10 @@ def check_measure_contract: Fn(Array(EntityEntry), Array(MeasureEntry)) -> Array
     let validated = array::map(measures, fn(entry) {
         let entity = get_index(entities, entry.entity);
         let field = get_index(entity.fields, entry.field);
+        if field.logical_type == Some(LogicalType::Ipv4) && entry.computed == None
+            && entry.aggregate != qb::AggregateFunction::Count {
+            fail!("IPv4 measures support Count only; no address ordering or numeric aggregate is declared", entity.id, entry.id)
+        } else { () };
         if entry.computed == None && (entry.aggregate == qb::AggregateFunction::Sum
             || entry.aggregate == qb::AggregateFunction::Avg)
             && field.ty != Int.type && field.ty != Float.type {
@@ -2096,6 +2136,7 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
                         match w {
                             FilterInput::Text(s) => field.ty == String.type && s != "",
                             FilterInput::Int(_) => field.ty == Int.type,
+                            FilterInput::Ipv4(_) => False,
                             FilterInput::Number(_) => False,
                             FilterInput::Bool(_) => False,
                             FilterInput::Rfc3339(_) => False,
@@ -2192,7 +2233,14 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     Some(role) => role.encoding == TimeEncoding::EpochMillis,
                     None => False,
                 };
-                let valid_kind = if array::length(enumerated) > 0 { FilterInputKind::Text }
+                let ipv4 = is_ipv4_field(entity.entity_type, f.index);
+                if ipv4 && (array::length(mapped) > 0 || array::length(enumerated) > 0
+                    || dd.input_kinds != [FilterInputKind::Ipv4]
+                    || array::any(dd.ops, fn(op) { !array::any(logical_type_ops(LogicalType::Ipv4), fn(allowed) { allowed == op }) })) {
+                    fail!(`IPv4 dimension \{dd.id} requires Ipv4 input and only address Eq/Ne; see info key \{syntax_key_hint("model/logical_types")}`, entity.id, f.name, dd.id)
+                } else { () };
+                let valid_kind = if ipv4 { FilterInputKind::Ipv4 }
+                    else if array::length(enumerated) > 0 { FilterInputKind::Text }
                     else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
                         Some(role) => role.encoding == TimeEncoding::LocalText,
                         None => False,
@@ -2242,6 +2290,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     fail!("plain dimension filter input or operation disagrees with field type", entity.id, f.name)
                 } else {
                     let output_type = match valid_kind {
+                        FilterInputKind::Ipv4 => OutputType::Text,
                         FilterInputKind::Text => OutputType::Text,
                         FilterInputKind::Int => OutputType::Integer,
                         FilterInputKind::Number => OutputType::Number,
@@ -2272,6 +2321,7 @@ def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb:
     let wire_shape = fn(kind: FilterInputKind) {
         match kind {
             FilterInputKind::Text => 1,
+            FilterInputKind::Ipv4 => 1,
             FilterInputKind::Rfc3339 => 1,
             FilterInputKind::Date => 1,
             FilterInputKind::Utc1 => 1,
@@ -2319,6 +2369,8 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
                 fail!("relation key fields require physical columns", from_entity.id, pair.from, to_entity.id, pair.to)
             } else if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
                 fail!("relation fields have different types", pair.from, pair.to)
+            } else if is_ipv4_field(from_entity.entity_type, from_field) != is_ipv4_field(to_entity.entity_type, to_field) {
+                fail!(`relation fields have different logical address types; see info key \{syntax_key_hint("model/logical_types")}`, pair.from, pair.to)
             } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
                 property::get_field_prop(to_entity.entity_type, to_field, TimeField.type)) {
                 (None, None) => False,
@@ -2371,7 +2423,9 @@ def safe_relation_covers_target_identity: Fn(EntityEntry, Array(RelationPair)) -
 };
 
 def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool = fn(entity, field, input) {
-    match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+    if field.logical_type == Some(LogicalType::Ipv4) {
+        match input { FilterInput::Ipv4(value) => canonical_ipv4(value), _ => False }
+    } else { match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
         Some(role) => match (role.encoding, input) {
             (TimeEncoding::CanonicalUtcSecondText, FilterInput::Utc1(value)) => canonical_utc_second(value),
             (TimeEncoding::Rfc3339Text, FilterInput::Rfc3339(value)) => canonical_rfc3339(value),
@@ -2383,7 +2437,7 @@ def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool 
         None => (field.ty == String.type && match input { FilterInput::Text(_) => True, _ => False })
             || (field.ty == Int.type && match input { FilterInput::Int(_) => True, _ => False })
             || (field.ty == Bool.type && match input { FilterInput::Bool(_) => True, _ => False }),
-    }
+    } }
 };
 
 def collect_relations: Fn(Array(EntityEntry)) -> Array(RelationEntry) = fn(entities) {
@@ -2796,6 +2850,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
                             None => "probe",
                         }),
                         FilterInputKind::Number => FilterInput::Number(1.0),
+                        FilterInputKind::Ipv4 => FilterInput::Ipv4("192.0.2.1"),
                         FilterInputKind::Int => FilterInput::Int(1),
                         FilterInputKind::Bool => FilterInput::Bool(True),
                         FilterInputKind::Rfc3339 => FilterInput::Rfc3339("2024-01-01T00:00:00Z"),
@@ -3193,6 +3248,7 @@ def dimension_output_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEn
 
 def filter_input_allowed: Fn(Array(FilterInputKind), FilterInput) -> Bool = fn(kinds, input) {
     let kind: FilterInputKind = match input {
+        FilterInput::Ipv4(_) => FilterInputKind::Ipv4,
         FilterInput::Unknown(_) => fail!("Unknown requires a half-open canonical domain", input),
         FilterInput::Unknowns => fail!("Unknowns requires a half-open canonical domain", input),
         FilterInput::Text(_) => FilterInputKind::Text,
@@ -3231,6 +3287,20 @@ def canonical_utc_second: Fn(String) -> Bool = fn(value) {
         Err(_) => False,
         Ok(parts) => calendar_components(parts.year, parts.month, parts.day)
             && parts.hour < 24 && parts.minute < 60 && parts.second < 60,
+    }
+};
+
+def is_ipv4_field: Fn(Type, Int) -> Bool = fn(owner, index) {
+    match property::get_field_prop(owner, index, LogicalFieldType.type) {
+        Some(declared) => declared.kind == LogicalType::Ipv4,
+        None => False,
+    }
+};
+
+def canonical_ipv4: Fn(String) -> Bool = fn(value) {
+    match string::parse@[Ipv4Parts](value) {
+        Ok(parts) => parts.a <= 255 && parts.b <= 255 && parts.c <= 255 && parts.d <= 255,
+        Err(_) => False,
     }
 };
 
@@ -3308,6 +3378,8 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
         FilterInput::Unknown(_) => fail!("Unknown is not a scalar wire", input),
         FilterInput::Unknowns => fail!("Unknowns is not a scalar wire", input),
         FilterInput::Text(s) => qb::Val::String(s),
+        FilterInput::Ipv4(value) => if canonical_ipv4(value) { qb::Val::String(value) }
+            else { fail!(`invalid canonical IPv4 address \{value}; see info key \{syntax_key_hint("model/logical_types")}`, value) },
         FilterInput::Number(f) => qb::Val::Float(f),
         FilterInput::Int(i) => qb::Val::Int(i),
         FilterInput::Bool(b) => qb::Val::Bool(b),
@@ -4633,7 +4705,8 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
             fail!(`graph top-per rank \{spec.rank} must be a plain authorized dimension on sample \{spec.sample}`, spec.rank, spec.sample)
             } else if rank.computed || !rank.authorized || array::length(rank.scope) > 0 {
             fail!(`graph top-per rank \{spec.rank} must be a plain authorized unscoped sample dimension`, spec.rank)
-            } else if array::length(rank.values) > 0 || rank.output_type == OutputType::Boolean
+            } else if array::any(rank.input_kinds, fn(kind) { kind == FilterInputKind::Ipv4 })
+                || array::length(rank.values) > 0 || rank.output_type == OutputType::Boolean
                 || (array::length(rank.canonical_values) > 0 && array::length(rank.canonical_order) == 0) {
                 fail!("graph top-per rank has no declared business ordering; choose an ordered dimension or declare canonical_order", spec.rank)
             } else {
@@ -5014,6 +5087,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                             None => fail!(`graph order on node \{item.node} references an unknown dimension \{item.dimension}`, item.node, item.dimension),
                         };
                         if (array::length(dimension.canonical_values) > 0 && array::length(dimension.canonical_order) == 0)
+                            || array::any(dimension.input_kinds, fn(kind) { kind == FilterInputKind::Ipv4 })
                             || array::length(dimension.values) > 0 || dimension.output_type == OutputType::Boolean {
                             fail!("graph order dimension has no declared business ordering; use a plain ordered dimension or extend the Model with an explicit value order", item.node, item.dimension)
                         } else {
@@ -5255,6 +5329,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
 # ---------------------------------------------------------------------------
 
 pub use self::{
+    LogicalType, LogicalFieldType, logical_type, logical_type_ops, canonical_ipv4,
     KnowledgeKind,
     KnowledgeTarget,
     knowledge_key,
