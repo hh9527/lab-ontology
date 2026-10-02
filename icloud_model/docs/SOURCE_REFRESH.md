@@ -92,15 +92,18 @@ IDs, NULL and threshold meanings, and the unresolved device port-usage formula.
   Tenant.TENANT_ID and Site.SITE_ID are supplemental business identities,
   explicitly recorded because their original isPK markers are N.
 - All original integer timestamp fields use standard EpochMillis. Where the
-  source does not establish a unit, the declaration carries a TODO. Newly
-  covered datetime KPI columns remain raw String fields until their physical
-  text format is established; they do not advertise an unproved time-window
-  encoding or aggregation contract.
+  source does not establish a unit, the source declaration carries a TODO.
+  Under the #41 modeling convention, datetime KPI String columns use Utc1
+  (UTC `YYYY-MM-DD HH:MM:SS`). Source-declared `YYYY-MM-DD` manufacturing dates
+  use Date instead. These provisional decisions are tracked in author-facing
+  audit material, not as questions for the querying Agent. Knowledge publishes
+  the current Model contract. See [TIME_COVERAGE.md](TIME_COVERAGE.md).
 - The fixed subject/authorize layer is removed. Query and discovery factories
   bind only the prepared model and relevant backend/domain. Dimension
   visibility remains a model capability; authentication belongs to the host.
 - Source-only carriers expose raw fields without invented sample grains,
-  aggregation meanings or datetime formats. UUID/IP use String, float/double
+  aggregation meanings. Time formats follow the explicit convention above.
+  UUID/IP use String, float/double
   use Float, integer/long use Int. Nullability remains recorded in the catalog;
   runtime scalar types describe the non-null value, not a NOT NULL assertion.
 - Every source enum wire is represented. EnterpriseSlot.operstatus has malformed

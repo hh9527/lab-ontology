@@ -47,20 +47,6 @@ def array_opt: Fn(Dict(Value), String) -> Array(Value) = fn(obj, key) {
     }
 };
 
-def graph_topic: Fn(String) -> String = fn(context) {
-    if context == "filter" || context == "any_of" { "syntax/graph/filter" }
-        else if context == "node" { "syntax/graph/node" }
-        else if context == "edge" { "syntax/graph/edge" }
-        else if context == "measure projection" || context == "count_value" || context == "select" { "syntax/graph/select" }
-        else if context == "aggregate threshold" || context == "count threshold" { "syntax/graph/aggregate" }
-        else if context == "existence" { "syntax/graph/existence" }
-        else if context == "order" || context == "top-per" || context == "aggregate top" || context == "time window" { "syntax/graph/order" }
-        else if context == "aggregate pair" { "syntax/graph_pair" }
-        else if context == "graph union" || string::contains(context, "graph union branch") { "syntax/graph_union" }
-        else if context == "query request" { "syntax/intent" }
-        else { "syntax/graph" }
-};
-
 def parse_op: Fn(String) -> edsl::FilterOp = fn(op) {
     match codec::decode@[edsl::FilterOp](Value::String(op)) {
         Ok(value) => value,
@@ -235,24 +221,24 @@ type RawGraphUnion = struct { op: String, branches: Array(Value) };
 type RawUnionBranch = struct { result_node: String, graph: Value };
 type RawQueryRequest = struct { intents: Array(Value) };
 
-def decode_graph_shape: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, context) {
+def decode_graph_shape: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, topic) {
     match codec::decode@[A](value) {
         Ok(decoded) => decoded,
         Err(error) => raise!(blame::with_context(error,
-            `see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", graph_topic(context))}`)),
+            `see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", topic)}`)),
     }
 };
 
 def parse_graph_node: Fn(Value) -> edsl::GraphNode = fn(item) {
-    decode_graph_shape@[edsl::GraphNode](item, "node")
+    decode_graph_shape@[edsl::GraphNode](item, "syntax/graph/node")
 };
 
 def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
-    decode_graph_shape@[edsl::GraphEdge](item, "edge")
+    decode_graph_shape@[edsl::GraphEdge](item, "syntax/graph/edge")
 };
 
 def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = fn(payload, item) {
-    let raw = decode_graph_shape@[RawGraphFilter](item, "filter");
+    let raw = decode_graph_shape@[RawGraphFilter](item, "syntax/graph/filter");
     let dimension = raw.dimension;
     let op = parse_op(raw.op);
     let value = raw.value;
@@ -284,7 +270,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = 
 def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
     fn(role, value) {
         match value {
-            Value::String("now") => fail!(`resolve now to an absolute time boundary before submitting intent; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/graph/filter")}`, value),
+            Value::String("now") => fail!(`resolve now to an absolute time boundary before submitting intent; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/operations/time_window")}`, value),
             Value::String(text) => match role.encoding {
                 edsl::TimeEncoding::DateText => time::TimeValue::Date(text),
                 edsl::TimeEncoding::Rfc3339Text => time::TimeValue::Rfc3339(text),
@@ -303,7 +289,7 @@ def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
 
 def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilter) =
     fn(payload, value) {
-        let raw = decode_graph_shape@[RawTimeWindow](value, "time window");
+        let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
         let detail = edsl::visible_dimension_detail(payload, raw.dimension);
         let role = edsl::time_domain(payload, detail.dataset, detail.field);
         let window: time::Window = {start: parse_time_value(role, raw.start),
@@ -317,19 +303,19 @@ def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilt
     };
 
 def parse_graph_any_of: Fn(edsl::PreparedPayload, Value) -> edsl::GraphAnyOf = fn(payload, item) {
-    let raw = decode_graph_shape@[RawGraphAnyOf](item, "any_of");
+    let raw = decode_graph_shape@[RawGraphAnyOf](item, "syntax/graph/filter");
     {node: raw.node, dimension: raw.dimension,
         values: array::map(raw.values, fn(value) { inferred_input(payload, raw.dimension, value) })}
 };
 
 def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
-    let raw = decode_graph_shape@[RawGraphHaving](item, "aggregate threshold");
+    let raw = decode_graph_shape@[RawGraphHaving](item, "syntax/graph/aggregate");
     {node: raw.node, measure: raw.measure, op: parse_op(raw.op),
         threshold: measure_input(payload, raw.measure, raw.value)}
 };
 
 def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist = fn(payload, item) {
-    let raw = decode_graph_shape@[RawGraphExistEnvelope](item, "existence");
+    let raw = decode_graph_shape@[RawGraphExistEnvelope](item, "syntax/graph/existence");
     let obj = as_object(item);
     let negated = match dict::get(obj, "negated") {
         None => False,
@@ -353,7 +339,7 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
     let op = as_string(field(obj, "op"));
     if op != "Graph" { fail!("graph pair and union branches must be Graph intents", op) }
     else {
-        let raw = decode_graph_shape@[RawGraphEnvelope](value, "request");
+        let raw = decode_graph_shape@[RawGraphEnvelope](value, "syntax/graph");
         let request: edsl::GraphRequest = {
             root: raw.root,
             row_grain: match dict::get(obj, "row_grain") {
@@ -371,9 +357,9 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
             nodes: array::map(as_array(raw.nodes), parse_graph_node),
             edges: array::map(as_array(raw.edges), parse_graph_edge),
             constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-            select: decode_graph_shape@[Array(edsl::GraphSelect)](raw.select, "select"),
+            select: decode_graph_shape@[Array(edsl::GraphSelect)](raw.select, "syntax/graph/select"),
             measures: array::map(array_opt(obj, "measures"), fn(value) {
-                decode_graph_shape@[edsl::GraphMeasureSelect](value, "measure projection")
+                decode_graph_shape@[edsl::GraphMeasureSelect](value, "syntax/graph/select")
             }),
             measure_having: array::map(array_opt(obj, "measure_having"), fn(value) { parse_graph_having(payload, value) }),
             filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, value) }),
@@ -388,13 +374,13 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
             count_value: match dict::get(obj, "count_value") {
                 None => None,
                 Some(Value::None) => None,
-                Some(value) => Some(decode_graph_shape@[edsl::GraphSelect](value, "count_value")),
+                Some(value) => Some(decode_graph_shape@[edsl::GraphSelect](value, "syntax/graph/select")),
             },
             count_having: match dict::get(obj, "count_having") {
                 None => None,
                 Some(Value::None) => None,
                 Some(value) => do {
-                    let threshold = decode_graph_shape@[RawCountThreshold](value, "count threshold");
+                    let threshold = decode_graph_shape@[RawCountThreshold](value, "syntax/graph/aggregate");
                     let count = match threshold.value {
                         Value::Int(n) => n,
                         other => fail!("graph count threshold must be an integer", other),
@@ -421,7 +407,7 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
                 Some(value) => fail!("graph raw take must be an integer", value),
             },
             order_by: array::map(array_opt(obj, "order_by"), fn(value) {
-                let order = decode_graph_shape@[RawGraphOrder](value, "order");
+                let order = decode_graph_shape@[RawGraphOrder](value, "syntax/graph/order");
                 let direction = match order.direction {
                     "Asc" => qb::Ordering::Asc,
                     "Desc" => qb::Ordering::Desc,
@@ -432,13 +418,13 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
             top_per: match dict::get(obj, "top_per") {
                 None => None,
                 Some(Value::None) => None,
-                Some(value) => Some(decode_graph_shape@[edsl::GraphTopPer](value, "top-per")),
+                Some(value) => Some(decode_graph_shape@[edsl::GraphTopPer](value, "syntax/graph/order")),
             },
             top_by_measure: match dict::get(obj, "top_by_measure") {
                 None => None,
                 Some(Value::None) => None,
                 Some(value) => do {
-                    let top = decode_graph_shape@[RawGraphTopMeasure](value, "aggregate top");
+                    let top = decode_graph_shape@[RawGraphTopMeasure](value, "syntax/graph/order");
                     let direction = match top.direction {
                         "Asc" => qb::Ordering::Asc,
                         "Desc" => qb::Ordering::Desc,
@@ -480,7 +466,7 @@ def same_group_expr: Fn(qb::BuildCtx, qb::Expr, qb::Expr) -> Bool = fn(ctx, left
 };
 
 def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
-    let raw = decode_graph_shape@[RawGraphPair](value, "aggregate pair");
+    let raw = decode_graph_shape@[RawGraphPair](value, "syntax/graph_pair");
     let obj = as_object(value);
     let count_groups = match dict::get(obj, "count_groups") {
         None => False,
@@ -571,14 +557,14 @@ def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, In
 
 def lower_union_branch: Fn(qb::BuildCtx, edsl::PreparedPayload, Value, Int) -> (qb::BuildCtx, String, Array(String), qb::Plan) =
     fn(ctx, payload, value, index) {
-        let branch = decode_graph_shape@[RawUnionBranch](value, `graph union branch \{index}`);
+        let branch = decode_graph_shape@[RawUnionBranch](value, "syntax/graph_union");
         let lowered = lower_graph_object(ctx, payload, branch.graph);
         let entity = union_graph_result(payload, lowered.1, branch.result_node, index);
         (lowered.0, entity, array::map(lowered.1.select, fn(item) { item.dimension }), lowered.2)
     };
 
 def lower_graph_union: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
-    let union = decode_graph_shape@[RawGraphUnion](value, "graph union");
+    let union = decode_graph_shape@[RawGraphUnion](value, "syntax/graph_union");
     let branches = union.branches;
     if array::length(branches) < 2 {
         fail!("graph union requires at least two graph branches", array::length(branches))
@@ -646,7 +632,7 @@ type BatchResponse = struct {
 def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> Value =
     fn(payload, to_query) {
         fn(request) {
-            let parsed = decode_graph_shape@[RawQueryRequest](request, "query request");
+            let parsed = decode_graph_shape@[RawQueryRequest](request, "syntax/intent");
             let intents = parsed.intents;
             if array::length(intents) < 1 || array::length(intents) > 5 {
                 fail!(`query request requires one to five independent intents; got \{array::length(intents)}`, array::length(intents))

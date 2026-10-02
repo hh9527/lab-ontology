@@ -20,7 +20,7 @@ def category(field):
     ty = field["type"]["type"]
     if ty == "enum" or field.get("dte.enum.values") or field.get("properties", {}).get("dte.enum.values"):
         return "declared-values"
-    if ty == "datetime" or field.get("columnType") == "timestamp":
+    if ty == "datetime" or field.get("columnType") == "timestamp" or field.get("properties", {}).get("dte.semantic.type") == "time":
         return "clock"
     if ty in {"integer", "long", "float", "double"}:
         return "number"
@@ -49,6 +49,20 @@ def operations(field):
     if group == "boolean":
         return "bool_ops"
     return "text_ops"
+
+
+def time_spec(field):
+    """Reviewed modeling conventions, not inference from a column name."""
+    props = field.get("properties", {})
+    ty = field["type"]["type"]
+    if ty == "string" and props.get("dte.time.format.pattern") == "YYYY-MM-DD":
+        return ("Date", "DateText", "Date", None)
+    if ty == "datetime" or (ty == "string" and props.get("dte.semantic.type") == "time"):
+        return ("Utc", "CanonicalUtcSecondText", "Utc1", "Model convention: source time String uses UTC second text.")
+    if ty in {"integer", "long"} and (field.get("columnType") == "timestamp"
+            or props.get("dte.displayName") == "EMSBaseClass.createTime"):
+        return ("Utc", "EpochMillis", "EpochMillis", "TODO: Confirm source integer clock unit; provisionally use Unix epoch milliseconds.")
+    return None
 
 
 def address_view(field):

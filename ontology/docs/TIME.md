@@ -8,11 +8,11 @@ Relation keys likewise reject incompatible time and plain fields.
 
 | Logical input | Declared encoding | Physical binding | Accepted spelling |
 | --- | --- | --- | --- |
-| `date` | `DateText` | String | Valid `YYYY-MM-DD` |
-| `rfc3339` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
+| `Date` | `DateText` | String | Valid `YYYY-MM-DD` |
+| `Rfc3339` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
 | `Utc1` | `CanonicalUtcSecondText` | String | UTC `YYYY-MM-DD HH:MM:SS` |
-| `local_datetime` | `LocalText` | String | Local `YYYY-MM-DD HH:MM:SS` |
-| `epoch_millis` | `EpochMillis` | Int | Unix epoch milliseconds |
+| `LocalDateTime` | `LocalText` | String | Local `YYYY-MM-DD HH:MM:SS` |
+| `EpochMillis` | `EpochMillis` | Int | Unix epoch milliseconds |
 
 `Utc1` replaces the misleading `UtcSecond` name in logical types and typed
 input variants. It accepts text, not an integer. Its `@edsl::doc(text)`
@@ -32,6 +32,12 @@ relative period into local wall-clock boundaries may require a timezone and
 ambiguity policy; this interface does not infer either.
 
 Graph Intents accept `time_windows` at the root and within `exists`:
+
+Each temporal DataType knowledge node links to the shared TimeWindow operation
+contract. Follow the returned opaque key to read the interval and boundary rules.
+Type support does not grant field authorization: the dimension must have a time
+role and authorize Ge, plus Lt when an upper bound is present. This is unrelated
+to a dimension's `half_open` business vocabulary contract.
 
 ```json
 "time_windows": [{
@@ -73,4 +79,4 @@ later time.
 Filter, `any_of`, and measure-threshold values can omit `kind`: the declared
 dimension input types or measure output type select the logical input. If a
 JSON value remains ambiguous under the Model declaration, lowering fails.
-An explicit `kind` remains accepted as a disambiguator.
+Do not supply a `kind` field in the external Intent protocol.

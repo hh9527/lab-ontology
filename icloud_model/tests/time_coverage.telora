@@ -1,0 +1,82 @@
+use crate::model::{ payload };
+use ontology::ontology as edsl;
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+def ast: Fn(Value) -> qb::QueryAst = query_intent_ast_factory(payload);
+type WindowCase = struct { start: String, end: String };
+
+pub def all_source_sample_clocks_publish_utc1_windows: test::Test = test::should_ok(fn() {
+    array::all(["NetworkAPKPI", "NetworkApRadioKPI", "NetworkCellLinkQualityKPI", "NetworkCellLinkTrafficKPI",
+        "NetworkDeviceBoardKPI", "NetworkDeviceOnlineKPI", "PonDeviceEthernetPortKPI", "PonDeviceKPI",
+        "PonDeviceOnlineKPI", "StorageDeviceKPI", "StorageHardDriveKPI"], fn(name) {
+        let owner = `source_\{name}`;
+        let id = `\{owner}__ts`;
+        let role = edsl::time_domain(payload, owner, "source_ts");
+        let dimension = edsl::visible_dimension_detail(payload, id);
+        let query = sqlite::build_query(ast(json::parse(`{"op":"Graph","root":"k",
+            "nodes":[{"id":"k","entity":"\{owner}"}],"edges":[],
+            "select":[{"node":"k","dimension":"\{id}"}],
+            "time_windows":[{"node":"k","dimension":"\{id}","start":"2026-09-30 00:00:00","end":"2026-10-01 00:00:00"}]}`).unwrap!()));
+        if role.encoding == edsl::TimeEncoding::CanonicalUtcSecondText && !dimension.half_open
+            && dimension.input_kinds == [edsl::FilterInputKind::Utc1]
+            && string::contains(query.sql, "k.ts >= ?1") && string::contains(query.sql, "k.ts < ?2") { True }
+        else { fail!("source sample clock lacks typed half-open window support", owner, role, dimension, query) }
+    })
+});
+
+pub def day_week_and_month_bounds_are_bound_without_clock_reads: test::Test = test::should_ok(fn() {
+    let cases: Array(WindowCase) = [
+        {start: "2026-09-30 00:00:00", end: "2026-10-01 00:00:00"},
+        {start: "2026-09-24 00:00:00", end: "2026-10-01 00:00:00"},
+        {start: "2024-02-01 00:00:00", end: "2024-03-01 00:00:00"},
+    ];
+    array::all(cases, fn(window) {
+        let plan = ast(json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"source_StorageHardDriveKPI"}],
+            "edges":[],"select":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts"}],
+            "time_windows":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts","start":"\{window.start}","end":"\{window.end}"}]}`).unwrap!());
+        let sq = sqlite::build_query(plan);
+        let pg = postgres::build_query(plan);
+        if sq.bindings == [qb::Val::String(window.start), qb::Val::String(window.end)] && sq.bindings == pg.bindings
+            && string::contains(sq.sql, "k.ts >= ?1") && string::contains(sq.sql, "k.ts < ?2")
+            && string::contains(pg.sql, "\"k\".\"ts\" >= $1") && string::contains(pg.sql, "\"k\".\"ts\" < $2")
+            && !string::contains(sq.sql, "now(") && !string::contains(pg.sql, "now(") { True }
+        else { fail!("absolute calendar bounds changed during lowering", window, sq, pg) }
+    })
+});
+
+pub def open_upper_bound_is_not_now: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(ast(json::parse(r#"{"op":"Graph","root":"k",
+        "nodes":[{"id":"k","entity":"source_StorageHardDriveKPI"}],"edges":[],
+        "select":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts"}],
+        "time_windows":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts","start":"2026-09-30 00:00:00","end":null}]}"#).unwrap!()));
+    if query.bindings == [qb::Val::String("2026-09-30 00:00:00")]
+        && string::contains(query.sql, "k.ts >= ?1") && !string::contains(query.sql, "k.ts <") { True }
+    else { fail!("open upper bound must not read now or invent a cutoff", query) }
+});
+
+pub def declared_dates_and_integer_creation_clock_have_distinct_types: test::Test = test::should_ok(fn() {
+    let date = edsl::time_domain(payload, "source_SYS_PowerSupply", "source_produceDate");
+    let epoch = edsl::time_domain(payload, "source_SYS_Controller", "source_createTime");
+    if date.encoding == edsl::TimeEncoding::DateText && epoch.encoding == edsl::TimeEncoding::EpochMillis { True }
+    else { fail!("source dates must not become UTC datetimes or plain integers", date, epoch) }
+});
+
+pub def source_sample_windows_reject_now: test::Test = test::should_fail_with(fn() {
+    ast(json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"source_StorageHardDriveKPI"}],
+        "edges":[],"select":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts"}],
+        "time_windows":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts","start":"2026-09-30 00:00:00","end":"now"}]}"#).unwrap!())
+}, "resolve now to an absolute time boundary");
+
+pub def source_sample_windows_reject_reversed_bounds: test::Test = test::should_fail_with(fn() {
+    ast(json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"source_StorageHardDriveKPI"}],
+        "edges":[],"select":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts"}],
+        "time_windows":[{"node":"k","dimension":"source_StorageHardDriveKPI__ts","start":"2026-10-01 00:00:00","end":"2026-09-30 00:00:00"}]}"#).unwrap!())
+}, "time window start must precede end");

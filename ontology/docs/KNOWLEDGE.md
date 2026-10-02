@@ -150,3 +150,10 @@ semantics. Time semantics continue to be described by TimeRole documents.
 Annotated fields link to the shared logical-types contract. Dimension ops
 describe field capabilities, while input_kinds/input_docs describe accepted
 logical values; neither is inferred from a SQL column name.
+
+DataType links also discover supported operation contracts: comparisons, text
+matching, IPv4 subnet membership, and TimeWindow for temporal types. Operations
+reuse Schema nodes; no new request method or key parsing convention is needed.
+These type-level links do not grant a field any capability: inspect its declared
+ops, filterable flag and time role. TimeWindow centralizes inclusive start,
+exclusive end, an optional unbounded end and the absence of an implicit clock.

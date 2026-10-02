@@ -14,6 +14,9 @@ from icloud_capabilities import address_view, category
 spec = importlib.util.spec_from_file_location("reconcile", SCRIPTS / "reconcile-icloud-capabilities.py")
 reconcile = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reconcile)
+spec = importlib.util.spec_from_file_location("time_audit", SCRIPTS / "audit-icloud-time.py")
+time_audit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(time_audit)
 
 
 def field(name, ty="string", **extra):
@@ -64,6 +67,42 @@ class SourceCapabilities(unittest.TestCase):
         before = [(m["id"], m["body"]) for m in reconcile.refresh.ENTITY.finditer(model)]
         after = [(m["id"], m["body"]) for m in reconcile.refresh.ENTITY.finditer(refreshed)]
         self.assertEqual(after, before)
+
+    def test_time_declarations_use_metadata_and_reviewed_conventions(self):
+        sample = reconcile.refresh.new_field("foo", field("ts", "datetime"), "sample_time")
+        self.assertIn("CanonicalUtcSecondText", sample)
+        self.assertIn("FilterInputKind::Utc1", sample)
+        date = reconcile.refresh.new_field("foo", field("date", properties={"dte.time.format.pattern": "YYYY-MM-DD"}), "date")
+        self.assertIn("TimeEncoding::DateText", date)
+        self.assertIn("FilterInputKind::Date", date)
+        clock = reconcile.refresh.new_field("foo", field("timestamp", "long", columnType="timestamp"), "timestamp")
+        self.assertIn("TODO: Confirm source integer clock unit", clock)
+        self.assertIn("FilterInputKind::EpochMillis", clock)
+        ordinary = reconcile.refresh.new_field("foo", field("time_like_name"), "text")
+        self.assertNotIn("time_field", ordinary)
+
+    def test_integer_time_assumptions_have_source_todos(self):
+        model = (ROOT / "icloud_model/src/model.telora").read_text()
+        catalog = json.loads((ROOT / "icloud_model/data/source_catalog.json").read_text())
+        sources = {dataset["table"]: {field["name"]: field for field in dataset["fields"]} for dataset in catalog["datasets"]}
+        count = 0
+        for entity in reconcile.refresh.ENTITY.finditer(model):
+            for field in reconcile.FIELD.finditer(entity["body"]):
+                if "TimeEncoding::EpochMillis" not in field["block"]:
+                    continue
+                raw = sources[entity["table"]][field["column"]]
+                if time_audit.basis(raw, "EpochMillis")["requires_confirmation"]:
+                    self.assertIn("TODO:", field["block"], f"{entity['id']}.{field['name']}")
+                    count += 1
+        self.assertGreater(count, 0)
+
+    def test_time_coverage_rejects_missing_roles_and_unreviewed_exclusions(self):
+        catalog = {"datasets": [{"table": "foo", "fields": [field("ts", "datetime")]}]}
+        report = {"revision": "foo-v1", "datasets": [{"id": "foo", "table": "foo", "time_roles": [],
+            "fields": [{"name": "ts", "column": "ts", "scalar": "String", "time": None}]}], "dimensions": []}
+        self.assertIn("undeclared source time", time_audit.audit(report, catalog)["errors"][0])
+        report["datasets"][0]["fields"][0]["time"] = {"encoding": "CanonicalUtcSecondText", "semantics": "Utc"}
+        self.assertIn("unreviewed window exclusion", time_audit.audit(report, catalog)["errors"][0])
 
 
 if __name__ == "__main__":

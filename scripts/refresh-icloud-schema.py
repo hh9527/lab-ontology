@@ -12,7 +12,7 @@ import json
 import re
 from pathlib import Path
 
-from icloud_capabilities import address_view, category, ipv4_declaration, operations, search_note
+from icloud_capabilities import address_view, category, ipv4_declaration, operations, search_note, time_spec
 
 
 SCALARS = {
@@ -50,6 +50,12 @@ def new_field(entity, field, name):
     }[ty]
     if ty == "String":
         ops = operations(field)
+    clock = time_spec(field)
+    prefix = ""
+    if clock:
+        semantics, encoding, logical, note = clock
+        ops, inputs = "int_ops", f"[edsl::FilterInputKind::{logical}]"
+        prefix = (f"    # {note}\n" if note else "") + f"    @edsl::time_field(edsl::TimeSemantics::{semantics}, edsl::TimeEncoding::{encoding})\n"
     dimension = identifier(f"{entity}__{field['name']}")
     label = field.get("businessName") or field["name"]
     summary = field.get("description") or "Source field; no additional business interpretation."
@@ -57,7 +63,8 @@ def new_field(entity, field, name):
         summary += " " + search_note(field)
     return (
         f'    @edsl::column({text(field["name"])})\n'
-        f'    @edsl::dimension({text(dimension)}, True, True, {ops}, {inputs})\n'
+        + prefix
+        + f'    @edsl::dimension({text(dimension)}, True, True, {ops}, {inputs})\n'
         f'    @edsl::dimension_description({text(dimension)}, {text(label)}, {text(summary)})\n'
         + (ipv4_declaration(dimension, label) if address_view(field) else "")
         + f'    {name}: {ty},\n'
