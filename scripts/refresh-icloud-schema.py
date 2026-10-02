@@ -12,6 +12,8 @@ import json
 import re
 from pathlib import Path
 
+from icloud_capabilities import address_view, category, ipv4_declaration, operations, search_note
+
 
 SCALARS = {
     "string": "String", "uuid": "String", "ip": "String", "enum": "String",
@@ -46,14 +48,19 @@ def new_field(entity, field, name):
         "Float": ("int_ops", "number_inputs"),
         "Bool": ("bool_ops", "bool_inputs"),
     }[ty]
+    if ty == "String":
+        ops = operations(field)
     dimension = identifier(f"{entity}__{field['name']}")
     label = field.get("businessName") or field["name"]
     summary = field.get("description") or "Source field; no additional business interpretation."
+    if category(field).endswith("-text"):
+        summary += " " + search_note(field)
     return (
         f'    @edsl::column({text(field["name"])})\n'
         f'    @edsl::dimension({text(dimension)}, True, True, {ops}, {inputs})\n'
         f'    @edsl::dimension_description({text(dimension)}, {text(label)}, {text(summary)})\n'
-        f'    {name}: {ty},\n'
+        + (ipv4_declaration(dimension, label) if address_view(field) else "")
+        + f'    {name}: {ty},\n'
     )
 
 

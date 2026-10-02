@@ -1,0 +1,75 @@
+use crate::model::{payload};
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::knowledge as knowledge;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{Value};
+
+def ast: Fn(String, edsl::FilterOp, String) -> qb::QueryAst = fn(id, op, value) {
+    let dimension = edsl::visible_dimension_detail(payload, id);
+    intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"x","nodes":[{"id":"x","entity":\{json::stringify(codec::encode(dimension.dataset))}}],"edges":[],"select":[{"node":"x","dimension":\{json::stringify(codec::encode(id))}}],"filters":[{"node":"x","dimension":\{json::stringify(codec::encode(id))},"op":\{json::stringify(codec::encode(op))},"value":\{json::stringify(codec::encode(value))}}]}`).unwrap!())
+};
+def representatives: Array(String) = ["device__version", "device__neOsVersion", "device__nePatchVersion",
+    "device__sn", "device_name", "device_alias", "device_mac", "device_ip_address",
+    "port__alias", "port__ipAddress", "site_name", "tenant_name", "frame_name",
+    "server_asset_number", "source_FCSwitchDevice__wwn", "physical_link_a_ne_ip", "alarm_name"];
+def search_ops: Array(edsl::FilterOp) = [edsl::FilterOp::Eq, edsl::FilterOp::Ne,
+    edsl::FilterOp::Contains, edsl::FilterOp::NotContains, edsl::FilterOp::StartsWith, edsl::FilterOp::EndsWith];
+pub def source_search_families_lower_all_declared_operations: test::Test = test::should_ok(fn() {
+    array::all(representatives, fn(id) {
+        array::all(search_ops, fn(op) {
+            let query = ast(id, op, "C00'_%");
+            let sq = sqlite::build_query(query);
+            let pg = postgres::build_query(query);
+            if sq.bindings == pg.bindings && !string::contains(sq.sql, "C00'_%")
+                && array::any(sq.bindings, fn(v) { v == qb::Val::String("C00'_%") }) { True }
+            else { fail!("search family lost binding or changed dialect arguments", id, op, sq, pg) }
+        })
+    })
+});
+pub def explicit_ipv4_view_lowers_subnet_without_retyping_raw_source: test::Test = test::should_ok(fn() {
+    let view = edsl::visible_dimension_detail(payload, "device_ip_address_ipv4");
+    let raw = edsl::visible_dimension_detail(payload, "device_ip_address");
+    let query = ast(view.id, edsl::FilterOp::InSubnet, "10.4.16.0/20");
+    let sq = sqlite::build_query(query);
+    let pg = postgres::build_query(query);
+    if view.input_kinds == [edsl::FilterInputKind::Ipv4] && raw.input_kinds == [edsl::FilterInputKind::Text]
+        && sq.bindings == pg.bindings && string::contains(sq.sql, "CASE WHEN")
+        && array::any(sq.bindings, fn(v) { v == qb::Val::None }) { True }
+    else { fail!("explicit view confused raw storage and logical address semantics", view, raw, sq, pg) }
+});
+pub def raw_address_contains_is_not_silently_replaced_by_prefix: test::Test = test::should_ok(fn() {
+    let sq = sqlite::build_query(ast("device_ip_address", edsl::FilterOp::Contains, "10.4"));
+    if sq.bindings == [qb::Val::String("10.4"), qb::Val::Int(0)]
+        && string::contains(sq.sql, " > ") { True }
+    else { fail!("literal Contains changed population", sq) }
+});
+pub def identity_remains_exact_only: test::Test = test::should_fail_with(fn() {
+    ast("device_id", edsl::FilterOp::Contains, "id")
+}, "filter operation not supported for dimension");
+pub def canonical_values_do_not_gain_text_search: test::Test = test::should_fail_with(fn() {
+    ast("device_class", edsl::FilterOp::Contains, "firewall")
+}, "filter operation not supported for dimension");
+pub def ipv4_view_cannot_be_used_as_text: test::Test = test::should_fail_with(fn() {
+    ast("device_ip_address_ipv4", edsl::FilterOp::Contains, "10.4.2.3")
+}, "filter operation not supported for dimension");
+pub def source_clock_does_not_gain_text_search: test::Test = test::should_fail_with(fn() {
+    ast("device_create_ms", edsl::FilterOp::Contains, "1700")
+}, "value does not match dimension device_create_ms input type");
+pub def view_knowledge_explains_domain_and_links_to_common_contract: test::Test = test::should_ok(fn() {
+    let target: edsl::KnowledgeTarget = {kind: edsl::KnowledgeKind::Dimension, owner: "device", id: "device_ip_address_ipv4"};
+    match knowledge::by_target(payload, target) {
+        knowledge::DocResult::Found(point) => if string::contains(point.summary, "NULL, IPv6")
+            && string::contains(point.summary, "device_ip_address")
+            && array::any(point.refs, fn(ref) { ref.target.id == "syntax/model/ipv4_subnets" }) { True }
+            else { fail!("IPv4 view knowledge lacks its partial-conversion contract", point) },
+        _ => fail!("IPv4 view was not published", target),
+    }
+});

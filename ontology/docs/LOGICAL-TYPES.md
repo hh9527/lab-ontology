@@ -125,3 +125,12 @@ node ontology/tests/subnets-runtime.mjs /tmp/subnets.json /tmp/ipv4-views.json
 
 This executes the generated queries across all masks and address boundaries,
 checks both complements and NULL, and verifies index range access for /16 and /20.
+
+The equivalent PostgreSQL check uses temporary tables inside a rolled-back
+transaction and executes templates with bound parameters:
+
+```sh
+bin/telora -C ontology eval @test/subnets:postgres_runtime --request-fuel 10000 > /tmp/subnets-pg.json
+node ontology/tests/subnets-postgres.mjs /tmp/subnets-pg.json > /tmp/subnets-pg.sql
+psql --dbname postgres --set ON_ERROR_STOP=1 --file /tmp/subnets-pg.sql
+```

@@ -10,7 +10,10 @@ import argparse
 import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path
+
+from icloud_capabilities import NUMBER_OPS, SEARCH_OPS, address_view, category
 
 
 SCALARS = {"string": "String", "uuid": "String", "ip": "String", "enum": "String",
@@ -60,6 +63,7 @@ def check(report, catalog, exceptions, aliases, metadata=None):
     by_table = {source["table"]: source for source in catalog["datasets"]}
     rows = {entity["id"]: entity for entity in report["datasets"]}
     relations = {relation["id"]: relation for relation in report["relations"]}
+    capability_summary = check_capabilities(report, catalog, errors)
     if len(rows) != len(report["datasets"]) or len(relations) != len(report["relations"]):
         errors.append("duplicate dataset or relation identifier")
     for source in catalog["datasets"]:
@@ -141,8 +145,54 @@ def check(report, catalog, exceptions, aliases, metadata=None):
         "business_aliases": len(aliases), "prepared_datasets": len(rows),
         "prepared_fields": sum(len(entity["fields"]) for entity in rows.values()),
         "prepared_relations": len(relations),
+        "capabilities": capability_summary,
         "errors": errors, "enum_gaps": enum_gaps,
     }
+
+
+def check_capabilities(report, catalog, errors):
+    """Check the compiled whole model, not only named example fields."""
+    source_fields = {(d["table"], f["name"]): f for d in catalog["datasets"] for f in d["fields"]}
+    entities = {entity["id"]: entity for entity in report["datasets"]}
+    categories = Counter(category(field) for field in source_fields.values())
+    compiled = Counter()
+    searched = 0
+    views = 0
+    for dimension in report["dimensions"]:
+        entity = entities[dimension["dataset"]]
+        field = source_fields[(entity["table"], dimension["column"])]
+        group = category(field)
+        if dimension["computed"]:
+            if dimension["input_kinds"] == ["Ipv4"]:
+                views += 1
+                if not address_view(field) or dimension["ops"] != ["Eq", "Ne", "InSubnet", "NotInSubnet"]:
+                    errors.append(f"invalid IPv4 view contract {dimension['id']}")
+            continue
+        compiled[group] += 1
+        if not dimension["authorized"] or not dimension["filterable"]:
+            continue
+        if dimension["values"]:
+            if set(dimension["ops"]) - {"Eq", "Ne"}:
+                errors.append(f"canonical domain gained raw-text operations {dimension['id']}")
+            continue
+        actual = set(dimension["ops"])
+        if group.endswith("-text"):
+            searched += 1
+            if actual != set(SEARCH_OPS) or dimension["input_kinds"] != ["Text"]:
+                errors.append(f"incomplete raw-text search {dimension['id']}: {dimension['ops']}")
+            if address_view(field):
+                candidates = [d for d in report["dimensions"] if d["dataset"] == dimension["dataset"]
+                              and d["column"] == dimension["column"] and d["computed"]
+                              and d["id"] == dimension["id"] + "_ipv4"]
+                if len(candidates) != 1 or candidates[0]["input_kinds"] != ["Ipv4"]:
+                    errors.append(f"missing explicit IPv4 view {dimension['id']}")
+        elif group == "number" and actual != set(NUMBER_OPS):
+            errors.append(f"incomplete numeric comparisons {dimension['id']}: {dimension['ops']}")
+        elif group in {"clock", "identity", "exact", "declared-values"} and actual & set(SEARCH_OPS[2:]):
+            errors.append(f"semantic field gained text search {dimension['id']}")
+    return {"source_field_categories": dict(sorted(categories.items())),
+            "plain_dimension_categories": dict(sorted(compiled.items())),
+            "searchable_text_dimensions": searched, "explicit_ipv4_views": views}
 
 
 def main():

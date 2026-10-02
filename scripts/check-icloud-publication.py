@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from icloud_capabilities import SEARCH_OPS
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -21,6 +23,9 @@ def main():
     keys += ["Dimension/device/device_class"]
     keys += ["Field/device/name", "Field/device/id", "Field/device_kpi/cpu_usage"]
     keys += ["Field/frame/frame_dn", "Field/frame/name"]
+    keys += [f"Dimension/{row['dataset']}/{row['id']}" for row in report["dimensions"] if row["authorized"]]
+    keys += ["Schema/syntax/graph/filter/capabilities", "Schema/syntax/model/ipv4_subnets"]
+    keys = list(dict.fromkeys(keys))
     requests = [{"method": "ic/info", "input": {"key": key}} for key in keys]
     graph = {
         "op": "Graph", "root": "alarm",
@@ -42,6 +47,15 @@ def main():
          "value": {"unknown": "FutureDevice"}},
     ]}
     requests.append({"method": "ic/transform", "input": {"intents": [device, exact_unknown]}})
+    def search(dimension, op, value):
+        return {"op": "Graph", "root": "device",
+                "nodes": [{"id": "device", "entity": "device"}], "edges": [],
+                "select": [{"node": "device", "dimension": dimension}],
+                "filters": [{"node": "device", "dimension": dimension, "op": op, "value": value}]}
+    searches = [search("device__version", "EndsWith", "C00"),
+                search("device_ip_address", "Contains", "10.4"),
+                search("device_ip_address_ipv4", "InSubnet", "10.4.16.0/20")]
+    requests.append({"method": "ic/transform", "input": {"intents": searches}})
     process = subprocess.run(
         [str(root / "bin/telora-run"), str(args.artifact.resolve()),
          "--serve", "stdio+jsonl://", "--request-fuel", "100000",
@@ -85,7 +99,18 @@ def main():
     assert nodes["Field/frame/name"]["detail"]["nullable"] is False
     assert "Field/frame/id" not in indexed
     assert "Dimension/frame/frame_id" not in indexed
-    result = responses[-2]
+    for dimension in report["dimensions"]:
+        if not dimension["authorized"]:
+            continue
+        key = f"Dimension/{dimension['dataset']}/{dimension['id']}"
+        node = nodes[key]
+        assert node["detail"]["ops"] == dimension["ops"], key
+        assert node["detail"]["input_kinds"] == dimension["input_kinds"], key
+        assert "Schema/syntax/graph/filter/capabilities" in {link["key"] for link in node["links"]}, key
+        if dimension["input_kinds"] == ["Ipv4"]:
+            assert "Schema/syntax/model/ipv4_subnets" in {link["key"] for link in node["links"]}, key
+            assert "NULL, IPv6" in node["description"]["summary"], key
+    result = responses[-3]
     assert result["accepted"] and len(result["queries"]) == 1, result
     query = result["queries"][0]
     assert "alarm.OCCURUTC >=" in query["sql"] and "alarm.OCCURUTC <" in query["sql"], query
@@ -95,14 +120,24 @@ def main():
         assert all(set(value) == {"Int"} for value in bindings), bindings
         bindings = [value["Int"] for value in bindings]
     assert sorted(bindings) == [1, 1709136000000, 1709222400000], bindings
-    result = responses[-1]
+    result = responses[-2]
     assert result["accepted"] and len(result["queries"]) == 2, result
     grouped, unknown = result["queries"]
     assert "device_device_class__kind" in grouped["sql"] and "WHERE" not in grouped["sql"], grouped
     assert unknown["bindings"] == ["FutureDevice"], unknown
+    result = responses[-1]
+    assert result["accepted"] and len(result["queries"]) == 3, result
+    version, address, subnet = result["queries"]
+    assert "C00" in version["bindings"] and "C00" not in version["sql"], version
+    assert address["bindings"] == ["10.4", 0] and " > " in address["sql"], address
+    assert "CASE WHEN" in subnet["sql"] and "REGEXP" in subnet["sql"], subnet
+    assert "10.4." in subnet["bindings"] and "10.4/" in subnet["bindings"], subnet
+    assert nodes["Dimension/device/device__version"]["detail"]["ops"] == SEARCH_OPS
     print(json.dumps({"index_entries": len(entries), "dataset_documents": 50,
                       "relation_documents": len(report["relations"]),
                       "clock_encoding": "EpochMillis", "query": "passed",
+                      "dimension_documents": len(report["dimensions"]),
+                      "search_and_ipv4_views": "passed",
                       "half_open": "passed", "field_roles": "passed"}, indent=2))
 
 
