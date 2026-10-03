@@ -80,6 +80,7 @@ remove their temporary output. Existing outputs are preserved.
 ```sh
 mise x -- node scripts/tests/icloud-data.test.mjs
 mise x -- node scripts/check-icloud-data.mjs bin/icloud-data
+mise x -- node scripts/check-icloud-discovery-pair.mjs bin/icloud-data
 ```
 
 The first command tests reproducibility, complete field/carrier/relation
@@ -88,6 +89,11 @@ failed publication. The second requires `bin/icloud_model.snapshot.wasm` and
 executes snapshot-generated SQLite queries for all 17 KPI windows, ONU/OLT
 scopes, five resource families' CPU averages and CPU GrowthRate Top-5. A snapshot path can be passed as its second
 argument.
+
+The discovery/pair check verifies time-identity rejection, legal overlapping
+sample pairing, shared storage/FC owner discovery and period comparisons, and
+directory-only vocabulary enumeration. The 91 device KPI members can be
+enumerated with 15 directory calls and no per-member reads for their IDs.
 
 StorageDeviceKPI contains a complete series for every storage device and every
 FC switch, so it has twice the base series count. Publication verifies that

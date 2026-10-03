@@ -97,8 +97,13 @@ directly to the matching path. The knowledge and query methods are:
 ```
 
 The `index` topic returns five discovery routes: datasets, relations, terminology,
-data types and query contracts. Directory entries are `{key,type,label}`; relation
-entries also carry `from`/`to` dataset keys. Large directories lead to smaller
+data types and query contracts. Directory entries have `{key,type,label}`.
+Vocabulary entries additionally publish canonical `id` and, when applicable,
+`dataset`, `dimension` or `hub`. A Relation's `dataset` is its origin; relation
+entries also carry `from`/`to` dataset keys. Enumerate IDs from entries directly,
+then follow member keys for capabilities, units and population semantics.
+Structural directory and schema entries have no query-vocabulary ID.
+Large directories lead to smaller
 directories, and each returned list is complete, never a truncated page. Pass an
 entry's `key` unchanged to `info`. Follow entries and `links[].key` values to
 check entity grain, dimensions, measures, business values, time roles, and

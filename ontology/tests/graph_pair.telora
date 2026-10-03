@@ -97,7 +97,40 @@ def profile: qb::PlanProfile = {
         qb::ScalarFunction::Ne, qb::ScalarFunction::Gt, qb::ScalarFunction::IsNotNull],
     allow_distinct: False,
 };
-def payload: edsl::PreparedPayload = edsl::build_root("pair-rank-v2", [Device.type, Sample.type, CompositeDevice.type, CompositeSample.type], profile);
+@edsl::entity_id("timed_sample")
+@edsl::entity_source("timed_samples", "timed")
+@edsl::dataset(edsl::DatasetKind::Metric, ["owner", "ts"], Some("ts"))
+type TimedSample = struct {
+    @edsl::column("owner") @edsl::key()
+    owner: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    @edsl::dimension("timed_time", True, True, [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::EpochMillis])
+    ts: Int,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    @edsl::dimension("timed_time_alias", True, True, [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::EpochMillis])
+    ts_alias: Int,
+    @edsl::column("usage")
+    @edsl::measure("timed_usage", qb::AggregateFunction::Avg, [])
+    @edsl::metric_value("timed_usage", qb::AggregateFunction::Avg, Some("%"))
+    usage: Float,
+};
+
+@edsl::entity_id("dated_sample")
+@edsl::entity_source("dated_samples", "dated")
+@edsl::dataset(edsl::DatasetKind::Entity, ["owner", "day"], None)
+type DatedSample = struct {
+    @edsl::column("owner") @edsl::key()
+    owner: String,
+    @edsl::column("day")
+    @edsl::time_field(edsl::TimeSemantics::DateUtc, edsl::TimeEncoding::DateText)
+    @edsl::dimension("dated_day", True, True, [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::DateUtc])
+    day: String,
+    @edsl::column("usage") @edsl::measure("dated_usage", qb::AggregateFunction::Avg, [])
+    usage: Float,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("pair-rank-v2", [Device.type, Sample.type, CompositeDevice.type, CompositeSample.type, TimedSample.type, DatedSample.type], profile);
 def lower: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
 
 def graph: Fn(String, String, Int, Int) -> Value = fn(node, measure, start, end) {
@@ -118,6 +151,49 @@ def pair: Fn(String, String, Value) -> Value = fn(left, right, ranking) {
 def patch: Fn(Value, Dict(Value)) -> Value = fn(value, changes) {
     match value { Value::Object(fields) => Value::Object(dict::merge(fields, changes)), _ => fail!("expected object", value) }
 };
+
+def timed_graph: Fn(String, Int, String, String) -> Value = fn(node, start, end, dimension) {
+    json::parse(`{"op":"Graph","root":"\{node}","nodes":[{"id":"\{node}","entity":"timed_sample"}],"edges":[],"select":[],
+        "group_by_identity":["\{node}"],"measures":[{"node":"\{node}","measure":"timed_usage"}],
+        "time_windows":[{"node":"\{node}","dimension":"\{dimension}","start":\{start},"end":\{end}}]}`).unwrap!()
+};
+def timed_pair: Fn(Int, String, Int, String) -> Value = fn(a, b, c, d) {
+    Value::Object({op: Value::String("GraphPair"), left: timed_graph("l", a, b, "timed_time"),
+        right: timed_graph("r", c, d, "timed_time_alias"),
+        align_by: json::parse(r#"[{"left":{"node":"l"},"right":{"node":"r"}}]"#).unwrap!(),
+        select: json::parse("[]").unwrap!()})
+};
+pub def temporal_identity_rejects_adjacent_windows: test::Test = test::should_fail_with(fn() {
+    lower(timed_pair(0, "10", 10, "20"))
+}, "identity contains time field ts");
+pub def temporal_identity_rejects_gapped_windows: test::Test = test::should_fail_with(fn() {
+    lower(timed_pair(0, "10", 11, "20"))
+}, "disjoint time windows");
+pub def temporal_identity_rejects_reversed_windows: test::Test = test::should_fail_with(fn() {
+    lower(timed_pair(10, "20", 0, "10"))
+}, "disjoint time windows");
+pub def temporal_identity_rejects_disjoint_open_window: test::Test = test::should_fail_with(fn() {
+    lower(timed_pair(0, "10", 10, "null"))
+}, "Align owner entities");
+pub def temporal_identity_accepts_equal_windows: test::Test = test::should_ok(fn() { lower(timed_pair(0, "10", 0, "10")) });
+pub def temporal_identity_accepts_overlapping_windows: test::Test = test::should_ok(fn() { lower(timed_pair(0, "10", 5, "15")) });
+pub def temporal_identity_accepts_overlapping_open_windows: test::Test = test::should_ok(fn() { lower(timed_pair(0, "null", 10, "null")) });
+
+def dated_graph: Fn(String, String, String) -> Value = fn(node, start, end) {
+    json::parse(`{"op":"Graph","root":"\{node}","nodes":[{"id":"\{node}","entity":"dated_sample"}],"edges":[],"select":[],
+        "group_by_identity":["\{node}"],"measures":[{"node":"\{node}","measure":"dated_usage"}],
+        "time_windows":[{"node":"\{node}","dimension":"dated_day","start":"\{start}","end":"\{end}"}]}`).unwrap!()
+};
+def dated_pair: Fn(String) -> Value = fn(right_start) {
+    patch(timed_pair(0, "10", 5, "15"), {
+        left: dated_graph("l", "2026-09-01", "2026-09-10"),
+        right: dated_graph("r", right_start, "2026-09-20"),
+    })
+};
+pub def temporal_date_identity_rejects_adjacent_windows: test::Test = test::should_fail_with(fn() {
+    lower(dated_pair("2026-09-10"))
+}, "identity contains time field day");
+pub def temporal_date_identity_accepts_overlapping_windows: test::Test = test::should_ok(fn() { lower(dated_pair("2026-09-05")) });
 
 pub def rank_is_bound_and_uses_right_minus_left_in_both_dialects: test::Test = test::should_ok(fn() {
     let ast = lower(pair("usage", "usage", rank("Desc", 5)));

@@ -24,6 +24,16 @@ export function inspectKnowledge(domain, nodes, maxNodeChars) {
   for (const node of nodes) {
     counts[node.type] = (counts[node.type] ?? 0) + 1;
     for (const key of discoveryKeys(node)) assert.ok(byKey.has(key), `dangling knowledge key: ${key}`);
+    for (const entry of node.detail.entries ?? []) {
+      if (!entry.type) continue;
+      const target = byKey.get(entry.key);
+      if ('id' in entry) {
+        assert.equal(entry.id, target.detail.id ?? (entry.type === 'TimeRole' ? target.detail.field : undefined), `entry ID mismatch: ${entry.key}`);
+      }
+      if ('dataset' in entry) assert.equal(entry.dataset, target.detail.dataset ?? target.detail.from_dataset, `entry owner mismatch: ${entry.key}`);
+      if ('dimension' in entry) assert.equal(entry.dimension, target.detail.dimension);
+      if ('hub' in entry) assert.equal(entry.hub, target.detail.hub);
+    }
     nodeSizes.push({ key: node.key, type: node.type, chars: responseSize(node) });
     for (const [kind, items] of [['entry', node.detail.entries ?? []], ['link', node.links]]) {
       for (const item of items) {

@@ -7,6 +7,7 @@ use std::codec as codec;
 use std::diagnostics as diagnostics;
 use std::dict as dict;
 use std::string as string;
+use std::type_property as property;
 use std::value::{ Value };
 
 def as_object: Fn(Value) -> Dict(Value) = fn(value) {
@@ -468,6 +469,52 @@ def pair_operand: Fn(Value, Array(PairSelection), qb::PairSide) -> Value = fn(va
     }
 };
 
+def temporal_leq: Fn(edsl::FilterInput, edsl::FilterInput) -> Bool = fn(a, b) {
+    match (a, b) {
+        (edsl::FilterInput::EpochMillis(x), edsl::FilterInput::EpochMillis(y)) => x <= y,
+        (edsl::FilterInput::DatetimeUtc(x), edsl::FilterInput::DatetimeUtc(y)) => x <= y,
+        (edsl::FilterInput::DateUtc(x), edsl::FilterInput::DateUtc(y)) => x <= y,
+        _ => False,
+    }
+};
+
+# A strict upper bound at or below the other population's inclusive lower
+# bound proves that equal temporal identity values cannot exist.
+def pair_time_alignment: Fn(edsl::PreparedPayload, edsl::GraphRequest, edsl::GraphRequest, Array(PairAlignment)) -> Bool = fn(payload, left, right, align) {
+    array::all(align, fn(pair) {
+        let entity_id = edsl::graph_node(left, pair.left.node).entity;
+        let entity = match array::find(payload.entities, fn(entity) { entity.id == entity_id }) {
+            Some(entity) => entity, None => fail!("aligned entity missing", entity_id),
+        };
+        let identity = match entity.dataset {
+            Some(spec) => spec.grain,
+            None => array::map(array::filter(entity.fields, fn(field) { field.is_key }), fn(field) { field.name }),
+        };
+        array::all(array::filter(entity.fields, fn(field) {
+            array::any(identity, fn(name) { name == field.name })
+                && property::get_field_prop(entity.entity_type, field.index, edsl::TimeField.type) != None
+        }), fn(field) {
+            let bounds = fn(request: edsl::GraphRequest, node: String) {
+                array::filter(request.filters, fn(filter) {
+                    let dimension = edsl::visible_dimension_detail(payload, filter.request.id);
+                    filter.node == node && !dimension.computed && array::any(entity.fields, fn(candidate) {
+                        candidate.name == dimension.field && candidate.column == field.column
+                    })
+                })
+            };
+            let l = bounds(left, pair.left.node);
+            let r = bounds(right, pair.right.node);
+            let disjoint = array::any(l, fn(a) { array::any(r, fn(b) {
+                (a.request.op == edsl::FilterOp::Lt && b.request.op == edsl::FilterOp::Ge && temporal_leq(a.request.input, b.request.input))
+                    || (b.request.op == edsl::FilterOp::Lt && a.request.op == edsl::FilterOp::Ge && temporal_leq(b.request.input, a.request.input))
+            }) });
+            if disjoint {
+                fail!(`GraphPair align_by nodes \{pair.left.node}/\{pair.right.node} identity contains time field \{field.name} (column \{field.column}); disjoint time windows cannot share an identity. Align owner entities for period comparisons, or use overlapping windows for sample-point pairing.`, pair, field.name)
+            } else { True }
+        })
+    })
+};
+
 def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
     let raw = decode_graph_shape@[RawGraphPair](value, "syntax/graph_pair");
     let obj = as_object(value);
@@ -506,6 +553,7 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
     }) {
         fail!("aggregate pair aligned nodes must belong to the same entity", align)
     } else {
+        if pair_time_alignment(payload, left.1, right.1, align) { () } else { fail!("invalid temporal alignment") };
         let left_identity = edsl::graph_pair_identity(payload, left.1, left.2);
         let right_identity = edsl::graph_pair_identity(payload, right.1, right.2);
         let keys = array::map(array::enumerate(left_identity), fn(entry) { `__q_key_\{entry.0}` });

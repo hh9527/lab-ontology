@@ -59,6 +59,16 @@ and `dimension`. Other domain nodes preserve their corresponding Model brief;
 Metric and TimeRole also identify their owning dataset, and BusinessLink has
 `id`, `hub`, `direction`, and `guard`. Business IDs are explicit Model data,
 not something consumers should recover by parsing a knowledge key.
+Directory vocabulary entries expose canonical `id` directly, so enumerating
+query IDs needs directory reads rather than one request per member. Owned
+Field, Dimension, Measure, Metric, TimeRole and Relation entries include
+`dataset`; for Relation this is its declared origin, even when listed as an
+incoming relation in another dataset's directory. Value entries include
+`dimension`, and BusinessLink entries include `hub`. TimeRole `id` is its field
+name. Dataset and DataType entries also expose `id`. Structural Index,
+Directory, Terminology and Schema entries carry no query-vocabulary ID.
+Follow a member's returned `key` for capabilities, unit and population details;
+`label` remains display text. Enumeration does not itself authorize a query.
 References are marked `Member`, `Traversable`, or `Related`. `Related` is documentation-only;
 it cannot establish a query edge. A relation's named endpoints, cardinality, and
 shape, a dataset's grain, and a time role's semantics, encoding, and

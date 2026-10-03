@@ -20,6 +20,17 @@ or key, including composite identities. Nodes cannot repeat on either side.
 Each operand's `group_by_identity` must exactly match its aligned nodes in
 order, beginning with its root. No partial or additional identity is allowed.
 
+If an aligned identity contains time, alignment pairs individual sample points
+or dates. When direct time bounds on the same identity column prove the two
+populations disjoint, the request is rejected before SQL is returned. This
+includes adjacent half-open windows and supports EpochMillis, DatetimeUtc and
+DateUtc boundaries. Bounds through raw dimensions sharing that column are
+recognized. Equal, overlapping or unproven-disjoint windows remain valid.
+For comparisons between periods, align a resource owner whose identity does
+not contain sample time, then aggregate each window's samples through the
+declared owner relation. Sample-point pairing can produce many more groups
+than owner-level period comparisons.
+
 Outer `select` is required (an empty array is allowed). Every entry specifies
 `side:Left|Right`, `node`, and `dimension`. Only aligned nodes may supply
 display attributes: the model identity contract requires these attributes

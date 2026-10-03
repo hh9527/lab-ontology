@@ -1,6 +1,6 @@
 # Source-backed sample statistics
 
-This describes the product Model (`icloud-source-v8`).
+This describes the product Model (`icloud-source-v9`).
 Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 
@@ -47,6 +47,14 @@ node scripts/check-icloud-cpu.mjs bin/icloud_model.snapshot.wasm
   table but use their own declared resource relations and populations.
 - Collaboration devices have no declared CPU sample source. CPU questions for
   this resource family are unsupported; missing CPU is not zero.
+- The shared storage CPU measure has two owner populations: `storage_device`
+  via `source_HuaweiStorageDeviceAssociationStorageDeviceKPI`, and
+  `source_FCSwitchDevice` via `source_FCSwitchDevice_StorageDeviceKPI`.
+  Both relations lead from owner to `source_StorageDeviceKPI`. For GraphPair
+  period comparisons, root/group/align each owner identity and measure its KPI
+  samples in each window. FC explicitly declares entity grain `source_id`.
+  The KPI grain includes sample time and is suitable for sample-point pairing;
+  disjoint windows cannot pair equal timestamps and are rejected.
 - Online-rate averages preserve the reported numeric scale and average eligible
   non-NULL stored rows. They are neither time-weighted nor weighted by
   `onlineRateEffcnt`; all-NULL groups have no average. Source descriptions do not
