@@ -6,7 +6,7 @@ use crate::query::{
     SelectItem, NamedExprItem, HavingOp, HavingMeasure, Having, Source,
     BuildCtx, JoinKind, JoinCondition, Join, Exists, ExistsLink, ExistsTail,
     PeerBranch, PeerCorr, UnionColumn, UnionBranch, DerivedSource,
-    SetOpKind, Ordering, AggregateRef, OrderKey, OrderBy, Plan, SetPlan, JoinedGroups,
+    SetOpKind, Ordering, AggregateRef, OrderKey, OrderBy, Plan, SetPlan, JoinedGroups, PairSide, PairRankOp,
     QueryPlan, QueryAst, PartitionedTopN, ScalarSubquery, ScalarAggregateComparison,
     RankedKeySubquery, RankedKeyComparison, is_sql_identifier,
     validate_contextual_pagination, validate_query_plan, validate_structure,
@@ -26,6 +26,7 @@ def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
         ScalarFunction::If => "if",
         ScalarFunction::Add => "+",
         ScalarFunction::Sub => "-",
+        ScalarFunction::Div => "/",
         ScalarFunction::Lower => "lower",
         ScalarFunction::Length => "length",
         ScalarFunction::UtcDaysAgo => "strftime",
@@ -75,6 +76,7 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
         ScalarFunction::If => `CASE WHEN \{parts[0]} THEN \{parts[1]} ELSE \{parts[2]} END`,
         ScalarFunction::Add => `(\{parts[0]} + \{parts[1]})`,
         ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
+        ScalarFunction::Div => `(\{parts[0]} / \{parts[1]})`,
         ScalarFunction::Lower => `lower(\{parts[0]})`,
         ScalarFunction::Length => `length(\{parts[0]})`,
         ScalarFunction::UtcDaysAgo => `strftime('%Y-%m-%dT%H:%M:%SZ', \{parts[0]}, printf('-%d days', \{parts[1]}))`,
@@ -746,10 +748,10 @@ def render_plan: Fn(Plan, BuildCtx) -> String = fn(plan, ctx) {
 def render_joined_groups: Fn(JoinedGroups, Bool, BuildCtx) -> String = fn(joined, count, ctx) {
     let left = render_plan(joined.left, ctx);
     let right = render_plan(joined.right, ctx);
-    let outputs = array::concat([
-        array::map(joined.left_outputs, fn(name) { `__q_left.\{name} AS \{name}` }),
-        array::map(joined.right_outputs, fn(name) { `__q_right.\{name} AS \{name}` }),
-    ]);
+    let outputs = array::map(joined.outputs, fn(item) {
+        let side = match item.side { PairSide::Left => "__q_left", PairSide::Right => "__q_right" };
+        `\{side}.\{item.column} AS \{item.alias}`
+    });
     let keys = array::map(joined.keys, fn(name) {
         `(__q_left.\{name} = __q_right.\{name} OR (__q_left.\{name} IS NULL AND __q_right.\{name} IS NULL))`
     });
@@ -759,9 +761,23 @@ def render_joined_groups: Fn(JoinedGroups, Bool, BuildCtx) -> String = fn(joined
         Some(rank) => {
             let l = `__q_left.\{rank.left_measure}`;
             let r = `__q_right.\{rank.right_measure}`;
+            let a = if rank.first == PairSide::Left { l } else { r };
+            let b = if rank.first == PairSide::Left { r } else { l };
+            let first = `CAST(\{a} AS REAL)`;
+            let second = `CAST(\{b} AS REAL)`;
+            let expression = match rank.op {
+                PairRankOp::Subtract => `(\{first} - \{second})`,
+                PairRankOp::Ratio => `(\{first} / NULLIF(\{second}, 0))`,
+                PairRankOp::GrowthRate => `((\{first} - \{second}) / NULLIF(\{second}, 0))`,
+            };
+            let guard = match rank.op {
+                PairRankOp::Subtract => "",
+                PairRankOp::Ratio => ` AND \{b} <> 0`,
+                PairRankOp::GrowthRate => ` AND \{b} > 0`,
+            };
             let direction = match rank.direction { Ordering::Asc => "ASC", Ordering::Desc => "DESC" };
             let ties = array::map(joined.keys, fn(name) { `__q_left.\{name} ASC NULLS FIRST` });
-            ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL ORDER BY (CAST(\{r} AS REAL) - CAST(\{l} AS REAL)) \{direction}, \{string::join(ties, ", ")} LIMIT \{render_expr(rank.take, ctx)}`
+            ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY \{expression} \{direction}, \{string::join(ties, ", ")} LIMIT \{render_expr(rank.take, ctx)}`
         },
     };
     `SELECT \{selected} FROM (\{left}) AS __q_left INNER JOIN (\{right}) AS __q_right ON \{string::join(keys, " AND ")}\{ranking}`

@@ -33,6 +33,7 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
         qb::ScalarFunction::If => `CASE WHEN \{parts[0]} THEN \{parts[1]} ELSE \{parts[2]} END`,
         qb::ScalarFunction::Add => `(\{parts[0]} + \{parts[1]})`,
         qb::ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
+        qb::ScalarFunction::Div => `(\{parts[0]} / \{parts[1]})`,
         qb::ScalarFunction::Lower => `translate(\{parts[0]}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`,
         qb::ScalarFunction::Length => `char_length(\{parts[0]})`,
         qb::ScalarFunction::UtcDaysAgo => `to_char((\{parts[0]}::timestamptz - make_interval(days => \{parts[1]}::integer)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
@@ -702,14 +703,10 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
     let right = emit_rows(joined.right, False, left.ctx);
     let left_alias = internal_alias(right.ctx);
     let right_alias = internal_alias(left_alias.1);
-    let outputs = array::concat([
-        array::map(joined.left_outputs, fn(name) {
-            `\{quoted(left_alias.0)}.\{quoted(name)} AS \{quoted(name)}`
-        }),
-        array::map(joined.right_outputs, fn(name) {
-            `\{quoted(right_alias.0)}.\{quoted(name)} AS \{quoted(name)}`
-        }),
-    ]);
+    let outputs = array::map(joined.outputs, fn(item) {
+        let alias = match item.side { qb::PairSide::Left => left_alias.0, qb::PairSide::Right => right_alias.0 };
+        `\{quoted(alias)}.\{quoted(item.column)} AS \{quoted(item.alias)}`
+    });
     let keys = array::map(joined.keys, fn(name) {
         let l = `\{quoted(left_alias.0)}.\{quoted(name)}`;
         let r = `\{quoted(right_alias.0)}.\{quoted(name)}`;
@@ -721,10 +718,24 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
         Some(rank) => {
             let l = `\{quoted(left_alias.0)}.\{quoted(rank.left_measure)}`;
             let r = `\{quoted(right_alias.0)}.\{quoted(rank.right_measure)}`;
+            let a = if rank.first == qb::PairSide::Left { l } else { r };
+            let b = if rank.first == qb::PairSide::Left { r } else { l };
+            let first = `CAST(\{a} AS DOUBLE PRECISION)`;
+            let second = `CAST(\{b} AS DOUBLE PRECISION)`;
+            let expression = match rank.op {
+                qb::PairRankOp::Subtract => `(\{first} - \{second})`,
+                qb::PairRankOp::Ratio => `(\{first} / NULLIF(\{second}, 0))`,
+                qb::PairRankOp::GrowthRate => `((\{first} - \{second}) / NULLIF(\{second}, 0))`,
+            };
+            let guard = match rank.op {
+                qb::PairRankOp::Subtract => "",
+                qb::PairRankOp::Ratio => ` AND \{b} <> 0`,
+                qb::PairRankOp::GrowthRate => ` AND \{b} > 0`,
+            };
             let direction = match rank.direction { qb::Ordering::Asc => "ASC", qb::Ordering::Desc => "DESC" };
             let ties = array::map(joined.keys, fn(name) { `\{quoted(left_alias.0)}.\{quoted(name)} ASC NULLS FIRST` });
             let limit = emit_expr(rank.take, right_alias.1);
-            {sql: ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL ORDER BY (CAST(\{r} AS DOUBLE PRECISION) - CAST(\{l} AS DOUBLE PRECISION)) \{direction}, \{string::join(ties, ", ")} LIMIT \{limit.sql}`, ctx: limit.ctx}
+            {sql: ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY \{expression} \{direction}, \{string::join(ties, ", ")} LIMIT \{limit.sql}`, ctx: limit.ctx}
         },
     };
     {sql: `SELECT \{selected} FROM (\{left.sql}) AS \{quoted(left_alias.0)} INNER JOIN (\{right.sql}) AS \{quoted(right_alias.0)} ON \{string::join(keys, " AND ")}\{ranking.sql}`,

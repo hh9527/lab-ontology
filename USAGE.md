@@ -298,59 +298,40 @@ distinct result categories rather than one entity set.
 
 ### Independent aggregate pair
 
-Use `GraphPair` when two measure populations must be aggregated separately
-and then matched by their complete declared group identities:
+Use `GraphPair` to aggregate two populations independently, explicitly align
+their complete identities, and choose the side of each output column.
 
 ```text
-{"op":"GraphPair","left":<graph Intent>,"right":<graph Intent>,
- "count_groups":false}
+{"op":"GraphPair","left":<Graph intent>,"right":<Graph intent>,
+ "align_by":[{"left":{"node":"d"},"right":{"node":"d"}}],
+ "select":[{"side":"Right","node":"d","dimension":"device_name"}],
+ "rank_by":{"op":"Subtract","minuend":"Right","subtrahend":"Left",
+            "direction":"Desc","take":5}}
 ```
 
-`left` and `right` are complete `Graph` Intents, each with its own nodes,
-named edges, filters, existence qualifications, one measure projection, and
-optional `measure_having`. Each side is lowered and grouped independently;
-the resulting groups are inner-joined on every hidden identity field.
-Neither the measure populations nor their raw rows are joined to each other
-before aggregation. Only identities present on both sides appear in the
-result. With `count_groups:false` (the default), the result contains the
-aligned visible dimensions and both measure values. With outer
-`count_groups:true`, it counts the aligned groups instead.
+Each side has exactly one measure and empty or omitted select. Its
+group_by_identity must exactly match its aligned nodes in order, beginning
+with root. Paired nodes belong to the same entity; their IDs may differ.
+Outer select is required (may be empty); display dimensions must belong to
+aligned nodes and never become alignment keys. Outputs follow select order
+then both measures, using left_<node>_<dimension or measure> and
+right_<node>_<dimension or measure> aliases.
 
-The two operands must satisfy all of these shape rules:
+Ranking supports Subtract (minuend/subtrahend), Ratio (numerator/denominator)
+and GrowthRate (current/baseline). Side parameters explicitly choose different
+Left/Right sides. Every rank needs direction Asc|Desc and take 1..1000.
+Numeric measures must be the same measure or declare matching non-null units.
+Exclude NULL measures, zero Ratio denominators and nonpositive GrowthRate
+baselines. Arithmetic uses approximate double precision; a growth rate of
+0.2 means 20%. Ties use complete aligned identities ascending, NULLS FIRST.
 
-1. Each has `op:"Graph"`, exactly one `measures` entry, and
-   `group_by_identity` beginning with its `root` node ID.
-2. They use the same root node ID and dataset. Their `group_by_identity`
-   arrays are identical, and every grouped node ID denotes the same dataset
-   on both sides. The complete Model-declared identity keys must match.
-3. Their `select` arrays are identical in order; each selected node ID
-   denotes the same dataset on both sides. The measure IDs and qualification
-   paths may differ between sides.
-4. Neither operand uses `count`, `count_value`, `count_having`,
-   `count_groups`, `distinct`, `include_empty`, `top_per`,
-   `top_by_measure`, `order_by`, or `take`. Put measure thresholds in
-   that operand's `measure_having`, not in the outer pair.
+Populations remain independent; filters, exists, time_windows and
+measure_having stay inside their respective Graph. Operand counts, distinct,
+include_empty, ordering and Top-N remain forbidden. Unranked count_groups:true
+counts all aligned identities and cannot combine with rank_by.
 
-To return the five largest increases, add this outer field:
-
-```json
-"rank_by": {"op":"Subtract","direction":"Desc","take":5}
-```
-
-Ranking uses **right minus left**, after independent aggregation and the
-identity join. `Asc` returns the largest decreases first. Both measures must
-be numeric; differing measure IDs must declare the same non-null unit.
-Groups with a NULL measure on either side are excluded. Ties use every
-hidden grouping key ascending, NULLS FIRST. `take` is a bound integer from
-1 to 1000. Arithmetic casts operands to double precision (`REAL` in SQLite,
-`DOUBLE PRECISION` in PostgreSQL), so large integers may lose precision.
-The output retains dimensions and both measures without a difference column.
-`rank_by` cannot combine with `count_groups:true`; that count continues to
-count all aligned groups, rather than a ranked subset.
-
-The outer object accepts `op`, `left`, `right`, optional boolean
-`count_groups`, and optional `rank_by`. A successful pair does not prove that two similarly named
-display values are the same entity: the join uses the aligned identity keys.
+Old implicit pairs require migration. See the [complete GraphPair contract](ontology/docs/GRAPH-PAIR.md)
+for shapes, output aliases, profile requirements and migration steps.
 
 In JSONL service mode, responses use the `telora.service/v1` envelope. On
 success, `ok.Document` holds `Found` or `NotFound`; the Found Index node contains

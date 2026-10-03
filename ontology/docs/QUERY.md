@@ -51,12 +51,20 @@ the allocation context and validated plan into one `QueryAst`; neither
 unfinished `Ctx` nor `Plan` crosses the renderer boundary. The AST cannot
 contain raw SQL, arbitrary functions, or literal fragments.
 
-`JoinedGroups.rank` optionally ranks independently aggregated, inner-joined
-groups by right minus left with a bound limit of 1..1000. Renderers exclude
-NULL measures and break ties by all hidden grouping keys ascending, NULLS
-FIRST. Operands are cast to double precision before subtraction. Output
-columns remain unchanged. `JoinedGroupCount` rejects ranking. Model lowering
-checks numeric measure types, compatible units, and profile authorization.
+`JoinedGroups` carries separate `left_identity` / `right_identity` expressions,
+hidden key aliases, and ordered `outputs` with side, column and result alias.
+Key projections must match the identity expressions and belong to operand
+grouping, without including display grouping expressions. Model lowering
+enforces complete identities and display attributes from aligned nodes.
+
+`JoinedGroups.rank` supports Subtract, Ratio and GrowthRate with an explicit
+first side (the second side is the opposite) and bound limit 1..1000.
+GrowthRate uses first as current and second as baseline. Renderers exclude
+NULL measures, zero Ratio denominators and nonpositive GrowthRate baselines,
+cast operands to double precision, and also guard division with NULLIF.
+Ties use complete alignment identities ascending, NULLS FIRST. No comparison
+column is added. JoinedGroupCount rejects ranking. Model lowering checks
+numeric types, units and profile authorization. See [GraphPair](GRAPH-PAIR.md).
 
 Model-backed type and grain checks belong to ontology lowering. The query
 module also validates structural invariants such as source visibility,

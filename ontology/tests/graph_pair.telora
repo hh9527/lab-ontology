@@ -55,6 +55,37 @@ type Sample = struct {
     label: String,
 };
 
+@edsl::entity_id("composite_device")
+@edsl::entity_source("composite_devices", "cd")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant"], None)
+type CompositeDevice = struct {
+    @edsl::column("id") id: String,
+    @edsl::column("tenant") tenant: String,
+    @edsl::column("name")
+    @edsl::dimension("composite_name", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    name: String,
+};
+@edsl::entity_id("composite_sample")
+@edsl::entity_source("composite_samples", "cs")
+@edsl::dataset(edsl::DatasetKind::Metric, ["id"], Some("ts"))
+@edsl::named_relation_key("composite_sample_device", CompositeDevice.type,
+    {from: edsl::Cardinality::Many0, to: edsl::Cardinality::One},
+    edsl::DeclaredRelationKey::And([
+        edsl::DeclaredRelationKey::FieldEq({from: "owner", to: "id"}),
+        edsl::DeclaredRelationKey::FieldEq({from: "tenant", to: "tenant"}),
+    ]))
+type CompositeSample = struct {
+    @edsl::column("id") @edsl::key() id: Int,
+    @edsl::column("owner") owner: String,
+    @edsl::column("tenant") tenant: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    @edsl::dimension("composite_phase", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::EpochMillis])
+    ts: Int,
+    @edsl::column("usage") @edsl::measure("composite_usage", qb::AggregateFunction::Avg, [])
+    usage: Float,
+};
+
 def profile: qb::PlanProfile = {
     allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
         qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate, qb::Operator::Filter,
@@ -62,24 +93,27 @@ def profile: qb::PlanProfile = {
     allowed_join_kinds: [qb::JoinKind::Inner],
     allowed_aggregates: [qb::AggregateFunction::Avg, qb::AggregateFunction::Max, qb::AggregateFunction::Min, qb::AggregateFunction::Sum],
     allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt,
-        qb::ScalarFunction::And, qb::ScalarFunction::Sub, qb::ScalarFunction::IsNotNull],
+        qb::ScalarFunction::And, qb::ScalarFunction::Sub, qb::ScalarFunction::Div,
+        qb::ScalarFunction::Ne, qb::ScalarFunction::Gt, qb::ScalarFunction::IsNotNull],
     allow_distinct: False,
 };
-def payload: edsl::PreparedPayload = edsl::build_root("pair-rank-v1", [Device.type, Sample.type], profile);
+def payload: edsl::PreparedPayload = edsl::build_root("pair-rank-v2", [Device.type, Sample.type, CompositeDevice.type, CompositeSample.type], profile);
 def lower: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
 
 def graph: Fn(String, String, Int, Int) -> Value = fn(node, measure, start, end) {
     json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"\{node}","entity":"sample"}],
-        "edges":[{"relation":"sample_device","from":"\{node}","to":"d"}],"select":[{"node":"d","dimension":"name"}],
+        "edges":[{"relation":"sample_device","from":"\{node}","to":"d"}],"select":[],
         "group_by_identity":["d"],"measures":[{"node":"\{node}","measure":"\{measure}"}],
         "time_windows":[{"node":"\{node}","dimension":"time","start":\{start},"end":\{end}}]}`).unwrap!()
 };
 def rank: Fn(String, Int) -> Value = fn(direction, take) {
-    json::parse(`{"op":"Subtract","direction":"\{direction}","take":\{take}}`).unwrap!()
+    json::parse(`{"op":"Subtract","minuend":"Right","subtrahend":"Left","direction":"\{direction}","take":\{take}}`).unwrap!()
 };
 def pair: Fn(String, String, Value) -> Value = fn(left, right, ranking) {
     Value::Object({op: Value::String("GraphPair"), left: graph("prev", left, 0, 10),
-        right: graph("curr", right, 10, 20), rank_by: ranking})
+        right: graph("curr", right, 10, 20), rank_by: ranking,
+        align_by: json::parse(r#"[{"left":{"node":"d"},"right":{"node":"d"}}]"#).unwrap!(),
+        select: json::parse(r#"[{"side":"Left","node":"d","dimension":"name"}]"#).unwrap!()})
 };
 def patch: Fn(Value, Dict(Value)) -> Value = fn(value, changes) {
     match value { Value::Object(fields) => Value::Object(dict::merge(fields, changes)), _ => fail!("expected object", value) }
@@ -93,7 +127,8 @@ pub def rank_is_bound_and_uses_right_minus_left_in_both_dialects: test::Test = t
         && pg.bindings == sq.bindings
         && string::contains(sq.sql, "CAST(__q_right.curr_usage AS REAL) - CAST(__q_left.prev_usage AS REAL)")
         && string::contains(sq.sql, "__q_left.prev_usage IS NOT NULL AND __q_right.curr_usage IS NOT NULL")
-        && string::contains(sq.sql, "DESC, __q_left.__q_key_1 ASC NULLS FIRST")
+        && string::contains(sq.sql, "DESC, __q_left.__q_key_0 ASC NULLS FIRST")
+        && !string::contains(sq.sql, "__q_key_1")
         && string::contains(sq.sql, "LIMIT ?5") && string::contains(pg.sql, "LIMIT $5")
         && string::contains(pg.sql, "AS DOUBLE PRECISION")
 });
@@ -118,9 +153,9 @@ pub def rank_rejects_excessive_take: test::Test = test::should_fail_with(fn() {
 pub def rank_rejects_count_groups: test::Test = test::should_fail_with(fn() {
     lower(patch(pair("usage", "usage", rank("Desc", 5)), {count_groups: Value::True}))
 }, "rank_by cannot be combined with count_groups");
-pub def rank_rejects_ratio: test::Test = test::should_fail_with(fn() {
-    lower(pair("usage", "usage", patch(rank("Desc", 5), {op: Value::String("Ratio")})))
-}, "supports only Subtract");
+pub def rank_rejects_unknown_operation: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", patch(rank("Desc", 5), {op: Value::String("Multiply")})))
+}, "supports Subtract, Ratio or GrowthRate");
 pub def rank_rejects_unknown_direction: test::Test = test::should_fail_with(fn() {
     lower(pair("usage", "usage", rank("Down", 5)))
 }, "direction must be Asc or Desc");
@@ -163,8 +198,115 @@ pub def rank_rejects_forged_group_count: test::Test = test::should_fail_with(fn(
     }
 }, "cannot rank or truncate groups");
 
+def comparison: Fn(String, String, String) -> Value = fn(op, first, second) {
+    if op == "Ratio" {
+        json::parse(`{"op":"Ratio","numerator":"\{first}","denominator":"\{second}","direction":"Desc","take":1000}`).unwrap!()
+    } else if op == "GrowthRate" {
+        json::parse(`{"op":"GrowthRate","current":"\{first}","baseline":"\{second}","direction":"Desc","take":1000}`).unwrap!()
+    } else {
+        json::parse(`{"op":"Subtract","minuend":"\{first}","subtrahend":"\{second}","direction":"Desc","take":1000}`).unwrap!()
+    }
+};
+pub def ratio_and_growth_render_guarded_floating_arithmetic: test::Test = test::should_ok(fn() {
+    let ratio = lower(pair("bytes", "bytes", comparison("Ratio", "Right", "Left")));
+    let growth = lower(pair("usage", "usage", comparison("GrowthRate", "Left", "Right")));
+    let sq = sqlite::build_query(ratio);
+    let pg = postgres::build_query(growth);
+    string::contains(sq.sql, "CAST(__q_right.curr_bytes AS REAL) / NULLIF(CAST(__q_left.prev_bytes AS REAL), 0)")
+        && string::contains(sq.sql, "AND __q_left.prev_bytes <> 0")
+        && string::contains(pg.sql, " / NULLIF(CAST(")
+        && string::contains(pg.sql, "AS DOUBLE PRECISION), 0)")
+        && string::contains(pg.sql, "\"curr_usage\" > 0")
+});
+pub def rank_rejects_same_side_operands: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", comparison("Ratio", "Left", "Left")))
+}, "must reference different sides");
+pub def rank_rejects_implicit_subtract_operands: test::Test = test::should_fail_with(fn() {
+    lower(pair("usage", "usage", json::parse(r#"{"op":"Subtract","direction":"Desc","take":5}"#).unwrap!()))
+}, "missing required field");
+pub def pair_rejects_implicit_alignment: test::Test = test::should_fail_with(fn() {
+    lower(json::parse(r#"{"op":"GraphPair","left":{},"right":{}}"#).unwrap!())
+}, "GraphPair migration");
+pub def pair_rejects_operand_display_columns: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        left: patch(graph("prev", "usage", 0, 10), {
+            select: json::parse(r#"[{"node":"d","dimension":"name"}]"#).unwrap!(),
+        }),
+    }))
+}, "move operand select");
+pub def pair_rejects_sample_display_columns: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        select: json::parse(r#"[{"side":"Right","node":"curr","dimension":"time"}]"#).unwrap!(),
+    }))
+}, "must belong to aligned identity nodes");
+pub def pair_rejects_duplicate_alignment: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        align_by: json::parse(r#"[{"left":{"node":"d"},"right":{"node":"d"}},{"left":{"node":"d"},"right":{"node":"d"}}]"#).unwrap!(),
+    }))
+}, "unique nodes");
+pub def pair_rejects_extra_group_identity: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        right: patch(graph("curr", "usage", 10, 20), {group_by_identity: json::parse(r#"["d","curr"]"#).unwrap!()}),
+    }))
+}, "must exactly match align_by");
+pub def pair_rejects_duplicate_output_aliases: test::Test = test::should_fail_with(fn() {
+    lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        select: json::parse(r#"[{"side":"Left","node":"d","dimension":"name"},{"side":"Left","node":"d","dimension":"name"}]"#).unwrap!(),
+    }))
+}, "unique projected non-key columns");
+pub def ratio_requires_division_authorization: test::Test = test::should_fail_with(fn() {
+    let restricted = edsl::build_root("restricted", [Device.type, Sample.type],
+        {...profile, allowed_scalars: array::filter(profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::Div })});
+    intent::query_intent_ast_factory(restricted)(pair("usage", "usage", comparison("Ratio", "Right", "Left")))
+}, "not authorized");
+
+# Simulate attributes resolved separately by each population; identities stay unchanged.
+def label_plan: Fn(qb::Plan, qb::Expr) -> qb::Plan = fn(plan, label) {
+    let original = match plan.projection[0] { qb::SelectItem::NamedExpr(named) => named.expr, _ => fail!("expected label") };
+    {...plan, projection: array::map(plan.projection, fn(item) { match item {
+        qb::SelectItem::NamedExpr(named) => if named.expr == original { qb::SelectItem::NamedExpr({...named, expr: label}) } else { item },
+        _ => item,
+    } }), grouping: array::map(plan.grouping, fn(expr) { if expr == original { label } else { expr } })}
+};
+def changed_labels: qb::Query = do {
+    let ast = lower(patch(pair("usage", "usage", rank("Desc", 5)), {
+        select: json::parse(r#"[{"side":"Right","node":"d","dimension":"name"},{"side":"Left","node":"d","dimension":"name"}]"#).unwrap!(),
+    }));
+    let old_label = qb::bind(ast.ctx, qb::Val::String("previous name"));
+    let new_label = qb::bind(old_label.0, qb::Val::String("current name"));
+    match ast.plan {
+        qb::QueryPlan::JoinedGroups(joined) => sqlite::build_query({...ast, ctx: new_label.0,
+            plan: qb::QueryPlan::JoinedGroups({...joined, left: label_plan(joined.left, old_label.1),
+                right: label_plan(joined.right, new_label.1)})}),
+        _ => fail!("expected joined groups"),
+    }
+};
+def composite_graph: Fn(String, Int) -> Value = fn(owner, phase) {
+    json::parse(`{"op":"Graph","root":"\{owner}","nodes":[{"id":"\{owner}","entity":"composite_device"},{"id":"s","entity":"composite_sample"}],
+        "edges":[{"relation":"composite_sample_device","from":"s","to":"\{owner}"}],"select":[],
+        "group_by_identity":["\{owner}"],"measures":[{"node":"s","measure":"composite_usage"}],
+        "filters":[{"node":"s","dimension":"composite_phase","op":"Eq","value":\{phase}}]}`).unwrap!()
+};
+def composite_pair: Value = Value::Object({op: Value::String("GraphPair"),
+    left: composite_graph("a", 1), right: composite_graph("z", 2),
+    align_by: json::parse(r#"[{"left":{"node":"a"},"right":{"node":"z"}}]"#).unwrap!(),
+    select: json::parse(r#"[{"side":"Right","node":"z","dimension":"composite_name"}]"#).unwrap!(),
+    rank_by: rank("Desc", 5)});
+pub def composite_alignment_keeps_complete_identity_without_display_keys: test::Test = test::should_ok(fn() {
+    let ast = lower(composite_pair);
+    match ast.plan {
+        qb::QueryPlan::JoinedGroups(joined) => array::length(joined.keys) == 2
+            && joined.left_identity == [qb::column(joined.left.sources[0], "id"), qb::column(joined.left.sources[0], "tenant")]
+            && joined.right_identity == [qb::column(joined.right.sources[0], "id"), qb::column(joined.right.sources[0], "tenant")]
+            && string::contains(postgres::build_query(ast).sql, "NULLS FIRST"),
+        _ => False,
+    }
+});
+
 def unranked: Value = Value::Object({op: Value::String("GraphPair"),
-    left: graph("prev", "usage", 0, 10), right: graph("curr", "usage", 10, 20)});
+    left: graph("prev", "usage", 0, 10), right: graph("curr", "usage", 10, 20),
+    align_by: json::parse(r#"[{"left":{"node":"d"},"right":{"node":"d"}}]"#).unwrap!(),
+    select: json::parse(r#"[{"side":"Left","node":"d","dimension":"name"}]"#).unwrap!()});
 pub def execution_queries: Value = codec::encode(array::concat([array::map([("Desc", 2), ("Asc", 2), ("Desc", 1000)], fn(spec) {
     sqlite::build_query(lower(pair("usage", "usage", rank(spec.0, spec.1))))
 }), [sqlite::build_query(lower(unranked)),
@@ -174,4 +316,11 @@ pub def execution_queries: Value = codec::encode(array::concat([array::map([("De
             measure_having: json::parse(r#"[{"node":"prev","measure":"usage","op":"Ge","value":20.0}]"#).unwrap!(),
         }),
     }))),
+    sqlite::build_query(lower(pair("usage", "usage", comparison("Ratio", "Right", "Left")))),
+    sqlite::build_query(lower(pair("usage", "usage", comparison("GrowthRate", "Right", "Left")))),
+    sqlite::build_query(lower(pair("usage", "usage", comparison("Ratio", "Left", "Right")))),
+    sqlite::build_query(lower(pair("usage", "usage", comparison("Subtract", "Left", "Right")))),
+    changed_labels,
+    sqlite::build_query(lower(pair("bytes", "bytes", comparison("Ratio", "Right", "Left")))),
+    sqlite::build_query(lower(composite_pair)),
 ]]));

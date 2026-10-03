@@ -211,8 +211,13 @@ type RawGraphExistEnvelope = struct {
     negated: Option(Value),
 };
 type RawCountThreshold = struct { op: String, value: Value };
-type RawGraphPair = struct { op: String, left: Value, right: Value, count_groups: Option(Value), rank_by: Option(Value) };
-type RawPairRank = struct { op: String, direction: String, take: Int };
+type RawGraphPair = struct { op: String, left: Value, right: Value, align_by: Option(Value), select: Option(Value), count_groups: Option(Value), rank_by: Option(Value) };
+type PairNode = struct { node: String };
+type PairAlignment = struct { left: PairNode, right: PairNode };
+type PairSelection = struct { side: qb::PairSide, node: String, dimension: String };
+type RawPairSubtract = struct { op: String, minuend: qb::PairSide, subtrahend: qb::PairSide, direction: String, take: Int };
+type RawPairRatio = struct { op: String, numerator: qb::PairSide, denominator: qb::PairSide, direction: String, take: Int };
+type RawPairGrowth = struct { op: String, baseline: qb::PairSide, current: qb::PairSide, direction: String, take: Int };
 type RawGraphUnion = struct { op: String, branches: Array(Value) };
 type RawUnionBranch = struct { result_node: String, graph: Value };
 type RawQueryRequest = struct { intents: Array(Value) };
@@ -442,21 +447,24 @@ def paired_graph_shape: Fn(edsl::GraphRequest) -> Bool = fn(request) {
         && array::length(request.order_by) == 0 && request.take == None
 };
 
-def paired_group_operand: Fn(qb::Plan) -> qb::Plan = fn(plan) {
-    let keys = array::map(array::enumerate(plan.grouping), fn(entry) {
+def paired_group_operand: Fn(qb::Plan, Array(qb::Expr)) -> qb::Plan = fn(plan, identity) {
+    let keys = array::map(array::enumerate(identity), fn(entry) {
         qb::named_expr_item(entry.1, `__q_key_\{entry.0}`)
     });
     {...plan, projection: array::concat([plan.projection, keys])}
 };
 
-def same_group_expr: Fn(qb::BuildCtx, qb::Expr, qb::Expr) -> Bool = fn(ctx, left, right) {
-    match (left, right) {
-        (qb::Expr::Column(a), qb::Expr::Column(b)) => a == b,
-        (qb::Expr::AllocatedBind(a), qb::Expr::AllocatedBind(b)) => ctx.bindings[a.index - 1] == ctx.bindings[b.index - 1],
-        (qb::Expr::Scalar(a), qb::Expr::Scalar(b)) => a.function == b.function
-            && array::length(a.args) == array::length(b.args)
-            && array::all(array::enumerate(a.args), fn(arg) { same_group_expr(ctx, arg.1, b.args[arg.0]) }),
-        _ => False,
+def pair_operand: Fn(Value, Array(PairSelection), qb::PairSide) -> Value = fn(value, selections, side) {
+    let obj = as_object(value);
+    if array::length(array_opt(obj, "select")) != 0 {
+        fail!("GraphPair migration: move operand select to outer select with an explicit side", value)
+    } else {
+        let selected = array::filter(selections, fn(item) { item.side == side });
+        let unique = array::fold(selected, [], fn(acc, item) {
+            let selection: edsl::GraphSelect = {node: item.node, dimension: item.dimension};
+            if array::any(acc, fn(existing) { existing == selection }) { acc } else { array::push(acc, selection) }
+        });
+        Value::Object(dict::merge(obj, {select: codec::encode(unique)}))
     }
 };
 
@@ -469,46 +477,70 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
         Some(Value::False) => False,
         Some(value) => fail!("aggregate pair count_groups must be boolean", value),
     };
-    let left = lower_graph_object(qb::build_context(), payload, raw.left);
-    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, raw.right);
+    let align = match raw.align_by {
+        Some(value) => decode_graph_shape@[Array(PairAlignment)](value, "syntax/graph_pair"),
+        None => fail!("GraphPair migration: supply explicit align_by and outer select with per-column side", value),
+    };
+    let selected = match raw.select {
+        Some(value) => decode_graph_shape@[Array(PairSelection)](value, "syntax/graph_pair"),
+        None => fail!("GraphPair migration: supply outer select (an empty array is allowed)", value),
+    };
+    let left_ids = array::map(align, fn(item) { item.left.node });
+    let right_ids = array::map(align, fn(item) { item.right.node });
+    if array::length(align) == 0 || !array::all(array::enumerate(align), fn(entry) {
+        array::length(array::filter(left_ids, fn(id) { id == entry.1.left.node })) == 1
+            && array::length(array::filter(right_ids, fn(id) { id == entry.1.right.node })) == 1
+    }) { fail!("aggregate pair align_by must contain unique nodes on each side", align) }
+    else if !array::all(selected, fn(item) {
+        array::any(if item.side == qb::PairSide::Left { left_ids } else { right_ids }, fn(id) { id == item.node })
+    }) { fail!("aggregate pair output dimensions must belong to aligned identity nodes", selected) }
+    else { () };
+    let left = lower_graph_object(qb::build_context(), payload, pair_operand(raw.left, selected, qb::PairSide::Left));
+    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, pair_operand(raw.right, selected, qb::PairSide::Right));
     if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
         fail!("aggregate pair operands each require one measure, grouping beginning with root identity, and no row ordering or count; qualify each population inside its own graph")
-    } else if left.1.root != right.1.root
-        || edsl::graph_node(left.1, left.1.root).entity != edsl::graph_node(right.1, right.1.root).entity {
-        fail!("aggregate pair roots must name the same entity instance on both sides", left.1.root, right.1.root)
-    } else if left.1.select != right.1.select {
-        fail!("aggregate pair operands must select the same dimensions in the same order", left.1.select, right.1.select)
-    } else if left.1.group_by_identity != right.1.group_by_identity
-        || !array::all(left.1.group_by_identity, fn(id) {
-            edsl::graph_node(left.1, id).entity == edsl::graph_node(right.1, id).entity
-        }) || !array::all(left.1.select, fn(item) {
-            edsl::graph_node(left.1, item.node).entity == edsl::graph_node(right.1, item.node).entity
-        }) {
-        fail!("aggregate pair operands must use the same node instance ids and entities for every grouped and selected node; align group_by_identity and node ids", left.1.group_by_identity, right.1.group_by_identity)
-    } else if array::length(left.2.grouping) != array::length(right.2.grouping)
-        || !array::all(array::enumerate(left.2.grouping), fn(group) {
-            same_group_expr(right.0, group.1, right.2.grouping[group.0])
-        }) {
-        fail!("aggregate pair operands must group by the same complete declared identities", left.1.group_by_identity)
+    } else if left.1.group_by_identity != left_ids || right.1.group_by_identity != right_ids {
+        fail!("aggregate pair group_by_identity must exactly match align_by on each side, beginning with the root", left_ids, right_ids)
+    } else if !array::all(align, fn(item) {
+        edsl::graph_node(left.1, item.left.node).entity == edsl::graph_node(right.1, item.right.node).entity
+    }) {
+        fail!("aggregate pair aligned nodes must belong to the same entity", align)
     } else {
-        let keys = array::map(array::enumerate(left.2.grouping), fn(entry) { `__q_key_\{entry.0}` });
-        let visible = array::flat_map(left.1.select, fn(item) {
+        let left_identity = edsl::graph_pair_identity(payload, left.1, left.2);
+        let right_identity = edsl::graph_pair_identity(payload, right.1, right.2);
+        let keys = array::map(array::enumerate(left_identity), fn(entry) { `__q_key_\{entry.0}` });
+        let visible = array::flat_map(selected, fn(item) {
             let alias = `\{item.node}_\{item.dimension}`;
-            if edsl::visible_dimension_detail(payload, item.dimension).half_open { [alias, `\{alias}__kind`] }
-            else { [alias] }
+            let prefix = if item.side == qb::PairSide::Left { "left" } else { "right" };
+            let columns = if edsl::visible_dimension_detail(payload, item.dimension).half_open { [alias, `\{alias}__kind`] } else { [alias] };
+            array::map(columns, fn(column) { {side: item.side, column, alias: `\{prefix}_\{column}`}.ty!(qb::JoinedGroupOutput) })
         });
         let left_measure = left.1.measures[0];
         let right_measure = right.1.measures[0];
         let ranked = match raw.rank_by {
             None => (right.0, None),
             Some(value) => {
-                let rank = decode_graph_shape@[RawPairRank](value, "syntax/graph_pair");
-                if rank.op != "Subtract" { fail!("aggregate pair rank supports only Subtract (right - left)", rank.op) }
+                let spec = match as_string(field(as_object(value), "op")) {
+                    "Subtract" => {
+                        let r = decode_graph_shape@[RawPairSubtract](value, "syntax/graph_pair");
+                        (qb::PairRankOp::Subtract, r.minuend, r.subtrahend, r.direction, r.take)
+                    },
+                    "Ratio" => {
+                        let r = decode_graph_shape@[RawPairRatio](value, "syntax/graph_pair");
+                        (qb::PairRankOp::Ratio, r.numerator, r.denominator, r.direction, r.take)
+                    },
+                    "GrowthRate" => {
+                        let r = decode_graph_shape@[RawPairGrowth](value, "syntax/graph_pair");
+                        (qb::PairRankOp::GrowthRate, r.current, r.baseline, r.direction, r.take)
+                    },
+                    other => fail!("aggregate pair rank supports Subtract, Ratio or GrowthRate with explicit sides", other),
+                };
+                if spec.1 == spec.2 { fail!("aggregate pair rank operands must reference different sides", value) }
                 else if count_groups { fail!("aggregate pair rank_by cannot be combined with count_groups", value) }
-                else if rank.take <= 0 || rank.take > qb::max_partition_take {
-                    fail!("aggregate pair rank take must be a positive integer within the cap", rank.take)
+                else if spec.4 <= 0 || spec.4 > qb::max_partition_take {
+                    fail!("aggregate pair rank take must be a positive integer within the cap", spec.4)
                 } else { () };
-                let direction = match rank.direction {
+                let direction = match spec.3 {
                     "Asc" => qb::Ordering::Asc, "Desc" => qb::Ordering::Desc,
                     other => fail!("aggregate pair rank direction must be Asc or Desc", other),
                 };
@@ -527,19 +559,26 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                 else { () };
                 if !array::all([qb::Operator::Order, qb::Operator::Limit, qb::Operator::Scalar, qb::Operator::Filter], fn(op) {
                     array::any(payload.profile.allowed_operators, fn(allowed) { allowed == op })
-                }) || !array::all([qb::ScalarFunction::Sub, qb::ScalarFunction::IsNotNull], fn(op) {
+                }) || !array::all(array::concat([[qb::ScalarFunction::IsNotNull], match spec.0 {
+                    qb::PairRankOp::Subtract => [qb::ScalarFunction::Sub],
+                    qb::PairRankOp::Ratio => [qb::ScalarFunction::Div, qb::ScalarFunction::Ne],
+                    qb::PairRankOp::GrowthRate => [qb::ScalarFunction::Sub, qb::ScalarFunction::Div, qb::ScalarFunction::Gt],
+                }]), fn(op) {
                     array::any(payload.profile.allowed_scalars, fn(allowed) { allowed == op })
                 }) { fail!("aggregate pair ranking is not authorized by the model query profile", value) }
                 else { () };
-                let bound = qb::take_bound(right.0, rank.take);
+                let bound = qb::take_bound(right.0, spec.4);
                 (bound.0, Some({left_measure: `\{left_measure.node}_\{left_measure.measure}`,
-                    right_measure: `\{right_measure.node}_\{right_measure.measure}`, direction, take: bound.1}.ty!(qb::JoinedGroupRank)))
+                    right_measure: `\{right_measure.node}_\{right_measure.measure}`, op: spec.0, first: spec.1, direction, take: bound.1}.ty!(qb::JoinedGroupRank)))
             },
         };
         let joined: qb::JoinedGroups = {
-            left: paired_group_operand(left.2), right: paired_group_operand(right.2), keys,
-            left_outputs: array::push(visible, `\{left_measure.node}_\{left_measure.measure}`),
-            right_outputs: [`\{right_measure.node}_\{right_measure.measure}`],
+            left: paired_group_operand(left.2, left_identity), right: paired_group_operand(right.2, right_identity), keys,
+            left_identity, right_identity,
+            outputs: array::concat([visible, [
+                {side: qb::PairSide::Left, column: `\{left_measure.node}_\{left_measure.measure}`, alias: `left_\{left_measure.node}_\{left_measure.measure}`},
+                {side: qb::PairSide::Right, column: `\{right_measure.node}_\{right_measure.measure}`, alias: `right_\{right_measure.node}_\{right_measure.measure}`},
+            ]]),
             rank: ranked.1,
         };
         let plan = if count_groups { qb::QueryPlan::JoinedGroupCount(joined) }

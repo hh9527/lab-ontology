@@ -65,6 +65,8 @@ type ScalarFunction = enum {
     If,
     Add,
     Sub,
+    # SQL division; pair ranking casts to double precision and guards zero.
+    Div,
     Lower,
     Length,
     UtcDaysAgo,
@@ -494,13 +496,17 @@ type Plan = struct {
 # Top-level result shape is part of the shared AST.  DISTINCT and set
 # operations cannot be inferred from a plain Plan's projection alone.
 type SetPlan = struct { kind: SetOpKind, operands: Array(Plan) };
-type JoinedGroupRank = struct { left_measure: String, right_measure: String, direction: Ordering, take: Expr };
+type PairSide = enum { Left, Right };
+type PairRankOp = enum { Subtract, Ratio, GrowthRate };
+type JoinedGroupOutput = struct { side: PairSide, column: String, alias: String };
+type JoinedGroupRank = struct { left_measure: String, right_measure: String, op: PairRankOp, first: PairSide, direction: Ordering, take: Expr };
 type JoinedGroups = struct {
     left: Plan,
     right: Plan,
     keys: Array(String),
-    left_outputs: Array(String),
-    right_outputs: Array(String),
+    left_identity: Array(Expr),
+    right_identity: Array(Expr),
+    outputs: Array(JoinedGroupOutput),
     rank: Option(JoinedGroupRank),
 };
 type QueryPlan = enum {
@@ -992,6 +998,7 @@ def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args
         ScalarFunction::If => len == 3,
         ScalarFunction::Add => len == 2,
         ScalarFunction::Sub => len == 2,
+        ScalarFunction::Div => len == 2,
         ScalarFunction::Lower => len == 1,
         ScalarFunction::Length => len == 1,
         ScalarFunction::UtcDaysAgo => len == 2,
@@ -2866,10 +2873,10 @@ def validate_joined_groups: Fn(JoinedGroups) -> JoinedGroups = fn(joined) {
             _ => "",
         }
     });
-    let outputs = array::concat([joined.left_outputs, joined.right_outputs]);
+    let outputs = array::map(joined.outputs, fn(item) { item.alias });
     if array::length(joined.keys) == 0 || array::length(outputs) == 0
-        || array::length(joined.keys) != array::length(left.grouping)
-        || array::length(joined.keys) != array::length(right.grouping)
+        || array::length(joined.keys) != array::length(joined.left_identity)
+        || array::length(joined.keys) != array::length(joined.right_identity)
         || !set_operand_embeddable(left) || !set_operand_embeddable(right) {
         fail!("joined groups require grouped, embeddable operands, identity keys and visible outputs")
     } else if !array::all(array::enumerate(joined.keys), fn(entry) {
@@ -2878,11 +2885,15 @@ def validate_joined_groups: Fn(JoinedGroups) -> JoinedGroups = fn(joined) {
             && count_in(left_names, key) == 1 && count_in(right_names, key) == 1
             && array::length(array::filter(joined.keys, fn(other) { other == key })) == 1
             && array::any(left.projection, fn(item) { match item {
-                SelectItem::NamedExpr(named) => named.alias == key && named.expr == left.grouping[entry.0],
+                SelectItem::NamedExpr(named) => named.alias == key && named.expr == joined.left_identity[entry.0]
+                    && array::any(left.grouping, fn(expr) { expr == named.expr })
+                    && match named.expr { Expr::Column(_) => True, _ => False },
                 _ => False,
             } })
             && array::any(right.projection, fn(item) { match item {
-                SelectItem::NamedExpr(named) => named.alias == key && named.expr == right.grouping[entry.0],
+                SelectItem::NamedExpr(named) => named.alias == key && named.expr == joined.right_identity[entry.0]
+                    && array::any(right.grouping, fn(expr) { expr == named.expr })
+                    && match named.expr { Expr::Column(_) => True, _ => False },
                 _ => False,
             } })
     }) { fail!("joined groups require uniquely projected grouping identity columns on both operands", joined.keys) }
@@ -2890,14 +2901,16 @@ def validate_joined_groups: Fn(JoinedGroups) -> JoinedGroups = fn(joined) {
         is_sql_identifier(name)
             && array::length(array::filter(outputs, fn(other) { other == name })) == 1
             && !array::any(joined.keys, fn(key) { key == name })
-    }) || !array::all(joined.left_outputs, fn(name) { count_in(left_names, name) == 1 })
-        || !array::all(joined.right_outputs, fn(name) { count_in(right_names, name) == 1 }) {
+    }) || !array::all(joined.outputs, fn(item) {
+        is_sql_identifier(item.column) && !array::any(joined.keys, fn(key) { key == item.column })
+            && count_in(match item.side { PairSide::Left => left_names, PairSide::Right => right_names }, item.column) == 1
+    }) {
         fail!("joined groups output must name unique projected non-key columns on its operand")
     } else if match joined.rank {
         None => False,
         Some(rank) => !page_value_ok(rank.take, True)
-            || !array::any(joined.left_outputs, fn(name) { name == rank.left_measure })
-            || !array::any(joined.right_outputs, fn(name) { name == rank.right_measure })
+            || !array::any(joined.outputs, fn(item) { item.side == PairSide::Left && item.column == rank.left_measure })
+            || !array::any(joined.outputs, fn(item) { item.side == PairSide::Right && item.column == rank.right_measure })
             || !array::any(left.projection, fn(item) { match item {
                 SelectItem::Aggregate(call) => call.alias == rank.left_measure,
                 SelectItem::Computed(call) => call.alias == rank.left_measure,
@@ -3461,6 +3474,9 @@ pub use self::{
     SetPlan,
     JoinedGroups,
     JoinedGroupRank,
+    JoinedGroupOutput,
+    PairSide,
+    PairRankOp,
     QueryPlan,
     QueryAst,
     finish,

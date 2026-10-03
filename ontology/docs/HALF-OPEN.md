@@ -66,8 +66,9 @@ Both columns participate in grouping and row DISTINCT. Known aliases collapse
 to one concept; unknowns group by original wire. Selecting a half-open domain
 does not add a closed-domain guard, so unknown and missing rows remain present.
 Consumers must retain the kind column to interpret the value correctly.
-GraphPair retains the kind column and compares both grouping components;
-missing-value groups on its two sides align using NULL-safe equality.
+GraphPair retains each selected side's kind column as display payload.
+Alignment compares explicitly aligned complete identities using NULL-safe
+equality; display value and kind never become identity keys.
 
 `count_value` counts distinct known IDs plus distinct unknown raw strings.
 NULL contributes to neither count. The two counts are internal aggregate

@@ -11,24 +11,33 @@ const reader = createInterface({ input: child.stdout });
 const lines = reader[Symbol.asyncIterator]();
 const deadline = setTimeout(() => child.kill(), 60000);
 const db = new DatabaseSync(':memory:');
-try {
-  const graph = (node, start, end) => ({ op: 'Graph', root: 'd',
-    nodes: [{ id: 'd', entity: 'device' }, { id: node, entity: 'device_kpi' }],
-    edges: [{ relation: 'device_kpi_of_device', from: node, to: 'd' }],
-    select: [{ node: 'd', dimension: 'device_name' }], group_by_identity: ['d'],
-    measures: [{ node, measure: 'cpu_usage' }],
-    time_windows: [{ node, dimension: 'device_kpi_ts_raw', start, end }] });
-  const intent = { op: 'GraphPair',
-    left: graph('prev', '2026-09-14T00:00:00Z', '2026-09-21T00:00:00Z'),
-    right: graph('curr', '2026-09-21T00:00:00Z', '2026-09-28T00:00:00Z'),
-    rank_by: { op: 'Subtract', direction: 'Desc', take: 5 } };
-  child.stdin.write(JSON.stringify({ method: 'ic/transform', input: { intents: [intent] } }) + '\n');
+async function call(method, input) {
+  child.stdin.write(JSON.stringify({ method, input }) + '\n');
   const line = await lines.next();
   assert.equal(line.done, false);
   const response = JSON.parse(line.value);
   assert.equal(response.error, false, JSON.stringify(response.diagnostics));
-  assert.equal(response.ok.accepted, true, JSON.stringify(response.ok.diagnostics));
-  const query = response.ok.queries[0];
+  return response.ok;
+}
+async function transform(intent) {
+  const result = await call('ic/transform', { intents: [intent] });
+  assert.equal(result.accepted, true, JSON.stringify(result.diagnostics));
+  return result.queries[0];
+}
+try {
+  const graph = (node, start, end) => ({ op: 'Graph', root: 'd',
+    nodes: [{ id: 'd', entity: 'device' }, { id: node, entity: 'device_kpi' }],
+    edges: [{ relation: 'device_kpi_of_device', from: node, to: 'd' }],
+    select: [], group_by_identity: ['d'],
+    measures: [{ node, measure: 'cpu_usage' }],
+    time_windows: [{ node, dimension: 'device_kpi_ts_raw', start, end }] });
+  const intent = { op: 'GraphPair',
+    align_by: [{ left: { node: 'd' }, right: { node: 'd' } }],
+    select: [{ side: 'Right', node: 'd', dimension: 'device_name' }],
+    left: graph('prev', '2026-09-14T00:00:00Z', '2026-09-21T00:00:00Z'),
+    right: graph('curr', '2026-09-21T00:00:00Z', '2026-09-28T00:00:00Z'),
+    rank_by: { op: 'Subtract', minuend: 'Right', subtrahend: 'Left', direction: 'Desc', take: 5 } };
+  const query = await transform(intent);
   db.exec('CREATE TABLE I_EntNetworkElement(id TEXT, name TEXT); CREATE TABLE NetworkDeviceKPI(resId TEXT, ts TEXT, cpuUsage REAL)');
   const device = db.prepare('INSERT INTO I_EntNetworkElement VALUES (?, ?)');
   const sample = db.prepare('INSERT INTO NetworkDeviceKPI VALUES (?, ?, ?)');
@@ -38,9 +47,32 @@ try {
     sample.run(`d${i}`, '2026-09-22T00:00:00Z', 10 + i);
   }
   const rows = db.prepare(query.sql).all(...query.bindings);
-  assert.deepEqual(rows.map(row => row.curr_cpu_usage), [16, 15, 14, 13, 12]);
-  assert.ok(rows.every(row => row.prev_cpu_usage === 10 && Object.keys(row).length === 3));
-  console.log('iCloud snapshot GraphPair CPU increase Top-5 passed');
+  assert.deepEqual(rows.map(row => row.right_curr_cpu_usage), [16, 15, 14, 13, 12]);
+  assert.ok(rows.every(row => row.left_prev_cpu_usage === 10 && Object.keys(row).length === 3));
+  for (const rank_by of [
+    { op: 'Ratio', numerator: 'Right', denominator: 'Left', direction: 'Desc', take: 5 },
+    { op: 'GrowthRate', current: 'Right', baseline: 'Left', direction: 'Desc', take: 5 },
+  ]) {
+    const query = await transform({ ...intent, rank_by });
+    assert.deepEqual(db.prepare(query.sql).all(...query.bindings).map(row => row.right_curr_cpu_usage),
+      [16, 15, 14, 13, 12], rank_by.op);
+  }
+  const inverse = await transform({ ...intent,
+    select: [{ side: 'Right', node: 'd', dimension: 'device_name' },
+      { side: 'Left', node: 'd', dimension: 'device_name' }],
+    rank_by: { op: 'Ratio', numerator: 'Left', denominator: 'Right', direction: 'Desc', take: 5 } });
+  const inverseRows = db.prepare(inverse.sql).all(...inverse.bindings);
+  assert.deepEqual(inverseRows.map(row => row.right_curr_cpu_usage), [10, 11, 12, 13, 14]);
+  assert.deepEqual(Object.keys(inverseRows[0]),
+    ['right_d_device_name', 'left_d_device_name', 'left_prev_cpu_usage', 'right_curr_cpu_usage']);
+  const legacy = { ...intent };
+  delete legacy.align_by;
+  const rejected = await call('ic/transform', { intents: [legacy] });
+  assert.equal(rejected.accepted, false);
+  assert.ok(JSON.stringify(rejected.diagnostics).includes('GraphPair migration'));
+  const contract = JSON.stringify(await call('ic/info', { key: 'Schema/syntax/graph_pair' }));
+  assert.ok(contract.includes('align_by') && contract.includes('GrowthRate') && contract.includes('subtrahend'));
+  console.log('iCloud snapshot GraphPair passed: CPU Top-5, Ratio/GrowthRate, reversed operands, per-column sides, migration diagnostics and discoverable contract');
 } finally {
   db.close();
   child.stdin.end();
