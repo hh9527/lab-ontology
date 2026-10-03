@@ -20,6 +20,9 @@ try {
   assert.ok(first.checks.relations.every(relation => relation.pairs > 0 && !relation.upperBoundExceeded));
   assert.deepEqual(first.checks.emptyCarriers, []);
   assert.deepEqual(first.checks.invalidEnums, []);
+  assert.deepEqual(first.checks.missingCpuSeries, []);
+  assert.deepEqual(first.checks.alarmsWithoutCpuSamples, []);
+  assert.equal(first.checks.unsupportedAlarmCpuResources.length, 2);
   db = new DatabaseSync(join(directory, 'first/icloud.sqlite'));
   const catalog = JSON.parse(readFileSync(new URL('../../icloud_model/data/source_catalog.json', import.meta.url)));
   for (const dataset of catalog.datasets) {
@@ -27,6 +30,11 @@ try {
   }
   assert.equal(db.prepare('SELECT count(*) n FROM NetworkDeviceKPI WHERE ts >= ? AND ts < ?').get(first.window.start, first.window.endExclusive).n, 12 * 48);
   assert.equal(db.prepare('SELECT max(ts) t FROM NetworkDeviceKPI').get().t, '2026-10-03T11:00:00Z');
+  for (const family of ['HuaweiStorageDevice', 'FCSwitchDevice']) {
+    const populations = db.prepare(`SELECT d.id, count(k.ts) n FROM ${family} d LEFT JOIN StorageDeviceKPI k ON k.resId=d.id GROUP BY d.id`).all();
+    assert.equal(populations.length, 12);
+    assert.ok(populations.every(row => row.n === 48), `${family}: every resource needs a complete series`);
+  }
   assert.ok(db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE resId=? AND ts<?').get('I_EntNetworkElement-0001', '2026-10-02T12:00:00Z').value
     < db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE resId=? AND ts>=?').get('I_EntNetworkElement-0001', '2026-10-02T12:00:00Z').value);
   assert.throws(() => db.exec('INSERT INTO NetworkDeviceKPI SELECT * FROM NetworkDeviceKPI LIMIT 1'), /UNIQUE/);
@@ -41,6 +49,10 @@ try {
   const invalid = validate(db, model, first.tables);
   assert.ok(invalid.invalidTimes.length > 0);
   assert.ok(invalid.invalidEnums.length > 0);
+  db.exec("UPDATE StorageDeviceKPI SET resId='missing-owner' WHERE resId='FCSwitchDevice-0005'");
+  const missing = validate(db, model, first.tables);
+  assert.ok(missing.missingCpuSeries.some(row => row.id === 'FCSwitchDevice-0005'));
+  assert.ok(missing.alarmsWithoutCpuSamples.some(row => row.MEDN === 'FCSwitchDevice-0005'));
   console.log('Passed: deterministic database, 48 tables/822 columns, all carriers/relations, UTC windows, trends, grains, validation and failed publication');
 } finally {
   db?.close();

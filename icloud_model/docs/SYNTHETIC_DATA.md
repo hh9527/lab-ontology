@@ -86,5 +86,12 @@ The first command tests reproducibility, complete field/carrier/relation
 coverage, time windows, trends, unique grains, invalid value detection and
 failed publication. The second requires `bin/icloud_model.snapshot.wasm` and
 executes snapshot-generated SQLite queries for all 17 KPI windows, ONU/OLT
-scopes and CPU GrowthRate Top-5. A snapshot path can be passed as its second
+scopes, five resource families' CPU averages and CPU GrowthRate Top-5. A snapshot path can be passed as its second
 argument.
+
+StorageDeviceKPI contains a complete series for every storage device and every
+FC switch, so it has twice the base series count. Publication verifies that
+all five CPU-capable resource families have series and that their alarm-linked
+resources have samples on the alarm UTC day. Collaboration-device alarms are
+reported separately as having no declared CPU source. Alarm occurrence times
+are chosen within the generated sample window, including historical anchors.

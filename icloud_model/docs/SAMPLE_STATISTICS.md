@@ -1,7 +1,7 @@
 # Source-backed sample statistics
 
-This describes the current product Model (`icloud-source-v5`), not the historical
-pressure fixture. Agents discover these declarations through `ic/info`; this
+This describes the product Model (`icloud-source-v8`).
+Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 
 ## Choosing a statistical meaning
@@ -17,6 +17,7 @@ Online-rate regression commands (after publishing the current IC snapshot):
 ```sh
 bin/telora -C icloud_model test online_rate --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048
 node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
+node scripts/check-icloud-cpu.mjs bin/icloud_model.snapshot.wasm
 ```
 
 | Population | Raw dimension | Average | Maximum sample | Minimum sample |
@@ -29,6 +30,8 @@ node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
 | PON online-rate table | `source_PonDeviceOnlineKPI__onlineRate` | `pon_online_table_rate_avg` | `pon_online_table_rate_max` | `pon_online_table_rate_min` |
 | Server CPU | `server_cpu_sample` | `server_cpu_usage` | `server_cpu_peak` | `server_cpu_sample_min` |
 | Server memory | `server_memory_sample` | `server_memory_usage` | `server_memory_sample_max` | `server_memory_sample_min` |
+| Storage / FC CPU | `source_StorageDeviceKPI__cpuusage` | `storage_cpu_usage` | `storage_cpu_sample_max` | `storage_cpu_sample_min` |
+| PON CPU | `source_PonDeviceKPI__cpuUsage` | `pon_cpu_usage` | `pon_cpu_sample_max` | `pon_cpu_sample_min` |
 | Device port usage | `device_kpi__ifUtilizationRate` | `device_port_usage_avg` | `device_port_usage_max` | `device_port_usage_min` |
 | Interface inbound bandwidth | `interface_kpi__ifInBandRate` | `interface_in_band_usage_avg` | `interface_in_band_usage_max` | `interface_in_band_usage_min` |
 | Interface outbound bandwidth | `interface_kpi__ifOutBandRate` | `interface_out_band_usage_avg` | `interface_out_band_usage_max` | `interface_out_band_usage_min` |
@@ -36,6 +39,14 @@ node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
 | PON port receive bandwidth | `pon_port_receive_sample` | `pon_port_receive_usage` | `pon_port_receive_sample_max` | `pon_port_receive_sample_min` |
 
 - A trend projects raw samples and sample timestamps, without aggregation.
+- Storage/FC and PON CPU use eligible stored samples. Avg is the arithmetic
+  mean, Min/Max are sample extrema; NULL is ignored and an all-NULL population
+  has no value. There is no time weighting, effective-count weighting, inferred
+  validity filter or rescaling. The unit is assumed to be `%`;
+  TODO(#47): confirm it against source metadata. Storage and FC share the KPI
+  table but use their own declared resource relations and populations.
+- Collaboration devices have no declared CPU sample source. CPU questions for
+  this resource family are unsupported; missing CPU is not zero.
 - Online-rate averages preserve the reported numeric scale and average eligible
   non-NULL stored rows. They are neither time-weighted nor weighted by
   `onlineRateEffcnt`; all-NULL groups have no average. Source descriptions do not

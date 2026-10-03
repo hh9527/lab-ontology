@@ -43,6 +43,23 @@ try {
   }
   const start = manifest.window.start;
   const end = manifest.window.endExclusive;
+  const cpuCases = [
+    ['device', 'device_kpi', 'device_kpi_of_device', true, 'cpu_usage', 'cpuUsage', 'device_kpi_ts_raw'],
+    ['server_device', 'server_kpi', 'server_kpi_of_server', true, 'server_cpu_usage', 'cpuUsage', 'server_kpi_ts_raw'],
+    ['storage_device', 'source_StorageDeviceKPI', 'source_HuaweiStorageDeviceAssociationStorageDeviceKPI', false, 'storage_cpu_usage', 'cpuusage', 'source_StorageDeviceKPI__ts'],
+    ['source_FCSwitchDevice', 'source_StorageDeviceKPI', 'source_FCSwitchDevice_StorageDeviceKPI', false, 'storage_cpu_usage', 'cpuusage', 'source_StorageDeviceKPI__ts'],
+    ['pon_device', 'source_PonDeviceKPI', 'source_EntPonElementAssociationPonDeviceKPI', false, 'pon_cpu_usage', 'cpuUsage', 'source_PonDeviceKPI__ts'],
+  ];
+  for (const [owner, entity, relation, reverse, measure, column, time] of cpuCases) {
+    const ownerTable = model.datasets.find(dataset => dataset.id === owner).table;
+    const metricTable = model.datasets.find(dataset => dataset.id === entity).table;
+    const rows = await query({ op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
+      edges: [{ relation, from: reverse ? 'k' : 'd', to: reverse ? 'd' : 'k' }], select: [], group_by_identity: ['d'],
+      measures: [{ node: 'k', measure }], time_windows: [{ node: 'k', dimension: time, start, end }] });
+    const expected = db.prepare(`SELECT avg(k."${column}") value FROM "${ownerTable}" d JOIN "${metricTable}" k ON k.resId=d.id WHERE k.ts>=? AND k.ts<? GROUP BY d.id`).all(start, end);
+    assert.equal(expected.length, manifest.tables[ownerTable], `${owner}: all resources need CPU samples`);
+    assert.deepEqual(rows.map(row => row[`k_${measure}`]).sort((a, b) => a - b), expected.map(row => row.value).sort((a, b) => a - b), owner);
+  }
   const middle = new Date(Date.parse(start) + Math.floor((Date.parse(end) - Date.parse(start)) / 2000) * 1000).toISOString().replace('.000Z', 'Z');
   const graph = (node, start, end) => ({ op: 'Graph', root: 'd',
     nodes: [{ id: 'd', entity: 'device' }, { id: node, entity: 'device_kpi' }],
@@ -56,7 +73,7 @@ try {
   assert.ok(rows[0].right_curr_cpu_usage > rows[0].left_prev_cpu_usage);
   const rates = rows.map(row => (row.right_curr_cpu_usage - row.left_prev_cpu_usage) / row.left_prev_cpu_usage);
   assert.deepEqual(rates, rates.toSorted((a, b) => b - a));
-  console.log('Passed snapshot queries: all 17 KPI windows, ONU/OLT scopes, CPU GrowthRate Top-5');
+  console.log('Passed snapshot queries: all 17 KPI windows, ONU/OLT scopes, five resource CPU averages, CPU GrowthRate Top-5');
 } finally {
   db.close();
   child.stdin.end();

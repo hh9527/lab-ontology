@@ -48,7 +48,7 @@ export function generate(options, model = loadModel()) {
   const interval = intervalMinutes * 60000;
   const samples = Math.ceil(days * 86400000 / interval);
   if (resources < 6) throw new Error('resources must be at least 6 to cover PON and polymorphic scenarios');
-  if (samples * resources * 17 > 10000000) throw new Error('Requested data exceeds 10 million KPI rows');
+  if (samples * resources * 18 > 10000000) throw new Error('Requested data exceeds 10 million KPI rows');
   if (existsSync(output)) throw new Error(`Output already exists: ${output}`);
   const catalogBytes = readFileSync(join(root, 'icloud_model/data/source_catalog.json'));
   const catalog = JSON.parse(catalogBytes);
@@ -147,8 +147,13 @@ export function generate(options, model = loadModel()) {
   for (const [table, dataset] of tables) if (dataset.fields.some(field => field.column === 'ts')) {
     const ownerTable = ownerTables[table] ?? (table.startsWith('Pon') ? 'I_EntPonElement' : 'I_EntNetworkElement');
     const owners = rows.get(ownerTable);
+    if (table === 'StorageDeviceKPI') {
+      const base = rows.get(table);
+      rows.set(table, [...owners, ...rows.get('FCSwitchDevice')].map((owner, index) => ({ ...base[index % base.length], resId: owner.id })));
+    }
     rows.get(table).forEach((row, index) => {
-      const owner = table === 'StorageDeviceKPI' && index % 2 ? rows.get('FCSwitchDevice')[index] : owners[index];
+      const owner = table === 'StorageDeviceKPI'
+        ? (index < owners.length ? owners[index] : rows.get('FCSwitchDevice')[index - owners.length]) : owners[index];
       if (table === 'PonDeviceOnuKPI') {
         const onus = pon.filter(entry => entry.classification === 'ne.category.pon.onu');
         const onu = onus[index % onus.length];
@@ -180,7 +185,8 @@ export function generate(options, model = loadModel()) {
     row.SEVERITY = index % 4 + 1;
     row.ACKED = index % 2;
     row.CLEARED = index % 3 === 0 ? 1 : 0;
-    const occur = anchorMs - (index + 1) * 3600000;
+    const recentSamples = Math.max(1, Math.min(samples, Math.floor(45 * 86400000 / interval)));
+    const occur = anchorMs - days * 86400000 + (samples - 1 - index % recentSamples) * interval;
     for (const column of ['OCCURUTC', 'OCCURTIME', 'LATESTOCCURUTC', 'LATESTOCCURTIME']) row[column] = occur;
     row.ARRIVEUTC = occur + 1000;
     row.ACKUTC = row.ACKED ? occur + 60000 : 0;
@@ -252,7 +258,7 @@ export function generate(options, model = loadModel()) {
     for (const [table, dataset] of tables) if (dataset.fields.some(field => field.column === 'ts')) index(table, ['ts']);
     db.exec('COMMIT; ANALYZE');
     const checks = validate(db, model, counts);
-    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
+    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
     db.close();
     db = undefined;
     const manifest = {
@@ -304,7 +310,22 @@ function relationSQL(key) {
 
 export function validate(db, model, counts) {
   const checks = { integrity: db.prepare('PRAGMA integrity_check').get().integrity_check,
-    emptyTables: [], emptyCarriers: [], invalidTimes: [], invalidEnums: [], relations: [] };
+    emptyTables: [], emptyCarriers: [], invalidTimes: [], invalidEnums: [], relations: [],
+    missingCpuSeries: [], alarmsWithoutCpuSamples: [], unsupportedAlarmCpuResources: [] };
+  const cpuSources = {
+    I_EntNetworkElement: 'NetworkDeviceKPI', PhysicalServer: 'ServerDeviceKPI',
+    HuaweiStorageDevice: 'StorageDeviceKPI', FCSwitchDevice: 'StorageDeviceKPI', I_EntPonElement: 'PonDeviceKPI',
+  };
+  for (const [resource, metric] of Object.entries(cpuSources)) {
+    const missing = db.prepare(`SELECT r.id FROM ${quote(resource)} r WHERE NOT EXISTS (SELECT 1 FROM ${quote(metric)} k WHERE k.resId=r.id)`).all();
+    checks.missingCpuSeries.push(...missing.map(row => ({ resource, id: row.id, metric })));
+    const missingAlarms = db.prepare(`SELECT a.CSN, a.MEDN FROM T_CURRENT_ALARM a JOIN ${quote(resource)} r ON a.MEDN=r.id
+      WHERE NOT EXISTS (SELECT 1 FROM ${quote(metric)} k WHERE k.resId=r.id AND k.ts >= strftime('%Y-%m-%dT00:00:00Z', a.OCCURUTC / 1000, 'unixepoch')
+        AND k.ts < strftime('%Y-%m-%dT00:00:00Z', a.OCCURUTC / 1000, 'unixepoch', '+1 day'))`).all();
+    checks.alarmsWithoutCpuSamples.push(...missingAlarms.map(row => ({ resource, ...row, metric })));
+  }
+  checks.unsupportedAlarmCpuResources = db.prepare('SELECT a.CSN, a.MEDN FROM T_CURRENT_ALARM a JOIN I_EntCollaborationElement r ON a.MEDN=r.id').all()
+    .map(row => ({ resource: 'I_EntCollaborationElement', ...row, reason: 'No declared CPU sample source' }));
   for (const [table, expected] of Object.entries(counts)) {
     const actual = db.prepare(`SELECT count(*) AS n FROM ${quote(table)}`).get().n;
     if (actual !== expected) throw new Error(`Row count mismatch: ${table}`);
