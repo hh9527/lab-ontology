@@ -44,7 +44,7 @@ that disagree with the DatetimeUtc/Rfc3339Text contract fail the audit.
 The source catalog and the compiled Prepared Model are compared; the report
 does not infer a runtime logical type from a field name or physical SQL type.
 
-Knowledge traversal is field/dimension -> DataType -> operation. TimeWindow
+Knowledge traversal is field/dimension -> Ty -> operation. TimeWindow
 is a shared operation contract for all supported temporal types; `[start,end)`
 and a null/omitted upper bound are not the `half_open` canonical-value feature.
 Day/week/month bounds are resolved outside the service, then bound unchanged.

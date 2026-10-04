@@ -149,8 +149,8 @@ For example, a Dn key and an Id key require the same declared business type to
 connect. No implicit type conversion is performed. Types with different storage
 encodings remain distinct even when their member names coincide.
 
-Knowledge publishes `Type/{type}` and `Value/{type}/{value}`. Type documents
+Knowledge publishes `Ty/{ty}` and `Value/{ty}/{value}`. Type documents
 contain `storage`, `half_open`, `canonical_order` and a single `values` array;
 each member carries its id, label, aliases, localized labels and physical wires.
-Dimensions explicitly publish `type_id` and dataset ownership. The independent
+Dimensions explicitly publish `ty` and dataset ownership. The independent
 `links` export lets consumers discover dimensions referencing a type.

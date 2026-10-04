@@ -11,7 +11,7 @@ test('organizes directly referenced fields by semantic dataset ownership', () =>
   const nodes = [
     node('Dataset/a%20b', 'Dataset', { id: 'a', grain: ['f'] }, [{ key: 'opaque-field', type: 'Member' }]),
     node('opaque-field', 'Field', { dataset: 'a', id: 'f', logical_type: 'Int' }, [{ key: 'Dataset/a%20b', type: 'Member' }]),
-    node('DataType/Int', 'DataType', { id: 'Int', operations: ['Eq', 'Ne'] }),
+    node('Ty/Int', 'Ty', { id: 'Int', operations: ['Eq', 'Ne'] }),
   ];
   const md = renderMarkdown(nodes, {});
   assert(!md.includes('Directory/'));
@@ -19,10 +19,10 @@ test('organizes directly referenced fields by semantic dataset ownership', () =>
   assert(md.includes('### Dataset/a%20b/fields'));
   assert(md.includes('#### opaque-field'));
   assert(md.includes('[f](#opaque-field)'));
-  assert(md.includes('[Int](#DataType/Int)'));
+  assert(md.includes('[Int](#Ty/Int)'));
   assert(md.includes('](#Dataset/a%20b)'));
   assert(!md.includes('%2520'));
-  assert(md.indexOf('#### opaque-field') < md.indexOf('# DataType'));
+  assert(md.indexOf('#### opaque-field') < md.indexOf('# Ty'));
   const anchors = new Set([...md.matchAll(/<a id="([^"]+)"><\/a>/g)].map(match => match[1]));
   for (const match of md.matchAll(/\]\(#([^\n]+?)\)/g)) assert(anchors.has(match[1]), match[1]);
 });
@@ -69,8 +69,8 @@ test('renders association kinds as direct references without a links wrapper', (
 
 test('links nested type documentation, prose, vocabulary entries, values and computed dependencies', () => {
   const source = node('Dimension/a/status', 'Dimension', {
-    dataset: 'a', id: 'status', type_id: 'status',
-    input_docs: [{ kind: 'DatetimeUtc', text: 'Use DatetimeUtc, not DatetimeUtcExtra; see DataType/DatetimeUtc.' }],
+    dataset: 'a', id: 'status', ty: 'status',
+    input_docs: [{ kind: 'DatetimeUtc', text: 'Use DatetimeUtc, not DatetimeUtcExtra; see Ty/DatetimeUtc.' }],
     values: [{ id: 'ready', label: 'Ready' }], canonical_order: ['ready'],
     sampling: { id: 'count', field: 'status' }, computed: { left: 'count', right: 'count', op: 'Add' },
   });
@@ -79,18 +79,18 @@ test('links nested type documentation, prose, vocabulary entries, values and com
     source,
     node('Dataset/a', 'Dataset', { id: 'a' }),
     node('Field/a/status', 'Field', { dataset: 'a', id: 'status' }),
-    node('Value/status/ready', 'Value', { type_id: 'status', id: 'ready' }),
+    node('Value/status/ready', 'Value', { ty: 'status', id: 'ready' }),
     node('Measure/a/count', 'Measure', { dataset: 'a', id: 'count' }),
-    node('DataType/DatetimeUtc', 'DataType', { id: 'DatetimeUtc' }),
-    node('DataType/Int', 'DataType', { id: 'Int' }),
-    node('Terminology/types', 'Terminology', { entries: [{ key: 'DataType/DatetimeUtc', id: 'DatetimeUtc', label: 'UTC instant', term: 'UTC' }] }),
+    node('Ty/DatetimeUtc', 'Ty', { id: 'DatetimeUtc' }),
+    node('Ty/Int', 'Ty', { id: 'Int' }),
+    node('Terminology/types', 'Terminology', { entries: [{ key: 'Ty/DatetimeUtc', id: 'DatetimeUtc', label: 'UTC instant', term: 'UTC' }] }),
   ], {});
-  assert(md.includes('kind: [DatetimeUtc](#DataType/DatetimeUtc)'));
-  assert(md.includes('Use [DatetimeUtc](#DataType/DatetimeUtc), not DatetimeUtcExtra; see [DataType/DatetimeUtc](#DataType/DatetimeUtc).'));
-  assert(md.includes('[DatetimeUtc](#DataType/DatetimeUtc) and [Int](#DataType/Int) are logical types.'));
+  assert(md.includes('kind: [DatetimeUtc](#Ty/DatetimeUtc)'));
+  assert(md.includes('Use [DatetimeUtc](#Ty/DatetimeUtc), not DatetimeUtcExtra; see [Ty/DatetimeUtc](#Ty/DatetimeUtc).'));
+  assert(md.includes('[DatetimeUtc](#Ty/DatetimeUtc) and [Int](#Ty/Int) are logical types.'));
   assert(md.includes('id: [ready](#Value/status/ready), label: [Ready](#Value/status/ready)'));
   assert(md.includes('**canonical_order**: [[ready](#Value/status/ready)]'));
   assert(md.includes('id: [count](#Measure/a/count), field: [status](#Field/a/status)'));
   assert(md.includes('left: [count](#Measure/a/count), right: [count](#Measure/a/count)'));
-  assert(md.includes('id: [DatetimeUtc](#DataType/DatetimeUtc), label: [UTC instant](#DataType/DatetimeUtc), term: [UTC](#DataType/DatetimeUtc)'));
+  assert(md.includes('id: [DatetimeUtc](#Ty/DatetimeUtc), label: [UTC instant](#Ty/DatetimeUtc), term: [UTC](#Ty/DatetimeUtc)'));
 });

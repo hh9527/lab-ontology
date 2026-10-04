@@ -23,13 +23,13 @@ export function renderMarkdown(nodes, metadata) {
   };
   const identities = new Map();
   for (const node of nodes) {
-    const owner = node.detail.dataset ?? node.detail.type_id ?? node.detail.hub ?? node.detail.from_dataset ?? '';
+    const owner = node.detail.dataset ?? node.detail.ty ?? node.detail.hub ?? node.detail.from_dataset ?? '';
     const id = node.detail.id ?? (node.type === 'TimeRole' ? node.detail.field : undefined);
     if (id !== undefined) identities.set(JSON.stringify([node.type, owner, id]), node.key);
   }
   const resolveIdentity = (type, owner, id) => identities.get(JSON.stringify([type, owner, id]));
   const textTargets = new Map(nodes.map(node => [node.key, node.key]));
-  for (const node of nodes.filter(node => node.type === 'DataType')) textTargets.set(node.detail.id, node.key);
+  for (const node of nodes.filter(node => node.type === 'Ty')) textTargets.set(node.detail.id, node.key);
   const escapePattern = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const textPattern = new RegExp(`(?<![\\p{L}\\p{N}_/])(?:${[...textTargets.keys()].sort((a, b) => b.length - a.length).map(escapePattern).join('|')})(?![\\p{L}\\p{N}_/])`, 'gu');
   function prose(value, context) {
@@ -54,9 +54,9 @@ export function renderMarkdown(nodes, metadata) {
     else if (['dimension', 'dimension_ids'].includes(field)) {
       const matches = nodes.filter(node => node.type === 'Dimension' && node.detail.id === value);
       key = resolveIdentity('Dimension', owner, value) ?? (matches.length === 1 ? matches[0].key : undefined);
-    } else if (['type_id', 'logical_type', 'input_kinds', 'kind', 'encoding', 'semantics'].includes(field)) key = resolveIdentity('DataType', '', value);
+    } else if (['ty', 'logical_type', 'input_kinds', 'kind', 'encoding', 'semantics'].includes(field)) key = resolveIdentity('Ty', '', value);
     else if (['left', 'right'].includes(field) && context.computed) key = resolveIdentity('Measure', owner, value);
-    else if (field === 'canonical_order') key = resolveIdentity('Value', context.type_id, value);
+    else if (field === 'canonical_order') key = resolveIdentity('Value', context.ty, value);
     return key && key !== context.nodeKey ? reference(key, value) : value === '' ? '`""`'
       : ['summary', 'description', 'text', 'value_contract'].includes(field) ? prose(value, context) : escapeText(value);
   }
@@ -68,7 +68,7 @@ export function renderMarkdown(nodes, metadata) {
     owner = value.dataset ?? owner;
     context = { ...context, computed: context.computed || field === 'computed',
       target: byKey.has(value.key) ? value.key
-        : ['values', 'mapping'].includes(field) ? resolveIdentity('Value', context.type_id, value.id)
+        : ['values', 'mapping'].includes(field) ? resolveIdentity('Value', context.ty, value.id)
         : field === 'sampling' ? resolveIdentity('Measure', owner, value.id) : undefined };
     const entries = Object.entries(value);
     return entries.length
@@ -95,7 +95,7 @@ export function renderMarkdown(nodes, metadata) {
   // Render properties first so semantic references also participate in chapter selection.
   const bodies = new Map(sorted.map(node => {
     const owner = owners.get(node.key) ?? '';
-    const context = { nodeKey: node.key, type_id: node.type === 'DataType' ? node.detail.id : node.detail.type_id };
+    const context = { nodeKey: node.key, ty: node.type === 'Ty' ? node.detail.id : node.detail.ty };
     const associations = new Map();
     for (const link of node.links) {
       if (!associations.has(link.type)) associations.set(link.type, []);
@@ -137,7 +137,7 @@ export function renderMarkdown(nodes, metadata) {
       for (const member of members) emit(member, 4);
     }
   }
-  for (const type of ['DataType', 'Schema', 'Index', ...Object.keys(counts)]) {
+  for (const type of ['Ty', 'Schema', 'Index', ...Object.keys(counts)]) {
     const remaining = sorted.filter(node => node.type === type && !emitted.has(node.key));
     if (!remaining.length) continue;
     lines.push(`# ${escapeText(type)}`, '');
@@ -157,7 +157,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const sha256 = createHash('sha256').update(readFileSync(artifact)).digest('hex');
   let calls = 0;
   const nodes = await withKnowledgeRunner(artifact, async (info, request) => {
-    const roots = await request(`${values.domain}/discovery`, {});
+    const { roots } = await request(`${values.domain}/discovery`, {});
     return collectKnowledge(async input => {
     if (++calls % 500 === 0) process.stderr.write(`Exported ${calls} nodes\n`);
     return info(values.domain, input);

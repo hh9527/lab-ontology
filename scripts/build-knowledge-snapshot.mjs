@@ -45,7 +45,7 @@ try {
     const domains = [];
     for (const domain of options.domain) {
       let calls = 0;
-      const roots = await request(`${domain}/discovery`, {});
+      const { roots } = await request(`${domain}/discovery`, {});
       const nodes = await collectKnowledge(async input => {
         if (++calls % 250 === 0) process.stderr.write(`Checking ${domain}: ${calls} nodes\n`);
         return info(domain, input);

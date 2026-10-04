@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { collectKnowledge, terminologyKeys } from './knowledge-export.mjs';
+import { collectKnowledge } from './knowledge-export.mjs';
 
 test('discovery follows Dataset roots, schema and member links', async () => {
   const key = '设备%2F位置/状态?#';
@@ -23,13 +23,4 @@ test('discovery follows Dataset roots, schema and member links', async () => {
 test('dangling or mismatched nodes cannot silently produce a partial export', async () => {
   await assert.rejects(collectKnowledge(async () => ({ Document: 'NotFound' }), []), /did not resolve/);
   await assert.rejects(collectKnowledge(async () => ({ Document: { Found: { key: 'wrong', links: [] } } }), []), /did not resolve/);
-});
-
-test('terminology keys encode every name once and retain value ownership', () => {
-  assert.deepEqual(terminologyKeys({
-    datasets: [{ name: 'a/b' }], dimensions: [{ dataset: 'a/b', name: 'd/e' }],
-    measures: [{ dataset: 'a/b', name: 'm/n' }], rels: [{ name: 'r/s' }],
-    types: [{ name: 't/u' }],
-    values: [{ type_id: 'd/e', name: 'v%w' }],
-  }), ['Dataset/a%2Fb', 'Dimension/a%2Fb/d%2Fe', 'Measure/a%2Fb/m%2Fn', 'Relation/r%2Fs', 'Type/t%2Fu', 'Value/d%2Fe/v%25w']);
 });

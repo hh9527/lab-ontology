@@ -7,10 +7,43 @@ import { parseArgs } from 'node:util';
 import { discoveryKeys } from '../ontology/tools/knowledge-export.mjs';
 import { withKnowledgeRunner } from '../ontology/tools/knowledge-runner.mjs';
 
-const groups = { Dataset: 'datasets', Dimension: 'dimensions', Measure: 'measures',
-  Relation: 'rels', DataType: 'types', Value: 'values', BusinessLink: 'business_links' };
 const distinct = strings => [...new Set(strings.filter(value => typeof value === 'string' && value !== ''))];
 const edgeKey = edge => JSON.stringify([edge.source, edge.target, edge.kind]);
+
+export function vocabularyFromDiscovery(detail) {
+  assert(Array.isArray(detail?.key_patterns), 'Missing key_patterns declaration');
+  assert(Array.isArray(detail.vocabulary), 'Missing vocabulary declaration');
+  const patterns = new Map();
+  const identifier = value => typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)
+    && !['__proto__', 'prototype', 'constructor'].includes(value);
+  for (const entry of detail.key_patterns) {
+    assert(identifier(entry.kind) && typeof entry.pattern === 'string', 'Invalid key pattern');
+    assert(!patterns.has(entry.kind), `Duplicate key pattern kind: ${entry.kind}`);
+    const parts = entry.pattern.split('/');
+    assert(parts[0] === entry.kind && parts.length >= 2, `Invalid key pattern: ${entry.pattern}`);
+    const placeholders = parts.slice(1).map(part => /^\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(part)?.[1]);
+    assert(placeholders.every(Boolean) && new Set(placeholders).size === placeholders.length, 'Invalid key placeholders');
+    patterns.set(entry.kind, { parts, placeholders });
+  }
+  const rules = new Map();
+  const groups = new Set();
+  for (const entry of detail.vocabulary) {
+    assert(patterns.has(entry.kind), `Vocabulary kind has no key pattern: ${entry.kind}`);
+    assert(!rules.has(entry.kind), `Duplicate vocabulary kind: ${entry.kind}`);
+    assert(identifier(entry.group) && entry.group !== 'revision' && !groups.has(entry.group), 'Invalid or duplicate vocabulary group');
+    assert(entry.owner == null || (identifier(entry.owner) && !['name', 'doc', 'aliases'].includes(entry.owner)), 'Invalid vocabulary owner');
+    assert(entry.require == null || identifier(entry.require), 'Invalid vocabulary require field');
+    assert(Object.keys(entry).every(key => ['kind', 'group', 'owner', 'require'].includes(key)), 'Unknown vocabulary field');
+    const pattern = patterns.get(entry.kind);
+    const ownerIndex = entry.owner == null ? -1 : pattern.parts.indexOf(`{${entry.owner}}`);
+    assert(entry.owner == null || ownerIndex > 0, `Owner missing from key pattern: ${entry.kind}`);
+    assert(pattern.parts.length === (entry.owner == null ? 2 : 3) && ownerIndex !== pattern.parts.length - 1,
+      `Unsupported vocabulary key shape: ${entry.kind}`);
+    groups.add(entry.group);
+    rules.set(entry.kind, { ...entry, pattern, ownerIndex });
+  }
+  return { patterns, rules, groups: [...groups] };
+}
 
 export async function discover(info, roots, onProgress = () => {}) {
   assert(Array.isArray(roots) && roots.length > 0, 'Dataset/Relation roots are required');
@@ -30,12 +63,15 @@ export async function discover(info, roots, onProgress = () => {}) {
   return nodes;
 }
 
-export function derive(nodes) {
+export function derive(nodes, discovery) {
   const byKey = new Map(nodes.map(node => [node.key, node]));
   assert.equal(byKey.size, nodes.length, 'Duplicate knowledge nodes');
-  const revision = byKey.get('index')?.detail.revision;
+  const index = byKey.get('index')?.detail;
+  const revision = index?.revision;
   assert.equal(typeof revision, 'string', 'Missing revision');
-  const terminology = { revision, datasets: [], dimensions: [], measures: [], rels: [], types: [], values: [], business_links: [] };
+  assert.equal(discovery?.revision, revision, 'Discovery/knowledge revision mismatch');
+  const vocabulary = vocabularyFromDiscovery(discovery);
+  const terminology = { revision, ...Object.fromEntries(vocabulary.groups.map(group => [group, []])) };
   const edges = new Map();
   for (const node of [...nodes].sort((a, b) => a.key.localeCompare(b.key, 'en'))) {
     for (const link of node.links) {
@@ -44,14 +80,14 @@ export function derive(nodes) {
       const edge = { source: node.key, target: link.key, kind: link.type };
       edges.set(edgeKey(edge), edge);
     }
-    const group = groups[node.type];
-    if (!group || (node.type === 'DataType' && typeof node.detail.storage !== 'string')) continue;
+    const rule = vocabulary.rules.get(node.type);
+    if (!rule || (rule.require != null && node.detail[rule.require] == null)) continue;
     const parts = node.key.split('/').map(decodeURIComponent);
-    const scoped = ['Dimension', 'Measure', 'Value', 'BusinessLink'].includes(node.type);
-    assert.equal(parts.length, scoped ? 3 : 2, `Invalid business key: ${node.key}`);
-    assert.equal(parts[0], node.type === 'DataType' ? 'Type' : node.type, 'Key/type mismatch');
+    assert.equal(parts.length, rule.pattern.parts.length, `Invalid business key: ${node.key}`);
+    assert.equal(parts[0], node.type, 'Key/kind mismatch');
+    assert(parts.slice(1).every(part => part !== ''), `Empty key component: ${node.key}`);
     const name = parts.at(-1);
-    assert.equal(node.detail.id, name, `Key/id mismatch: ${node.key}`);
+    if (node.detail.id != null) assert.equal(node.detail.id, name, `Key/id mismatch: ${node.key}`);
     const localized = [...(node.description.localized ?? []), ...(node.detail.localized ?? [])];
     // Alias terms use the display label when the node has no declared summary.
     const terms = node.description.terms ?? [];
@@ -62,19 +98,11 @@ export function derive(nodes) {
         ...terms.map(term => term.description), aliasDoc]).join('\n'),
       aliases: distinct([node.description.label, ...(node.description.aliases ?? []),
         ...localized.map(text => text.label), ...terms.map(term => term.term)]).filter(alias => alias !== name) };
-    if (['Dimension', 'Measure'].includes(node.type)) {
-      assert.equal(node.detail.dataset, parts[1], `Dataset owner mismatch: ${node.key}`);
-      entry.dataset = parts[1];
+    if (rule.owner != null) {
+      assert.equal(node.detail[rule.owner], parts[rule.ownerIndex], `Vocabulary owner mismatch: ${node.key}`);
+      entry[rule.owner] = parts[rule.ownerIndex];
     }
-    if (node.type === 'Value') {
-      assert.equal(node.detail.type_id, parts[1], `Type owner mismatch: ${node.key}`);
-      entry.type_id = parts[1];
-    }
-    if (node.type === 'BusinessLink') {
-      assert.equal(node.detail.hub, parts[1], `Hub owner mismatch: ${node.key}`);
-      entry.hub = parts[1];
-    }
-    terminology[group].push(entry);
+    terminology[rule.group].push(entry);
   }
   return { terminology, links: { revision, links: [...edges.values()] } };
 }
@@ -83,10 +111,11 @@ export function compareDiscovery(result, baseline) {
   assert.equal(result.terminology.revision, baseline.terminology.revision, 'Terminology revision mismatch');
   assert.equal(result.links.revision, baseline.links.revision, 'Links revision mismatch');
   const terminology = {};
-  for (const group of Object.values(groups)) {
-    const identity = entry => JSON.stringify([entry.dataset ?? entry.type_id ?? entry.hub ?? '', entry.name]);
-    const expected = new Map(baseline.terminology[group].map(entry => [identity(entry), entry]));
-    const actual = new Map(result.terminology[group].map(entry => [identity(entry), entry]));
+  for (const group of new Set([...Object.keys(result.terminology), ...Object.keys(baseline.terminology)])) {
+    if (group === 'revision') continue;
+    const identity = entry => JSON.stringify(Object.entries(entry).filter(([key]) => !['doc', 'aliases'].includes(key)).sort());
+    const expected = new Map((baseline.terminology[group] ?? []).map(entry => [identity(entry), entry]));
+    const actual = new Map((result.terminology[group] ?? []).map(entry => [identity(entry), entry]));
     terminology[group] = {
       missing: [...expected.keys()].filter(key => !actual.has(key)),
       extra: [...actual.keys()].filter(key => !expected.has(key)),
@@ -121,18 +150,20 @@ async function main() {
   const domain = manifest.domains.find(domain => domain.domain === values.domain);
   assert(domain, 'Unknown domain');
   let roots;
+  let discovery;
   const nodes = await withKnowledgeRunner(artifact, async (info, request) => {
-    roots = values.keys ? JSON.parse(readFileSync(values.keys, 'utf8')) : await request(`${values.domain}/discovery`, {});
+    discovery = await request(`${values.domain}/discovery`, {});
+    roots = values.keys ? JSON.parse(readFileSync(values.keys, 'utf8')) : discovery.roots;
     return discover(input => info(values.domain, input), roots,
       count => { if (count % 500 === 0) process.stderr.write(`Discovered ${count} nodes\n`); });
   }, { memory: '2048' });
-  const result = derive(nodes);
+  const result = derive(nodes, discovery);
   assert.equal(result.terminology.revision, domain.revision, 'Manifest revision mismatch');
   const found = new Set(nodes.map(node => node.key));
   const expected = new Set(domain.entries.map(entry => entry.key));
   const report = { artifact_sha256: sha, revision: domain.revision, roots: roots.length, nodes: nodes.length,
     coverage: { missing: [...expected].filter(key => !found.has(key)), extra: [...found].filter(key => !expected.has(key)) },
-    counts: Object.fromEntries(Object.values(groups).map(group => [group, result.terminology[group].length])),
+    counts: Object.fromEntries(Object.entries(result.terminology).filter(([group]) => group !== 'revision').map(([group, entries]) => [group, entries.length])),
     links: result.links.links.length };
   if (values['compare-prefix']) {
     const prefix = values['compare-prefix'];

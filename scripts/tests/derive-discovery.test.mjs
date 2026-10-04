@@ -1,20 +1,42 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { discover, derive, compareDiscovery } from '../derive-discovery.mjs';
+import { discover, derive as deriveWithDiscovery, compareDiscovery, vocabularyFromDiscovery } from '../derive-discovery.mjs';
+const derive = (nodes, discovery = discoveryFixture()) => deriveWithDiscovery(nodes, discovery);
 
 const node = (key, type, detail, links = [], description = {}) => ({ key, type, detail, links,
   description: { label: detail.id ?? key, summary: '', aliases: [], localized: [], ...description } });
+function discoveryFixture() {
+  return { revision: 'v1', roots: ['Dataset/a%2Fb', 'Relation/self'],
+      key_patterns: [
+        {kind: 'Dataset', pattern: 'Dataset/{dataset}'},
+        {kind: 'Dimension', pattern: 'Dimension/{dataset}/{dimension}'},
+        {kind: 'Measure', pattern: 'Measure/{dataset}/{measure}'},
+        {kind: 'Relation', pattern: 'Relation/{relation}'},
+        {kind: 'Ty', pattern: 'Ty/{ty}'},
+        {kind: 'Value', pattern: 'Value/{ty}/{value}'},
+        {kind: 'BusinessLink', pattern: 'BusinessLink/{hub}/{link}'},
+        {kind: 'TimeRole', pattern: 'TimeRole/{dataset}/{field}'},
+      ], vocabulary: [
+        {kind: 'Dataset', group: 'datasets'},
+        {kind: 'Dimension', group: 'dimensions', owner: 'dataset'},
+        {kind: 'Measure', group: 'measures', owner: 'dataset'},
+        {kind: 'Relation', group: 'rels'},
+        {kind: 'Ty', group: 'types', require: 'storage'},
+        {kind: 'Value', group: 'values', owner: 'ty'},
+        {kind: 'BusinessLink', group: 'business_links', owner: 'hub'},
+      ] };
+}
 function fixture() {
   return [
-    node('index', 'Index', { revision: 'v1', schemas: ['Schema/test'] }),
+    node('index', 'Index', {revision: 'v1', schemas: ['Schema/test'], key_patterns: discoveryFixture().key_patterns}),
     node('Schema/test', 'Schema', {}, [{ key: 'index', type: 'Member' }]),
     node('Dataset/a%2Fb', 'Dataset', { id: 'a/b' }, [{ key: 'Dimension/a%2Fb/status', type: 'Member' }]),
-    node('Dimension/a%2Fb/status', 'Dimension', { id: 'status', dataset: 'a/b', type_id: 'Status' },
-      [{ key: 'Type/Status', type: 'Member' }, { key: 'Type/Int', type: 'Member' }],
+    node('Dimension/a%2Fb/status', 'Dimension', { id: 'status', dataset: 'a/b', ty: 'Status' },
+      [{ key: 'Ty/Status', type: 'Member' }, { key: 'Ty/Int', type: 'Member' }],
       { label: 'Status', summary: 'Current status', localized: [{ label: '状态', summary: '当前状态', locale: 'zh' }] }),
-    node('Type/Status', 'DataType', { id: 'Status', storage: 'Int' }, [{ key: 'Value/Status/online', type: 'Member' }]),
-    node('Type/Int', 'DataType', { id: 'Int' }),
-    node('Value/Status/online', 'Value', { id: 'online', type_id: 'Status' }, [{ key: 'Type/Status', type: 'Member' }]),
+    node('Ty/Status', 'Ty', { id: 'Status', storage: 'Int' }, [{ key: 'Value/Status/online', type: 'Member' }]),
+    node('Ty/Int', 'Ty', { id: 'Int' }),
+    node('Value/Status/online', 'Value', { id: 'online', ty: 'Status' }, [{ key: 'Ty/Status', type: 'Member' }]),
     node('Relation/self', 'Relation', { id: 'self', from_dataset: 'a/b', to_dataset: 'a/b' }, [
       { key: 'Dataset/a%2Fb', type: 'Member' }, { key: 'Dataset/a%2Fb', type: 'Member' },
       { key: 'Dataset/a%2Fb', type: 'Traversable' },
@@ -39,7 +61,7 @@ test('derives vocabulary, ownership and unique reference kinds from documents', 
     name: 'status', dataset: 'a/b', doc: 'Current status\n当前状态', aliases: ['Status', '状态'],
   });
   assert.deepEqual(result.terminology.types.map(entry => entry.name), ['Status']);
-  assert.equal(result.terminology.values[0].type_id, 'Status');
+  assert.equal(result.terminology.values[0].ty, 'Status');
   assert.deepEqual(result.links.links.filter(link => link.source === 'Relation/self').map(link => link.kind),
     ['Member', 'Traversable']);
   assert(compareDiscovery(result, result).equal);
@@ -57,7 +79,7 @@ test('comparison exposes unavailable term metadata instead of inventing it', () 
 
 test('structured terms preserve explicit aliases and descriptions, including alias overrides', () => {
   const nodes = fixture();
-  const status = nodes.find(node => node.key === 'Type/Status');
+  const status = nodes.find(node => node.key === 'Ty/Status');
   status.description.aliases = ['业务状态'];
   status.description.terms = [{ term: '业务状态', description: '业务状态的说明' }];
   const entry = derive(nodes).terminology.types[0];
@@ -76,7 +98,7 @@ test('alias descriptions preserve the display-label fallback alongside localized
 test('unresolved references and invalid discovery roots fail explicitly', async () => {
   await assert.rejects(discover(async () => ({ Document: 'NotFound' }), ['Dataset/a']), /Unresolved/);
   await assert.rejects(discover(async () => {}, ['Field/a/f']), /Invalid discovery root/);
-  assert.throws(() => derive(fixture().filter(node => node.key !== 'Type/Status')), /Unresolved reference/);
+  assert.throws(() => derive(fixture().filter(node => node.key !== 'Ty/Status')), /Unresolved reference/);
 });
 
 test('wrong owner and duplicate node keys cannot generate a search index', () => {
@@ -100,5 +122,36 @@ test('business links retain hub ownership, business descriptions and searchable 
   }]);
   assert(compareDiscovery(result, result).equal);
   nodes.at(-1).detail.hub = 'wrong';
-  assert.throws(() => derive(nodes), /Hub owner mismatch/);
+  assert.throws(() => derive(nodes), /owner mismatch/);
+});
+
+test('vocabulary additions, removals and group names need no kind-specific code', () => {
+  const nodes = fixture();
+  nodes.push(node('TimeRole/a%2Fb/ts', 'TimeRole', {dataset: 'a/b', field: 'ts'}, [], {label: '采样时间'}));
+  const index = discoveryFixture();
+  assert(!Object.hasOwn(derive(nodes, index).terminology, 'clocks'));
+  index.vocabulary.push({kind: 'TimeRole', group: 'clocks', owner: 'dataset'});
+  assert.deepEqual(derive(nodes, index).terminology.clocks, [{name: 'ts', dataset: 'a/b', doc: '', aliases: ['采样时间']}]);
+  index.vocabulary = index.vocabulary.filter(entry => entry.kind !== 'Dimension');
+  assert(!Object.hasOwn(derive(nodes, index).terminology, 'dimensions'));
+  index.vocabulary = [];
+  assert.deepEqual(derive(nodes, index).terminology, {revision: 'v1'});
+  delete index.vocabulary;
+  assert.throws(() => derive(nodes, index), /Missing vocabulary/);
+});
+
+test('declarations distinguish non-vocabulary kinds from unknown kinds and reject malformed contracts', () => {
+  const detail = discoveryFixture();
+  const policy = vocabularyFromDiscovery(detail);
+  assert(policy.patterns.has('TimeRole') && !policy.rules.has('TimeRole'));
+  assert(!policy.patterns.has('MissingKind'));
+  assert.throws(() => vocabularyFromDiscovery({...detail, vocabulary: [{kind: 'MissingKind', group: 'missing'}]}), /no key pattern/);
+  assert.throws(() => vocabularyFromDiscovery({...detail, vocabulary: [{kind: 'Value', group: 'values', owner: 'type_id'}]}), /Owner missing/);
+  assert.throws(() => vocabularyFromDiscovery({...detail, vocabulary: [{kind: 'Ty', group: 'types', require: 'storage.value'}]}), /require field/);
+  assert.throws(() => vocabularyFromDiscovery({...detail, vocabulary: [{kind: 'Dataset', group: 'revision'}]}), /group/);
+});
+
+test('discovery and knowledge must share a revision', () => {
+  assert.throws(() => derive(fixture(), {...discoveryFixture(), revision: 'v2'}), /revision mismatch/);
+  assert.throws(() => deriveWithDiscovery(fixture()), /revision mismatch/);
 });

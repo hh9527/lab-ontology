@@ -1,17 +1,5 @@
 import { pathToFileURL } from 'node:url';
 
-export function terminologyKeys(terminology) {
-  const component = encodeURIComponent;
-  return [
-    ...terminology.datasets.map(entry => `Dataset/${component(entry.name)}`),
-    ...terminology.dimensions.map(entry => `Dimension/${component(entry.dataset)}/${component(entry.name)}`),
-    ...terminology.measures.map(entry => `Measure/${component(entry.dataset)}/${component(entry.name)}`),
-    ...terminology.rels.map(entry => `Relation/${component(entry.name)}`),
-    ...terminology.types.map(entry => `Type/${component(entry.name)}`),
-    ...terminology.values.map(entry => `Value/${component(entry.type_id)}/${component(entry.name)}`),
-  ];
-}
-
 export async function collectKnowledge(info, roots) {
   const nodes = [];
   if (!Array.isArray(roots) || roots.some(key => !/^(Dataset|Relation)\/[^/]+$/.test(key))) {

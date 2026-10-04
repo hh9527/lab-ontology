@@ -39,7 +39,7 @@ ambiguity policy; this interface does not infer either.
 
 Graph Intents accept `time_windows` at the root and within `exists`:
 
-Each temporal DataType knowledge node links to the shared TimeWindow operation
+Each temporal Ty knowledge node links to the shared TimeWindow operation
 contract. Follow the returned opaque key to read the interval and boundary rules.
 Type support does not grant field authorization: the dimension must have a time
 role and authorize Ge, plus Lt when an upper bound is present. This is unrelated

@@ -16,7 +16,8 @@ and a single `intent` key are not supported.
 `<model>/info` accepts `{ "key": "index" }`
 to return schema keys and concrete knowledge key patterns, or another key for
 one complete knowledge point. `<model>/discovery` accepts `{}` and returns
-Dataset and Relation keys for external vocabulary and reference generation. The ic model has
+`{revision,roots,key_patterns,vocabulary}` for external vocabulary and reference
+generation; `roots` contains Dataset and Relation keys. The ic model has
 the same three routes under `ic/` in its own `icloud_model` entry.
 All domains use the same [service and agent guide](../USAGE.md) with their
 domain name and the separate Intent contract supplied by the host.

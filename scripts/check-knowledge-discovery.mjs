@@ -28,7 +28,7 @@ async function request(method, input) {
 }
 const info = input => request(`${domain}/info`, input);
 try {
-  const roots = await request(`${domain}/discovery`, {});
+  const { roots } = await request(`${domain}/discovery`, {});
   const nodes = await collectKnowledge(info, roots);
   const expected = JSON.parse(readFileSync(expectedFile, 'utf8'));
   const found = new Map(nodes.map(node => [node.key, node]));

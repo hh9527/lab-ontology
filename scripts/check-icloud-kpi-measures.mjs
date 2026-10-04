@@ -75,7 +75,7 @@ try {
       assert.deepEqual(result.map(row => row[`k_${dimension}`]), buckets);
       assert.deepEqual(result.map(row => row[`k_${measure}`]), values);
       const node = await info(`Dimension/${entity}/${dimension}`);
-      assert.equal(node.detail.type_id, 'DatetimeUtc');
+      assert.equal(node.detail.ty, 'DatetimeUtc');
       assert.ok(node.links.some(link => link.key === 'Schema/syntax/operations/utc_time_bucket'));
     }
     // Empty-valued populations must not turn into zero or an absent row.
@@ -111,8 +111,8 @@ try {
     ['PhysicalLinkType', 'lldp', 1], ['PhysicalLinkType', 'csp', 7],
     ['PhysicalLinkType', 'server_internal', 8], ['PhysicalLinkType', 'fiber_search', 9],
   ]) {
-    const value = await info(`Value/${type}/${member}`);
-    assert.ok(JSON.stringify(value.detail).includes(JSON.stringify(wire)), `${type}/${member}: original wire`);
+    const value = await info(`Value/${ty}/${member}`);
+    assert.ok(JSON.stringify(value.detail).includes(JSON.stringify(wire)), `${ty}/${member}: original wire`);
   }
   console.log('Passed: 7 KPI datasets, 104 measures, hour/day/month grouped trends, half-open windows, NULL populations, alarm counts, online-rate populations and stable value keys');
 } finally {

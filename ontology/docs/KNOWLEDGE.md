@@ -45,6 +45,8 @@ schemas lists every exact Schema key. key_patterns lists `{kind,pattern}`
 for concrete knowledge nodes. encoding explains URI component encoding.
 The index enumerates no business instances.
 
+Key prefixes equal their kinds, including `Ty/{ty}`.
+
 | Node kind | Key pattern |
 | --- | --- |
 | Dataset | `Dataset/{dataset}` |
@@ -52,8 +54,8 @@ The index enumerates no business instances.
 | Dimension | `Dimension/{dataset}/{dimension}` |
 | Measure | `Measure/{dataset}/{measure}` |
 | Relation | `Relation/{relation}` |
-| DataType | `Type/{type}` |
-| Value | `Value/{type}/{value}` |
+| Ty | `Ty/{ty}` |
+| Value | `Value/{ty}/{value}` |
 | TimeRole | `TimeRole/{dataset}/{field}` |
 | BusinessLink | `BusinessLink/{hub}/{link}` |
 
@@ -72,7 +74,7 @@ A relation publishes its endpoints, cardinality and shape from the same
 Prepared Model used for query lowering.
 
 Field detail contains `{id,dataset,nullable,logical_type,roles,reference_ids}`.
-Value detail contains `{id,type_id,wires}`. DataType detail has id; its description
+Value detail contains `{id,ty,wires}`. Ty detail has id; its description
 and schema links explain the logical value domain and supported operations.
 Dimension, Measure and Relation preserve the corresponding Model brief.
 Measure detail includes `sampling`, when declared: source field, unit, aggregate
@@ -118,10 +120,20 @@ typed lookups; service factories likewise initialize their catalog once.
 ## Programmatic Discovery
 
 `knowledge::knowledge_discovery_method_factory(payload)` mounts
-`<domain>/discovery`. It accepts `{}` and returns only complete visible Dataset
-and Relation keys as a JSON array. No names, aliases, descriptions or reference
-edges are cached by this service. Consumers read `info(key)` from these roots;
-Schema discovery uses `index.detail.schemas`.
+`<domain>/discovery`. It accepts `{}` and returns
+`{revision,roots,key_patterns,vocabulary}`. `roots` lists complete visible Dataset
+and Relation keys. `key_patterns` uses the same definition as the top-level index.
+Consumers read `info(key)` from these roots; Schema discovery uses
+`index.detail.schemas`.
+
+`vocabulary` declares searchable membership and output shape as
+`{kind,group,owner,require}` entries. `group` names the terminology output array.
+Optional `owner` is both the detail field and key-pattern placeholder identifying
+the owner; Value uses `ty`. Optional `require` names one detail field that must
+exist and be non-NULL for inclusion. It is not an expression or conversion.
+Kinds absent from vocabulary remain readable but are not vocabulary members.
+Consumers distinguish an excluded kind from an unknown kind using `key_patterns`.
+An empty vocabulary declares no members; a missing declaration is a contract error.
 
 `description.terms` contains explicit `{term,description}` annotations on each
 knowledge point. Together with its label, summary, aliases and localized text,
@@ -146,7 +158,7 @@ compares vocabulary names, documents and aliases, and unique reference edges
 with local baseline files; differences produce exit status 1.
 
 Dataset, Relation and business Type terms are `{name,doc,aliases}`.
-Dimension and Measure terms add `dataset`; Value terms add `type_id`.
+Dimension and Measure terms add `dataset`; Value terms add `ty`.
 Only visible nodes are indexed. Physical Fields and primitive Types remain
 available through info and do not enter search vocabulary.
 A term can match multiple keys; names, aliases and documents support scoped
@@ -159,7 +171,7 @@ For Relation endpoints the source dataset is a Member edge and the destination
 is a Traversable edge, retaining both sides of self-relations.
 Consumers index edges by target to find referencing knowledge keys.
 
-Value ownership is encoded by `Value/{type}/{value}`; Dimension ownership by
+Value ownership is encoded by `Value/{ty}/{value}`; Dimension ownership by
 `Dimension/{dataset}/{dimension}`. Reverse type references find dimensions
 using a type. Read their local constraints to determine accepted values.
 
