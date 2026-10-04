@@ -85,3 +85,20 @@ test('wrong owner and duplicate node keys cannot generate a search index', () =>
   assert.throws(() => derive(nodes), /owner mismatch/);
   assert.throws(() => derive([...fixture(), fixture()[0]]), /Duplicate knowledge/);
 });
+
+test('business links retain hub ownership, business descriptions and searchable terms', () => {
+  const nodes = fixture();
+  nodes.push(node('BusinessLink/a%2Fb/peer', 'BusinessLink', { id: 'peer', hub: 'a/b' },
+    [{ key: 'Dataset/a%2Fb', type: 'Member' }], {
+      label: 'Peer device', summary: 'Bidirectional peer traversal',
+      terms: [{ term: '对端设备', description: '双向物理链路的另一端设备' }],
+    }));
+  const result = derive(nodes);
+  assert.deepEqual(result.terminology.business_links, [{
+    name: 'peer', hub: 'a/b', doc: 'Bidirectional peer traversal\n双向物理链路的另一端设备',
+    aliases: ['Peer device', '对端设备'],
+  }]);
+  assert(compareDiscovery(result, result).equal);
+  nodes.at(-1).detail.hub = 'wrong';
+  assert.throws(() => derive(nodes), /Hub owner mismatch/);
+});

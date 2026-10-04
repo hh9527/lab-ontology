@@ -98,6 +98,11 @@ boundaries and local timezone ambiguities must be resolved externally.
 TimeWindow links share the inclusive-start, exclusive-end contract with an
 optional unbounded end and no implicit clock.
 
+`business_link_description(id,label,summary)` describes a declared link on its
+hub. `term` supplies searchable aliases and their explanations. BusinessLink
+names describe traversal through two endpoint relations; direction and guard
+remain explicit query contracts, and names do not establish device hierarchy.
+
 Dataset references are alternative complete unique addresses `{id,fields}`.
 Any NULL member makes a reference unavailable; this does not create a total key
 or query grain. Field nullable derives from Option(T).
@@ -126,10 +131,14 @@ this preserves the metadata needed for external search vocabulary generation.
 
 `scripts/derive-discovery.mjs` uses discovery and exact info calls to generate:
 
-- `.terminology.json`: `{revision,datasets,dimensions,measures,rels,types,values}`.
+- `.terminology.json`: `{revision,datasets,dimensions,measures,rels,types,values,business_links}`.
 - `.links.json`: `{revision,links:[{source,target,kind}]}`.
 - `.keys.json`: the Dataset/Relation roots.
 - `.report.json`: complete manifest coverage and optional baseline comparison.
+
+Business-link terminology entries are `{hub,name,doc,aliases}` and identify
+`BusinessLink/{hub}/{name}` using encoded URI components. They are distinct
+from Relation terminology; discovery still starts from Dataset/Relation roots.
 
 `--keys roots.json` accepts roots from a standalone file. Unresolved references,
 duplicate nodes and owner mismatches fail explicitly. `--compare-prefix`

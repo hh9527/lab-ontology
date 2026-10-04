@@ -8,7 +8,7 @@ import { discoveryKeys } from '../ontology/tools/knowledge-export.mjs';
 import { withKnowledgeRunner } from '../ontology/tools/knowledge-runner.mjs';
 
 const groups = { Dataset: 'datasets', Dimension: 'dimensions', Measure: 'measures',
-  Relation: 'rels', DataType: 'types', Value: 'values' };
+  Relation: 'rels', DataType: 'types', Value: 'values', BusinessLink: 'business_links' };
 const distinct = strings => [...new Set(strings.filter(value => typeof value === 'string' && value !== ''))];
 const edgeKey = edge => JSON.stringify([edge.source, edge.target, edge.kind]);
 
@@ -35,7 +35,7 @@ export function derive(nodes) {
   assert.equal(byKey.size, nodes.length, 'Duplicate knowledge nodes');
   const revision = byKey.get('index')?.detail.revision;
   assert.equal(typeof revision, 'string', 'Missing revision');
-  const terminology = { revision, datasets: [], dimensions: [], measures: [], rels: [], types: [], values: [] };
+  const terminology = { revision, datasets: [], dimensions: [], measures: [], rels: [], types: [], values: [], business_links: [] };
   const edges = new Map();
   for (const node of [...nodes].sort((a, b) => a.key.localeCompare(b.key, 'en'))) {
     for (const link of node.links) {
@@ -47,7 +47,7 @@ export function derive(nodes) {
     const group = groups[node.type];
     if (!group || (node.type === 'DataType' && typeof node.detail.storage !== 'string')) continue;
     const parts = node.key.split('/').map(decodeURIComponent);
-    const scoped = ['Dimension', 'Measure', 'Value'].includes(node.type);
+    const scoped = ['Dimension', 'Measure', 'Value', 'BusinessLink'].includes(node.type);
     assert.equal(parts.length, scoped ? 3 : 2, `Invalid business key: ${node.key}`);
     assert.equal(parts[0], node.type === 'DataType' ? 'Type' : node.type, 'Key/type mismatch');
     const name = parts.at(-1);
@@ -70,6 +70,10 @@ export function derive(nodes) {
       assert.equal(node.detail.type_id, parts[1], `Type owner mismatch: ${node.key}`);
       entry.type_id = parts[1];
     }
+    if (node.type === 'BusinessLink') {
+      assert.equal(node.detail.hub, parts[1], `Hub owner mismatch: ${node.key}`);
+      entry.hub = parts[1];
+    }
     terminology[group].push(entry);
   }
   return { terminology, links: { revision, links: [...edges.values()] } };
@@ -80,7 +84,7 @@ export function compareDiscovery(result, baseline) {
   assert.equal(result.links.revision, baseline.links.revision, 'Links revision mismatch');
   const terminology = {};
   for (const group of Object.values(groups)) {
-    const identity = entry => JSON.stringify([entry.dataset ?? entry.type_id ?? '', entry.name]);
+    const identity = entry => JSON.stringify([entry.dataset ?? entry.type_id ?? entry.hub ?? '', entry.name]);
     const expected = new Map(baseline.terminology[group].map(entry => [identity(entry), entry]));
     const actual = new Map(result.terminology[group].map(entry => [identity(entry), entry]));
     terminology[group] = {
