@@ -1,0 +1,101 @@
+use crate::model::{ payload };
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::ontology as edsl;
+use ontology::knowledge as knowledge;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+def graph: Fn(String, String, String, Bool) -> Value = fn(family, start, end, mixed) {
+    let server = family == "server";
+    let owner = if server { "server_device" } else { "device" };
+    let dataset = if server { "server_kpi" } else { "device_kpi" };
+    let relation = if server { "server_kpi_of_server" } else { "device_kpi_of_device" };
+    let avg = if server { "server_cpu_usage" } else { "cpu_usage" };
+    let name = if server { "server_name" } else { "device_name" };
+    let selected = if server { `[{"node":"d","dimension":"\{name}"}]` }
+        else { `[{"node":"d","dimension":"\{name}"},{"node":"d","dimension":"device_id"}]` };
+    let measures = if mixed {
+        `[{"node":"k","measure":"\{family}_cpu_latest"},{"node":"k","measure":"\{family}_memory_latest"},{"node":"k","measure":"\{avg}"}\{if server { "" } else { ",{\"node\":\"k\",\"measure\":\"device_kpi_sample_count\"}" }}]`
+    } else { `[{"node":"k","measure":"\{family}_cpu_latest"}]` };
+    json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"\{owner}"},{"id":"k","entity":"\{dataset}"}],
+        "edges":[{"relation":"\{relation}","from":"k","to":"d"}],
+        "select":\{selected},"group_by_identity":["d"],"measures":\{measures},
+        "time_windows":[{"node":"k","dimension":"\{dataset}_ts_raw","start":"\{start}","end":"\{end}"}]}`).unwrap!()
+};
+def patch: Fn(Value, Dict(Value)) -> Value = fn(value, changes) {
+    match value { Value::Object(fields) => Value::Object({...fields, ...changes}), _ => fail!("object required") }
+};
+def base: Value = graph("device", "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", True);
+def postfilter: Value = patch(base, {measure_having: json::parse(r#"[{"node":"k","measure":"device_cpu_latest","op":"Gt","value":80}]"#).unwrap!()});
+def prefilter: Value = patch(base, {filters: json::parse(r#"[{"node":"k","dimension":"device_cpu_sample","op":"Gt","value":80}]"#).unwrap!()});
+def top: Value = patch(base, {top_by_measure: json::parse(r#"{"node":"k","measure":"device_cpu_latest","direction":"Desc","take":2}"#).unwrap!()});
+def pair: Fn(String) -> Value = fn(op) {
+    let sides = if op == "Ratio" { r#""numerator":"Right","denominator":"Left""# }
+        else if op == "GrowthRate" { r#""current":"Right","baseline":"Left""# }
+        else { r#""minuend":"Right","subtrahend":"Left""# };
+    Value::Object({op: Value::String("GraphPair"),
+        left: patch(graph("device", "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", False), {select: Value::Array([])}),
+        right: patch(graph("device", "2026-10-02T00:00:00Z", "2026-10-04T00:00:00Z", False), {select: Value::Array([])}),
+        align_by: json::parse(r#"[{"left":{"node":"d"},"right":{"node":"d"}}]"#).unwrap!(),
+        select: json::parse(r#"[{"side":"Right","node":"d","dimension":"device_name"},{"side":"Right","node":"d","dimension":"device_id"}]"#).unwrap!(),
+        rank_by: json::parse(`{"op":"\{op}",\{sides},"direction":"Desc","take":100}`).unwrap!()})
+};
+
+pub def projected_latest_mixed_average_having_top_and_pair_lower: test::Test = test::should_ok(fn() {
+    array::all([base, postfilter, prefilter, top, pair("Subtract"), pair("Ratio"), pair("GrowthRate"),
+        graph("server", "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", True)], fn(value) {
+        let ast = query_intent_ast_factory(payload)(value);
+        let sq = sqlite::build_query(ast);
+        let pg = postgres::build_query(ast);
+        string::contains(sq.sql, "row_number() OVER (")
+            && string::contains(pg.sql, "row_number() OVER (")
+            && string::contains(sq.sql, "max(CASE WHEN")
+            && string::contains(pg.sql, "max(CASE WHEN")
+    })
+});
+pub def latest_output_types_and_units_are_source_backed: test::Test = test::should_ok(fn() {
+    array::all(["device_cpu_latest", "device_memory_latest", "server_cpu_latest", "server_memory_latest"], fn(id) {
+        edsl::measure_output_type(payload, id) == edsl::OutputType::Number
+            && match edsl::measure_domain(payload, id).metric {
+                Some(metric) => metric.aggregate == qb::AggregateFunction::Latest && metric.unit == Some("%"), None => False,
+            }
+    })
+});
+pub def latest_knowledge_links_clock_grain_raw_dimension_and_contract: test::Test = test::should_ok(fn() {
+    let lookup = knowledge::knowledge_lookup_factory(payload);
+    array::all([("device_kpi", "device_cpu_latest", "device_cpu_sample"),
+        ("device_kpi", "device_memory_latest", "device_memory_sample"),
+        ("server_kpi", "server_cpu_latest", "server_cpu_sample"),
+        ("server_kpi", "server_memory_latest", "server_memory_sample")], fn(item) {
+        match lookup({kind: edsl::KnowledgeKind::Measure, owner: item.0, id: item.1}) {
+            knowledge::DocResult::Found(point) => array::all([
+                {kind: edsl::KnowledgeKind::Schema, owner: "", id: "syntax/graph/latest"},
+                {kind: edsl::KnowledgeKind::TimeRole, owner: item.0, id: "ts"},
+                {kind: edsl::KnowledgeKind::Field, owner: item.0, id: "res_id"},
+                {kind: edsl::KnowledgeKind::Dimension, owner: item.0, id: item.2},
+            ], fn(target) { array::any(point.refs, fn(ref) { ref.target == target }) }),
+            _ => False,
+        }
+    })
+});
+
+type RuntimeCase = struct { name: String, intent: Value, sqlite: qb::Query, postgres: qb::Query };
+def runtime: Fn(String, Value) -> RuntimeCase = fn(name, value) {
+    let ast = query_intent_ast_factory(payload)(value);
+    {name, intent: value, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_queries: Value = codec::encode([
+    runtime("mixed", base), runtime("postfilter", postfilter), runtime("prefilter", prefilter), runtime("top", top),
+    runtime("subtract", pair("Subtract")), runtime("ratio", pair("Ratio")), runtime("growth", pair("GrowthRate")),
+    runtime("server", graph("server", "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", True)),
+    runtime("unbounded", patch(base, {time_windows: Value::Array([])})),
+    runtime("inverse", patch(pair("Subtract"), {rank_by: json::parse(r#"{"op":"Subtract","minuend":"Left","subtrahend":"Right","direction":"Desc","take":100}"#).unwrap!()})),
+    runtime("filtered_top", patch(postfilter, {top_by_measure: json::parse(r#"{"node":"k","measure":"device_cpu_latest","direction":"Desc","take":2}"#).unwrap!()})),
+]);

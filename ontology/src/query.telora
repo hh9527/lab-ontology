@@ -116,7 +116,10 @@ type AggregateFunction = enum {
     Avg,
     Min,
     Max,
+    Latest,
 };
+
+type LatestOrder = struct { time: ColumnRef, ties: Array(ColumnRef) };
 
 # `filter` is the aggregate-local row predicate (SQLite
 # `FILTER (WHERE ...)`).  It only narrows this aggregate's input rows and is
@@ -128,6 +131,7 @@ type AggregateCall = struct {
     distinct: Bool,
     filter: Option(Expr),
     alias: String,
+    latest: Option(LatestOrder),
 };
 
 # A restricted arithmetic combination of declared aggregates. Operands resolve
@@ -690,7 +694,9 @@ def exprs_operators: Fn(Array(Expr)) -> Array(Operator) = fn(exprs) {
 def aggregate_operators: Fn(AggregateCall) -> Array(Operator) = fn(call) {
     # An aggregate-local predicate is a Filter capability: it narrows that
     # aggregate's input rows, so a profile that forbids Filter must reject it.
-    let base = ops_union(expr_operators(call.arg), [Operator::Aggregate]);
+    let base = ops_union(expr_operators(call.arg), if call.function == AggregateFunction::Latest {
+        [Operator::Aggregate, Operator::Group, Operator::Order, Operator::Partition]
+    } else { [Operator::Aggregate] });
     match call.filter {
         Some(expr) => ops_union(ops_union(base, expr_operators(expr)), [Operator::Filter]),
         None => base,
@@ -1054,6 +1060,7 @@ def select_item_valid: Fn(SelectItem, Array(String)) -> Bool = fn(item, aliases)
         SelectItem::Expr(expr) => expr_valid(expr, aliases),
         SelectItem::NamedExpr(named) => is_sql_identifier(named.alias) && expr_valid(named.expr, aliases),
         SelectItem::Aggregate(call) => is_sql_identifier(call.alias) && expr_valid(call.arg, aliases)
+            && latest_call_valid(call, aliases)
             && (match call.filter {
                 Some(expr) => expr_valid(expr, aliases),
                 None => True,
@@ -1062,6 +1069,123 @@ def select_item_valid: Fn(SelectItem, Array(String)) -> Bool = fn(item, aliases)
         # check runs in `computed_items_ok`.
         SelectItem::Computed(_) => True,
     }
+};
+
+def latest_call_valid: Fn(AggregateCall, Array(String)) -> Bool = fn(call, aliases) {
+    match call.latest {
+        None => call.function != AggregateFunction::Latest,
+        Some(order) => call.function == AggregateFunction::Latest && !call.distinct && call.filter == None
+            && match call.arg {
+                Expr::Column(arg) => arg.source == order.time.source
+                    && array::all(array::concat([[order.time], order.ties]), fn(ref) {
+                        ref.source == arg.source && expr_valid(Expr::Column(ref), aliases)
+                    })
+                    && !array::any(order.ties, fn(ref) { ref == order.time })
+                    && array::all(order.ties, fn(ref) { count_in(array::map(order.ties, fn(tie) { tie.column }), ref.column) == 1 }),
+                _ => False,
+            },
+    }
+};
+
+def latest_calls: Fn(Plan) -> Array(AggregateCall) = fn(plan) {
+    array::flat_map(array::concat([plan.projection, plan.internal_measures]), fn(item) {
+        match item { SelectItem::Aggregate(call) => if call.function == AggregateFunction::Latest { [call] } else { [] }, _ => [] }
+    })
+};
+
+def expr_uses_sample: Fn(Expr, String) -> Bool = fn(expr, source) { match expr {
+    Expr::Column(ref) => ref.source == source,
+    Expr::AllocatedBind(_) => True,
+    Expr::Scalar(call) => array::all(call.args, fn(arg) { expr_uses_sample(arg, source) }),
+} };
+
+def validate_latest_plan: Fn(Plan) -> Bool = fn(plan) {
+    let calls = latest_calls(plan);
+    if array::length(calls) == 0 { True }
+    else if plan.partition != None || plan.derived != None {
+        fail!("Latest cannot combine with raw partitioning or a derived union source")
+    } else if !array::all(calls, fn(call) { call.latest == calls[0].latest }) {
+        fail!("Latest measures in one grouped operand require the same sample source and ordering")
+    } else if array::any(array::concat([plan.projection, plan.internal_measures]), fn(item) { match item {
+        SelectItem::Aggregate(call) => match calls[0].latest {
+            Some(order) => !expr_uses_sample(call.arg, order.time.source)
+                || match call.filter { Some(expr) => !expr_uses_sample(expr, order.time.source), None => False },
+            None => False,
+        },
+        _ => False,
+    } }) { fail!("Latest and ordinary measures in one operand must use the same sample source")
+    } else if array::any(plan.having, fn(item) { match item.measure {
+        HavingMeasure::Call(call) => call.function == AggregateFunction::Latest, _ => False,
+    } }) || array::any(plan.ordering, fn(item) { match item.key {
+        OrderKey::Aggregate(call) => call.function == AggregateFunction::Latest, _ => False,
+    } }) { fail!("Latest predicates and ordering must reference a projected measure") }
+    else { True }
+};
+
+# Latest preserves the complete eligible input for ordinary aggregates. Only
+# its single-row reduction consumes the shared pre-group row number.
+type LatestStage = struct { input: Plan, output: Plan, partition: Array(String), order: Array(String) };
+
+def latest_stage: Fn(Plan) -> LatestStage = fn(plan) {
+    let latest = latest_calls(plan)[0];
+    let order = match latest.latest { Some(order) => order, None => fail!("Latest ordering is required") };
+    let item_exprs: Fn(SelectItem) -> Array(Expr) = fn(item) { match item {
+        SelectItem::Expr(expr) => [expr],
+        SelectItem::NamedExpr(named) => [named.expr],
+        SelectItem::Aggregate(call) => array::concat([[call.arg], match call.filter { Some(expr) => [expr], None => [] }]),
+        SelectItem::Computed(_) => [],
+    } };
+    let expressions = array::fold(array::concat([
+        plan.grouping,
+        array::flat_map(array::concat([plan.projection, plan.internal_measures]), item_exprs),
+        array::map(array::concat([[order.time], order.ties]), fn(ref) { Expr::Column(ref) }),
+        array::flat_map(plan.ordering, fn(item) { match item.key {
+            OrderKey::Expr(expr) => [expr], OrderKey::Aggregate(call) => item_exprs(SelectItem::Aggregate(call)), _ => [],
+        } }),
+        array::flat_map(plan.having, fn(item) { match item.measure {
+            HavingMeasure::Call(call) => item_exprs(SelectItem::Aggregate(call)), _ => [],
+        } }),
+    ]), [], fn(acc, expr) { if array::any(acc, fn(existing) { existing == expr }) { acc } else { array::push(acc, expr) } });
+    let names = array::map(array::enumerate(expressions), fn(pair) { `__latest_input_\{pair.0}` });
+    let name_of: Fn(Expr) -> String = fn(expr) {
+        let found = match array::find(array::enumerate(expressions), fn(pair) { pair.1 == expr }) {
+            Some(pair) => pair, None => fail!("missing Latest stage expression"),
+        };
+        names[found.0]
+    };
+    let source: Source = {table: "__latest_stage", alias: "__latest_stage", scope: None};
+    let mapped: Fn(Expr) -> Expr = fn(expr) { column(source, name_of(expr)) };
+    let mapped_ref: Fn(ColumnRef) -> ColumnRef = fn(ref) { column_ref(source, name_of(Expr::Column(ref))) };
+    let map_call: Fn(AggregateCall) -> AggregateCall = fn(call) {
+        if call.function == AggregateFunction::Latest {
+            {...call, arg: mapped(call.arg), latest: Some({time: mapped_ref(order.time), ties: array::map(order.ties, mapped_ref)})}
+        } else {
+            {...call, arg: mapped(call.arg), filter: match call.filter { Some(expr) => Some(mapped(expr)), None => None }}
+        }
+    };
+    let map_item: Fn(SelectItem) -> SelectItem = fn(item) { match item {
+        SelectItem::Expr(expr) => SelectItem::Expr(mapped(expr)),
+        SelectItem::NamedExpr(named) => SelectItem::NamedExpr({...named, expr: mapped(named.expr)}),
+        SelectItem::Aggregate(call) => SelectItem::Aggregate(map_call(call)),
+        SelectItem::Computed(_) => item,
+    } };
+    let input: Plan = {...plan,
+        projection: array::map(array::enumerate(expressions), fn(pair) {
+            SelectItem::NamedExpr({expr: pair.1, alias: names[pair.0]})
+        }), internal_measures: [], grouping: [], having: [], ordering: [], limit: None, offset: None, partition: None};
+    let output: Plan = {...plan, sources: [source], derived: None, joins: [], filter: None, exists: [],
+        scalar_comparisons: [], ranked_key_comparisons: [],
+        projection: array::map(plan.projection, map_item), internal_measures: array::map(plan.internal_measures, map_item),
+        grouping: array::map(plan.grouping, mapped),
+        having: array::map(plan.having, fn(item) { {...item, measure: match item.measure {
+            HavingMeasure::Call(call) => HavingMeasure::Call(map_call(call)), _ => item.measure,
+        }} }),
+        ordering: array::map(plan.ordering, fn(item) { {...item, key: match item.key {
+            OrderKey::Expr(expr) => OrderKey::Expr(mapped(expr)),
+            OrderKey::Aggregate(call) => OrderKey::Aggregate(map_call(call)), _ => item.key,
+        }} })};
+    {input, output, partition: array::map(plan.grouping, name_of),
+        order: array::map(array::concat([[order.time], order.ties]), fn(ref) { name_of(Expr::Column(ref)) })}
 };
 
 def column_ref_id_ok: Fn(ColumnRef) -> Bool = fn(ref) {
@@ -1174,7 +1298,8 @@ def order_key_valid: Fn(OrderKey, Array(String), Array(String)) -> Bool = fn(key
     match key {
         OrderKey::Expr(expr) => expr_valid(expr, source_aliases),
         OrderKey::AggregateRef(ref) => is_sql_identifier(ref.alias) && known_alias(measure_aliases, ref.alias),
-        OrderKey::Aggregate(call) => expr_valid(call.arg, source_aliases)
+        OrderKey::Aggregate(call) => call.function != AggregateFunction::Latest && call.latest == None
+            && expr_valid(call.arg, source_aliases)
             && (match call.filter {
                 Some(expr) => expr_valid(expr, source_aliases),
                 None => True,
@@ -1571,7 +1696,8 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
                 let having_ok = array::all(ex.having, fn(h) {
                     let measure_ok = match h.measure {
                         HavingMeasure::Ref(_) => False,
-                        HavingMeasure::Call(call) => expr_valid(call.arg, allowed)
+                        HavingMeasure::Call(call) => call.function != AggregateFunction::Latest && call.latest == None
+                            && expr_valid(call.arg, allowed)
                             && (match call.filter {
                                 Some(expr) => expr_valid(expr, allowed),
                                 None => True,
@@ -1619,7 +1745,8 @@ def having_measure_ok: Fn(Plan, HavingMeasure, Array(String)) -> Bool = fn(plan,
             Some(SelectItem::Computed(_)) => True,
             _ => False,
         },
-        HavingMeasure::Call(call) => expr_valid(call.arg, aliases)
+        HavingMeasure::Call(call) => call.function != AggregateFunction::Latest && call.latest == None
+            && expr_valid(call.arg, aliases)
             && (match call.filter {
                 Some(expr) => expr_valid(expr, aliases),
                 None => True,
@@ -1712,6 +1839,12 @@ def expr_derived_cols_ok: Fn(Expr, String, Array(String)) -> Bool = fn(expr, ali
 
 def aggregate_call_derived_cols_ok: Fn(AggregateCall, String, Array(String)) -> Bool = fn(call, alias, names) {
     expr_derived_cols_ok(call.arg, alias, names)
+        && match call.latest {
+            None => True,
+            Some(order) => array::all(array::concat([[order.time], order.ties]), fn(ref) {
+                expr_derived_cols_ok(Expr::Column(ref), alias, names)
+            }),
+        }
         && (match call.filter {
             Some(expr) => expr_derived_cols_ok(expr, alias, names),
             None => True,
@@ -1981,7 +2114,7 @@ def scalar_subquery_inner_ok: Fn(ScalarSubquery) -> Bool = fn(sq) {
         Some(expr) => expr_valid(expr, inner_aliases),
         None => True,
     };
-    source_id_ok && join_ids_ok && join_shape_ok && join_conds_ok
+    sq.function != AggregateFunction::Latest && source_id_ok && join_ids_ok && join_shape_ok && join_conds_ok
         && agg_arg_ok && agg_filter_ok && row_filter_ok
 };
 
@@ -2054,7 +2187,7 @@ def ranked_inner_ok: Fn(RankedKeySubquery) -> Bool = fn(sq) {
         Some(expr) => expr_valid(expr, inner_aliases),
         None => True,
     };
-    source_id_ok && join_ids_ok && join_shape_ok && join_conds_ok
+    sq.order.function != AggregateFunction::Latest && sq.order.latest == None && source_id_ok && join_ids_ok && join_shape_ok && join_conds_ok
         && no_self_dup && joins_distinct && key_ok
         && order_arg_ok && order_filter_ok && row_filter_ok
 };
@@ -2386,6 +2519,7 @@ def validate_structure_tables: Fn(Plan) -> Plan = fn(plan) {
 # identifiers, unknown source references, bad scalar arities and negative
 # limits with a Host diagnostic.  Never publishes a partial Query.
 def validate_structure: Fn(Plan) -> Plan = fn(plan) {
+    let checked = validate_latest_plan(plan);
     match plan.derived {
         Some(ds) => {
             if array::length(plan.sources) > 0
@@ -2734,6 +2868,7 @@ def aggregate_name: Fn(AggregateFunction) -> String = fn(function) {
         AggregateFunction::Avg => "avg",
         AggregateFunction::Min => "min",
         AggregateFunction::Max => "max",
+        AggregateFunction::Latest => fail!("Latest requires a staged grouped reduction"),
     }
 };
 
@@ -3090,14 +3225,14 @@ def named_expr_item: Fn(Expr, String) -> SelectItem = fn(expr, alias) {
 };
 
 def aggregate: Fn(AggregateFunction, Expr, Bool, String) -> SelectItem = fn(function, arg, distinct, alias) {
-    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: None, alias: alias};
+    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: None, alias: alias, latest: None};
     SelectItem::Aggregate(call)
 };
 
 # Filtered aggregate: the row-level predicate only narrows this aggregate's
 # input rows (`FILTER (WHERE ...)`); it is never merged into the global WHERE.
 def aggregate_filtered: Fn(AggregateFunction, Expr, Bool, Option(Expr), String) -> SelectItem = fn(function, arg, distinct, filter, alias) {
-    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: filter, alias: alias};
+    let call: AggregateCall = {function: function, arg: arg, distinct: distinct, filter: filter, alias: alias, latest: None};
     SelectItem::Aggregate(call)
 };
 
@@ -3367,12 +3502,12 @@ def having_bound: Fn(HavingOp, String, Expr) -> Having = fn(op, measure_alias, t
 # `<call> <op> <threshold>`; used for nested aggregate bodies.
 
 def having_call_bound: Fn(HavingOp, AggregateFunction, Expr, Bool, Expr) -> Having = fn(op, function, arg, distinct, threshold) {
-    let call: AggregateCall = {function, arg, distinct, filter: None, alias: "__having"};
+    let call: AggregateCall = {function, arg, distinct, filter: None, alias: "__having", latest: None};
     {op, measure: HavingMeasure::Call(call), threshold}
 };
 
 def having_call_filtered_bound: Fn(HavingOp, AggregateFunction, Expr, Bool, Option(Expr), Expr) -> Having = fn(op, function, arg, distinct, filter, threshold) {
-    let call: AggregateCall = {function, arg, distinct, filter, alias: "__having"};
+    let call: AggregateCall = {function, arg, distinct, filter, alias: "__having", latest: None};
     {op, measure: HavingMeasure::Call(call), threshold}
 };
 
@@ -3445,6 +3580,10 @@ pub use self::{
     Expr,
     AggregateFunction,
     AggregateCall,
+    LatestOrder,
+    LatestStage,
+    latest_calls,
+    latest_stage,
     ComputedOp,
     ComputedAggregate,
     SelectItem,

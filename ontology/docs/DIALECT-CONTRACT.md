@@ -23,6 +23,16 @@ emitting a set AST; a bare AST caller is responsible for its physical schema.
 SQLite can execute mixed-type sets that PostgreSQL rejects, so a model-derived
 set must never reach either renderer with mismatched output types.
 
+### Latest measure contract
+
+Latest measures use a shared pre-group window followed by single-row reduction
+in both dialects. The chosen value retains its physical numeric type and NULL;
+time ties use complete sample grain with explicit NULL ordering. Native PG
+timestamptz and normalized SQLite UTC text order the same instants under the
+declared encoding contract. EpochMillis and exact BIGINT values are also tested.
+The Latest execution checks do not establish full dialect equivalence for
+unrelated AST forms. See [Latest measures](LATEST-DESIGN.md).
+
 ### Set projection type contract
 
 Ontology derives a positional *output* type for each model-derived set

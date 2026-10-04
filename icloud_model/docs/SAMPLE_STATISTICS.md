@@ -1,10 +1,22 @@
 # Source-backed sample statistics
 
-This describes the product Model (`icloud-source-v12`).
+This describes the product Model (`icloud-source-v14`).
 Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 
 ## Choosing a statistical meaning
+
+The product declares `device_cpu_latest`, `device_memory_latest`,
+`server_cpu_latest` and `server_memory_latest`. These return the original
+percent value from the latest eligible sampling row, preserving a selected
+NULL. CPU/memory on one sample node share the same row. Latest is neither
+latest non-NULL nor Avg/Max. Select through `measures`; qualify with
+`measure_having`, rank with `top_by_measure`, or compare windows through
+GraphPair aligned on owner identity. Explicit row filters and windows apply
+before selection, and NULL-time rows cannot supply Latest. No implicit current
+time or extra validity filter is introduced. See the linked
+`Schema/syntax/graph/latest` knowledge point and
+[Latest measures](../../ontology/docs/LATEST-DESIGN.md).
 
 Each measure ID fixes one meaning. An average is not a default that callers can
 override. Select another declared ID for another meaning; an undeclared ID is

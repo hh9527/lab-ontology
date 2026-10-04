@@ -33,6 +33,13 @@ lowering code for complete query constructions.
 
 ## Construction boundary
 
+`AggregateFunction::Latest` requires `AggregateCall.latest` containing a closed
+time/grain ordering specification; ordinary calls require `latest:None`.
+Renderers introduce a shared pre-group row number and reduce only the selected
+row for Latest, preserving other aggregates' complete populations. Flat scalar
+subqueries, ranked-key subqueries and direct nested aggregate predicates reject
+Latest. See [Latest measures](LATEST-DESIGN.md) for declarations and semantics.
+
 `BuildCtx` is immutable. Builders take it as input and return a new context
 alongside the allocated resource. `bind(ctx, Val)` registers a scalar and
 returns an expression carrying its binding index; the scalar never becomes

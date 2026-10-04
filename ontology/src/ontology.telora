@@ -987,6 +987,10 @@ def sample_aggregate: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(pr
     }
 };
 
+def latest_measure: Fn(String, Option(String)) -> Fn(property::FieldPropertyCtx, Option(SampleAggregateDef)) -> SampleAggregateDef = fn(id, unit) {
+    sample_aggregate(id, qb::AggregateFunction::Latest, unit)
+};
+
 def time_field: Fn(TimeSemantics, TimeEncoding) -> Fn(property::FieldPropertyCtx, Option(TimeField)) -> TimeField = fn(semantics, encoding) {
     fn(ctx, previous) {
         if (semantics == TimeSemantics::Utc && encoding != TimeEncoding::EpochMillis && encoding != TimeEncoding::Rfc3339Text)
@@ -1841,12 +1845,46 @@ def measure_value_type: Fn(Array(EntityEntry), Array(MeasureEntry), String) -> O
                     let entity = get_index(entities, entry.entity);
                     field_output_type(get_index(entity.fields, entry.field).ty)
                 },
+                qb::AggregateFunction::Latest => {
+                    let entity = get_index(entities, entry.entity);
+                    field_output_type(get_index(entity.fields, entry.field).ty)
+                },
             },
         }
     };
 
 def measure_output_type: Fn(PreparedPayload, String) -> OutputType = fn(payload, id) {
     measure_value_type(payload.entities, payload.measures, id)
+};
+
+def measure_latest_order: Fn(EntityEntry, MeasureEntry, qb::Source) -> Option(qb::LatestOrder) = fn(entity, entry, source) {
+    if entry.aggregate != qb::AggregateFunction::Latest { None }
+    else {
+        let field = get_index(entity.fields, entry.field);
+        if (field.ty != Int.type && field.ty != Float.type) || entry.input != MeasureInput::All
+            || entry.predicate != None || entry.computed != None || array::length(entry.requires) > 0 {
+            fail!("Latest requires a numeric field without distinct, local filters or external dependencies", entry.id)
+        } else { () };
+        let dataset = match entity.dataset {
+            Some(spec) => spec,
+            None => fail!("Latest requires a metric dataset with an authoritative UTC instant and complete sample grain", entry.id),
+        };
+        if dataset.kind != DatasetKind::Metric || array::length(dataset.grain) == 0 || dataset.utc_time == None {
+            fail!("Latest requires a metric dataset with an authoritative UTC instant and complete sample grain", entry.id)
+        } else { () };
+        let time_name = match dataset.utc_time { Some(name) => name, None => fail!("Latest requires an authoritative UTC time") };
+        let time = match array::find(entity.fields, fn(field) { field.name == time_name }) {
+            Some(field) => field, None => fail!("unknown Latest time field", time_name),
+        };
+        Some({time: qb::column_ref(source, time.column), ties: array::map(array::filter(dataset.grain, fn(name) {
+            name != time_name
+        }), fn(name) {
+            let grain_field = match array::find(entity.fields, fn(field) { field.name == name }) {
+                Some(field) => field, None => fail!("unknown Latest grain field", name),
+            };
+            qb::column_ref(source, grain_field.column)
+        })})
+    }
 };
 
 def dimension_output_type: Fn(PreparedPayload, String) -> OutputType = fn(payload, id) {
@@ -1887,6 +1925,7 @@ def check_measure_contract: Fn(Array(EntityEntry), Array(MeasureEntry)) -> Array
     let validated = array::map(measures, fn(entry) {
         let entity = get_index(entities, entry.entity);
         let field = get_index(entity.fields, entry.field);
+        let latest_checked = measure_latest_order(entity, entry, entity.source);
         if field.logical_type == Some(LogicalType::Ipv4) && entry.computed == None
             && entry.aggregate != qb::AggregateFunction::Count {
             fail!("IPv4 measures support Count only; no address ordering or numeric aggregate is declared", entity.id, entry.id)
@@ -3042,7 +3081,8 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
                 };
                 let call: qb::AggregateCall = {function: entry.aggregate,
                     arg: qb::column(entity.source, field.column),
-                    distinct: entry.input == MeasureInput::Distinct, filter: filtered, alias: entry.id};
+                    distinct: entry.input == MeasureInput::Distinct, filter: filtered, alias: entry.id,
+                    latest: measure_latest_order(entity, entry, entity.source)};
                 if qb::aggregate_profile_accepts(call, profile) { True }
                 else { fail!("declared measure uses aggregate, filter or scalar capabilities not allowed by the query profile", entity.id, entry.id) }
             },
@@ -4536,6 +4576,8 @@ def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Arr
         };
         if spec.node != sample.id || measure.entity != sample.entity {
             fail!("graph aggregate measure does not belong to its sample node", spec.node, spec.measure)
+        } else if measure.aggregate == qb::AggregateFunction::Latest {
+            fail!("Latest is not supported in nested EXISTS aggregate predicates; use an outer projected measure", spec.measure)
         } else if measure.computed != None || array::length(measure.requires) > 0 {
             fail!("graph aggregate requires a non-computed sample measure without external dependencies", spec.measure)
         } else {
@@ -5027,8 +5069,10 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
                         (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, instance.source.alias)))
                     },
                 };
-                let item = qb::aggregate_filtered(measure.aggregate, qb::column(instance.source, field.column),
-                    measure.input == MeasureInput::Distinct, filtered.1, alias);
+                let call: qb::AggregateCall = {function: measure.aggregate, arg: qb::column(instance.source, field.column),
+                    distinct: measure.input == MeasureInput::Distinct, filter: filtered.1, alias,
+                    latest: measure_latest_order(entity, measure, instance.source)};
+                let item = qb::SelectItem::Aggregate(call);
                 (filtered.0, item, array::push(cached, item))
             }
         }
@@ -5821,6 +5865,7 @@ pub use self::{
     dataset,
     metric_value,
     sample_aggregate,
+    latest_measure,
     native_pair,
     time_field,
     dataset_description,

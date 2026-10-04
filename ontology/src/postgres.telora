@@ -198,6 +198,10 @@ def render_join: Fn(qb::Join, RenderCtx) -> Emitted = fn(join, ctx) {
 
 def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
     let arg = emit_expr(call.arg, ctx);
+    if call.function == qb::AggregateFunction::Latest {
+        let time = match call.latest { Some(order) => order.time, None => fail!("Latest ordering is required") };
+        {sql: `max(CASE WHEN \{quoted(time.source)}."__latest_row" = 1 AND \{quoted(time.source)}.\{quoted(time.column)} IS NOT NULL THEN \{arg.sql} END)`, ctx: arg.ctx}
+    } else {
     let distinct = if call.distinct { "DISTINCT " } else { "" };
     let filtered: Emitted = match call.filter {
         Some(expr) => {
@@ -208,6 +212,7 @@ def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
     };
     {sql: `\{qb::aggregate_name(call.function)}(\{distinct}\{arg.sql})\{filtered.sql}`,
         ctx: filtered.ctx}
+    }
 };
 
 def measure: Fn(qb::Plan, String, RenderCtx) -> Emitted = fn(plan, name, ctx) {
@@ -405,6 +410,7 @@ def render_scalar_comparison: Fn(qb::ScalarAggregateComparison, RenderCtx) -> Em
     let call: qb::AggregateCall = {
         function: sq.function, arg: sq.arg, distinct: sq.distinct,
         filter: sq.agg_filter, alias: "__scalar_value",
+        latest: None,
     };
     let value = aggregate(call, ctx);
     let source = render_source(sq.source, value.ctx);
@@ -654,7 +660,22 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
 };
 
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
+    emit_rows_from(raw, distinct, ctx, None)
+};
+
+def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = fn(raw, distinct, ctx, override) {
     let plan = if distinct { qb::validate_distinct_plan(raw) } else { qb::validate_structure(raw) };
+    if override == None && array::length(qb::latest_calls(plan)) > 0 {
+        let stage = qb::latest_stage(plan);
+        let input = emit_rows(stage.input, False, ctx);
+        let partition = if array::length(stage.partition) == 0 { "" }
+            else { `PARTITION BY \{string::join(array::map(stage.partition, quoted), ", ")} ` };
+        let orders = array::map(array::enumerate(stage.order), fn(pair) {
+            `\{quoted(pair.1)} \{if pair.0 == 0 { "DESC NULLS LAST" } else { "ASC NULLS FIRST" }}`
+        });
+        let source = `(SELECT "__latest_input".*, row_number() OVER (\{partition}ORDER BY \{string::join(orders, ", ")}) AS "__latest_row" FROM (\{input.sql}) AS "__latest_input") AS "__latest_stage"`;
+        emit_rows_from(stage.output, distinct, input.ctx, Some(source))
+    } else {
     match plan.partition {
         Some(pt) => emit_partitioned(plan, pt, ctx),
         None => {
@@ -663,7 +684,7 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
             let value = select_item(item, plan, state.ctx);
             {sql: array::push(state.sql, value.sql), ctx: value.ctx}
         });
-        let source = render_from(plan, selected.ctx);
+        let source = match override { Some(sql) => {sql, ctx: selected.ctx}.ty!(Emitted), None => render_from(plan, selected.ctx) };
         let join_initial: Arguments = {sql: [], ctx: source.ctx};
         let joins = array::fold(plan.joins, join_initial, fn(state, join) {
             let value = render_join(join, state.ctx);
@@ -704,6 +725,7 @@ def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx)
         {sql: `\{prefix} \{string::join(selected.sql, ", ")} FROM \{source.sql}\{join_sql}\{where_sql}\{group_sql}\{having_sql}\{order_sql}\{limit.sql}\{offset.sql}`,
             ctx: offset.ctx}
         },
+    }
     }
 };
 

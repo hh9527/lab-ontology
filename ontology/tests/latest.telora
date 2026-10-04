@@ -1,0 +1,108 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::intent::{ query_intent_ast_factory };
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::test as test;
+use std::value::{ Value };
+
+@edsl::entity_id("samples")
+@edsl::entity_source("samples", "s")
+@edsl::dataset(edsl::DatasetKind::Metric, ["id"], Some("ts"))
+type Samples = struct {
+    @edsl::column("id") @edsl::key() @edsl::measure("sample_count", qb::AggregateFunction::Count, []) id: Int,
+    @edsl::column("owner")
+    @edsl::dimension("owner", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    owner: String,
+    @edsl::column("tenant") tenant: String,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    ts: Option(Int),
+    @edsl::column("value")
+    @edsl::dimension("sample_value", True, True, [edsl::FilterOp::Gt], [edsl::FilterInputKind::Int])
+    @edsl::filtered_measure("positive_count", qb::AggregateFunction::Count, [], {field: "value", op: edsl::FilterOp::Gt, input: edsl::FilterInput::Int(0)})
+    @edsl::measure("mean", qb::AggregateFunction::Avg, [])
+    @edsl::metric_value("mean", qb::AggregateFunction::Avg, Some("byte"))
+    @edsl::latest_measure("latest", Some("byte"))
+    value: Option(Int),
+    @edsl::column("memory")
+    @edsl::measure("memory_mean", qb::AggregateFunction::Avg, [])
+    @edsl::metric_value("memory_mean", qb::AggregateFunction::Avg, Some("byte"))
+    @edsl::latest_measure("memory_latest", Some("byte"))
+    memory: Option(Int),
+    @edsl::column("value")
+    @edsl::computed_measure("latest_minus_mean", qb::ComputedOp::Sub, "latest", "mean")
+    computed_carrier: Int,
+};
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project,
+        qb::Operator::Aggregate, qb::Operator::Group, qb::Operator::Order, qb::Operator::Partition,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Having, qb::Operator::Filter],
+    allowed_aggregates: [qb::AggregateFunction::Latest, qb::AggregateFunction::Avg, qb::AggregateFunction::Count],
+    allowed_join_kinds: [], allowed_scalars: [qb::ScalarFunction::Sub, qb::ScalarFunction::Eq, qb::ScalarFunction::Gt], allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("latest", [Samples.type], profile);
+def intent: Value = json::parse(r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"samples"}],
+    "edges":[],"select":[{"node":"s","dimension":"owner"}],
+    "measures":[{"node":"s","measure":"latest"},{"node":"s","measure":"memory_latest"},{"node":"s","measure":"mean"},{"node":"s","measure":"latest_minus_mean"},{"node":"s","measure":"sample_count"},{"node":"s","measure":"positive_count"}]}"#).unwrap!();
+def ast: qb::QueryAst = query_intent_ast_factory(payload)(intent);
+def rows: qb::Plan = match ast.plan { qb::QueryPlan::Rows(rows) => rows, _ => fail!("rows required") };
+def forge: Fn(qb::AggregateCall, String) -> qb::AggregateCall = fn(call, mode) {
+    if call.function != qb::AggregateFunction::Latest { call }
+    else if mode == "distinct" { {...call, distinct: True} }
+    else if mode == "missing" { {...call, latest: None} }
+    else if mode == "filtered" { {...call, filter: Some(qb::scalar(qb::ScalarFunction::Eq, [call.arg, call.arg]))} }
+    else {
+        let order = match call.latest { Some(order) => order, None => fail!("order required") };
+        if mode == "source" { {...call, latest: Some({...order, time: {...order.time, source: "missing"}})} }
+        else { {...call, latest: Some({...order, ties: array::concat([order.ties, order.ties])})} }
+    }
+};
+def invalid: Fn(String) -> qb::Query = fn(mode) {
+    sqlite::build_query({...ast, plan: qb::QueryPlan::Rows({...rows, projection: array::map(rows.projection, fn(item) {
+        match item { qb::SelectItem::Aggregate(call) => qb::SelectItem::Aggregate(forge(call, mode)), _ => item }
+    })})})
+};
+pub def integer_latest_preserves_type_and_computed_dependencies: test::Test = test::should_ok(fn() {
+    edsl::measure_output_type(payload, "latest") == edsl::OutputType::Integer
+        && edsl::measure_output_type(payload, "latest_minus_mean") == edsl::OutputType::Number
+        && sqlite::build_query(ast).bindings == postgres::build_query(ast).bindings
+});
+pub def latest_rejects_distinct: test::Test = test::should_fail_with(fn() { invalid("distinct") }, "invalid expression");
+pub def latest_rejects_aggregate_local_filter: test::Test = test::should_fail_with(fn() { invalid("filtered") }, "invalid expression");
+pub def latest_rejects_missing_order: test::Test = test::should_fail_with(fn() { invalid("missing") }, "invalid expression");
+pub def latest_rejects_foreign_time_source: test::Test = test::should_fail_with(fn() { invalid("source") }, "same sample source");
+pub def latest_rejects_duplicate_grain_ties: test::Test = test::should_fail_with(fn() { invalid("ties") }, "invalid expression");
+pub def latest_requires_aggregate_authorization: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("denied", [Samples.type], {...profile, allowed_aggregates: [qb::AggregateFunction::Avg]})
+}, "not allowed by the query profile");
+pub def latest_requires_partition_authorization: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("denied", [Samples.type], {...profile, allowed_operators: array::filter(profile.allowed_operators, fn(op) { op != qb::Operator::Partition })})
+}, "not allowed by the query profile");
+
+@edsl::entity_id("untimed") @edsl::entity_source("untimed", "u")
+type Untimed = struct {
+    @edsl::column("id") @edsl::key() id: Int,
+    @edsl::column("value") @edsl::measure("untimed_latest", qb::AggregateFunction::Latest, []) value: Int,
+};
+pub def latest_requires_authoritative_time_and_grain: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("untimed", [Untimed.type], profile)
+}, "Latest requires a metric dataset");
+pub def latest_rejects_ordinary_aggregate_order_payload: test::Test = test::should_fail_with(fn() {
+    sqlite::build_query({...ast, plan: qb::QueryPlan::Rows({...rows, projection: array::map(rows.projection, fn(item) {
+        match item { qb::SelectItem::Aggregate(call) => if call.function == qb::AggregateFunction::Latest {
+            qb::SelectItem::Aggregate({...call, function: qb::AggregateFunction::Max})
+        } else { item }, _ => item }
+    })})})
+}, "invalid expression");
+type QueryPair = struct { sqlite: qb::Query, postgres: qb::Query };
+def integer_ast: qb::QueryAst = query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"samples"}],
+    "edges":[],"select":[{"node":"s","dimension":"owner"}],"measures":[{"node":"s","measure":"latest"}]}"#).unwrap!());
+type RuntimeBundle = struct { mixed: QueryPair, integer: QueryPair };
+pub def runtime_queries: Value = codec::encode({
+    mixed: {sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}.ty!(QueryPair),
+    integer: {sqlite: sqlite::build_query(integer_ast), postgres: postgres::build_query(integer_ast)}.ty!(QueryPair),
+}.ty!(RuntimeBundle));

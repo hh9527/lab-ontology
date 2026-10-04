@@ -52,6 +52,7 @@ def aggregate_name: Fn(AggregateFunction) -> String = fn(function) {
         AggregateFunction::Avg => "avg",
         AggregateFunction::Min => "min",
         AggregateFunction::Max => "max",
+        AggregateFunction::Latest => fail!("Latest requires a staged grouped reduction"),
     }
 };
 
@@ -163,6 +164,10 @@ def render_scalar_subquery: Fn(ScalarSubquery, BuildCtx) -> String = fn(sq, ctx)
 };
 
 def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> String = fn(call, ctx) {
+    if call.function == AggregateFunction::Latest {
+        let order = match call.latest { Some(order) => order, None => fail!("Latest ordering is required") };
+        `max(CASE WHEN \{order.time.source}.__latest_row = 1 AND \{order.time.source}.\{order.time.column} IS NOT NULL THEN \{render_expr(call.arg, ctx)} END)`
+    } else {
     let rendered = render_expr(call.arg, ctx);
     let distinct_sql = if call.distinct { "DISTINCT " } else { "" };
     let filter_part = match call.filter {
@@ -170,6 +175,7 @@ def render_aggregate_call: Fn(AggregateCall, BuildCtx) -> String = fn(call, ctx)
         None => "",
     };
     `\{aggregate_name(call.function)}(\{distinct_sql}\{rendered})\{filter_part}`
+    }
 };
 
 # Renders the full expression of a measure alias (aggregate or computed) by
@@ -578,10 +584,25 @@ def render_from_clause: Fn(Plan, BuildCtx) -> String = fn(plan, ctx) {
 };
 
 def render_unpartitioned: Fn(Plan, Bool, BuildCtx) -> String = fn(plan, distinct, ctx) {
+    if array::length(qb::latest_calls(plan)) == 0 { render_unpartitioned_from(plan, distinct, ctx, None) }
+    else {
+        let stage = qb::latest_stage(plan);
+        let input = render_unpartitioned(stage.input, False, ctx);
+        let partition = if array::length(stage.partition) == 0 { "" }
+            else { `PARTITION BY \{string::join(stage.partition, ", ")} ` };
+        let orders = array::map(array::enumerate(stage.order), fn(pair) {
+            `\{pair.1} \{if pair.0 == 0 { "DESC NULLS LAST" } else { "ASC NULLS FIRST" }}`
+        });
+        let source = `(SELECT __latest_input.*, row_number() OVER (\{partition}ORDER BY \{string::join(orders, ", ")}) AS __latest_row FROM (\{input}) AS __latest_input) AS __latest_stage`;
+        render_unpartitioned_from(stage.output, distinct, ctx, Some(source))
+    }
+};
+
+def render_unpartitioned_from: Fn(Plan, Bool, BuildCtx, Option(String)) -> String = fn(plan, distinct, ctx, source) {
     let select_sql = string::join(array::map(plan.projection, fn(item) {
         render_select_item(item, plan, ctx)
     }), ", ");
-    let from_sql = render_from_clause(plan, ctx);
+    let from_sql = match source { Some(sql) => sql, None => render_from_clause(plan, ctx) };
     let joins = array::map(plan.joins, fn(join) { render_join(join, ctx) });
     let join_text = if array::length(joins) > 0 {
         ` \{string::join(joins, " ")}`
