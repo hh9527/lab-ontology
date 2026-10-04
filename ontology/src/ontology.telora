@@ -93,7 +93,7 @@ type DimensionNote = struct { id: String, label: String, summary: String };
 type DimensionDescriptions = struct { notes: Array(DimensionNote) };
 
 type LocalizedKnowledgeText = struct { locale: String, label: String, summary: String };
-type KnowledgeKind = enum { Index, DataType, Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
+type KnowledgeKind = enum { Index, DataType, Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole };
 type KnowledgeTarget = struct { kind: KnowledgeKind, owner: String, id: String };
 def knowledge_key: Fn(KnowledgeTarget) -> String = fn(target) {
     if target.kind == KnowledgeKind::Index { "index" }
@@ -276,16 +276,15 @@ type RelationAlias = struct { id: String, label: String };
 type RelationAliasesDef = struct { aliases: Array(RelationAlias) };
 
 @prelude::property(PropertyTarget::Field)
-type MetricValueSpec = struct {
+type PrimarySampleMeasureSpec = struct {
     id: String,
     aggregate: qb::AggregateFunction,
     unit: Option(String),
 };
 
-# Additional explicitly named summaries over raw samples of an existing metric
-# field. They do not change that field's declared primary metric aggregation.
+# Additional statistics over the same field and unit as its primary sample measure.
 @prelude::property(PropertyTarget::Field)
-type SampleAggregateDef = struct { summaries: Array(MetricValueSpec) };
+type SampleAggregateDef = struct { summaries: Array(PrimarySampleMeasureSpec) };
 
 # Union (multi-source) entity declaration. An entity declared only with
 # `union_source` (and no `entity_source`) is a logical entity whose rows are the
@@ -608,17 +607,17 @@ type EntityEntry = struct {
     fields: Array(FieldEntry),
     union: Option(UnionEntry),
     dataset: Option(DatasetSpec),
-    metrics: Array(MetricValueEntry),
+    sample_measures: Array(SampleMeasureEntry),
     description: Option(DatasetDescription),
     scope: Array(ScopePredicate),
 };
 
-type MetricValueEntry = struct {
+type SampleMeasureEntry = struct {
     id: String,
     field: String,
     aggregate: qb::AggregateFunction,
     unit: Option(String),
-    role: MetricValueRole,
+    role: SampleMeasureRole,
 };
 
 type MeasurePredicateBrief = struct { field: String, op: FilterOp, input: FilterInput };
@@ -635,7 +634,7 @@ type MeasureBrief = struct {
     required_dataset_ids: Array(String),
     predicate: Option(MeasurePredicateBrief),
     computed: Option(ComputedMeasureEntry),
-    metric: Option(MetricValueEntry),
+    sampling: Option(SampleMeasureEntry),
 };
 
 type DimensionScopeBrief = struct { field: String, op: FilterOp, input: FilterInput };
@@ -690,7 +689,7 @@ type VisibleDimensionBrief = struct {
     scope: Array(DimensionScopeBrief),
 };
 
-type MetricValueRole = enum { DeclaredMetric, SampleSummary };
+type SampleMeasureRole = enum { Primary, SampleSummary };
 
 type TimeRoleBrief = struct {
     field: String,
@@ -712,7 +711,6 @@ type DatasetBrief = struct {
     kind: DatasetKind,
     dimension_ids: Array(String),
     measure_ids: Array(String),
-    metric_ids: Array(String),
     relation_ids: Array(String),
     time_roles: Array(TimeRoleBrief),
     scope: Array(DimensionScopeBrief),
@@ -969,16 +967,16 @@ def dataset: Fn(DatasetKind, Array(String), Option(String)) -> Fn(td::TypeDesc, 
     }
 };
 
-def metric_value: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(property::FieldPropertyCtx, Option(MetricValueSpec)) -> MetricValueSpec = fn(id, aggregate, unit) {
+def sample_measure: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(property::FieldPropertyCtx, Option(PrimarySampleMeasureSpec)) -> PrimarySampleMeasureSpec = fn(id, aggregate, unit) {
     fn(ctx, previous) {
-        let result: MetricValueSpec = { id, aggregate, unit };
+        let result: PrimarySampleMeasureSpec = { id, aggregate, unit };
         result
     }
 };
 
 def sample_aggregate: Fn(String, qb::AggregateFunction, Option(String)) -> Fn(property::FieldPropertyCtx, Option(SampleAggregateDef)) -> SampleAggregateDef = fn(id, aggregate, unit) {
     fn(ctx, previous) {
-        let summary: MetricValueSpec = { id, aggregate, unit };
+        let summary: PrimarySampleMeasureSpec = { id, aggregate, unit };
         let summaries = match previous {
             Some(existing) => array::push(existing.summaries, summary),
             None => [summary],
@@ -1510,7 +1508,7 @@ def field_roles_for: Fn(Type, FieldEntry, Array(ReferenceSpec)) -> Array(FieldRo
     let declared = match property::get_field_prop(owner, field.index, FieldRolesDef.type) {
         Some(note) => note.roles, None => [],
     };
-    let roles = if property::get_field_prop(owner, field.index, MetricValueSpec.type) != None
+    let roles = if property::get_field_prop(owner, field.index, PrimarySampleMeasureSpec.type) != None
         && !array::any(declared, fn(role) { role == FieldRole::Metric }) {
         array::push(declared, FieldRole::Metric)
     } else { declared };
@@ -1604,9 +1602,9 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
             }
         },
     };
-    let metrics: Array(MetricValueEntry) = array::flat_map(fields, fn(field) {
-        let declared = property::get_field_prop(ty, field.index, MetricValueSpec.type);
-        let primary: Array(MetricValueEntry) = match declared {
+    let sample_measures: Array(SampleMeasureEntry) = array::flat_map(fields, fn(field) {
+        let declared = property::get_field_prop(ty, field.index, PrimarySampleMeasureSpec.type);
+        let primary: Array(SampleMeasureEntry) = match declared {
             None => [],
             Some(metric) => do {
                 let is_metric = match validated_dataset {
@@ -1614,38 +1612,27 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                     None => False,
                 };
                 if !is_metric {
-                    fail!("metric value requires a metric dataset", field.name)
+                    fail!("sample measure requires a metric dataset", field.name)
                 } else if metric.id == "" || (field.ty != Int.type && field.ty != Float.type) {
-                    fail!("metric value requires an id and numeric field", field.name)
+                    fail!("sample measure requires an id and numeric field", field.name)
                 } else {
-                    let measure = property::get_field_prop(ty, field.index, MeasureDef.type);
-                    match measure {
-                        Some(declared) => if array::any(declared.measures, fn(spec) {
-                            spec.id == metric.id && spec.aggregate == metric.aggregate && spec.input == MeasureInput::All
-                        }) {
-                            ()
-                        } else {
-                            fail!("metric metadata disagrees with its lowerable measure", metric.id)
-                        },
-                        None => fail!("metric value requires a lowerable measure", metric.id),
-                    };
-                    let result: MetricValueEntry = { id: metric.id, field: field.name, aggregate: metric.aggregate, unit: metric.unit, role: MetricValueRole::DeclaredMetric };
+                    let result: SampleMeasureEntry = { id: metric.id, field: field.name, aggregate: metric.aggregate, unit: metric.unit, role: SampleMeasureRole::Primary };
                     [result]
                 }
             },
         };
-        let summaries: Array(MetricValueEntry) = match property::get_field_prop(ty, field.index, SampleAggregateDef.type) {
+        let summaries: Array(SampleMeasureEntry) = match property::get_field_prop(ty, field.index, SampleAggregateDef.type) {
             None => [],
             Some(extra) => do {
                 let base = match declared {
                     Some(metric) => metric,
-                    None => fail!("sample aggregate requires a declared metric on the same field", field.name),
+                    None => fail!("sample aggregate requires a primary sample measure on the same field", field.name),
                 };
                 array::map(extra.summaries, fn(spec) {
                     if spec.id == "" || spec.unit != base.unit {
-                        fail!("sample aggregate requires an id and the original metric unit", field.name, spec.id)
+                        fail!("sample aggregate requires an id and the primary sample measure unit", field.name, spec.id)
                     } else {
-                        let result: MetricValueEntry = { id: spec.id, field: field.name, aggregate: spec.aggregate, unit: spec.unit, role: MetricValueRole::SampleSummary };
+                        let result: SampleMeasureEntry = { id: spec.id, field: field.name, aggregate: spec.aggregate, unit: spec.unit, role: SampleMeasureRole::SampleSummary };
                         result
                     }
                 })
@@ -1653,10 +1640,10 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
         };
         array::concat([primary, summaries])
     });
-    if let Some(duplicate) = array::find(metrics, fn(metric) {
-        array::length(array::filter(metrics, fn(other) { other.id == metric.id })) > 1
+    if let Some(duplicate) = array::find(sample_measures, fn(metric) {
+        array::length(array::filter(sample_measures, fn(other) { other.id == metric.id })) > 1
     }) {
-        fail!("duplicate metric value id", duplicate.id)
+        fail!("duplicate sample measure id", duplicate.id)
     } else { () };
     let field_roles = array::flat_map(fields, fn(field) {
         let roles = field_roles_for(ty, field, references);
@@ -1679,7 +1666,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 None => source.alias,
             };
             let handle = qb::source_with_hint(qb::build_context(), source.table, source.alias).1;
-            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, source: handle, key_field, fields, union: None, dataset: validated_dataset, metrics, description, scope: entity_scopes, references, field_roles };
+            let result: EntityEntry = { index, id, entity_type: ty, table: source.table, alias: source.alias, source: handle, key_field, fields, union: None, dataset: validated_dataset, sample_measures, description, scope: entity_scopes, references, field_roles };
             result
         },
         (None, Some(union_def)) => do {
@@ -1690,7 +1677,7 @@ def build_entity: Fn(Type, Int) -> EntityEntry = fn(ty, index) {
                 None => union.alias,
             };
             let handle = qb::source_with_hint(qb::build_context(), union.alias, union.alias).1;
-            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, source: handle, key_field, fields, union: Some(union), dataset: validated_dataset, metrics, description, scope: entity_scopes, references, field_roles };
+            let result: EntityEntry = { index, id, entity_type: ty, table: "", alias: union.alias, source: handle, key_field, fields, union: Some(union), dataset: validated_dataset, sample_measures, description, scope: entity_scopes, references, field_roles };
             result
         },
         _ => fail!("entity must declare exactly one of entity_source or union_source", ty),
@@ -1731,6 +1718,12 @@ def resolve_required: Fn(Array(EntityEntry), Array(Type)) -> Array(Int) = fn(ent
 def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(MeasureEntry) = fn(entities, entity) {
     let fields = entity.fields;
     array::flat_map(fields, fn(f) {
+        let primary = match property::get_field_prop(entity.entity_type, f.index, PrimarySampleMeasureSpec.type) {
+            Some(spec) => [{id: spec.id, entity: entity.index, field: f.index,
+                aggregate: spec.aggregate, input: MeasureInput::All, alias: spec.id,
+                requires: [], predicate: None, computed: None}.ty!(MeasureEntry)],
+            None => [],
+        };
         let plain = match property::get_field_prop(entity.entity_type, f.index, MeasureDef.type) {
             Some(d) => array::map(d.measures, fn(spec) {
                 let result: MeasureEntry = {
@@ -1799,7 +1792,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
             }),
             None => [],
         };
-        array::concat([plain, filtered, sample_summaries, computed])
+        array::concat([primary, plain, filtered, sample_summaries, computed])
     })
 };
 
@@ -2832,7 +2825,7 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
                     || property::get_field_prop(e.entity_type, field.index, TimeField.type) != None
                     || array::any(payload.dimensions, fn(d) { d.entity == e.index && d.authorized && d.field == field.index })
                     || array::any(payload.measures, fn(m) { m.entity == e.index && m.field == field.index })
-                    || array::any(e.metrics, fn(metric) { metric.field == field.name })
+                    || array::any(e.sample_measures, fn(metric) { metric.field == field.name })
                     || array::any(payload.relations, fn(rel) {
                         rel.from == e.index && rel.id != "" && match rel.guard {
                             Some(guard) => guard.field == field.name, None => False,
@@ -2856,9 +2849,6 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
         }),
         KnowledgeKind::BusinessLink => array::any(payload.business_links, fn(link) {
             link.id == target.id && get_index(payload.entities, link.hub).id == target.owner
-        }),
-        KnowledgeKind::Metric => array::any(payload.entities, fn(e) {
-            e.id == target.owner && array::any(e.metrics, fn(metric) { metric.id == target.id })
         }),
         KnowledgeKind::TimeRole => array::any(payload.entities, fn(e) {
             e.id == target.owner && array::any(e.fields, fn(field) {
@@ -3326,9 +3316,9 @@ def time_logical_type: Fn(TimeField) -> TimeLogicalType = fn(role) {
     }
 };
 
-def metric_domain: Fn(PreparedPayload, String) -> Array(MetricValueEntry) = fn(payload, id) {
+def sample_measure_domain: Fn(PreparedPayload, String) -> Array(SampleMeasureEntry) = fn(payload, id) {
     match array::find(payload.entities, fn(entry) { entry.id == id }) {
-        Some(entry) => entry.metrics,
+        Some(entry) => entry.sample_measures,
         None => fail!(`unknown dataset \{id}`, id),
     }
 };
@@ -3363,7 +3353,7 @@ def measure_domain: Fn(PreparedPayload, String) -> MeasureBrief = fn(payload, id
         required_dataset_ids,
         predicate,
         computed,
-        metric: array::find(entity.metrics, fn(entry) { entry.id == id }),
+        sampling: array::find(entity.sample_measures, fn(entry) { entry.id == id }),
     };
     result
 };
@@ -3479,7 +3469,6 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
                 d.entity == entity.index && (!authorized_only || d.authorized)
             }), fn(d) { d.id }),
             measure_ids: array::map(array::filter(payload.measures, fn(m) { m.entity == entity.index }), fn(m) { m.id }),
-            metric_ids: array::map(entity.metrics, fn(metric) { metric.id }),
             relation_ids: array::map(array::filter(payload.relations, fn(rel) {
                 rel.id != "" && (rel.from == entity.index || rel.to == entity.index)
             }), fn(rel) { rel.id }),
@@ -5769,10 +5758,10 @@ pub use self::{
     TimeEncoding,
     TimeField,
     DatasetSpec,
-    MetricValueSpec,
-    MetricValueEntry,
+    PrimarySampleMeasureSpec,
+    SampleMeasureEntry,
     MeasureBrief,
-    MetricValueRole,
+    SampleMeasureRole,
     SampleAggregateDef,
     DatasetDescription,
     LocalizedKnowledgeText,
@@ -5863,7 +5852,7 @@ pub use self::{
     reference,
     entity_id,
     dataset,
-    metric_value,
+    sample_measure,
     sample_aggregate,
     latest_measure,
     native_pair,
@@ -5912,7 +5901,7 @@ pub use self::{
     canonical_utc_second,
     canonical_rfc3339,
     canonical_ipv4_view,
-    metric_domain,
+    sample_measure_domain,
     measure_domain,
     measure_detail,
     relation_domain,

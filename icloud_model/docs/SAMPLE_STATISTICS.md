@@ -104,7 +104,7 @@ node scripts/check-icloud-kpi-measures.mjs bin/icloud_model.snapshot.wasm
 
 ## Terminology and source uncertainty
 
-All four online-rate populations declare their Avg as a primary metric and
+All four online-rate populations declare their Avg as a primary sample measure and
 Min/Max as sample summaries. PonDeviceKPI explicitly declares unitName: percent,
 so its summaries use % and a 90% threshold uses raw value 90. NetworkDeviceKPI
 has no unit declaration; both online-rate tables declare ratio/one and the PON

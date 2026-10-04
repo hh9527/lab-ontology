@@ -54,7 +54,6 @@ The index enumerates no business instances.
 | Relation | `Relation/{relation}` |
 | DataType | `Type/{type}` |
 | Value | `Value/{type}/{value}` |
-| Metric | `Metric/{dataset}/{metric}` |
 | TimeRole | `TimeRole/{dataset}/{field}` |
 | BusinessLink | `BusinessLink/{hub}/{link}` |
 
@@ -67,7 +66,7 @@ Names, aliases and labels are distinct from canonical Intent IDs.
 
 Dataset detail contains `{id,grain,time_roles,references,field_roles}`.
 Its Member links directly identify published Fields, Dimensions, Measures,
-Relations, Metrics, TimeRoles and BusinessLinks, plus applicable schema contracts.
+Relations, TimeRoles and BusinessLinks, plus applicable schema contracts.
 Dimension links identify its Field, logical Types and declared Values.
 A relation publishes its endpoints, cardinality and shape from the same
 Prepared Model used for query lowering.
@@ -76,12 +75,18 @@ Field detail contains `{id,dataset,nullable,logical_type,roles,reference_ids}`.
 Value detail contains `{id,type_id,wires}`. DataType detail has id; its description
 and schema links explain the logical value domain and supported operations.
 Dimension, Measure and Relation preserve the corresponding Model brief.
+Measure detail includes `sampling`, when declared: source field, unit, aggregate
+and role (`Primary` or `SampleSummary`). Sampling metadata belongs to that
+Measure and has no separate knowledge key. `sample_measure` directly declares a
+primary sample measure and its unit; `sample_aggregate` declares another statistic on the same field
+with the same unit. Dataset kind `Metric` describes a sampling population, and
+Field role `Metric` describes quantitative use; neither is a knowledge node kind.
 Metric and TimeRole identify their owning dataset. BusinessLink contains
 `{id,hub,direction,guard}`. Schema detail is empty; its description and links
 describe interface shapes, Intent syntax and query constraints.
 
 Field visibility comes from grain, time roles, visible dimensions, measures
-and metrics. A private physical column alone is not published.
+and sampling measures. A private physical column alone is not published.
 A Field ID is not automatically a queryable Dimension ID.
 Logical type operations do not grant field authorization: inspect the
 Dimension's ops, filterable flag and time role.

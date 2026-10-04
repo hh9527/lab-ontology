@@ -34,7 +34,7 @@ cpu_usage: Float,
 mem_usage: Float,
 ```
 
-The annotation requires an existing numeric metric on the same field, with a
+The annotation requires a primary numeric sample measure on the same field, with a
 matching unit. It declares a stable measure ID and derives ordering from
 the enclosing dataset's authoritative UTC time and complete sampling grain.
 The caller does not choose a time field, ordering direction or NULL policy.

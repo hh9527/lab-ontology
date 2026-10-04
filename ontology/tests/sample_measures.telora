@@ -1,0 +1,66 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use std::array as array;
+use std::test as test;
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Aggregate, qb::Operator::Group],
+    allowed_join_kinds: [],
+    allowed_aggregates: [qb::AggregateFunction::Avg, qb::AggregateFunction::Max],
+    allowed_scalars: [], allow_distinct: False,
+};
+
+@edsl::entity_id("samples")
+@edsl::entity_source("samples", "s")
+@edsl::dataset(edsl::DatasetKind::Metric, ["ts"], Some("ts"))
+type Samples = struct {
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
+    ts: String,
+    @edsl::column("value")
+    @edsl::sample_measure("mean", qb::AggregateFunction::Avg, Some("%"))
+    @edsl::sample_aggregate("peak", qb::AggregateFunction::Max, Some("%"))
+    value: Float,
+};
+
+pub def primary_and_summary_are_lowerable_measures_with_inline_metadata: test::Test = test::should_ok(fn() {
+    let payload = edsl::build_root("sample-measures", [Samples.type], profile);
+    let mean = edsl::measure_domain(payload, "mean");
+    let peak = edsl::measure_domain(payload, "peak");
+    match (mean.sampling, peak.sampling) {
+        (Some(primary), Some(summary)) =>
+            array::length(payload.measures) == 2 && mean.field == Some("value")
+                && peak.field == mean.field && primary.unit == Some("%")
+                && summary.unit == primary.unit && primary.role == edsl::SampleMeasureRole::Primary
+                && summary.role == edsl::SampleMeasureRole::SampleSummary,
+        _ => fail!("sample measures lost their source or metadata", mean, peak),
+    }
+});
+
+@edsl::entity_source("bad_units", "b")
+@edsl::dataset(edsl::DatasetKind::Metric, ["ts"], Some("ts"))
+type BadUnits = struct {
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
+    ts: String,
+    @edsl::column("value")
+    @edsl::sample_measure("mean", qb::AggregateFunction::Avg, Some("%"))
+    @edsl::sample_aggregate("peak", qb::AggregateFunction::Max, Some("byte"))
+    value: Float,
+};
+
+pub def summary_rejects_different_unit: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("bad-units", [BadUnits.type], profile)
+}, "sample aggregate requires an id and the primary sample measure unit");
+
+@edsl::entity_source("missing_primary", "m")
+type MissingPrimary = struct {
+    @edsl::column("value")
+    @edsl::sample_aggregate("peak", qb::AggregateFunction::Max, Some("%"))
+    value: Float,
+};
+
+pub def summary_requires_primary_on_same_field: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("missing-primary", [MissingPrimary.type], profile)
+}, "sample aggregate requires a primary sample measure on the same field");

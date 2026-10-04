@@ -34,10 +34,10 @@ also needs its usual source, column and capability annotations.
 | Metric | Describes quantitative use | A unit, aggregation rule or queryable measure |
 
 Roles may overlap: uuid above has Appellation and the derived Reference role.
-No role is guessed from an attribute name. Formal `metric_value` declarations
+No role is guessed from an attribute name. Formal `sample_measure` declarations
 also derive Metric; explicitly labeling the same field Metric does not
 duplicate it. A numeric field or count measure does not automatically become
-Metric. Formal metric metadata continues to define units and aggregation.
+Metric. Sample measure metadata defines units and aggregation.
 
 ## Unique reference sets
 

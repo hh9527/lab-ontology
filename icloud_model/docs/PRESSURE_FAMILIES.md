@@ -314,7 +314,7 @@ conditions hold for the same complete owner key; mixing tenants must fail.
 For Q0091/Q0092, the declared `Sum` metric cannot be silently used as `AVG`.
 Explicit `port_count_sample_avg`, `used_port_sample_avg`, and
 `running_port_sample_avg` now model the alternative sample-mean knowledge
-points, preserving the original Sum measures and units. `metric_domain`
+points, preserving the original Sum measures and units. `sample_measure_domain`
 exposes each role and aggregation; qualification selects the named Avg rather
 than overriding the Sum metric. The two thresholds lower as separate EXISTS
 with complete resource-and-tenant correlation, and the count remains over

@@ -72,7 +72,7 @@ test('links nested type documentation, prose, vocabulary entries, values and com
     dataset: 'a', id: 'status', type_id: 'status',
     input_docs: [{ kind: 'DatetimeUtc', text: 'Use DatetimeUtc, not DatetimeUtcExtra; see DataType/DatetimeUtc.' }],
     values: [{ id: 'ready', label: 'Ready' }], canonical_order: ['ready'],
-    metric: { id: 'count', field: 'status' }, computed: { left: 'count', right: 'count', op: 'Add' },
+    sampling: { id: 'count', field: 'status' }, computed: { left: 'count', right: 'count', op: 'Add' },
   });
   source.description.summary = 'DatetimeUtc and Int are logical types.';
   const md = renderMarkdown([
@@ -80,7 +80,6 @@ test('links nested type documentation, prose, vocabulary entries, values and com
     node('Dataset/a', 'Dataset', { id: 'a' }),
     node('Field/a/status', 'Field', { dataset: 'a', id: 'status' }),
     node('Value/status/ready', 'Value', { type_id: 'status', id: 'ready' }),
-    node('Metric/a/count', 'Metric', { dataset: 'a', id: 'count' }),
     node('Measure/a/count', 'Measure', { dataset: 'a', id: 'count' }),
     node('DataType/DatetimeUtc', 'DataType', { id: 'DatetimeUtc' }),
     node('DataType/Int', 'DataType', { id: 'Int' }),
@@ -91,7 +90,7 @@ test('links nested type documentation, prose, vocabulary entries, values and com
   assert(md.includes('[DatetimeUtc](#DataType/DatetimeUtc) and [Int](#DataType/Int) are logical types.'));
   assert(md.includes('id: [ready](#Value/status/ready), label: [Ready](#Value/status/ready)'));
   assert(md.includes('**canonical_order**: [[ready](#Value/status/ready)]'));
-  assert(md.includes('id: [count](#Metric/a/count), field: [status](#Field/a/status)'));
+  assert(md.includes('id: [count](#Measure/a/count), field: [status](#Field/a/status)'));
   assert(md.includes('left: [count](#Measure/a/count), right: [count](#Measure/a/count)'));
   assert(md.includes('id: [DatetimeUtc](#DataType/DatetimeUtc), label: [UTC instant](#DataType/DatetimeUtc), term: [UTC](#DataType/DatetimeUtc)'));
 });

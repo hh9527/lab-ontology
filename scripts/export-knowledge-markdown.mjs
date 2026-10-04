@@ -69,7 +69,7 @@ export function renderMarkdown(nodes, metadata) {
     context = { ...context, computed: context.computed || field === 'computed',
       target: byKey.has(value.key) ? value.key
         : ['values', 'mapping'].includes(field) ? resolveIdentity('Value', context.type_id, value.id)
-        : field === 'metric' ? resolveIdentity('Metric', owner, value.id) : undefined };
+        : field === 'sampling' ? resolveIdentity('Measure', owner, value.id) : undefined };
     const entries = Object.entries(value);
     return entries.length
       ? `{ ${entries.map(([name, item]) => `${escapeText(name)}: ${inline(item, owner, name, context)}`).join(', ')} }`
@@ -125,7 +125,7 @@ export function renderMarkdown(nodes, metadata) {
   }
   const groups = {
     Field: 'fields', Relation: 'rels', Dimension: 'dimensions', Value: 'values',
-    Measure: 'measures', Metric: 'metrics', TimeRole: 'time_roles', BusinessLink: 'business_links',
+    Measure: 'measures', TimeRole: 'time_roles', BusinessLink: 'business_links',
   };
   lines.push('# Datasets', '');
   for (const dataset of sorted.filter(node => node.type === 'Dataset')) {

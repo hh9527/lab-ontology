@@ -34,7 +34,7 @@ try {
         ['server_kpi', 'server_cpu_latest'], ['server_kpi', 'server_memory_latest']]) {
         const node = (await request('ic/info', { key: `Measure/${dataset}/${id}` })).Document.Found;
         assert.equal(node.detail.aggregate, 'Latest');
-        assert.equal(node.detail.metric.unit, '%');
+        assert.equal(node.detail.sampling.unit, '%');
         assert.ok(node.links.some(link => link.key === 'Schema/syntax/graph/latest'));
         assert.ok(node.links.some(link => link.key === `TimeRole/${dataset}/ts`));
       }
