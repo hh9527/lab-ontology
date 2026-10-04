@@ -1,0 +1,57 @@
+// Independent expectations for the KPI declarations and executable SQL checks.
+export const cases = [
+  ['onu_kpi', 'PonDeviceOnuKPI', 'onu_kpi_ts', [
+    ['onuHwOpticsRxPower', 'onu_rx_power', 'dBm', 'ONU接收光功率'],
+    ['onuHwOpticsTxPower', 'onu_tx_power', 'dBm', 'ONU发送光功率'],
+    ['hwGponOntOpticsOltRxOntPower', 'onu_olt_rx', 'dBm', 'OLT接收ONU光功率'],
+    ['onuhwOpticsTemperature', 'onu_opt_temp', 'degC', 'ONU光模块温度'],
+    ['temperature', 'onu_temp', 'degC', 'ONU CPU温度'],
+    ['memUsage', 'onu_mem', '%', 'ONU内存利用率'],
+    ['cpuUsage', 'onu_cpu', '%', 'ONU CPU利用率'],
+    ['ifHCInOctetsSpeed', 'onu_rx', 'bit/s', 'ONU接收速率'],
+    ['ifHCOutOctetsSpeed', 'onu_tx', 'bit/s', 'ONU发送速率'],
+    ['ifOutBandRate', 'onu_tx_usage', '%', 'ONU发送带宽利用率'],
+  ]],
+  ['pon_port_kpi', 'PonDevicePonPortKPI', 'pon_port_kpi_ts', [
+    ['ifOutBandRate', 'pon_port_transmit_usage', '%', 'PON端口发送带宽利用率'],
+    ['onuHwOpticsTxPower', 'pon_port_optics_tx_power', 'dBm', 'PON端口发送光功率'],
+    ['hwOpticsTemperature', 'pon_port_optics_temperature', 'degC', 'PON光模块温度'],
+    ['ifHCInOctetsSpeed', 'pon_port_rx_rate', 'bit/s', 'PON端口接收速率'],
+    ['ifHCOutOctetsSpeed', 'pon_port_tx_rate', 'bit/s', 'PON端口发送速率'],
+  ]],
+  ['interface_kpi', 'NetworkDeviceInterfaceKPI', 'interface_kpi_ts_raw', [
+    ['ifInPktSpeed', 'interface_rx', 'packets/s', '接口接收包速率'],
+    ['ifHCInMulticastPktsSpeed', 'interface_multicast_rx', 'packets/s', '接口组播接收速率'],
+    ['ifHCOutMulticastPktsSpeed', 'interface_multicast_tx', 'packets/s', '接口组播发送速率'],
+    ['ifHCInBroadtPktSpeed', 'interface_broadcast_rx', 'packets/s', '接口广播接收速率'],
+    ['ifHCOutBroadPktSpeed', 'interface_broadcast_tx', 'packets/s', '接口广播发送速率'],
+    ['ifInErrors', 'interface_in_errors', null, '接口接收错误包数'],
+    ['ifHCInOctetsSpeed', 'interface_rx_rate', 'byte/s', '接口接收速率'],
+    ['ifHCOutOctetsSpeed', 'interface_tx_rate', 'byte/s', '接口发送速率'],
+  ]],
+  ['ap_radio_ssid_kpi', 'NetworkApRadioSsidKPI', 'ap_ssid_sample_time', [
+    ['hwSsidAirportRecvBytes', 'ap_ssid_receive_bytes', 'byte', 'SSID接收字节数'],
+    ['hwSsidAirportTransmitBytes', 'ap_ssid_transmit_bytes', 'byte', 'SSID发送字节数'],
+  ]],
+  ['source_NetworkAPKPI', 'NetworkAPKPI', 'source_NetworkAPKPI__ts', [
+    ['hwCurrAssStationCount', 'ap_associated_terminals', null, 'AP关联移动终端数'],
+    ['hwApEthportUpRate', 'ap_uplink_tx_rate', 'kbit/s', 'AP上行发送速率'],
+    ['hwApEthportDownRate', 'ap_uplink_rx_rate', 'kbit/s', 'AP上行接收速率'],
+    ['hwAPUpPortPER', 'ap_uplink_packet_error_rate', '%', 'AP上行误包率'],
+  ]],
+  ['source_NetworkApRadioKPI', 'NetworkApRadioKPI', 'source_NetworkApRadioKPI__ts', [
+    ['hwRadioChUtilizationRate', 'ap_radio_channel_usage', '%', '射频信道利用率'],
+    ['hwRadioNoise', 'ap_radio_noise', 'dBm', '干扰强度'],
+    ['hwWlanRadioRetryFramesRate', 'ap_radio_retry_rate', '%', '射频重传率'],
+    ['upwardSpeed', 'ap_radio_uplink_rate', 'kbit/s', '射频上行速率'],
+    ['downwardSpeed', 'ap_radio_downlink_rate', 'kbit/s', '射频下行速率'],
+    ['packetLossRate', 'ap_radio_packet_loss_rate', '%', '射频丢包率'],
+    ['connectedTerminals', 'ap_radio_connected_terminals', null, '射频在线用户数'],
+    ['rssi', 'ap_radio_rssi', null, '射频接收信号强度'],
+  ]],
+  ['source_NetworkDeviceBoardKPI', 'NetworkDeviceBoardKPI', 'source_NetworkDeviceBoardKPI__ts', [
+    ['cpuUsage', 'board_cpu_usage', '%', '单板CPU利用率'],
+    ['memUsage', 'board_memory_usage', '%', '单板内存利用率'],
+    ['hwEntityTemperature', 'board_temperature', 'degC', '单板温度'],
+  ]],
+];

@@ -1,5 +1,6 @@
 use std::array as array;
 use std::string as string;
+use crate::query as qb;
 use crate::query::{
     Val, Query, ColumnRef, ColumnEq, ScalarFunction, ScalarCall, Expr,
     AggregateFunction, AggregateCall, ComputedOp, ComputedAggregate,
@@ -30,6 +31,7 @@ def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
         ScalarFunction::Lower => "lower",
         ScalarFunction::Length => "length",
         ScalarFunction::UtcDaysAgo => "strftime",
+        ScalarFunction::UtcTimeBucket(_) => "strftime",
         ScalarFunction::Eq => "=",
         ScalarFunction::Ne => "!=",
         ScalarFunction::Lt => "<",
@@ -67,6 +69,29 @@ def direction_sql: Fn(Ordering) -> String = fn(direction) {
     }
 };
 
+def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
+    match spec.encoding {
+        qb::UtcBucketEncoding::DatetimeUtc => match spec.unit {
+            qb::UtcBucketUnit::Hour => `strftime('%Y-%m-%dT%H:00:00Z', \{value})`,
+            qb::UtcBucketUnit::Day => `strftime('%Y-%m-%dT00:00:00Z', \{value})`,
+            qb::UtcBucketUnit::Month => `strftime('%Y-%m-01T00:00:00Z', \{value})`,
+        },
+        qb::UtcBucketEncoding::DateUtc => match spec.unit {
+            qb::UtcBucketUnit::Day => `date(\{value})`,
+            qb::UtcBucketUnit::Month => `date(\{value}, 'start of month')`,
+            _ => fail!("DateUtc has no hour bucket"),
+        },
+        qb::UtcBucketEncoding::EpochMillis => do {
+            let bucket = match spec.unit {
+            qb::UtcBucketUnit::Hour => `(\{value} - ((\{value} % 3600000 + 3600000) % 3600000))`,
+            qb::UtcBucketUnit::Day => `(\{value} - ((\{value} % 86400000 + 86400000) % 86400000))`,
+            qb::UtcBucketUnit::Month => `(CAST(strftime('%s', (\{value} - ((\{value} % 1000 + 1000) % 1000)) / 1000, 'unixepoch', 'start of month') AS INTEGER) * 1000)`,
+            };
+            `CASE WHEN \{value} >= -62135596800000 AND \{value} < 253402300800000 THEN \{bucket} ELSE NULL END`
+        },
+    }
+};
+
 def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function, parts) {
     match function {
         ScalarFunction::Substr => `\{scalar_name(function)}(\{string::join(parts, ", ")})`,
@@ -80,6 +105,7 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
         ScalarFunction::Lower => `lower(\{parts[0]})`,
         ScalarFunction::Length => `length(\{parts[0]})`,
         ScalarFunction::UtcDaysAgo => `strftime('%Y-%m-%dT%H:%M:%SZ', \{parts[0]}, printf('-%d days', \{parts[1]}))`,
+        ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, parts[0]),
         ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         ScalarFunction::Ne => `\{parts[0]} != \{parts[1]}`,
         ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,

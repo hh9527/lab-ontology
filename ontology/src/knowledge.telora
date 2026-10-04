@@ -161,6 +161,9 @@ def syntax_points: Array(Point) = [
     point(syntax_target("operations/text_match"), "Text match operations", [],
         "Contains, NotContains, StartsWith and EndsWith operate on Text only when authorized by the dimension. Inputs are literal text, not caller-provided SQL or regex patterns. Current matching is case-folded. Do not replace one operation with another after rejection: they select different populations. Text storage alone does not authorize text matching on a logical address or time.",
         [member(syntax_target("graph/filter")), member(syntax_target("graph/filter/capabilities"))]),
+    point(syntax_target("operations/utc_time_bucket"), "UTC time bucket", [],
+        "A declared UTC bucket dimension projects the start of an hour, day or calendar month. Select it alongside a declared measure to group observations by that bucket; no Intent granularity parameter is accepted. DatetimeUtc output is canonical UTC YYYY-MM-DDTHH:MM:SSZ, DateUtc output is YYYY-MM-DD and supports day/month only, EpochMillis output is integer Unix milliseconds. Input and output logical types agree. NULL stays NULL. Common calendar range is years 0001..9999; out-of-range epoch values produce NULL. Negative epochs floor toward the preceding bucket, not toward zero. Month is a calendar operation, not a fixed duration. PostgreSQL session timezone does not change bucket boundaries. Filter the original time dimension with an explicit half-open interval, then group by the bucket dimension; do not replace the interval with a bucket filter unless that is the requested population. No inferred timezone, clock, local-calendar interpretation or implicit type conversion.",
+        [member(syntax_target("operations/time_window"))]),
     point(syntax_target("operations/time_window"), "TimeWindow operation", [],
         "Graph time_windows items are {node,dimension,start,end}, at the root or inside exists. The dimension must have a declared time role and authorize Ge for start and Lt for a finite end. The interval is [start,end): start is included, end is excluded. start is required and concrete; end may be null or omitted for [start,None), meaning no upper cutoff, NOT now. Future-dated rows may match an open upper bound. Finite bounds must use the same dimension's logical format and start must precede end. SQL compares the original column with bound values, >= start AND < end, or just >= start for no end. No implicit clock, database now(), timezone inference or column-side time conversion. Resolve yesterday, last seven days, calendar months and other relative periods externally using the application's reference time and timezone; submit concrete boundaries. A calendar day need not be 24 hours and a calendar month is not a fixed number of days. For example, in DatetimeUtc, UTC February 2024 is start=2024-02-01T00:00:00Z, end=2024-03-01T00:00:00Z. This interval contract is unrelated to dimension.half_open, which denotes a partially enumerated business value domain. Linking a type to this operation does not grant field authorization.",
         [member(type_target("EpochMillis")), member(type_target("DatetimeUtc")),
@@ -289,7 +292,19 @@ def dimension_points: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(pay
     let operation_contracts = if detail.input_kinds == [edsl::FilterInputKind::Ipv4] {
         [member(syntax_target("graph/filter/capabilities")), member(syntax_target("model/ipv4_subnets"))]
     } else { [member(syntax_target("graph/filter/capabilities"))] };
-    let contracts = array::concat([operation_contracts, array::map(detail.input_kinds, input_type_ref)]);
+    let entity = match array::find(payload.entities, fn(entity) { entity.id == detail.dataset }) {
+        Some(entity) => entity, None => fail!("dimension owner missing", detail.dataset),
+    };
+    let field = match array::find(entity.fields, fn(field) { field.name == detail.field }) {
+        Some(field) => field, None => fail!("dimension field missing", detail.field),
+    };
+    let bucket_contract = match property::get_field_prop(entity.entity_type, field.index, edsl::UtcBucketDimensionsDef.type) {
+        Some(definition) => if array::any(definition.dimensions, fn(spec) { spec.id == detail.id }) {
+            [member(syntax_target("operations/utc_time_bucket"))]
+        } else { [] },
+        None => [],
+    };
+    let contracts = array::concat([operation_contracts, bucket_contract, array::map(detail.input_kinds, input_type_ref)]);
     let base = point(dimension, detail.label, array::concat([detail.aliases, labels(detail.localized)]),
         detail.summary, array::concat([[member(parent), member(target(edsl::KnowledgeKind::Field, detail.dataset, detail.field)), member(type_target(detail.type_id))], value_refs, contracts]));
     [{...base, dimension: Some(detail), localized: detail.localized}]

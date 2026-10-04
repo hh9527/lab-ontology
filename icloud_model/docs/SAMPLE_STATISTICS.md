@@ -1,6 +1,6 @@
 # Source-backed sample statistics
 
-This describes the product Model (`icloud-source-v10`).
+This describes the product Model (`icloud-source-v12`).
 Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 
@@ -18,6 +18,7 @@ Online-rate regression commands (after publishing the current IC snapshot):
 bin/telora -C icloud_model test online_rate --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048
 node scripts/check-icloud-online-rate.mjs bin/icloud_model.snapshot.wasm
 node scripts/check-icloud-cpu.mjs bin/icloud_model.snapshot.wasm
+node scripts/check-icloud-kpi-measures.mjs bin/icloud_model.snapshot.wasm
 ```
 
 | Population | Raw dimension | Average | Maximum sample | Minimum sample |
@@ -107,12 +108,58 @@ numeric values only. Formula-based questions require further domain evidence
 or clarification, not an invented formula.
 
 CPU/memory percent units follow source metadata and the existing metric
-declarations. ONU/PON receive statistics retain their existing metric units;
-new interface bandwidth statistics leave the unit unspecified rather than
-infer it from the field name. This is a bounded addition for the reported
-pressure families, not a policy to add every aggregate to every numeric field.
+declarations. Interface bandwidth utilization retains its existing unspecified
+unit. ONU/PON receive statistics retain their existing metric units.
+
+## Wireless, ONU, PON-port, interface and board samples
+
+Forty sample fields across seven KPI datasets expose 104 measures. The base ID
+is the arithmetic mean. Interface additions use Avg, matching the existing
+interface packet-rate/error measures. The other six datasets also expose
+suffixes `_max` and `_min` for raw sample extrema.
+The executable expectations in `scripts/tests/fixtures/icloud-kpi-measures.mjs`
+list every dataset, physical column, measure base ID and unit. Measures publish
+Chinese aliases and links to the corresponding raw dimensions.
+
+ONU optical powers use dBm, temperatures degC, utilization %, and data rates
+bit/s. PON-port power/temperature/data rates use the same units. Interface
+packet rates use packets/s. AP Ethernet and radio data rates use kbit/s;
+radio interference uses dBm. Board CPU/memory use % and temperature degC.
+SSID byte samples use byte: their Avg/Min/Max summarize reported observations,
+not cumulative traffic across the selected period. No Sum is declared.
+
+TODO(#51): interface data-rate descriptions say bytes/s and display metadata
+specifies rate=8, whereas unitName says bits_per_second. The Model provisionally
+uses byte/s for stored values and performs no conversion. Confirm the raw unit.
+PON-port bandwidth metadata says unitName=one but displays %; preserve raw values
+and provisionally assume %, with a TODO on both receive and transmit statistics.
+Radio RSSI has no explicit unit contract; it remains unspecified.
+
+AP, radio and board KPI datasets provisionally use tenant/resource/UTC sample
+time as their grain. TODO(#51): validate production uniqueness. The source only
+marks resId as a primary key and does not establish sample uniqueness. Existing
+owner relations remain the published source relations; no tenant join is inferred.
+These grain declarations do not prove production uniqueness or collection cadence.
+
+The four online-rate tables describe distinct observation populations in both
+dataset and measure documents. The current-alarm table includes whatever clearance
+states its rows report. `alarm_open_count` explicitly counts CLEARED=0; asking for
+current alarms without a clearance condition does not imply that filtered count.
+
+Canonical member names are scoped by nominal Type. `PonClass` and `PonOltClass`
+each publish `olt` with their original encoding; shared names do not merge Types.
+`PhysicalLinkType` publishes `lldp`, `csp`, `server_internal`, `fiber_search` and
+`manual` for the corresponding source encodings 1, 7, 8, 9 and 99.
 
 ## Regression
+
+All 17 KPI timestamp carriers declare UTC hour/day/month bucket dimensions.
+Their IDs are `<dataset>_utc_hour`, `_utc_day`, `_utc_month`; ONU uses the compact
+prefix `onu_utc_*`. Select one alongside a declared measure, filter the raw sample
+time dimension, and order the bucket dimension when a chronological trend is
+required. Bucket outputs remain DatetimeUtc; they represent bucket starts, not
+labels or elapsed durations. Knowledge links each bucket to its shared operation
+contract. Declaring buckets does not create missing measures for source carriers.
 
 `tests/sample_meanings.telora` exercises the actual product Model: explicit
 Avg/Max/Min SQL and bindings, owner grouping, peak HAVING/ranking, raw trends, qualifying

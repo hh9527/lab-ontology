@@ -1,0 +1,147 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::intent::{ query_intent_ast_factory };
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::codec as codec;
+use std::value::{ Value };
+
+@edsl::entity_id("sample")
+@edsl::entity_source("samples", "s")
+type Sample = struct {
+    @edsl::column("id")
+    @edsl::key()
+    id: Int,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
+    @edsl::dimension("sample_time", True, True, [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::DatetimeUtc])
+    @edsl::utc_bucket_dimension("sample_datetime_hour", qb::UtcBucketUnit::Hour)
+    @edsl::utc_bucket_dimension("sample_datetime_day", qb::UtcBucketUnit::Day)
+    @edsl::utc_bucket_dimension("sample_datetime_month", qb::UtcBucketUnit::Month)
+    ts: Option(String),
+    @edsl::column("epoch")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    @edsl::utc_bucket_dimension("sample_epoch_hour", qb::UtcBucketUnit::Hour)
+    @edsl::utc_bucket_dimension("sample_epoch_day", qb::UtcBucketUnit::Day)
+    @edsl::utc_bucket_dimension("sample_epoch_month", qb::UtcBucketUnit::Month)
+    epoch: Option(Int),
+    @edsl::column("day")
+    @edsl::time_field(edsl::TimeSemantics::DateUtc, edsl::TimeEncoding::DateText)
+    @edsl::utc_bucket_dimension("sample_date_day", qb::UtcBucketUnit::Day)
+    @edsl::utc_bucket_dimension("sample_date_month", qb::UtcBucketUnit::Month)
+    day: Option(String),
+    @edsl::column("value")
+    @edsl::measure("sample_mean", qb::AggregateFunction::Avg, [])
+    value: Float,
+};
+
+def bucket_functions: Array(qb::ScalarFunction) = array::concat([
+    array::flat_map([qb::UtcBucketEncoding::DatetimeUtc, qb::UtcBucketEncoding::EpochMillis], fn(encoding) {
+        array::map([qb::UtcBucketUnit::Hour, qb::UtcBucketUnit::Day, qb::UtcBucketUnit::Month], fn(unit) {
+            qb::ScalarFunction::UtcTimeBucket({encoding, unit})
+        })
+    }),
+    array::map([qb::UtcBucketUnit::Day, qb::UtcBucketUnit::Month], fn(unit) {
+        qb::ScalarFunction::UtcTimeBucket({encoding: qb::UtcBucketEncoding::DateUtc, unit})
+    }),
+]);
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project,
+        qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind, qb::Operator::Group, qb::Operator::Aggregate],
+    allowed_join_kinds: [], allowed_aggregates: [qb::AggregateFunction::Avg],
+    allowed_scalars: array::concat([bucket_functions, [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Gt, qb::ScalarFunction::Ge, qb::ScalarFunction::Le, qb::ScalarFunction::Lt, qb::ScalarFunction::And]]),
+    allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("utc-buckets", [Sample.type], profile);
+type RuntimeCase = struct { encoding: String, unit: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_queries: Array(RuntimeCase) = array::flat_map(["datetime", "epoch", "date"], fn(encoding) {
+    let units = if encoding == "date" { ["day", "month"] } else { ["hour", "day", "month"] };
+    array::map(units, fn(unit) {
+        let ast = query_intent_ast_factory(payload)(json::parse(`{
+            "op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],
+            "edges":[],"select":[{"node":"s","dimension":"sample_\{encoding}_\{unit}"}]
+        }`).unwrap!());
+        {encoding, unit, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}.ty!(RuntimeCase)
+    })
+});
+def grouped_ast: qb::QueryAst = query_intent_ast_factory(payload)(json::parse(r#"{
+    "op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],
+    "select":[{"node":"s","dimension":"sample_datetime_day"}],
+    "measures":[{"node":"s","measure":"sample_mean"}],
+    "time_windows":[{"node":"s","dimension":"sample_time","start":"2024-02-29T00:00:00Z","end":"2024-03-02T00:00:00Z"}]
+}"#).unwrap!());
+type QueryPair = struct { sqlite: qb::Query, postgres: qb::Query };
+type RuntimeBundle = struct { cases: Array(RuntimeCase), grouped: QueryPair };
+pub def runtime_cases: Value = codec::encode({cases: runtime_queries,
+    grouped: {sqlite: sqlite::build_query(grouped_ast), postgres: postgres::build_query(grouped_ast)}.ty!(QueryPair)}.ty!(RuntimeBundle));
+
+pub def buckets_preserve_nominal_time_types: test::Test = test::should_ok(fn() {
+    array::all([("sample_datetime_day", "DatetimeUtc"), ("sample_epoch_day", "EpochMillis"), ("sample_date_month", "DateUtc")], fn(spec) {
+        let detail = edsl::visible_dimension_detail(payload, spec.0);
+        detail.type_id == spec.1 && detail.computed && detail.filterable
+    })
+});
+
+pub def dialects_use_temporal_operations_not_text_substrings: test::Test = test::should_ok(fn() {
+    array::all(runtime_queries, fn(spec) {
+        !string::contains(spec.sqlite.sql, "substr(") && !string::contains(spec.postgres.sql, "substr(")
+            && (spec.encoding != "datetime" || string::contains(spec.postgres.sql, "AT TIME ZONE 'UTC'"))
+    })
+});
+
+pub def grouped_trend_uses_bucket_but_filters_raw_clock: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],
+        "select":[{"node":"s","dimension":"sample_datetime_day"}],
+        "measures":[{"node":"s","measure":"sample_mean"}],
+        "time_windows":[{"node":"s","dimension":"sample_time","start":"2024-02-29T00:00:00Z","end":"2024-03-02T00:00:00Z"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if string::contains(sq.sql, "GROUP BY strftime(") && string::contains(pg.sql, "GROUP BY (date_trunc(")
+        && string::contains(sq.sql, "s.ts >= ?1") && string::contains(sq.sql, "s.ts < ?2")
+        && sq.bindings == pg.bindings { True }
+    else { fail!("bucket grouping must preserve raw half-open time predicates", sq, pg) }
+});
+
+pub def invalid_bucket_calendar_filter_is_rejected: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],
+        "select":[{"node":"s","dimension":"sample_datetime_day"}],
+        "filters":[{"node":"s","dimension":"sample_datetime_day","op":"Eq","value":"2024-02-30T00:00:00Z"}]
+    }"#).unwrap!())
+}, "invalid canonical RFC3339 UTC second value");
+
+@edsl::entity_source("local_samples", "l")
+type LocalSample = struct {
+    @edsl::column("clock")
+    @edsl::time_field(edsl::TimeSemantics::Local, edsl::TimeEncoding::EpochMillis)
+    @edsl::utc_bucket_dimension("local_day", qb::UtcBucketUnit::Day)
+    clock: Int,
+};
+pub def local_time_bucket_is_rejected: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("local-bucket", [LocalSample.type], profile)
+}, "UTC bucket does not accept local time");
+
+@edsl::entity_source("date_samples", "d")
+type DateHour = struct {
+    @edsl::column("day")
+    @edsl::time_field(edsl::TimeSemantics::DateUtc, edsl::TimeEncoding::DateText)
+    @edsl::utc_bucket_dimension("date_hour", qb::UtcBucketUnit::Hour)
+    day: String,
+};
+pub def date_has_no_hour_bucket: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("date-hour", [DateHour.type], profile)
+}, "DateUtc has no hour bucket");
+
+pub def undeclared_bucket_scalar_is_rejected_by_profile: test::Test = test::should_fail_with(fn() {
+    let restricted = edsl::build_root("restricted-bucket", [Sample.type], {...profile, allowed_scalars: []});
+    query_intent_ast_factory(restricted)(json::parse(r#"{
+        "op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],
+        "edges":[],"select":[{"node":"s","dimension":"sample_datetime_day"}]
+    }"#).unwrap!())
+}, "declared dimension projection uses capabilities not allowed by the query profile");

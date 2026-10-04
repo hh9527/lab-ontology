@@ -54,10 +54,41 @@ to a dimension's `half_open` business vocabulary contract.
 ```
 
 The window is `[start, end)`. Both endpoints must be concrete values in the
-dimension's declared logical type. SQL compares the original column to
+dimension's declared logical type. For a raw time dimension, SQL compares the original column to
 allocated bindings (`>= start AND < end`), without database `now()` or
 column-side time transformation. Reversed or invalid endpoints fail before
 Query materialization.
+
+## UTC calendar buckets
+
+Declare fixed bucket dimensions on a field with a UTC time role:
+
+```telora
+@edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
+@edsl::utc_bucket_dimension("sample_hour", qb::UtcBucketUnit::Hour)
+@edsl::utc_bucket_dimension("sample_day", qb::UtcBucketUnit::Day)
+@edsl::utc_bucket_dimension("sample_month", qb::UtcBucketUnit::Month)
+ts: String,
+```
+
+The result is the bucket's UTC start, preserving the source logical type.
+DatetimeUtc retains RFC3339 text in SQLite and native timestamptz in PostgreSQL;
+clients serialize it as canonical UTC RFC3339. EpochMillis returns integer
+milliseconds, and DateUtc retains date text/native date (day/month only). A month is
+a calendar month. Local time roles are rejected. Each exact unit/encoding pair
+must be authorized as `qb::ScalarFunction::UtcTimeBucket({unit, encoding})`
+in the query profile. There is no runtime granularity parameter or implicit
+type conversion. NULL remains NULL. Calendar bucketing uses the common range
+0001-01-01 through 9999-12-31; epoch inputs outside this range return NULL.
+Negative epochs floor to the preceding bucket, including -1 millisecond.
+PostgreSQL session timezone does not affect the result.
+
+Select the bucket dimension together with a declared measure to group samples.
+Apply the requested half-open window to the raw time dimension so the stored
+clock predicate remains available for index use. Filtering a bucket dimension
+instead compares the explicitly computed bucket start and can select a different
+population. Bucketing does not fill missing periods, alter NULL aggregates,
+change the selected measure's meaning, or authorize summing gauges across time.
 
 The upper bound may be `null` or omitted:
 

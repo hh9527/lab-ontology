@@ -1,0 +1,78 @@
+use crate::model::{ payload };
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+type Case = struct { dataset: String, time: String, measure: String, column: String };
+def cases: Array(Case) = [
+    {dataset: "onu_kpi", time: "onu_kpi_ts", measure: "onu_opt_temp", column: "onuhwOpticsTemperature"},
+    {dataset: "pon_port_kpi", time: "pon_port_kpi_ts", measure: "pon_port_optics_tx_power", column: "onuHwOpticsTxPower"},
+    {dataset: "interface_kpi", time: "interface_kpi_ts_raw", measure: "interface_multicast_rx", column: "ifHCInMulticastPktsSpeed"},
+    {dataset: "ap_radio_ssid_kpi", time: "ap_ssid_sample_time", measure: "ap_ssid_transmit_bytes", column: "hwSsidAirportTransmitBytes"},
+    {dataset: "source_NetworkAPKPI", time: "source_NetworkAPKPI__ts", measure: "ap_uplink_tx_rate", column: "hwApEthportUpRate"},
+    {dataset: "source_NetworkApRadioKPI", time: "source_NetworkApRadioKPI__ts", measure: "ap_radio_noise", column: "hwRadioNoise"},
+    {dataset: "source_NetworkDeviceBoardKPI", time: "source_NetworkDeviceBoardKPI__ts", measure: "board_cpu_usage", column: "cpuUsage"},
+];
+
+pub def seven_kpi_populations_lower_in_sqlite_and_postgres: test::Test = test::should_ok(fn() {
+    array::all(cases, fn(spec) {
+        let bucket = if spec.dataset == "onu_kpi" { "onu_utc_day" } else { `\{spec.dataset}_utc_day` };
+        let ast = query_intent_ast_factory(payload)(json::parse(`{
+            "op":"Graph","root":"k","nodes":[{"id":"k","entity":"\{spec.dataset}"}],
+            "edges":[],"select":[{"node":"k","dimension":"\{bucket}"}],"measures":[{"node":"k","measure":"\{spec.measure}"}],
+            "time_windows":[{"node":"k","dimension":"\{spec.time}","start":"2026-10-02T00:00:00Z","end":"2026-10-03T00:00:00Z"}]
+        }`).unwrap!());
+        let sq = sqlite::build_query(ast);
+        let pg = postgres::build_query(ast);
+        if string::contains(sq.sql, "avg(")
+            && string::contains(sq.sql, `.\{spec.column})`)
+            && string::contains(pg.sql, `."\{spec.column}")`)
+            && string::contains(sq.sql, "GROUP BY strftime(")
+            && string::contains(pg.sql, "GROUP BY (date_trunc(")
+            && string::contains(sq.sql, ".ts >= ?1")
+            && string::contains(sq.sql, ".ts < ?2")
+            && !string::contains(sq.sql, "Effcnt")
+            && !string::contains(sq.sql, "sum(")
+            && sq.bindings == pg.bindings { True }
+        else { fail!("KPI sample average lost its column or window", spec, sq, pg) }
+    })
+});
+
+pub def ssid_bytes_do_not_authorize_period_sum: test::Test = test::should_fail_with(fn() {
+    query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"k","nodes":[{"id":"k","entity":"ap_radio_ssid_kpi"}],
+        "edges":[],"select":[],"measures":[{"node":"k","measure":"ap_ssid_transmit_bytes_sum"}]
+    }"#).unwrap!())
+}, "unknown declared measure");
+
+pub def stable_link_member_binds_original_integer_wire: test::Test = test::should_ok(fn() {
+    let ast = query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"l","nodes":[{"id":"l","entity":"physical_link"}],
+        "edges":[],"select":[],"count":"l",
+        "filters":[{"node":"l","dimension":"physical_link_type","op":"Eq","value":"lldp"}]
+    }"#).unwrap!());
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.bindings == [qb::Val::Int(1)] && pg.bindings == sq.bindings { True }
+    else { fail!("friendly link member changed its stored encoding", sq, pg) }
+});
+
+pub def olt_member_names_match_without_merging_nominal_types: test::Test = test::should_ok(fn() {
+    let general = array::find(payload.dimensions, fn(dimension) { dimension.id == "pon_class" });
+    let role = array::find(payload.dimensions, fn(dimension) { dimension.id == "pon_olt_class" });
+    match (general, role) {
+        (Some(general), Some(role)) => if general.type_id != role.type_id
+            && array::any(general.canonical_values, fn(value) {
+                value.id == "olt" && array::any(role.canonical_values, fn(other) {
+                    other.id == "olt" && other.wires == value.wires
+                })
+            }) { True }
+            else { fail!("OLT member agreement must preserve distinct nominal types", general, role) },
+        _ => fail!("OLT dimensions missing"),
+    }
+});

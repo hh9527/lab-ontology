@@ -195,6 +195,10 @@ type ComputedDimensionDef = struct {
     build: Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr),
 };
 
+@prelude::property(PropertyTarget::Field)
+type UtcBucketDimensionsDef = struct { dimensions: Array(UtcBucketDimensionSpec) };
+type UtcBucketDimensionSpec = struct { id: String, unit: qb::UtcBucketUnit };
+
 # Member-level: inherent row-range scope of a dimension member. Predicates
 # reference stable field names of the member's own entity; the scope is
 # merged with user filters in deterministic order at lowering time. Dynamic
@@ -932,6 +936,15 @@ def computed_dimension: Fn(String, OutputType, Bool, Bool, Array(FilterOp), Arra
     fn(ctx, previous) {
         let result: ComputedDimensionDef = { id, output_type, authorized, filterable, ops, input_kinds, build };
         result
+    }
+};
+
+def utc_bucket_dimension: Fn(String, qb::UtcBucketUnit) -> Fn(property::FieldPropertyCtx, Option(UtcBucketDimensionsDef)) -> UtcBucketDimensionsDef = fn(id, unit) {
+    fn(ctx, previous) {
+        let existing = match previous { Some(definition) => definition.dimensions, None => [] };
+        if id == "" || array::any(existing, fn(spec) { spec.id == id }) {
+            fail!("UTC bucket requires a distinct nonempty dimension id", id)
+        } else { {dimensions: array::push(existing, {id, unit})}.ty!(UtcBucketDimensionsDef) }
     }
 };
 
@@ -2381,7 +2394,43 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
             None => [],
         }
     });
-    if declared { array::concat([plain, computed]) } else { [] }
+    let buckets = array::flat_map(fields, fn(f) {
+        match property::get_field_prop(entity.entity_type, f.index, UtcBucketDimensionsDef.type) {
+            None => [],
+            Some(definition) => do {
+                let time = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    Some(time) => time,
+                    None => fail!("UTC bucket requires a declared UTC time field", entity.id, f.name),
+                };
+                let encoding = match time.encoding {
+                    TimeEncoding::Rfc3339Text => qb::UtcBucketEncoding::DatetimeUtc,
+                    TimeEncoding::EpochMillis => qb::UtcBucketEncoding::EpochMillis,
+                    TimeEncoding::DateText => qb::UtcBucketEncoding::DateUtc,
+                    _ => fail!("UTC bucket does not accept local time", entity.id, f.name),
+                };
+                if time.semantics == TimeSemantics::Local {
+                    fail!("UTC bucket does not accept local time", entity.id, f.name)
+                } else { () };
+                let input = match encoding {
+                    qb::UtcBucketEncoding::DatetimeUtc => FilterInputKind::DatetimeUtc,
+                    qb::UtcBucketEncoding::EpochMillis => FilterInputKind::EpochMillis,
+                    qb::UtcBucketEncoding::DateUtc => FilterInputKind::DateUtc,
+                };
+                let output = if encoding == qb::UtcBucketEncoding::EpochMillis { OutputType::Integer } else { OutputType::Text };
+                array::map(definition.dimensions, fn(spec) {
+                    if encoding == qb::UtcBucketEncoding::DateUtc && spec.unit == qb::UtcBucketUnit::Hour {
+                        fail!("DateUtc has no hour bucket", entity.id, f.name, spec.id)
+                    } else { () };
+                    let function = qb::ScalarFunction::UtcTimeBucket({unit: spec.unit, encoding});
+                    let build = fn(ctx: qb::BuildCtx, column: qb::Expr) { (ctx, qb::scalar(function, [column])) };
+                    dimension_entry(entity.index, f.index, spec.id, output, True, build, True, True,
+                        [FilterOp::Eq, FilterOp::Ne, FilterOp::Lt, FilterOp::Le, FilterOp::Gt, FilterOp::Ge],
+                        [input], [], [], [], [], field_scope(entity.entity_type, f.index), False)
+                })
+            },
+        }
+    });
+    if declared { array::concat([plain, computed, buckets]) } else { [] }
 };
 
 def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr), Bool, Bool, Array(FilterOp), Array(FilterInputKind), Array(EnumValueEntry), Array(CanonicalValueSpec), Array(String), Array(CanonicalAlias), Array(ScopePredicate), Bool) -> DimensionEntry = fn(entity, field, id, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open) {
@@ -3145,6 +3194,10 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         Some(declared) => array::find(declared.notes, fn(item) { item.id == entry.id }),
         None => None,
     };
+    let bucket = match property::get_field_prop(entity.entity_type, field.index, UtcBucketDimensionsDef.type) {
+        Some(definition) => array::find(definition.dimensions, fn(spec) { spec.id == entry.id }),
+        None => None,
+    };
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
         {field: predicate.field, op: predicate.op, input: predicate.input}
     });
@@ -3153,7 +3206,13 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
     } else { "" }, id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
         aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
         localized: localized_member_texts(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
-        summary: match note { Some(n) => n.summary, None => "" },
+        summary: match note { Some(n) => n.summary, None => match bucket {
+            Some(spec) => {
+                let unit = match spec.unit { qb::UtcBucketUnit::Hour => "hour", qb::UtcBucketUnit::Day => "day", qb::UtcBucketUnit::Month => "month" };
+                `UTC calendar \{unit} bucket start, preserving the source logical time type and NULL. Calendar range is years 0001..9999; out-of-range epoch values return NULL. Select this dimension with a declared measure to group samples; filter the raw time dimension for the requested interval.`
+            },
+            None => "",
+        } },
         dataset: entity.id, field: field.name, computed: entry.computed,
         authorized: entry.authorized, filterable: entry.filterable,
         ops: entry.ops, input_kinds: entry.input_kinds, input_docs: filter_input_docs(entry.input_kinds), values: entry.values,
@@ -3601,7 +3660,10 @@ def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bo
     let entity = get_index(payload.entities, entry.entity);
     let role = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
     match role {
-        Some(time) => if !entry.computed {
+        Some(time) => if !entry.computed || match property::get_field_prop(entity.entity_type, entry.field, UtcBucketDimensionsDef.type) {
+            Some(definition) => array::any(definition.dimensions, fn(spec) { spec.id == entry.id }),
+            None => False,
+        } {
             match time.encoding {
                 TimeEncoding::DateText => match input {
                     FilterInput::DateUtc(value) => if calendar_date(value) { True }
@@ -5653,6 +5715,8 @@ pub use self::{
     ComputedMeasureDef,
     DimensionDef,
     ComputedDimensionDef,
+    UtcBucketDimensionsDef,
+    UtcBucketDimensionSpec,
     EntitySource,
     EntityId,
     DatasetKind,
@@ -5749,6 +5813,7 @@ pub use self::{
     computed_measure,
     dimension,
     computed_dimension,
+    utc_bucket_dimension,
     entity_source,
     field_role,
     reference,
