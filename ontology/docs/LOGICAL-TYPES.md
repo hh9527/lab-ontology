@@ -134,3 +134,23 @@ bin/telora -C ontology eval @test/subnets:postgres_runtime --request-fuel 10000 
 node ontology/tests/subnets-postgres.mjs /tmp/subnets-pg.json > /tmp/subnets-pg.sql
 psql --dbname postgres --set ON_ERROR_STOP=1 --file /tmp/subnets-pg.sql
 ```
+# Named Business Types
+
+A named business type owns its public identity, member values and physical
+storage encoding. Declare it with `@edsl::value_type(id, storage, members)` on a
+Telora Type and bind a dimension using `@edsl::dimension_type(TypeName.type)`.
+The physical field is the scalar database carrier and must match the declared
+storage type. Type-level annotations define aliases, localized member labels,
+canonical ordering and the half-open contract. Dimensions retain their local
+scope and permitted operations.
+
+Distinct named types cannot be joined merely because both use String or Int.
+For example, a Dn key and an Id key require the same declared business type to
+connect. No implicit type conversion is performed. Types with different storage
+encodings remain distinct even when their member names coincide.
+
+Knowledge publishes `Type/{type}` and `Value/{type}/{value}`. Type documents
+contain `storage`, `half_open`, `canonical_order` and a single `values` array;
+each member carries its id, label, aliases, localized labels and physical wires.
+Dimensions explicitly publish `type_id` and dataset ownership. The independent
+`links` export lets consumers discover dimensions referencing a type.

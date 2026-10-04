@@ -80,37 +80,23 @@ try {
       time_windows: [{ node: 'k', dimension: 'source_StorageDeviceKPI__ts', start, end }] });
     assert.equal((await transform(pair(graph(start, middle), graph(middle, end), 'd'))).length, 3);
   }
-  // #49: enumerate IDs using only directory reads, then submit a discovered measure ID.
-  let directoryCalls = 0;
-  async function enumerate(key) {
-    directoryCalls++;
-    const node = await info(key);
-    const entries = [];
-    for (const entry of node.detail.entries) {
-      if (entry.type === 'Directory') {
-        assert.equal('id' in entry, false);
-        entries.push(...await enumerate(entry.key));
-      } else entries.push(entry);
-    }
-    return entries;
-  }
-  const entries = await enumerate('Directory/device_kpi/members');
-  assert.equal(entries.length, (await info('Directory/device_kpi/members')).detail.total);
-  assert.ok(directoryCalls < entries.length / 2);
-  for (const entry of entries.filter(entry => entry.type !== 'Schema')) {
-    assert.equal(typeof entry.id, 'string', entry.key);
-    if (entry.type !== 'Relation') assert.equal(entry.dataset, 'device_kpi', entry.key);
-    else assert.ok(typeof entry.dataset === 'string' && entry.dataset.length > 0);
-  }
-  const average = entries.find(entry => entry.type === 'Measure' && entry.id === 'cpu_usage');
-  assert.ok(average && average.label !== average.id);
+  // Discover canonical business IDs from the independently cached vocabulary.
+  const terminology = JSON.parse(readFileSync('bin/icloud_model.terminology.json'));
+  const average = terminology.measures.find(entry => entry.dataset === 'device_kpi' && entry.name === 'cpu_usage');
+  const clock = terminology.dimensions.find(entry => entry.dataset === 'device_kpi' && entry.name === 'device_kpi_ts_raw');
+  assert.ok(average && clock);
+  const dataset = await info('Dataset/device_kpi');
+  assert(dataset.links.some(link => link.key === 'Measure/device_kpi/cpu_usage'));
+  const averageDetail = await info(`Measure/${encodeURIComponent(average.dataset)}/${encodeURIComponent(average.name)}`);
+  assert.equal(averageDetail.detail.id, average.name);
+  assert.deepEqual(await request('info', { key: 'terminology' }), { Document: 'NotFound' });
   const rows = await transform({ op: 'Graph', root: 'k', nodes: [{ id: 'k', entity: average.dataset }], edges: [], select: [],
-    measures: [{ node: 'k', measure: average.id }],
-    time_windows: [{ node: 'k', dimension: entries.find(entry => entry.type === 'Dimension' && entry.id === 'device_kpi_ts_raw').id, start, end }] });
+    measures: [{ node: 'k', measure: average.name }],
+    time_windows: [{ node: 'k', dimension: clock.name, start, end }] });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].k_cpu_usage, db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE ts>=? AND ts<?').get(start, end).value);
-  console.log(JSON.stringify({ status: 'passed', checks: ['#48 time identity pairing', '#47 owner discovery and period ranking', '#49 directory vocabulary'],
-    vocabularyMembers: entries.length, directoryCalls, memberReadsForEnumeration: 0 }));
+  console.log(JSON.stringify({ status: 'passed', checks: ['#48 time identity pairing', '#47 owner discovery and period ranking', 'terminology discovery and direct Dataset members'],
+    vocabularyMeasures: terminology.measures.length }));
 } finally {
   db.close();
   child.stdin.end();

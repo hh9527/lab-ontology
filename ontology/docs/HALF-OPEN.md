@@ -7,9 +7,7 @@ with known variants and `Unknown(String)`; a business concept called Other is
 still a known variant.
 
 ```telora
-@edsl::dimension("device_class", True, True,
-    [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
-@edsl::canonical_values([
+@edsl::value_type("DeviceClass", String.type, [
     {id: "LoadBalancer", label: "Load balancer", wires: [
         edsl::FilterInput::Text("lb"),
         edsl::FilterInput::Text("ne.category.lb")
@@ -17,11 +15,16 @@ still a known variant.
     {id: "Other", label: "Other device", wires: [edsl::FilterInput::Text("other")]}
 ])
 @edsl::half_open()
+type DeviceClass = struct {};
+
+@edsl::dimension("device_class", True, True,
+    [edsl::FilterOp::Eq, edsl::FilterOp::Ne], [edsl::FilterInputKind::Text])
+@edsl::dimension_type(DeviceClass.type)
 classification: String,
 ```
 
-This declaration currently requires a plain String dimension with nonempty
-`canonical_values`. Known IDs are distinct and their physical wire sets are
+This declaration requires a named value type with String storage and nonempty
+declared members. Known IDs are distinct and their physical wire sets are
 disjoint. Wires are exact, case-sensitive values; there is no implicit prefix,
 spelling or label normalization. An undeclared wire equal to a known business
 ID is still Unknown. An empty stored string is also Unknown unless the model

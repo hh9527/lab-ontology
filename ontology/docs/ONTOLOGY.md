@@ -50,9 +50,10 @@ permissions, keys, grain and aggregate rules.
 - `@dimension`, `@measure`, and related annotations publish queryable
   capabilities. A physical field is not automatically a visible or filterable
   dimension. The declared operators and input kinds constrain Intent values.
-- Canonical values map source encodings to stable business IDs. Labels and
+- Named value types own canonical members and their source encodings.
+  Dimensions bind them through `@dimension_type`. Labels and
   aliases aid discovery; a Query Intent still uses stable IDs.
-  `@half_open()` adds an explicit Unknown branch retaining unrecognized strings;
+  Type-level `@half_open()` adds an explicit Unknown branch retaining unrecognized strings;
   see [HALF-OPEN.md](HALF-OPEN.md) for tagged inputs, result columns and grouping.
 - Named relation declarations include endpoint types, join keys, and a
   `RelationCardinality {from,to}`. Each endpoint specifies how many records on

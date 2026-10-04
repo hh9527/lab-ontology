@@ -5,7 +5,7 @@ import { inspectKnowledge, publicationMetadata, responseSize, verifyManifest } f
 const node = (key, type, detail = {}, links = []) => ({ key, type,
   description: { label: key, aliases: [], localized: [], summary: '' }, links, detail });
 const nodes = () => [
-  node('index', 'Index', { revision: 'foo-v1', entries: [{ key: 'opaque', type: 'Dataset', label: 'opaque' }] }),
+  node('index', 'Index', { revision: 'foo-v1', schemas: [] }),
   node('opaque', 'Dataset', { id: 'foo' }, [{ type: 'Member', key: 'index' }]),
 ];
 
@@ -14,7 +14,7 @@ test('manifest keys/types, counts and revision come from visible nodes only', ()
   assert.deepEqual(manifest.domains[0], { domain: 'foo', revision: 'foo-v1',
     counts: { Index: 1, Dataset: 1 }, entries: [{ key: 'index', type: 'Index' }, { key: 'opaque', type: 'Dataset' }] });
   assert.equal(sizes.status, 'passed');
-  assert.equal(sizes.domains[0].largest_entry.target_key, 'opaque');
+  assert.equal(sizes.domains[0].largest_entry, null);
   assert.equal(sizes.domains[0].largest_link.target_key, 'index');
 });
 
@@ -37,9 +37,19 @@ test('the budget counts JavaScript UTF-16 characters, not UTF-8 bytes', () => {
   assert.notEqual(responseSize(item), Buffer.byteLength(rendered));
 });
 
+test('index metadata is measured without the concrete document size limit', () => {
+  const input = nodes();
+  input[0].detail.encoding = 'x'.repeat(20000);
+  const report = inspectKnowledge('foo', input, 16000).sizes;
+  assert.equal(report.oversized.length, 0);
+  assert(report.node_sizes.find(item => item.key === 'index').chars > 16000);
+});
+
 test('duplicate/dangling keys and missing revision cannot generate a valid publication', () => {
   assert.throws(() => inspectKnowledge('foo', [nodes()[0], nodes()[0]], 16000), /duplicate/);
-  assert.throws(() => inspectKnowledge('foo', [nodes()[0]], 16000), /dangling/);
+  const dangling = nodes();
+  dangling[0].detail.schemas = ['missing'];
+  assert.throws(() => inspectKnowledge('foo', dangling, 16000), /dangling/);
   const input = nodes();
   delete input[0].detail.revision;
   assert.throws(() => inspectKnowledge('foo', input, 16000), /revision/);

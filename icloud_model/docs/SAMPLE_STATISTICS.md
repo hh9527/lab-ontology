@@ -1,6 +1,6 @@
 # Source-backed sample statistics
 
-This describes the product Model (`icloud-source-v9`).
+This describes the product Model (`icloud-source-v10`).
 Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 

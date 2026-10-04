@@ -41,14 +41,15 @@ try {
   if (build.error) throw build.error;
   if (build.status !== 0) throw new Error(`snapshot compilation failed (${build.status})`);
   const sha256 = createHash('sha256').update(readFileSync(artifact)).digest('hex');
-  const metadata = await withKnowledgeRunner(artifact, async info => {
+  const metadata = await withKnowledgeRunner(artifact, async (info, request) => {
     const domains = [];
     for (const domain of options.domain) {
       let calls = 0;
+      const roots = await request(`${domain}/discovery`, {});
       const nodes = await collectKnowledge(async input => {
         if (++calls % 250 === 0) process.stderr.write(`Checking ${domain}: ${calls} nodes\n`);
         return info(domain, input);
-      });
+      }, roots);
       domains.push({ domain, nodes });
     }
     const metadata = publicationMetadata(sha256, domains, maxNodeChars);

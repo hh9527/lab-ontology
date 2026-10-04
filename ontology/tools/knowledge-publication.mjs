@@ -24,18 +24,8 @@ export function inspectKnowledge(domain, nodes, maxNodeChars) {
   for (const node of nodes) {
     counts[node.type] = (counts[node.type] ?? 0) + 1;
     for (const key of discoveryKeys(node)) assert.ok(byKey.has(key), `dangling knowledge key: ${key}`);
-    for (const entry of node.detail.entries ?? []) {
-      if (!entry.type) continue;
-      const target = byKey.get(entry.key);
-      if ('id' in entry) {
-        assert.equal(entry.id, target.detail.id ?? (entry.type === 'TimeRole' ? target.detail.field : undefined), `entry ID mismatch: ${entry.key}`);
-      }
-      if ('dataset' in entry) assert.equal(entry.dataset, target.detail.dataset ?? target.detail.from_dataset, `entry owner mismatch: ${entry.key}`);
-      if ('dimension' in entry) assert.equal(entry.dimension, target.detail.dimension);
-      if ('hub' in entry) assert.equal(entry.hub, target.detail.hub);
-    }
     nodeSizes.push({ key: node.key, type: node.type, chars: responseSize(node) });
-    for (const [kind, items] of [['entry', node.detail.entries ?? []], ['link', node.links]]) {
+    for (const [kind, items] of [['entry', (node.detail.schemas ?? []).map(key => ({ key }))], ['link', node.links]]) {
       for (const item of items) {
         const size = { node_key: node.key, target_key: item.key, chars: itemSize(item) };
         if (kind === 'entry' && (!largestEntry || size.chars > largestEntry.chars)) largestEntry = size;
@@ -44,7 +34,8 @@ export function inspectKnowledge(domain, nodes, maxNodeChars) {
     }
   }
   nodeSizes.sort((a, b) => b.chars - a.chars || compareKeys(a, b));
-  const oversized = nodeSizes.filter(item => item.chars > maxNodeChars);
+  const lists = new Set(['Index']);
+  const oversized = nodeSizes.filter(item => !lists.has(item.type) && item.chars > maxNodeChars);
   return {
     manifest: { domain, revision, counts,
       entries: nodes.map(({ key, type }) => ({ key, type })).sort(compareKeys) },
@@ -59,6 +50,7 @@ export function publicationMetadata(artifactSha256, domains, maxNodeChars) {
     domains: inspected.map(item => item.manifest) };
   const sizes = { schema: 'ontology.knowledge-sizes/v1', artifact_sha256: artifactSha256,
     measurement: 'JSON.stringify({Document:{Found:node}}, null, 2).length',
+    budget_scope: 'info knowledge nodes; Index metadata is measured but exempt; terminology is a separate capability',
     max_node_chars: maxNodeChars, status: inspected.some(item => item.sizes.oversized.length) ? 'failed' : 'passed',
     domains: inspected.map(item => item.sizes) };
   return { manifest, sizes };

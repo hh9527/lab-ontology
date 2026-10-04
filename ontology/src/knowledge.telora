@@ -4,6 +4,7 @@ use std::blame as blame;
 use std::codec as codec;
 use std::dict as dict;
 use std::json as json;
+use std::string as string;
 use std::type_property as property;
 use std::value::{ Value };
 
@@ -12,6 +13,9 @@ type KnowledgeLink = struct { target: edsl::KnowledgeTarget, kind: LinkKind };
 type IndexEntry = struct { key: edsl::KnowledgeTarget, label: String, aliases: Array(String), summary: String,
     from: Option(edsl::KnowledgeTarget), to: Option(edsl::KnowledgeTarget) };
 type Point = struct {
+    terms: Array(edsl::TermAnnotation),
+    value_type: Option(edsl::ValueTypeBrief),
+    value: Option(edsl::CanonicalValueSpec),
     logical_type: Option(edsl::LogicalType),
     nullable: Bool,
     references: Array(edsl::ReferenceSpec),
@@ -33,25 +37,36 @@ type Point = struct {
     direction: Option(edsl::LinkDirection),
     guard: Option(edsl::ScopePredicate),
     entries: Option(Array(IndexEntry)),
-    terminology: Option(Array(edsl::TermAnnotation)),
-    total: Int,
     revision: String,
 };
-type KnowledgeIndex = struct { entries: Array(IndexEntry), directories: Array(Point),
+type KnowledgeIndex = struct { entries: Array(IndexEntry),
     targets: Dict(edsl::KnowledgeTarget), points: Dict(Point) };
 type DocResult = enum { NotFound, Found(Point) };
 type KnowledgeResponse = enum { Document(DocResult) };
 type KnowledgeRequest = struct { method: String, input: Value };
 type InfoInput = struct { key: String };
-type Description = struct { label: String, aliases: Array(String), localized: Array(edsl::LocalizedKnowledgeText), summary: String };
+type TermText = struct { term: String, description: String };
+type Description = struct { label: String, aliases: Array(String), localized: Array(edsl::LocalizedKnowledgeText), summary: String, terms: Array(TermText) };
 type NodeLink = struct { type: LinkKind, key: String };
 type Node = struct { key: String, type: edsl::KnowledgeKind, description: Description, links: Array(NodeLink), detail: Value };
 type NodeResult = enum { NotFound, Found(Node) };
 type NodeResponse = enum { Document(NodeResult) };
 type DatasetDetail = struct { id: String, grain: Array(String), time_roles: Array(edsl::TimeRoleBrief), references: Array(edsl::ReferenceSpec), field_roles: Array(edsl::FieldRoleBrief) };
 type FieldDetail = struct { id: String, dataset: String, nullable: Bool, logical_type: Option(edsl::LogicalType), roles: Array(edsl::FieldRole), reference_ids: Array(String) };
-type ValueDetail = struct { id: String, dimension: String };
+type ValueDetail = struct { id: String, type_id: String, wires: Array(edsl::FilterInput) };
+type TypeValueDetail = struct { id: String, label: String, aliases: Array(String), localized: Array(edsl::LocalizedValueLabel), wires: Array(edsl::FilterInput) };
+type ValueTypeDetail = struct { id: String, label: String, summary: String, storage: String, half_open: Bool,
+    values: Array(TypeValueDetail), canonical_order: Array(String) };
 type BusinessLinkDetail = struct { id: String, hub: String, direction: Option(edsl::LinkDirection), guard: Option(edsl::ScopePredicate) };
+type DatasetTerm = struct { name: String, doc: String, aliases: Array(String) };
+type DimensionTerm = struct { dataset: String, name: String, doc: String, aliases: Array(String) };
+type MeasureTerm = struct { dataset: String, name: String, doc: String, aliases: Array(String) };
+type ValueTerm = struct { type_id: String, name: String, doc: String, aliases: Array(String) };
+type RelationTerm = struct { name: String, doc: String, aliases: Array(String) };
+type LinkEntry = struct { source: String, target: String, kind: LinkKind };
+type LinksIndex = struct { revision: String, links: Array(LinkEntry) };
+type TerminologyIndex = struct { revision: String, datasets: Array(DatasetTerm), dimensions: Array(DimensionTerm), measures: Array(MeasureTerm), rels: Array(RelationTerm), types: Array(DatasetTerm), values: Array(ValueTerm) };
+type DiscoveryInput = struct {};
 
 def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
     {kind, owner, id}
@@ -62,10 +77,10 @@ def traversable: Fn(edsl::KnowledgeTarget) -> KnowledgeLink = fn(item) { {target
 
 def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(KnowledgeLink)) -> Point =
     fn(id, label, aliases, summary, refs) {
-        {target: id, label, aliases, localized: [], summary, refs, grain: [], time_roles: [], time_role: None,
+        {target: id, label, aliases, localized: [], summary, refs, terms: [], grain: [], time_roles: [], time_role: None,
             references: [], field_roles: [], roles: [], nullable: False, logical_type: None,
             dimension: None, measure: None, relation: None, metric: None, direction: None, guard: None,
-            entries: None, terminology: None, total: 0, revision: ""}
+            entries: None, revision: "", value_type: None, value: None}
     };
 
 def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
@@ -116,64 +131,27 @@ def type_points: Array(Point) = array::map([
         array::concat([[member(syntax_target("model/logical_types")), member(syntax_target("graph/filter"))], type_operations(entry.0)]))
 });
 
-def directory_target: Fn(String, String) -> edsl::KnowledgeTarget = fn(owner, id) {
-    target(edsl::KnowledgeKind::Directory, owner, id)
+def value_type_points: Fn(edsl::PreparedPayload) -> Array(Point) = fn(payload) {
+    array::flat_map(edsl::visible_value_types(payload), fn(spec) {
+        let parent = type_target(spec.id);
+        let values = array::map(spec.values, fn(value) {
+            let current = target(edsl::KnowledgeKind::Value, spec.id, value.id);
+            let base = point(current, value.label,
+                array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]), "", [member(parent)]);
+            {...base, value: array::find(spec.mapping, fn(mapping) { mapping.id == value.id }),
+                localized: array::map(value.localized, fn(text) { {locale: text.locale, label: text.label, summary: ""} })}
+        });
+        let base = point(parent, spec.label, [], spec.summary,
+            array::concat([[member(syntax_target("model/logical_types")), member(syntax_target("operations/comparison"))],
+                array::map(values, fn(value) { member(value.target) })]));
+        array::concat([[{...base, value_type: Some(spec)}], values])
+    })
 };
 
-# Small deterministic leaves and binary branches bound directory fan-out.
-def directory_tree: Fn(edsl::KnowledgeTarget, String, Array(IndexEntry)) -> Array(Point) = fn(key, label, entries) {
-    if array::length(entries) <= 12 {
-        [{...point(key, label, [], "Complete directory; entries are the only enumeration source. total counts leaf entries in this subtree. Follow each returned opaque key unchanged.", []), entries: Some(entries), total: array::length(entries)}]
-    } else {
-        let indexed = array::enumerate(entries);
-        let middle = array::length(entries) / 2;
-        let left = directory_tree(directory_target(key.owner, `\{key.id}/1`), `\{label} (1)`,
-            array::map(array::filter(indexed, fn(item) { item.0 < middle }), fn(item) { item.1 }));
-        let right = directory_tree(directory_target(key.owner, `\{key.id}/2`), `\{label} (2)`,
-            array::map(array::filter(indexed, fn(item) { item.0 >= middle }), fn(item) { item.1 }));
-        array::concat([[{...point(key, label, [], "Complete directory branches; total counts leaf entries in this subtree, not child directories. Follow returned opaque keys until reaching members.", []),
-            entries: Some(index_entries([left[0], right[0]]).entries), total: array::length(entries)}], left, right])
-    }
-};
-
-def terminology_tree: Fn(edsl::KnowledgeTarget, String, Array(edsl::TermAnnotation)) -> Array(Point) = fn(key, label, terms) {
-    if array::length(terms) <= 12 {
-        [terminology_point(point(key, label, [], "Supplemental natural-language expressions mapped to canonical domain concepts; total counts expression-to-target associations, not distinct words. Not additional query vocabulary.", []), terms)]
-    } else {
-        let indexed = array::enumerate(terms);
-        let middle = array::length(terms) / 2;
-        let left = terminology_tree(target(edsl::KnowledgeKind::Terminology, "", `\{key.id}/1`), `\{label} (1)`,
-            array::map(array::filter(indexed, fn(item) { item.0 < middle }), fn(item) { item.1 }));
-        let right = terminology_tree(target(edsl::KnowledgeKind::Terminology, "", `\{key.id}/2`), `\{label} (2)`,
-            array::map(array::filter(indexed, fn(item) { item.0 >= middle }), fn(item) { item.1 }));
-        array::concat([[{...point(directory_target(key.owner, key.id), label, [], "Supplemental terminology directory; total counts expression-to-target associations in this subtree. Follow entries to complete lists of expressions.", []),
-            entries: Some(index_entries([left[0], right[0]]).entries), total: array::length(terms)}], left, right])
-    }
-};
-
-def directories: Fn(edsl::PreparedPayload, Array(IndexEntry)) -> Array(Point) = fn(payload, entries) {
-    let lookup = dict::from_pairs(array::map(entries, fn(entry) { (target_key(entry.key), entry) }));
-    let datasets = directory_tree(directory_target("", "datasets"), "Datasets",
-        array::filter(entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Dataset }));
-    let relations = directory_tree(directory_target("", "relations"), "Relations",
-        array::filter(entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Relation || entry.key.kind == edsl::KnowledgeKind::BusinessLink }));
-    let types = directory_tree(directory_target("", "types"), "Data types", index_entries(type_points).entries);
-    let syntax = directory_tree(directory_target("", "query"), "Query contracts",
-        array::filter(entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Schema }));
-    let terms = terminology_tree(target(edsl::KnowledgeKind::Terminology, "", "terminology"), "Terminology", visible_terms(payload, entries));
-    let members = array::flat_map(edsl::visible_knowledge_index(payload), fn(brief) {
-        let refs = dataset_point(payload, brief).refs;
-        directory_tree(directory_target(brief.id, "members"), `\{brief.label} members`,
-            array::flat_map(refs, fn(ref) {
-                match dict::get(lookup, target_key(ref.target)) {
-                    Some(entry) => [entry], None => fail!("dataset member missing from visible catalog", ref.target),
-                }
-            }))
-    });
-    let root = {...point(target(edsl::KnowledgeKind::Index, "", "index"), "Knowledge index", [],
-        "Start here. Five complete discovery routes: datasets, relations, terminology, data types and query contracts. Keys are opaque; follow entries and semantic links without constructing keys.", []),
-        entries: Some(index_entries([datasets[0], relations[0], terms[0], types[0], syntax[0]]).entries), total: 5, revision: payload.revision};
-    array::concat([[root], datasets, relations, terms, types, syntax, members])
+def index_point: Fn(edsl::PreparedPayload) -> Point = fn(payload) {
+    {...point(target(edsl::KnowledgeKind::Index, "", "index"), "Knowledge index", [],
+        "Schema keys and concrete knowledge key patterns. Use discovery roots and info(key) for complete details. Dataset details directly reference their members.", []),
+        entries: Some(index_entries(syntax_points).entries), revision: payload.revision}
 };
 
 def syntax_points: Array(Point) = [
@@ -191,21 +169,25 @@ def syntax_points: Array(Point) = [
         "InSubnet and NotInSubnet apply only to an Ipv4 dimension that declares the operation in ops. value is a canonical IPv4 CIDR string, no kind: for example 10.4.16.0/20. Every integer mask /0..32 is supported. Host bits must be zero, never silently normalized. Input address and stored values use canonical dotted decimal without leading zeros. Whole-octet prefixes retain the trailing dot, so 10.4.0.0/16 cannot match 10.40.0.1. Lowering uses a bound half-open binary text range as prefilter, followed by a bound generated regex for partial octets. /32 uses address equality; /0 matches every non-NULL address. NotInSubnet negates the entire membership predicate over non-NULL addresses, not missing values. CIDR is a network operation argument, not an address for Eq or any_of. Typed callers use Ipv4Subnet. No Text, IPv6 or native inet conversion is implied. PostgreSQL uses COLLATE C and native regex; SQLite uses COLLATE BINARY and requires the executor to register regexp(pattern,value), returning NULL for NULL arguments and boolean membership otherwise. Generated patterns use only anchors, decimal alternatives, groups, [.] and [0-9]{1,3}. A usable range index must have the matching collation; index use is not guaranteed by semantic support. Preparation checks comparison, binary collation, conjunction, regex and negation capabilities.",
         [member(syntax_target("model/logical_types")), member(syntax_target("graph/filter"))]),
     point(syntax_target("model/logical_types"), "Logical types and field capabilities", [],
-        "Physical storage is not the logical value domain. Time fields distinguish DatetimeUtc, DateUtc, LocalDateTime and EpochMillis even when their storage is String or Int. Explicit logical_type(Ipv4) uses canonical dotted-decimal String storage with four octets 0..255 and no leading zeros; it is not Text. Address Eq/Ne and IPv4 CIDR InSubnet/NotInSubnet are defined; see the linked subnet contract. No lexical ordering, Contains, IPv6 or implicit conversion to Text. Noncanonical stored addresses violate the declared storage contract; preparation does not scan data. The field's published ops may narrow the type's operations, but cannot give a type an undefined operation. Index availability and cost are field/physical capability considerations, not a reason to reinterpret address semantics. Names of fields do not infer their types; raw unknown-format source columns remain Text until their representation is established. Logical types grant no filter or projection authorization.", [member(syntax_target("model/ipv4_subnets"))]),
+        "Physical storage is not the logical value domain. Time fields distinguish DatetimeUtc, DateUtc, LocalDateTime and EpochMillis even when their storage is String or Int. Explicit logical_type(Ipv4) uses canonical dotted-decimal String storage with four octets 0..255 and no leading zeros; it is not Text. Address Eq/Ne and IPv4 CIDR InSubnet/NotInSubnet are defined; see the linked subnet contract. No lexical ordering, Contains, IPv6 or implicit conversion to Text. Noncanonical stored addresses violate the declared storage contract; preparation does not scan data. The field's published ops may narrow the type's operations, but cannot give a type an undefined operation. Index availability and cost are field/physical capability considerations, not a reason to reinterpret address semantics. Names of fields do not infer their types; raw unknown-format source columns remain Text until their representation is established. Logical types grant no filter or projection authorization.",
+        array::concat([[member(syntax_target("model/ipv4_subnets"))], array::map(type_points, fn(item) { member(item.target) })])),
     point(syntax_target("model/field_roles"), "Field roles and object references", [],
         "Dataset detail.references contains named {id,fields} sets. Each complete non-NULL tuple is a trusted unique address within that dataset; fields inside a set participate together, and different sets are alternative addresses. Field detail.nullable is derived from Option(T). Any missing member makes the entire reference unavailable; NULL is not an address value. A nullable reference does not establish a total key or grain. Do not treat one member of a composite set as a complete reference. Dataset detail.field_roles contains {field,roles}; Field detail has roles and reference_ids. Appellation participates in identity display and need not be unique; Reference participates in an explicitly declared unique address; Classification describes a category; Metric describes quantitative use. Roles may overlap. Formal metric declarations also derive Metric. Roles grant no query capabilities, do not change grain or keys, and imply no default display, URL, unit or aggregate. Only fully visible references are published. Query and report consumers must respect the separately declared capabilities.", []),
     point(syntax_target("knowledge/target"), "Knowledge target", [],
-        "Start at Index key index. Its five entries lead to datasets, relations, terminology, data types and query contracts; detail.revision identifies the Prepared Model revision. Directory branches lead to complete small leaves; Dataset links lead to member directories. info accepts {key:<opaque string>}; pass an entry key or a semantic link key unchanged. Keys are path-like but opaque: do not split, decode or construct them. Names and aliases describe knowledge but are not keys.",
+        "Index key index publishes schema keys and concrete knowledge key patterns; detail.revision identifies the Prepared Model revision. Names are URI-encoded components; Schema keys preserve slash-separated path segments. info accepts {key:<string>} and returns complete knowledge for the exact key. The discovery capability supplies Dataset and Relation roots. Consumers derive search vocabulary and references from info documents.",
         [member(syntax_target("knowledge/node"))]),
     point(syntax_target("knowledge/node"), "Knowledge node contract", [],
-        "Every Found node is {key,type,description,links,detail}. description is {label,aliases,localized,summary}; localized items are {locale,label,summary}. links are {type,key}: Member structural membership, Related discovery-only association, Traversable declared relation endpoint. Index and Directory detail has complete entries with {key,type,label}. Vocabulary entries additionally publish canonical id: Dataset, Field, Dimension, Measure, Metric, TimeRole, Relation, Value, DataType and BusinessLink. Field/Dimension/Measure/Metric/TimeRole/Relation entries include the owning dataset ID; Value includes dimension ID; BusinessLink includes hub ID. TimeRole id is its field name. Structural Index/Directory/Terminology/Schema entries have no query-vocabulary id. Use entry id directly to enumerate vocabulary; follow key for capabilities, units, population semantics and other details. Labels are display text, never identifiers; Relation and BusinessLink entries additionally have from/to Dataset keys, for discovery only. Directory entries are not repeated in links. Entries naming Directory lead to child directories; other entries name members. Terminology leaves have entries {term,description,key}; a Terminology leaf never contains child directories. Empty entries means an empty complete list. No cursor or implicit truncation. DataType detail has id; type descriptions explain the logical value domain, not field authorization. Dataset has {id,grain,time_roles,references,field_roles} and links to its member directory. Field has {id,dataset,nullable,logical_type,roles,reference_ids}; Value has {id,dimension}; Dimension, Measure and Relation preserve their Model details; TimeRole and Metric identify their owning dataset; BusinessLink has {id,hub,direction,guard}; Schema detail is empty. Canonical business IDs are explicit detail fields, never inferred from a knowledge key. Unknown or hidden keys return NotFound.",
+        "Every Found node is {key,type,description,links,detail}. description is {label,aliases,localized,summary}; localized items are {locale,label,summary}; terms are {term,description}. links are {type,key}: Member structural membership, Related explanatory association, Traversable declared relation endpoint. Index detail is {revision,schemas,key_patterns,encoding}: schemas lists exact Schema keys; key_patterns lists {kind,pattern} for concrete nodes. Index enumerates no business instances. Dataset has {id,grain,time_roles,references,field_roles} and directly links to its fields, dimensions, measures, relations, metrics, time roles and business links. Field has {id,dataset,nullable,logical_type,roles,reference_ids}; Value has {id,type_id,wires}; named DataType details contain id, storage, half_open, canonical_order and values with member labels, aliases, localized labels and wires. Dimension, Measure and Relation preserve their Model details; TimeRole and Metric identify their owning dataset; BusinessLink has {id,hub,direction,guard}; Schema detail is empty. Labels are display text, never Intent identifiers. Follow references for capabilities, units and population semantics. info publishes only Index, Schema and concrete knowledge nodes. Unknown or hidden keys return NotFound. The discovery capability returns only Dataset and Relation keys; search vocabulary and reverse references are generated by consumers.",
         [member(target(edsl::KnowledgeKind::Index, "", "index"))]),
     point(syntax_target("knowledge/request"), "Knowledge request", [],
         "The unbound knowledge service accepts exactly {method,input}. method is <domain>/info; input follows the declared info shape. A mounted service slot receives only input, without this envelope.",
         [member(syntax_target("knowledge/info"))]),
     point(syntax_target("knowledge/info"), "Knowledge info request", [],
-        "info input is exactly {key:<opaque string>}. Start with key \"index\" for five discovery routes. Follow directory entries and node links unchanged to discover all visible knowledge; each list is complete, not truncated. Unknown or invisible keys return NotFound.",
+        "info input is exactly {key:<string>}. Read index for schema keys and concrete key patterns. Find business names through the consumer search service backed by externally generated terminology, then read exact keys. Dataset links directly identify members. Unknown or invisible keys return NotFound. discovery returns Dataset and Relation roots for consumer-side indexing.",
         [member(syntax_target("knowledge/target")), member(target(edsl::KnowledgeKind::Index, "", "index"))]),
+    point(syntax_target("knowledge/discovery"), "Knowledge discovery request", [],
+        "discovery input is exactly {}. The independent capability returns only complete visible Dataset and Relation keys as a JSON array. Consumers follow info references from these roots to find dimensions, measures, business types and their values. Structured descriptions include declared terms as {term,description}. Consumers derive terminology and unique reference edges for search and reverse lookup. Schema keys and concrete key patterns are available through info(index).",
+        [member(syntax_target("knowledge/info"))]),
     point(syntax_target("intent"), "Intent syntax", [],
         "Submit {intents:[...]} with one to five independent intents. Each intent has op Graph, GraphPair or GraphUnion. Values in filters are interpreted by their declared dimension or measure; do not supply an input kind.",
         [member(syntax_target("graph")), member(syntax_target("graph_pair")), member(syntax_target("graph_union")),
@@ -301,24 +283,16 @@ def dimension_points: Fn(edsl::PreparedPayload, String) -> Array(Point) = fn(pay
     let detail = edsl::visible_dimension_detail(payload, id);
     let parent = target(edsl::KnowledgeKind::Dataset, "", detail.dataset);
     let dimension = target(edsl::KnowledgeKind::Dimension, detail.dataset, detail.id);
-    let values = array::map(detail.values, fn(value) {
-        let current = target(edsl::KnowledgeKind::Value, detail.id, value.id);
-        let item = point(current, value.label, array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]),
-            "", [member(dimension)]);
-        {...item, localized: array::map(value.localized, fn(text) {
-            {locale: text.locale, label: text.label, summary: ""}
-        })}
-    });
     let value_refs = array::map(detail.values, fn(value) {
-        member(target(edsl::KnowledgeKind::Value, detail.id, value.id))
+        member(target(edsl::KnowledgeKind::Value, detail.type_id, value.id))
     });
     let operation_contracts = if detail.input_kinds == [edsl::FilterInputKind::Ipv4] {
         [member(syntax_target("graph/filter/capabilities")), member(syntax_target("model/ipv4_subnets"))]
     } else { [member(syntax_target("graph/filter/capabilities"))] };
     let contracts = array::concat([operation_contracts, array::map(detail.input_kinds, input_type_ref)]);
     let base = point(dimension, detail.label, array::concat([detail.aliases, labels(detail.localized)]),
-        detail.summary, array::concat([[member(parent), member(target(edsl::KnowledgeKind::Field, detail.dataset, detail.field))], value_refs, contracts]));
-    array::concat([[{...base, dimension: Some(detail), localized: detail.localized}], values])
+        detail.summary, array::concat([[member(parent), member(target(edsl::KnowledgeKind::Field, detail.dataset, detail.field)), member(type_target(detail.type_id))], value_refs, contracts]));
+    [{...base, dimension: Some(detail), localized: detail.localized}]
 };
 
 def measure_point: Fn(edsl::PreparedPayload, String) -> Point = fn(payload, id) {
@@ -345,7 +319,7 @@ def measure_point: Fn(edsl::PreparedPayload, String) -> Point = fn(payload, id) 
             let value_ref = match (predicate.op, predicate.input) {
                 (edsl::FilterOp::Eq, edsl::FilterInput::Text(name)) =>
                     if array::any(business.values, fn(value) { value.id == name }) {
-                        [member(target(edsl::KnowledgeKind::Value, dimension.id, name))]
+                        [member(target(edsl::KnowledgeKind::Value, dimension.type_id, name))]
                     } else { [] },
                 _ => [],
             };
@@ -458,8 +432,8 @@ def target_key: Fn(edsl::KnowledgeTarget) -> String = fn(id) {
 
 def visible_terms: Fn(edsl::PreparedPayload, Array(IndexEntry)) -> Array(edsl::TermAnnotation) =
     fn(payload, entries) {
-        let declared = array::filter(array::flat_map(payload.entities, fn(entity) {
-            match property::get_type_prop(entity.entity_type, edsl::TermAnnotations.type) {
+        let declared = array::filter(array::flat_map(edsl::knowledge_annotation_types(payload), fn(ty) {
+            match property::get_type_prop(ty, edsl::TermAnnotations.type) {
                 Some(declared) => declared.entries, None => [],
             }
         }), fn(entry) { array::any(entries, fn(item) { item.key == entry.target }) });
@@ -474,59 +448,54 @@ def visible_terms: Fn(edsl::PreparedPayload, Array(IndexEntry)) -> Array(edsl::T
         })
     };
 
-def terminology_point: Fn(Point, Array(edsl::TermAnnotation)) -> Point = fn(item, terminology) {
-    let targets = array::fold(terminology, [].ty!(Array(edsl::KnowledgeTarget)), fn(seen, entry) {
-        if array::any(seen, fn(target) { target == entry.target }) { seen }
-        else { array::push(seen, entry.target) }
-    });
-    {...item, terminology: Some(terminology), total: array::length(terminology), refs: array::concat([item.refs,
-        array::map(targets, fn(target) { {target, kind: LinkKind::Related} })])}
-};
-
 # Materialize the same nodes as the public, cached lookup path.
 def map: Fn(edsl::PreparedPayload) -> Array(Point) = fn(payload) {
     let index = index_from_model(payload);
+    let declared_terms = array::flat_map(edsl::knowledge_annotation_types(payload), fn(ty) {
+        match property::get_type_prop(ty, edsl::TermAnnotations.type) {
+            Some(spec) => spec.entries, None => [],
+        }
+    });
     let datasets = edsl::visible_knowledge_index(payload);
     let domain = array::concat([
         array::map(datasets, fn(brief) { dataset_point(payload, brief) }),
         array::flat_map(datasets, fn(brief) { dataset_members(payload, brief) }),
     ]);
-    let docs = array::flat_map(payload.entities, fn(entity) {
-        match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+    let docs = array::flat_map(edsl::knowledge_annotation_types(payload), fn(ty) {
+        match property::get_type_prop(ty, edsl::KnowledgeDocs.type) {
             Some(declared) => declared.entries, None => [],
         }
     });
-    let related = array::flat_map(payload.entities, fn(entity) {
-        match property::get_type_prop(entity.entity_type, edsl::KnowledgeRelations.type) {
+    let related = array::flat_map(edsl::knowledge_annotation_types(payload), fn(ty) {
+        match property::get_type_prop(ty, edsl::KnowledgeRelations.type) {
             Some(declared) => declared.entries, None => [],
         }
     });
     let keys = dict::from_pairs(array::map(index.entries, fn(entry) { (target_key(entry.key), True) }));
     let raw = array::concat([syntax_points, type_points, array::map(domain, fn(item) {
-        let base_refs = if item.target.kind == edsl::KnowledgeKind::Dataset {
-            [member(directory_target(item.target.id, "members"))]
-        } else { item.refs };
-        let refs = array::concat([base_refs, array::map(array::filter(related, fn(ref) {
+        let refs = array::concat([item.refs, array::map(array::filter(related, fn(ref) {
             ref.source == item.target && dict::get(keys, target_key(ref.target)) != None
         }), fn(ref) { {target: ref.target, kind: LinkKind::Related} })]);
         let summary = match array::find(docs, fn(note) { note.target == item.target }) {
             Some(note) => note.text, None => item.summary,
         };
         {...item, refs, summary}
-    }), index.directories]);
+    }), array::map(dict::keys(index.points), fn(key) { match dict::get(index.points, key) {
+        Some(item) => item, None => fail!("cached knowledge point disappeared", key),
+    } })]);
     let visible = dict::from_pairs(array::map(raw, fn(item) { (target_key(item.target), True) }));
     if let Some(dangling) = array::find(raw, fn(item) {
         array::any(item.refs, fn(ref) {
             dict::get(visible, target_key(ref.target)) == None
         })
     }) { fail!("knowledge point references a point outside the visible model", dangling.target) }
-    else { raw }
+    else { array::map(raw, fn(item) { {...item, terms: array::filter(declared_terms, fn(term) { term.target == item.target })} }) }
 };
 
 def index_entries: Fn(Array(Point)) -> KnowledgeIndex = fn(points) {
     {entries: array::map(points, fn(item) {
         {key: item.target, label: item.label, aliases: item.aliases, summary: item.summary, from: None, to: None}
-    }), directories: [], targets: {}, points: {}}
+    }), targets: {}, points: {}}
 };
 
 def index_entry: Fn(edsl::KnowledgeTarget, String, Array(String), String) -> IndexEntry = fn(key, label, aliases, summary) {
@@ -543,14 +512,10 @@ def index_from_model: Fn(edsl::PreparedPayload) -> KnowledgeIndex = fn(payload) 
         let fields = array::map(edsl::published_fields(payload, brief.id), fn(name) {
             index_entry(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], "")
         });
-        let dimensions = array::flat_map(brief.dimension_ids, fn(id) {
+        let dimensions = array::map(brief.dimension_ids, fn(id) {
             let detail = edsl::visible_dimension_detail(payload, id);
-            array::concat([[index_entry(target(edsl::KnowledgeKind::Dimension, brief.id, id),
-                detail.label, array::concat([detail.aliases, labels(detail.localized)]), detail.summary)],
-                array::map(detail.values, fn(value) {
-                index_entry(target(edsl::KnowledgeKind::Value, id, value.id), value.label,
-                    array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]), "")
-            })])
+            index_entry(target(edsl::KnowledgeKind::Dimension, brief.id, id),
+                detail.label, array::concat([detail.aliases, labels(detail.localized)]), detail.summary)
         });
         let measures = array::map(brief.measure_ids, fn(id) {
             let detail = edsl::measure_detail(payload, id);
@@ -584,12 +549,13 @@ def index_from_model: Fn(edsl::PreparedPayload) -> KnowledgeIndex = fn(payload) 
         });
         array::concat([fields, dimensions, measures, relations, metrics, times, links])
     });
-    let docs = array::flat_map(payload.entities, fn(entity) {
-        match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+    let docs = array::flat_map(edsl::knowledge_annotation_types(payload), fn(ty) {
+        match property::get_type_prop(ty, edsl::KnowledgeDocs.type) {
             Some(declared) => declared.entries, None => [],
         }
     });
-    let entries = array::map(array::concat([index_entries(syntax_points).entries, index_entries(type_points).entries, roots, members]), fn(entry) {
+    let typed = value_type_points(payload);
+    let entries = array::map(array::concat([index_entries(syntax_points).entries, index_entries(type_points).entries, index_entries(typed).entries, roots, members]), fn(entry) {
         match array::find(docs, fn(note) { note.target == entry.key }) {
             Some(note) => {...entry, summary: note.text}, None => entry,
         }
@@ -598,18 +564,87 @@ def index_from_model: Fn(edsl::PreparedPayload) -> KnowledgeIndex = fn(payload) 
     if array::length(dict::keys(keys)) != array::length(entries) {
         fail!("knowledge keys must identify exactly one visible node", entries)
     } else {
-        let tree = directories(payload, entries);
-        let directory_entries = index_entries(tree).entries;
-        let catalog = array::concat([array::filter(entries, fn(entry) {
-            entry.key.kind != edsl::KnowledgeKind::Index && entry.key.kind != edsl::KnowledgeKind::Terminology
-        }), directory_entries]);
-        {entries: catalog, directories: tree,
+        let root = index_point(payload);
+        let catalog = array::concat([entries, index_entries([root]).entries]);
+        {entries: catalog,
             targets: dict::from_pairs(array::map(catalog, fn(entry) { (target_key(entry.key), entry.key) })),
-            points: dict::from_pairs(array::map(tree, fn(item) { (target_key(item.target), item) }))}
+            points: dict::from_pairs(array::map(array::concat([[root], typed]), fn(item) {
+                let summary = match array::find(docs, fn(note) { note.target == item.target }) {
+                    Some(note) => note.text, None => item.summary,
+                };
+                (target_key(item.target), {...item, summary})
+            }))}
     }
 };
 
-def point_from_model: Fn(edsl::PreparedPayload, KnowledgeIndex, edsl::KnowledgeTarget) -> DocResult =
+def distinct_text: Fn(Array(String)) -> Array(String) = fn(items) {
+    array::fold(items, [].ty!(Array(String)), fn(seen, item) {
+        if item == "" || array::any(seen, fn(other) { other == item }) { seen }
+        else { array::push(seen, item) }
+    })
+};
+
+def terminology_entry: Fn(IndexEntry, Array(edsl::TermAnnotation), Array(String)) -> DatasetTerm = fn(entry, terms, localized_docs) {
+    let matching = array::filter(terms, fn(term) { term.target == entry.key });
+    let aliases = distinct_text(array::concat([[entry.label], entry.aliases, array::map(matching, fn(term) { term.term })]));
+    {name: entry.key.id,
+        doc: string::join(distinct_text(array::concat([[entry.summary], localized_docs, array::map(matching, fn(term) { term.description })])), "\n"),
+        aliases: array::filter(aliases, fn(alias) { alias != entry.key.id })}
+};
+
+def terminology_from_catalog: Fn(edsl::PreparedPayload, KnowledgeIndex) -> TerminologyIndex = fn(payload, index) {
+    let terms = visible_terms(payload, index.entries);
+    let datasets = edsl::visible_knowledge_index(payload);
+    {revision: payload.revision,
+        types: array::map(array::filter(index.entries, fn(entry) {
+            entry.key.kind == edsl::KnowledgeKind::DataType && dict::get(index.points, target_key(entry.key)) != None
+        }), fn(entry) { terminology_entry(entry, terms, []) }),
+        datasets: array::map(array::filter(index.entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Dataset }),
+            fn(entry) {
+                let brief = match array::find(datasets, fn(brief) { brief.id == entry.key.id }) {
+                    Some(brief) => brief, None => fail!("terminology dataset disappeared", entry.key),
+                };
+                terminology_entry(entry, terms, array::map(brief.localized, fn(text) { text.summary }))
+            }),
+        dimensions: array::map(array::filter(index.entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Dimension }), fn(entry) {
+            let detail = edsl::visible_dimension_detail(payload, entry.key.id);
+            let text = terminology_entry(entry, terms, array::map(detail.localized, fn(text) { text.summary }));
+            {dataset: entry.key.owner, name: text.name, doc: text.doc, aliases: text.aliases}.ty!(DimensionTerm)
+        }),
+        measures: array::map(array::filter(index.entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Measure }), fn(entry) {
+            let detail = edsl::measure_detail(payload, entry.key.id);
+            let text = terminology_entry(entry, terms, array::map(detail.localized, fn(text) { text.summary }));
+            {dataset: entry.key.owner, name: text.name, doc: text.doc, aliases: text.aliases}.ty!(MeasureTerm)
+        }),
+        values: array::map(array::filter(index.entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Value }), fn(entry) {
+            let text = terminology_entry(entry, terms, []);
+            {type_id: entry.key.owner, name: text.name, doc: text.doc, aliases: text.aliases}.ty!(ValueTerm)
+        }),
+        rels: array::map(array::filter(index.entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Relation }), fn(entry) {
+            let detail = edsl::relation_detail(payload, entry.key.id);
+            let text = terminology_entry(entry, terms, array::map(detail.localized, fn(text) { text.summary }));
+            {name: text.name, doc: text.doc, aliases: text.aliases}.ty!(RelationTerm)
+        })}
+};
+
+def terminology_from_model: Fn(edsl::PreparedPayload) -> TerminologyIndex = fn(payload) {
+    terminology_from_catalog(payload, index_from_model(payload))
+};
+
+def links_from_model: Fn(edsl::PreparedPayload) -> LinksIndex = fn(payload) {
+    {revision: payload.revision, links: array::flat_map(map(payload), fn(item) {
+        let unique = array::fold(item.refs, {}.ty!(Dict(KnowledgeLink)), fn(seen, ref) {
+            let key = json::stringify(codec::encode((target_key(ref.target), ref.kind)));
+            if dict::get(seen, key) != None { seen }
+            else { dict::merge(seen, dict::from_pairs([(key, ref)])) }
+        });
+        array::map(dict::values(unique), fn(ref) {
+            {source: target_key(item.target), target: target_key(ref.target), kind: ref.kind}.ty!(LinkEntry)
+        })
+    })}.ty!(LinksIndex)
+};
+
+def raw_point_from_model: Fn(edsl::PreparedPayload, KnowledgeIndex, edsl::KnowledgeTarget) -> DocResult =
     fn(payload, index, key) {
         if !array::any(index.entries, fn(entry) { entry.key == key }) { DocResult::NotFound }
         else if let Some(item) = dict::get(index.points, target_key(key)) {
@@ -627,9 +662,7 @@ def point_from_model: Fn(edsl::PreparedPayload, KnowledgeIndex, edsl::KnowledgeT
             let datasets = edsl::visible_knowledge_index(payload);
             let brief = match array::find(datasets, fn(entry) {
                 if key.kind == edsl::KnowledgeKind::Dataset { entry.id == key.id }
-                else if key.kind == edsl::KnowledgeKind::Value {
-                    array::any(entry.dimension_ids, fn(name) { name == key.owner })
-                } else { entry.id == key.owner }
+                else { entry.id == key.owner }
             }) {
                 Some(entry) => entry,
                 None => fail!("knowledge key owner disappeared from prepared model", key),
@@ -655,13 +688,24 @@ def point_from_model: Fn(edsl::PreparedPayload, KnowledgeIndex, edsl::KnowledgeT
             let summary = match array::find(docs, fn(note) { note.target == key }) {
                 Some(note) => note.text, None => raw.summary,
             };
-            let published_refs = if key.kind == edsl::KnowledgeKind::Dataset {
-                array::concat([[member(directory_target(key.id, "members"))],
-                    array::filter(refs, fn(ref) { ref.kind != LinkKind::Member })])
-            } else { refs };
-            DocResult::Found({...raw, refs: published_refs, summary})
+            DocResult::Found({...raw, refs, summary})
         }
     };
+
+def point_from_model: Fn(edsl::PreparedPayload, KnowledgeIndex, edsl::KnowledgeTarget) -> DocResult = fn(payload, index, key) {
+    match raw_point_from_model(payload, index, key) {
+        DocResult::NotFound => DocResult::NotFound,
+        DocResult::Found(item) => {
+            let terms = if key.kind == edsl::KnowledgeKind::Index || key.kind == edsl::KnowledgeKind::Schema { [] }
+                else { array::filter(array::flat_map(edsl::knowledge_annotation_types(payload), fn(ty) {
+                    match property::get_type_prop(ty, edsl::TermAnnotations.type) {
+                        Some(spec) => spec.entries, None => [],
+                    }
+                }), fn(term) { term.target == key }) };
+            DocResult::Found({...item, terms})
+        },
+    }
+};
 
 def by_target: Fn(edsl::PreparedPayload, edsl::KnowledgeTarget) -> DocResult = fn(payload, id) {
     point_from_model(payload, index_from_model(payload), id)
@@ -707,29 +751,20 @@ def object_value: Fn(Array((String, Value))) -> Value = fn(fields) {
     Value::Object(dict::from_pairs(fields))
 };
 
-def public_entry: Fn(IndexEntry) -> Value = fn(entry) {
-    let identity = match entry.key.kind {
-        edsl::KnowledgeKind::Index => [],
-        edsl::KnowledgeKind::Directory => [],
-        edsl::KnowledgeKind::Terminology => [],
-        edsl::KnowledgeKind::Schema => [],
-        _ => [("id", Value::String(entry.key.id))],
-    };
-    let owner = if array::any([edsl::KnowledgeKind::Field, edsl::KnowledgeKind::Dimension, edsl::KnowledgeKind::Measure,
-        edsl::KnowledgeKind::Metric, edsl::KnowledgeKind::TimeRole, edsl::KnowledgeKind::Relation], fn(kind) { kind == entry.key.kind }) {
-        [("dataset", Value::String(entry.key.owner))]
-    } else { match entry.key.kind {
-        edsl::KnowledgeKind::Value => [("dimension", Value::String(entry.key.owner))],
-        edsl::KnowledgeKind::BusinessLink => [("hub", Value::String(entry.key.owner))],
-        _ => [],
-    } };
-    object_value(array::concat([[
-        ("key", Value::String(target_key(entry.key))),
-        ("type", codec::encode(entry.key.kind)),
-        ("label", Value::String(entry.label)),
-    ], identity, owner, match entry.from { Some(key) => [("from", Value::String(target_key(key)))], None => [] },
-       match entry.to { Some(key) => [("to", Value::String(target_key(key)))], None => [] }]))
-};
+type KeyPattern = struct { kind: edsl::KnowledgeKind, pattern: String };
+type IndexDetail = struct { revision: String, schemas: Array(String), key_patterns: Array(KeyPattern), encoding: String };
+def key_patterns: Array(KeyPattern) = array::map([
+    (edsl::KnowledgeKind::Dataset, "Dataset/{dataset}"),
+    (edsl::KnowledgeKind::Field, "Field/{dataset}/{field}"),
+    (edsl::KnowledgeKind::Dimension, "Dimension/{dataset}/{dimension}"),
+    (edsl::KnowledgeKind::Measure, "Measure/{dataset}/{measure}"),
+    (edsl::KnowledgeKind::Relation, "Relation/{relation}"),
+    (edsl::KnowledgeKind::DataType, "Type/{type}"),
+    (edsl::KnowledgeKind::Value, "Value/{type}/{value}"),
+    (edsl::KnowledgeKind::Metric, "Metric/{dataset}/{metric}"),
+    (edsl::KnowledgeKind::TimeRole, "TimeRole/{dataset}/{field}"),
+    (edsl::KnowledgeKind::BusinessLink, "BusinessLink/{hub}/{link}"),
+], fn(entry) { {kind: entry.0, pattern: entry.1} });
 
 def owned_detail: for(A: codec::Encode) Fn(String, A) -> Value = fn(dataset, detail) {
     match codec::encode(detail) {
@@ -740,24 +775,26 @@ def owned_detail: for(A: codec::Encode) Fn(String, A) -> Value = fn(dataset, det
 
 def node_value: Fn(Point) -> Value = fn(item) {
     let detail = match item.target.kind {
-        edsl::KnowledgeKind::Index => object_value([("revision", Value::String(item.revision)), ("total", Value::Int(item.total)), ("entries", codec::encode(array::map(
-            match item.entries { Some(entries) => entries, None => [] }, public_entry)))]),
-        edsl::KnowledgeKind::Directory => object_value([("total", Value::Int(item.total)), ("entries", codec::encode(array::map(
-            match item.entries { Some(entries) => entries, None => [] }, public_entry)))]),
-        edsl::KnowledgeKind::Terminology => object_value([("total", Value::Int(item.total)), ("entries", codec::encode(array::map(
-            match item.terminology { Some(entries) => entries, None => [] }, fn(entry) {
-                object_value([
-                    ("term", Value::String(entry.term)),
-                    ("description", Value::String(entry.description)),
-                    ("key", Value::String(target_key(entry.target))),
-                ])
-            })))]),
+        edsl::KnowledgeKind::Index => codec::encode({revision: item.revision,
+            schemas: array::map(match item.entries { Some(entries) => entries, None => [] }, fn(entry) { target_key(entry.key) }),
+            key_patterns, encoding: "Encode each canonical name as one URI component exactly once. Schema keys use Schema/syntax/{path}; encode each path segment. Returned keys are complete and can be passed directly to info."}.ty!(IndexDetail)),
         edsl::KnowledgeKind::Dataset => codec::encode({id: item.target.id, grain: item.grain, time_roles: item.time_roles,
             references: item.references, field_roles: item.field_roles}.ty!(DatasetDetail)),
         edsl::KnowledgeKind::Field => codec::encode({id: item.target.id, dataset: item.target.owner, nullable: item.nullable, logical_type: item.logical_type, roles: item.roles,
             reference_ids: array::map(item.references, fn(ref) { ref.id })}.ty!(FieldDetail)),
-        edsl::KnowledgeKind::DataType => object_value([("id", Value::String(item.target.id))]),
-        edsl::KnowledgeKind::Value => codec::encode({id: item.target.id, dimension: item.target.owner}.ty!(ValueDetail)),
+        edsl::KnowledgeKind::DataType => match item.value_type {
+            Some(spec) => codec::encode({id: spec.id, label: spec.label, summary: spec.summary,
+                storage: spec.storage, half_open: spec.half_open, canonical_order: spec.canonical_order,
+                values: array::map(spec.values, fn(value) {
+                    let wires = match array::find(spec.mapping, fn(member) { member.id == value.id }) {
+                        Some(member) => member.wires, None => [],
+                    };
+                    {id: value.id, label: value.label, aliases: value.aliases, localized: value.localized, wires}.ty!(TypeValueDetail)
+                })}.ty!(ValueTypeDetail)),
+            None => object_value([("id", Value::String(item.target.id))]),
+        },
+        edsl::KnowledgeKind::Value => codec::encode({id: item.target.id, type_id: item.target.owner,
+            wires: match item.value { Some(value) => value.wires, None => [] }}.ty!(ValueDetail)),
         edsl::KnowledgeKind::Dimension => match item.dimension {
             Some(value) => codec::encode(value), None => object_value([]),
         },
@@ -780,7 +817,8 @@ def node_value: Fn(Point) -> Value = fn(item) {
     object_value([
         ("key", Value::String(target_key(item.target))),
         ("type", codec::encode(item.target.kind)),
-        ("description", codec::encode({label: item.label, aliases: item.aliases, localized: item.localized, summary: item.summary}.ty!(Description))),
+        ("description", codec::encode({label: item.label, aliases: item.aliases, localized: item.localized, summary: item.summary,
+            terms: array::map(item.terms, fn(term) { {term: term.term, description: term.description}.ty!(TermText) })}.ty!(Description))),
         ("links", codec::encode(array::map(item.refs, fn(ref) {
             object_value([("type", codec::encode(ref.kind)), ("key", Value::String(target_key(ref.target)))])
         }))),
@@ -819,8 +857,30 @@ def knowledge_info_method_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> Val
         }
     };
 
+def discovery_keys: Fn(edsl::PreparedPayload) -> Array(String) = fn(payload) {
+    let datasets = edsl::visible_knowledge_index(payload);
+    let visible = dict::from_pairs(array::map(datasets, fn(dataset) { (dataset.id, True) }));
+    array::concat([
+        array::map(datasets, fn(dataset) { target_key(target(edsl::KnowledgeKind::Dataset, "", dataset.id)) }),
+        array::map(array::filter(payload.relations, fn(relation) {
+            relation.id != "" && dict::get(visible, payload.entities[relation.from].id) != None
+        }), fn(relation) { target_key(target(edsl::KnowledgeKind::Relation, "", relation.id)) }),
+    ])
+};
+
+def knowledge_discovery_method_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> Value = fn(payload) {
+    let keys = codec::encode(discovery_keys(payload));
+    fn(input) {
+        let request = decode_request@[DiscoveryInput](input, "syntax/knowledge/discovery");
+        keys
+    }
+};
+
 pub use self::{ LinkKind, KnowledgeLink, Point, IndexEntry, KnowledgeIndex, DocResult, KnowledgeResponse,
-    Description, NodeLink, Node, NodeResult, NodeResponse, node_value,
-    DatasetDetail, FieldDetail, ValueDetail, BusinessLinkDetail,
+    Description, TermText, NodeLink, Node, NodeResult, NodeResponse, node_value,
+    DatasetDetail, FieldDetail, ValueDetail, TypeValueDetail, ValueTypeDetail, BusinessLinkDetail, KeyPattern, IndexDetail,
     map, index_entries, index_from_model, by_target, knowledge_lookup_factory, serve, serve_value,
+    DatasetTerm, DimensionTerm, MeasureTerm, ValueTerm, RelationTerm, TerminologyIndex, terminology_from_model,
+    LinkEntry, LinksIndex, links_from_model,
+    discovery_keys, knowledge_discovery_method_factory,
     knowledge_service_factory, knowledge_info_method_factory };

@@ -1,8 +1,23 @@
 import { pathToFileURL } from 'node:url';
 
-export async function collectKnowledge(info) {
+export function terminologyKeys(terminology) {
+  const component = encodeURIComponent;
+  return [
+    ...terminology.datasets.map(entry => `Dataset/${component(entry.name)}`),
+    ...terminology.dimensions.map(entry => `Dimension/${component(entry.dataset)}/${component(entry.name)}`),
+    ...terminology.measures.map(entry => `Measure/${component(entry.dataset)}/${component(entry.name)}`),
+    ...terminology.rels.map(entry => `Relation/${component(entry.name)}`),
+    ...terminology.types.map(entry => `Type/${component(entry.name)}`),
+    ...terminology.values.map(entry => `Value/${component(entry.type_id)}/${component(entry.name)}`),
+  ];
+}
+
+export async function collectKnowledge(info, roots) {
   const nodes = [];
-  const pending = ['index'];
+  if (!Array.isArray(roots) || roots.some(key => !/^(Dataset|Relation)\/[^/]+$/.test(key))) {
+    throw new Error('Discovery requires Dataset/Relation keys');
+  }
+  const pending = [...new Set(['index', ...roots])];
   const seen = new Set(pending);
   for (let index = 0; index < pending.length; index++) {
     const key = pending[index];
@@ -24,13 +39,7 @@ export async function collectKnowledge(info) {
 
 export function discoveryKeys(node) {
   const keys = node.links.map(link => link.key);
-  if (['Index', 'Directory', 'Terminology'].includes(node.type)) {
-    for (const entry of node.detail.entries) {
-      keys.push(entry.key);
-      if ('from' in entry) keys.push(entry.from);
-      if ('to' in entry) keys.push(entry.to);
-    }
-  }
+  if (node.type === 'Index') keys.push(...node.detail.schemas);
   if (keys.some(key => typeof key !== 'string')) {
     throw new Error('Knowledge references require opaque string keys');
   }
@@ -40,7 +49,7 @@ export function discoveryKeys(node) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const endpoint = process.argv[2];
   if (!endpoint) throw new Error('Usage: node knowledge-export.mjs <HTTP info endpoint>');
-  const nodes = await collectKnowledge(async (input) => {
+  async function request(endpoint, input) {
     const response = await fetch(endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
     });
@@ -48,6 +57,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const envelope = await response.json();
     if (envelope.error) throw new Error(JSON.stringify(envelope.diagnostics));
     return envelope.ok;
-  });
+  }
+  const discoveryEndpoint = new URL(endpoint);
+  if (!discoveryEndpoint.pathname.endsWith('/info')) throw new Error('Info endpoint must end with /info');
+  discoveryEndpoint.pathname = discoveryEndpoint.pathname.slice(0, -4) + 'discovery';
+  const roots = await request(discoveryEndpoint, {});
+  const nodes = await collectKnowledge(input => request(endpoint, input), roots);
   process.stdout.write(JSON.stringify(nodes));
 }

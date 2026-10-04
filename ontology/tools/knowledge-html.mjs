@@ -26,15 +26,9 @@ export function renderKnowledge(nodes) {
     const { key, type, description, links, detail } = node;
     for (const key of discoveryKeys(node)) checkLink(key);
     let content;
-    if (['Index', 'Directory', 'Terminology'].includes(type)) {
-      if (!Array.isArray(detail.entries)) throw new Error(`${type} requires detail.entries`);
-      content = '<table><thead><tr><th>Node / Term</th><th>Description / Endpoints</th><th>Key</th></tr></thead><tbody>' +
-        detail.entries.map((entry) => {
-          checkLink(entry.key);
-          return `<tr><td>${escape(entry.label ?? entry.term)}</td>` +
-            `<td>${entry.from ? link(entry.from) + ' → ' + link(entry.to) : escape(entry.description ?? entry.type ?? '')}</td>` +
-            `<td>${link(entry.key)}</td></tr>`;
-        }).join('') + '</tbody></table>';
+    if (type === 'Index') {
+      content = `<ul>${detail.schemas.map(key => `<li>${link(key)}</li>`).join('')}</ul>` +
+        `<pre>${escape(JSON.stringify({ key_patterns: detail.key_patterns, encoding: detail.encoding, revision: detail.revision }, null, 2))}</pre>`;
     } else {
       content = `<pre>${escape(JSON.stringify(detail, null, 2))}</pre>`;
     }

@@ -14,13 +14,13 @@ export async function withKnowledgeRunner(artifact, use, { requestFuel = '100000
   child.on('error', error => { failure = error; reader.close(); });
   child.stdin.on('error', error => { failure = error; reader.close(); });
   let active = false;
-  const info = async (domain, input) => {
+  const request = async (method, input) => {
     assert.equal(active, false, 'knowledge runner calls must be sequential');
     if (failure) throw failure;
     active = true;
     const timeout = setTimeout(() => child.kill(), 60000);
     try {
-      child.stdin.write(JSON.stringify({ method: `${domain}/info`, input }) + '\n');
+      child.stdin.write(JSON.stringify({ method, input }) + '\n');
       const line = await lines.next();
       if (failure) throw failure;
       assert.equal(line.done, false, 'knowledge runner exited before answering');
@@ -32,7 +32,8 @@ export async function withKnowledgeRunner(artifact, use, { requestFuel = '100000
       active = false;
     }
   };
-  try { return await use(info); }
+  const info = (domain, input) => request(`${domain}/info`, input);
+  try { return await use(info, request); }
   finally {
     child.stdin.end();
     child.kill();

@@ -1,0 +1,178 @@
+use ontology::ontology as edsl;
+use ontology::knowledge as knowledge;
+use ontology::intent::{ query_intent_ast_factory };
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+
+def members: Array(edsl::CanonicalValueSpec) = [
+    {id: "online", label: "Online", wires: [edsl::FilterInput::Int(1)]},
+    {id: "offline", label: "Offline", wires: [edsl::FilterInput::Int(0)]},
+];
+
+@edsl::value_type("ConnectionStatus", Int.type, members)
+@edsl::value_type_description("Connection status", "Source-coded online or offline status")
+@edsl::term("连接状态", "设备的连接状态", {kind: edsl::KnowledgeKind::DataType, owner: "", id: "ConnectionStatus"})
+@edsl::localized_canonical_value("online", "zh", "在线")
+@edsl::knowledge_doc({kind: edsl::KnowledgeKind::Value, owner: "ConnectionStatus", id: "online"}, "Connected to the source network")
+type ConnectionStatus = struct {};
+
+@edsl::value_type("OtherStatus", Int.type, [
+    {id: "online", label: "Online", wires: [edsl::FilterInput::Int(0)]},
+    {id: "offline", label: "Offline", wires: [edsl::FilterInput::Int(1)]},
+])
+type OtherStatus = struct {};
+
+@edsl::value_type("HiddenStatus", Int.type, members)
+type HiddenStatus = struct {};
+
+@edsl::entity_id("first")
+@edsl::entity_source("first", "a")
+type First = struct {
+    @edsl::column("id") @edsl::key() id: Int,
+    @edsl::column("status")
+    @edsl::dimension("first_status", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(ConnectionStatus.type)
+    status: Int,
+};
+
+@edsl::entity_id("second")
+@edsl::entity_source("second", "b")
+type Second = struct {
+    @edsl::column("id") @edsl::key()
+    @edsl::dimension("second_id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Int]) id: Int,
+    @edsl::column("status")
+    @edsl::dimension("second_status", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(ConnectionStatus.type)
+    @edsl::scope([{field: "status", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("online")}])
+    status: Int,
+};
+
+@edsl::entity_id("third")
+@edsl::entity_source("third", "c")
+type Third = struct {
+    @edsl::column("secret")
+    @edsl::dimension("private_status", False, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(HiddenStatus.type)
+    secret: Int,
+    @edsl::column("id") @edsl::key() id: Int,
+    @edsl::column("status")
+    @edsl::dimension("third_status", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(OtherStatus.type)
+    status: Int,
+};
+
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project, qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter, qb::Operator::Join],
+    allowed_join_kinds: [qb::JoinKind::Inner], allowed_aggregates: [],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::And, qb::ScalarFunction::Or, qb::ScalarFunction::If], allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("named-types", [First.type, Second.type, Third.type], profile);
+
+pub def terminology_indexes_business_types_and_their_terms: test::Test = test::should_ok(fn() {
+    let terms = knowledge::terminology_from_model(payload);
+    array::length(terms.types) == 2
+        && !array::any(terms.types, fn(entry) { entry.name == "Int" || entry.name == "Text" })
+        && match array::find(terms.types, fn(entry) { entry.name == "ConnectionStatus" }) {
+            Some(entry) => array::any(entry.aliases, fn(alias) { alias == "连接状态" })
+                && array::any(entry.aliases, fn(alias) { alias == "Connection status" })
+                && string::contains(entry.doc, "设备的连接状态"),
+            None => False,
+        }
+});
+
+pub def shared_types_have_one_value_identity_and_all_visible_uses: test::Test = test::should_ok(fn() {
+    let terms = knowledge::terminology_from_model(payload);
+    let matching = array::filter(terms.values, fn(value) { value.type_id == "ConnectionStatus" && value.name == "online" });
+    let uses = array::filter(knowledge::links_from_model(payload).links, fn(link) {
+        link.target == "Type/ConnectionStatus" && string::starts_with(link.source, "Dimension/")
+    });
+    array::length(matching) == 1 && array::length(uses) == 2
+        && matching[0].aliases == ["Online", "在线"]
+        && matching[0].doc == "Connected to the source network"
+        && array::length(edsl::visible_value_types(payload)) == 2
+});
+
+pub def type_owns_storage_mapping_and_dimension_links_to_type: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    let response = codec::decode@[knowledge::NodeResponse](info(json::parse(r#"{"key":"Type/ConnectionStatus"}"#).unwrap!())).unwrap!();
+    match response {
+        knowledge::NodeResponse::Document(knowledge::NodeResult::Found(node)) => {
+            let detail = codec::decode@[knowledge::ValueTypeDetail](node.detail).unwrap!();
+            detail.storage == "Int" && array::length(detail.values) == array::length(members)
+                && array::all(detail.values, fn(value) { array::any(members, fn(member) { member.id == value.id && member.wires == value.wires }) })
+                && detail.summary == "Source-coded online or offline status"
+                && array::any(node.links, fn(link) { link.key == "Value/ConnectionStatus/online" })
+                && match knowledge::by_target(payload, {kind: edsl::KnowledgeKind::Dimension, owner: "first", id: "first_status"}) {
+                    knowledge::DocResult::Found(point) => array::any(point.refs, fn(link) {
+                        link.target == {kind: edsl::KnowledgeKind::DataType, owner: "", id: "ConnectionStatus"}.ty!(edsl::KnowledgeTarget)
+                    }), _ => False,
+                }
+        }, _ => False,
+    }
+});
+
+def filtered_query: Fn(String, String) -> qb::Query = fn(dataset, dimension) {
+    let selected = if dataset == "second" { "second_id" } else { dimension };
+    sqlite::build_query(query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"x","nodes":[{"id":"x","entity":"\{dataset}"}],"edges":[],"select":[{"node":"x","dimension":"\{selected}"}],"filters":[{"node":"x","dimension":"\{dimension}","op":"Eq","value":"online"}]}`).unwrap!()))
+};
+
+pub def different_types_keep_opposite_wire_encodings: test::Test = test::should_ok(fn() {
+    let first = filtered_query("first", "first_status");
+    let third = filtered_query("third", "third_status");
+    first.bindings != third.bindings
+        && array::any(first.bindings, fn(value) { value == qb::Val::Int(1) })
+        && array::any(third.bindings, fn(value) { value == qb::Val::Int(0) })
+});
+
+pub def dimension_scope_narrows_usage_without_changing_type_members: test::Test = test::should_ok(fn() {
+    let scope = edsl::visible_dimension_detail(payload, "second_status").scope;
+    let query = filtered_query("second", "second_status");
+    array::length(scope) == 1 && scope[0].input == edsl::FilterInput::Text("online")
+        && array::length(edsl::visible_dimension_detail(payload, "second_status").values) == 2
+        && string::contains(query.sql, " AND ")
+});
+
+@edsl::value_type("ConnectionStatus", Int.type, members)
+type DuplicateStatus = struct {};
+@edsl::entity_id("duplicate")
+@edsl::entity_source("duplicate", "d")
+type Duplicate = struct {
+    @edsl::column("status")
+    @edsl::dimension("duplicate_status", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(DuplicateStatus.type)
+    status: Int,
+};
+pub def distinct_nominal_types_cannot_reuse_the_same_public_id: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("duplicate-type", [First.type, Duplicate.type], profile)
+}, "value type ids must be nonempty, unique");
+
+@edsl::entity_id("wrong_storage")
+@edsl::entity_source("wrong_storage", "w")
+type WrongStorage = struct {
+    @edsl::column("status")
+    @edsl::dimension("wrong_status", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(ConnectionStatus.type)
+    status: String,
+};
+pub def type_storage_must_match_its_physical_field: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("wrong-storage", [WrongStorage.type], profile)
+}, "value type storage disagrees with field storage");
+
+@edsl::entity_id("incompatible")
+@edsl::entity_source("incompatible", "i")
+@edsl::named_relation_key("incompatible_status", First.type, {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional},
+    edsl::DeclaredRelationKey::FieldEq({from: "status", to: "status"}))
+type Incompatible = struct {
+    @edsl::column("status")
+    @edsl::dimension("incompatible_status_dimension", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    @edsl::dimension_type(OtherStatus.type)
+    status: Int,
+};
+pub def different_types_are_not_implicitly_converted_in_relations: test::Test = test::should_fail_with(fn() {
+    edsl::build_root("incompatible-types", [First.type, Incompatible.type], profile)
+}, "relation fields have different named value types");

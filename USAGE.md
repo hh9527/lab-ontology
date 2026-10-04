@@ -36,8 +36,10 @@ domain in a collection (for example `dog`, `spider`, `world`). It writes
 `<artifact>.wasm.knowledge.json` (visible keys/types, counts, Model revisions and
 artifact SHA-256) and `<artifact>.wasm.knowledge-sizes.json` (full size rankings,
 largest entry/link, threshold and runtime verification results).
-The default node budget is 16,000 characters, measured exactly as
+The default concrete-document budget is 16,000 characters, measured exactly as
 `JSON.stringify({Document:{Found:node}}, null, 2).length`, not UTF-8 bytes.
+Index metadata is measured but exempt from this budget. The full terminology
+is obtained through a separate capability for consumer-side caching and search.
 Use `--max-node-chars <number>` to set the deployment budget. Oversize fails
 before replacing any previous artifact; `--on-oversize warn` explicitly permits
 publication with a warning report. `--not-found <checks.json>` additionally
@@ -96,35 +98,56 @@ directly to the matching path. The knowledge and query methods are:
 {"method":"<domain>/info","input":{"key":"<key returned by index or links>"}}
 ```
 
-The `index` topic returns five discovery routes: datasets, relations, terminology,
-data types and query contracts. Directory entries have `{key,type,label}`.
-Vocabulary entries additionally publish canonical `id` and, when applicable,
-`dataset`, `dimension` or `hub`. A Relation's `dataset` is its origin; relation
-entries also carry `from`/`to` dataset keys. Enumerate IDs from entries directly,
-then follow member keys for capabilities, units and population semantics.
-Structural directory and schema entries have no query-vocabulary ID.
-Large directories lead to smaller
-directories, and each returned list is complete, never a truncated page. Pass an
-entry's `key` unchanged to `info`. Follow entries and `links[].key` values to
-check entity grain, dimensions, measures, business values, time roles, and
-named relations. A `Related` link explains knowledge but does not authorize a
-query traversal. Labels, translations, aliases, and physical column names are
-not substitutes for stable Intent IDs.
+The `index` topic returns `{revision,schemas,key_patterns,encoding}`. It lists
+exact schema keys and `{kind,pattern}` rules for concrete knowledge keys;
+business instances are discovered through consumer-side terminology search.
+Read a matching key through `info`, then follow direct `links[].key` references
+for capabilities, units, population semantics and related knowledge. Dataset
+members are direct references. A `Related` link explains knowledge but does not
+authorize query traversal. Labels, translations, aliases and physical column
+names are not substitutes for canonical Intent IDs.
 
-Every knowledge node has `{key,type,description,links,detail}`. The string key
-is opaque: do not construct it from a type or business ID, split it, or decode it.
-The response `type` determines the `detail` shape. `Index` and `Directory` enumerate
-their children in `detail.entries`, without repeating entries in links. Index
-also publishes the Model's `detail.revision`. Dataset
-links lead to member directories. The terminology route uses `Directory` branches
-and `Terminology` leaves with `{term,description,key}` entries derived from Model annotations. `DataType`
-describes logical values and operations; a field must still authorize an operation.
-The directory tree discovers the formal domain concepts; terminology is supplemental
-language assistance, not a second concept system or automatic substitution.
-A term may refer to multiple nodes; interpret the user's meaning, read those
-nodes, and use only Model-defined canonical business IDs in Intent.
-Use index entries to discover the knowledge key and request contracts as well. A shape diagnostic
-includes the offending JSON path and a key that can be passed to `info`.
+Every knowledge node has `{key,type,description,links,detail}`. Public keys include
+`Dataset/{name}`, `Dimension/{dataset}/{name}`, `Field/{dataset}/{name}`, `Relation/{name}`, `Type/{name}`
+and `Value/{type}/{value}`. Name components are URI-encoded exactly once; `Type` keys return
+nodes whose response type is `DataType`. Prefer returned keys when following references.
+The response `type` determines the `detail` shape. `info` returns Index, Schema
+or a concrete knowledge point. `DataType` describes logical values and operations;
+a field must still authorize an operation. Search vocabulary and reverse references
+are generated outside the model. A term may match multiple nodes; read the matching
+nodes and use canonical business IDs in Intent. Structured descriptions include
+`terms:[{term,description}]` for explicit business terminology.
+Use `index.detail.schemas` to discover request contracts.
+
+Models mount `<domain>/discovery` with input `{}`. It returns a JSON array of
+complete visible Dataset and Relation keys. The consumer follows these roots
+through `info` to discover dimensions, measures, business types and values.
+Mount `knowledge::knowledge_discovery_method_factory(payload)` for this capability.
+
+Generate consumer data with:
+
+```sh
+node scripts/derive-discovery.mjs --output-prefix bin/icloud_model
+```
+
+The script writes `.terminology.json`, `.links.json`, `.keys.json` and
+`.report.json`. `--artifact`, `--domain` and `--output-prefix` select the model
+and output. `--keys roots.json` supplies roots instead of calling discovery.
+
+Terminology has `{revision,datasets,dimensions,measures,rels,types,values}`.
+Dataset, Relation and business Type entries contain `{name,doc,aliases}`;
+Dimension and Measure entries add `dataset`; Value entries add `type_id`.
+Physical Fields and primitive Types are available through info and are excluded
+from search vocabulary. Aliases and descriptions come from structured metadata,
+localized labels and explicit terms.
+
+Links has `{revision,links:[{source,target,kind}]}`. The consumer indexes it by
+target for reverse discovery. Edges are unique by `(source,target,kind)`;
+different kinds preserve both sides of self-relations. Full definitions and
+local dimension constraints remain in info documents.
+
+Dimensions identify business projections and filters; Measures identify declared
+aggregations. Their documents supply permitted query capabilities.
 
 Use the index topic and `info` to discover the Model, then express the user's business
 request as an Intent using discovered stable IDs. Use `transform` diagnostics to

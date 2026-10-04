@@ -6,13 +6,12 @@ const node = (key, type = 'Dataset', detail = {}, links = []) => ({
   key, type, description: { label: '<script>unsafe</script>', aliases: ['A&B'], localized: [], summary: '"quoted"' }, links, detail,
 });
 
-test('one generic template renders index, terminology and domain nodes using opaque keys', () => {
+test('one generic template renders schema index and concrete nodes using opaque keys', () => {
   const key = 'Dimension/设备%2F位置/状态?#';
   const target = node(key);
   const nodes = [
-    node('index', 'Index', { entries: [{ key: 'directory', type: 'Directory', label: '<script>unsafe</script>' }] }),
-    node('directory', 'Directory', { entries: [{ key, type: target.type, label: '<script>unsafe</script>', from: key, to: key }] }),
-    node('terminology', 'Terminology', { entries: [{ term: '业务说法', description: '<img onerror=bad>', key }] }, [{ type: 'Related', key }]),
+    node('index', 'Index', { schemas: ['Schema/a'], key_patterns: [{ kind: 'Dimension', pattern: 'Dimension/{dataset}/{dimension}' }], encoding: '<img onerror=bad>' }),
+    node('Schema/a', 'Schema', {}, [{ type: 'Related', key }]),
     target,
   ];
   const html = renderKnowledge(nodes);
@@ -21,12 +20,11 @@ test('one generic template renders index, terminology and domain nodes using opa
   assert.ok(html.includes('&lt;script&gt;unsafe&lt;/script&gt;'));
   assert.ok(html.includes('&lt;img onerror=bad&gt;'));
   assert.ok(!html.includes('<script>'));
-  assert.ok(html.includes('业务说法'));
+  assert.ok(html.includes('Dimension/{dataset}/{dimension}'));
 });
 
 test('the rendered graph must have unique keys and closed references', () => {
   assert.throws(() => renderKnowledge([node('a'), node('a')]), /Duplicate/);
   assert.throws(() => renderKnowledge([node('a', 'Dataset', {}, [{ type: 'Related', key: 'missing' }])]), /Unresolved/);
-  assert.throws(() => renderKnowledge([node('index', 'Index', { entries: [{ key: 'missing' }] })]), /Unresolved/);
-  assert.throws(() => renderKnowledge([node('index', 'Index', { entries: [{ key: 'index', from: 'missing', to: 'index' }] })]), /Unresolved/);
+  assert.throws(() => renderKnowledge([node('index', 'Index', { schemas: ['missing'] })]), /Unresolved/);
 });

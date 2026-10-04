@@ -93,19 +93,20 @@ type DimensionNote = struct { id: String, label: String, summary: String };
 type DimensionDescriptions = struct { notes: Array(DimensionNote) };
 
 type LocalizedKnowledgeText = struct { locale: String, label: String, summary: String };
-type KnowledgeKind = enum { Index, Directory, DataType, Terminology, Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
+type KnowledgeKind = enum { Index, DataType, Schema, Dataset, Field, Dimension, Measure, Value, Relation, BusinessLink, TimeRole, Metric };
 type KnowledgeTarget = struct { kind: KnowledgeKind, owner: String, id: String };
 def knowledge_key: Fn(KnowledgeTarget) -> String = fn(target) {
     if target.kind == KnowledgeKind::Index { "index" }
-    else if target.kind == KnowledgeKind::Terminology && target.id == "terminology" { "terminology" }
     else {
         let kind = match codec::encode(target.kind) {
-            Value::String(name) => name,
+            Value::String(name) => if target.kind == KnowledgeKind::DataType { "Type" } else { name },
             other => fail!("knowledge type must encode as a name", other),
         };
         let owner = uri::encode_component(target.owner);
-        let id = string::join(array::map(string::split(target.id, "/"), uri::encode_component), "/");
-        if owner == "" { `\{kind}/\{id}` } else { `\{kind}/\{owner}/\{id}` }
+        let id = if target.kind != KnowledgeKind::Schema {
+            uri::encode_component(target.id)
+        } else { string::join(array::map(string::split(target.id, "/"), uri::encode_component), "/") };
+        if owner == "" || target.kind == KnowledgeKind::Relation { `\{kind}/\{id}` } else { `\{kind}/\{owner}/\{id}` }
     }
 };
 def knowledge_key_hint: Fn(KnowledgeKind, String, String) -> String = fn(kind, owner, id) {
@@ -375,35 +376,39 @@ type RelationDecl = struct {
 @prelude::property(PropertyTarget::Variant)
 type EnumValueDef = struct { value: String, label: String };
 
-# A closed value domain on a scalar field. A canonical business value may
-# represent several distinct physical scalar values. Unlike enum_value, this does
-# not require the stored field to have a Telora enum type.
+# One member of a logical value type, including its physical representations.
 type CanonicalValueSpec = struct { id: String, label: String, wires: Array(FilterInput) };
 
-@prelude::property(PropertyTarget::Field)
-type CanonicalValuesDef = struct { values: Array(CanonicalValueSpec) };
+@prelude::property(PropertyTarget::Type)
+type ValueTypeDef = struct { id: String, storage: Type, values: Array(CanonicalValueSpec) };
 
 @prelude::property(PropertyTarget::Field)
+type DimensionTypeDef = struct { ty: Type };
+
+@prelude::property(PropertyTarget::Type)
 type HalfOpenDef = struct {};
 
-def half_open: Fn() -> Fn(property::FieldPropertyCtx, Option(HalfOpenDef)) -> HalfOpenDef = fn() {
+def half_open: Fn() -> Fn(td::TypeDesc, Option(HalfOpenDef)) -> HalfOpenDef = fn() {
     fn(ctx, previous) {
         if previous != None { fail!("half-open domain must be declared once", ctx) }
         else { {} }
     }
 };
 
-@prelude::property(PropertyTarget::Field)
+@prelude::property(PropertyTarget::Type)
 type CanonicalOrderDef = struct { ids: Array(String) };
 
 type CanonicalAlias = struct { id: String, label: String };
-@prelude::property(PropertyTarget::Field)
+@prelude::property(PropertyTarget::Type)
 type CanonicalAliasesDef = struct { aliases: Array(CanonicalAlias) };
 
 type LocalizedValueLabel = struct { locale: String, label: String };
 type LocalizedCanonicalValue = struct { id: String, locale: String, label: String };
-@prelude::property(PropertyTarget::Field)
+@prelude::property(PropertyTarget::Type)
 type LocalizedCanonicalValuesDef = struct { labels: Array(LocalizedCanonicalValue) };
+
+@prelude::property(PropertyTarget::Type)
+type ValueTypeDescription = struct { label: String, summary: String };
 
 @prelude::property(PropertyTarget::Type)
 type NativePairDef = struct { pairs: Array(NativePairSpec) };
@@ -631,6 +636,7 @@ type MeasureBrief = struct {
 
 type DimensionScopeBrief = struct { field: String, op: FilterOp, input: FilterInput };
 type DimensionBrief = struct {
+    type_id: String,
     half_open: Bool,
     value_contract: String,
     id: String,
@@ -655,7 +661,12 @@ type DimensionBrief = struct {
 };
 
 type BusinessValueBrief = struct { id: String, label: String, aliases: Array(String), localized: Array(LocalizedValueLabel) };
+type ValueTypeBrief = struct {
+    id: String, label: String, summary: String, storage: String, half_open: Bool,
+    values: Array(BusinessValueBrief), mapping: Array(CanonicalValueSpec), canonical_order: Array(String),
+};
 type VisibleDimensionBrief = struct {
+    type_id: String,
     half_open: Bool,
     value_contract: String,
     id: String,
@@ -724,6 +735,8 @@ type MeasureEntry = struct {
 };
 
 type DimensionEntry = struct {
+    value_type: Option(Type),
+    type_id: String,
     half_open: Bool,
     id: String,
     entity: Int,
@@ -1171,24 +1184,35 @@ def enum_value: Fn(String, String) -> Fn(property::VariantPropertyCtx, Option(En
     }
 };
 
-def canonical_values: Fn(Array(CanonicalValueSpec)) -> Fn(property::FieldPropertyCtx, Option(CanonicalValuesDef)) -> CanonicalValuesDef = fn(values) {
+def value_type: Fn(String, Type, Array(CanonicalValueSpec)) -> Fn(td::TypeDesc, Option(ValueTypeDef)) -> ValueTypeDef = fn(id, storage, values) {
     fn(ctx, previous) {
         if previous != None {
-            fail!("canonical value domain must be declared once per field", ctx)
+            fail!("value type must be declared once", ctx)
         } else {
-            { values }
+            { id, storage, values }
         }
     }
 };
 
-def canonical_order: Fn(Array(String)) -> Fn(property::FieldPropertyCtx, Option(CanonicalOrderDef)) -> CanonicalOrderDef = fn(ids) {
+def dimension_type: Fn(Type) -> Fn(property::FieldPropertyCtx, Option(DimensionTypeDef)) -> DimensionTypeDef = fn(ty) {
+    fn(ctx, previous) {
+        if previous != None { fail!("dimension type must be declared once", ctx) }
+        else { {ty} }
+    }
+};
+
+def value_type_description: Fn(String, String) -> Fn(td::TypeDesc, Option(ValueTypeDescription)) -> ValueTypeDescription = fn(label, summary) {
+    fn(ctx, previous) { {label, summary} }
+};
+
+def canonical_order: Fn(Array(String)) -> Fn(td::TypeDesc, Option(CanonicalOrderDef)) -> CanonicalOrderDef = fn(ids) {
     fn(ctx, previous) {
         if previous != None { fail!("canonical business order must be declared once per field", ctx) }
         else { {ids} }
     }
 };
 
-def canonical_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option(CanonicalAliasesDef)) -> CanonicalAliasesDef = fn(id, label) {
+def canonical_alias: Fn(String, String) -> Fn(td::TypeDesc, Option(CanonicalAliasesDef)) -> CanonicalAliasesDef = fn(id, label) {
     fn(ctx, previous) {
         let aliases = match previous {
             Some(p) => p.aliases,
@@ -1198,7 +1222,7 @@ def canonical_alias: Fn(String, String) -> Fn(property::FieldPropertyCtx, Option
     }
 };
 
-def localized_canonical_value: Fn(String, String, String) -> Fn(property::FieldPropertyCtx, Option(LocalizedCanonicalValuesDef)) -> LocalizedCanonicalValuesDef = fn(id, locale, label) {
+def localized_canonical_value: Fn(String, String, String) -> Fn(td::TypeDesc, Option(LocalizedCanonicalValuesDef)) -> LocalizedCanonicalValuesDef = fn(id, locale, label) {
     fn(ctx, previous) {
         let labels = match previous { Some(p) => p.labels, None => [] };
         {labels: array::push(labels, {id, locale, label})}
@@ -1951,9 +1975,22 @@ def localized_relation_texts: Fn(Type, String) -> Array(LocalizedKnowledgeText) 
     }
 };
 
+def field_value_type_ref: Fn(Type, Int) -> Option(Type) = fn(owner, field) {
+    match property::get_field_prop(owner, field, DimensionTypeDef.type) {
+        Some(declared) => Some(declared.ty),
+        None => {
+            let ty = field_value_type(td::fields(owner)[field].ty);
+            if property::get_type_prop(ty, ValueTypeDef.type) != None { Some(ty) } else { None }
+        },
+    }
+};
+
 def localized_value_labels: Fn(Type, Int) -> Array(LocalizedCanonicalValue) = fn(owner, field) {
-    match property::get_field_prop(owner, field, LocalizedCanonicalValuesDef.type) {
-        Some(declared) => declared.labels, None => [],
+    match field_value_type_ref(owner, field) {
+        Some(ty) => match property::get_type_prop(ty, LocalizedCanonicalValuesDef.type) {
+            Some(declared) => declared.labels, None => [],
+        },
+        None => [],
     }
 };
 
@@ -2127,9 +2164,25 @@ def value_domain: Fn(Type) -> Array(EnumValueEntry) = fn(field_ty) {
 };
 
 def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(owner, field) {
-    match property::get_field_prop(owner, field.index, CanonicalValuesDef.type) {
+    match field_value_type_ref(owner, field.index) {
         None => [],
-        Some(mapping) => do {
+        Some(ty) => do {
+            let mapping = match property::get_type_prop(ty, ValueTypeDef.type) {
+                Some(definition) => definition,
+                None => fail!("dimension_type requires a declared value_type", owner, field.name, ty),
+            };
+            if mapping.id == "" { fail!("value type id must be nonempty", ty) } else { () };
+            let enum_values = value_domain(field.ty);
+            if array::length(enum_values) > 0 {
+                if ty != field.ty || mapping.storage != String.type || array::length(mapping.values) != 0 {
+                    fail!("named enum type requires String storage and derives mappings from its variants", ty)
+                } else { [] }
+            } else {
+            if mapping.storage != field.ty { fail!("value type storage disagrees with field storage", mapping.id, field.name) } else { () };
+            if property::get_field_prop(owner, field.index, TimeField.type) != None
+                || property::get_field_prop(owner, field.index, LogicalFieldType.type) != None {
+                fail!("value type cannot combine with another logical field type", mapping.id, field.name)
+            } else { () };
             let valid_field = field.ty == String.type || field.ty == Int.type;
             let nonempty = array::length(mapping.values) > 0;
             let valid_entries = array::all(mapping.values, fn(v) {
@@ -2162,12 +2215,16 @@ def canonical_domain: Fn(Type, FieldEntry) -> Array(CanonicalValueSpec) = fn(own
             } else {
                 mapping.values
             }
+            }
         },
     }
 };
 
 def canonical_order_domain: Fn(Type, FieldEntry, Array(CanonicalValueSpec)) -> Array(String) = fn(owner, field, values) {
-    match property::get_field_prop(owner, field.index, CanonicalOrderDef.type) {
+    let declared = match field_value_type_ref(owner, field.index) {
+        Some(ty) => property::get_type_prop(ty, CanonicalOrderDef.type), None => None,
+    };
+    match declared {
         None => [],
         Some(declared) => {
             if array::length(values) == 0 || array::length(declared.ids) != array::length(values)
@@ -2182,7 +2239,10 @@ def canonical_order_domain: Fn(Type, FieldEntry, Array(CanonicalValueSpec)) -> A
 };
 
 def canonical_alias_domain: Fn(Type, FieldEntry, Array(CanonicalValueSpec)) -> Array(CanonicalAlias) = fn(owner, field, values) {
-    match property::get_field_prop(owner, field.index, CanonicalAliasesDef.type) {
+    let declared = match field_value_type_ref(owner, field.index) {
+        Some(ty) => property::get_type_prop(ty, CanonicalAliasesDef.type), None => None,
+    };
+    match declared {
         None => [],
         Some(declared) => do {
             let valid = array::all(declared.aliases, fn(alias) {
@@ -2206,14 +2266,11 @@ def field_scope: Fn(Type, Int) -> Array(ScopePredicate) = fn(owner, index) {
 def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(entity) {
     let fields = entity.fields;
     let orphan = array::find(fields, fn(f) {
-        (property::get_field_prop(entity.entity_type, f.index, HalfOpenDef.type) != None
-            || property::get_field_prop(entity.entity_type, f.index, CanonicalValuesDef.type) != None
-            || property::get_field_prop(entity.entity_type, f.index, CanonicalOrderDef.type) != None
-            || property::get_field_prop(entity.entity_type, f.index, CanonicalAliasesDef.type) != None)
+        property::get_field_prop(entity.entity_type, f.index, DimensionTypeDef.type) != None
             && property::get_field_prop(entity.entity_type, f.index, DimensionDef.type) == None
     });
     let declared: Bool = match orphan {
-        Some(f) => fail!("canonical value mapping requires a plain dimension on its field", entity.id, f.name),
+        Some(f) => fail!("dimension_type requires a plain dimension on its field", entity.id, f.name),
         None => True,
     };
     let plain = array::flat_map(fields, fn(f) {
@@ -2221,16 +2278,22 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         match d {
             Some(dd) => do {
                 let mapped = canonical_domain(entity.entity_type, f);
-                let half_open = property::get_field_prop(entity.entity_type, f.index, HalfOpenDef.type) != None;
+                let value_type = field_value_type_ref(entity.entity_type, f.index);
+                let half_open = match value_type {
+                    Some(ty) => property::get_type_prop(ty, HalfOpenDef.type) != None, None => False,
+                };
                 if half_open && (f.ty != String.type || array::length(mapped) == 0) {
-                    fail!("half-open domain requires a String dimension with canonical_values", entity.id, f.name)
+                    fail!("half-open value type requires String storage and declared members", entity.id, f.name)
                 } else { () };
                 let order = canonical_order_domain(entity.entity_type, f, mapped);
                 if half_open && array::length(order) > 0 {
-                    fail!("half-open domain cannot declare a closed canonical_order: unknown values have no business rank", entity.id, f.name)
+                    fail!("half-open value type cannot declare a closed canonical_order: unknown values have no business rank", entity.id, f.name)
                 } else { () };
                 let aliases = canonical_alias_domain(entity.entity_type, f, mapped);
                 let enumerated = value_domain(f.ty);
+                if array::length(enumerated) > 0 && value_type == None {
+                    fail!("enum dimension requires a named value_type declaration", entity.id, f.name)
+                } else { () };
                 let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
                     Some(role) => role.encoding == TimeEncoding::EpochMillis,
                     None => False,
@@ -2298,7 +2361,14 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                         FilterInputKind::DateUtc => OutputType::Text,
                         FilterInputKind::LocalDateTime => OutputType::Text,
                     };
-                    [dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index), half_open)]
+                    let entry = dimension_entry(entity.index, f.index, dd.id, output_type, False, identity_expr, dd.authorized, dd.filterable, dd.ops, dd.input_kinds, enumerated, mapped, order, aliases, field_scope(entity.entity_type, f.index), half_open);
+                    let type_id = match value_type {
+                        Some(ty) => match property::get_type_prop(ty, ValueTypeDef.type) {
+                            Some(definition) => definition.id, None => fail!("missing value type declaration", ty),
+                        },
+                        None => input_type_id(valid_kind),
+                    };
+                    [{...entry, value_type, type_id}]
                 }
             },
             None => [],
@@ -2344,8 +2414,76 @@ def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb:
         })
     }) { fail!(`dimension \{id} declares indistinguishable input types; one JSON value must resolve to one logical type`, id, ambiguous) }
     else { () };
-    let result: DimensionEntry = { id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open };
+    let type_id = if array::length(input_kinds) == 1 { input_type_id(input_kinds[0]) } else {
+        match output_type { OutputType::Text => "Text", OutputType::Integer => "Int", OutputType::Number => "Number", OutputType::Boolean => "Bool" }
+    };
+    let result: DimensionEntry = { value_type: None, type_id, id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open };
     result
+};
+
+def input_type_id: Fn(FilterInputKind) -> String = fn(kind) {
+    match codec::encode(kind) { Value::String(name) => name, _ => fail!("input type must have a name", kind) }
+};
+
+def value_type_refs: Fn(PreparedPayload, Bool) -> Array(Type) = fn(payload, visible_only) {
+    array::fold(array::flat_map(payload.dimensions, fn(dimension) {
+        if visible_only && !dimension.authorized { [] }
+        else { match dimension.value_type { Some(ty) => [ty], None => [] } }
+    }), [].ty!(Array(Type)), fn(seen, ty) {
+        if array::any(seen, fn(other) { other == ty }) { seen } else { array::push(seen, ty) }
+    })
+};
+
+def value_type_mapping: Fn(Type) -> Array(CanonicalValueSpec) = fn(ty) {
+    let definition = match property::get_type_prop(ty, ValueTypeDef.type) {
+        Some(definition) => definition, None => fail!("value type declaration is missing", ty),
+    };
+    if array::length(definition.values) > 0 { definition.values }
+    else { array::map(value_domain(ty), fn(value) {
+        {id: value.value, label: value.label, wires: [FilterInput::Text(value.value)]}.ty!(CanonicalValueSpec)
+    }) }
+};
+
+def value_type_brief: Fn(Type) -> ValueTypeBrief = fn(ty) {
+    let definition = match property::get_type_prop(ty, ValueTypeDef.type) {
+        Some(definition) => definition, None => fail!("value type declaration is missing", ty),
+    };
+    let mapping = value_type_mapping(ty);
+    let aliases = match property::get_type_prop(ty, CanonicalAliasesDef.type) { Some(spec) => spec.aliases, None => [] };
+    let localized = match property::get_type_prop(ty, LocalizedCanonicalValuesDef.type) { Some(spec) => spec.labels, None => [] };
+    let note = match property::get_type_prop(ty, ValueTypeDescription.type) {
+        Some(note) => note, None => {label: definition.id, summary: ""}.ty!(ValueTypeDescription),
+    };
+    {id: definition.id, label: note.label, summary: note.summary,
+        storage: if definition.storage == String.type { "String" } else if definition.storage == Int.type { "Int" } else { fail!("unsupported value type storage", definition.id) },
+        half_open: property::get_type_prop(ty, HalfOpenDef.type) != None, mapping,
+        canonical_order: match property::get_type_prop(ty, CanonicalOrderDef.type) { Some(spec) => spec.ids, None => [] },
+        values: array::map(mapping, fn(value) {
+            {id: value.id, label: value.label,
+                aliases: array::map(array::filter(aliases, fn(alias) { alias.id == value.id }), fn(alias) { alias.label }),
+                localized: array::map(array::filter(localized, fn(text) { text.id == value.id }), fn(text) {
+                    {locale: text.locale, label: text.label}.ty!(LocalizedValueLabel)
+                })}.ty!(BusinessValueBrief)
+        })}
+};
+
+def visible_value_types: Fn(PreparedPayload) -> Array(ValueTypeBrief) = fn(payload) {
+    array::map(value_type_refs(payload, True), value_type_brief)
+};
+
+def check_value_types: Fn(PreparedPayload) -> Bool = fn(payload) {
+    let refs = value_type_refs(payload, False);
+    let types = array::map(refs, value_type_brief);
+    array::all(types, fn(spec) {
+        if spec.id == "" || array::any(["Text", "Int", "Number", "Bool", "Ipv4", "DatetimeUtc", "DateUtc", "EpochMillis", "LocalDateTime"], fn(name) { name == spec.id })
+            || array::length(array::filter(types, fn(other) { other.id == spec.id })) != 1 {
+            fail!("value type ids must be nonempty, unique and distinct from built-in types", spec.id)
+        } else { True }
+    })
+};
+
+def knowledge_annotation_types: Fn(PreparedPayload) -> Array(Type) = fn(payload) {
+    array::concat([array::map(payload.entities, fn(entity) { entity.entity_type }), value_type_refs(payload, False)])
 };
 
 def check_dimension_ids: Fn(Array(DimensionEntry)) -> Array(DimensionEntry) = fn(dimensions) {
@@ -2373,6 +2511,8 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
                 fail!("relation key fields require physical columns", from_entity.id, pair.from, to_entity.id, pair.to)
             } else if get_index(from_entity.fields, from_field).ty != get_index(to_entity.fields, to_field).ty {
                 fail!("relation fields have different types", pair.from, pair.to)
+            } else if field_value_type_ref(from_entity.entity_type, from_field) != field_value_type_ref(to_entity.entity_type, to_field) {
+                fail!("relation fields have different named value types", pair.from, pair.to)
             } else if is_ipv4_field(from_entity.entity_type, from_field) != is_ipv4_field(to_entity.entity_type, to_field) {
                 fail!(`relation fields have different logical address types; see info key \{syntax_key_hint("syntax/model/logical_types")}`, pair.from, pair.to)
             } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
@@ -2594,9 +2734,7 @@ def collect_business_links: Fn(Array(EntityEntry), Array(RelationEntry)) -> Arra
 def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn(payload, target) {
     match target.kind {
         KnowledgeKind::Index => False,
-        KnowledgeKind::Directory => False,
-        KnowledgeKind::DataType => False,
-        KnowledgeKind::Terminology => False,
+        KnowledgeKind::DataType => target.owner == "" && array::any(value_type_refs(payload, False), fn(ty) { value_type_brief(ty).id == target.id }),
         KnowledgeKind::Schema => False,
         KnowledgeKind::Dataset => target.owner == "" && array::any(payload.entities, fn(e) { e.id == target.id }),
         KnowledgeKind::Field => array::any(payload.entities, fn(e) {
@@ -2621,9 +2759,9 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
         KnowledgeKind::Measure => array::any(payload.measures, fn(m) {
             m.id == target.id && get_index(payload.entities, m.entity).id == target.owner
         }),
-        KnowledgeKind::Value => array::any(payload.dimensions, fn(d) {
-            d.id == target.owner && (array::any(d.canonical_values, fn(v) { v.id == target.id })
-                || array::any(d.values, fn(v) { v.value == target.id }))
+        KnowledgeKind::Value => array::any(value_type_refs(payload, False), fn(ty) {
+            let spec = value_type_brief(ty);
+            spec.id == target.owner && array::any(spec.values, fn(value) { value.id == target.id })
         }),
         KnowledgeKind::Relation => array::any(payload.relations, fn(r) {
             r.id != "" && r.id == target.id && get_index(payload.entities, r.from).id == target.owner
@@ -2655,15 +2793,26 @@ def knowledge_owned_by: Fn(PreparedPayload, EntityEntry, KnowledgeTarget) -> Boo
     if !knowledge_target_declared(payload, target) { False }
     else match target.kind {
         KnowledgeKind::Dataset => target.id == entity.id,
-        KnowledgeKind::Value => array::any(payload.dimensions, fn(d) {
-            d.id == target.owner && d.entity == entity.index
-        }),
+        KnowledgeKind::Value => False,
         _ => target.owner == entity.id,
     }
 };
 
 def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
-    let docs = array::flat_map(payload.entities, fn(entity) {
+    let owned = fn(ty: Type, target: KnowledgeTarget) {
+        let spec = value_type_brief(ty);
+        knowledge_target_declared(payload, target) &&
+            ((target.kind == KnowledgeKind::DataType && target.owner == "" && target.id == spec.id)
+                || (target.kind == KnowledgeKind::Value && target.owner == spec.id))
+    };
+    let type_docs = array::flat_map(value_type_refs(payload, False), fn(ty) {
+        let entries = match property::get_type_prop(ty, KnowledgeDocs.type) { Some(spec) => spec.entries, None => [] };
+        array::map(entries, fn(item) {
+            if item.text == "" || !owned(ty, item.target) { fail!("type knowledge doc must describe its own type or member", ty, item.target) }
+            else { item }
+        })
+    });
+    let docs = array::concat([type_docs, array::flat_map(payload.entities, fn(entity) {
         let entries = match property::get_type_prop(entity.entity_type, KnowledgeDocs.type) {
             Some(declared) => declared.entries, None => [],
         };
@@ -2672,11 +2821,19 @@ def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
                 fail!("knowledge doc must describe an existing point owned by its declaring entity", entity.id, item.target)
             } else { item }
         })
-    });
+    })]);
     if let Some(duplicate) = array::find(docs, fn(item) {
         array::length(array::filter(docs, fn(other) { other.target == item.target })) > 1
     }) { fail!("duplicate knowledge doc target", duplicate.target) } else { () };
-    let refs = array::flat_map(payload.entities, fn(entity) {
+    let type_refs = array::flat_map(value_type_refs(payload, False), fn(ty) {
+        let entries = match property::get_type_prop(ty, KnowledgeRelations.type) { Some(spec) => spec.entries, None => [] };
+        array::map(entries, fn(item) {
+            if !owned(ty, item.source) || !knowledge_target_declared(payload, item.target) || item.source == item.target {
+                fail!("type knowledge reference requires its own source and a distinct declared target", ty, item)
+            } else { item }
+        })
+    });
+    let refs = array::concat([type_refs, array::flat_map(payload.entities, fn(entity) {
         let entries = match property::get_type_prop(entity.entity_type, KnowledgeRelations.type) {
             Some(declared) => declared.entries, None => [],
         };
@@ -2686,11 +2843,19 @@ def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
                 fail!("knowledge reference must link distinct declared points from its owner", entity.id, item)
             } else { item }
         })
-    });
+    })]);
     if let Some(duplicate) = array::find(refs, fn(item) {
         array::length(array::filter(refs, fn(other) { other == item })) > 1
     }) { fail!("duplicate knowledge reference", duplicate) } else { () };
-    let terminology = array::flat_map(payload.entities, fn(entity) {
+    let type_terms = array::flat_map(value_type_refs(payload, False), fn(ty) {
+        let entries = match property::get_type_prop(ty, TermAnnotations.type) { Some(spec) => spec.entries, None => [] };
+        array::map(entries, fn(item) {
+            if item.term == "" || item.description == "" || !owned(ty, item.target) {
+                fail!("type term annotation requires its own type or member", ty, item)
+            } else { item }
+        })
+    });
+    let terminology = array::concat([type_terms, array::flat_map(payload.entities, fn(entity) {
         let entries = match property::get_type_prop(entity.entity_type, TermAnnotations.type) {
             Some(declared) => declared.entries, None => [],
         };
@@ -2699,7 +2864,7 @@ def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
                 fail!("term annotation requires a term, description and declared target owned by its entity", entity.id, item)
             } else { item }
         })
-    });
+    })]);
     if let Some(duplicate) = array::find(terminology, fn(item) {
         array::length(array::filter(terminology, fn(other) {
             other.term == item.term && other.target == item.target
@@ -2909,10 +3074,11 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
             } else { True },
         }
     });
+    let types_ok = check_value_types(payload);
     let aliases_ok = check_knowledge_aliases(payload);
     let localized_ok = check_localized_knowledge(payload);
     let annotations_ok = check_knowledge_annotations(payload);
-    if profile_ok && computed_profile_ok && measure_profiles_validated && dimension_profiles_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok && annotations_ok { payload } else { payload }
+    if types_ok && profile_ok && computed_profile_ok && measure_profiles_validated && dimension_profiles_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok && annotations_ok { payload } else { payload }
 };
 
 # ---------------------------------------------------------------------------
@@ -2982,7 +3148,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
         {field: predicate.field, op: predicate.op, input: predicate.input}
     });
-    {half_open: entry.half_open, value_contract: if entry.half_open {
+    {type_id: entry.type_id, half_open: entry.half_open, value_contract: if entry.half_open {
         "Known: use a listed business ID string. Unknown: use {\"unknown\":\"raw value\"}; known wires are rejected. All unknowns: use {\"unknowns\":true}. Eq/Ne exclude NULL. Projection returns <node>_<dimension> plus <node>_<dimension>__kind (Known, Unknown, or NULL); group by both columns. Other is an ordinary known concept."
     } else { "" }, id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
         aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
@@ -3017,7 +3183,7 @@ def visible_dimension_detail: Fn(PreparedPayload, String) -> VisibleDimensionBri
             } else {
                 array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: [], localized: []} })
             };
-            {half_open: detail.half_open, value_contract: detail.value_contract, id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
+            {type_id: detail.type_id, half_open: detail.half_open, value_contract: detail.value_contract, id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
                 filterable: detail.filterable, ops: detail.ops,
                 input_kinds: detail.input_kinds, input_docs: detail.input_docs, values, canonical_order: detail.canonical_order, scope: detail.scope}
@@ -5609,7 +5775,8 @@ pub use self::{
     business_link,
     guarded_business_link,
     enum_value,
-    canonical_values,
+    ValueTypeDef, DimensionTypeDef, ValueTypeBrief, ValueTypeDescription,
+    value_type, dimension_type, value_type_description, value_type_refs, value_type_brief, visible_value_types, knowledge_annotation_types,
     half_open,
     canonical_order,
     canonical_alias,

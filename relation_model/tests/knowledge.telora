@@ -35,9 +35,13 @@ def status_values: Array(edsl::CanonicalValueSpec) = [
 @edsl::related_to(order_status, unrelated)
 @edsl::term("生命周期", "订单的当前生命周期", order_status)
 @edsl::term("生命周期", "订单对象", {kind: edsl::KnowledgeKind::Dataset, owner: "", id: "order"})
+@edsl::term("存储状态", "数据库中保存的订单状态", {kind: edsl::KnowledgeKind::Field, owner: "order", id: "status"})
 @edsl::term("内部机密", "不可见状态", {kind: edsl::KnowledgeKind::Dimension, owner: "order", id: "private_status"})
 type Order = struct {
     @edsl::column("id")
+    @edsl::measure("order_count", qb::AggregateFunction::Count, [])
+    @edsl::measure_description("order_count", "Order count", "Count eligible order IDs")
+    @edsl::measure_alias("order_count", "订单数量")
     @edsl::dimension("order_id", True, True, eq_ops, text_inputs)
     id: String,
     @edsl::column("tenant_id")
@@ -45,7 +49,8 @@ type Order = struct {
     @edsl::column("status")
     @edsl::dimension("order_status", True, True, eq_ops, text_inputs)
     @edsl::dimension_alias("order_status", "订单状态")
-    @edsl::canonical_values(status_values)
+    @edsl::localized_dimension("order_status", "zh-CN", "订单生命周期状态", "订单当前状态说明")
+    @edsl::dimension_type(OrderStatusValueType.type)
     status: String,
     @edsl::column("secret")
     @edsl::dimension("private_status", False, True, eq_ops, text_inputs)
@@ -93,8 +98,8 @@ type Unrelated = struct {
 
 def profile: qb::PlanProfile = {
     allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project,
-        qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind, qb::Operator::Join],
-    allowed_join_kinds: [qb::JoinKind::Inner], allowed_aggregates: [],
+        qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind, qb::Operator::Join, qb::Operator::Aggregate],
+    allowed_join_kinds: [qb::JoinKind::Inner], allowed_aggregates: [qb::AggregateFunction::Count],
     allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Or, qb::ScalarFunction::If, qb::ScalarFunction::And],
     allow_distinct: False,
 };
@@ -233,10 +238,8 @@ pub def docs_and_terms_do_not_change_query_lowering: test::Test = test::should_o
     match (explained, bare) {
         (knowledge::DocResult::Found(x), knowledge::DocResult::Found(y)) =>
             if a == b && x.summary == "Documented state" && y.summary == ""
-                && string::contains(json::stringify(knowledge::knowledge_info_method_factory(with_doc)(
-                    Value::Object({key: Value::String("terminology")}))), "状态含义")
-                && !string::contains(json::stringify(knowledge::knowledge_info_method_factory(without_doc)(
-                    Value::Object({key: Value::String("terminology")}))), "状态含义") { True }
+                && string::contains(json::stringify(codec::encode(knowledge::terminology_from_model(with_doc))), "状态含义")
+                && !string::contains(json::stringify(codec::encode(knowledge::terminology_from_model(without_doc))), "状态含义") { True }
             else { fail!("documentation changed the query or failed to change the description", a, b, x, y) },
         other => fail!("documentation affected knowledge point identity", other),
     }
@@ -258,7 +261,7 @@ pub def on_demand_doc_matches_validated_catalog: test::Test = test::should_ok(fn
     let inputs = [
         json::parse(r#"{"key":"Dataset/order"}"#).unwrap!(),
         json::parse(r#"{"key":"Dimension/order/order_status"}"#).unwrap!(),
-        json::parse(r#"{"key":"Relation/status_event/event_order"}"#).unwrap!(),
+        json::parse(r#"{"key":"Relation/event_order"}"#).unwrap!(),
         json::parse(r#"{"key":"Dataset/missing"}"#).unwrap!(),
     ];
     if array::all(inputs, fn(input) {
@@ -267,11 +270,6 @@ pub def on_demand_doc_matches_validated_catalog: test::Test = test::should_ok(fn
         }) { True }
     else { fail!("bound info differs from the same knowledge catalog") }
 });
-
-type TermEntry = struct { term: String, description: String, key: String };
-type TerminologyDetail = struct { entries: Array(TermEntry), total: Int };
-type CatalogEntry = struct { key: String, type: edsl::KnowledgeKind, label: String, from: Option(String), to: Option(String) };
-type CatalogDetail = struct { entries: Array(CatalogEntry), total: Int, revision: Option(String) };
 
 def read_node: Fn(Fn(Value) -> Value, String) -> knowledge::Node = fn(info, key) {
     match codec::decode@[knowledge::NodeResponse](info(Value::Object({key: Value::String(key)}))).unwrap!() {
@@ -291,28 +289,14 @@ def encoded_type: for(A: codec::Encode) Fn(A) -> Value = fn(item) {
     }
 };
 
-def directory_entries: Fn(Fn(Value) -> Value, String) -> Array(CatalogEntry) = fn(info, key) {
-    let entries = codec::decode@[CatalogDetail](read_node(info, key).detail).unwrap!().entries;
-    array::flat_map(entries, fn(entry) {
-        if encoded_type(entry) == Value::String("Directory") { directory_entries(info, entry.key) }
-        else { [entry] }
-    })
-};
-
 pub def terminology_derives_aliases_preserve_ambiguity_and_hide_private_targets: test::Test = test::should_ok(fn() {
-    let info = knowledge::knowledge_info_method_factory(payload);
-    let node = read_node(info, "terminology");
-    let entries = codec::decode@[TerminologyDetail](node.detail).unwrap!().entries;
-    if encoded_type(node) == Value::String("Terminology")
-        && array::length(array::filter(entries, fn(entry) { entry.term == "生命周期" })) == 2
-        && array::length(array::filter(entries, fn(entry) { entry.term == "订单状态" })) == 2
-        && array::any(entries, fn(entry) { entry.term == "订单资料" })
-        && !array::any(entries, fn(entry) { entry.term == "内部机密" || entry.term == "隐私状态" })
-        && array::all(entries, fn(entry) {
-            let target = read_node(info, entry.key);
-            target.key == entry.key && array::any(node.links, fn(link) { link.key == entry.key && encoded_type(link) == Value::String("Related") })
-        }) { True }
-    else { fail!("derived terminology lost aliases, ambiguity, visibility or navigable links", node) }
+    let terms = knowledge::terminology_from_model(payload);
+    let aliases = array::concat([array::flat_map(terms.datasets, fn(entry) { entry.aliases }),
+        array::flat_map(terms.dimensions, fn(entry) { entry.aliases })]);
+    array::length(array::filter(aliases, fn(term) { term == "生命周期" })) == 2
+        && array::length(array::filter(aliases, fn(term) { term == "订单状态" })) == 2
+        && array::any(aliases, fn(term) { term == "订单资料" })
+        && !array::any(aliases, fn(term) { term == "内部机密" || term == "隐私状态" })
 });
 
 pub def old_concepts_key_is_not_an_alternate_vocabulary: test::Test = test::should_ok(fn() {
@@ -326,35 +310,27 @@ pub def old_concepts_key_is_not_an_alternate_vocabulary: test::Test = test::shou
 pub def index_and_links_resolve_opaque_keys_with_one_node_contract: test::Test = test::should_ok(fn() {
     let info = knowledge::knowledge_info_method_factory(payload);
     let index = read_node(info, "index");
-    let catalog = codec::decode@[CatalogDetail](index.detail).unwrap!();
-    let entries = catalog.entries;
-    if encoded_type(index) == Value::String("Index") && array::length(entries) == 5
-        && catalog.revision == Some(payload.revision)
+    let catalog = codec::decode@[knowledge::IndexDetail](index.detail).unwrap!();
+    if encoded_type(index) == Value::String("Index") && array::length(catalog.schemas) > 0
+        && catalog.revision == payload.revision
         && array::length(index.links) == 0
-        && array::any(entries, fn(entry) { entry.key == "terminology" && encoded_type(entry) == Value::String("Terminology") })
-        && array::all(entries, fn(entry) {
-            let node = read_node(info, entry.key);
-            node.key == entry.key && encoded_type(node) == encoded_type(entry)
-                && node.description.label == entry.label
+        && array::length(catalog.key_patterns) == 10
+        && array::all(catalog.schemas, fn(key) {
+            let node = read_node(info, key);
+            node.key == key && encoded_type(node) == Value::String("Schema")
                 && array::all(node.links, fn(link) { read_node(info, link.key).key == link.key })
-                && array::length(array::filter(entries, fn(other) { other.key == entry.key })) == 1
+                && array::length(array::filter(catalog.schemas, fn(other) { other == key })) == 1
         }) { True }
     else { fail!("root catalog and node links do not form a unique, self-discoverable map", index) }
 });
 
 pub def data_types_are_discovered_separately_from_query_contracts: test::Test = test::should_ok(fn() {
     let info = knowledge::knowledge_info_method_factory(payload);
-    let entries = directory_entries(info, "index");
-    let types = array::filter(entries, fn(entry) { encoded_type(entry) == Value::String("DataType") });
-    let utc = match array::find(types, fn(entry) { entry.label == "DatetimeUtc" }) {
-        Some(entry) => read_node(info, entry.key), None => fail!("DatetimeUtc type is not discoverable"),
-    };
+    let utc = read_node(info, "Type/DatetimeUtc");
     let role = read_node(info, edsl::knowledge_key({kind: edsl::KnowledgeKind::Dimension, owner: "status_event", id: "event_time"}.ty!(edsl::KnowledgeTarget)));
-    if array::length(types) == 9
-        && array::any(types, fn(entry) { entry.label == "Ipv4" })
-        && string::contains(utc.description.summary, "UTC instant")
+    if string::contains(utc.description.summary, "UTC instant")
         && array::any(role.links, fn(link) { link.key == utc.key }) { True }
-    else { fail!("types, temporal input meaning or dimension references are missing", types, utc, role) }
+    else { fail!("types, temporal input meaning or dimension references are missing", utc, role) }
 });
 
 pub def temporal_types_link_to_shared_time_window_operation: test::Test = test::should_ok(fn() {
@@ -384,31 +360,28 @@ pub def public_nodes_match_the_full_model_map: test::Test = test::should_ok(fn()
 
 pub def opaque_keys_do_not_hide_canonical_intent_ids: test::Test = test::should_ok(fn() {
     let info = knowledge::knowledge_info_method_factory(payload);
-    let entries = directory_entries(info, "index");
-    let order = match array::find(entries, fn(entry) { entry.label == "Order" }) {
-        Some(entry) => read_node(info, entry.key), None => fail!("Order is not discoverable"),
-    };
+    let order = read_node(info, "Dataset/order");
     let detail = codec::decode@[knowledge::DatasetDetail](order.detail).unwrap!();
-    let members = directory_entries(info, order.links[0].key);
-    let dimension = match array::find(members, fn(entry) { encoded_type(entry) == Value::String("Dimension") && entry.label == "order_status" }) {
-        Some(entry) => read_node(info, entry.key), None => fail!("Order status dimension is not discoverable"),
+    let members = array::map(order.links, fn(link) { read_node(info, link.key) });
+    let dimension = match array::find(members, fn(node) { encoded_type(node) == Value::String("Dimension") && node.key == "Dimension/order/order_status" }) {
+        Some(node) => node, None => fail!("Order status dimension is not discoverable"),
     };
     let paid = match array::find(array::map(dimension.links, fn(link) { read_node(info, link.key) }), fn(node) {
         node.description.label == "Paid" && encoded_type(node) == Value::String("Value")
     }) { Some(node) => node, None => fail!("Paid value is not discoverable") };
-    let status = match array::find(members, fn(entry) {
-        entry.label == "status" && encoded_type(entry) == Value::String("Field")
-    }) { Some(entry) => read_node(info, entry.key), None => fail!("Status field is not discoverable") };
+    let status = match array::find(members, fn(node) {
+        node.description.label == "status" && encoded_type(node) == Value::String("Field")
+    }) { Some(node) => node, None => fail!("Status field is not discoverable") };
     let canonical = codec::decode@[knowledge::ValueDetail](paid.detail).unwrap!();
     let field = codec::decode@[knowledge::FieldDetail](status.detail).unwrap!();
     let ast = query_intent_ast_factory(payload)(Value::Object({
         op: Value::String("Graph"), root: Value::String("o"),
         nodes: Value::Array([Value::Object({id: Value::String("o"), entity: Value::String(detail.id)})]),
-        edges: Value::Array([]), select: Value::Array([Value::Object({node: Value::String("o"), dimension: Value::String(canonical.dimension)})]),
-        filters: Value::Array([Value::Object({node: Value::String("o"), dimension: Value::String(canonical.dimension),
+        edges: Value::Array([]), select: Value::Array([Value::Object({node: Value::String("o"), dimension: Value::String("order_status")})]),
+        filters: Value::Array([Value::Object({node: Value::String("o"), dimension: Value::String("order_status"),
             op: Value::String("Eq"), value: Value::String(canonical.id)})]),
     }));
-    if detail.id == "order" && canonical.id == "paid" && canonical.dimension == "order_status"
+    if detail.id == "order" && canonical.id == "paid" && canonical.type_id == "OrderStatus"
         && field.id == "status" && field.dataset == detail.id && sqlite::build_query(ast).bindings != [] { True }
     else { fail!("opaque node keys replaced the canonical Model IDs", detail, canonical, field) }
 });
@@ -416,9 +389,120 @@ pub def opaque_keys_do_not_hide_canonical_intent_ids: test::Test = test::should_
 pub def path_like_keys_encode_components_without_collisions: test::Test = test::should_ok(fn() {
     let first = edsl::knowledge_key({kind: edsl::KnowledgeKind::Dimension, owner: "设备/位置", id: "状态?#/值%"});
     let second = edsl::knowledge_key({kind: edsl::KnowledgeKind::Dimension, owner: "设备", id: "位置/状态?#/值%"});
-    if first == "Dimension/%E8%AE%BE%E5%A4%87%2F%E4%BD%8D%E7%BD%AE/%E7%8A%B6%E6%80%81%3F%23/%E5%80%BC%25"
+    if first == "Dimension/%E8%AE%BE%E5%A4%87%2F%E4%BD%8D%E7%BD%AE/%E7%8A%B6%E6%80%81%3F%23%2F%E5%80%BC%25"
         && first != second { True }
     else { fail!("knowledge key components are not safely encoded", first, second) }
+});
+
+pub def vocabulary_keys_keep_name_components_unambiguous: test::Test = test::should_ok(fn() {
+    edsl::knowledge_key({kind: edsl::KnowledgeKind::Dataset, owner: "", id: "a/b"}) == "Dataset/a%2Fb"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::Field, owner: "a/b", id: "f/g"}) == "Field/a%2Fb/f%2Fg"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::Dimension, owner: "a/b", id: "d/e"}) == "Dimension/a%2Fb/d%2Fe"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::Relation, owner: "ignored", id: "r/s"}) == "Relation/r%2Fs"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::DataType, owner: "", id: "t/u"}) == "Type/t%2Fu"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::Value, owner: "t/u", id: "v/w"}) == "Value/t%2Fu/v%2Fw"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::Measure, owner: "a/b", id: "m/n"}) == "Measure/a%2Fb/m%2Fn"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::Metric, owner: "a/b", id: "m/n"}) == "Metric/a%2Fb/m%2Fn"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::TimeRole, owner: "a/b", id: "t/u"}) == "TimeRole/a%2Fb/t%2Fu"
+        && edsl::knowledge_key({kind: edsl::KnowledgeKind::BusinessLink, owner: "a/b", id: "l/r"}) == "BusinessLink/a%2Fb/l%2Fr"
+});
+
+pub def search_terminology_covers_visible_names_docs_and_localizations: test::Test = test::should_ok(fn() {
+    let terms = knowledge::terminology_from_model(payload);
+    let order = array::find(terms.datasets, fn(entry) { entry.name == "order" });
+    let status = array::find(terms.dimensions, fn(entry) { entry.dataset == "order" && entry.name == "order_status" });
+    let relation = array::find(terms.rels, fn(entry) { entry.name == "event_order" });
+    match (order, status, relation) {
+        (Some(dataset), Some(dimension), Some(rel)) =>
+            terms.revision == payload.revision
+                && array::all(["Order", "订单", "订单资料", "生命周期"], fn(alias) {
+                    array::any(dataset.aliases, fn(value) { value == alias })
+                })
+                && string::contains(dataset.doc, "One commercial order per tenant")
+                && string::contains(dataset.doc, "每个租户下的订单")
+                && string::contains(dimension.doc, "Status is the current lifecycle value")
+                && string::contains(dimension.doc, "订单的当前生命周期")
+                && string::contains(dimension.doc, "订单当前状态说明")
+                && array::all(["订单状态", "订单生命周期状态", "生命周期"], fn(alias) {
+                    array::any(dimension.aliases, fn(value) { value == alias })
+                })
+                && !array::any(dimension.aliases, fn(alias) { alias == "存储状态" })
+                && rel.aliases == ["Changed order"]
+                && rel.doc == "Event belongs to one order"
+                && !array::any(terms.dimensions, fn(entry) { entry.dataset == "order" && entry.name == "private_status" }),
+        _ => fail!("visible terminology is incomplete", terms),
+    }
+});
+
+pub def search_terminology_keys_resolve_to_complete_documents: test::Test = test::should_ok(fn() {
+    let terms = knowledge::terminology_from_model(payload);
+    let info = knowledge::knowledge_info_method_factory(payload);
+    array::all(terms.datasets, fn(entry) { encoded_type(read_node(info, `Dataset/\{entry.name}`)) == Value::String("Dataset") })
+        && array::all(terms.dimensions, fn(entry) { encoded_type(read_node(info, `Dimension/\{entry.dataset}/\{entry.name}`)) == Value::String("Dimension") })
+        && array::all(terms.measures, fn(entry) { encoded_type(read_node(info, `Measure/\{entry.dataset}/\{entry.name}`)) == Value::String("Measure") })
+        && array::all(terms.values, fn(entry) { encoded_type(read_node(info, `Value/\{entry.type_id}/\{entry.name}`)) == Value::String("Value") })
+        && array::all(terms.rels, fn(entry) { encoded_type(read_node(info, `Relation/\{entry.name}`)) == Value::String("Relation") })
+        && encoded_type(read_node(info, "Type/DatetimeUtc")) == Value::String("DataType")
+});
+
+pub def search_terminology_preserves_measure_semantics: test::Test = test::should_ok(fn() {
+    let terms = knowledge::terminology_from_model(payload);
+    match array::find(terms.measures, fn(entry) { entry.dataset == "order" && entry.name == "order_count" }) {
+        Some(measure) => measure.doc == "Count eligible order IDs"
+            && measure.aliases == ["Order count", "订单数量"]
+            && !array::any(terms.dimensions, fn(entry) { entry.name == "order_count" }),
+        None => fail!("measure terminology is missing", terms),
+    }
+});
+
+pub def search_terminology_preserves_value_names_and_scope: test::Test = test::should_ok(fn() {
+    let terms = knowledge::terminology_from_model(payload);
+    match array::find(terms.values, fn(entry) { entry.type_id == "OrderStatus" && entry.name == "paid" }) {
+        Some(value) => value.doc == "Payment completed\n订单已完成支付"
+            && value.aliases == ["Paid", "已付款"]
+            && !array::any(knowledge::links_from_model(payload).links, fn(link) { link.source == "Dimension/order/private_status" }),
+        None => fail!("value terminology is missing", terms),
+    }
+});
+
+pub def links_match_public_info_and_resolve_only_visible_targets: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    let links = knowledge::links_from_model(payload);
+    links.revision == payload.revision && array::length(links.links) > 0
+        && array::all(links.links, fn(link) { array::length(array::filter(links.links, fn(other) { other == link })) == 1 })
+        && array::all(links.links, fn(link) {
+            let source = read_node(info, link.source);
+            let destination = read_node(info, link.target);
+            destination.key == link.target && array::any(source.links, fn(ref) {
+                ref.key == link.target
+            })
+        })
+        && array::any(links.links, fn(link) { link.source == "Dimension/order/order_status" && link.target == "Type/OrderStatus" })
+});
+
+pub def bulk_reference_data_is_not_an_info_document: test::Test = test::should_ok(fn() {
+    knowledge::knowledge_info_method_factory(payload)(Value::Object({key: Value::String("links")}))
+            == json::parse(r#"{"Document":"NotFound"}"#).unwrap!()
+});
+
+pub def discovery_handler_returns_only_visible_root_keys: test::Test = test::should_ok(fn() {
+    let handler = knowledge::knowledge_discovery_method_factory(payload);
+    let first = handler(Value::Object({}));
+    let second = handler(Value::Object({}));
+    first == second && first == codec::encode(knowledge::discovery_keys(payload))
+});
+
+pub def discovery_rejects_query_fields: test::Test = test::should_fail_with(fn() {
+    knowledge::knowledge_discovery_method_factory(payload)(Value::Object({query: Value::String("order")}))
+}, "$.query: unknown field; see info key");
+
+pub def info_contains_only_index_schema_and_concrete_knowledge: test::Test = test::should_ok(fn() {
+    let info = knowledge::knowledge_info_method_factory(payload);
+    array::all(["terminology", "Directory/datasets", "Directory/order/members"], fn(key) {
+        info(Value::Object({key: Value::String(key)})) == Value::Object({Document: Value::String("NotFound")})
+    }) && array::all(knowledge::map(payload), fn(point) {
+        point.target.kind == edsl::KnowledgeKind::Index || point.entries == None
+    })
 });
 
 pub def published_field_is_distinct_from_dimension_and_hidden_column: test::Test = test::should_ok(fn() {
@@ -493,10 +577,10 @@ pub def service_index_lists_unique_keys_and_info_navigates: test::Test = test::s
         (knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(a)),
             knowledge::KnowledgeResponse::Document(knowledge::DocResult::Found(item))) =>
             match a.entries {
-                Some(entries) => if array::length(entries) == 5
+                Some(entries) => if array::length(entries) > 0 && array::all(entries, fn(entry) { entry.key.kind == edsl::KnowledgeKind::Schema })
                     && array::length(a.refs) == 0
                     && item.target == order_status { True }
-                    else { fail!("five-route index or exact key navigation failed", a, item) },
+                    else { fail!("schema index or exact key navigation failed", a, item) },
                 None => fail!("index topic has no entries", a),
             },
         other => fail!("unexpected service response", other),
@@ -640,3 +724,8 @@ type InvalidRef = struct { @edsl::column("id") @edsl::key() id: String };
 pub def nonexistent_related_point_is_rejected: test::Test = test::should_fail_with(fn() {
     edsl::build_root("invalid-reference", [InvalidRef.type], profile)
 }, "knowledge reference must link distinct declared points from its owner");
+
+@edsl::value_type("OrderStatus", String.type, status_values)
+@edsl::knowledge_doc({kind: edsl::KnowledgeKind::Value, owner: "OrderStatus", id: "paid"}, "Payment completed")
+@edsl::term("已付款", "订单已完成支付", {kind: edsl::KnowledgeKind::Value, owner: "OrderStatus", id: "paid"})
+type OrderStatusValueType = struct {};
