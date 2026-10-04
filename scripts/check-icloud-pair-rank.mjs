@@ -48,14 +48,21 @@ try {
   }
   const rows = db.prepare(query.sql).all(...query.bindings);
   assert.deepEqual(rows.map(row => row.right_curr_cpu_usage), [16, 15, 14, 13, 12]);
-  assert.ok(rows.every(row => row.left_prev_cpu_usage === 10 && Object.keys(row).length === 3));
+  assert.ok(rows.every(row => row.left_prev_cpu_usage === 10 && Object.keys(row).length === 4));
+  assert.deepEqual(rows.map(row => row.comparison_value), [6, 5, 4, 3, 2]);
   for (const rank_by of [
     { op: 'Ratio', numerator: 'Right', denominator: 'Left', direction: 'Desc', take: 5 },
     { op: 'GrowthRate', current: 'Right', baseline: 'Left', direction: 'Desc', take: 5 },
   ]) {
     const query = await transform({ ...intent, rank_by });
-    assert.deepEqual(db.prepare(query.sql).all(...query.bindings).map(row => row.right_curr_cpu_usage),
+    const rows = db.prepare(query.sql).all(...query.bindings);
+    assert.deepEqual(rows.map(row => row.right_curr_cpu_usage),
       [16, 15, 14, 13, 12], rank_by.op);
+    for (const row of rows) {
+      assert.equal(row.comparison_value, rank_by.op === 'Ratio'
+        ? row.right_curr_cpu_usage / row.left_prev_cpu_usage
+        : (row.right_curr_cpu_usage - row.left_prev_cpu_usage) / row.left_prev_cpu_usage);
+    }
   }
   const inverse = await transform({ ...intent,
     select: [{ side: 'Right', node: 'd', dimension: 'device_name' },
@@ -64,7 +71,7 @@ try {
   const inverseRows = db.prepare(inverse.sql).all(...inverse.bindings);
   assert.deepEqual(inverseRows.map(row => row.right_curr_cpu_usage), [10, 11, 12, 13, 14]);
   assert.deepEqual(Object.keys(inverseRows[0]),
-    ['right_d_device_name', 'left_d_device_name', 'left_prev_cpu_usage', 'right_curr_cpu_usage']);
+    ['right_d_device_name', 'left_d_device_name', 'left_prev_cpu_usage', 'right_curr_cpu_usage', 'comparison_value']);
   const legacy = { ...intent };
   delete legacy.align_by;
   const rejected = await call('ic/transform', { intents: [legacy] });

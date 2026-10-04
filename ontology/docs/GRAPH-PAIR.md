@@ -82,8 +82,12 @@ Ties use every complete alignment identity key ascending, NULLS FIRST.
 Both operands are cast to double precision (`REAL` in SQLite,
 `DOUBLE PRECISION` in PostgreSQL) before arithmetic. Integer division retains
 fractions, but large integers may lose precision. NULLIF also guards division
-against optimizer evaluation before filtering. No comparison output column
-is added. Ranking cannot combine with `count_groups:true`.
+against optimizer evaluation before filtering. Ranked results append the numeric
+`comparison_value` column after both measures and order by that same column.
+Subtract retains the operands' declared unit (a difference of percent samples
+is in percentage points); Ratio is a dimensionless multiple and GrowthRate is
+a dimensionless fraction. Unranked results have no comparison column.
+Ranking cannot combine with `count_groups:true`.
 
 The profile must allow Order, Limit, Scalar and Filter, plus IsNotNull and
 the operation's scalar capabilities: Sub for Subtract, Div and Ne for Ratio,

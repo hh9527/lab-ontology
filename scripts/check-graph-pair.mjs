@@ -4,10 +4,12 @@ import { cpSync, copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 
 // Evaluation loads source modules; copy the test model into an isolated crate.
 const temporary = mkdtempSync(join(tmpdir(), 'graph-pair-'));
 const db = new DatabaseSync(':memory:');
+let pg;
 try {
   writeFileSync(join(temporary, 'telora-config.json'), JSON.stringify({ version: 1, members: ['ontology'] }));
   writeFileSync(join(temporary, 'telora-lock.json'), JSON.stringify({ version: 1,
@@ -37,7 +39,20 @@ try {
   assert.deepEqual(values(queries[0]), [[10, 30], [10, 20]]);
   assert.deepEqual(values(queries[1]), [[30, 20], [10, 20]]);
   assert.deepEqual(values(queries[2]), [[10, 30], [10, 20], [30, 40], [30, 20]]);
-  assert.ok(execute(queries[2]).every(row => Object.keys(row).length === 3));
+  assert.ok(execute(queries[2]).every(row => Object.keys(row).length === 4));
+  assert.ok(execute(queries[3]).every(row => !('comparison_value' in row)));
+  const checkComparison = (index, formula, left = 'left_prev_usage', right = 'right_curr_usage') => {
+    for (const row of execute(queries[index])) {
+      assert.equal(row.comparison_value, formula(row[left], row[right]));
+    }
+  };
+  for (const index of [0, 1, 2, 5]) checkComparison(index, (l, r) => r - l);
+  checkComparison(6, (l, r) => r / l);
+  checkComparison(7, (l, r) => (r - l) / l);
+  checkComparison(8, (l, r) => l / r);
+  checkComparison(9, (l, r) => l - r);
+  checkComparison(11, (l, r) => r / l, 'left_prev_bytes', 'right_curr_bytes');
+  assert.deepEqual(execute(queries[2]).map(row => row.comparison_value), [20, 10, 10, -10]);
   assert.equal(execute(queries[3]).length, 6);
   assert.deepEqual(Object.values(execute(queries[4])[0]), [6]);
   assert.deepEqual(values(queries[5]), [[30, 40], [30, 20]]);
@@ -48,7 +63,7 @@ try {
   const labels = execute(queries[10]);
   assert.equal(labels.length, 4, 'different display values must not remove aligned identities');
   assert.ok(labels.every(row => row.right_d_name === 'current name' && row.left_d_name === 'previous name'));
-  assert.deepEqual(Object.keys(labels[0]), ['right_d_name', 'left_d_name', 'left_prev_usage', 'right_curr_usage']);
+  assert.deepEqual(Object.keys(labels[0]), ['right_d_name', 'left_d_name', 'left_prev_usage', 'right_curr_usage', 'comparison_value']);
   assert.deepEqual(execute(queries[11]).map(row => [row.left_prev_bytes, row.right_curr_bytes]),
     [[10, 60], [20, 30], [30, 40], [30, 20]], 'integer division must retain fractional ratios');
   for (const [owner, before, after] of [
@@ -64,6 +79,9 @@ try {
   assert.equal(execute(queries[7]).length, 6, 'GrowthRate requires a positive selected baseline');
   assert.ok(execute(queries[7]).every(row => row.left_prev_usage > 0));
   assert.deepEqual(values(queries[7]).slice(-2), [[10, 0], [10, -20]]);
+  checkComparison(6, (l, r) => r / l);
+  checkComparison(7, (l, r) => (r - l) / l);
+  checkComparison(8, (l, r) => l / r);
   db.exec('CREATE TABLE composite_devices(id TEXT, tenant TEXT, name TEXT); CREATE TABLE composite_samples(id INTEGER, owner TEXT, tenant TEXT, ts INTEGER, usage REAL)');
   const compositeDevice = db.prepare('INSERT INTO composite_devices VALUES (?, ?, ?)');
   const compositeSample = db.prepare('INSERT INTO composite_samples VALUES (?, ?, ?, ?, ?)');
@@ -76,8 +94,41 @@ try {
   }
   assert.deepEqual(execute(queries[12]).map(row => [row.left_s_composite_usage, row.right_s_composite_usage]),
     [[100, 300], [10, 20]], 'all composite identity columns must align without cross-tenant fanout');
+  if (process.argv[2]) {
+    const { PGlite } = await import(pathToFileURL(process.argv[2]).href);
+    pg = new PGlite();
+    const pgQueries = JSON.parse(execFileSync('bin/telora', ['-C', crate, 'eval',
+      '@src/graph_pair:postgres_execution_queries', '--initialization-fuel', '100000',
+      '--with-memory-limit', '2048'], { encoding: 'utf8' }));
+    await pg.exec('CREATE TABLE devices(id TEXT, name TEXT); CREATE TABLE samples(id INTEGER, owner TEXT, ts INTEGER, usage REAL, bytes INTEGER, label TEXT)');
+    for (const row of db.prepare('SELECT * FROM devices').all()) {
+      await pg.query('INSERT INTO devices VALUES ($1, $2)', Object.values(row));
+    }
+    for (const row of db.prepare('SELECT * FROM samples').all()) {
+      await pg.query('INSERT INTO samples VALUES ($1, $2, $3, $4, $5, $6)', Object.values(row));
+    }
+    const formulas = [(l, r) => r - l, (l, r) => r - l, (l, r) => r - l,
+      (l, r) => r / l, (l, r) => (r - l) / l, (l, r) => l - r,
+      (l, r) => l / r, (l, r) => (l - r) / r];
+    const sqliteIndexes = [0, 1, 2, 6, 7, 9, 8];
+    for (const [index, query] of pgQueries.entries()) {
+      const { rows } = await pg.query(query.sql, query.bindings);
+      if (index === 8) {
+        assert.ok(rows.every(row => !('comparison_value' in row)));
+        continue;
+      }
+      for (const row of rows) {
+        assert.equal(row.comparison_value, formulas[index](row.left_prev_usage, row.right_curr_usage));
+      }
+      if (index < sqliteIndexes.length) {
+        assert.deepEqual(rows, execute(queries[sqliteIndexes[index]]).map(row => ({ ...row })));
+      }
+    }
+    console.log('GraphPair PostgreSQL execution passed: comparison values, operand directions, NULL/zero/negative guards, ties, limits and SQLite parity');
+  }
   console.log('GraphPair SQLite execution passed: explicit identity/output sides, changed labels, independent populations, thresholds/counts, operand directions, fractional ratios, zero/negative baselines, ties and limits');
 } finally {
+  await pg?.close();
   db.close();
   rmSync(temporary, { recursive: true, force: true });
 }

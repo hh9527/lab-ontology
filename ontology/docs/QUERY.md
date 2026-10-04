@@ -62,8 +62,9 @@ first side (the second side is the opposite) and bound limit 1..1000.
 GrowthRate uses first as current and second as baseline. Renderers exclude
 NULL measures, zero Ratio denominators and nonpositive GrowthRate baselines,
 cast operands to double precision, and also guard division with NULLIF.
-Ties use complete alignment identities ascending, NULLS FIRST. No comparison
-column is added. JoinedGroupCount rejects ranking. Model lowering checks
+Ties use complete alignment identities ascending, NULLS FIRST. Ranked results
+append numeric `comparison_value` and order by that column; unranked results
+do not add it. JoinedGroupCount rejects ranking. Model lowering checks
 numeric types, units and profile authorization. See [GraphPair](GRAPH-PAIR.md).
 
 Model-backed type and grain checks belong to ontology lowering. The query
