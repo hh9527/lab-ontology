@@ -35,7 +35,11 @@ try {
   assert.deepEqual([...found.keys()].sort(), expected.slice().sort(), 'unreachable or unpublished catalog nodes');
   const root = found.get('index');
   assert(root.detail.schemas.length > 0);
-  assert.equal(root.detail.key_patterns.length, 10);
+  const kinds = root.detail.key_patterns.map(entry => entry.kind);
+  assert(kinds.length > 0);
+  assert.equal(new Set(kinds).size, kinds.length);
+  assert(nodes.every(node => ['Index', 'Schema'].includes(node.type) || kinds.includes(node.type)),
+    'concrete node has no declared key pattern');
   assert.equal(new Set(root.detail.schemas).size, root.detail.schemas.length);
   assert(root.detail.schemas.every(key => found.get(key)?.type === 'Schema'));
   assert.deepEqual(root.detail.schemas.slice().sort(), nodes.filter(node => node.type === 'Schema').map(node => node.key).sort());

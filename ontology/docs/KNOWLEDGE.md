@@ -116,6 +116,16 @@ See [FIELD-ROLES.md](FIELD-ROLES.md).
 capabilities. @related_to adds explanatory references without creating query
 relationships. knowledge_lookup_factory prepares one catalog for repeated
 typed lookups; service factories likewise initialize their catalog once.
+The catalog caches visible Dataset briefs and indexes documentation, related
+references and explicit terms by key. Member lookups construct only the requested
+node; full member documents are not cached.
+
+`node scripts/benchmark-knowledge.mjs --artifact <snapshot> --full --output <report.json>`
+measures snapshot startup through the first discovery response, warmed single-key
+requests and complete traversal. The report includes compact JSON byte sizes and
+SHA-256 hashes for comparing every node across snapshots. On Linux it also records
+runner resident memory; this includes the runtime and transient allocations, not
+just the catalog. Startup excludes source compilation and snapshot initialization.
 
 ## Programmatic Discovery
 
