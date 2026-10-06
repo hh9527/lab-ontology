@@ -1,6 +1,6 @@
 # Source-backed sample statistics
 
-This describes the product Model (`icloud-source-v14`).
+This describes the product Model (`icloud-source-v19`).
 Agents discover these declarations through `ic/info`; this
 document records model-author decisions and source limitations.
 
@@ -44,6 +44,10 @@ node scripts/check-icloud-kpi-measures.mjs bin/icloud_model.snapshot.wasm
 | Server CPU | `server_cpu_sample` | `server_cpu_usage` | `server_cpu_peak` | `server_cpu_sample_min` |
 | Server memory | `server_memory_sample` | `server_memory_usage` | `server_memory_sample_max` | `server_memory_sample_min` |
 | Storage / FC CPU | `source_StorageDeviceKPI__cpuusage` | `storage_cpu_usage` | `storage_cpu_sample_max` | `storage_cpu_sample_min` |
+| Storage / FC memory | `source_StorageDeviceKPI__memoryusage` | `storage_memory_usage` | `storage_memory_usage_max` | `storage_memory_usage_min` |
+| Disk utilization | `source_StorageHardDriveKPI__utility` | `storage_disk_usage` | `storage_disk_usage_max` | `storage_disk_usage_min` |
+| Disk average read I/O size | `source_StorageHardDriveKPI__avgreadiosize` | `storage_disk_read_io_size` | `storage_disk_read_io_size_max` | `storage_disk_read_io_size_min` |
+| Disk average write I/O size | `source_StorageHardDriveKPI__avgwriteiosize` | `storage_disk_write_io_size` | `storage_disk_write_io_size_max` | `storage_disk_write_io_size_min` |
 | PON CPU | `source_PonDeviceKPI__cpuUsage` | `pon_cpu_usage` | `pon_cpu_sample_max` | `pon_cpu_sample_min` |
 | Device port usage | `device_kpi__ifUtilizationRate` | `device_port_usage_avg` | `device_port_usage_max` | `device_port_usage_min` |
 | Interface inbound bandwidth | `interface_kpi__ifInBandRate` | `interface_in_band_usage_avg` | `interface_in_band_usage_max` | `interface_in_band_usage_min` |
@@ -55,9 +59,18 @@ node scripts/check-icloud-kpi-measures.mjs bin/icloud_model.snapshot.wasm
 - Storage/FC and PON CPU use eligible stored samples. Avg is the arithmetic
   mean, Min/Max are sample extrema; NULL is ignored and an all-NULL population
   has no value. There is no time weighting, effective-count weighting, inferred
-  validity filter or rescaling. The unit is assumed to be `%`;
-  TODO(#47): confirm it against source metadata. Storage and FC share the KPI
+  validity filter or rescaling. StorageDeviceKPI declares the CPU unit as
+  percent (%); the PON CPU unit remains assumed, TODO(#47): confirm it against
+  source metadata. Storage and FC share the KPI
   table but use their own declared resource relations and populations.
+- StorageDeviceKPI memory and StorageHardDriveKPI utilization declare percent
+  units. Read/write I/O size declares kilobyte (KB); TODO(#58): confirm the byte
+  multiplier before conversion. No unit conversion is performed. An arithmetic
+  average of already-averaged I/O size samples is not a global per-operation
+  average; extrema likewise describe stored averages, not individual I/O.
+  Effective counts are not used as weights or validity predicates. Disk owner
+  identity and its relation remain unresolved; disk KPI queries use the dataset's
+  resource identifier and time window directly.
 - Collaboration devices have no declared CPU sample source. CPU questions for
   this resource family are unsupported; missing CPU is not zero.
 - The shared storage CPU measure has two owner populations: `storage_device`

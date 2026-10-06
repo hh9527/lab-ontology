@@ -1,5 +1,13 @@
 // Independent expectations for the KPI declarations and executable SQL checks.
 export const cases = [
+  ['source_StorageDeviceKPI', 'StorageDeviceKPI', 'source_StorageDeviceKPI__ts', [
+    ['memoryusage', 'storage_memory_usage', '%', '存储及FC设备内存使用率'],
+  ]],
+  ['source_StorageHardDriveKPI', 'StorageHardDriveKPI', 'source_StorageHardDriveKPI__ts', [
+    ['utility', 'storage_disk_usage', '%', '硬盘利用率'],
+    ['avgreadiosize', 'storage_disk_read_io_size', 'KB', '硬盘平均读I/O大小'],
+    ['avgwriteiosize', 'storage_disk_write_io_size', 'KB', '硬盘平均写I/O大小'],
+  ]],
   ['onu_kpi', 'PonDeviceOnuKPI', 'onu_kpi_ts', [
     ['onuHwOpticsRxPower', 'onu_rx_power', 'dBm', 'ONU接收光功率'],
     ['onuHwOpticsTxPower', 'onu_tx_power', 'dBm', 'ONU发送光功率'],

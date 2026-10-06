@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
+import { readFileSync } from 'node:fs';
 import { cases } from './tests/fixtures/icloud-kpi-measures.mjs';
 
 const child = spawn('bin/telora-run', [process.argv[2] ?? 'bin/icloud_model.snapshot.wasm',
@@ -26,6 +27,19 @@ async function info(key) {
   return node;
 }
 try {
+  const catalog = JSON.parse(readFileSync('icloud_model/data/source_catalog.json', 'utf8'));
+  for (const [table, column, unitName, unitType] of [
+    ['StorageDeviceKPI', 'cpuusage', 'percent', 'ratio'],
+    ['StorageDeviceKPI', 'memoryusage', 'percent', 'ratio'],
+    ['StorageHardDriveKPI', 'utility', 'percent', 'ratio'],
+    ['StorageHardDriveKPI', 'avgreadiosize', 'kilobyte', 'data_size'],
+    ['StorageHardDriveKPI', 'avgwriteiosize', 'kilobyte', 'data_size'],
+  ]) {
+    const field = catalog.datasets.find(dataset => dataset.table === table).fields.find(field => field.name === column);
+    assert.equal(field.columnType, 'measure');
+    assert.equal(field.unitName, unitName);
+    assert.equal(field.unitType, unitType);
+  }
   for (const [entity, table, time, fields] of cases) {
     db.exec(`CREATE TABLE ${table}(resId TEXT, tenantId TEXT, ts TEXT, ${fields.map(([column]) => `${column} REAL`).join(', ')})`);
     const insert = db.prepare(`INSERT INTO ${table} VALUES (${Array(fields.length + 3).fill('?').join(', ')})`);
@@ -83,7 +97,7 @@ try {
     const empty = db.prepare(query.sql).all(...query.bindings);
     assert.equal(empty.length, 1);
     for (const measure of measures) assert.equal(empty[0][`k_${measure}`], null);
-    if (entity.startsWith('source_')) {
+    if (entity.startsWith('source_') && entity !== 'source_StorageDeviceKPI') {
       const dataset = await info(`Dataset/${entity}`);
       assert.ok(dataset.description.summary.includes('provisional'));
     }
@@ -104,9 +118,24 @@ try {
   assert.ok(cleared.description.summary.includes('do not impose'));
   for (const aggregate of ['avg', 'min', 'max']) {
     const node = await info(`Measure/device_kpi/device_online_rate_${aggregate}`);
-    assert.ok(node.description.summary.includes('distinct population from NetworkDeviceOnlineKPI'));
+    assert.ok(node.description.summary.toLowerCase().includes('distinct population from networkdeviceonlinekpi'));
   }
-  for (const [type, member, wire] of [
+  db.exec('CREATE TABLE HuaweiStorageDevice(id TEXT, name TEXT)');
+  db.exec("INSERT INTO HuaweiStorageDevice VALUES ('s1','Storage-DC1-A'),('s2','Other')");
+  const named = await request('transform', { intents: [{ op: 'Graph', root: 's',
+    nodes: [{ id: 's', entity: 'storage_device' }], edges: [],
+    select: [{ node: 's', dimension: 'storage_device__name' }],
+    filters: [{ node: 's', dimension: 'storage_device__name', op: 'Contains', value: 'storage' }],
+  }] });
+  assert.equal(named.accepted, true, JSON.stringify(named.diagnostics));
+  const namedQuery = named.queries[0];
+  const namedRows = db.prepare(namedQuery.sql).all(...namedQuery.bindings);
+  assert.equal(namedRows.length, 1);
+  assert.equal(namedRows[0].s_storage_device__name, 'Storage-DC1-A');
+  assert((await info('Field/storage_device/name')).detail.roles.includes('Appellation'));
+  assert((await info('Dataset/storage_device')).detail.references.some(ref => ref.id === 'id'));
+
+  for (const [ty, member, wire] of [
     ['PonClass', 'olt', 'ne.category.olt'],
     ['PhysicalLinkType', 'lldp', 1], ['PhysicalLinkType', 'csp', 7],
     ['PhysicalLinkType', 'server_internal', 8], ['PhysicalLinkType', 'fiber_search', 9],
@@ -114,7 +143,7 @@ try {
     const value = await info(`Value/${ty}/${member}`);
     assert.ok(JSON.stringify(value.detail).includes(JSON.stringify(wire)), `${ty}/${member}: original wire`);
   }
-  console.log('Passed: 7 KPI datasets, 104 measures, hour/day/month grouped trends, half-open windows, NULL populations, alarm counts, online-rate populations and stable value keys');
+  console.log(`Passed: ${cases.length} KPI datasets, sample aggregates, hour/day/month trends, half-open windows, NULL populations, storage name search, alarm counts, online-rate populations and stable value keys`);
 } finally {
   db.close();
   child.stdin.end();

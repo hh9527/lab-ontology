@@ -24,7 +24,7 @@ def field_metadata(field):
         key: value for key, value in properties.items()
         if key not in {"ui", "dte.llmFriendly", "dte.writable", "dte.unique"}
     }
-    for key in ("dte.enum.values", "unit", "aggregation", "aggregate"):
+    for key in ("dte.enum.values", "unit", "unitName", "unitType", "aggregation", "aggregate"):
         if key in field:
             selected[key] = field[key]
     return selected
