@@ -40,7 +40,7 @@ try {
       '2026-09-30T23:59:59Z', '2026-10-01T00:00:00Z', '2026-10-01T12:00:00Z'];
     const insert = db.prepare(`INSERT INTO "${table}" VALUES (?)`);
     for (const value of values) insert.run(value);
-    const intent = { op: 'Graph', root: 'k', nodes: [{ id: 'k', entity }], edges: [],
+    const intent = { op: 'Graph', limit: 1000, root: 'k', nodes: [{ id: 'k', entity }], edges: [],
       select: [{ node: 'k', dimension }],
       time_windows: [{ node: 'k', dimension, start: '2026-09-30T00:00:00Z', end: '2026-10-01T00:00:00Z' }] };
     const result = await transform(intent);

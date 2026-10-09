@@ -58,6 +58,15 @@ the allocation context and validated plan into one `QueryAst`; neither
 unfinished `Ctx` nor `Plan` crosses the renderer boundary. The AST cannot
 contain raw SQL, arbitrary functions, or literal fragments.
 
+`QueryAst.result_limit` is an optional allocated positive integer binding for the
+final output cap. Public Intent lowering always supplies it; `finish` leaves it
+absent for low-level QueryBuilder callers. It is independent of `Plan.limit`,
+partition `take`, joined-group rank `take`, and business profile permissions.
+Both renderers validate its binding and apply it only to the final result SELECT.
+An existing final business limit combines with it using the smaller bound while
+retaining the original ORDER BY; PostgreSQL explicitly casts both CASE operands
+to BIGINT. Nested operands and Latest/window input stages remain unchanged.
+
 `JoinedGroups` carries separate `left_identity` / `right_identity` expressions,
 hidden key aliases, and ordered `outputs` with side, column and result alias.
 Key projections must match the identity expressions and belong to operand

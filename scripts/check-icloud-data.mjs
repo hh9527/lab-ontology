@@ -29,14 +29,14 @@ async function query(intent) {
 try {
   for (const dataset of model.datasets.filter(dataset => dataset.fields.some(field => field.column === 'ts'))) {
     const dimension = model.dimensions.find(dimension => dimension.dataset === dataset.id && dimension.column === 'ts' && !dimension.computed);
-    const rows = await query({ op: 'Graph', root: 'k', nodes: [{ id: 'k', entity: dataset.id }], edges: [],
+    const rows = await query({ op: 'Graph', limit: 1000, root: 'k', nodes: [{ id: 'k', entity: dataset.id }], edges: [],
       select: [{ node: 'k', dimension: dimension.id }],
       time_windows: [{ node: 'k', dimension: dimension.id, start: manifest.window.start, end: manifest.window.endExclusive }] });
     assert.equal(rows.length, manifest.tables[dataset.table], dataset.id);
   }
   for (const role of ['pon_onu_role', 'pon_olt_role']) {
     const dimension = model.dimensions.find(dimension => dimension.dataset === role && dimension.column === 'name');
-    const rows = await query({ op: 'Graph', root: 'p', nodes: [{ id: 'p', entity: role }], edges: [], select: [{ node: 'p', dimension: dimension.id }] });
+    const rows = await query({ op: 'Graph', limit: 1000, root: 'p', nodes: [{ id: 'p', entity: role }], edges: [], select: [{ node: 'p', dimension: dimension.id }] });
     assert.ok(rows.length > 0);
     const expected = db.prepare('SELECT name FROM I_EntPonElement WHERE classification=?').all(role === 'pon_onu_role' ? 'ne.category.pon.onu' : 'ne.category.olt').map(row => row.name).sort();
     assert.deepEqual(rows.map(row => Object.values(row)[0]).sort(), expected);
@@ -53,7 +53,7 @@ try {
   for (const [owner, entity, relation, reverse, measure, column, time] of cpuCases) {
     const ownerTable = model.datasets.find(dataset => dataset.id === owner).table;
     const metricTable = model.datasets.find(dataset => dataset.id === entity).table;
-    const rows = await query({ op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
+    const rows = await query({ op: 'Graph', limit: 1000, root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
       edges: [{ relation, from: reverse ? 'k' : 'd', to: reverse ? 'd' : 'k' }], select: [], group_by_identity: ['d'],
       measures: [{ node: 'k', measure }], time_windows: [{ node: 'k', dimension: time, start, end }] });
     const expected = db.prepare(`SELECT avg(k."${column}") value FROM "${ownerTable}" d JOIN "${metricTable}" k ON k.resId=d.id WHERE k.ts>=? AND k.ts<? GROUP BY d.id`).all(start, end);
@@ -61,12 +61,12 @@ try {
     assert.deepEqual(rows.map(row => row[`k_${measure}`]).sort((a, b) => a - b), expected.map(row => row.value).sort((a, b) => a - b), owner);
   }
   const middle = new Date(Date.parse(start) + Math.floor((Date.parse(end) - Date.parse(start)) / 2000) * 1000).toISOString().replace('.000Z', 'Z');
-  const graph = (node, start, end) => ({ op: 'Graph', root: 'd',
+  const graph = (node, start, end) => ({ op: 'Graph', limit: 1000, root: 'd',
     nodes: [{ id: 'd', entity: 'device' }, { id: node, entity: 'device_kpi' }],
     edges: [{ relation: 'device_kpi_of_device', from: node, to: 'd' }],
     select: [], group_by_identity: ['d'], measures: [{ node, measure: 'cpu_usage' }],
     time_windows: [{ node, dimension: 'device_kpi_ts_raw', start, end }] });
-  const rows = await query({ op: 'GraphPair', left: graph('prev', start, middle), right: graph('curr', middle, end),
+  const rows = await query({ op: 'GraphPair', limit: 1000, left: graph('prev', start, middle), right: graph('curr', middle, end),
     align_by: [{ left: { node: 'd' }, right: { node: 'd' } }], select: [{ side: 'Right', node: 'd', dimension: 'device_name' }],
     rank_by: { op: 'GrowthRate', current: 'Right', baseline: 'Left', direction: 'Desc', take: 5 } });
   assert.equal(rows.length, 5);

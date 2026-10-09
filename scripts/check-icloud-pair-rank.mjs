@@ -25,13 +25,13 @@ async function transform(intent) {
   return result.queries[0];
 }
 try {
-  const graph = (node, start, end) => ({ op: 'Graph', root: 'd',
+  const graph = (node, start, end) => ({ op: 'Graph', limit: 1000, root: 'd',
     nodes: [{ id: 'd', entity: 'device' }, { id: node, entity: 'device_kpi' }],
     edges: [{ relation: 'device_kpi_of_device', from: node, to: 'd' }],
     select: [], group_by_identity: ['d'],
     measures: [{ node, measure: 'cpu_usage' }],
     time_windows: [{ node, dimension: 'device_kpi_ts_raw', start, end }] });
-  const intent = { op: 'GraphPair',
+  const intent = { op: 'GraphPair', limit: 1000,
     align_by: [{ left: { node: 'd' }, right: { node: 'd' } }],
     select: [{ side: 'Right', node: 'd', dimension: 'device_name' }],
     left: graph('prev', '2026-09-14T00:00:00Z', '2026-09-21T00:00:00Z'),

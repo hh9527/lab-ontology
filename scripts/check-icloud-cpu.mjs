@@ -46,7 +46,7 @@ try {
   }
   for (const [owner, entity, relation, dimension, table, column, prefix] of cases) {
     const measures = [`${prefix}_cpu_usage`, `${prefix}_cpu_sample_max`, `${prefix}_cpu_sample_min`];
-    const intent = { op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
+    const intent = { op: 'Graph', limit: 1000, root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
       edges: [{ relation, from: 'd', to: 'k' }], select: [{ node: 'd', dimension }], group_by_identity: ['d'],
       measures: measures.map(measure => ({ node: 'k', measure })),
       time_windows: [{ node: 'k', dimension: `${entity}__ts`, start: '2026-10-02T00:00:00Z', end: '2026-10-03T00:00:00Z' }] };

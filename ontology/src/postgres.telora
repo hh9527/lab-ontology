@@ -660,10 +660,10 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
 };
 
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
-    emit_rows_from(raw, distinct, ctx, None)
+    emit_rows_from(raw, distinct, ctx, None, None)
 };
 
-def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = fn(raw, distinct, ctx, override) {
+def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String), Option(qb::Expr)) -> Emitted = fn(raw, distinct, ctx, override, cap) {
     let plan = if distinct { qb::validate_distinct_plan(raw) } else { qb::validate_structure(raw) };
     if override == None && array::length(qb::latest_calls(plan)) > 0 {
         let stage = qb::latest_stage(plan);
@@ -674,10 +674,10 @@ def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = f
             `\{quoted(pair.1)} \{if pair.0 == 0 { "DESC NULLS LAST" } else { "ASC NULLS FIRST" }}`
         });
         let source = `(SELECT "__latest_input".*, row_number() OVER (\{partition}ORDER BY \{string::join(orders, ", ")}) AS "__latest_row" FROM (\{input.sql}) AS "__latest_input") AS "__latest_stage"`;
-        emit_rows_from(stage.output, distinct, input.ctx, Some(source))
+        emit_rows_from(stage.output, distinct, input.ctx, Some(source), cap)
     } else {
     match plan.partition {
-        Some(pt) => emit_partitioned(plan, pt, ctx),
+        Some(pt) => append_output_limit(emit_partitioned(plan, pt, ctx), cap),
         None => {
         let select_initial: Arguments = {sql: [], ctx};
         let selected = array::fold(plan.projection, select_initial, fn(state, item) {
@@ -702,12 +702,15 @@ def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = f
             let value = order_item(item, plan, state.ctx);
             {sql: array::push(state.sql, value.sql), ctx: value.ctx}
         });
-        let limit: Emitted = match plan.limit {
-            Some(value) => {
-                let allocated = emit_expr(value, ordering.ctx);
-                {sql: ` LIMIT \{allocated.sql}`, ctx: allocated.ctx}
+        let limit: Emitted = match cap {
+            Some(value) => emit_output_limit(plan.limit, value, ordering.ctx),
+            None => match plan.limit {
+                Some(value) => {
+                    let allocated = emit_expr(value, ordering.ctx);
+                    {sql: ` LIMIT \{allocated.sql}`, ctx: allocated.ctx}
+                },
+                None => {sql: "", ctx: ordering.ctx},
             },
-            None => {sql: "", ctx: ordering.ctx},
         };
         let offset: Emitted = match plan.offset {
             Some(value) => {
@@ -739,7 +742,7 @@ def emit_set: Fn(qb::SetPlan, RenderCtx) -> Emitted = fn(set, ctx) {
     {sql: string::join(rendered.0, ` \{op} `), ctx: rendered.1}
 };
 
-def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(joined, count, ctx) {
+def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx, Option(qb::Expr)) -> Emitted = fn(joined, count, ctx, cap) {
     let left = emit_rows(joined.left, False, ctx);
     let right = emit_rows(joined.right, False, left.ctx);
     let left_alias = internal_alias(right.ctx);
@@ -755,7 +758,7 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
     });
     let selected = if count { "count(1)" } else { string::join(outputs, ", ") };
     let ranking = match joined.rank {
-        None => ("", {sql: "", ctx: right_alias.1}.ty!(Emitted)),
+        None => ("", match cap { None => {sql: "", ctx: right_alias.1}.ty!(Emitted), Some(value) => emit_output_limit(None, value, right_alias.1) }),
         Some(rank) => {
             let l = `\{quoted(left_alias.0)}.\{quoted(rank.left_measure)}`;
             let r = `\{quoted(right_alias.0)}.\{quoted(rank.right_measure)}`;
@@ -775,9 +778,15 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
             };
             let direction = match rank.direction { qb::Ordering::Asc => "ASC", qb::Ordering::Desc => "DESC" };
             let ties = array::map(joined.keys, fn(name) { `\{quoted(left_alias.0)}.\{quoted(name)} ASC NULLS FIRST` });
-            let limit = emit_expr(rank.take, right_alias.1);
+            let limit = match cap {
+                Some(value) => emit_output_limit(Some(rank.take), value, right_alias.1),
+                None => {
+                    let local = emit_expr(rank.take, right_alias.1);
+                    {sql: ` LIMIT \{local.sql}`, ctx: local.ctx}.ty!(Emitted)
+                },
+            };
             (`, \{expression} AS "comparison_value"`,
-                {sql: ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY "comparison_value" \{direction}, \{string::join(ties, ", ")} LIMIT \{limit.sql}`, ctx: limit.ctx}.ty!(Emitted))
+                {sql: ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY "comparison_value" \{direction}, \{string::join(ties, ", ")}\{limit.sql}`, ctx: limit.ctx}.ty!(Emitted))
         },
     };
     {sql: `SELECT \{selected}\{ranking.0} FROM (\{left.sql}) AS \{quoted(left_alias.0)} INNER JOIN (\{right.sql}) AS \{quoted(right_alias.0)} ON \{string::join(keys, " AND ")}\{ranking.1.sql}`,
@@ -787,10 +796,32 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
 # The single PG AST boundary remains a candidate until the dialect contract
 # (notably set projection types) is proven by cross-dialect execution.
 
+def emit_output_limit: Fn(Option(qb::Expr), qb::Expr, RenderCtx) -> Emitted = fn(local, cap, ctx) {
+    let output = emit_expr(cap, ctx);
+    match local {
+        None => {sql: ` LIMIT \{output.sql}`, ctx: output.ctx},
+        Some(value) => {
+            let business = emit_expr(value, output.ctx);
+            {sql: ` LIMIT CASE WHEN CAST(\{business.sql} AS BIGINT) < CAST(\{output.sql} AS BIGINT) THEN CAST(\{business.sql} AS BIGINT) ELSE CAST(\{output.sql} AS BIGINT) END`, ctx: business.ctx}
+        },
+    }
+};
+
+def append_output_limit: Fn(Emitted, Option(qb::Expr)) -> Emitted = fn(query, cap) {
+    match cap {
+        None => query,
+        Some(value) => {
+            let limit = emit_output_limit(None, value, query.ctx);
+            {sql: `\{query.sql}\{limit.sql}`, ctx: limit.ctx}
+        },
+    }
+};
+
 pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
     let raw = ast.plan;
     let builder = ast.ctx;
     let plan = qb::validate_query_plan(qb::validate_contextual_pagination(raw, builder));
+    let cap = qb::validated_output_limit(ast);
     let reserved = match plan {
         qb::QueryPlan::Rows(rows) => plan_aliases(rows),
         qb::QueryPlan::DistinctRows(rows) => plan_aliases(rows),
@@ -802,21 +833,21 @@ pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
     };
     let ctx = context(reserved, builder.bindings);
     let rendered = match plan {
-        qb::QueryPlan::Rows(rows) => emit_rows(rows, False, ctx),
-        qb::QueryPlan::DistinctRows(rows) => emit_rows(rows, True, ctx),
+        qb::QueryPlan::Rows(rows) => emit_rows_from(rows, False, ctx, None, cap),
+        qb::QueryPlan::DistinctRows(rows) => emit_rows_from(rows, True, ctx, None, cap),
         qb::QueryPlan::GroupCount(rows) => {
             let inner = emit_rows(rows, False, ctx);
             let alias = internal_alias(inner.ctx);
-            {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}
+            append_output_limit({sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}, cap)
         },
-        qb::QueryPlan::SetRows(set) => emit_set(set, ctx),
+        qb::QueryPlan::SetRows(set) => append_output_limit(emit_set(set, ctx), cap),
         qb::QueryPlan::SetCount(set) => {
             let inner = emit_set(set, ctx);
             let alias = internal_alias(inner.ctx);
-            {sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}
+            append_output_limit({sql: `SELECT count(1) FROM (\{inner.sql}) AS \{quoted(alias.0)}`, ctx: alias.1}, cap)
         },
-        qb::QueryPlan::JoinedGroups(joined) => emit_joined_groups(joined, False, ctx),
-        qb::QueryPlan::JoinedGroupCount(joined) => emit_joined_groups(joined, True, ctx),
+        qb::QueryPlan::JoinedGroups(joined) => emit_joined_groups(joined, False, ctx, cap),
+        qb::QueryPlan::JoinedGroupCount(joined) => emit_joined_groups(joined, True, ctx, cap),
     };
     {sql: rendered.sql, bindings: builder.bindings}
 };

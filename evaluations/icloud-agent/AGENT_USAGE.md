@@ -90,7 +90,7 @@ The Model and `transform` decide which combinations have valid business meaning.
 A graph Intent has five required fields, including empty arrays where needed:
 
 ```json
-{"op":"Graph","root":"item",
+{"op":"Graph","limit":1000,"root":"item",
  "nodes":[{"id":"item","entity":"<dataset ID>"}],
  "edges":[],
  "select":[],"count":"item"}
@@ -159,7 +159,7 @@ Use `GraphUnion` when at least two independently valid graph paths must
 return one deduplicated population of the same entity:
 
 ```text
-{"op":"GraphUnion","branches":[
+{"op":"GraphUnion","limit":1000,"branches":[
   {"result_node":"<node ID>","graph":<graph Intent>},
   {"result_node":"<node ID>","graph":<graph Intent>}
 ]}
@@ -181,7 +181,7 @@ Use `GraphPair` to aggregate two populations independently, explicitly align
 their complete identities, and choose the side of each output column.
 
 ```text
-{"op":"GraphPair","left":<Graph intent>,"right":<Graph intent>,
+{"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
  "align_by":[{"left":{"node":"d"},"right":{"node":"d"}}],
  "select":[{"side":"Right","node":"d","dimension":"device_name"}],
  "rank_by":{"op":"Subtract","minuend":"Right","subtrahend":"Left",
@@ -220,3 +220,7 @@ response is a database result. In this evaluation there is no data execution
 layer: return the receipt and your business-language interpretation of each
 planned result, not a fabricated number or SQL.
 When an execution layer is connected, present its returned data instead.
+
+The forwarding adapter sets `limit: 100` on every top-level Intent, overriding
+any supplied value. This limits final output rows independently of business
+`take` and Top-N. A result reaching 100 rows does not establish completeness.

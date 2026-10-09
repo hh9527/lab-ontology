@@ -176,6 +176,7 @@ type RawGraphTopMeasure = struct { node: String, measure: String, direction: Str
 # reads the original object to distinguish omission from explicit null.
 type RawGraphEnvelope = struct {
     op: String,
+    limit: Option(Value),
     root: String,
     nodes: Value,
     edges: Value,
@@ -212,14 +213,14 @@ type RawGraphExistEnvelope = struct {
     negated: Option(Value),
 };
 type RawCountThreshold = struct { op: String, value: Value };
-type RawGraphPair = struct { op: String, left: Value, right: Value, align_by: Option(Value), select: Option(Value), count_groups: Option(Value), rank_by: Option(Value) };
+type RawGraphPair = struct { op: String, limit: Option(Value), left: Value, right: Value, align_by: Option(Value), select: Option(Value), count_groups: Option(Value), rank_by: Option(Value) };
 type PairNode = struct { node: String };
 type PairAlignment = struct { left: PairNode, right: PairNode };
 type PairSelection = struct { side: qb::PairSide, node: String, dimension: String };
 type RawPairSubtract = struct { op: String, minuend: qb::PairSide, subtrahend: qb::PairSide, direction: String, take: Int };
 type RawPairRatio = struct { op: String, numerator: qb::PairSide, denominator: qb::PairSide, direction: String, take: Int };
 type RawPairGrowth = struct { op: String, baseline: qb::PairSide, current: qb::PairSide, direction: String, take: Int };
-type RawGraphUnion = struct { op: String, branches: Array(Value) };
+type RawGraphUnion = struct { op: String, limit: Option(Value), branches: Array(Value) };
 type RawUnionBranch = struct { result_node: String, graph: Value };
 type RawQueryRequest = struct { intents: Array(Value) };
 
@@ -709,7 +710,7 @@ def lower_graph_union: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(pay
     }
 };
 
-def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
+def lower_unlimited_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "Graph" {
@@ -722,6 +723,19 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
     } else if op == "GraphPair" { lower_graph_pair(payload, intent) }
     else if op == "GraphUnion" { lower_graph_union(payload, intent) }
     else { fail!(`unsupported intent op \{op}; use Graph, GraphPair or GraphUnion with named nodes and relations; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/intent")}`, op) }
+};
+
+# Validate before business lowering so missing/invalid caps retain their origin.
+# Int is signed 64-bit; no product cap or Top-N cap applies here.
+def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
+    let obj = as_object(intent);
+    let limit = match field(obj, "limit") {
+        Value::Int(n) => if n > 0 { n } else { fail!("intent limit must be a positive integer (1..9223372036854775807)", field(obj, "limit")) },
+        value => fail!("intent limit must be a positive integer (1..9223372036854775807)", value),
+    };
+    let ast = lower_unlimited_intent_ast(payload, intent);
+    let bound = qb::bind(ast.ctx, qb::Val::Int(limit));
+    {...ast, ctx: bound.0, result_limit: Some(bound.1)}
 };
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;

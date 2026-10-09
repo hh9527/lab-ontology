@@ -4,7 +4,7 @@ GraphPair independently aggregates two populations, inner joins their complete
 identities, and chooses the source side of each display column.
 
 ```text
-{"op":"GraphPair","left":<Graph intent>,"right":<Graph intent>,
+{"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
  "align_by":[{"left":{"node":"previous_device"},"right":{"node":"current_device"}}],
  "select":[{"side":"Left","node":"previous_device","dimension":"device_name"},
            {"side":"Right","node":"current_device","dimension":"device_name"}],

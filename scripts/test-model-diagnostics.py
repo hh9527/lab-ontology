@@ -53,7 +53,7 @@ for item in records:
         assert [source_text(loc, item) for loc in authored] == ["0", "0"], item
     else:
         authored = [loc for loc in subjects if loc["source"].startswith("@test-ctx/")]
-        expected_text = {("limit", (0,)): "-1", ("offset", (0,)): "-1", ("missing_field", (0,)): "{}"}
+        expected_text = {("limit", (0,)): "-1", ("offset", (0,)): "-1", ("missing_field", (0,)): '{"limit":1000}'}
         assert [source_text(loc, item) for loc in authored] == [expected_text[key]], item
     seen.add(key)
 assert seen == expected.keys(), (seen, expected.keys())

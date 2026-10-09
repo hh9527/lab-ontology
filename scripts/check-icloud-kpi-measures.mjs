@@ -51,7 +51,7 @@ try {
       : [['', 'Avg', 20], ['_max', 'Max', 30], ['_min', 'Min', 10]];
     const measures = fields.flatMap(([, base]) => statistics.map(([suffix]) => base + suffix));
     const intent = {
-      op: 'Graph', root: 'k', nodes: [{ id: 'k', entity }], edges: [], select: [],
+      op: 'Graph', limit: 1000, root: 'k', nodes: [{ id: 'k', entity }], edges: [], select: [],
       measures: measures.map(measure => ({ node: 'k', measure })),
       time_windows: [{ node: 'k', dimension: time, start: '2026-10-02T00:00:00Z', end: '2026-10-03T00:00:00Z' }],
     };
@@ -105,7 +105,7 @@ try {
 
   db.exec('CREATE TABLE T_CURRENT_ALARM(CSN INTEGER, CLEARED INTEGER)');
   db.exec('INSERT INTO T_CURRENT_ALARM VALUES (1,0),(2,1),(3,NULL),(4,0)');
-  const alarms = await request('transform', { intents: [{ op: 'Graph', root: 'a',
+  const alarms = await request('transform', { intents: [{ op: 'Graph', limit: 1000, root: 'a',
     nodes: [{ id: 'a', entity: 'current_alarm' }], edges: [], select: [],
     measures: [{ node: 'a', measure: 'alarm_count' }, { node: 'a', measure: 'alarm_open_count' }],
   }] });
@@ -122,7 +122,7 @@ try {
   }
   db.exec('CREATE TABLE HuaweiStorageDevice(id TEXT, name TEXT)');
   db.exec("INSERT INTO HuaweiStorageDevice VALUES ('s1','Storage-DC1-A'),('s2','Other')");
-  const named = await request('transform', { intents: [{ op: 'Graph', root: 's',
+  const named = await request('transform', { intents: [{ op: 'Graph', limit: 1000, root: 's',
     nodes: [{ id: 's', entity: 'storage_device' }], edges: [],
     select: [{ node: 's', dimension: 'storage_device__name' }],
     filters: [{ node: 's', dimension: 'storage_device__name', op: 'Contains', value: 'storage' }],
