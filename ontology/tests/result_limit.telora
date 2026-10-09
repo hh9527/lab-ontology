@@ -89,24 +89,58 @@ def fixtures: Array(Fixture) = [
     {name: "union", intent: union},
     {name: "empty", intent: patch(plain, {filters: parse(r#"[{"node":"o","dimension":"id","op":"Eq","value":-1}]"#)})},
 ];
-type RuntimeCase = struct { name: String, limit: Int, sqlite: qb::Query, postgres: qb::Query };
+type RuntimeCase = struct { name: String, mode: String, limit: Option(Int), sqlite: qb::Query, postgres: qb::Query };
+type LimitCase = struct { mode: String, limit: Option(Int) };
+def limit_cases: Array(LimitCase) = array::concat([
+    [{mode: "omitted", limit: None}, {mode: "null", limit: None}],
+    array::map([1, 2, 3, 100, 101, 1001, 9223372036854775807], fn(value) {
+        {mode: "explicit", limit: Some(value)}.ty!(LimitCase)
+    }),
+]);
 pub def execution_queries: Value = codec::encode(array::flat_map(fixtures, fn(item) {
-    array::map([1, 2, 3, 100, 101, 1001, 9223372036854775807], fn(limit) {
-        let ast = lower(patch(item.intent, {limit: Value::Int(limit)}));
-        {name: item.name, limit, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}.ty!(RuntimeCase)
+    array::map(limit_cases, fn(cap) {
+        let input = if cap.mode == "omitted" { item.intent }
+            else { patch(item.intent, {limit: match cap.limit { None => Value::None, Some(value) => Value::Int(value) }}) };
+        let ast = lower(input);
+        {name: item.name, mode: cap.mode, limit: cap.limit, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}.ty!(RuntimeCase)
     })
 }));
 pub def illegal_limits_are_rejected_for_every_top_level_op: test::Test = test::should_ok(fn() {
-    array::all(["Graph", "GraphPair", "GraphUnion"], fn(op) {
-        array::all([Value::None, Value::Int(0), Value::Int(-1), Value::Float(1.5), Value::Float(1.0), Value::String("1"), Value::True, Value::False], fn(value) {
+    if array::all(["Graph", "GraphPair", "GraphUnion"], fn(op) {
+        array::all([Value::Int(0), Value::Int(-1), Value::Float(1.5), Value::Float(1.0), Value::String("1"), Value::True, Value::False], fn(value) {
             match diagnostics::with_diagnostics(lower)(Value::Object({op: Value::String(op), limit: value})) {
                 Err(reports) => array::any(reports, fn(report) { string::contains(report.message, "limit") }),
                 _ => False,
             }
         })
-    })
+    }) { True } else { fail!("an illegal limit was accepted or lost its diagnostic") }
 });
-pub def missing_limit_is_rejected: test::Test = test::should_fail_with(fn() { lower(plain) }, "limit");
+pub def omitted_limit_preserves_all_query_shapes: test::Test = test::should_ok(fn() {
+    if array::all(fixtures, fn(item) {
+        let ast = lower(item.intent);
+        let sq = sqlite::build_query(ast);
+        let pg = postgres::build_query(ast);
+        ast.result_limit == None && sq.bindings == ast.ctx.bindings && pg.bindings == ast.ctx.bindings
+    }) { True } else { fail!("omission added a cap or binding") }
+});
+pub def omitted_limit_keeps_legacy_sql_and_bindings: test::Test = test::should_ok(fn() {
+    let ast = lower(plain);
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.sql == "SELECT o.id AS o_id FROM owners AS o ORDER BY o.id ASC"
+        && pg.sql == "SELECT \"o\".\"id\" AS \"o_id\" FROM \"owners\" AS \"o\" ORDER BY \"o\".\"id\" ASC NULLS FIRST"
+        && sq.bindings == [] && pg.bindings == [] { True }
+    else { fail!("legacy SQL or bindings changed", sq, pg) }
+});
+pub def null_limit_is_identical_to_omission: test::Test = test::should_ok(fn() {
+    if array::all(fixtures, fn(item) {
+        let absent = lower(item.intent);
+        let null_limit = lower(patch(item.intent, {limit: Value::None}));
+        null_limit.result_limit == None
+            && sqlite::build_query(null_limit) == sqlite::build_query(absent)
+            && postgres::build_query(null_limit) == postgres::build_query(absent)
+    }) { True } else { fail!("null changed legacy SQL or bindings") }
+});
 pub def signed_64_bit_max_is_supported: test::Test = test::should_ok(fn() {
     let query = sqlite::build_query(lower(patch(plain, {limit: Value::Int(9223372036854775807)})));
     if query.bindings == [qb::Val::Int(9223372036854775807)] { True } else { fail!("limit was capped", query) }
@@ -120,7 +154,7 @@ pub def mixed_batch_preserves_diagnostic_indices: test::Test = test::should_ok(f
             match dict::get(obj, "diagnostics") {
                 Some(Value::Array(items)) => if array::map(items, fn(item) {
                     match item { Value::Object(entry) => dict::get(entry, "index"), _ => None }
-                }) == [Some(Value::Int(1)), Some(Value::Int(2)), Some(Value::Int(4))] { True } else { fail!("wrong diagnostic indices", items) },
+                }) == [Some(Value::Int(2)), Some(Value::Int(4))] { True } else { fail!("wrong diagnostic indices", items) },
                 _ => fail!("missing diagnostics", response),
             }
         } else { fail!("invalid batch response", response) },
@@ -176,4 +210,18 @@ pub def forged_output_cap_is_rejected_by_both_dialects: test::Test = test::shoul
             _ => False,
         }
     }) { True } else { fail!("a renderer accepted an invalid output cap") }
+});
+
+pub def mixed_optional_and_explicit_batch_is_accepted: test::Test = test::should_ok(fn() {
+    let response = intent::query_request_method_factory(payload, sqlite::build_query)(Value::Object({intents: Value::Array([
+        plain, patch(plain, {limit: Value::Int(101)}), patch(pair, {limit: Value::None}), union])}));
+    match response {
+        Value::Object(obj) => if dict::get(obj, "accepted") == Some(Value::True) {
+            match dict::get(obj, "queries") {
+                Some(Value::Array(items)) => if array::length(items) == 4 { True } else { fail!("missing queries", items) },
+                _ => fail!("missing queries", response),
+            }
+        } else { fail!("mixed optional batch rejected", response) },
+        _ => fail!("invalid response", response),
+    }
 });

@@ -15,7 +15,7 @@ try {
     select: [{ node: 'd', dimension: 'device_name' }] };
   await withKnowledgeRunner(artifact, async (_, request) => {
     const schema = (await request('ic/info', { key: 'Schema/syntax/intent' })).Document.Found;
-    assert.match(JSON.stringify(schema), /required limit/);
+    assert.match(JSON.stringify(schema), /optional limit/);
     for (const limit of [1, 100, 101]) {
       const batch = await request('ic/transform', { intents: [{ ...graph, limit }] });
       assert.equal(batch.accepted, true, JSON.stringify(batch.diagnostics));
@@ -29,15 +29,22 @@ try {
     ] });
     assert.equal(invalid.accepted, false);
     assert.equal(invalid.queries, null);
-    assert.deepEqual(invalid.diagnostics.map(item => item.index), [1, 2, 4]);
+    assert.deepEqual(invalid.diagnostics.map(item => item.index), [4]);
     assert.ok(invalid.diagnostics.every(item => item.diagnostic.message.includes('limit')));
     assert.ok(invalid.diagnostics.every(item => item.diagnostic.locs.length >= 2));
+    const legacy = await request('ic/transform', { intents: [graph, { ...graph, limit: null }] });
+    assert.equal(legacy.accepted, true);
+    assert.equal(legacy.queries.length, 2);
+    assert.deepEqual(legacy.queries[1], legacy.queries[0]);
+    assert.deepEqual(legacy.queries[0].bindings, []);
+    assert.doesNotMatch(legacy.queries[0].sql, /LIMIT/);
+    assert.equal(database.prepare(legacy.queries[0].sql).all().length, 130);
     const forwarded = withOutputLimit({ intents: [{ ...graph, limit: 101 }] });
     const capped = await request('ic/transform', forwarded);
     assert.equal(capped.accepted, true);
     const query = capped.queries[0];
     assert.equal(database.prepare(query.sql).all(...query.bindings).length, OUTPUT_ROW_LIMIT);
-    console.log('Published snapshot: syntax, 1/100/101 rows, mixed-batch origins and plugin-enforced output cap passed.');
+    console.log('Published snapshot: syntax, omitted/null/1/100/101 rows, mixed-batch origins and plugin-enforced output cap passed.');
   });
 } finally {
   database.close();

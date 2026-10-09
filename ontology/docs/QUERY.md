@@ -59,8 +59,9 @@ unfinished `Ctx` nor `Plan` crosses the renderer boundary. The AST cannot
 contain raw SQL, arbitrary functions, or literal fragments.
 
 `QueryAst.result_limit` is an optional allocated positive integer binding for the
-final output cap. Public Intent lowering always supplies it; `finish` leaves it
-absent for low-level QueryBuilder callers. It is independent of `Plan.limit`,
+final output cap. Public Intent lowering supplies it only when `limit` is
+a positive integer; omission, null and `finish` leave it absent, preserving QueryBuilder
+behavior. It is independent of `Plan.limit`,
 partition `take`, joined-group rank `take`, and business profile permissions.
 Both renderers validate its binding and apply it only to the final result SELECT.
 An existing final business limit combines with it using the smaller bound while

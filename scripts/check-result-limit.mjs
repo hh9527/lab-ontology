@@ -39,7 +39,7 @@ try {
     }
   }
   const full = new Map();
-  for (const item of cases.filter(item => item.limit === 1001)) {
+  for (const item of cases.filter(item => item.mode === 'omitted')) {
     full.set(item.name, plain(sqlite.prepare(item.sqlite.sql).all(...item.sqlite.bindings)));
   }
   const ordered = new Set(['plain', 'top', 'aggregate_top', 'partitioned', 'ranked_pair']);
@@ -47,13 +47,19 @@ try {
     const sq = plain(sqlite.prepare(item.sqlite.sql).all(...item.sqlite.bindings));
     const pg = plain((await postgres.query(item.postgres.sql, item.postgres.bindings)).rows);
     assert.deepEqual(item.sqlite.bindings, item.postgres.bindings);
-    assert.equal(item.sqlite.bindings.at(-1), item.limit);
-    assert.match(item.sqlite.sql, /LIMIT (?:CASE WHEN )?\?\d/);
-    assert.match(item.postgres.sql, /LIMIT (?:CASE WHEN CAST\()?\$\d/);
-    assert.equal(sq.length, Math.min(full.get(item.name).length, Number(item.limit)), item.name);
+    if (item.limit !== null) {
+      assert.equal(item.sqlite.bindings.at(-1), item.limit);
+      assert.match(item.sqlite.sql, /LIMIT (?:CASE WHEN )?\?\d/);
+      assert.match(item.postgres.sql, /LIMIT (?:CASE WHEN CAST\()?\$\d/);
+    } else if (item.name === 'plain') {
+      assert.equal(item.sqlite.bindings.length, 0);
+      assert.doesNotMatch(item.sqlite.sql, /LIMIT/);
+      assert.doesNotMatch(item.postgres.sql, /LIMIT/);
+    }
+    assert.equal(sq.length, Math.min(full.get(item.name).length, (item.limit === null ? Infinity : Number(item.limit))), item.name);
     assert.equal(pg.length, sq.length, item.name);
     if (ordered.has(item.name)) {
-      assert.deepEqual(sq, full.get(item.name).slice(0, Number(item.limit)), `${item.name}: preserve ordered prefix`);
+      assert.deepEqual(sq, full.get(item.name).slice(0, (item.limit === null ? Infinity : Number(item.limit))), `${item.name}: preserve ordered prefix`);
       assert.deepEqual(pg, sq, `${item.name}: dialect parity`);
     } else if (sq.length === full.get(item.name).length) {
       assert.deepEqual(normalized(pg), normalized(sq), `${item.name}: dialect parity`);
@@ -82,7 +88,7 @@ try {
   assert.equal(full.get('union').length, 130, 'union before limit');
   assert.equal(full.get('partitioned').length, 260, 'per-owner Top-N before limit');
   assert.equal(cases.find(item => item.name === 'plain' && item.limit === 101).limit, 101);
-  console.log(`Final output limit: ${cases.length} SQLite/PostgreSQL execution cases passed (1/2/3/100/101/1001/INT64_MAX; detail, aggregate/Latest, DISTINCT, Top-N, partitioned Top-N, pair/rank/count, union, empty and exact-cap results).`);
+  console.log(`Optional final output limit: ${cases.length} SQLite/PostgreSQL execution cases passed (omitted/null/1/2/3/100/101/1001/INT64_MAX; detail, aggregate/Latest, DISTINCT, Top-N, partitioned Top-N, pair/rank/count, union, empty and exact-cap results).`);
 } finally {
   sqlite.close();
   await postgres.close();

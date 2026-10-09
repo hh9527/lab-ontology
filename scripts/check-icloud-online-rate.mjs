@@ -43,7 +43,7 @@ try {
     insert.run('a', '2026-10-01T00:00:00Z', 1000, 1);
   }
   const intents = cases.map(([entity, owner, relation, reverse, name, time, measure]) => ({
-    op: 'Graph', limit: 1000, root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
+    op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: owner }, { id: 'k', entity }],
     edges: [{ relation, from: reverse ? 'k' : 'd', to: reverse ? 'd' : 'k' }],
     select: [{ node: 'd', dimension: name }], group_by_identity: ['d'],
     measures: [{ node: 'k', measure }],

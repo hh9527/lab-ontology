@@ -43,7 +43,7 @@ async function transform(intent, accepted = true) {
 const start = manifest.window.start;
 const end = manifest.window.endExclusive;
 const middle = new Date((Date.parse(start) + Date.parse(end)) / 2).toISOString().replace('.000Z', 'Z');
-const pair = (left, right, node) => ({ op: 'GraphPair', limit: 1000, left, right, select: [],
+const pair = (left, right, node) => ({ op: 'GraphPair', left, right, select: [],
   align_by: [{ left: { node }, right: { node } }],
   rank_by: { op: 'GrowthRate', current: 'Right', baseline: 'Left', direction: 'Desc', take: 3 } });
 try {
@@ -52,7 +52,7 @@ try {
     ['source_StorageDeviceKPI', 'storage_cpu_usage', 'source_StorageDeviceKPI__ts'],
     ['source_PonDeviceKPI', 'pon_cpu_usage', 'source_PonDeviceKPI__ts'],
   ]) {
-    const graph = (start, end) => ({ op: 'Graph', limit: 1000, root: 'k', nodes: [{ id: 'k', entity }], edges: [], select: [],
+    const graph = (start, end) => ({ op: 'Graph', root: 'k', nodes: [{ id: 'k', entity }], edges: [], select: [],
       group_by_identity: ['k'], measures: [{ node: 'k', measure }], time_windows: [{ node: 'k', dimension, start, end }] });
     await transform(pair(graph(start, middle), graph(middle, end), 'k'), false);
     await transform(pair(graph(middle, end), graph(start, middle), 'k'), false);
@@ -74,7 +74,7 @@ try {
     assert.equal(path.detail.to_dataset, 'source_StorageDeviceKPI');
     assert.deepEqual(dataset.detail.grain, [owner === 'storage_device' ? 'id' : 'source_id']);
     assert.ok(measure.description.summary.includes(owner) && measure.description.summary.includes(relation));
-    const graph = (start, end) => ({ op: 'Graph', limit: 1000, root: 'd', nodes: [{ id: 'd', entity: dataset.detail.id }, { id: 'k', entity: path.detail.to_dataset }],
+    const graph = (start, end) => ({ op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: dataset.detail.id }, { id: 'k', entity: path.detail.to_dataset }],
       edges: [{ relation: path.detail.id, from: 'd', to: 'k' }], select: [], group_by_identity: ['d'],
       measures: [{ node: 'k', measure: measure.detail.id }],
       time_windows: [{ node: 'k', dimension: 'source_StorageDeviceKPI__ts', start, end }] });
@@ -90,7 +90,7 @@ try {
   const averageDetail = await info(`Measure/${encodeURIComponent(average.dataset)}/${encodeURIComponent(average.name)}`);
   assert.equal(averageDetail.detail.id, average.name);
   assert.deepEqual(await request('info', { key: 'terminology' }), { Document: 'NotFound' });
-  const rows = await transform({ op: 'Graph', limit: 1000, root: 'k', nodes: [{ id: 'k', entity: average.dataset }], edges: [], select: [],
+  const rows = await transform({ op: 'Graph', root: 'k', nodes: [{ id: 'k', entity: average.dataset }], edges: [], select: [],
     measures: [{ node: 'k', measure: average.name }],
     time_windows: [{ node: 'k', dimension: clock.name, start, end }] });
   assert.equal(rows.length, 1);

@@ -171,13 +171,16 @@ be wrapped in an array:
 {"method":"<domain>/transform","input":{"intents":[<Intent>, ...]}}
 ```
 
-Every top-level Intent must declare `limit`, a JSON integer from 1 through
-9,223,372,036,854,775,807 (signed 64-bit). Missing, null, boolean, string,
-fractional and nonpositive values are rejected with a diagnostic for `limit`.
+Every top-level Intent may declare `limit`, a JSON integer from 1 through
+9,223,372,036,854,775,807 (signed 64-bit). Omission or explicit null preserves existing behavior
+without adding an output cap or binding. Boolean, string,
+floating-point and nonpositive values are rejected with a diagnostic for `limit`.
 GraphPair operands and GraphUnion branches do not require it. There is no
 service product cap of 100: 101 and larger supported integers are valid.
 A forwarding plugin can inject or override this field uniformly to enforce its
-own fixed output cap without interpreting the business query.
+own fixed output cap without interpreting the business query. Middleware may
+require `limit` and perform additional validation before forwarding; the service
+does not require it from legacy callers.
 
 `limit` caps final rows after filtering, aggregation, DISTINCT, ranking,
 partitioned Top-N, pairing and set operations. Business `take` continues to
@@ -227,8 +230,8 @@ deploy a rebuilt snapshot and discover the current types through `info`.
 
 ### Graph Intent syntax
 
-A top-level Graph Intent has six required fields, including `limit` and empty
-arrays where needed:
+A Graph Intent has five required fields, including empty arrays where needed.
+The optional top-level `limit` below adds a final output cap:
 
 ```json
 {"op":"Graph","limit":1000,"root":"item",
@@ -265,7 +268,7 @@ Optional top-level graph fields and their shapes:
 | `group_by_identity` | Array of node instance ID strings |
 | `row_grain` | `"Root"` or `"Association"` |
 | `order_by` | Array of `{"node":"...","dimension":"...","direction":"Asc|Desc"}` |
-| `limit` | Required on top-level Intent only; positive signed 64-bit integer; final output cap |
+| `limit` | Optional on top-level Intent only; positive signed 64-bit integer; final output cap |
 | `take` | Integer |
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |

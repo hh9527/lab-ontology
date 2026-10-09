@@ -29,7 +29,7 @@ def main():
     keys = list(dict.fromkeys(keys))
     requests = [{"method": "ic/info", "input": {"key": key}} for key in keys]
     graph = {
-        "op": "Graph","limit":1000, "root": "alarm",
+        "op": "Graph", "root": "alarm",
         "nodes": [{"id": "alarm", "entity": "current_alarm"}],
         "edges": [], "select": [], "count": "alarm",
         "time_windows": [{"node": "alarm", "dimension": "alarm_occur_utc_raw",
@@ -39,7 +39,7 @@ def main():
     }
     requests.append({"method": "ic/transform", "input": {"intents": [graph]}})
     device = {
-        "op": "Graph","limit":1000, "root": "device",
+        "op": "Graph", "root": "device",
         "nodes": [{"id": "device", "entity": "device"}], "edges": [],
         "select": [{"node": "device", "dimension": "device_class"}], "count": "device",
     }
@@ -49,7 +49,7 @@ def main():
     ]}
     requests.append({"method": "ic/transform", "input": {"intents": [device, exact_unknown]}})
     def search(dimension, op, value):
-        return {"op": "Graph","limit":1000, "root": "device",
+        return {"op": "Graph", "root": "device",
                 "nodes": [{"id": "device", "entity": "device"}], "edges": [],
                 "select": [{"node": "device", "dimension": dimension}],
                 "filters": [{"node": "device", "dimension": dimension, "op": op, "value": value}]}
