@@ -80,7 +80,7 @@ The product model publishes these measure IDs:
 
 ```json
 {
-  "op": "Graph",
+  "op": "Graph","limit":1000,
   "root": "d",
   "nodes": [
     {"id": "d", "entity": "device"},

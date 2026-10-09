@@ -1,0 +1,227 @@
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::dict as dict;
+use std::diagnostics as diagnostics;
+use std::string as string;
+use std::json as json;
+use std::test as test;
+use std::value::{ Value };
+
+@edsl::entity_id("owner")
+@edsl::entity_source("owners", "o")
+type Owner = struct {
+    @edsl::column("id") @edsl::key()
+    @edsl::dimension("id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Int])
+    id: Int,
+    @edsl::column("label")
+    @edsl::dimension("label", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Text])
+    label: String,
+};
+@edsl::entity_id("sample")
+@edsl::entity_source("samples", "s")
+@edsl::dataset(edsl::DatasetKind::Metric, ["id"], Some("ts"))
+@edsl::named_relation_key("sample_owner", Owner.type,
+    {from: edsl::Cardinality::Many0, to: edsl::Cardinality::One},
+    edsl::DeclaredRelationKey::FieldEq({from: "owner", to: "id"}))
+type Sample = struct {
+    @edsl::column("id") @edsl::key()
+    id: Int,
+    @edsl::column("owner")
+    owner: Int,
+    @edsl::column("ts")
+    @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
+    ts: Int,
+    @edsl::column("value")
+    @edsl::dimension("value", True, True, [edsl::FilterOp::Gt], [edsl::FilterInputKind::Int])
+    @edsl::sample_measure("mean", qb::AggregateFunction::Avg, Some("units"))
+    value: Int,
+    @edsl::column("value")
+    @edsl::sample_measure("latest", qb::AggregateFunction::Latest, Some("units"))
+    latest: Int,
+};
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter, qb::Operator::Join,
+        qb::Operator::Group, qb::Operator::Aggregate, qb::Operator::Having, qb::Operator::Order,
+        qb::Operator::Limit, qb::Operator::Partition],
+    allowed_join_kinds: [qb::JoinKind::Inner],
+    allowed_aggregates: [qb::AggregateFunction::Avg, qb::AggregateFunction::Count, qb::AggregateFunction::Latest],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Gt, qb::ScalarFunction::And,
+        qb::ScalarFunction::Sub, qb::ScalarFunction::IsNotNull],
+    allow_distinct: True,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("result-limit-v1", [Owner.type, Sample.type], profile);
+def lower: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
+def parse: Fn(String) -> Value = fn(text) { json::parse(text).unwrap!() };
+def patch: Fn(Value, Dict(Value)) -> Value = fn(value, changes) {
+    match value { Value::Object(obj) => Value::Object(dict::merge(obj, changes)), _ => fail!("expected object") }
+};
+def plain: Value = parse(r#"{"op":"Graph","root":"o","nodes":[{"id":"o","entity":"owner"}],"edges":[],"select":[{"node":"o","dimension":"id"}],"order_by":[{"node":"o","dimension":"id","direction":"Asc"}]}"#);
+def operand: Value = parse(r#"{"op":"Graph","root":"o","nodes":[{"id":"o","entity":"owner"},{"id":"s","entity":"sample"}],"edges":[{"relation":"sample_owner","from":"s","to":"o"}],"select":[],"group_by_identity":["o"],"measures":[{"node":"s","measure":"mean"}]}"#);
+def aggregate: Value = patch(operand, {select: parse(r#"[{"node":"o","dimension":"id"}]"#)});
+def pair: Value = Value::Object({op: Value::String("GraphPair"), left: operand,
+    right: patch(operand, {filters: parse(r#"[{"node":"s","dimension":"value","op":"Gt","value":50}]"#)}),
+    align_by: parse(r#"[{"left":{"node":"o"},"right":{"node":"o"}}]"#),
+    select: parse(r#"[{"side":"Left","node":"o","dimension":"id"}]"#)});
+def union_branch: Value = patch(plain, {order_by: Value::Array([])});
+def union: Value = Value::Object({op: Value::String("GraphUnion"), branches: Value::Array([
+    Value::Object({result_node: Value::String("o"), graph: union_branch}),
+    Value::Object({result_node: Value::String("o"), graph: union_branch})])});
+def partitioned: Value = parse(r#"{"op":"Graph","root":"o","nodes":[{"id":"o","entity":"owner"},{"id":"s","entity":"sample"}],"edges":[{"relation":"sample_owner","from":"s","to":"o"}],"select":[{"node":"o","dimension":"id"},{"node":"s","dimension":"value"}],"top_per":{"owner":"o","sample":"s","rank":"value","take":2}}"#);
+type Fixture = struct { name: String, intent: Value };
+def fixtures: Array(Fixture) = [
+    {name: "plain", intent: plain},
+    {name: "aggregate", intent: aggregate},
+    {name: "latest", intent: patch(aggregate, {measures: parse(r#"[{"node":"s","measure":"mean"},{"node":"s","measure":"latest"}]"#)})},
+    {name: "distinct", intent: parse(r#"{"op":"Graph","root":"o","nodes":[{"id":"o","entity":"owner"}],"edges":[],"select":[{"node":"o","dimension":"label"}],"distinct":true}"#)},
+    {name: "top", intent: patch(plain, {take: Value::Int(3)})},
+    {name: "aggregate_top", intent: patch(aggregate, {group_by_identity: Value::Array([]), top_by_measure: parse(r#"{"node":"s","measure":"mean","direction":"Desc","take":3}"#)})},
+    {name: "partitioned", intent: partitioned},
+    {name: "pair", intent: pair},
+    {name: "ranked_pair", intent: patch(pair, {rank_by: parse(r#"{"op":"Subtract","minuend":"Right","subtrahend":"Left","direction":"Desc","take":3}"#)})},
+    {name: "pair_count", intent: patch(pair, {count_groups: Value::True})},
+    {name: "group_count", intent: patch(aggregate, {count_groups: Value::True, measure_having: parse(r#"[{"node":"s","measure":"mean","op":"Gt","value":0}]"#)})},
+    {name: "union", intent: union},
+    {name: "empty", intent: patch(plain, {filters: parse(r#"[{"node":"o","dimension":"id","op":"Eq","value":-1}]"#)})},
+];
+type RuntimeCase = struct { name: String, mode: String, limit: Option(Int), sqlite: qb::Query, postgres: qb::Query };
+type LimitCase = struct { mode: String, limit: Option(Int) };
+def limit_cases: Array(LimitCase) = array::concat([
+    [{mode: "omitted", limit: None}, {mode: "null", limit: None}],
+    array::map([1, 2, 3, 100, 101, 1001, 9223372036854775807], fn(value) {
+        {mode: "explicit", limit: Some(value)}.ty!(LimitCase)
+    }),
+]);
+pub def execution_queries: Value = codec::encode(array::flat_map(fixtures, fn(item) {
+    array::map(limit_cases, fn(cap) {
+        let input = if cap.mode == "omitted" { item.intent }
+            else { patch(item.intent, {limit: match cap.limit { None => Value::None, Some(value) => Value::Int(value) }}) };
+        let ast = lower(input);
+        {name: item.name, mode: cap.mode, limit: cap.limit, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}.ty!(RuntimeCase)
+    })
+}));
+pub def illegal_limits_are_rejected_for_every_top_level_op: test::Test = test::should_ok(fn() {
+    if array::all(["Graph", "GraphPair", "GraphUnion"], fn(op) {
+        array::all([Value::Int(0), Value::Int(-1), Value::Float(1.5), Value::Float(1.0), Value::String("1"), Value::True, Value::False], fn(value) {
+            match diagnostics::with_diagnostics(lower)(Value::Object({op: Value::String(op), limit: value})) {
+                Err(reports) => array::any(reports, fn(report) { string::contains(report.message, "limit") }),
+                _ => False,
+            }
+        })
+    }) { True } else { fail!("an illegal limit was accepted or lost its diagnostic") }
+});
+pub def omitted_limit_preserves_all_query_shapes: test::Test = test::should_ok(fn() {
+    if array::all(fixtures, fn(item) {
+        let ast = lower(item.intent);
+        let sq = sqlite::build_query(ast);
+        let pg = postgres::build_query(ast);
+        ast.result_limit == None && sq.bindings == ast.ctx.bindings && pg.bindings == ast.ctx.bindings
+    }) { True } else { fail!("omission added a cap or binding") }
+});
+pub def omitted_limit_keeps_legacy_sql_and_bindings: test::Test = test::should_ok(fn() {
+    let ast = lower(plain);
+    let sq = sqlite::build_query(ast);
+    let pg = postgres::build_query(ast);
+    if sq.sql == "SELECT o.id AS o_id FROM owners AS o ORDER BY o.id ASC"
+        && pg.sql == "SELECT \"o\".\"id\" AS \"o_id\" FROM \"owners\" AS \"o\" ORDER BY \"o\".\"id\" ASC NULLS FIRST"
+        && sq.bindings == [] && pg.bindings == [] { True }
+    else { fail!("legacy SQL or bindings changed", sq, pg) }
+});
+pub def null_limit_is_identical_to_omission: test::Test = test::should_ok(fn() {
+    if array::all(fixtures, fn(item) {
+        let absent = lower(item.intent);
+        let null_limit = lower(patch(item.intent, {limit: Value::None}));
+        null_limit.result_limit == None
+            && sqlite::build_query(null_limit) == sqlite::build_query(absent)
+            && postgres::build_query(null_limit) == postgres::build_query(absent)
+    }) { True } else { fail!("null changed legacy SQL or bindings") }
+});
+pub def signed_64_bit_max_is_supported: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(lower(patch(plain, {limit: Value::Int(9223372036854775807)})));
+    if query.bindings == [qb::Val::Int(9223372036854775807)] { True } else { fail!("limit was capped", query) }
+});
+pub def mixed_batch_preserves_diagnostic_indices: test::Test = test::should_ok(fn() {
+    let response = intent::query_request_method_factory(payload, sqlite::build_query)(Value::Object({intents: Value::Array([
+        patch(plain, {limit: Value::Int(1)}), plain, patch(pair, {limit: Value::Int(0)}),
+        patch(union, {limit: Value::Int(101)}), patch(plain, {limit: Value::String("1")})])}));
+    match response {
+        Value::Object(obj) => if dict::get(obj, "accepted") == Some(Value::False) && dict::get(obj, "queries") == Some(Value::None) {
+            match dict::get(obj, "diagnostics") {
+                Some(Value::Array(items)) => if array::map(items, fn(item) {
+                    match item { Value::Object(entry) => dict::get(entry, "index"), _ => None }
+                }) == [Some(Value::Int(2)), Some(Value::Int(4))] { True } else { fail!("wrong diagnostic indices", items) },
+                _ => fail!("missing diagnostics", response),
+            }
+        } else { fail!("invalid batch response", response) },
+        _ => fail!("invalid response", response),
+    }
+});
+
+pub def invalid_limits_keep_request_origins: test::Test = test::with_fixtures(
+    ["fixtures/result-limit-invalid.json"], fn(input) { test::should_ok(fn() {
+        let response = intent::query_request_method_factory(payload, sqlite::build_query)(input);
+        let reports = match response {
+            Value::Object(obj) => match dict::get(obj, "diagnostics") {
+                Some(Value::Array(items)) => items,
+                _ => fail!("missing diagnostics", response),
+            },
+            _ => fail!("invalid response", response),
+        };
+        if array::length(reports) == 5 && array::all(array::enumerate(reports), fn(entry) {
+            match entry.1 {
+                Value::Object(item) => match dict::get(item, "diagnostic") {
+                    Some(value) => {
+                        let report = codec::decode@[diagnostics::Diagnostic](value).unwrap!();
+                        dict::get(item, "index") == Some(Value::Int(entry.0))
+                            && string::contains(report.message, "limit")
+                            && array::any(report.locs, fn(loc) {
+                                string::contains(loc.source, "@test-ctx/")
+                                    && loc.start.line == entry.0 + 3 && loc.start.offset < loc.end.offset
+                            })
+                    },
+                    _ => False,
+                },
+                _ => False,
+            }
+        }) { True } else { fail!("limit diagnostics lost indexed input origins", response) }
+    }) });
+
+pub def output_cap_is_independent_of_business_profile_limit: test::Test = test::should_ok(fn() {
+    let restricted = edsl::build_root("no-business-limit", [Owner.type, Sample.type],
+        {...profile, allowed_operators: array::filter(profile.allowed_operators, fn(op) { op != qb::Operator::Limit })});
+    let ast = intent::query_intent_ast_factory(restricted)(patch(plain,
+        {limit: Value::Int(101), order_by: Value::Array([])}));
+    if sqlite::build_query(ast).bindings == [qb::Val::Int(101)]
+        && postgres::build_query(ast).bindings == [qb::Val::Int(101)] { True }
+    else { fail!("output limit incorrectly depends on business capabilities") }
+});
+
+pub def forged_output_cap_is_rejected_by_both_dialects: test::Test = test::should_ok(fn() {
+    let ast = lower(patch(plain, {limit: Value::Int(1)}));
+    if array::all([qb::Val::Int(0), qb::Val::Int(-1), qb::Val::Float(1.5), qb::Val::String("1"), qb::Val::None], fn(value) {
+        let forged = {...ast, ctx: {...ast.ctx, bindings: [value]}};
+        match (diagnostics::with_diagnostics(sqlite::build_query)(forged), diagnostics::with_diagnostics(postgres::build_query)(forged)) {
+            (Err(_), Err(_)) => True,
+            _ => False,
+        }
+    }) { True } else { fail!("a renderer accepted an invalid output cap") }
+});
+
+pub def mixed_optional_and_explicit_batch_is_accepted: test::Test = test::should_ok(fn() {
+    let response = intent::query_request_method_factory(payload, sqlite::build_query)(Value::Object({intents: Value::Array([
+        plain, patch(plain, {limit: Value::Int(101)}), patch(pair, {limit: Value::None}), union])}));
+    match response {
+        Value::Object(obj) => if dict::get(obj, "accepted") == Some(Value::True) {
+            match dict::get(obj, "queries") {
+                Some(Value::Array(items)) => if array::length(items) == 4 { True } else { fail!("missing queries", items) },
+                _ => fail!("missing queries", response),
+            }
+        } else { fail!("mixed optional batch rejected", response) },
+        _ => fail!("invalid response", response),
+    }
+});

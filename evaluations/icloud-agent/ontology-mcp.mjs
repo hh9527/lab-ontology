@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { transformResults } from './ontology-transform-receipt.mjs';
+import { withOutputLimit } from './ontology-output-limit.mjs';
 
 const runnerPath = process.env.ONTOLOGY_EVAL_RUNNER;
 const artifactPath = process.env.ONTOLOGY_EVAL_ARTIFACT;
@@ -28,7 +29,7 @@ const tools = [
   },
   {
     name: 'transform',
-    description: 'Validate and store one to five independent Model-backed Intents; return a grouped receipt and indexed diagnostics.',
+    description: 'Validate and store one to five independent Model-backed Intents; return a grouped receipt and indexed diagnostics. The adapter enforces a final output cap of 100 rows per Intent.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -116,8 +117,9 @@ async function handle(message) {
       }
       try {
         if (name === 'transform') {
-          const result = await callService(name, input);
-          return reply(id, transformResults(result, input.intents, outputDir));
+          const forwarded = withOutputLimit(input);
+          const result = await callService(name, forwarded);
+          return reply(id, transformResults(result, forwarded.intents, outputDir));
         }
         const result = await callService(name, input);
         return reply(id, {

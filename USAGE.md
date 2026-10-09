@@ -171,6 +171,29 @@ be wrapped in an array:
 {"method":"<domain>/transform","input":{"intents":[<Intent>, ...]}}
 ```
 
+Every top-level Intent may declare `limit`, a JSON integer from 1 through
+9,223,372,036,854,775,807 (signed 64-bit). Omission or explicit null preserves existing behavior
+without adding an output cap or binding. Boolean, string,
+floating-point and nonpositive values are rejected with a diagnostic for `limit`.
+GraphPair operands and GraphUnion branches do not require it. There is no
+service product cap of 100: 101 and larger supported integers are valid.
+A forwarding plugin can inject or override this field uniformly to enforce its
+own fixed output cap without interpreting the business query. Middleware may
+require `limit` and perform additional validation before forwarding; the service
+does not require it from legacy callers.
+
+`limit` caps final rows after filtering, aggregation, DISTINCT, ranking,
+partitioned Top-N, pairing and set operations. Business `take` continues to
+select its population; when both constrain the same final ordered rows, the
+SQL uses the smaller bound. Partitioned Top-N runs before the global output cap.
+The cap is a SQL binding, not client-side slicing. Existing ordering is retained;
+without ordering, no particular subset or stable pagination is promised.
+`transform` returns complete SQL and bindings, not database rows. The execution
+layer must return every resulting row, including empty results and results
+exactly at the cap; any additional execution-layer truncation must be disclosed.
+No total count or `hasMore` is computed. Reaching the cap does not establish
+that the result covers the entire population.
+
 The response has `accepted`, `diagnostics`, and `queries`. Each diagnostic
 entry has a zero-based `index` identifying its Intent and a `diagnostic`
 containing `severity`, `message`, and ordered `locs`. For lowering failures
@@ -207,10 +230,11 @@ deploy a rebuilt snapshot and discover the current types through `info`.
 
 ### Graph Intent syntax
 
-A graph Intent has five required fields, including empty arrays where needed:
+A Graph Intent has five required fields, including empty arrays where needed.
+The optional top-level `limit` below adds a final output cap:
 
 ```json
-{"op":"Graph","root":"item",
+{"op":"Graph","limit":1000,"root":"item",
  "nodes":[{"id":"item","entity":"<dataset ID>"}],
  "edges":[],
  "select":[],"count":"item"}
@@ -244,6 +268,7 @@ Optional top-level graph fields and their shapes:
 | `group_by_identity` | Array of node instance ID strings |
 | `row_grain` | `"Root"` or `"Association"` |
 | `order_by` | Array of `{"node":"...","dimension":"...","direction":"Asc|Desc"}` |
+| `limit` | Optional on top-level Intent only; positive signed 64-bit integer; final output cap |
 | `take` | Integer |
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |
@@ -301,7 +326,7 @@ Use `GraphUnion` when two or more independently valid graph paths must return on
 deduplicated population of the same entity:
 
 ```text
-{"op":"GraphUnion","branches":[
+{"op":"GraphUnion","limit":1000,"branches":[
   {"result_node":"<node ID>","graph":<graph Intent>},
   {"result_node":"<node ID>","graph":<graph Intent>}
 ]}
@@ -330,7 +355,7 @@ Use `GraphPair` to aggregate two populations independently, explicitly align
 their complete identities, and choose the side of each output column.
 
 ```text
-{"op":"GraphPair","left":<Graph intent>,"right":<Graph intent>,
+{"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
  "align_by":[{"left":{"node":"d"},"right":{"node":"d"}}],
  "select":[{"side":"Right","node":"d","dimension":"device_name"}],
  "rank_by":{"op":"Subtract","minuend":"Right","subtrahend":"Left",
