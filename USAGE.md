@@ -175,12 +175,12 @@ Every top-level Intent may declare `limit`, a JSON integer from 1 through
 9,223,372,036,854,775,807 (signed 64-bit). Omission or explicit null preserves existing behavior
 without adding an output cap or binding. Boolean, string,
 floating-point and nonpositive values are rejected with a diagnostic for `limit`.
-GraphPair operands and GraphUnion branches do not require it. There is no
-service product cap of 100: 101 and larger supported integers are valid.
-A forwarding plugin can inject or override this field uniformly to enforce its
-own fixed output cap without interpreting the business query. Middleware may
-require `limit` and perform additional validation before forwarding; the service
-does not require it from legacy callers.
+GraphPair operands and GraphUnion branches do not require it.
+The model defines `limit` semantics and the valid integer range. External plugins
+declare and enforce their own invocation requirements and result-row limits:
+they may require `limit`, restrict its range, or inject or override it before
+forwarding. When invoking through a plugin, follow that plugin's declared
+requirements.
 
 `limit` caps final rows after filtering, aggregation, DISTINCT, ranking,
 partitioned Top-N, pairing and set operations. Business `take` continues to
