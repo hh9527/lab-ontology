@@ -1,11 +1,15 @@
 # Ontology model and lowering
 
 This is the current model-author contract for the `ontology` crate. The
-external service protocol and complete JSON Intent syntax are in
+host service protocol and JSON Intent syntax are in
 [USAGE.md](../../USAGE.md); knowledge lookup is in [KNOWLEDGE.md](KNOWLEDGE.md).
 The source of truth for declaration signatures is
 [`ontology.telora`](../src/ontology.telora), not an independently maintained
 list of decorator parameters here.
+
+Knowledge publication contains facts and declared constraints. Consumers own
+Agent-facing usage and tool examples; the versioned contracts are described in
+[KNOWLEDGE.md](KNOWLEDGE.md).
 
 ## One model, two uses
 

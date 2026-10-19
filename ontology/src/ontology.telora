@@ -109,12 +109,40 @@ def knowledge_key: Fn(KnowledgeTarget) -> String = fn(target) {
         if owner == "" || target.kind == KnowledgeKind::Relation { `\{kind}/\{id}` } else { `\{kind}/\{owner}/\{id}` }
     }
 };
+type KnowledgeAddress = struct { node: String, member: Option(String) };
+# Stable two-part identities; IDs are independently URI encoded once.
+def knowledge_role: Fn(KnowledgeKind) -> String = fn(kind) {
+    match kind {
+        KnowledgeKind::Dataset => "datasets",
+        KnowledgeKind::Field => "fields",
+        KnowledgeKind::Dimension => "dimensions",
+        KnowledgeKind::Measure => "measures",
+        KnowledgeKind::Ty => "types",
+        KnowledgeKind::Value => "values",
+        KnowledgeKind::Relation => "relations",
+        KnowledgeKind::TimeRole => "time_roles",
+        KnowledgeKind::BusinessLink => "business_links",
+        _ => "index",
+    }
+};
+def knowledge_address: Fn(KnowledgeTarget) -> KnowledgeAddress = fn(target) {
+    let role = knowledge_role(target.kind);
+    let id = uri::encode_component(target.id);
+    let owner = uri::encode_component(target.owner);
+    if target.kind == KnowledgeKind::Index { {node: "index", member: None} }
+    else if target.kind == KnowledgeKind::Dataset || target.kind == KnowledgeKind::Ty || target.kind == KnowledgeKind::Relation {
+        {node: `\{role}/\{id}`, member: None}
+    } else {
+        let root = if target.kind == KnowledgeKind::Value { "types" } else { "datasets" };
+        {node: `\{root}/\{owner}`, member: Some(`\{role}/\{id}`)}
+    }
+};
+
 def knowledge_key_hint: Fn(KnowledgeKind, String, String) -> String = fn(kind, owner, id) {
     let key: KnowledgeTarget = {kind, owner, id};
-    json::stringify(Value::String(knowledge_key(key)))
-};
-def syntax_key_hint: Fn(String) -> String = fn(id) {
-    knowledge_key_hint(KnowledgeKind::Schema, "", id)
+    let address = knowledge_address(key);
+    let ref = match address.member { Some(member) => `\{address.node}#\{member}`, None => address.node };
+    json::stringify(Value::String(ref))
 };
 type KnowledgeDoc = struct { target: KnowledgeTarget, text: String };
 type KnowledgeRelation = struct { source: KnowledgeTarget, target: KnowledgeTarget };
@@ -496,7 +524,7 @@ def doc: Fn(String) -> Fn(property::VariantPropertyCtx, Option(VariantDoc)) -> V
 };
 
 type FilterInputKind = enum {
-    @doc("IPv4 address stored as canonical dotted decimal: four octets 0..255, no leading zeros. Eq/Ne take an address; InSubnet/NotInSubnet take a canonical CIDR network with /0..32 and zero host bits. Read the shared IPv4 subnet contract for backend requirements. IPv6 is not supported.")
+    @doc("IPv4 address stored as canonical dotted decimal: four octets 0..255, no leading zeros. Eq/Ne take an address; InSubnet/NotInSubnet take a canonical CIDR network with /0..32 and zero host bits. IPv6 is not supported.")
     Ipv4,
     Text, Number, Int, Bool,
     @doc("UTC instant with second precision. Format: YYYY-MM-DDTHH:MM:SSZ. Example: \"2026-09-20T16:00:00Z\". PostgreSQL uses timestamptz; SQLite uses this normalized text format.")
@@ -645,6 +673,7 @@ type DimensionBrief = struct {
     ty: String,
     half_open: Bool,
     value_contract: String,
+    utc_bucket: Option(UtcBucketDimensionSpec),
     id: String,
     label: String,
     aliases: Array(String),
@@ -675,6 +704,7 @@ type VisibleDimensionBrief = struct {
     ty: String,
     half_open: Bool,
     value_contract: String,
+    utc_bucket: Option(UtcBucketDimensionSpec),
     id: String,
     label: String,
     aliases: Array(String),
@@ -2361,7 +2391,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 if ipv4 && (array::length(mapped) > 0 || array::length(enumerated) > 0
                     || dd.input_kinds != [FilterInputKind::Ipv4]
                     || array::any(dd.ops, fn(op) { !array::any(logical_type_ops(LogicalType::Ipv4), fn(allowed) { allowed == op }) })) {
-                    fail!(`IPv4 dimension \{dd.id} requires Ipv4 input and declared address operations; see info key \{syntax_key_hint("syntax/model/logical_types")}`, entity.id, f.name, dd.id)
+                    fail!(`IPv4 dimension \{dd.id} requires Ipv4 input and declared address operations`, entity.id, f.name, dd.id)
                 } else { () };
                 let valid_kind = if ipv4 { FilterInputKind::Ipv4 }
                     else if array::length(enumerated) > 0 { FilterInputKind::Text }
@@ -2483,10 +2513,10 @@ def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb:
     if array::any(input_kinds, fn(kind) { kind == FilterInputKind::Ipv4 })
         && (input_kinds != [FilterInputKind::Ipv4] || output_type != OutputType::Text
             || array::any(ops, fn(op) { !array::any(logical_type_ops(LogicalType::Ipv4), fn(allowed) { allowed == op }) })) {
-        fail!(`IPv4 dimension \{id} requires Ipv4 input, Text output and declared address operations; see info key \{syntax_key_hint("syntax/model/logical_types")}`, id, input_kinds, ops)
+        fail!(`IPv4 dimension \{id} requires Ipv4 input, Text output and declared address operations`, id, input_kinds, ops)
     } else { () };
     if array::any(ops, is_subnet_op) && input_kinds != [FilterInputKind::Ipv4] {
-        fail!(`subnet operations require an IPv4 dimension \{id}; see info key \{syntax_key_hint("syntax/model/logical_types")}`, id)
+        fail!(`subnet operations require an IPv4 dimension \{id}`, id)
     } else { () };
     let wire_shape = fn(kind: FilterInputKind) {
         match kind {
@@ -2609,7 +2639,7 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
             } else if field_value_type_ref(from_entity.entity_type, from_field) != field_value_type_ref(to_entity.entity_type, to_field) {
                 fail!("relation fields have different named value types", pair.from, pair.to)
             } else if is_ipv4_field(from_entity.entity_type, from_field) != is_ipv4_field(to_entity.entity_type, to_field) {
-                fail!(`relation fields have different logical address types; see info key \{syntax_key_hint("syntax/model/logical_types")}`, pair.from, pair.to)
+                fail!(`relation fields have different logical address types`, pair.from, pair.to)
             } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
                 property::get_field_prop(to_entity.entity_type, to_field, TimeField.type)) {
                 (None, None) => False,
@@ -3255,15 +3285,15 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
         {field: predicate.field, op: predicate.op, input: predicate.input}
     });
-    {ty: entry.ty, half_open: entry.half_open, value_contract: if entry.half_open {
-        "Known: use a listed business ID string. Unknown: use {\"unknown\":\"raw value\"}; known wires are rejected. All unknowns: use {\"unknowns\":true}. Eq/Ne exclude NULL. Projection returns <node>_<dimension> plus <node>_<dimension>__kind (Known, Unknown, or NULL); group by both columns. Other is an ordinary known concept."
+    {ty: entry.ty, half_open: entry.half_open, utc_bucket: bucket, value_contract: if entry.half_open {
+        "Half-open business domain with Known, Unknown and NULL populations. Known values have canonical business IDs; unknown values preserve raw strings. Known physical wires cannot represent Unknown. Eq/Ne exclude NULL. The logical value is paired with a __kind discriminator. The unknowns population includes all Unknown values. Other is an ordinary Known concept."
     } else { "" }, id: entry.id, label: match note { Some(n) => n.label, None => entry.id },
         aliases: member_aliases(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
         localized: localized_member_texts(entity.entity_type, field.index, MemberAliasKind::Dimension, entry.id),
         summary: match note { Some(n) => n.summary, None => match bucket {
             Some(spec) => {
                 let unit = match spec.unit { qb::UtcBucketUnit::Hour => "hour", qb::UtcBucketUnit::Day => "day", qb::UtcBucketUnit::Month => "month" };
-                `UTC calendar \{unit} bucket start, preserving the source logical time type and NULL. Calendar range is years 0001..9999; out-of-range epoch values return NULL. Select this dimension with a declared measure to group samples; filter the raw time dimension for the requested interval.`
+                `UTC calendar \{unit} bucket start, preserving the source logical time type and NULL. Calendar range is years 0001..9999; out-of-range epoch values return NULL. Negative epochs floor toward the preceding bucket. Month is a calendar unit.`
             },
             None => "",
         } },
@@ -3296,7 +3326,7 @@ def visible_dimension_detail: Fn(PreparedPayload, String) -> VisibleDimensionBri
             } else {
                 array::map(detail.values, fn(value) { {id: value.value, label: value.label, aliases: [], localized: []} })
             };
-            {ty: detail.ty, half_open: detail.half_open, value_contract: detail.value_contract, id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
+            {ty: detail.ty, half_open: detail.half_open, value_contract: detail.value_contract, utc_bucket: detail.utc_bucket, id: detail.id, label: detail.label, aliases: detail.aliases, localized: detail.localized, summary: detail.summary,
                 dataset: detail.dataset, field: detail.field, computed: detail.computed,
                 filterable: detail.filterable, ops: detail.ops,
                 input_kinds: detail.input_kinds, input_docs: detail.input_docs, values, canonical_order: detail.canonical_order, scope: detail.scope}
@@ -3625,12 +3655,12 @@ type Ipv4SubnetSpec = struct { prefix: String, upper: String, exact: Bool, patte
 def ipv4_subnet: Fn(String) -> Ipv4SubnetSpec = fn(value) {
     let parts = string::split(value, "/");
     if array::length(parts) != 2 || !canonical_ipv4(parts[0]) {
-        fail!(`invalid canonical IPv4 subnet \{value}; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value)
+        fail!(`invalid canonical IPv4 subnet \{value}`, value)
     } else {
         let octets = string::split(parts[0], ".");
         let mask = match string::parse@[Ipv4Mask](parts[1]) {
-            Ok(parsed) => if parsed.mask <= 32 { parsed.mask } else { fail!(`IPv4 subnet mask must be 0..32; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value) },
-            Err(_) => fail!(`IPv4 subnet mask must be canonical 0..32; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value),
+            Ok(parsed) => if parsed.mask <= 32 { parsed.mask } else { fail!(`IPv4 subnet mask must be 0..32`, value) },
+            Err(_) => fail!(`IPv4 subnet mask must be canonical 0..32`, value),
         };
         let parsed = match string::parse@[Ipv4Parts](parts[0]) {
             Ok(address) => address,
@@ -3643,7 +3673,7 @@ def ipv4_subnet: Fn(String) -> Ipv4SubnetSpec = fn(value) {
         let host_bits = array::any(int_range(4), fn(i) {
             if i < whole { False } else if i == whole { values[i] % width != 0 } else { values[i] != 0 }
         });
-        if host_bits { fail!(`IPv4 subnet network address contains host bits: \{value}; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, value) }
+        if host_bits { fail!(`IPv4 subnet network address contains host bits: \{value}`, value) }
         else {
             let prefix = string::join(array::map(int_range(whole), fn(i) { octets[i] }), ".");
             let pattern = if remainder == 0 { None } else {
@@ -3664,7 +3694,7 @@ def filter_argument_allowed: Fn(Array(FilterInputKind), FilterOp, FilterInput) -
 
 def subnet_condition: Fn(qb::BuildCtx, DimensionEntry, qb::Expr, FilterOp, FilterInput) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base, op, input) {
     if !filter_argument_allowed(entry.input_kinds, op, input) {
-        fail!(`subnet operation requires a typed IPv4 subnet for dimension \{entry.id}; see info key \{syntax_key_hint("syntax/model/ipv4_subnets")}`, entry.id, input)
+        fail!(`subnet operation requires a typed IPv4 subnet for dimension \{entry.id}`, entry.id, input)
     } else {
         let spec = match input { FilterInput::Ipv4Subnet(value) => ipv4_subnet(value), _ => fail!("missing subnet argument", input) };
         let comparison = if op == FilterOp::InSubnet { qb::ScalarFunction::Eq } else { qb::ScalarFunction::Ne };
@@ -3777,7 +3807,7 @@ def to_val: Fn(FilterInput) -> qb::Val = fn(input) {
         FilterInput::Text(s) => qb::Val::String(s),
         FilterInput::Ipv4Subnet(_) => fail!("IPv4 subnet is an operation argument, not a scalar address", input),
         FilterInput::Ipv4(value) => if canonical_ipv4(value) { qb::Val::String(value) }
-            else { fail!(`invalid canonical IPv4 address \{value}; see info key \{syntax_key_hint("syntax/model/logical_types")}`, value) },
+            else { fail!(`invalid canonical IPv4 address \{value}`, value) },
         FilterInput::Number(f) => qb::Val::Float(f),
         FilterInput::Int(i) => qb::Val::Int(i),
         FilterInput::Bool(b) => qb::Val::Bool(b),
@@ -3950,11 +3980,11 @@ def resolve_filters_with_context: Fn(qb::BuildCtx, PreparedPayload, Array(Filter
 
             let entry = match array::find(payload.dimensions, fn(d) { d.id == req.id }) {
                 Some(d) => d,
-                None => fail!(`unknown filter dimension \{req.id}; see info key "index"`, req.id),
+                None => fail!(`unknown filter dimension \{req.id}; related knowledge key "index"`, req.id),
             };
-            if !entry.authorized { fail!(`dimension \{req.id} is not authorized; see info key "index" for visible alternatives`, req.id) }
-            else if !entry.filterable { fail!(`dimension has no filter capability: \{req.id}; see info key \{knowledge_key_hint(KnowledgeKind::Dimension, get_index(payload.entities, entry.entity).id, entry.id)}`, req.id) }
-            else if !array::any(entry.ops, fn(op) { op == req.op }) { fail!(`filter operation not supported for dimension \{req.id}: \{json::stringify(codec::encode(req.op))}; see info key \{knowledge_key_hint(KnowledgeKind::Dimension, get_index(payload.entities, entry.entity).id, entry.id)}`, req.id, req.op) }
+            if !entry.authorized { fail!(`dimension \{req.id} is not authorized; related knowledge key "index" for visible alternatives`, req.id) }
+            else if !entry.filterable { fail!(`dimension has no filter capability: \{req.id}; related knowledge key \{knowledge_key_hint(KnowledgeKind::Dimension, get_index(payload.entities, entry.entity).id, entry.id)}`, req.id) }
+            else if !array::any(entry.ops, fn(op) { op == req.op }) { fail!(`filter operation not supported for dimension \{req.id}: \{json::stringify(codec::encode(req.op))}; related knowledge key \{knowledge_key_hint(KnowledgeKind::Dimension, get_index(payload.entities, entry.entity).id, entry.id)}`, req.id, req.op) }
             else {
                 let valid_time = validate_time_filter(payload, entry, req.input);
                 let computed = dimension_expr(state.0, payload, entry);
@@ -4062,11 +4092,11 @@ def resolve_scope_with_context: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry
     let hint = if d.authorized { knowledge_key_hint(KnowledgeKind::Dimension, entity.id, d.id) }
         else { "\"index\"" };
     if require_authorized && !d.authorized {
-        fail!(`scope references a dimension that is not authorized: \{d.id}; see info key "index" for visible alternatives`, d.id)
+        fail!(`scope references a dimension that is not authorized: \{d.id}; related knowledge key "index" for visible alternatives`, d.id)
     } else if !d.filterable {
-        fail!(`scope references a dimension with no filter capability: \{d.id}; see info key \{hint}`, d.id)
+        fail!(`scope references a dimension with no filter capability: \{d.id}; related knowledge key \{hint}`, d.id)
     } else if !array::any(d.ops, fn(op) { op == predicate.op }) {
-        fail!(`scope uses an operation not supported by the dimension \{d.id}: \{json::stringify(codec::encode(predicate.op))}; see info key \{hint}`, d.id, predicate.op)
+        fail!(`scope uses an operation not supported by the dimension \{d.id}: \{json::stringify(codec::encode(predicate.op))}; related knowledge key \{hint}`, d.id, predicate.op)
     } else if array::length(d.values) > 0 && predicate.op != FilterOp::Eq {
         fail!("scope on enum dimension supports only Eq", d.id, predicate.op)
     } else if is_text_op(predicate.op) && match predicate.input { FilterInput::Text(_) => False, _ => True } {
@@ -4204,11 +4234,11 @@ def resolve_measure_predicate_with_context: Fn(qb::BuildCtx, PreparedPayload, Me
                 None => fail!("measure predicate references a field with no dimension declaration", entry.id, field.name),
             };
             if !dimension.authorized {
-                fail!(`measure predicate references a dimension that is not authorized: \{dimension.id}; see info key "index" for visible alternatives`, dimension.id)
+                fail!(`measure predicate references a dimension that is not authorized: \{dimension.id}; related knowledge key "index" for visible alternatives`, dimension.id)
             } else if !dimension.filterable {
-                fail!(`measure predicate references a dimension with no filter capability: \{dimension.id}; see info key \{knowledge_key_hint(KnowledgeKind::Dimension, entity.id, dimension.id)}`, dimension.id)
+                fail!(`measure predicate references a dimension with no filter capability: \{dimension.id}; related knowledge key \{knowledge_key_hint(KnowledgeKind::Dimension, entity.id, dimension.id)}`, dimension.id)
             } else if !array::any(dimension.ops, fn(op) { op == pred.op }) {
-                fail!(`measure predicate uses an operation not supported by the dimension \{dimension.id}: \{json::stringify(codec::encode(pred.op))}; see info key \{knowledge_key_hint(KnowledgeKind::Dimension, entity.id, dimension.id)}`, dimension.id, pred.op)
+                fail!(`measure predicate uses an operation not supported by the dimension \{dimension.id}: \{json::stringify(codec::encode(pred.op))}; related knowledge key \{knowledge_key_hint(KnowledgeKind::Dimension, entity.id, dimension.id)}`, dimension.id, pred.op)
             } else {
                 filter_value_with_context(ctx, payload, dimension, pred.op, pred.input)
             }
@@ -4354,7 +4384,7 @@ def graph_filters: Fn(qb::BuildCtx, PreparedPayload, Array(GraphInstance), Array
         let instance = graph_instance(instances, spec.node);
         let dimension = match array::find(payload.dimensions, fn(d) { d.id == spec.request.id }) {
             Some(d) => d,
-            None => fail!(`graph filter on node \{spec.node} references an unknown dimension \{spec.request.id}; see info key "index"`, spec.node, spec.request.id),
+            None => fail!(`graph filter on node \{spec.node} references an unknown dimension \{spec.request.id}; related knowledge key "index"`, spec.node, spec.request.id),
         };
         if dimension.entity != instance.entity {
             fail!(`graph filter dimension \{spec.request.id} does not belong to node \{spec.node}`, spec.node, spec.request.id)
@@ -5069,8 +5099,8 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
                         {...request, group_by_identity: [request.root, edge.to]}, selection.node) {
                         fail!(`graph contextual measure requires group_by_identity [\{request.root}, \{edge.to}] to keep context and owner identities separate; the measure remains owned by \{selection.node}`,
                             request.root, edge.to, selection.node, selection.measure)
-                    } else { fail!(`graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification; see info key \{syntax_key_hint("syntax/graph/existence")}`, selection.node, selection.measure, proof.1) },
-                    None => fail!(`graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification; see info key \{syntax_key_hint("syntax/graph/existence")}`, selection.node, selection.measure, proof.1),
+                    } else { fail!(`graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification`, selection.node, selection.measure, proof.1) },
+                    None => fail!(`graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification`, selection.node, selection.measure, proof.1),
                 }
             } else {
                 let entity = get_index(payload.entities, instance.entity);
@@ -5094,7 +5124,7 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
 def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphInstance), GraphTopPer) -> (qb::BuildCtx, qb::PartitionedTopN) = fn(ctx, payload, request, instances, spec) {
     if request.count != None || request.include_empty || array::length(request.nodes) != 2
         || array::length(request.edges) != 1 || request.root != spec.owner || spec.owner == spec.sample {
-        fail!(`graph top-per requires one sample joined directly to its root owner; see info key \{syntax_key_hint("syntax/graph/order")}`, spec)
+        fail!(`graph top-per requires one sample joined directly to its root owner`, spec)
     } else if spec.take <= 0 || spec.take > qb::max_partition_take {
         fail!("graph top-per take must be positive and within the declared bound", spec.take)
     } else {
@@ -5104,7 +5134,7 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
         let relation = relation_domain(payload, edge.relation);
         if edge.from != spec.sample || edge.to != spec.owner
             || relation.from != sample.entity || relation.to != owner.entity || !relation_preserves_grain(relation, True) {
-            fail!(`graph top-per requires a named at-most-one sample-to-owner relation; see info key \{syntax_key_hint("syntax/graph/order")}`, edge.relation)
+            fail!(`graph top-per requires a named at-most-one sample-to-owner relation`, edge.relation)
         } else {
             let sample_entity = get_index(payload.entities, sample.entity);
             let sample_dataset = match sample_entity.dataset {
@@ -5179,7 +5209,7 @@ def graph_top_by_measure: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(
         if !array::any(request.measures, fn(item) { item.node == spec.node && item.measure == spec.measure }) {
             fail!(`graph aggregate top must reference a projected measure: \{spec.node}.\{spec.measure}; add it to measures or select a projected measure`, spec.node, spec.measure)
         } else if !dimension_group && !identity_group && !contextual_group {
-            fail!(`graph aggregate top requires a visible dimension group not split by hidden identity keys and a grain-safe measure source, or a proven identity/contextual measure group; see info key \{syntax_key_hint("syntax/graph/order")}`, request.root, spec.node)
+            fail!(`graph aggregate top requires a visible dimension group not split by hidden identity keys and a grain-safe measure source, or a proven identity/contextual measure group`, request.root, spec.node)
         } else if spec.take <= 0 || spec.take > qb::max_partition_take {
             fail!("graph aggregate top take must be positive and within the declared bound", spec.take)
         } else {
@@ -5292,11 +5322,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
         fail!("graph distinct requires raw projected rows; remove count, measures, Top-N or include_empty")
     } else if array::length(request.order_by) > 0 && (request.count != None
         || array::length(request.measures) > 0 || request.top_per != None || request.top_by_measure != None) {
-        fail!(`graph dimension order requires raw rows; use aggregate top or sample top for aggregated or partitioned results; see info key \{syntax_key_hint("syntax/graph/order")}`)
+        fail!(`graph dimension order requires raw rows; use aggregate top or sample top for aggregated or partitioned results`)
     } else if request.take != None && (array::length(request.order_by) == 0 || request.distinct
         || request.count != None || array::length(request.measures) > 0
         || request.top_per != None || request.top_by_measure != None) {
-        fail!(`graph raw take requires ordered raw rows without DISTINCT, aggregates or partitioned Top-N; see info key \{syntax_key_hint("syntax/graph/order")}`)
+        fail!(`graph raw take requires ordered raw rows without DISTINCT, aggregates or partitioned Top-N`)
     } else if request.row_grain == GraphRowGrain::Association && (request.take != None
         || request.count != None || request.count_value != None || array::length(request.measures) > 0
         || request.top_per != None || request.top_by_measure != None
@@ -5309,9 +5339,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
             None => False,
         };
         if projected {
-            fail!(`graph raw take cannot preserve root row grain while projecting a multiplying relation; remove the related projection and use correlated EXISTS to qualify the root, or query explicit relationship rows without global root take; see info key \{syntax_key_hint("syntax/graph/existence")}`, request.root, unsafe_edge)
+            fail!(`graph raw take cannot preserve root row grain while projecting a multiplying relation; remove the related projection and use correlated EXISTS to qualify the root, or query explicit relationship rows without global root take`, request.root, unsafe_edge)
         } else {
-            fail!(`graph raw take requires grain-safe joins from the root; move multiplying relations into correlated EXISTS before selecting global top rows; see info key \{syntax_key_hint("syntax/graph/existence")}`, request.root, unsafe_edge)
+            fail!(`graph raw take requires grain-safe joins from the root; move multiplying relations into correlated EXISTS before selecting global top rows`, request.root, unsafe_edge)
         }
     } else if request.count != None && array::length(request.measures) > 0 {
         fail!("graph cannot combine row count with measure projection; choose one aggregation grain")
@@ -5326,7 +5356,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
             && array::all(request.select, fn(item) { item.node == request.root }))
             && !graph_contextual_measure_grain(payload, request, spec.node)
     }) {
-        fail!(`graph measure threshold requires complete root identity with root-only dimensions, or proven context and owner identities for its named measure \{spec.node}.\{spec.measure}; see info key \{syntax_key_hint("syntax/graph/aggregate")}`, request.root, spec.node, spec.measure)
+        fail!(`graph measure threshold requires complete root identity with root-only dimensions, or proven context and owner identities for its named measure \{spec.node}.\{spec.measure}`, request.root, spec.node, spec.measure)
     } else if request.count_groups && (request.count_having == None && array::length(request.measure_having) == 0
         || request.distinct
         || request.top_per != None || request.top_by_measure != None || array::length(request.order_by) > 0) {
@@ -5337,9 +5367,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
     } else if request.include_empty && array::length(request.constraints) > 0 {
         fail!("graph include_empty cannot apply constraint edges in WHERE without changing empty populations")
     } else if request.top_per != None && request.top_by_measure != None {
-        fail!(`graph cannot combine raw-sample top_per with aggregate top_by_measure; see info key \{syntax_key_hint("syntax/graph/order")}`)
+        fail!(`graph cannot combine raw-sample top_per with aggregate top_by_measure`)
     } else if request.top_per != None && array::length(request.measures) > 0 {
-        fail!(`graph measure projection cannot rank raw rows with top_per; see info key \{syntax_key_hint("syntax/graph/order")}`)
+        fail!(`graph measure projection cannot rank raw rows with top_per`)
     } else if let Some(unknown) = array::find(request.group_by_identity, fn(id) {
         !array::any(request.nodes, fn(node) { node.id == id })
     }) { fail!(`graph group identity references an unknown node \{unknown}`, unknown) }
@@ -5457,9 +5487,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
             && !array::all(graph_unsafe_edges(payload, request, request.root).1, fn(edge) {
                 graph_multiplying_projection(request, edge)
             }) {
-            fail!(`graph raw joins multiply root rows without projecting every related association; move unprojected relations into correlated EXISTS; see info key \{syntax_key_hint("syntax/graph/existence")}`, request.root, graph_unsafe_edges(payload, request, request.root).1)
+            fail!(`graph raw joins multiply root rows without projecting every related association; move unprojected relations into correlated EXISTS`, request.root, graph_unsafe_edges(payload, request, request.root).1)
         } else if graph_raw_row_fanout(payload, request) && request.row_grain != GraphRowGrain::Association {
-            fail!(`graph raw projection crosses a multiplying relation; declare row_grain association for explicit relationship rows, or use correlated EXISTS to retain root row grain; see info key \{syntax_key_hint("syntax/graph/existence")}`, request.root, graph_count_subject_grain(payload, request, request.root).1)
+            fail!(`graph raw projection crosses a multiplying relation; declare row_grain association for explicit relationship rows, or use correlated EXISTS to retain root row grain`, request.root, graph_count_subject_grain(payload, request, request.root).1)
         } else if request.row_grain == GraphRowGrain::Association && !graph_raw_row_fanout(payload, request) {
             fail!("graph association row grain requires a projected multiplying relation; otherwise use root row grain", request.root)
         } else {
@@ -5749,7 +5779,7 @@ pub use self::{
     LogicalType, LogicalFieldType, logical_type, logical_type_ops, canonical_ipv4,
     KnowledgeKind,
     KnowledgeTarget,
-    knowledge_key,
+    KnowledgeAddress, knowledge_role, knowledge_address, knowledge_key,
     knowledge_key_hint,
     KnowledgeDoc,
     KnowledgeRelation,

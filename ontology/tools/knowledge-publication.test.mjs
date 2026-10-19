@@ -5,7 +5,7 @@ import { inspectKnowledge, publicationMetadata, responseSize, verifyManifest } f
 const node = (key, type, detail = {}, links = []) => ({ key, type,
   description: { label: key, aliases: [], localized: [], summary: '' }, links, detail });
 const nodes = () => [
-  node('index', 'Index', { revision: 'foo-v1', schemas: [] }),
+  node('index', 'Index', { revision: 'foo-v1' }),
   node('opaque', 'Dataset', { id: 'foo' }, [{ type: 'Member', key: 'index' }]),
 ];
 
@@ -14,7 +14,6 @@ test('manifest keys/types, counts and revision come from visible nodes only', ()
   assert.deepEqual(manifest.domains[0], { domain: 'foo', revision: 'foo-v1',
     counts: { Index: 1, Dataset: 1 }, entries: [{ key: 'index', type: 'Index' }, { key: 'opaque', type: 'Dataset' }] });
   assert.equal(sizes.status, 'passed');
-  assert.equal(sizes.domains[0].largest_entry, null);
   assert.equal(sizes.domains[0].largest_link.target_key, 'index');
 });
 
@@ -48,7 +47,7 @@ test('index metadata is measured without the concrete document size limit', () =
 test('duplicate/dangling keys and missing revision cannot generate a valid publication', () => {
   assert.throws(() => inspectKnowledge('foo', [nodes()[0], nodes()[0]], 16000), /duplicate/);
   const dangling = nodes();
-  dangling[0].detail.schemas = ['missing'];
+  dangling[0].links = [{ type: 'Member', key: 'missing' }];
   assert.throws(() => inspectKnowledge('foo', dangling, 16000), /dangling/);
   const input = nodes();
   delete input[0].detail.revision;

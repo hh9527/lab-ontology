@@ -87,7 +87,7 @@ authorization belong to the host. `transform` only produces a Query; it does
 not execute it. `--serve` is the current CLI option; `--bind` belongs to older
 Telora documentation.
 
-## 3. Request protocol and agent workflow
+## 3. Host request protocol and knowledge facts
 
 For JSONL, every request has exactly `method` and `input`. The method selects a
 slot; only `input` is passed to that slot. For HTTP, POST the same `input`
@@ -98,31 +98,26 @@ directly to the matching path. The knowledge and query methods are:
 {"method":"<domain>/info","input":{"key":"<key returned by index or links>"}}
 ```
 
-The `index` topic returns `{revision,schemas,key_patterns,encoding}`. It lists
-exact schema keys and `{kind,pattern}` rules for concrete knowledge keys;
-business instances are discovered through consumer-side terminology search.
-Read a matching key through `info`, then follow direct `links[].key` references
-for capabilities, units, population semantics and related knowledge. Dataset
-members are direct references. A `Related` link explains knowledge but does not
-authorize query traversal. Labels, translations, aliases and physical column
-names are not substitutes for canonical Intent IDs.
+The host collects `index` and discovery roots, then follows every `links[].key`
+reference. `index.detail` contains `{revision,key_patterns,encoding}` and its
+Member links include primitive types. Every node has
+`{key,type,description,links,detail}`. Keys include Dataset, Dimension, Field,
+Measure, Relation, Ty, Value, TimeRole and BusinessLink, with each canonical name
+URI-encoded once. Returned keys are complete stable identities. Labels, aliases
+and physical names do not replace canonical business IDs.
 
-Every knowledge node has `{key,type,description,links,detail}`. Public keys include
-`Dataset/{name}`, `Dimension/{dataset}/{name}`, `Field/{dataset}/{name}`, `Relation/{name}`, `Type/{name}`
-and `Value/{type}/{value}`. Name components are URI-encoded exactly once; `Type` keys return
-nodes whose response type is `DataType`. Prefer returned keys when following references.
-The response `type` determines the `detail` shape. `info` returns Index, Schema
-or a concrete knowledge point. `DataType` describes logical values and operations;
-a field must still authorize an operation. Search vocabulary and reverse references
-are generated outside the model. A term may match multiple nodes; read the matching
-nodes and use canonical business IDs in Intent. Structured descriptions include
-`terms:[{term,description}]` for explicit business terminology.
-Use `index.detail.schemas` to discover request contracts.
+`<domain>/discovery` accepts `{}` and returns
+`{knowledge_contract,intent_contract,revision,roots,key_patterns,vocabulary}`.
+Current contracts are `ontology-knowledge-v2` and `ontology-intent-v1`. Roots
+identify visible Dataset and Relation nodes. The graph contains knowledge facts
+and business constraints. Consumer tools own Agent workflows, query help and
+retrieval examples; the host's info method is an integration interface.
 
-Models mount `<domain>/discovery` with input `{}`. It returns a JSON array of
-complete visible Dataset and Relation keys. The consumer follows these roots
-through `info` to discover dimensions, measures, business types and values.
-Mount `knowledge::knowledge_discovery_method_factory(payload)` for this capability.
+For dsh-oks, knowledge is a `{meta,origin,data}` resource whose data is a
+canonical-key dictionary. `oks_data` automatically unwraps `.data` and exposes
+`knowledge://#meta` for metadata/provenance. Usage is available separately from
+`oks://help/knowledge` and `oks://help/query`, with retrieval supplied by built-in
+jq programs. The consumer validates contracts before loading the graph.
 
 Generate consumer data with:
 
@@ -135,8 +130,8 @@ The script writes `.terminology.json`, `.links.json`, `.keys.json` and
 and output. `--keys roots.json` supplies roots instead of calling discovery.
 
 Terminology has `{revision,datasets,dimensions,measures,rels,types,values}`.
-Dataset, Relation and business Type entries contain `{name,doc,aliases}`;
-Dimension and Measure entries add `dataset`; Value entries add `type_id`.
+Dataset, Relation and business Ty entries contain `{name,doc,aliases}`;
+Dimension and Measure entries add `dataset`; Value entries add `ty`.
 Physical Fields and primitive Types are available through info and are excluded
 from search vocabulary. Aliases and descriptions come from structured metadata,
 localized labels and explicit terms.

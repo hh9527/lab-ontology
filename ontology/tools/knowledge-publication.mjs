@@ -19,18 +19,14 @@ export function inspectKnowledge(domain, nodes, maxNodeChars) {
   assert.ok(revision.length > 0, `${domain}: empty Model revision`);
   const counts = {};
   const nodeSizes = [];
-  let largestEntry = null;
   let largestLink = null;
   for (const node of nodes) {
     counts[node.type] = (counts[node.type] ?? 0) + 1;
     for (const key of discoveryKeys(node)) assert.ok(byKey.has(key), `dangling knowledge key: ${key}`);
     nodeSizes.push({ key: node.key, type: node.type, chars: responseSize(node) });
-    for (const [kind, items] of [['entry', (node.detail.schemas ?? []).map(key => ({ key }))], ['link', node.links]]) {
-      for (const item of items) {
-        const size = { node_key: node.key, target_key: item.key, chars: itemSize(item) };
-        if (kind === 'entry' && (!largestEntry || size.chars > largestEntry.chars)) largestEntry = size;
-        if (kind === 'link' && (!largestLink || size.chars > largestLink.chars)) largestLink = size;
-      }
+    for (const item of node.links) {
+      const size = { node_key: node.key, target_key: item.key, chars: itemSize(item) };
+      if (!largestLink || size.chars > largestLink.chars) largestLink = size;
     }
   }
   nodeSizes.sort((a, b) => b.chars - a.chars || compareKeys(a, b));
@@ -40,7 +36,7 @@ export function inspectKnowledge(domain, nodes, maxNodeChars) {
     manifest: { domain, revision, counts,
       entries: nodes.map(({ key, type }) => ({ key, type })).sort(compareKeys) },
     sizes: { domain, revision, count: nodes.length, max_node_chars: maxNodeChars,
-      oversized, node_sizes: nodeSizes, largest_entry: largestEntry, largest_link: largestLink },
+      oversized, node_sizes: nodeSizes, largest_link: largestLink },
   };
 }
 

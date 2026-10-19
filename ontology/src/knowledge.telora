@@ -49,8 +49,9 @@ type KnowledgeRequest = struct { method: String, input: Value };
 type InfoInput = struct { key: String };
 type TermText = struct { term: String, description: String };
 type Description = struct { label: String, aliases: Array(String), localized: Array(edsl::LocalizedKnowledgeText), summary: String, terms: Array(TermText) };
-type NodeLink = struct { type: LinkKind, key: String };
-type Node = struct { key: String, type: edsl::KnowledgeKind, description: Description, links: Array(NodeLink), detail: Value };
+type NodeAddress = edsl::KnowledgeAddress;
+type NodeLink = struct { type: LinkKind, key: String, role: String };
+type Node = struct { key: String, address: NodeAddress, type: edsl::KnowledgeKind, description: Description, links: Array(NodeLink), detail: Value };
 type NodeResult = enum { NotFound, Found(Node) };
 type NodeResponse = enum { Document(NodeResult) };
 type DatasetDetail = struct { id: String, grain: Array(String), time_roles: Array(edsl::TimeRoleBrief), references: Array(edsl::ReferenceSpec), field_roles: Array(edsl::FieldRoleBrief) };
@@ -85,10 +86,6 @@ def point: Fn(edsl::KnowledgeTarget, String, Array(String), String, Array(Knowle
             entries: None, revision: "", value_type: None, value: None}
     };
 
-def syntax_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
-    target(edsl::KnowledgeKind::Schema, "", `syntax/\{id}`)
-};
-
 def type_target: Fn(String) -> edsl::KnowledgeTarget = fn(id) {
     target(edsl::KnowledgeKind::Ty, "", id)
 };
@@ -100,37 +97,22 @@ def input_type_ref: Fn(edsl::FilterInputKind) -> KnowledgeLink = fn(kind) {
     }
 };
 
-def type_operations: Fn(edsl::FilterInputKind) -> Array(KnowledgeLink) = fn(kind) {
-    let comparisons = [member(syntax_target("operations/comparison"))];
-    match kind {
-        edsl::FilterInputKind::Text => array::push(comparisons, member(syntax_target("operations/text_match"))),
-        edsl::FilterInputKind::Ipv4 => array::push(comparisons, member(syntax_target("model/ipv4_subnets"))),
-        edsl::FilterInputKind::DatetimeUtc => array::push(comparisons, member(syntax_target("operations/time_window"))),
-        edsl::FilterInputKind::DateUtc => array::push(comparisons, member(syntax_target("operations/time_window"))),
-        edsl::FilterInputKind::LocalDateTime => array::push(comparisons, member(syntax_target("operations/time_window"))),
-        edsl::FilterInputKind::EpochMillis => array::push(comparisons, member(syntax_target("operations/time_window"))),
-        edsl::FilterInputKind::Int => comparisons,
-        edsl::FilterInputKind::Number => comparisons,
-        edsl::FilterInputKind::Bool => comparisons,
-    }
-};
-
 def type_points: Array(Point) = array::map([
     (edsl::FilterInputKind::Text, "JSON string; literal text comparisons and pattern searches only where the dimension declares them. Text is not an address or a temporal value."),
     (edsl::FilterInputKind::Int, "JSON integer; exact integral values, with Model-declared comparison operations. Units and business meaning come from the field or measure."),
     (edsl::FilterInputKind::Number, "JSON number; numeric values with Model-declared comparisons. Units and permitted aggregations come from the Model."),
     (edsl::FilterInputKind::Bool, "JSON boolean true or false; not a string or integer flag. Model declarations map physical representations."),
     (edsl::FilterInputKind::Ipv4, "Canonical dotted-decimal JSON string: four octets 0..255 without leading zeros. Eq/Ne compare addresses; InSubnet/NotInSubnet take canonical CIDR networks /0..32. No lexical order, text pattern search or implicit IPv6 conversion. Raw unknown-format addresses remain Text. A validated IPv4 view can return NULL for invalid source values."),
-    (edsl::FilterInputKind::DatetimeUtc, "JSON string expressing a UTC instant as YYYY-MM-DDTHH:MM:SSZ, for example 2024-03-01T00:00:00Z. Currently only normalized UTC seconds are accepted; resolve other offsets and fractions before submission. Not arbitrary Text or an unzoned local datetime."),
-    (edsl::FilterInputKind::EpochMillis, "JSON integer representing milliseconds since the Unix epoch. Not seconds, Number or arbitrary Int; do not silently change units."),
+    (edsl::FilterInputKind::DatetimeUtc, "JSON string expressing a UTC instant as YYYY-MM-DDTHH:MM:SSZ, for example 2024-03-01T00:00:00Z. The logical domain has normalized UTC seconds precision; offsets and fractional seconds are outside this domain. Not arbitrary Text or an unzoned local datetime."),
+    (edsl::FilterInputKind::EpochMillis, "JSON integer representing milliseconds since the Unix epoch. The unit is milliseconds, distinct from seconds, Number and arbitrary Int."),
     (edsl::FilterInputKind::DateUtc, "JSON string YYYY-MM-DD expressing a UTC calendar date, without a time of day. Not an instant or arbitrary Text."),
-    (edsl::FilterInputKind::LocalDateTime, "JSON string YYYY-MM-DD HH:MM:SS expressing a local calendar datetime without an embedded zone. Local wall-clock boundaries must be resolved externally with the relevant timezone and ambiguity policy; never infer the database session timezone."),
+    (edsl::FilterInputKind::LocalDateTime, "JSON string YYYY-MM-DD HH:MM:SS expressing a local calendar datetime without an embedded zone. The value carries neither a timezone nor an ambiguity policy; database session timezone does not establish its business timezone."),
 ], fn(entry) {
     let name = match codec::encode(entry.0) {
         Value::String(name) => name, other => fail!("logical input type must encode as a name", other),
     };
     point(type_target(name), name, [], entry.1,
-        array::concat([[member(syntax_target("model/logical_types")), member(syntax_target("graph/filter"))], type_operations(entry.0)]))
+        [])
 });
 
 def value_type_points: Fn(edsl::PreparedPayload) -> Array(Point) = fn(payload) {
@@ -139,102 +121,21 @@ def value_type_points: Fn(edsl::PreparedPayload) -> Array(Point) = fn(payload) {
         let values = array::map(spec.values, fn(value) {
             let current = target(edsl::KnowledgeKind::Value, spec.id, value.id);
             let base = point(current, value.label,
-                array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]), "", [member(parent)]);
+                array::concat([value.aliases, array::map(value.localized, fn(text) { text.label })]), "", []);
             {...base, value: array::find(spec.mapping, fn(mapping) { mapping.id == value.id }),
                 localized: array::map(value.localized, fn(text) { {locale: text.locale, label: text.label, summary: ""} })}
         });
         let base = point(parent, spec.label, [], spec.summary,
-            array::concat([[member(syntax_target("model/logical_types")), member(syntax_target("operations/comparison"))],
-                array::map(values, fn(value) { member(value.target) })]));
+            array::map(values, fn(value) { member(value.target) }));
         array::concat([[{...base, value_type: Some(spec)}], values])
     })
 };
 
 def index_point: Fn(edsl::PreparedPayload) -> Point = fn(payload) {
     {...point(target(edsl::KnowledgeKind::Index, "", "index"), "Knowledge index", [],
-        "Schema keys and concrete knowledge key patterns. Use discovery roots and info(key) for complete details. Dataset details directly reference their members.", []),
-        entries: Some(index_entries(syntax_points).entries), revision: payload.revision}
+        "Visible domain knowledge, stable identities, types, relationships and declared business constraints.", array::map(type_points, fn(item) { member(item.target) })),
+        entries: None, revision: payload.revision}
 };
-
-def syntax_points: Array(Point) = [
-    point(syntax_target("operations/comparison"), "Comparison operations", [],
-        "Eq and Ne compare compatible logical values. Gt, Ge, Lt and Le are also defined for Int, Number and temporal types; Text has Model-declared lexical comparisons, not numeric or temporal ordering. Bool and Ipv4 do not gain ordered comparisons. A type's links describe supported operations, not permission on every field: inspect the dimension's filterable and ops. Values must follow its logical format and declared canonical value contract. Comparisons against NULL are not arbitrary value comparisons; Ne does not include missing values.",
-        [member(syntax_target("graph/filter")), member(syntax_target("graph/filter/capabilities"))]),
-    point(syntax_target("operations/text_match"), "Text match operations", [],
-        "Contains, NotContains, StartsWith and EndsWith operate on Text only when authorized by the dimension. Inputs are literal text, not caller-provided SQL or regex patterns. Current matching is case-folded. Do not replace one operation with another after rejection: they select different populations. Text storage alone does not authorize text matching on a logical address or time.",
-        [member(syntax_target("graph/filter")), member(syntax_target("graph/filter/capabilities"))]),
-    point(syntax_target("operations/utc_time_bucket"), "UTC time bucket", [],
-        "A declared UTC bucket dimension projects the start of an hour, day or calendar month. Select it alongside a declared measure to group observations by that bucket; no Intent granularity parameter is accepted. DatetimeUtc output is canonical UTC YYYY-MM-DDTHH:MM:SSZ, DateUtc output is YYYY-MM-DD and supports day/month only, EpochMillis output is integer Unix milliseconds. Input and output logical types agree. NULL stays NULL. Common calendar range is years 0001..9999; out-of-range epoch values produce NULL. Negative epochs floor toward the preceding bucket, not toward zero. Month is a calendar operation, not a fixed duration. PostgreSQL session timezone does not change bucket boundaries. Filter the original time dimension with an explicit half-open interval, then group by the bucket dimension; do not replace the interval with a bucket filter unless that is the requested population. No inferred timezone, clock, local-calendar interpretation or implicit type conversion.",
-        [member(syntax_target("operations/time_window"))]),
-    point(syntax_target("operations/time_window"), "TimeWindow operation", [],
-        "Graph time_windows items are {node,dimension,start,end}, at the root or inside exists. The dimension must have a declared time role and authorize Ge for start and Lt for a finite end. The interval is [start,end): start is included, end is excluded. start is required and concrete; end may be null or omitted for [start,None), meaning no upper cutoff, NOT now. Future-dated rows may match an open upper bound. Finite bounds must use the same dimension's logical format and start must precede end. SQL compares the original column with bound values, >= start AND < end, or just >= start for no end. No implicit clock, database now(), timezone inference or column-side time conversion. Resolve yesterday, last seven days, calendar months and other relative periods externally using the application's reference time and timezone; submit concrete boundaries. A calendar day need not be 24 hours and a calendar month is not a fixed number of days. For example, in DatetimeUtc, UTC February 2024 is start=2024-02-01T00:00:00Z, end=2024-03-01T00:00:00Z. This interval contract is unrelated to dimension.half_open, which denotes a partially enumerated business value domain. Linking a type to this operation does not grant field authorization.",
-        [member(type_target("EpochMillis")), member(type_target("DatetimeUtc")),
-            member(type_target("DateUtc")), member(type_target("LocalDateTime")), member(syntax_target("graph/filter/capabilities"))]),
-    point(syntax_target("model/ipv4_subnets"), "Restricted IPv4 subnet operations", [],
-        "InSubnet and NotInSubnet apply only to an Ipv4 dimension that declares the operation in ops. value is a canonical IPv4 CIDR string, no kind: for example 10.4.16.0/20. Every integer mask /0..32 is supported. Host bits must be zero, never silently normalized. Input address and stored values use canonical dotted decimal without leading zeros. Whole-octet prefixes retain the trailing dot, so 10.4.0.0/16 cannot match 10.40.0.1. Lowering uses a bound half-open binary text range as prefilter, followed by a bound generated regex for partial octets. /32 uses address equality; /0 matches every non-NULL address. NotInSubnet negates the entire membership predicate over non-NULL addresses, not missing values. CIDR is a network operation argument, not an address for Eq or any_of. Typed callers use Ipv4Subnet. No Text, IPv6 or native inet conversion is implied. PostgreSQL uses COLLATE C and native regex; SQLite uses COLLATE BINARY and requires the executor to register regexp(pattern,value), returning NULL for NULL arguments and boolean membership otherwise. Generated patterns use only anchors, decimal alternatives, groups, [.] and [0-9]{1,3}. A usable range index must have the matching collation; index use is not guaranteed by semantic support. Preparation checks comparison, binary collation, conjunction, regex and negation capabilities.",
-        [member(syntax_target("model/logical_types")), member(syntax_target("graph/filter"))]),
-    point(syntax_target("model/logical_types"), "Logical types and field capabilities", [],
-        "Physical storage is not the logical value domain. Time fields distinguish DatetimeUtc, DateUtc, LocalDateTime and EpochMillis even when their storage is String or Int. Explicit logical_type(Ipv4) uses canonical dotted-decimal String storage with four octets 0..255 and no leading zeros; it is not Text. Address Eq/Ne and IPv4 CIDR InSubnet/NotInSubnet are defined; see the linked subnet contract. No lexical ordering, Contains, IPv6 or implicit conversion to Text. Noncanonical stored addresses violate the declared storage contract; preparation does not scan data. The field's published ops may narrow the type's operations, but cannot give a type an undefined operation. Index availability and cost are field/physical capability considerations, not a reason to reinterpret address semantics. Names of fields do not infer their types; raw unknown-format source columns remain Text until their representation is established. Logical types grant no filter or projection authorization.",
-        array::concat([[member(syntax_target("model/ipv4_subnets"))], array::map(type_points, fn(item) { member(item.target) })])),
-    point(syntax_target("model/field_roles"), "Field roles and object references", [],
-        "Dataset detail.references contains named {id,fields} sets. Each complete non-NULL tuple is a trusted unique address within that dataset; fields inside a set participate together, and different sets are alternative addresses. Field detail.nullable is derived from Option(T). Any missing member makes the entire reference unavailable; NULL is not an address value. A nullable reference does not establish a total key or grain. Do not treat one member of a composite set as a complete reference. Dataset detail.field_roles contains {field,roles}; Field detail has roles and reference_ids. Appellation participates in identity display and need not be unique; Reference participates in an explicitly declared unique address; Classification describes a category; Metric describes quantitative use. Roles may overlap. Formal metric declarations also derive Metric. Roles grant no query capabilities, do not change grain or keys, and imply no default display, URL, unit or aggregate. Only fully visible references are published. Query and report consumers must respect the separately declared capabilities.", []),
-    point(syntax_target("knowledge/target"), "Knowledge target", [],
-        "Index key index publishes schema keys and concrete knowledge key patterns; detail.revision identifies the Prepared Model revision. Names are URI-encoded components; Schema keys preserve slash-separated path segments. info accepts {key:<string>} and returns complete knowledge for the exact key. The discovery capability supplies Dataset and Relation roots. Consumers derive search vocabulary and references from info documents.",
-        [member(syntax_target("knowledge/node"))]),
-    point(syntax_target("knowledge/node"), "Knowledge node contract", [],
-        "Every Found node is {key,type,description,links,detail}. description is {label,aliases,localized,summary}; localized items are {locale,label,summary}; terms are {term,description}. links are {type,key}: Member structural membership, Related explanatory association, Traversable declared relation endpoint. Index detail is {revision,schemas,key_patterns,encoding}: schemas lists exact Schema keys; key_patterns lists {kind,pattern} for concrete nodes. Index enumerates no business instances. Dataset has {id,grain,time_roles,references,field_roles} and directly links to its fields, dimensions, measures, relations, time roles and business links. Field has {id,dataset,nullable,logical_type,roles,reference_ids}; Value has {id,ty,wires}; named Ty details contain id, storage, half_open, canonical_order and values with member labels, aliases, localized labels and wires. Dimension, Measure and Relation preserve their Model details. Measure detail.sampling contains its declared source field, unit, aggregate and Primary or SampleSummary role. Sampling metadata has no independent key. TimeRole identifies its owning dataset; BusinessLink has {id,hub,direction,guard}; Schema detail is empty. Labels are display text, never Intent identifiers. Follow references for capabilities, units and population semantics. info publishes only Index, Schema and concrete knowledge nodes. Unknown or hidden keys return NotFound. The discovery capability returns {revision,roots,key_patterns,vocabulary}; search vocabulary and reverse references are generated by consumers.",
-        [member(target(edsl::KnowledgeKind::Index, "", "index"))]),
-    point(syntax_target("knowledge/request"), "Knowledge request", [],
-        "The unbound knowledge service accepts exactly {method,input}. method is <domain>/info; input follows the declared info shape. A mounted service slot receives only input, without this envelope.",
-        [member(syntax_target("knowledge/info"))]),
-    point(syntax_target("knowledge/info"), "Knowledge info request", [],
-        "info input is exactly {key:<string>}. Read index for schema keys and concrete key patterns. Find business names through the consumer search service backed by externally generated terminology, then read exact keys. Dataset links directly identify members. Unknown or invisible keys return NotFound. discovery returns Dataset and Relation roots for consumer-side indexing.",
-        [member(syntax_target("knowledge/target")), member(target(edsl::KnowledgeKind::Index, "", "index"))]),
-    point(syntax_target("knowledge/discovery"), "Knowledge discovery request", [],
-        "discovery input is exactly {}. The independent capability returns {revision,roots,key_patterns,vocabulary}. roots contains complete visible Dataset and Relation keys. key_patterns shares the Index definition. vocabulary declares searchable membership and output shape as {kind,group,owner,require}; owner names the detail field and key placeholder; require checks a direct detail field is present and non-NULL. Kinds outside vocabulary remain readable but are not vocabulary members. An empty vocabulary declares no members; a missing declaration is a contract error. Consumers follow info references from these roots to find dimensions, measures, business types and their values. Structured descriptions include declared terms as {term,description}. Consumers derive terminology and unique reference edges for search and reverse lookup. Schema keys and concrete key patterns are available through info(index).",
-        [member(syntax_target("knowledge/info"))]),
-    point(syntax_target("intent"), "Intent syntax", [],
-        "Submit {intents:[...]} with one to five independent intents. Each top-level intent has op Graph, GraphPair or GraphUnion and an optional limit: an integer 1..9223372036854775807. Omission or explicit null preserves existing output behavior and adds no cap or binding. Other supplied values must be positive integers. limit caps final output rows after all business operations and is lowered into SQL plus bindings; it is independent of business take/Top-N. Nested operands do not require limit. The model defines limit semantics and the valid integer range. External plugins declare and enforce their own invocation requirements and result-row limits: they may require limit, restrict its range, or inject or override it before forwarding. When invoking through a plugin, follow that plugin's declared requirements. The service applies the supplied limit without additional result truncation or total/hasMore calculation. Values in filters are interpreted by their declared dimension or measure; do not supply an input kind.",
-        [member(syntax_target("graph")), member(syntax_target("graph_pair")), member(syntax_target("graph_union")),
-            member(syntax_target("knowledge/target")), member(syntax_target("knowledge/request"))]),
-    point(syntax_target("graph"), "Graph intent", [],
-        "Required: op=Graph, root node id, nodes, edges, select. Optional: top-level limit, row_grain=Root|Association, distinct, constraints, measures, measure_having, filters, time_windows, any_of, exists, count, count_value, count_having, count_groups, include_empty, group_by_identity, top_per, top_by_measure, order_by, take. A graph must project dimensions/measures or count an explicit subject. Entity, dimension, measure and relation IDs come from domain knowledge.",
-        [member(syntax_target("graph/node")), member(syntax_target("graph/edge")), member(syntax_target("graph/select")),
-            member(syntax_target("graph/filter")), member(syntax_target("graph/aggregate")),
-            member(syntax_target("graph/existence")), member(syntax_target("graph/order"))]),
-    point(syntax_target("graph/node"), "Graph node", [],
-        "Node: {id,entity}. id is a request-local node name; entity is a declared dataset ID. root names one node id.", []),
-    point(syntax_target("graph/edge"), "Graph edge", [],
-        "Edge or constraint: {relation,from,to}. relation is a declared relation ID; from and to name nodes. Only declared, directionally valid relations can be traversed.", []),
-    point(syntax_target("graph/select"), "Graph projection", [],
-        "select items are {node,dimension}; measures items are {node,measure}. count is a node id; count_value is {node,dimension}. group_by_identity is an array of node ids. Use declared IDs, not field or SQL names.", []),
-    point(syntax_target("graph/filter"), "Graph filter", [],
-        "filters items are {node,dimension,op,value}; any_of items are {node,dimension,values}. Operators: Eq, Ne, Gt, Ge, Lt, Le, Contains, NotContains, StartsWith, EndsWith, InSubnet, NotInSubnet. Subnet operators take a restricted canonical IPv4 CIDR network; read the shared subnet contract. The dimension declares allowed operators, logical input type and values. No kind field: use a JSON string, number or boolean compatible with the dimension. For half_open dimensions, a known concept uses its listed business ID; {\"unknown\":\"raw value\"} matches one unrecognized wire and {\"unknowns\":true} matches all unrecognized non-NULL wires. Ne takes the non-NULL complement. Consult dimension.value_contract for tagged result columns. Typed measure predicate inputs and canonical wires in info describe Model facts, not the Intent value shape. Resolve relative times before submission.", [member(syntax_target("model/ipv4_subnets"))]),
-    point(syntax_target("graph/aggregate"), "Graph aggregate", [],
-        "measure_having and existence having items are {node,measure,op,value}; value follows the measure output type. A measure ID selects its Model-declared aggregation, never an implicit override. If that meaning does not meet the business request, discover another declared measure or report the missing capability. Outer measure_having requires its measure in measures and either (1) group_by_identity=[root] with root-only selected dimensions, or (2) the supported contextual sample shape: root context -> owner and sample -> owner, both owner endpoints One or Optional, complete context/owner/sample identities, group_by_identity=[root,owner], and selections from context/owner only. The latter permits one optional owner -> ancestor edge with an at-most-one ancestor endpoint and ancestor selections; exactly three nodes, or four with that ancestor, and no extra edges, row count, business-link edges or include_empty. This keeps each owner's sample population separate per context identity instead of merging names or multiplying observations. Existence having is checked in its own population, not by the outer measure_having shape. count_having is {op,value} with integer value. count_groups and include_empty are booleans. Do not add identity grouping merely to bypass a rejection if it changes the requested business groups.",
-        [member(syntax_target("graph/select")), member(syntax_target("graph/edge")), member(syntax_target("graph/existence"))]),
-    point(syntax_target("graph/filter/capabilities"), "Declared filter capabilities", [],
-        "The syntax operator vocabulary is not permission to apply every operator to every dimension. Read the dimension's filterable, ops, input_kinds and values. Eq-only is a Model capability boundary, not a missing SQL implementation. A rejected Contains cannot silently become StartsWith or Eq: these select different populations. Choose a discovered equivalent plan, ask a business clarification when appropriate, or explain the unavailable capability. Text pattern operators currently compare case-folded text; do not infer exact case-sensitive identifier semantics. Model scope and filtered-measure predicates obey the same declared capabilities.",
-        [member(syntax_target("graph/filter"))]),
-    point(syntax_target("graph/order/semantics"), "Ordering and aggregate meaning", [],
-        "Raw order_by plus take returns the first rows in one global ordered population, not per-group Min or Max statistics. Raw take appends complete declared grain identity columns as tie breakers for deterministic selection; it does not promise a business preference among equal values. SQLite ASC places NULL first and DESC places NULL last; PostgreSQL execution equivalence must explicitly preserve that contract rather than use its opposite defaults. Consequently ASC take=1 may return a missing value whereas Min ignores NULL. Aggregate top_by_measure ranks by the selected measure's declared aggregation: highest average is not highest sample peak. Discover a declared sample summary when that is the requested meaning, and never substitute raw Top-N for a missing statistical capability without explaining the different business result.",
-        [member(syntax_target("graph/order")), member(syntax_target("graph/aggregate"))]),
-    point(syntax_target("graph/existence"), "Graph existence", [],
-        "Use EXISTS to qualify outer rows without multiplying their grain. Complete Graph shape: {\"op\":\"Graph\",\"limit\":1000,\"root\":\"outer\",\"nodes\":[{\"id\":\"outer\",\"entity\":\"<outer entity>\"}],\"edges\":[],\"select\":[{\"node\":\"outer\",\"dimension\":\"<outer dimension>\"}],\"exists\":[{\"anchor\":\"outer\",\"nodes\":[{\"id\":\"related\",\"entity\":\"<related entity>\"}],\"edges\":[{\"relation\":\"<declared relation>\",\"from\":\"related\",\"to\":\"outer\"}],\"filters\":[{\"node\":\"related\",\"dimension\":\"<related dimension>\",\"op\":\"Eq\",\"value\":\"<value>\"}]}]}. Replace placeholders using domain info; relation direction must match its declaration and may instead run from outer to related. The anchor names an outer node; inner nodes belong only to EXISTS. Other optional existence keys: constraints, time_windows, any_of, having, negated (boolean). Remove the example filter if mere existence is enough. An outer count or measure can replace select when its grain is valid.",
-        [member(syntax_target("graph/edge")), member(syntax_target("graph/filter"))]),
-    point(syntax_target("graph/order"), "Graph ordering and time", [],
-        "Raw global Top-N Graph shape: {\"op\":\"Graph\",\"limit\":1000,\"root\":\"row\",\"nodes\":[{\"id\":\"row\",\"entity\":\"<entity>\"}],\"edges\":[],\"select\":[{\"node\":\"row\",\"dimension\":\"<dimension>\"}],\"order_by\":[{\"node\":\"row\",\"dimension\":\"<ordered dimension>\",\"direction\":\"Desc\"}],\"take\":3}. Raw take requires ordered raw rows and grain-safe joins from the root; qualify multiplying paths with EXISTS (see syntax/graph/existence). Aggregate Top-N Graph shape: {\"op\":\"Graph\",\"limit\":1000,\"root\":\"row\",\"nodes\":[{\"id\":\"row\",\"entity\":\"<entity>\"}],\"edges\":[],\"select\":[{\"node\":\"row\",\"dimension\":\"<group dimension>\"}],\"measures\":[{\"node\":\"row\",\"measure\":\"<measure>\"}],\"top_by_measure\":{\"node\":\"row\",\"measure\":\"<measure>\",\"direction\":\"Desc\",\"take\":3}}. This ranks visible dimension groups only when hidden identity keys do not split them and the measure source is grain-safe. Per-owner sample Top-N Graph shape: {\"op\":\"Graph\",\"limit\":1000,\"root\":\"owner\",\"nodes\":[{\"id\":\"owner\",\"entity\":\"<owner entity>\"},{\"id\":\"sample\",\"entity\":\"<sample entity>\"}],\"edges\":[{\"relation\":\"<sample-to-owner relation>\",\"from\":\"sample\",\"to\":\"owner\"}],\"select\":[{\"node\":\"owner\",\"dimension\":\"<owner dimension>\"},{\"node\":\"sample\",\"dimension\":\"<sample dimension>\"}],\"top_per\":{\"owner\":\"owner\",\"sample\":\"sample\",\"rank\":\"<ordered sample dimension>\",\"take\":3}}. It requires exactly one declared sample-to-owner edge whose owner endpoint is One or Optional, a sample grain and an ordered sample rank dimension. Replace all placeholders using domain info. order_by items are {node,dimension,direction} with Asc|Desc; take is a positive bounded integer. time_windows items are {node,dimension,start,end}; end may be null or omitted for an open upper bound. Time values use the dimension's declared logical format.",
-        [member(syntax_target("graph/existence")), member(syntax_target("graph/aggregate")), member(syntax_target("operations/time_window")), member(syntax_target("graph/latest"))]),
-    point(syntax_target("graph/latest"), "Latest sample measure", [],
-        "Latest is a Model-declared numeric measure selected through measures:[{node,measure}]. Within each actual grouping population, order eligible rows by the dataset's authoritative UTC instant descending, NULLS LAST, then remaining complete sample grain ascending, NULLS FIRST. Return that row's original value and unit, preserving a selected NULL; never substitute an older non-NULL value. Measures on the same sample node share one selected row. NULL-time rows cannot supply Latest, but remain in ordinary Avg/Count populations. Dataset scope, joins, filters, explicit half-open windows and EXISTS qualify samples before selection; measure_having compares the selected value afterwards. No implicit now cutoff; future samples can match an unbounded window. Use complete owner identity grouping for per-owner questions. Latest can coexist with same-source ordinary measures, participate in top_by_measure and be the measure of each GraphPair window; align owner identities for comparisons. Initial restrictions: one Latest sample source/order per grouped operand, numeric fields, no DISTINCT, aggregate-local FILTER, external dependencies, raw top_per, derived union source, or nested EXISTS aggregate predicates. Missing owners follow existing inner-join population semantics; Latest does not extend include_empty. Read the measure's TimeRole and dataset grain references for the selection clock and tie fields. Raw top_per remains the whole-row retrieval path.",
-        [member(syntax_target("graph/aggregate")), member(syntax_target("graph/order")), member(syntax_target("graph_pair")), member(syntax_target("operations/time_window"))]),
-    point(syntax_target("graph_pair"), "Graph pair", [],
-        "GraphPair shape: {op:GraphPair,limit?:<positive integer>,left:<Graph>,right:<Graph>,align_by:[{left:{node:<left node>},right:{node:<right node>}}],select:[{side:Left|Right,node:<node on that side>,dimension:<dimension>}],count_groups?:boolean,rank_by?:<rank>}. Required nonempty align_by pairs nodes of the same entity and expands complete model-declared identities, including composite grains. Node IDs may differ; no repeated nodes. Each operand has exactly one measure, empty or omitted select, and group_by_identity exactly matching its aligned nodes in order, beginning with root. Required outer select (may be empty) chooses a side per column and only references aligned nodes whose attributes are determined by identity. It derives operand projections; display dimensions never become alignment keys. Output follows select order then both measures; aliases are left_<node>_<dimension or measure> / right_<node>_<dimension or measure>, with adjacent __kind for half-open dimensions. Both sides can expose differing display values without changing matching. An identity containing time pairs individual sample points, not periods. Disjoint windows on the same aligned identity time field are rejected because no identity can match; align owner entities for period comparisons. Equal or overlapping windows remain valid. Independently aggregate and inner join identities; apply filters, time_windows, exists and measure_having inside each population. Operand counts, distinct, include_empty, order_by, take, top_by_measure and top_per are forbidden. Rank examples: {op:Subtract,minuend:Right,subtrahend:Left,direction:Desc,take:5}; {op:Ratio,numerator:Right,denominator:Left,direction:Desc,take:5}; {op:GrowthRate,current:Right,baseline:Left,direction:Desc,take:5}. Side parameters accept Left|Right but must reference different sides. Formulas: minuend-subtrahend; numerator/denominator; (current-baseline)/baseline as a fraction (0.2 means 20%). direction is Asc|Desc; take is an integer 1..1000. Both measures must be numeric; different measure IDs require matching non-null declared units. Exclude NULL measures, zero Ratio denominators and nonpositive GrowthRate baselines. Negative current values remain eligible. Cast both operands to approximate double precision; rank after identity joining, with complete alignment identity ties ascending, NULLS FIRST. Ranked results append numeric comparison_value after both measures and order by that column. Subtract retains the declared operand unit (percent differences are percentage points); Ratio returns a dimensionless multiple; GrowthRate returns a dimensionless fraction. Unranked results have no comparison column. Profile authorization requires Order, Limit, Scalar, Filter and IsNotNull, plus Sub for Subtract, Div/Ne for Ratio or Sub/Div/Gt for GrowthRate. Ranking cannot combine with count_groups:true; unranked count_groups counts all aligned identities.",
-        [member(syntax_target("graph"))]),
-    point(syntax_target("graph_union"), "Graph union", [],
-        "{op:GraphUnion,limit?:<positive integer>,branches:[{result_node,graph},...]}. At least two Graph branches return the same entity and selected dimensions in the same order. Each branch projects the complete result identity as raw unordered rows; union removes duplicates.",
-        [member(syntax_target("graph"))]),
-];
 
 def labels: Fn(Array(edsl::LocalizedKnowledgeText)) -> Array(String) = fn(texts) {
     array::map(texts, fn(entry) { entry.label })
@@ -268,10 +169,7 @@ def dataset_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Point = fn(p
     }), fn(link) {
         member(target(edsl::KnowledgeKind::BusinessLink, payload.entities[link.hub].id, link.id))
     });
-    let role_contract = if array::length(brief.references) > 0 || array::length(brief.field_roles) > 0 {
-        [member(syntax_target("model/field_roles"))]
-    } else { [] };
-    let refs = array::concat([fields, dimensions, measures, times, relations, links, role_contract]);
+    let refs = array::concat([fields, dimensions, measures, times, relations, links]);
     let item = point(id, brief.label, array::concat([brief.aliases, labels(brief.localized)]), brief.summary, refs);
     let entity = match array::find(payload.entities, fn(e) { e.id == brief.id }) {
         Some(e) => e, None => fail!("knowledge dataset disappeared from prepared model", brief.id),
@@ -286,29 +184,13 @@ def dataset_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Point = fn(p
 
 def dimension_point: Fn(edsl::PreparedPayload, String) -> Point = fn(payload, id) {
     let detail = edsl::visible_dimension_detail(payload, id);
-    let parent = target(edsl::KnowledgeKind::Dataset, "", detail.dataset);
     let dimension = target(edsl::KnowledgeKind::Dimension, detail.dataset, detail.id);
     let value_refs = array::map(detail.values, fn(value) {
         member(target(edsl::KnowledgeKind::Value, detail.ty, value.id))
     });
-    let operation_contracts = if detail.input_kinds == [edsl::FilterInputKind::Ipv4] {
-        [member(syntax_target("graph/filter/capabilities")), member(syntax_target("model/ipv4_subnets"))]
-    } else { [member(syntax_target("graph/filter/capabilities"))] };
-    let entity = match array::find(payload.entities, fn(entity) { entity.id == detail.dataset }) {
-        Some(entity) => entity, None => fail!("dimension owner missing", detail.dataset),
-    };
-    let field = match array::find(entity.fields, fn(field) { field.name == detail.field }) {
-        Some(field) => field, None => fail!("dimension field missing", detail.field),
-    };
-    let bucket_contract = match property::get_field_prop(entity.entity_type, field.index, edsl::UtcBucketDimensionsDef.type) {
-        Some(definition) => if array::any(definition.dimensions, fn(spec) { spec.id == detail.id }) {
-            [member(syntax_target("operations/utc_time_bucket"))]
-        } else { [] },
-        None => [],
-    };
-    let contracts = array::concat([operation_contracts, bucket_contract, array::map(detail.input_kinds, input_type_ref)]);
+    let contracts = array::map(detail.input_kinds, input_type_ref);
     let base = point(dimension, detail.label, array::concat([detail.aliases, labels(detail.localized)]),
-        detail.summary, array::concat([[member(parent), member(target(edsl::KnowledgeKind::Field, detail.dataset, detail.field)), member(type_target(detail.ty))], value_refs, contracts]));
+        detail.summary, array::concat([[member(target(edsl::KnowledgeKind::Field, detail.dataset, detail.field)), member(type_target(detail.ty))], value_refs, contracts]));
     {...base, dimension: Some(detail), localized: detail.localized}
 };
 
@@ -350,14 +232,13 @@ def measure_point: Fn(edsl::PreparedPayload, String) -> Point = fn(payload, id) 
     };
     let latest_refs = if detail.aggregate == Some(qb::AggregateFunction::Latest) {
         let dataset = edsl::dataset_domain(payload, detail.dataset);
-        array::concat([[member(syntax_target("graph/latest"))],
+        array::concat([
             match dataset.utc_time {
                 Some(name) => [member(target(edsl::KnowledgeKind::TimeRole, detail.dataset, name))], None => [],
             },
             array::map(dataset.grain, fn(name) { member(target(edsl::KnowledgeKind::Field, detail.dataset, name)) })])
     } else { [] };
     let refs = array::concat([
-        [member(target(edsl::KnowledgeKind::Dataset, "", detail.dataset))],
         field_refs,
         array::map(detail.required_dataset_ids, fn(dataset) {
             member(target(edsl::KnowledgeKind::Dataset, "", dataset))
@@ -366,7 +247,8 @@ def measure_point: Fn(edsl::PreparedPayload, String) -> Point = fn(payload, id) 
     ]);
     let base = point(target(edsl::KnowledgeKind::Measure, detail.dataset, detail.id), detail.label,
         array::concat([detail.aliases, labels(detail.localized)]), detail.summary, refs);
-    {...base, measure: Some(detail), localized: detail.localized}
+    {...base, measure: Some(detail), localized: detail.localized,
+        grain: if detail.aggregate == Some(qb::AggregateFunction::Latest) { edsl::dataset_domain(payload, detail.dataset).grain } else { [] }}
 };
 
 def relation_point: Fn(edsl::PreparedPayload, String) -> Point = fn(payload, id) {
@@ -407,8 +289,7 @@ def field_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief, String) -> Point 
     let entity = match array::find(payload.entities, fn(entity) { entity.id == brief.id }) {
         Some(entity) => entity, None => fail!("published dataset missing", brief.id),
     };
-    let item = point(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], "",
-        [member(target(edsl::KnowledgeKind::Dataset, "", brief.id))]);
+    let item = point(target(edsl::KnowledgeKind::Field, brief.id, name), name, [], "", []);
     let field = match array::find(entity.fields, fn(field) { field.name == name }) {
         Some(field) => field, None => fail!("published field missing", brief.id, name),
     };
@@ -426,8 +307,7 @@ def field_point: Fn(edsl::PreparedPayload, edsl::DatasetBrief, String) -> Point 
 
 def time_role_point: Fn(edsl::DatasetBrief, edsl::TimeRoleBrief) -> Point = fn(brief, role) {
     let base = point(target(edsl::KnowledgeKind::TimeRole, brief.id, role.field), role.field, [], "",
-        array::concat([[member(target(edsl::KnowledgeKind::Dataset, "", brief.id)),
-            member(target(edsl::KnowledgeKind::Field, brief.id, role.field))],
+        array::concat([[member(target(edsl::KnowledgeKind::Field, brief.id, role.field))],
             array::map(role.dimension_ids, fn(id) {
                 member(target(edsl::KnowledgeKind::Dimension, brief.id, id))
             }), [match codec::encode(role.logical_type) {
@@ -456,6 +336,9 @@ def dataset_members: Fn(edsl::PreparedPayload, edsl::DatasetBrief) -> Array(Poin
 def target_key: Fn(edsl::KnowledgeTarget) -> String = fn(id) {
     edsl::knowledge_key(id)
 };
+
+def target_role: Fn(edsl::KnowledgeKind) -> String = edsl::knowledge_role;
+def target_address: Fn(edsl::KnowledgeTarget) -> NodeAddress = edsl::knowledge_address;
 
 def visible_terms: Fn(edsl::PreparedPayload, Array(IndexEntry)) -> Array(edsl::TermAnnotation) =
     fn(payload, entries) {
@@ -499,7 +382,7 @@ def map: Fn(edsl::PreparedPayload) -> Array(Point) = fn(payload) {
         }
     });
     let keys = dict::from_pairs(array::map(index.entries, fn(entry) { (target_key(entry.key), True) }));
-    let raw = array::concat([syntax_points, type_points, array::map(domain, fn(item) {
+    let raw = array::concat([type_points, array::map(domain, fn(item) {
         let refs = array::concat([item.refs, array::map(array::filter(related, fn(ref) {
             ref.source == item.target && dict::get(keys, target_key(ref.target)) != None
         }), fn(ref) { {target: ref.target, kind: LinkKind::Related} })]);
@@ -577,7 +460,7 @@ def index_from_model: Fn(edsl::PreparedPayload) -> KnowledgeIndex = fn(payload) 
         }
     });
     let typed = value_type_points(payload);
-    let entries = array::map(array::concat([index_entries(syntax_points).entries, index_entries(type_points).entries, index_entries(typed).entries, roots, members]), fn(entry) {
+    let entries = array::map(array::concat([index_entries(type_points).entries, index_entries(typed).entries, roots, members]), fn(entry) {
         match array::find(docs, fn(note) { note.target == entry.key }) {
             Some(note) => {...entry, summary: note.text}, None => entry,
         }
@@ -707,11 +590,6 @@ def raw_point_from_model: Fn(edsl::PreparedPayload, KnowledgeIndex, edsl::Knowle
             match array::find(type_points, fn(item) { item.target == key }) {
                 Some(item) => DocResult::Found(item), None => fail!("knowledge data type disappeared", key),
             }
-        } else if key.kind == edsl::KnowledgeKind::Schema {
-            match array::find(syntax_points, fn(item) { item.target == key }) {
-                Some(item) => DocResult::Found(item),
-                None => fail!("knowledge schema key has no point", key),
-            }
         } else {
             let owner = if key.kind == edsl::KnowledgeKind::Dataset { key.id } else { key.owner };
             let brief = match dict::get(index.datasets, owner) {
@@ -772,7 +650,7 @@ def decode_request: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, con
     match codec::decode@[A](value) {
         Ok(decoded) => decoded,
         Err(error) => raise!(blame::with_context(error,
-            `see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", contract)}`)),
+            `contract \{contract}`)),
     }
 };
 
@@ -792,7 +670,7 @@ def serve_catalog: Fn(edsl::PreparedPayload, KnowledgeIndex, String, Value) -> K
     if envelope.method == `\{domain}/info` {
         let input = decode_request@[InfoInput](envelope.input, "syntax/knowledge/info");
         KnowledgeResponse::Document(point_from_key(payload, index, input.key))
-    } else { fail!(`unknown knowledge method for domain; see info key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Schema, "", "syntax/knowledge/request")}`, envelope.method, domain) }
+    } else { fail!(`unknown knowledge method for domain`, envelope.method, domain) }
 };
 
 def serve: Fn(edsl::PreparedPayload, String, Value) -> KnowledgeResponse = fn(payload, domain, request) {
@@ -803,10 +681,12 @@ def object_value: Fn(Array((String, Value))) -> Value = fn(fields) {
     Value::Object(dict::from_pairs(fields))
 };
 
+type LatestSelection = struct { time_order: String, null_time: String, null_value: String, tie_order: String, tie_nulls: String, clock: Array(String), grain: Array(String) };
+
 type KeyPattern = struct { kind: edsl::KnowledgeKind, pattern: String };
 type VocabularyEntry = struct { kind: edsl::KnowledgeKind, group: String, owner: Option(String), require: Option(String) };
-type IndexDetail = struct { revision: String, schemas: Array(String), key_patterns: Array(KeyPattern), encoding: String };
-type DiscoveryDetail = struct { revision: String, roots: Array(String), key_patterns: Array(KeyPattern), vocabulary: Array(VocabularyEntry) };
+type IndexDetail = struct { revision: String, key_patterns: Array(KeyPattern), encoding: String };
+type DiscoveryDetail = struct { addressing: String, knowledge_contract: String, intent_contract: String, revision: String, roots: Array(String), key_patterns: Array(KeyPattern), vocabulary: Array(VocabularyEntry) };
 def vocabulary: Array(VocabularyEntry) = [
     {kind: edsl::KnowledgeKind::Dataset, group: "datasets", owner: None, require: None},
     {kind: edsl::KnowledgeKind::Dimension, group: "dimensions", owner: Some("dataset"), require: None},
@@ -835,11 +715,19 @@ def owned_detail: for(A: codec::Encode) Fn(String, A) -> Value = fn(dataset, det
     }
 };
 
+def primitive_detail: Fn(String) -> Value = fn(id) {
+    let ordered = id == "Int" || id == "Number" || id == "DatetimeUtc" || id == "DateUtc" || id == "LocalDateTime" || id == "EpochMillis";
+    let ops = array::concat([["Eq", "Ne"], if ordered { ["Gt", "Ge", "Lt", "Le"] } else { [] },
+        if id == "Text" { ["Contains", "NotContains", "StartsWith", "EndsWith"] } else { [] },
+        if id == "Ipv4" { ["InSubnet", "NotInSubnet"] } else { [] }]);
+    object_value([("id", Value::String(id)), ("operations", codec::encode(ops)),
+        ("nullable_comparison", Value::String("NonNullPopulation"))])
+};
+
 def node_value: Fn(Point) -> Value = fn(item) {
     let detail = match item.target.kind {
         edsl::KnowledgeKind::Index => codec::encode({revision: item.revision,
-            schemas: array::map(match item.entries { Some(entries) => entries, None => [] }, fn(entry) { target_key(entry.key) }),
-            key_patterns, encoding: "Encode each canonical name as one URI component exactly once. Schema keys use Schema/syntax/{path}; encode each path segment. Returned keys are complete and can be passed directly to info."}.ty!(IndexDetail)),
+            key_patterns, encoding: "Each canonical name is encoded once as a URI component. Knowledge keys are complete stable identities; link keys identify nodes in the same publication."}.ty!(IndexDetail)),
         edsl::KnowledgeKind::Dataset => codec::encode({id: item.target.id, grain: item.grain, time_roles: item.time_roles,
             references: item.references, field_roles: item.field_roles}.ty!(DatasetDetail)),
         edsl::KnowledgeKind::Field => codec::encode({id: item.target.id, dataset: item.target.owner, nullable: item.nullable, logical_type: item.logical_type, roles: item.roles,
@@ -853,7 +741,7 @@ def node_value: Fn(Point) -> Value = fn(item) {
                     };
                     {id: value.id, label: value.label, aliases: value.aliases, localized: value.localized, wires}.ty!(TypeValueDetail)
                 })}.ty!(ValueTypeDetail)),
-            None => object_value([("id", Value::String(item.target.id))]),
+            None => primitive_detail(item.target.id),
         },
         edsl::KnowledgeKind::Value => codec::encode({id: item.target.id, ty: item.target.owner,
             wires: match item.value { Some(value) => value.wires, None => [] }}.ty!(ValueDetail)),
@@ -861,7 +749,16 @@ def node_value: Fn(Point) -> Value = fn(item) {
             Some(value) => codec::encode(value), None => object_value([]),
         },
         edsl::KnowledgeKind::Measure => match item.measure {
-            Some(value) => codec::encode(value), None => object_value([]),
+            Some(value) => if value.aggregate == Some(qb::AggregateFunction::Latest) {
+                match codec::encode(value) {
+                    Value::Object(fields) => Value::Object(dict::merge(fields, {selection: codec::encode({
+                        time_order: "Desc", null_time: "Excluded", null_value: "Preserved", tie_order: "Asc", tie_nulls: "First",
+                        clock: array::map(array::filter(item.refs, fn(ref) { ref.target.kind == edsl::KnowledgeKind::TimeRole }), fn(ref) { target_key(ref.target) }),
+                        grain: array::map(item.grain, fn(name) { target_key(target(edsl::KnowledgeKind::Field, value.dataset, name)) })
+                    }.ty!(LatestSelection))})),
+                    other => fail!("measure detail must be a record", other),
+                }
+            } else { codec::encode(value) }, None => object_value([]),
         },
         edsl::KnowledgeKind::Relation => match item.relation {
             Some(value) => codec::encode(value), None => object_value([]),
@@ -875,11 +772,12 @@ def node_value: Fn(Point) -> Value = fn(item) {
     };
     object_value([
         ("key", Value::String(target_key(item.target))),
+        ("address", codec::encode(target_address(item.target))),
         ("type", codec::encode(item.target.kind)),
         ("description", codec::encode({label: item.label, aliases: item.aliases, localized: item.localized, summary: item.summary,
             terms: array::map(item.terms, fn(term) { {term: term.term, description: term.description}.ty!(TermText) })}.ty!(Description))),
         ("links", codec::encode(array::map(item.refs, fn(ref) {
-            object_value([("type", codec::encode(ref.kind)), ("key", Value::String(target_key(ref.target)))])
+            object_value([("type", codec::encode(ref.kind)), ("key", Value::String(target_key(ref.target))), ("role", Value::String(target_role(ref.target.kind)))])
         }))),
         ("detail", detail),
     ])
@@ -928,7 +826,7 @@ def discovery_keys: Fn(edsl::PreparedPayload) -> Array(String) = fn(payload) {
 };
 
 def knowledge_discovery_method_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> Value = fn(payload) {
-    let detail: DiscoveryDetail = {revision: payload.revision, roots: discovery_keys(payload), key_patterns, vocabulary};
+    let detail: DiscoveryDetail = {addressing: "node-member-uri-v1", knowledge_contract: "ontology-knowledge-v3", intent_contract: "ontology-intent-v1", revision: payload.revision, roots: discovery_keys(payload), key_patterns, vocabulary};
     let response = codec::encode(detail);
     fn(input) {
         let request = decode_request@[DiscoveryInput](input, "syntax/knowledge/discovery");
@@ -937,10 +835,10 @@ def knowledge_discovery_method_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -
 };
 
 pub use self::{ LinkKind, KnowledgeLink, Point, IndexEntry, KnowledgeIndex, DocResult, KnowledgeResponse,
-    Description, TermText, NodeLink, Node, NodeResult, NodeResponse, node_value,
+    Description, TermText, NodeAddress, NodeLink, Node, NodeResult, NodeResponse, node_value,
     DatasetDetail, FieldDetail, ValueDetail, TypeValueDetail, ValueTypeDetail, BusinessLinkDetail, KeyPattern, IndexDetail, DiscoveryDetail, VocabularyEntry,
     map, index_entries, index_from_model, by_target, knowledge_lookup_factory, serve, serve_value,
     DatasetTerm, DimensionTerm, MeasureTerm, ValueTerm, RelationTerm, TerminologyIndex, terminology_from_model,
     LinkEntry, LinksIndex, links_from_model,
-    discovery_keys, knowledge_discovery_method_factory,
+    target_address, target_role, discovery_keys, knowledge_discovery_method_factory,
     knowledge_service_factory, knowledge_info_method_factory };

@@ -25,13 +25,7 @@ export function renderKnowledge(nodes) {
   const sections = nodes.map((node) => {
     const { key, type, description, links, detail } = node;
     for (const key of discoveryKeys(node)) checkLink(key);
-    let content;
-    if (type === 'Index') {
-      content = `<ul>${detail.schemas.map(key => `<li>${link(key)}</li>`).join('')}</ul>` +
-        `<pre>${escape(JSON.stringify({ key_patterns: detail.key_patterns, encoding: detail.encoding, revision: detail.revision }, null, 2))}</pre>`;
-    } else {
-      content = `<pre>${escape(JSON.stringify(detail, null, 2))}</pre>`;
-    }
+    const content = `<pre>${escape(JSON.stringify(detail, null, 2))}</pre>`;
     return `<section id="${escape(key)}"><h2>${escape(description.label)}</h2>` +
       `<p class="identity">${escape(type)} · ${escape(key)}</p>` +
       `<p>${escape(description.summary ?? '')}</p>` +

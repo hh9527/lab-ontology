@@ -27,7 +27,6 @@ export async function collectKnowledge(info, roots) {
 
 export function discoveryKeys(node) {
   const keys = node.links.map(link => link.key);
-  if (node.type === 'Index') keys.push(...node.detail.schemas);
   if (keys.some(key => typeof key !== 'string')) {
     throw new Error('Knowledge references require opaque string keys');
   }

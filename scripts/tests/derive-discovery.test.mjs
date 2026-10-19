@@ -28,8 +28,7 @@ function discoveryFixture() {
 }
 function fixture() {
   return [
-    node('index', 'Index', {revision: 'v1', schemas: ['Schema/test'], key_patterns: discoveryFixture().key_patterns}),
-    node('Schema/test', 'Schema', {}, [{ key: 'index', type: 'Member' }]),
+    node('index', 'Index', {revision: 'v1', key_patterns: discoveryFixture().key_patterns}),
     node('Dataset/a%2Fb', 'Dataset', { id: 'a/b' }, [{ key: 'Dimension/a%2Fb/status', type: 'Member' }]),
     node('Dimension/a%2Fb/status', 'Dimension', { id: 'status', dataset: 'a/b', ty: 'Status' },
       [{ key: 'Ty/Status', type: 'Member' }, { key: 'Ty/Int', type: 'Member' }],
@@ -44,7 +43,7 @@ function fixture() {
   ];
 }
 
-test('discovers from Dataset/Relation roots using only exact info, including cycles and schemas', async () => {
+test('discovers from Dataset/Relation roots using only exact info, including cycles', async () => {
   const source = new Map(fixture().map(node => [node.key, node]));
   const calls = [];
   const nodes = await discover(async ({ key }) => {
