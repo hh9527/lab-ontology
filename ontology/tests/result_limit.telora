@@ -49,7 +49,7 @@ def profile: qb::PlanProfile = {
         qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter, qb::Operator::Join,
         qb::Operator::Group, qb::Operator::Aggregate, qb::Operator::Having, qb::Operator::Order,
         qb::Operator::Limit, qb::Operator::Partition],
-    allowed_join_kinds: [qb::JoinKind::Inner],
+    allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
     allowed_aggregates: [qb::AggregateFunction::Avg, qb::AggregateFunction::Count, qb::AggregateFunction::Latest],
     allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Gt, qb::ScalarFunction::And,
         qb::ScalarFunction::Sub, qb::ScalarFunction::IsNotNull],
@@ -89,7 +89,7 @@ def fixtures: Array(Fixture) = [
     {name: "union", intent: union},
     {name: "empty", intent: patch(plain, {filters: parse(r#"[{"node":"o","dimension":"id","op":"Eq","value":-1}]"#)})},
 ];
-type RuntimeCase = struct { name: String, mode: String, limit: Option(Int), sqlite: qb::Query, postgres: qb::Query };
+type RuntimeCase = struct { name: String, mode: String, limit: Option(Int), sqlite: intent::PreparedQuery, postgres: intent::PreparedQuery };
 type LimitCase = struct { mode: String, limit: Option(Int) };
 def limit_cases: Array(LimitCase) = array::concat([
     [{mode: "omitted", limit: None}, {mode: "null", limit: None}],
@@ -101,8 +101,7 @@ pub def execution_queries: Value = codec::encode(array::flat_map(fixtures, fn(it
     array::map(limit_cases, fn(cap) {
         let input = if cap.mode == "omitted" { item.intent }
             else { patch(item.intent, {limit: match cap.limit { None => Value::None, Some(value) => Value::Int(value) }}) };
-        let ast = lower(input);
-        {name: item.name, mode: cap.mode, limit: cap.limit, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}.ty!(RuntimeCase)
+        {name: item.name, mode: cap.mode, limit: cap.limit, sqlite: prepare_columns(sqlite::build_query, input), postgres: prepare_columns(postgres::build_query, input)}.ty!(RuntimeCase)
     })
 }));
 pub def illegal_limits_are_rejected_for_every_top_level_op: test::Test = test::should_ok(fn() {
@@ -224,4 +223,66 @@ pub def mixed_optional_and_explicit_batch_is_accepted: test::Test = test::should
         } else { fail!("mixed optional batch rejected", response) },
         _ => fail!("invalid response", response),
     }
+});
+
+# Every public result shape has a schema before SQL execution, including
+# wrappers whose implicit SQL column name otherwise differs by dialect.
+def nullable_join: Value = patch(aggregate, {
+    measures: Value::Array([]), count: Value::String("s"), include_empty: Value::True,
+    select: parse(r#"[{"node":"o","dimension":"id"},{"node":"s","dimension":"value"}]"#),
+});
+def column_fixtures: Array(Fixture) = array::push(fixtures, {name: "nullable_join", intent: nullable_join});
+type ColumnResponse = struct { accepted: Bool, diagnostics: Array(Value), queries: Option(Array(intent::PreparedQuery)) };
+def prepare_columns: Fn(intent::ToQuery, Value) -> intent::PreparedQuery = fn(dialect, input) {
+    let response = intent::query_request_method_factory(payload, dialect)(Value::Object({intents: Value::Array([input])}));
+    match codec::decode@[ColumnResponse](response).unwrap!().queries {
+        Some(queries) => queries[0], None => fail!("valid shape rejected during column preparation", response),
+    }
+};
+pub def columns_cover_all_final_query_shapes: test::Test = test::should_ok(fn() {
+    if array::all(column_fixtures, fn(item) {
+        let sq = prepare_columns(sqlite::build_query, item.intent);
+        let pg = prepare_columns(postgres::build_query, item.intent);
+        let expected = match item.name {
+            "aggregate" => ["o_id", "s_mean"],
+            "aggregate_top" => ["o_id", "s_mean"],
+            "latest" => ["o_id", "s_mean", "s_latest"],
+            "distinct" => ["o_label"],
+            "partitioned" => ["o_id", "s_value"],
+            "nullable_join" => ["o_id", "s_value", "s_count"],
+            "pair" => ["left_o_id", "left_s_mean", "right_s_mean"],
+            "ranked_pair" => ["left_o_id", "left_s_mean", "right_s_mean", "comparison_value"],
+            "pair_count" => ["count"],
+            "group_count" => ["count"],
+            _ => ["o_id"],
+        };
+        array::map(sq.columns, fn(column) { column.name }) == expected && sq.columns == pg.columns
+    }) { True } else { fail!("final query shape lost its columns") }
+});
+type ColumnExecutionCase = struct { name: String, sqlite: intent::PreparedQuery, postgres: intent::PreparedQuery };
+pub def column_execution_queries: Value = codec::encode(array::map(column_fixtures, fn(item) {
+    {name: item.name, sqlite: prepare_columns(sqlite::build_query, item.intent), postgres: prepare_columns(postgres::build_query, item.intent)}.ty!(ColumnExecutionCase)
+}));
+
+
+pub def left_join_nullability_does_not_change_root_or_count: test::Test = test::should_ok(fn() {
+    let columns = prepare_columns(sqlite::build_query, nullable_join).columns;
+    if array::map(columns, fn(column) { column.nullable }) == [False, True, False] { True }
+    else { fail!("left join nullability is wrong", columns) }
+});
+
+# The slot identifies the outer output cap, including queries with their own
+# ranking/partition limits and equal-valued filter bindings.
+pub def public_limit_slot_identifies_only_top_level_limit: test::Test = test::should_ok(fn() {
+    array::all(fixtures, fn(item) {
+        let input = patch(item.intent, {limit: Value::Int(3)});
+        let sq = prepare_columns(sqlite::build_query, input);
+        let pg = prepare_columns(postgres::build_query, input);
+        match (sq.limit_slot, pg.limit_slot) {
+            (Some(a), Some(b)) => a == b && a >= 0 && sq.bindings[a] == qb::Val::Int(3)
+                && pg.bindings[b] == qb::Val::Int(3)
+                && prepare_columns(sqlite::build_query, item.intent).limit_slot == None,
+            _ => False,
+        }
+    })
 });

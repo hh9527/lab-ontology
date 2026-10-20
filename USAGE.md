@@ -208,6 +208,63 @@ Intent in the same order; otherwise `queries` is null. A successful batch may
 still have warnings; read them before using its Queries. This is a batch of
 independent plans, not a union into one result set.
 
+Each successful Query is `{sql, bindings, columns, limit_slot}`. `columns` is an ordered
+array matching the final SQL result, including generated tag and comparison
+columns. Its entries are `{name, type, nullable}`; for example:
+
+```json
+{
+  "sql": "SELECT ...",
+  "bindings": [],
+  "limit_slot": null,
+  "columns": [
+    {"name": "alarm_severity", "type": "String", "nullable": true},
+    {"name": "alarm_count", "type": "Int", "nullable": false}
+  ]
+}
+```
+
+`limit_slot` is the zero-based index of the final output limit in `bindings`,
+or null when the Intent has no top-level limit. It does not refer to an internal
+Top-N/partition cap. Execution adapters can copy bindings and adjust this slot
+for their own bounded fetch policy; the model returns the requested limit unchanged.
+
+Columns are derived from the validated model and final projection during
+transform, without opening a database or executing SQL. They remain available
+for empty results and all-NULL columns. The type vocabulary is `Int`, `Float`,
+`Bool`, `String`, `DatetimeUtc`, `EpochMillis`, and `LocalDateTime`. DatetimeUtc
+and EpochMillis retain explicit UTC-instant semantics instead of being reduced to their String/Int storage.
+Calendar bucket dimensions retain the declared time encoding; Min/Max/Latest
+retain a declared instant type when their output is a source value. Count is
+Int; Avg is Float; numeric sums and computed measures follow their output types.
+Named value domains project String business IDs, including half-open value
+and `__kind` columns. A ranked GraphPair appends Float `comparison_value`.
+
+`nullable: false` guarantees a non-NULL result under the model contract;
+`true` conservatively permits NULL and does not predict that a result contains
+NULL. Nullability includes optional fields, outer joins, empty aggregate inputs
+and conditional expressions. Predicates and ranking guards do not narrow the
+schema. Logical types describe values; driver-specific Bool and lossless Int
+representations remain the execution adapter's responsibility.
+
+LocalDateTime represents a date and clock time without a timezone or offset.
+It is a self-contained value, not an instant; converting it to DatetimeUtc or
+EpochMillis requires an explicitly supplied timezone or offset and any necessary
+ambiguity policy for gaps or repeated times. Columns supply no default timezone
+and perform no temporal conversion. EpochMillis denotes an absolute instant even
+when the field has a local business description; a shifted wall-clock integer
+requires a separately specified encoding. Date-only and address values
+retain their primitive representation in this result contract; their field
+semantics remain available in knowledge. Transform uses no ambient clock or
+timezone to infer columns.
+
+GraphPair group counts and Graph group counts use the explicit result alias
+`count` in both SQLite and PostgreSQL. Ordinary count projections retain their
+node-qualified aliases. Low-level dialect builders and `query_intent_lower_factory`
+return `{sql, bindings}`; the public transform batch adds the semantic columns
+contract. `intent::result_columns(payload, validated_intent, ast)` exposes the same
+static schema for integrations that already hold a validated Intent and AST.
+
 The caller resolves relative time before submitting an Intent. Reference time
 and timezone may come from the application client or the Agent's environment;
 neither is read by the service. Use concrete values in the dimension's declared
@@ -252,7 +309,7 @@ Optional top-level graph fields and their shapes:
 | `constraints` | Array of edge objects, same shape as `edges` |
 | `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
 | `filters` | Array of `{"node":"...","dimension":"...","op":"Eq","value":...}` |
-| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` may be `null` or omitted |
+| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` is required and non-null; `start` may be `null` or omitted |
 | `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}` |
 | `exists` | Array of existence objects described below |
 | `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}` |
@@ -288,8 +345,8 @@ Find these nodes in `index` and pass their returned keys unchanged to `info`.
 Do not change the business meaning merely to make an Intent lower.
 
 Time windows are `[start, end)` with concrete values in the dimension's declared
-logical type. `end:null` or an omitted `end` means `[start, None)`: no upper
-time predicate. It does not mean `now`; future-dated rows may match. Resolve
+logical type. `end` is required and non-null; an omitted or null `start` means
+all history strictly before `end`. Fix the cutoff when planning. Resolve
 `now`, elapsed durations, calendar boundaries and timezone effects before
 submitting the Intent. The service rejects relative expressions and request
 `ctx`.

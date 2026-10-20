@@ -9,7 +9,9 @@ type TimeValue = enum {
     EpochMillis(Int),
 };
 
-type Window = struct { start: TimeValue, end: Option(TimeValue) };
+# Every window has a concrete exclusive cutoff; no clock is read at lowering
+# or execution. None start means all history before that explicit cutoff.
+type Window = struct { start: Option(TimeValue), end: TimeValue };
 
 def input: Fn(edsl::TimeField, TimeValue, String) -> edsl::FilterInput = fn(role, value, dimension) {
     match (role.encoding, value) {
@@ -45,21 +47,22 @@ def before: Fn(TimeValue, TimeValue, String) -> Bool = fn(start, end, dimension)
 def window_filters: Fn(edsl::PreparedPayload, String, Window) -> Array(edsl::FilterRequest) =
     fn(payload, dimension, window) {
         let detail = edsl::visible_dimension_detail(payload, dimension);
-        if !detail.filterable || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Ge }) {
-            fail!("time dimension does not support lower-bound range filters", dimension)
+        if !detail.filterable || !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Lt }) {
+            fail!("time dimension does not support upper-bound range filters", dimension)
         } else {
             let role = edsl::time_domain(payload, detail.dataset, detail.field);
-            let start = input(role, window.start, dimension);
-            let lower: edsl::FilterRequest = {id: dimension, op: edsl::FilterOp::Ge, input: start};
-            match window.end {
-                None => [lower],
-                Some(end) => if !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Lt }) {
-                    fail!("time dimension does not support upper-bound range filters", dimension)
-                } else if !before(window.start, end, dimension) {
-                    fail!("time window start must precede end", dimension, window)
+            let end = input(role, window.end, dimension);
+            let upper: edsl::FilterRequest = {id: dimension, op: edsl::FilterOp::Lt, input: end};
+            match window.start {
+                None => [upper],
+                Some(start) => if !array::any(detail.ops, fn(op) { op == edsl::FilterOp::Ge }) {
+                    fail!("time dimension does not support lower-bound range filters", dimension)
                 } else {
-                    [lower, {id: dimension, op: edsl::FilterOp::Lt,
-                        input: input(role, end, dimension)}]
+                    let lower: edsl::FilterRequest = {id: dimension, op: edsl::FilterOp::Ge,
+                        input: input(role, start, dimension)};
+                    if !before(start, window.end, dimension) {
+                        fail!("time window start must precede end", dimension, window)
+                    } else { [lower, upper] }
                 },
             }
         }

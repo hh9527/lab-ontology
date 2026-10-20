@@ -169,7 +169,7 @@ def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput
 type RawGraphFilter = struct { node: String, dimension: String, op: String, value: Value };
 type RawGraphAnyOf = struct { node: String, dimension: String, values: Array(Value) };
 type RawGraphHaving = struct { node: String, measure: String, op: String, value: Value };
-type RawTimeWindow = struct { node: String, dimension: String, start: Value, end: Option(Value) };
+type RawTimeWindow = struct { node: String, dimension: String, start: Option(Value), end: Value };
 type RawGraphOrder = struct { node: String, dimension: String, direction: String };
 type RawGraphTopMeasure = struct { node: String, measure: String, direction: String, take: Int };
 # Optional Value fields define the codec key schema; semantic parsing below
@@ -291,14 +291,18 @@ def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
 
 def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilter) =
     fn(payload, value) {
+        match dict::get(as_object(value), "end") {
+            None => fail!("time window end is required and must be non-null"),
+            Some(Value::None) => fail!("time window end is required and must be non-null"),
+            _ => (),
+        };
         let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
         let detail = edsl::visible_dimension_detail(payload, raw.dimension);
         let role = edsl::time_domain(payload, detail.dataset, detail.field);
-        let window: time::Window = {start: parse_time_value(role, raw.start),
-            end: match raw.end {
+        let window: time::Window = {start: match raw.start {
                 None => None,
-                Some(end) => Some(parse_time_value(role, end)),
-            }};
+                Some(start) => Some(parse_time_value(role, start)),
+            }, end: parse_time_value(role, raw.end)};
         array::map(time::window_filters(payload, raw.dimension, window), fn(request) {
             {node: raw.node, request}
         })
@@ -746,6 +750,183 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
     }
 };
 
+# Static result contract. Types describe projected values, not observed rows.
+# nullable is conservative: True permits NULL; False guarantees a non-NULL value
+# under the declared model contract. Filters do not narrow this declaration.
+# LocalDateTime is a date plus clock time without timezone or UTC offset.
+# Its value does not depend on the runtime environment. Locating it on the
+# instant timeline requires an explicit zone/offset and ambiguity policy.
+# Returning columns classifies values; it never performs that conversion.
+type ResultType = enum { String, Int, Float, Bool, DatetimeUtc, EpochMillis, LocalDateTime };
+type ResultColumn = struct { name: String, type: ResultType, nullable: Bool };
+type PreparedQuery = struct { sql: String, bindings: Array(qb::Val), columns: Array(ResultColumn), limit_slot: Option(Int) };
+
+def primitive_result_type: Fn(edsl::OutputType) -> ResultType = fn(ty) {
+    match ty {
+        edsl::OutputType::Text => ResultType::String,
+        edsl::OutputType::Integer => ResultType::Int,
+        edsl::OutputType::Number => ResultType::Float,
+        edsl::OutputType::Boolean => ResultType::Bool,
+    }
+};
+def result_column: Fn(String, edsl::OutputType, Bool) -> ResultColumn = fn(name, ty, nullable) {
+    {name, type: primitive_result_type(ty), nullable}
+};
+# Special logical types retain their declared representation. A named value
+# domain projects canonical business IDs (String), not the physical wire type.
+def dimension_result_type: Fn(edsl::DimensionEntry) -> ResultType = fn(dimension) {
+    if dimension.value_type != None || array::length(dimension.canonical_values) > 0 { ResultType::String }
+    else { match (dimension.ty, dimension.output_type) {
+        ("DatetimeUtc", edsl::OutputType::Text) => ResultType::DatetimeUtc,
+        ("LocalDateTime", edsl::OutputType::Text) => ResultType::LocalDateTime,
+        ("EpochMillis", edsl::OutputType::Integer) => ResultType::EpochMillis,
+        _ => primitive_result_type(dimension.output_type),
+    } }
+};
+def measure_result_type: Fn(edsl::PreparedPayload, String) -> ResultType = fn(payload, id) {
+    let entry = match array::find(payload.measures, fn(entry) { entry.id == id }) {
+        Some(entry) => entry, None => fail!("result column references unknown measure", id),
+    };
+    let primitive = primitive_result_type(edsl::measure_output_type(payload, id));
+    if entry.computed != None || (entry.aggregate != qb::AggregateFunction::Min
+        && entry.aggregate != qb::AggregateFunction::Max && entry.aggregate != qb::AggregateFunction::Latest) { primitive }
+    else {
+        let entity = payload.entities[entry.entity];
+        let field = entity.fields[entry.field];
+        match property::get_field_prop(entity.entity_type, field.index, edsl::TimeField.type) {
+            Some(role) => match role.encoding {
+                edsl::TimeEncoding::Rfc3339Text => ResultType::DatetimeUtc,
+                edsl::TimeEncoding::EpochMillis => ResultType::EpochMillis,
+                edsl::TimeEncoding::DateText => primitive,
+                edsl::TimeEncoding::LocalText => ResultType::LocalDateTime,
+            },
+            None => primitive,
+        }
+    }
+};
+def count_column: ResultColumn = result_column("count", edsl::OutputType::Integer, False);
+
+def expression_nullable: Fn(edsl::PreparedPayload, qb::BuildCtx, qb::Plan, qb::Expr) -> Bool = fn(payload, ctx, plan, expr) {
+    match expr {
+        qb::Expr::AllocatedBind(binding) => ctx.bindings[binding.index - 1] == qb::Val::None,
+        qb::Expr::Column(ref) => {
+            let outer = array::any(plan.joins, fn(join) { join.kind == qb::JoinKind::Left && join.source.alias == ref.source });
+            let source = array::find(plan.sources, fn(source) { source.alias == ref.source });
+            let fields = match source {
+                None => [],
+                Some(source) => array::flat_map(array::filter(payload.entities, fn(entity) { entity.table == source.table }),
+                    fn(entity) { array::filter(entity.fields, fn(field) { field.column == ref.column }) }),
+            };
+            outer || array::length(fields) == 0 || array::any(fields, fn(field) { field.nullable })
+        },
+        qb::Expr::Scalar(call) => match call.function {
+            qb::ScalarFunction::IsNotNull => False,
+            qb::ScalarFunction::If => expression_nullable(payload, ctx, plan, call.args[1])
+                || expression_nullable(payload, ctx, plan, call.args[2]),
+            # Arithmetic overflow, division by zero and invalid temporal source
+            # values may produce NULL even with non-null operands.
+            qb::ScalarFunction::Div => True,
+            qb::ScalarFunction::UtcDaysAgo => True,
+            qb::ScalarFunction::UtcTimeBucket(_) => True,
+            _ => array::any(call.args, fn(arg) { expression_nullable(payload, ctx, plan, arg) }),
+        },
+    }
+};
+
+def measure_nullable: Fn(edsl::PreparedPayload, String) -> Bool = fn(payload, id) {
+    let entry = match array::find(payload.measures, fn(entry) { entry.id == id }) {
+        Some(entry) => entry, None => fail!("result column references unknown measure", id),
+    };
+    match entry.computed {
+        Some(computed) => measure_nullable(payload, computed.left) || measure_nullable(payload, computed.right),
+        None => entry.aggregate != qb::AggregateFunction::Count,
+    }
+};
+
+def projection_name: Fn(qb::SelectItem) -> String = fn(item) {
+    match item {
+        qb::SelectItem::NamedExpr(item) => item.alias,
+        qb::SelectItem::Aggregate(item) => item.alias,
+        qb::SelectItem::Computed(item) => item.alias,
+        qb::SelectItem::Expr(_) => fail!("semantic result projection requires an explicit alias", item),
+    }
+};
+
+def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> Array(ResultColumn) = fn(payload, input, plan, ctx) {
+    let obj = as_object(input);
+    let dimensions = array::flat_map(array_opt(obj, "select"), fn(value) {
+        let item = codec::decode@[edsl::GraphSelect](value).unwrap!();
+        let dimension = match array::find(payload.dimensions, fn(d) { d.id == item.dimension }) {
+            Some(d) => d, None => fail!("result column references unknown dimension", item.dimension),
+        };
+        let name = `\{item.node}_\{item.dimension}`;
+        let column: ResultColumn = {name, type: dimension_result_type(dimension), nullable: True};
+        if dimension.half_open { [column, result_column(`\{name}__kind`, edsl::OutputType::Text, True)] } else { [column] }
+    });
+    let measures = array::map(array_opt(obj, "measures"), fn(value) {
+        let item = codec::decode@[edsl::GraphMeasureSelect](value).unwrap!();
+        {name: `\{item.node}_\{item.measure}`, type: measure_result_type(payload, item.measure), nullable: measure_nullable(payload, item.measure)}.ty!(ResultColumn)
+    });
+    let counts = match dict::get(obj, "count") {
+        Some(Value::String(node)) => [result_column(`\{node}_count`, edsl::OutputType::Integer, False)],
+        _ => [],
+    };
+    let value_counts = match dict::get(obj, "count_value") {
+        Some(Value::Object(value)) => [result_column(`\{as_string(field(value, "node"))}_\{as_string(field(value, "dimension"))}_count`, edsl::OutputType::Integer, False)],
+        _ => [],
+    };
+    let declared = array::concat([dimensions, measures, counts, value_counts]);
+    array::map(plan.projection, fn(item) {
+        let name = projection_name(item);
+        let column = match array::find(declared, fn(column) { column.name == name }) {
+            Some(column) => column, None => fail!("result projection is missing a column declaration", name),
+        };
+        match item {
+            qb::SelectItem::NamedExpr(named) => {...column, nullable: expression_nullable(payload, ctx, plan, named.expr)},
+            _ => column,
+        }
+    })
+};
+
+def result_columns: Fn(edsl::PreparedPayload, Value, qb::QueryAst) -> Array(ResultColumn) = fn(payload, input, ast) {
+    match ast.plan {
+        qb::QueryPlan::Rows(plan) => graph_columns(payload, input, plan, ast.ctx),
+        qb::QueryPlan::DistinctRows(plan) => graph_columns(payload, input, plan, ast.ctx),
+        qb::QueryPlan::GroupCount(_) => [count_column],
+        qb::QueryPlan::SetCount(_) => [count_column],
+        qb::QueryPlan::JoinedGroupCount(_) => [count_column],
+        qb::QueryPlan::SetRows(set) => {
+            let raw = codec::decode@[RawGraphUnion](input).unwrap!();
+            let branches = array::map(array::enumerate(set.operands), fn(entry) {
+                let branch = codec::decode@[RawUnionBranch](raw.branches[entry.0]).unwrap!();
+                graph_columns(payload, branch.graph, entry.1, ast.ctx)
+            });
+            array::map(array::enumerate(branches[0]), fn(entry) {
+                {...entry.1, nullable: array::any(branches, fn(columns) { columns[entry.0].nullable })}
+            })
+        },
+        qb::QueryPlan::JoinedGroups(joined) => {
+            let raw = codec::decode@[RawGraphPair](input).unwrap!();
+            let selected = codec::decode@[Array(PairSelection)](match raw.select { Some(value) => value, None => fail!("validated pair select is missing") }).unwrap!();
+            let left_plan = {...joined.left, projection: array::filter(joined.left.projection, fn(item) { !array::any(joined.keys, fn(key) { key == projection_name(item) }) })};
+            let right_plan = {...joined.right, projection: array::filter(joined.right.projection, fn(item) { !array::any(joined.keys, fn(key) { key == projection_name(item) }) })};
+            let left = graph_columns(payload, pair_operand(raw.left, selected, qb::PairSide::Left), left_plan, ast.ctx);
+            let right = graph_columns(payload, pair_operand(raw.right, selected, qb::PairSide::Right), right_plan, ast.ctx);
+            let visible = array::map(joined.outputs, fn(output) {
+                let columns = if output.side == qb::PairSide::Left { left } else { right };
+                let column = match array::find(columns, fn(column) { column.name == output.column }) {
+                    Some(column) => column, None => fail!("joined result column is missing", output.column),
+                };
+                {...column, name: output.alias}
+            });
+            match joined.rank {
+                None => visible,
+                Some(_) => array::push(visible, result_column("comparison_value", edsl::OutputType::Number, True)),
+            }
+        },
+    }
+};
+
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
 
 def query_intent_lower_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> qb::Query = fn(payload, to_query) {
@@ -758,7 +939,7 @@ def query_intent_ast_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> qb::Quer
 
 type BatchEvaluation = struct {
     index: Int,
-    query: Option(qb::Query),
+    query: Option(PreparedQuery),
     diagnostics: Array(diagnostics::Diagnostic),
 };
 type IndexedDiagnostic = struct {
@@ -768,7 +949,7 @@ type IndexedDiagnostic = struct {
 type BatchResponse = struct {
     accepted: Bool,
     diagnostics: Array(IndexedDiagnostic),
-    queries: Option(Array(qb::Query)),
+    queries: Option(Array(PreparedQuery)),
 };
 
 def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> Value =
@@ -781,7 +962,14 @@ def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value
             } else {
                 let assessed: Array(BatchEvaluation) = array::map(array::enumerate(intents), fn(entry) {
                     let observed = diagnostics::with_diagnostics(fn(intent: Value) {
-                        to_query(lower_intent_ast(payload, intent))
+                        let ast = lower_intent_ast(payload, intent);
+                        let query = to_query(ast);
+                        {sql: query.sql, bindings: query.bindings, columns: result_columns(payload, intent, ast),
+                            limit_slot: match ast.result_limit {
+                                None => None,
+                                Some(qb::Expr::AllocatedBind(binding)) => Some(binding.index - 1),
+                                Some(_) => fail!("final output limit requires an allocated binding"),
+                            }}.ty!(PreparedQuery)
                     })(entry.1);
                     match observed {
                         Ok((query, reports)) => {index: entry.0, query: Some(query), diagnostics: reports},
@@ -808,5 +996,5 @@ def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value
         }
     };
 
-pub use self::{ ToQuery, query_intent_lower_factory, query_intent_ast_factory,
+pub use self::{ ResultType, ResultColumn, PreparedQuery, result_columns, ToQuery, query_intent_lower_factory, query_intent_ast_factory,
     query_request_method_factory };

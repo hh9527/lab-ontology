@@ -113,7 +113,7 @@ Optional top-level graph fields and their shapes:
 | `constraints` | Array of edge objects, same shape as `edges` |
 | `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
 | `filters` | Array of `{"node":"...","dimension":"...","op":"Eq","value":...}` |
-| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` may be `null` or omitted |
+| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` is required and non-null; `start` may be `null` or omitted |
 | `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}` |
 | `exists` | Array of existence objects described below |
 | `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}` |
@@ -129,8 +129,8 @@ Optional top-level graph fields and their shapes:
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |
 
 Time windows use concrete values in the dimension's declared logical type.
-`end:null` or an omitted `end` means `[start, None)` with no upper predicate;
-it does not mean `now`. Relative expressions are rejected.
+`end` is required and non-null. An omitted or null `start` means all history
+strictly before `end`. Fix the cutoff when planning; relative expressions are rejected.
 
 An existence object has required `anchor` (an outer node instance ID),
 `nodes` (inner node objects), and `edges` (named edge objects connecting

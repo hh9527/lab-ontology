@@ -32,7 +32,8 @@ preserves chronological ordering under raw-column string comparison.
 `EpochMillis` is an absolute instant measured from `1970-01-01T00:00:00Z`;
 its encoding does not depend on a timezone. A UTC/local business description
 does not change its integer representation. A shifted wall-clock integer
-would require a separately specified encoding. Local wall-clock text is
+would require a separately specified encoding. LocalDateTime is a date plus clock time without timezone or UTC offset;
+its value has no dependency on the runtime environment. Local wall-clock text is
 distinct from an instant. Resolving an instant or a
 relative period into local wall-clock boundaries may require a timezone and
 ambiguity policy; this interface does not infer either.
@@ -42,7 +43,7 @@ Graph Intents accept `time_windows` at the root and within `exists`:
 Each temporal Ty knowledge node links to the shared TimeWindow operation
 contract. Follow the returned opaque key to read the interval and boundary rules.
 Type support does not grant field authorization: the dimension must have a time
-role and authorize Ge, plus Lt when an upper bound is present. This is unrelated
+role and authorize Lt, plus Ge when a start is present. This is unrelated
 to a dimension's `half_open` business vocabulary contract.
 
 ```json
@@ -53,7 +54,7 @@ to a dimension's `half_open` business vocabulary contract.
 }]
 ```
 
-The window is `[start, end)`. Both endpoints must be concrete values in the
+The window is `[start, end)`. The end is required and non-null; start may be omitted or null. Supplied endpoints must be concrete values in the
 dimension's declared logical type. For a raw time dimension, SQL compares the original column to
 allocated bindings (`>= start AND < end`), without database `now()` or
 column-side time transformation. Reversed or invalid endpoints fail before
@@ -90,19 +91,20 @@ instead compares the explicitly computed bucket start and can select a different
 population. Bucketing does not fill missing periods, alter NULL aggregates,
 change the selected measure's meaning, or authorize summing gauges across time.
 
-The upper bound may be `null` or omitted:
+The lower bound may be `null` or omitted:
 
 ```json
 "time_windows": [{
   "node": "sample", "dimension": "sample_time",
-  "start": 1727308800000,
-  "end": null
+  "end": 1727395200000
 }]
 ```
 
-This means `[start, None)`: the Query has only `>= start`. It does **not** mean
-`[start, now)`; future-dated rows can match. Use an explicit concrete end when
-the business request requires an exact upper instant or replayable cutoff.
+This means all history strictly before the explicit cutoff: SQL has only `< end`.
+Omitted or null `end` is rejected. The caller fixes the end when planning;
+execution never substitutes `now`. With unchanged database contents and fixed
+ordering/tie rules, replaying the same plan yields the same results.
+Omitting `time_windows` entirely continues to mean no time restriction.
 
 The Agent resolves references such as "now", "three days ago", and calendar
 periods before submitting the Intent. Its reference time and timezone may

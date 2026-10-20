@@ -14,13 +14,15 @@ try {
   const graph = { op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: 'device' }], edges: [],
     select: [{ node: 'd', dimension: 'device_name' }] };
   await withKnowledgeRunner(artifact, async (_, request) => {
-    const schema = (await request('ic/info', { key: 'Schema/syntax/intent' })).Document.Found;
-    assert.match(JSON.stringify(schema), /optional limit/);
     for (const limit of [1, 100, 101]) {
       const batch = await request('ic/transform', { intents: [{ ...graph, limit }] });
       assert.equal(batch.accepted, true, JSON.stringify(batch.diagnostics));
       const query = batch.queries[0];
       assert.equal(query.bindings.at(-1), limit);
+      assert.equal(query.bindings[query.limit_slot], limit);
+      const probe = [...query.bindings]; probe[query.limit_slot] = limit + 1;
+      assert.equal(database.prepare(query.sql).all(...probe).length, limit + 1);
+      assert.deepEqual(query.columns, [{ name: 'd_device_name', type: 'String', nullable: false }]);
       assert.equal(database.prepare(query.sql).all(...query.bindings).length, limit);
     }
     const invalid = await request('ic/transform', { intents: [
@@ -37,6 +39,7 @@ try {
     assert.equal(legacy.queries.length, 2);
     assert.deepEqual(legacy.queries[1], legacy.queries[0]);
     assert.deepEqual(legacy.queries[0].bindings, []);
+    assert.equal(legacy.queries[0].limit_slot, null);
     assert.doesNotMatch(legacy.queries[0].sql, /LIMIT/);
     assert.equal(database.prepare(legacy.queries[0].sql).all().length, 130);
     const forwarded = withOutputLimit({ intents: [{ ...graph, limit: 101 }] });
@@ -44,7 +47,7 @@ try {
     assert.equal(capped.accepted, true);
     const query = capped.queries[0];
     assert.equal(database.prepare(query.sql).all(...query.bindings).length, OUTPUT_ROW_LIMIT);
-    console.log('Published snapshot: syntax, omitted/null/1/100/101 rows, mixed-batch origins and plugin-enforced output cap passed.');
+    console.log('Published snapshot: columns, omitted/null/1/100/101 rows, mixed-batch origins and plugin-enforced output cap passed.');
   });
 } finally {
   database.close();

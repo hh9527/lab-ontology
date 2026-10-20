@@ -49,9 +49,21 @@ try {
     assert.deepEqual(item.sqlite.bindings, item.postgres.bindings);
     if (item.limit !== null) {
       assert.equal(item.sqlite.bindings.at(-1), item.limit);
+      assert.equal(item.sqlite.limit_slot, item.postgres.limit_slot);
+      assert.ok(Number.isInteger(item.sqlite.limit_slot));
+      assert.equal(item.sqlite.bindings[item.sqlite.limit_slot], item.limit);
+      if (Number(item.limit) < Number.MAX_SAFE_INTEGER) {
+        const probeBindings = [...item.sqlite.bindings];
+        probeBindings[item.sqlite.limit_slot] = Number(item.limit) + 1;
+        const expected = Math.min(full.get(item.name).length, Number(item.limit) + 1);
+        assert.equal(sqlite.prepare(item.sqlite.sql).all(...probeBindings).length, expected, `${item.name}: SQLite probe`);
+        assert.equal((await postgres.query(item.postgres.sql, probeBindings)).rows.length, expected, `${item.name}: PostgreSQL probe`);
+      }
       assert.match(item.sqlite.sql, /LIMIT (?:CASE WHEN )?\?\d/);
       assert.match(item.postgres.sql, /LIMIT (?:CASE WHEN CAST\()?\$\d/);
     } else if (item.name === 'plain') {
+      assert.equal(item.sqlite.limit_slot, null);
+      assert.equal(item.postgres.limit_slot, null);
       assert.equal(item.sqlite.bindings.length, 0);
       assert.doesNotMatch(item.sqlite.sql, /LIMIT/);
       assert.doesNotMatch(item.postgres.sql, /LIMIT/);
