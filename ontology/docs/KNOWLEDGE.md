@@ -244,3 +244,52 @@ types, values or relations. The model publishes identity and facts; consumers
 organize projections and derive classified reverse navigation from these facts.
 
 反向导航由工具层从正向事实派生。模型通过地址表达成员归属，并由父节点列出成员；成员不重复发布归属父节点的链接。关系端点、业务链接端点及度量依赖属于业务事实，仍显式发布。
+
+## Host 持有知识索引的实验入口
+
+IC 的 `@src/hosted` 入口提供 `ic/transform` 与 `ic/discovery`。模型准备结果通过
+`knowledge::model_roots(payload)` 派生两个 root：`lowering` 供查询编译，`knowledge`
+提供发现契约和按需物化的知识节点清单。构造 root、服务 init 和查询请求均不强制生成知识清单。
+
+```sh
+bin/telora -C icloud_model build @src/hosted --snapshot \
+  --initialization-fuel 1000000 --request-fuel 1000000 \
+  --with-memory-limit 2048 -o /tmp/icloud-hosted.snapshot.wasm
+```
+
+该入口的 discovery 返回 `ontology-knowledge-export-v1`：
+
+```json
+{"format":"ontology-knowledge-export-v1","discovery":{},"complete":true,"nodes":[]}
+```
+
+`discovery` 内是已有的地址、知识、intent 契约及 revision、roots、key_patterns、vocabulary；
+`nodes` 保持 `ontology-knowledge-v3` 结构。IC 返回完整清单。host 的
+`ontology/tools/knowledge-host.mjs` 校验清单并建立 key、引用索引，提供
+`load()`、`discovery()` 和 `info({key})`。调用方提供 `request(method, input)`，
+返回成功响应的解包值，并把传输或 Guest 诊断作为异常抛出。
+
+```js
+const host = createKnowledgeHost({ request, artifactHash, domain: 'ic' });
+await host.load();
+const node = await host.info({ key: 'Dataset/device' });
+```
+
+缓存按产物 SHA-256 和 domain 共享，并发首次加载复用同一次发现，失败后可重试。
+适配器也支持 `complete=false` 的入口节点清单：沿 index、roots 和 links 通过提供者的
+`info` 补齐可达节点，每个 key 只取一次；提供者必须实现对应 info 路由。
+缓存生存期由 host 管理，可以通过 `cache`、`pending` 参数传入应用持有的 Map。
+
+完整入口 `icloud_model` 继续使用现有 discovery/info 协议。hosted 的 discovery 返回知识
+root，消费方须使用对应 host 适配器。`dsh-oks` 的接入作为后续迁移。
+
+完整节点等价检查和首次加载计时可以运行：
+
+```sh
+node scripts/benchmark-host-knowledge.mjs \
+  --artifact /tmp/icloud-hosted.snapshot.wasm --output /tmp/host-knowledge.json
+```
+
+`--runner` 可指定隔离的 release runner，`--baseline` 可指定
+`scripts/benchmark-knowledge.mjs --full` 生成的知识图摘要，逐节点核对 SHA-256 和字节数。
+设计及边界见 [RFC 0001](../../docs/rfcs/0001-host-knowledge-index.md)。

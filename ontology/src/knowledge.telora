@@ -70,6 +70,8 @@ type LinkEntry = struct { source: String, target: String, kind: LinkKind };
 type LinksIndex = struct { revision: String, links: Array(LinkEntry) };
 type TerminologyIndex = struct { revision: String, datasets: Array(DatasetTerm), dimensions: Array(DimensionTerm), measures: Array(MeasureTerm), rels: Array(RelationTerm), types: Array(DatasetTerm), values: Array(ValueTerm) };
 type DiscoveryInput = struct {};
+type KnowledgeRoot = struct { discover: Fn() -> DiscoveryDetail, nodes: Fn() -> Array(Value), complete: Bool };
+type ModelRoots = struct { lowering: edsl::PreparedPayload, knowledge: KnowledgeRoot };
 
 def target: Fn(edsl::KnowledgeKind, String, String) -> edsl::KnowledgeTarget = fn(kind, owner, id) {
     {kind, owner, id}
@@ -406,6 +408,106 @@ def index_entries: Fn(Array(Point)) -> KnowledgeIndex = fn(points) {
     {entries: array::map(points, fn(item) {
         {key: item.target, label: item.label, aliases: item.aliases, summary: item.summary, from: None, to: None}
     }), targets: {}, points: {}, datasets: {}, summaries: {}, related: {}, terms: {}}
+};
+
+# Request-local materialization for a host-owned knowledge index. This path
+# builds each published point directly, without preparing the lookup catalog.
+def export_points: Fn(edsl::PreparedPayload) -> Array(Point) = fn(payload) {
+    let datasets = edsl::visible_knowledge_index(payload);
+    let raw = array::concat([[index_point(payload)], type_points, value_type_points(payload),
+        array::flat_map(datasets, fn(brief) {
+            array::concat([[dataset_point(payload, brief)], dataset_members(payload, brief)])
+        })]);
+    let keys = dict::from_pairs(array::map(raw, fn(item) { (target_key(item.target), True) }));
+    if array::length(dict::keys(keys)) != array::length(raw) {
+        fail!("knowledge keys must identify exactly one visible node")
+    } else { () };
+    array::map(raw, export_decorator(payload, keys))
+};
+
+def export_decorator: Fn(edsl::PreparedPayload, Dict(Bool)) -> Fn(Point) -> Point = fn(payload, keys) {
+    let annotation_types = edsl::knowledge_annotation_types(payload);
+    let docs = array::flat_map(annotation_types, fn(ty) {
+        match property::get_type_prop(ty, edsl::KnowledgeDocs.type) {
+            Some(spec) => spec.entries, None => [],
+        }
+    });
+    let entity_docs = array::flat_map(payload.entities, fn(entity) {
+        match property::get_type_prop(entity.entity_type, edsl::KnowledgeDocs.type) {
+            Some(spec) => spec.entries, None => [],
+        }
+    });
+    let related = array::flat_map(payload.entities, fn(entity) {
+        match property::get_type_prop(entity.entity_type, edsl::KnowledgeRelations.type) {
+            Some(spec) => spec.entries, None => [],
+        }
+    });
+    let terms = array::flat_map(annotation_types, fn(ty) {
+        match property::get_type_prop(ty, edsl::TermAnnotations.type) {
+            Some(spec) => spec.entries, None => [],
+        }
+    });
+    fn(item) {
+        let cached = item.target.kind == edsl::KnowledgeKind::Index
+            || item.target.kind == edsl::KnowledgeKind::Value || item.value_type != None;
+        let primitive = item.target.kind == edsl::KnowledgeKind::Ty && item.value_type == None;
+        let summary = if primitive { item.summary }
+            else { match array::find(if cached { docs } else { entity_docs }, fn(note) { note.target == item.target }) {
+                Some(note) => note.text, None => item.summary,
+            } };
+        let refs = if cached || primitive { item.refs }
+            else { array::concat([item.refs, array::map(array::filter(related, fn(ref) {
+                ref.source == item.target && dict::get(keys, target_key(ref.target)) != None
+            }), fn(ref) { {target: ref.target, kind: LinkKind::Related} })]) };
+        let enriched = {...item, summary, refs, terms: if item.target.kind == edsl::KnowledgeKind::Index
+            || item.target.kind == edsl::KnowledgeKind::Schema { [] }
+            else { array::filter(terms, fn(term) { term.target == item.target }) }};
+        if array::any(enriched.refs, fn(ref) { dict::get(keys, target_key(ref.target)) == None }) {
+            fail!("knowledge point references a point outside the visible model", enriched.target)
+        } else { enriched }
+    }
+};
+
+# Build the visibility set from identities, without materializing domain details.
+def export_keys: Fn(edsl::PreparedPayload, Array(edsl::DatasetBrief), Array(Point)) -> Dict(Bool) = fn(payload, datasets, typed) {
+    let identities = array::concat([
+        [target(edsl::KnowledgeKind::Index, "", "index")],
+        array::map(array::concat([type_points, typed]), fn(item) { item.target }),
+        array::flat_map(datasets, fn(brief) { array::concat([
+            [target(edsl::KnowledgeKind::Dataset, "", brief.id)],
+            array::map(edsl::published_fields(payload, brief.id), fn(id) { target(edsl::KnowledgeKind::Field, brief.id, id) }),
+            array::map(brief.dimension_ids, fn(id) { target(edsl::KnowledgeKind::Dimension, brief.id, id) }),
+            array::map(brief.measure_ids, fn(id) { target(edsl::KnowledgeKind::Measure, brief.id, id) }),
+            array::map(brief.time_roles, fn(role) { target(edsl::KnowledgeKind::TimeRole, brief.id, role.field) }),
+        ]) }),
+        array::map(array::filter(payload.relations, fn(rel) { rel.id != "" }), fn(rel) {
+            target(edsl::KnowledgeKind::Relation, payload.entities[rel.from].id, rel.id)
+        }),
+        array::map(payload.business_links, fn(link) {
+            target(edsl::KnowledgeKind::BusinessLink, payload.entities[link.hub].id, link.id)
+        }),
+    ]);
+    let keys = dict::from_pairs(array::map(identities, fn(id) { (target_key(id), True) }));
+    if array::length(dict::keys(keys)) != array::length(identities) {
+        fail!("knowledge keys must identify exactly one visible node")
+    } else { keys }
+};
+
+# Encode one dataset at a time so the response does not retain both the full
+# rich Point graph and the serialized Node graph within the request heap.
+def export_nodes: Fn(edsl::PreparedPayload) -> Array(Value) = fn(payload) {
+    let datasets = edsl::visible_knowledge_index(payload);
+    let typed = value_type_points(payload);
+    let keys = export_keys(payload, datasets, typed);
+    let decorate = export_decorator(payload, keys);
+    array::concat([
+        array::map(array::concat([[index_point(payload)], type_points, typed]), fn(item) { node_value(decorate(item)) }),
+        array::flat_map(datasets, fn(brief) {
+            array::map(array::concat([[dataset_point(payload, brief)], dataset_members(payload, brief)]), fn(item) {
+                node_value(decorate(item))
+            })
+        }),
+    ])
 };
 
 def index_entry: Fn(edsl::KnowledgeTarget, String, Array(String), String) -> IndexEntry = fn(key, label, aliases, summary) {
@@ -827,9 +929,35 @@ def discovery_keys: Fn(edsl::PreparedPayload) -> Array(String) = fn(payload) {
     ])
 };
 
+def discovery_detail: Fn(edsl::PreparedPayload) -> DiscoveryDetail = fn(payload) {
+    {addressing: "node-member-uri-v1", knowledge_contract: "ontology-knowledge-v3", intent_contract: "ontology-intent-v1", revision: payload.revision, roots: discovery_keys(payload), key_patterns, vocabulary}
+};
+
+def model_roots: Fn(edsl::PreparedPayload) -> ModelRoots = fn(payload) {
+    {lowering: payload, knowledge: {complete: True,
+        discover: fn() { discovery_detail(payload) },
+        nodes: fn() { export_nodes(payload) },
+    }}
+};
+
+def knowledge_root_value: Fn(KnowledgeRoot) -> Value = fn(root) {
+    object_value([("format", Value::String("ontology-knowledge-export-v1")),
+        ("discovery", codec::encode(root.discover())),
+        ("complete", codec::encode(root.complete)),
+        ("nodes", Value::Array(root.nodes()))])
+};
+
+# Only capture the prepared lowering model during init. Materialize knowledge
+# when the host asks for it; the host owns the resulting data and its indexes.
+def knowledge_root_method_factory: Fn(KnowledgeRoot) -> Fn(Value) -> Value = fn(root) {
+    fn(input) {
+        let request = decode_request@[DiscoveryInput](input, "syntax/knowledge/discovery");
+        knowledge_root_value(root)
+    }
+};
+
 def knowledge_discovery_method_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> Value = fn(payload) {
-    let detail: DiscoveryDetail = {addressing: "node-member-uri-v1", knowledge_contract: "ontology-knowledge-v3", intent_contract: "ontology-intent-v1", revision: payload.revision, roots: discovery_keys(payload), key_patterns, vocabulary};
-    let response = codec::encode(detail);
+    let response = codec::encode(discovery_detail(payload));
     fn(input) {
         let request = decode_request@[DiscoveryInput](input, "syntax/knowledge/discovery");
         response
@@ -839,7 +967,9 @@ def knowledge_discovery_method_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -
 pub use self::{ LinkKind, KnowledgeLink, Point, IndexEntry, KnowledgeIndex, DocResult, KnowledgeResponse,
     Description, TermText, NodeAddress, NodeLink, Node, NodeResult, NodeResponse, node_value,
     DatasetDetail, FieldDetail, ValueDetail, TypeValueDetail, ValueTypeDetail, BusinessLinkDetail, KeyPattern, IndexDetail, DiscoveryDetail, VocabularyEntry,
-    map, index_entries, index_from_model, by_target, knowledge_lookup_factory, serve, serve_value,
+    map, export_points, KnowledgeRoot, ModelRoots, model_roots,
+    knowledge_root_method_factory,
+    index_entries, index_from_model, by_target, knowledge_lookup_factory, serve, serve_value,
     DatasetTerm, DimensionTerm, MeasureTerm, ValueTerm, RelationTerm, TerminologyIndex, terminology_from_model,
     LinkEntry, LinksIndex, links_from_model,
     target_address, target_role, discovery_keys, knowledge_discovery_method_factory,

@@ -3031,6 +3031,50 @@ def check_knowledge_annotations: Fn(PreparedPayload) -> Bool = fn(payload) {
     }) { fail!("duplicate term for knowledge target", duplicate) } else { True }
 };
 
+# Scalar requirements of the declaration probes, including every known value
+# and subnet shape. Half-open operations have additional checks in build_root.
+# Computed base expressions are checked separately. Keep this in sync with the
+# filter builders via differential tests.
+def filter_profile_scalars: Fn(DimensionEntry, FilterOp) -> Array(qb::ScalarFunction) = fn(entry, op) {
+    if is_subnet_op(op) {
+        array::concat([
+            [qb::ScalarFunction::And, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt,
+                qb::ScalarFunction::BinaryText, qb::ScalarFunction::RegexMatch],
+            if op == FilterOp::InSubnet { [qb::ScalarFunction::Eq] }
+            else { [qb::ScalarFunction::Ne, qb::ScalarFunction::Not] },
+        ])
+    } else if array::length(entry.canonical_values) > 0 {
+        let multi_wire = array::any(entry.canonical_values, fn(value) { array::length(value.wires) > 1 });
+        if op == FilterOp::Eq {
+            array::concat([[qb::ScalarFunction::Eq], if multi_wire { [qb::ScalarFunction::Or] } else { [] }])
+        } else if op == FilterOp::Ne {
+            array::concat([[qb::ScalarFunction::Ne],
+                if multi_wire || !entry.half_open { [qb::ScalarFunction::And] } else { [] },
+                if !entry.half_open && (multi_wire || array::length(entry.canonical_values) > 1) {
+                    [qb::ScalarFunction::Eq, qb::ScalarFunction::Or]
+                } else if !entry.half_open { [qb::ScalarFunction::Eq] } else { [] }])
+        } else { fail!("canonical dimension supports only Eq or Ne", entry.id, op) }
+    } else if array::length(entry.values) > 0 {
+        if op == FilterOp::Eq { [qb::ScalarFunction::Eq] }
+        else { fail!("enum dimension filter supports only Eq", entry.id, op) }
+    } else {
+        match op {
+            FilterOp::Contains => [qb::ScalarFunction::Gt, qb::ScalarFunction::Instr, qb::ScalarFunction::Lower],
+            FilterOp::NotContains => [qb::ScalarFunction::Eq, qb::ScalarFunction::Instr, qb::ScalarFunction::Lower],
+            FilterOp::StartsWith => [qb::ScalarFunction::Eq, qb::ScalarFunction::Instr, qb::ScalarFunction::Lower],
+            FilterOp::EndsWith => [qb::ScalarFunction::Eq, qb::ScalarFunction::Substr, qb::ScalarFunction::Lower,
+                qb::ScalarFunction::Add, qb::ScalarFunction::Sub, qb::ScalarFunction::Length],
+            FilterOp::Eq => [qb::ScalarFunction::Eq],
+            FilterOp::Ne => [qb::ScalarFunction::Ne],
+            FilterOp::Gt => [qb::ScalarFunction::Gt],
+            FilterOp::Ge => [qb::ScalarFunction::Ge],
+            FilterOp::Lt => [qb::ScalarFunction::Lt],
+            FilterOp::Le => [qb::ScalarFunction::Le],
+            _ => fail!("invalid scalar filter operation", op),
+        }
+    }
+};
+
 def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn(revision, entity_types, profile) {
     let n = array::length(entity_types);
     let entities = check_entity_aliases(check_entity_ids(array::map(int_range(n), fn(i) {
@@ -3168,12 +3212,12 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
         }
     });
     let dimension_profiles_validated = array::all(dimensions, fn(entry) {
-        if !entry.filterable { True }
+        if !entry.filterable || array::length(entry.ops) == 0 { True }
         else {
             let inputs: Array(FilterInput) = if array::length(entry.canonical_values) > 0 {
-                array::map(entry.canonical_values, fn(value) { FilterInput::Text(value.id) })
+                [FilterInput::Text(entry.canonical_values[0].id)]
             } else if array::length(entry.values) > 0 {
-                array::map(entry.values, fn(value) { FilterInput::Text(value.value) })
+                [FilterInput::Text(entry.values[0].value)]
             } else {
                 let entity = get_index(payload.entities, entry.entity);
                 let time = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
@@ -3196,16 +3240,35 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
                     }
                 })
             };
-            array::all(entry.ops, fn(op) {
-                let arguments = if is_subnet_op(op) {
-                    array::map(["0.0.0.0/0", "128.0.0.0/1", "192.0.0.0/8", "192.0.0.0/9", "192.0.0.0/16", "192.0.0.0/17", "192.0.2.0/24", "192.0.2.0/25", "192.0.2.1/32"], fn(value) { FilterInput::Ipv4Subnet(value) })
-                } else { inputs };
-                array::all(arguments, fn(input) {
-                    let built = filter_value_with_context(qb::build_context(), payload, entry, op, input);
-                    if qb::predicate_profile_accepts(built.1, profile) { True }
+            if array::length(inputs) == 0 && !array::any(entry.ops, is_subnet_op) { True }
+            else {
+                let base = dimension_expr(qb::build_context(), payload, entry);
+                let base_ok = qb::predicate_profile_accepts(base.1, profile);
+                array::all(entry.ops, fn(op) {
+                    let arguments = if is_subnet_op(op) { [FilterInput::Ipv4Subnet("0.0.0.0/0")] } else { inputs };
+                    let valid = array::all(arguments, fn(input) {
+                        let time_ok = validate_time_filter(payload, entry, input);
+                        if is_subnet_op(op) {
+                            if filter_argument_allowed(entry.input_kinds, op, input) { time_ok }
+                            else { fail!(`subnet operation requires a typed IPv4 subnet for dimension \{entry.id}`, entry.id, input) }
+                        } else if array::length(entry.canonical_values) > 0 || array::length(entry.values) > 0 { time_ok }
+                        else if is_text_op(op) && match input { FilterInput::Text(_) => False, _ => True } {
+                            fail!("text filter operation requires a text input value", entry.id)
+                        } else if !filter_input_allowed(entry.input_kinds, input) {
+                            fail!(`invalid filter value for dimension \{entry.id}; find its Dimension key in index`, entry.id)
+                        } else { time_ok }
+                    });
+                    if array::length(arguments) == 0 { True }
+                    else if valid && base_ok
+                        && array::all([qb::Operator::Bind, qb::Operator::Scalar], fn(required) {
+                            array::any(profile.allowed_operators, fn(allowed) { allowed == required })
+                        })
+                        && array::all(filter_profile_scalars(entry, op), fn(required) {
+                            array::any(profile.allowed_scalars, fn(allowed) { allowed == required })
+                        }) { True }
                     else { fail!("declared dimension filter uses capabilities not allowed by the query profile", entry.id, op) }
                 })
-            })
+            }
         }
     });
     let dimension_scopes_validated = array::all(dimensions, fn(entry) {
