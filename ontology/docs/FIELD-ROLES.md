@@ -86,8 +86,10 @@ dimension or measure to retrieve its value.
 Roles do not publish otherwise invisible fields. Public discovery filters
 roles by existing visibility and publishes a reference only when all members
 are visible. It never truncates a composite reference. Internal prepared
-metadata retains all declarations. Dataset links lead to the shared
-`syntax/model/field_roles` contract when roles/references are present.
+metadata retains all declarations. Dataset documents publish role and reference
+facts in their detail and link to visible member documents. Shared interpretation
+rules are documented here; the knowledge graph publishes domain facts under the
+versioned contract described in [KNOWLEDGE.md](KNOWLEDGE.md).
 
 ## Acceptance
 
