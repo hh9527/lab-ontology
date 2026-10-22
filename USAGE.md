@@ -18,6 +18,10 @@ this repository.
 
 ## 1. Build a snapshot
 
+Building from source requires Telora with `std::seq` support (RFC 0313,
+Telora commit `6b48a33b` or later). The ontology uses explicit pipelines to
+avoid intermediate arrays during model validation and knowledge construction.
+
 ```sh
 node scripts/build-knowledge-snapshot.mjs --module <module> \
   --domain <domain> --output <artifact>.wasm
