@@ -130,6 +130,26 @@ The catalog caches visible Dataset briefs and indexes documentation, related
 references and explicit terms by key. Member lookups construct only the requested
 node; full member documents are not cached.
 
+Preparation checks dimension ID uniqueness through a bulk dictionary; duplicate
+diagnostics select the first conflicting declaration in source order. Dataset
+publication prepares entity-local field membership, and catalog construction
+consumes resolved dimension entries. Input-type documentation metadata is prepared
+once and shared across dimension descriptions. Profile validation checks operator
+and scalar capabilities together while traversing expressions.
+
+Measure model preparation with a release compiler, serially against the same
+source revision and resource limits. For example, from the repository root:
+
+```sh
+printf '{"method":"ic/discovery","input":{}}\n' | /usr/bin/time -v /path/to/telora/target/release/telora \
+  -C icloud_model --initialization-fuel 1000000 --request-fuel 10000 \
+  --with-memory-limit 2048 run icloud_model
+```
+
+This includes compilation, model preparation and service initialization. Record
+elapsed and user CPU time separately. Snapshot startup benchmarks below measure
+loading an already prepared model.
+
 `node scripts/benchmark-knowledge.mjs --artifact <snapshot> --full --output <report.json>`
 measures snapshot startup through the first discovery response, warmed single-key
 requests and complete traversal. The report includes compact JSON byte sizes and

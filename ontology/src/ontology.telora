@@ -11,6 +11,8 @@
 
 use crate::query as qb;
 use std::array as array;
+use std::dict as dict;
+use std::diagnostics as diagnostics;
 use std::codec as codec;
 use std::json as json;
 use std::value::{ Value };
@@ -537,16 +539,18 @@ type FilterInputKind = enum {
 
 type FilterInputDoc = struct { kind: FilterInputKind, text: String };
 
+def filter_input_doc_entries: Array((String, String)) = array::flat_map(td::variants(FilterInputKind.type), fn(variant) {
+    match property::get_variant_prop(FilterInputKind.type, variant.index, VariantDoc.type) {
+        Some(note) => [(variant.name, note.text)],
+        None => [],
+    }
+});
+
 def filter_input_docs: Fn(Array(FilterInputKind)) -> Array(FilterInputDoc) = fn(kinds) {
     array::flat_map(kinds, fn(kind) {
         let name = codec::encode(kind);
-        array::flat_map(td::variants(FilterInputKind.type), fn(variant) {
-            if Value::String(variant.name) != name { [] } else {
-                match property::get_variant_prop(FilterInputKind.type, variant.index, VariantDoc.type) {
-                    Some(note) => [{kind, text: note.text}],
-                    None => [],
-                }
-            }
+        array::flat_map(filter_input_doc_entries, fn(entry) {
+            if Value::String(entry.0) == name { [{kind, text: entry.1}] } else { [] }
         })
     })
 };
@@ -2614,7 +2618,16 @@ def knowledge_annotation_types: Fn(PreparedPayload) -> Array(Type) = fn(payload)
 def check_dimension_ids: Fn(Array(DimensionEntry)) -> Array(DimensionEntry) = fn(dimensions) {
     if let Some(entry) = array::find(dimensions, fn(d) { d.id == "" }) {
         fail!("dimension id must be nonempty", entry.entity, entry.field)
+    } else if match diagnostics::with_diagnostics(fn(entries: Array(DimensionEntry)) {
+        dict::from_pairs(array::map(entries, fn(d) { (d.id, True) }))
+    })(dimensions) {
+        Ok(_) => True,
+        # Translate duplicate dictionary keys into the model's domain diagnostic.
+        Err(_) => False,
+    } {
+        dimensions
     } else if let Some(entry) = array::find(dimensions, fn(d) {
+        # Select the first duplicate in declaration order for its diagnostic.
         array::length(array::filter(dimensions, fn(other) { other.id == d.id })) > 1
     }) {
         fail!("duplicate dimension id", entry.id)
@@ -2912,11 +2925,25 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
     }
 };
 
+def published_field_names: Fn(PreparedPayload, EntityEntry) -> Array(String) = fn(payload, entity) {
+    let dimensions = array::filter(payload.dimensions, fn(d) { d.entity == entity.index && d.authorized });
+    let measures = array::filter(payload.measures, fn(m) { m.entity == entity.index });
+    let relations = array::filter(payload.relations, fn(rel) { rel.from == entity.index && rel.id != "" });
+    array::map(array::filter(entity.fields, fn(field) {
+        (match entity.dataset { Some(spec) => array::any(spec.grain, fn(name) { name == field.name }), None => False })
+        || property::get_field_prop(entity.entity_type, field.index, TimeField.type) != None
+        || array::any(dimensions, fn(d) { d.field == field.index })
+        || array::any(measures, fn(m) { m.field == field.index })
+        || array::any(entity.sample_measures, fn(metric) { metric.field == field.name })
+        || array::any(relations, fn(rel) { match rel.guard {
+            Some(guard) => guard.field == field.name, None => False,
+        } })
+    }), fn(field) { field.name })
+};
+
 def published_fields: Fn(PreparedPayload, String) -> Array(String) = fn(payload, dataset) {
     match array::find(payload.entities, fn(e) { e.id == dataset }) {
-        Some(entity) => array::map(array::filter(entity.fields, fn(field) {
-            knowledge_target_declared(payload, {kind: KnowledgeKind::Field, owner: dataset, id: field.name})
-        }), fn(field) { field.name }),
+        Some(entity) => published_field_names(payload, entity),
         None => fail!("unknown dataset for knowledge fields", dataset),
     }
 };
@@ -3271,6 +3298,8 @@ def canonical_value_domain: Fn(PreparedPayload, String) -> Array(CanonicalValueS
     }
 };
 
+# Metadata for an already resolved dimension; catalog construction uses this
+# without materializing its full visible value domain.
 def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(payload, entry) {
     let entity = get_index(payload.entities, entry.entity);
     let field = get_index(entity.fields, entry.field);
@@ -3457,14 +3486,14 @@ def native_pair_domain: Fn(PreparedPayload, String) -> Array(NativePairEntry) = 
 };
 
 def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(payload, entity, authorized_only) {
+        let published = if authorized_only { published_field_names(payload, entity) } else { [] };
         let references = if authorized_only {
             array::filter(entity.references, fn(ref) { array::all(ref.fields, fn(name) {
-                knowledge_target_declared(payload, {kind: KnowledgeKind::Field, owner: entity.id, id: name})
+                array::any(published, fn(field) { field == name })
             }) })
         } else { entity.references };
         let field_roles = array::flat_map(entity.field_roles, fn(field) {
-            if authorized_only && !knowledge_target_declared(payload,
-                {kind: KnowledgeKind::Field, owner: entity.id, id: field.field}) { [] }
+            if authorized_only && !array::any(published, fn(name) { name == field.field }) { [] }
             else {
                 let roles = array::filter(field.roles, fn(role) { role != FieldRole::Reference
                     || array::any(references, fn(ref) { array::any(ref.fields, fn(name) { name == field.field }) }) });
@@ -5949,6 +5978,7 @@ pub use self::{
     measure_output_type,
     dimension_domain,
     canonical_value_domain,
+    dimension_brief,
     dimension_detail,
     visible_dimension_detail,
     dataset_domain,
