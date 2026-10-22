@@ -37,8 +37,9 @@ def info: Fn(Value) -> Value =
 
 The selected SQL backend is supplied when constructing the lowering function.
 The request itself does not choose a backend. An entry service passes only its
-slot input to each method; the host's JSONL envelope selects the slot. Both
-SQLite and PostgreSQL have `build_query(QueryAst)` renderers, while
+slot input to each method; the host's JSONL envelope selects the slot.
+SQLite, PostgreSQL and UQL have `build_query(QueryAst)` renderers. See
+[UQL.md](UQL.md) for UQL integration and execution assumptions, while
 [DIALECT-CONTRACT.md](DIALECT-CONTRACT.md) records the execution-equivalence
 work still needed before declaring full cross-dialect support.
 

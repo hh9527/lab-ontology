@@ -92,9 +92,9 @@ as permission for a renderer to reinterpret a valid AST.
 
 ## Materialization boundary
 
-Both renderers expose `build_query(QueryAst) -> Query`, where `Query` has
+SQLite, PostgreSQL and UQL expose `build_query(QueryAst) -> Query`, where `Query` has
 `sql: String` and `bindings: Array(Val)`. The same allocated binding handle
-becomes `?n` in SQLite and `$n` in PostgreSQL. `bindings[n-1]` supplies the
+becomes `?n` in SQLite and `$n` in PostgreSQL and UQL. `bindings[n-1]` supplies the
 value for handle `n`; repeated references reuse that handle. A renderer
 handles identifier quoting and its own syntax/functions without reverse
 parsing an SQL string or escaping data values into the template.
@@ -102,13 +102,16 @@ parsing an SQL string or escaping data values into the template.
 ```telora
 use ontology::sqlite as sqlite;
 use ontology::postgres as postgres;
+use ontology::uql as uql;
 
 let sqlite_query = sqlite::build_query(ast);
 # In a PostgreSQL-backed service, select postgres::build_query instead.
+# In a UQL-backed service, select uql::build_query instead.
 ```
 
 The service picks one backend when it constructs its lowering function; a
 request cannot mix dialects. See [DIALECT-CONTRACT.md](DIALECT-CONTRACT.md)
-for semantic parity and PostgreSQL admission status. SQL and bindings are
+for semantic parity and PostgreSQL admission status, and [UQL.md](UQL.md)
+for the UQL execution contract and verification scope. SQL and bindings are
 intermediate execution artifacts, not user-facing business answers. The
 service protocol is documented in [USAGE.md](../../USAGE.md).

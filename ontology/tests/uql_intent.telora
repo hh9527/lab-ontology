@@ -1,0 +1,108 @@
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use crate::uql as uql;
+use std::array as array;
+use std::codec as codec;
+use std::dict as dict;
+use std::json as json;
+use std::string as string;
+use std::test as test;
+use std::value::{ Value };
+
+@edsl::entity_id("server")
+@edsl::entity_source("PhysicalServer", "s")
+type Server = struct {
+    @edsl::column("ID") @edsl::key()
+    @edsl::dimension("id", True, True, [edsl::FilterOp::Eq], [edsl::FilterInputKind::Int])
+    id: Int,
+    @edsl::column("IP_ADDRESS")
+    @edsl::logical_type(edsl::LogicalType::Ipv4)
+    @edsl::dimension("ip", True, True, [edsl::FilterOp::InSubnet], [edsl::FilterInputKind::Ipv4])
+    ip: Option(String),
+};
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter, qb::Operator::Limit],
+    allowed_join_kinds: [], allowed_aggregates: [],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::And, qb::ScalarFunction::Ge,
+        qb::ScalarFunction::Lt, qb::ScalarFunction::BinaryText, qb::ScalarFunction::RegexMatch],
+    allow_distinct: False,
+};
+def payload: edsl::PreparedPayload = edsl::build_root("uql-integration", [Server.type], profile);
+def parse: Fn(String) -> Value = fn(text) { match json::parse(text) {
+    Ok(value) => value, Err(error) => fail!("invalid test JSON", error),
+} };
+def input: Value = parse(r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"server"}],"edges":[],"select":[{"node":"d","dimension":"ip"}],"filters":[{"node":"d","dimension":"id","op":"Eq","value":42}],"limit":7}"#);
+def ast: qb::QueryAst = intent::query_intent_ast_factory(payload)(input);
+def lower: Fn(Value) -> Value = intent::query_request_method_factory(payload, uql::build_query);
+
+pub def model_lowering_uses_the_same_ast_and_bindings_in_three_backends: test::Test = test::should_ok(fn() {
+    let rendered = intent::query_intent_lower_factory(payload, uql::build_query)(input);
+    rendered == uql::build_query(ast)
+        && rendered.bindings == sqlite::build_query(ast).bindings
+        && rendered.bindings == postgres::build_query(ast).bindings
+        && rendered.bindings == [qb::Val::Int(42), qb::Val::Int(7)]
+        && string::contains(rendered.sql, "`PhysicalServer` AS `s`")
+        && string::contains(rendered.sql, "`s`.`IP_ADDRESS`")
+        && string::contains(rendered.sql, "`s`.`ID` = $1")
+        && string::contains(rendered.sql, "LIMIT $2")
+});
+
+pub def batch_service_preserves_columns_and_limit_slot: test::Test = test::should_ok(fn() {
+    match lower(Value::Object({intents: Value::Array([input])})) {
+        Value::Object(response) => dict::get(response, "accepted") == Some(Value::True)
+            && dict::get(response, "diagnostics") == Some(Value::Array([]))
+            && (match dict::get(response, "queries") {
+                Some(Value::Array(queries)) => array::length(queries) == 1
+                    && (match queries[0] {
+                        Value::Object(query) => dict::get(query, "columns") == Some(codec::encode(intent::result_columns(payload, input, ast)))
+                            && dict::get(query, "limit_slot") == Some(Value::Int(1))
+                            && dict::get(query, "bindings") == Some(codec::encode(ast.ctx.bindings)),
+                        _ => False,
+                    }),
+                _ => False,
+            }),
+        _ => False,
+    }
+});
+
+pub def batch_failure_retains_the_failing_intent_index: test::Test = test::should_ok(fn() {
+    let invalid = parse(r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"missing"}],"edges":[],"select":[{"node":"d","dimension":"ip"}]}"#);
+    match lower(Value::Object({intents: Value::Array([input, invalid])})) {
+        Value::Object(response) => dict::get(response, "accepted") == Some(Value::False)
+            && dict::get(response, "queries") == Some(Value::None)
+            && (match dict::get(response, "diagnostics") {
+                Some(Value::Array(reports)) => array::length(reports) > 0
+                    && array::all(reports, fn(report) { match report {
+                        Value::Object(fields) => dict::get(fields, "index") == Some(Value::Int(1)),
+                        _ => False,
+                    } }),
+                _ => False,
+            }),
+        _ => False,
+    }
+});
+
+pub def unsupported_uql_collation_is_an_indexed_batch_failure: test::Test = test::should_ok(fn() {
+    let subnet = parse(r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"server"}],"edges":[],"select":[{"node":"d","dimension":"ip"}],"filters":[{"node":"d","dimension":"ip","op":"InSubnet","value":"192.0.2.0/24"}]}"#);
+    match lower(Value::Object({intents: Value::Array([input, subnet])})) {
+        Value::Object(response) => dict::get(response, "accepted") == Some(Value::False)
+            && dict::get(response, "queries") == Some(Value::None)
+            && (match dict::get(response, "diagnostics") {
+                Some(Value::Array(reports)) => array::any(reports, fn(report) { match report {
+                    Value::Object(fields) => dict::get(fields, "index") == Some(Value::Int(1))
+                        && (match dict::get(fields, "diagnostic") {
+                            Some(Value::Object(diagnostic)) => dict::get(diagnostic, "message")
+                                == Some(Value::String("UQL spec does not define binary text collation")),
+                            _ => False,
+                        }),
+                    _ => False,
+                } }),
+                _ => False,
+            }),
+        _ => False,
+    }
+});

@@ -1,11 +1,12 @@
 # Shared QueryAst and SQL dialects
 
 `ontology/intent` produces a validated `QueryAst` containing the immutable
-allocation context and a `QueryPlan`. Both `ontology/sqlite` and
-`ontology/postgres` expose `build_query(QueryAst) -> Query`. The SQLite
+allocation context and a `QueryPlan`. `ontology/sqlite`, `ontology/postgres`
+and `ontology/uql` expose `build_query(QueryAst) -> Query`. The SQLite
 renderer is used by the current example and icloud services. The PostgreSQL
 renderer exists but is not yet admitted as execution-equivalent across the
 full public AST; that requires the checks below, not merely plausible SQL.
+The UQL renderer and its validation scope are documented in [UQL.md](UQL.md).
 
 `ontology/postgres` has expression, Rows/DistinctRows, GroupCount and set candidate
 renderers for projections, scoped sources, JOIN ON, grouped aggregates, HAVING,
@@ -67,7 +68,7 @@ grouping key. Full cross-dialect query equivalence is still pending.
   cannot silently approximate an AST node, reinterpret an identity key, change
   the ordering of bindings, or apply session-dependent date/time semantics.
 - `BuildCtx` assigns each dynamic scalar a stable index while building the AST.
-  SQLite emits `?n` and PostgreSQL emits `$n` for the same handle; repeated
+  SQLite emits `?n`; PostgreSQL and UQL emit `$n` for the same handle; repeated
   references reuse its index. `Query.bindings[n-1]` is the scalar for handle
   `n`, even when SQL expression order differs from allocation order.
 - The source, column, and alias identifiers are checked as identifiers rather
