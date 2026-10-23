@@ -1,0 +1,50 @@
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::scalars as s;
+use ontology::experimental::transform as t;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+
+type Row = struct { seq: Int, raw: Option(String) };
+def rows: m::Dataset(Row) = m::dataset("addresses", "address_rows", Row.type, ["seq"]);
+def address: g::Expr(Row, s::Ipv4) = g::ipv4(g::input(m::optional_field(Row.type, String.type, "raw")));
+def declared: t::Declaration = t::map_columns(t::declare(rows, [], [
+    g::dimension(rows, g::dimension_group("seq", Int.type, True, []), g::input(m::field(Row.type, Int.type, "seq")), "seq", True, []),
+    g::dimension(rows, g::dimension_group("raw", String.type, True, g::text_search_filters), g::input(m::optional_field(Row.type, String.type, "raw")), "raw", True, g::text_search_filters),
+    g::dimension(rows, g::dimension_group("ip", s::Ipv4.type, True, g::ipv4_filters), address, "ip", True, g::ipv4_filters),
+], []), [t::column(m::optional_field(Row.type, String.type, "raw"), "ADDRESS_TEXT")]);
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column, qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter],
+    allowed_join_kinds: [], allowed_aggregates: [], allow_distinct: False,
+    allowed_scalars: [qb::ScalarFunction::Gt, qb::ScalarFunction::BinaryText, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt, qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::If, qb::ScalarFunction::And, qb::ScalarFunction::Or, qb::ScalarFunction::Not, qb::ScalarFunction::IsNotNull, qb::ScalarFunction::RegexMatch, qb::ScalarFunction::Instr, qb::ScalarFunction::Lower, qb::ScalarFunction::Substr, qb::ScalarFunction::Add, qb::ScalarFunction::Sub, qb::ScalarFunction::Length],
+};
+def payload: edsl::PreparedPayload = t::prepare("ipv4", [declared], profile).payload;
+def ast: Fn(String) -> qb::QueryAst = fn(extra) { intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"addresses"}],"edges":[],\{extra}}`).unwrap!()) };
+type RuntimeCase = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> RuntimeCase = fn(id, extra) { let query = ast(extra); {id, sqlite: sqlite::build_query(query), postgres: postgres::build_query(query)} };
+def filtered: Fn(String, String, String) -> RuntimeCase = fn(id, op, value) { runtime_case(id, `"select":[{"node":"r","dimension":"seq"}],"filters":[{"node":"r","dimension":"ip","op":"\{op}","value":"\{value}"}]`) };
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("project", r#""select":[{"node":"r","dimension":"seq"},{"node":"r","dimension":"ip"}]"#),
+    filtered("eq", "Eq", "192.0.2.1"), filtered("ne", "Ne", "192.0.2.1"),
+    filtered("subnet", "InSubnet", "192.0.2.0/24"), filtered("outside", "NotInSubnet", "192.0.2.0/24"),
+    filtered("all", "InSubnet", "0.0.0.0/0"), filtered("exact", "InSubnet", "192.0.2.1/32"),
+    filtered("non_octet", "InSubnet", "192.0.2.0/25"),
+    runtime_case("raw", r#""select":[{"node":"r","dimension":"seq"}],"filters":[{"node":"r","dimension":"raw","op":"Contains","value":"2001:"}]"#),
+]);
+pub def text_cannot_advertise_subnet: test::Test = test::should_fail_with(fn() { g::dimension_group("bad", String.type, True, g::ipv4_filters) }, "subnet filters require IPv4 values");
+pub def ipv4_cannot_advertise_text_search: test::Test = test::should_fail_with(fn() { g::dimension_group("bad", s::Ipv4.type, True, g::text_search_filters) }, "IPv4 dimensions only support address operations");
+pub def erased_conversion_input_is_rechecked: test::Test = test::should_fail_with(fn() { let forged = address <~ {node: g::Node::Ipv4(g::Node::Column({name: "seq", value: Int.type, nullable: False}))}; g::checked(forged) }, "IPv4 view requires text input");
+pub def malformed_address_input_is_rejected: test::Test = test::should_fail(fn() { filtered("bad", "Eq", "192.000.2.1") });
+pub def subnet_host_bits_are_rejected: test::Test = test::should_fail(fn() { filtered("bad", "InSubnet", "192.0.2.1/24") });
+type RequiredRow = struct { raw: String };
+pub def conversion_is_always_nullable: test::Test = test::should_ok(fn() { g::ipv4(g::input(m::field(RequiredRow.type, String.type, "raw"))).nullable });
+pub def ipv4_projection_requires_regex_capability: test::Test = test::should_fail(fn() {
+    t::prepare("missing-regex", [declared], profile <~ {allowed_scalars: [qb::ScalarFunction::Eq]})
+});

@@ -772,3 +772,25 @@ def states: v::Domain(State, Int) = v::domain(
 验收覆盖 13 个声明／请求正反例与九组真实 SQLite 查询，包括多编码归一、同名未知值、Unknowns、NULL、空文本和空表。
 SQLite 与 PostgreSQL 的绑定参数一致；本阶段未实际执行 PostgreSQL。
 这是业务离散值域的 transform 入口，逻辑标量、时间角色和 IC 全量迁移仍待继续推进。
+
+
+### 阶段 D 进展：类型化 IPv4 部分转换
+
+新增 `experimental::scalars::Ipv4` 和 `groups::ipv4`，用封闭表达式将文本源显式转换为可空 IPv4 逻辑值。
+`Expr(Row, String)` 转换后成为 `Expr(Row, Ipv4)`；即使源字段非空，结果也可能为 NULL。
+底层使用现有 `canonical_ipv4_view`，只接受无前导零的四段十进制地址，保留原始规范地址，不修复非法格式。
+
+```telora
+g::dimension(rows,
+    g::dimension_group("addresses", s::Ipv4.type, True, g::ipv4_filters),
+    g::ipv4(g::input(m::optional_field(Row.type, String.type, "raw"))),
+    "ip", True, g::ipv4_filters)
+```
+
+IPv4 类型只允许 Eq、Ne、InSubnet、NotInSubnet；普通文本类型不能发布子网操作。
+Graph 输入使用既有 IPv4 与 CIDR 校验，原始文本可以另行作为搜索维度发布。
+表达式仍走统一物理列映射与 profile 校验；转换和子网补集排除非法源值与 NULL。
+
+验收使用真实 SQLite 执行九组查询，覆盖规范地址、范围外 octet、前导零、IPv6、尾换行、空文本、NULL、空表，以及 /0、/24、/25、/32 和补集。
+SQLite 测试提供 REGEXP 函数；PostgreSQL 仅核对参数一致性。
+逻辑时间类型、时间角色与样本统计能力仍是后续步骤，不由本 IPv4 子项替代。

@@ -2,6 +2,8 @@
 use crate::experimental::model as model;
 use crate::experimental::quantity as quantity;
 use crate::query as qb;
+use crate::experimental::scalars as scalars;
+use crate::ontology as edsl;
 use std::array as array;
 use std::type_desc as td;
 
@@ -11,6 +13,7 @@ type IdentityInput = struct { column: Column, parts: Array(Column) };
 type Node = enum {
     Column(Column),
     Seconds(Node),
+    Ipv4(Node),
     Rate(RateInputs),
     Identity(IdentityInput),
 };
@@ -33,6 +36,11 @@ def column_shape: Fn(Type, Column) -> Shape = fn(row, column) {
 def shape: Fn(Type, Node) -> Shape = fn(row, node) {
     match node {
         Node::Column(column) => column_shape(row, column),
+        Node::Ipv4(input) => {
+            let source = shape(row, input);
+            if source.value != String.type { fail!("IPv4 view requires text input", source.value) }
+            else { {value: scalars::Ipv4.type, nullable: True} }
+        },
         Node::Seconds(input) => {
             let source = shape(row, input);
             if source.value != quantity::Milliseconds.type { fail!("seconds conversion requires milliseconds", source.value) }
@@ -78,7 +86,12 @@ def rate: for(Row) Fn(Expr(Row, quantity::Bytes), Expr(Row, quantity::Seconds)) 
         node: Node::Rate({amount: checked(amount).node, duration: checked(duration).node})}
 };
 
-type Filter = enum { Eq, Ne, Gt, Ge, Lt, Le, Contains, NotContains, StartsWith, EndsWith };
+def ipv4: for(Row) Fn(Expr(Row, String)) -> Expr(Row, scalars::Ipv4) = fn(source) {
+    {row: Row.type, value: scalars::Ipv4.type, nullable: True, node: Node::Ipv4(checked(source).node)}
+};
+
+type Filter = enum { Eq, Ne, Gt, Ge, Lt, Le, Contains, NotContains, StartsWith, EndsWith, InSubnet, NotInSubnet };
+def ipv4_filters: Array(Filter) = [Filter::Eq, Filter::Ne, Filter::InSubnet, Filter::NotInSubnet];
 def equality_filters: Array(Filter) = [Filter::Eq, Filter::Ne];
 def text_search_filters: Array(Filter) = [Filter::Eq, Filter::Ne, Filter::Contains, Filter::NotContains, Filter::StartsWith, Filter::EndsWith];
 def numeric_filters: Array(Filter) = [Filter::Eq, Filter::Ne, Filter::Gt, Filter::Ge, Filter::Lt, Filter::Le];
@@ -90,9 +103,12 @@ def representation: Fn(Type) -> Type = fn(value) {
 };
 def validate_filters: Fn(Type, Array(Filter)) -> () = fn(value, filters) {
     let storage = representation(value);
+    if value == scalars::Ipv4.type && !array::all(filters, fn(op) { array::any(ipv4_filters, fn(allowed) { op == allowed }) }) { fail!("IPv4 dimensions only support address operations", value) } else { () };
     array::map(filters, fn(op) {
         if array::length(array::filter(filters, fn(other) { other == op })) != 1 { fail!("dimension policy repeats a filter", op) }
         else { match op {
+            Filter::InSubnet => if value != scalars::Ipv4.type { fail!("subnet filters require IPv4 values", value) } else { () },
+            Filter::NotInSubnet => if value != scalars::Ipv4.type { fail!("subnet filters require IPv4 values", value) } else { () },
             Filter::Eq => (),
             Filter::Ne => (),
             Filter::Gt => if storage != Int.type && storage != Float.type { fail!("ordered filters require a numeric representation", value, op) } else { () },
@@ -282,6 +298,7 @@ def prepare: for(Row) Fn(model::Dataset(Row), Array(Binding(Row))) -> Array(Memb
 def lower: Fn(qb::BuildCtx, qb::Source, Node) -> (qb::BuildCtx, qb::Expr) = fn(ctx, source, node) {
     match node {
         Node::Column(column) => (ctx, qb::column(source, column.name)),
+        Node::Ipv4(input) => { let lowered = lower(ctx, source, input); edsl::canonical_ipv4_view(lowered.0, lowered.1) },
         Node::Seconds(input) => {
             let lowered = lower(ctx, source, input);
             let divisor = qb::bind(lowered.0, qb::Val::Float(1000.0));
@@ -336,4 +353,4 @@ pub use self::{Column, Node, Shape, Expr, input, seconds, rate, Filter, MemberKi
     DimensionGroup, dimension_group, dimension, MeasureGroup, TransferMember, transfer,
     Rename, transfer_binding, Member, Binding, prepare, query};
 pub use self::{identity_dimensions, IdentityName};
-pub use self::{BindingFacts, binding_facts, binding_roles, prepare_facts, lower, checked, shape, representation, equality_filters, text_search_filters, numeric_filters};
+pub use self::{BindingFacts, binding_facts, binding_roles, prepare_facts, lower, checked, shape, representation, ipv4, ipv4_filters, equality_filters, text_search_filters, numeric_filters};
