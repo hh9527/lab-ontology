@@ -38,7 +38,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | PonOltRole | `pon_olt_role` | `I_EntPonElement` | 第十批已验证 |
 | OnuKpi | `onu_kpi` | `PonDeviceOnuKPI` | 第十一批已验证 |
 | PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 第十二批已验证 |
-| ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 待迁移 |
+| ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 第十三批已验证 |
 | DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 待迁移 |
 | CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 待迁移 |
 | PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 待迁移 |
@@ -279,3 +279,19 @@ SQL fixture 覆盖 resId 恰好与设备 ID 相同但 parentId 不匹配、不�
 当前只准备 transform，MainService 尚未切换，不构建知识地图或运行知识测试。
 
 累计完成 18/50 个载体。源 SHA256 与 catalog 一致；12 项 transform 契约（100000 fuel）、独立初始化及累计 491 组实际 SQLite 对照与空表检查通过。PostgreSQL 仅核对参数。
+
+## 第十三批 AP Radio SSID KPI
+
+迁移 12 个物理字段、13 个维度（含三个 UTC 分桶）、8 个统计和两条设备关系。
+SsidId、DeviceId、TenantId 区分来源 SSID、父设备和租户；保持 res_id／tenant_id／ts 复合采样 grain 与 UTC 时钟。
+连接终端字段使用 Count，显式声明既有样本 Sum 与 Mean；Sum 是原始连接数样本之和，不是跨时刻去重用户数或期末快照。
+接收与发送字节使用 ByteCount(Int) 和复用的 Mean/Min/Max 模板，不因为类型可加就新增字节 Sum，不推导增量、速率或复位修正。
+有效次数保持独立字段，不成为默认权重或样本有效性筛选。
+
+真实 SQL 场景包含跨租户同刻采样、同名不同 SSID、同一 SSID 多次采样、NULL、NULL 时钟，以及 resId 与设备 ID 碰撞但 parentId 不匹配。
+同名 Guest 的样本均值独立期望为 78，而不是先按 SSID 求均值再平均；设备引用保持 parentId→DeviceId，不增加 AP 分类过滤。
+不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
+
+通用 quantity::Bytes 使用 Float；本来源为 Int，因此使用独立 ByteCount 保留公开整数类型与精度，不隐式转为 Float。
+
+累计完成 19/50 个载体。源 SHA256 与 catalog 一致；12 项 transform 契约使用双模型初始化预算 150000 通过，独立初始化仍为 100000；累计 518 组实际 SQLite 新旧查询及空表检查通过，PostgreSQL 仅核对参数。

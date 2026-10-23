@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"] + fixture["pon_port"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"] + fixture["pon_port"] + fixture["ssid"]
 # 多个角色可共享一张表，按物理列并集合并，不能重复建表或重复装载。
 schema_by_table = {}
 for table, columns in fixture["schema"]:
@@ -296,6 +296,36 @@ with sqlite3.connect(":memory:") as db:
     expected["pon_port_kpi_of_device"] = [("o1", 30.0), ("o2", 200.0), ("n1", 300.0)]
     expected["source_EntPonElementAssociationPonDevicePonPortKPI"] = expected["pon_port_kpi_of_device"]
     expected["pon_port_parent_rows"] = [("o1", 10.0), ("o1", 30.0), ("o1", 50.0), ("o2", None), ("o2", 200.0), ("n1", 300.0)]
+    ssid_columns = next(columns for table, columns in schema if table == "NetworkApRadioSsidKPI")
+    for identity, parent, tenant, clock, value in [
+        ("ssid1", "d1", "t1", "2024-02-29T23:00:00Z", 10),
+        ("ssid1", "d1", "t2", "2024-03-01T00:00:00Z", 30),
+        ("ssid2", "d1", "t1", "2024-03-01T00:00:00Z", 50),
+        ("ssid3", "d2", "t2", "2024-03-02T00:00:00Z", None),
+        ("d2", "missing", "t1", "2024-03-01T01:00:00Z", 100),
+        ("ssid4", "d2", "t2", None, 200),
+        ("ssid5", "d3", "t1", "2024-03-01T02:00:00Z", 300),
+    ]:
+        values = {column: value for column in ssid_columns}
+        values.update(resId=identity, parentId=parent, tenantId=tenant, ts=clock, projectId="s1",
+                      ssidName="Private" if identity == "ssid5" else "Guest",
+                      hwSsidAirportRecvBytes=None if value is None else value * 10,
+                      hwSsidAirportTransmitBytes=None if value is None else value * 20)
+        for column in ssid_columns:
+            if column.endswith("Effcnt"):
+                values[column] = 1000 if value == 10 else 0
+        db.execute('INSERT INTO NetworkApRadioSsidKPI VALUES (' + ','.join('?' for _ in ssid_columns) + ')', [values[column] for column in ssid_columns])
+    ssid_measures = {case["id"].removeprefix("measure_") for case in fixture["ssid"] if case["id"].startswith("measure_")}
+    assert len(ssid_measures) == 8
+    for measure in ssid_measures:
+        factor = 10 if measure.startswith("ap_ssid_receive_bytes") else 20 if measure.startswith("ap_ssid_transmit_bytes") else 1
+        value = 690 if measure == "ap_ssid_connected_terminals" else (300 if measure.endswith("_max") else 10 if measure.endswith("_min") else 115.0) * factor
+        expected[f"measure_{measure}"] = [(value,)]
+    expected.update(ssid_window=[(480, 120.0)], ssid_day=[(None, 200), ("2024-02-29T00:00:00Z", 10), ("2024-03-01T00:00:00Z", 480), ("2024-03-02T00:00:00Z", None)],
+                    ssid_names=[("Guest", 390, 78.0), ("Private", 300, 300.0)])
+    expected["ap_ssid_kpi_of_device"] = [("d1", 90, 30.0), ("d2", 200, 200.0), ("d3", 300, 300.0)]
+    expected["source_EntNetworkElement_NetworkApRadioSsidKPI"] = expected["ap_ssid_kpi_of_device"]
+    expected["ssid_parent_rows"] = [("d1", 10), ("d1", 30), ("d1", 50), ("d2", None), ("d2", 200), ("d3", 300)]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()

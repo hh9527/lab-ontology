@@ -1056,3 +1056,15 @@ ONU 与端口共享 pon_quantities 中的 dBm、摄氏温度、bit/s 类型与 M
 端口百分比用 ReportedPercent 保留 #51 的尺度冲突；不因显示 % 而确认来源单位或执行换算。
 12 项 transform 契约、独立初始化及累计 491 组实际 SQLite 对照和空表检查通过，包含 resId 碰撞、不同端口同设备、NULL、负功率与原 ONU 统计回归。
 MainService 尚未切换；不构建知识地图或执行知识测试，PostgreSQL 仅核对参数。
+
+### 阶段 D 进展：AP Radio SSID KPI
+
+新增 12 个字段、13 个维度、8 个统计和两条 parentId 设备关系。
+Count 显式声明原始连接数样本 Sum/Mean，不解释成跨时刻去重终端数或快照。
+来源字节数使用 ByteCount(Int)，保留旧接口的整数存储与输出；通用 quantity::Bytes 为 Float，不能直接替换以免隐式改变类型和精度。
+字节模板只复用 Mean/Min/Max，不新增跨时刻 Sum、增量、速率或复位修正；有效次数不作为默认权重。
+保持复合采样 grain 与 UTC 分桶；同名 SSID 的均值按原始采样行计算，不先对每个 SSID 求均值再等权平均。
+独立声明初始化仍在 100000 fuel 内；新旧载荷共同准备的契约测试本阶段使用 150000，不预生成累计 SQL 用例。
+只准备 transform，MainService 尚未切换，不建立知识地图或执行知识测试。
+
+本批累计 19/50 个载体；12 项 transform 契约、独立初始化及 518 组实际 SQLite 对照与空表检查通过。PostgreSQL 仅核对参数。
