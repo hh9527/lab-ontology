@@ -40,7 +40,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 第十二批已验证 |
 | ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 第十三批已验证 |
 | DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 第十四批已验证 |
-| CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 待迁移 |
+| CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 第十五批已验证 |
 | PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 待迁移 |
 | SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 待迁移 |
 | SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 待迁移 |
@@ -374,3 +374,28 @@ IdentityPart/Part 保留可选 raw 类型见证，角色准备及擦除后重验
 原有 20 项 Entity/Dataset 身份契约、102 个 Graph 请求及 6 组实际 SQLite 关系对照通过。
 CurrentAlarm 尚未迁移，仍为 20/50；只推进 transform，不执行知识发现、知识地图构建或知识测试。
 本项 7 项显式引用正反例（含整数正例）和 12 项 IC transform 契约通过，MainService 尚未切换。
+
+## 第十五批 CurrentAlarm
+
+迁移 46 个物理字段、42 个维度、六个度量、六个闭合业务域及与前 20 个载体之间的十条关系。
+Dataset 显式声明 Event、csn grain 和 occur_utc 时钟；current 表名不隐含未清除范围，来源行不默认排除已清除、未知状态或孤立引用。
+时钟单位、Local 编码和来源字段非空性延续旧模型契约及待生产确认假定，不借迁移作出新确认。
+
+MEDN 保留原始 String，通过 reference_part 分别引用 Device、Server、Storage、PON 的名义身份；不把它们的 ID 合为一类。
+STREXT13 的业务站点关系保留 != "3" guard，原始 source_X_SITE_VIEW_T_CURRENT_ALARM 关系不附加该 guard；来源标记恰与站点 ID 相同时，两种查询总体不同。
+所有来源关系保持既有方向、完整键和基数，不擅自加入租户连接键或设备分类范围。
+
+字段计数保留 COUNT(CSN)；未清除、critical、major 分别使用已绑定业务成员的来源编码。
+critical_or_major_alarm_count 依赖 critical + major；weighted_severe_alarm_score 再加 critical，只是原声明的加权分数，不解释为告警数或去重数。
+当前计数组合 API 约束输入及来源，业务结果名义类型仍待进一步细化；本批保持旧公开计算能力，不声称已经解决任意单位的聚合后计算。
+闭合域投影／分组只包含已知编码，Ne 也只在已知编码内计算；未知编码与 NULL 的原始行仍参与不按该域分组的总计。
+NULL fixture 用于验证来源异常值的 SQL 行为，不将旧非空字段契约改成可空。
+
+来源 T_CURRENT_ALARM.logical.yaml SHA256 与 catalog 一致。
+14 项 IC transform 契约在双载荷 200000 fuel 内通过；独立 typed 初始化在 150000 fuel 内通过。
+原双载荷 150000 与独立 100000 预算在新增声明后不足，因此分别提升验证预算，不引入知识初始化或累积查询准备。
+单独按需生成告警 fixture，128 组实际 SQLite 新旧请求和空表检查通过，包含所有维度投影、六个域全部成员的 Eq/Ne、六个度量、窗口、文本转义搜索、十条关系与两种站点 EXISTS。
+过滤成员及重点总体另有独立期望值；PostgreSQL 只核对参数，未实际执行。
+此前其他载体的 SQL 证据保持历史记录，本批未重跑其全部 574 组查询，现有载体契约随 14 项检查一起验证。
+
+累计完成 21/50 个既有载体。MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。

@@ -1,0 +1,57 @@
+use crate::typed::{payload};
+use crate::typed::inventory as inventory;
+use crate::model as baseline;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+
+type Pair = struct { id: String, typed: qb::Query, baseline: qb::Query, postgres: qb::Query, columns: Array(intent::ResultColumn), baseline_columns: Array(intent::ResultColumn) };
+def pair: Fn(String, Value) -> Pair = fn(id, request) {
+    let actual = intent::query_intent_ast_factory(payload)(request);
+    let expected = intent::query_intent_ast_factory(baseline::payload)(request);
+    {id, typed: sqlite::build_query(actual), baseline: sqlite::build_query(expected), postgres: postgres::build_query(actual),
+        columns: intent::result_columns(payload, request, actual), baseline_columns: intent::result_columns(baseline::payload, request, expected)}
+};
+def alarm_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"}],"edges":[],\{extra}}`).unwrap!()) };
+def measure_selection: String = r#""select":[],"measures":[{"node":"a","measure":"alarm_count"},{"node":"a","measure":"alarm_open_count"},{"node":"a","measure":"critical_alarm_count"},{"node":"a","measure":"major_alarm_count"},{"node":"a","measure":"critical_or_major_alarm_count"},{"node":"a","measure":"weighted_severe_alarm_score"}]"#;
+def cases: Array(Pair) = array::concat([
+    array::map(array::filter(payload.dimensions, fn(dimension) { payload.entities[dimension.entity].id == "current_alarm" }), fn(dimension) {
+        alarm_case(`project_\{dimension.id}`, `"select":[{"node":"a","dimension":"\{dimension.id}"}]`)
+    }),
+    array::flat_map(array::filter(payload.dimensions, fn(dimension) { payload.entities[dimension.entity].id == "current_alarm" && array::length(dimension.canonical_values) > 0 }), fn(dimension) {
+        array::flat_map(dimension.canonical_values, fn(member) { array::map(["Eq", "Ne"], fn(op) {
+            alarm_case(`filter_\{dimension.id}_\{member.id}_\{op}`, `"select":[{"node":"a","dimension":"alarm_csn"}],"filters":[{"node":"a","dimension":"\{dimension.id}","op":"\{op}","value":"\{member.id}"}]`)
+        }) })
+    }),
+    [alarm_case("totals", measure_selection),
+     alarm_case("uncleared", `\{measure_selection},"filters":[{"node":"a","dimension":"alarm_cleared","op":"Eq","value":"uncleared"}]`),
+     alarm_case("window", `\{measure_selection},"time_windows":[{"node":"a","dimension":"alarm_occur_utc_raw","start":2000,"end":7000}]`),
+     alarm_case("severity_groups", r#""select":[{"node":"a","dimension":"alarm_severity"}],"measures":[{"node":"a","measure":"alarm_count"},{"node":"a","measure":"weighted_severe_alarm_score"}]"#),
+     alarm_case("tenant_groups", r#""select":[{"node":"a","dimension":"alarm_tenant_id"}],"measures":[{"node":"a","measure":"alarm_count"}]"#),
+     alarm_case("name_search", r#""select":[{"node":"a","dimension":"alarm_csn"}],"filters":[{"node":"a","dimension":"alarm_name","op":"Contains","value":"_%"}]"#),
+    ],
+    [
+    pair("alarm_site_reference", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"site"}],"edges":[{"relation":"alarm_site_reference","from":"a","to":"p"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"site_id"}]}"#).unwrap!()),
+    pair("alarm_belongs_to_tenant", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"tenant"}],"edges":[{"relation":"alarm_belongs_to_tenant","from":"a","to":"p"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"tenant_id"}]}"#).unwrap!()),
+    pair("server_current_alarm", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"server_device"}],"edges":[{"relation":"server_current_alarm","from":"a","to":"p"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"server_name"}]}"#).unwrap!()),
+    pair("device_current_alarm", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"device"}],"edges":[{"relation":"device_current_alarm","from":"a","to":"p"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"device_id"}]}"#).unwrap!()),
+    pair("source_EntNetworkElement_T_CURRENT_ALARM", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"device"}],"edges":[{"relation":"source_EntNetworkElement_T_CURRENT_ALARM","from":"p","to":"a"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"device_id"}]}"#).unwrap!()),
+    pair("source_X_TENANT_VIEW_T_CURRENT_ALARM", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"tenant"}],"edges":[{"relation":"source_X_TENANT_VIEW_T_CURRENT_ALARM","from":"p","to":"a"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"tenant_id"}]}"#).unwrap!()),
+    pair("source_X_SITE_VIEW_T_CURRENT_ALARM", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"site"}],"edges":[{"relation":"source_X_SITE_VIEW_T_CURRENT_ALARM","from":"p","to":"a"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"site_id"}]}"#).unwrap!()),
+    pair("source_PhysicalServer_T_CURRENT_ALARM", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"server_device"}],"edges":[{"relation":"source_PhysicalServer_T_CURRENT_ALARM","from":"p","to":"a"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"server_name"}]}"#).unwrap!()),
+    pair("source_HuaweiStorageDeviceAggregationT_CURRENT_ALARM", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"storage_device"}],"edges":[{"relation":"source_HuaweiStorageDeviceAggregationT_CURRENT_ALARM","from":"p","to":"a"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"storage_device_id"}]}"#).unwrap!()),
+    pair("source_EntPonElementAssociationT_CURRENT_ALARM", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"},{"id":"p","entity":"pon_device"}],"edges":[{"relation":"source_EntPonElementAssociationT_CURRENT_ALARM","from":"p","to":"a"}],"select":[{"node":"a","dimension":"alarm_csn"},{"node":"p","dimension":"pon_id"}]}"#).unwrap!()),
+    pair("semantic_site_exists", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"}],"edges":[],"select":[{"node":"a","dimension":"alarm_csn"}],"exists":[{"anchor":"a","nodes":[{"id":"p","entity":"site"}],"edges":[{"relation":"alarm_site_reference","from":"a","to":"p"}]}]}"#).unwrap!()),
+    pair("source_site_exists", json::parse(r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"}],"edges":[],"select":[{"node":"a","dimension":"alarm_csn"}],"exists":[{"anchor":"a","nodes":[{"id":"p","entity":"site"}],"edges":[{"relation":"source_X_SITE_VIEW_T_CURRENT_ALARM","from":"p","to":"a"}]}]}"#).unwrap!()),
+    ],
+]);
+type Fixture = struct { cases: Array(Pair), schema: Value };
+pub def runtime_fixture: Value = codec::encode({cases, schema: codec::encode(array::map(payload.entities, fn(entity) {
+    (entity.id, entity.table, array::map(entity.fields, fn(field) { (field.name, field.column, if field.ty == Int.type || field.ty == Bool.type { "INTEGER" } else if field.ty == Float.type { "REAL" } else { "TEXT" }) }))
+}))}.ty!(Fixture));
