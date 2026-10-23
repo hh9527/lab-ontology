@@ -25,7 +25,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | Site | `site` | `X_SITE_VIEW` | 第二批已验证 |
 | Port | `port` | `I_EnterpriseNetworkLTP` | 第三批已验证 |
 | InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 第四批已验证 |
-| ServerDevice | `server_device` | `PhysicalServer` | 待迁移 |
+| ServerDevice | `server_device` | `PhysicalServer` | 第五批已验证 |
 | ServerKpi | `server_kpi` | `ServerDeviceKPI` | 待迁移 |
 | ServerFan | `server_fan` | `PhysicalServerFan` | 待迁移 |
 | ServerPsu | `server_psu` | `PhysicalServerPSU` | 待迁移 |
@@ -133,3 +133,20 @@ SQLite 原渲染将 38 项接口类型映射为深层嵌套 CASE，实际投影�
 实际覆盖全部投影、全部度量、UTC 日分组、闰日与月界、半开窗口和两个端口方向。
 共享直接列降级通过三个普通统计查询及九个 Group 查询回归；没有构建知识图或运行知识测试。
 PostgreSQL 仍只核对参数，没有实际执行。服务入口未切换。
+
+## 第五批 ServerDevice
+
+完整迁移 23 个物理字段、19 个公开维度和四个跨批关系。
+ServerId 与 ServerOriginId 使用不同名义类型，主 grain 保持 id，oriResId 不冒充主身份。
+保留 13 项服务器分类、七项健康状态和四项连接状态的闭合域及全部物理编码。
+原始地址搜索与可空 IPv4 视图分别发布，createTime 显式使用 EpochMillis UTC。
+serviceDuration 和 serviceStartTime 保持普通整数，不仅因名称推断时间单位或时区。
+
+两个服务器／租户关系及两个 OR 站点关系保留原有基数和方向，不顺带修正源声明的基数假定。
+源文件 PhysicalServer.logical.yaml 哈希与 source_catalog.json 一致，非空字段契约继续沿用基线。
+八个契约测试和独立初始化通过；SQL 覆盖全部投影、负数健康状态、连接状态、IPv4、半开时间窗和全部批内关系。
+OR 关系夹具覆盖单路匹配、双路同站点去重、双路不同站点和无匹配。
+
+服务器到租户和站点的跨端原始投影显式声明 Association 行粒度，并增加默认根行粒度下拒绝扩行投影的回归。
+
+累计 149 组 SQLite 新旧查询及空表检查通过，当前完成 6/50 个载体。PostgreSQL 仅核对参数，服务入口未切换。

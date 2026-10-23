@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"]
 schema = fixture["schema"]
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
@@ -33,7 +33,7 @@ with sqlite3.connect(":memory:") as db:
     db.create_function("regexp", 2, lambda pattern, value: None if value is None else bool(re.search(pattern, value)))
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
-        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
+        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType", "healthStatus", "connectStatus", "serviceDuration", "serviceStartTime"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
         if table == "NetworkDeviceInterfaceKPI":
             fields = ", ".join(f'"{name}" ' + ("TEXT" if name in {"resId", "tenantId", "ts", "parentId", "projectId", "interfaceName"}
                               else "INTEGER" if "Errors" in name or "Effcnt" in name else "REAL") for name in columns)
@@ -101,6 +101,25 @@ with sqlite3.connect(":memory:") as db:
     expected["kpi_day"] = [("2024-02-29T00:00:00Z", 10.0), ("2024-03-01T00:00:00Z", 25.0), ("2024-03-02T00:00:00Z", 100.0)]
     expected["interface_kpi_of_port"] = [("p1", 20.0), ("p2", 20.0)]
     expected["source_EnterpriseNetworkLTP_NetworkDeviceInterfaceKPI"] = expected["interface_kpi_of_port"]
+    server_columns = next(columns for table, columns in schema if table == "PhysicalServer")
+    for index, (identity, tenant, subnet, project, classification, health, connection, address) in enumerate([
+        ("sv1", "t1", "s1", "missing", "ne.category.server.rack", 0, 1, "192.0.2.1"),
+        ("sv2", "t2", "missing", "s2", "ne.category.server.edge", -1, 5, "2001:db8::1"),
+        ("sv3", "missing", "s1", "s1", "newClass", -2, 4, "192.0.2.255"),
+        ("sv4", "t1", "s1", "s2", "ne.category.server.kunlun", 4, 3, "192.0.2.01"),
+        ("sv5", "missing", "missing", "missing", "ne.category.server.subrack", 2, 99, "256.0.0.1"),
+    ]):
+        values = {name: f"{identity}_{name}" for name in server_columns}
+        values.update(id=identity, oriResId=f"origin_{identity}", name=identity, tenantId=tenant, refParentSubnet=subnet,
+                      projectId=project, classification=classification, healthStatus=health, connectStatus=connection,
+                      ipAddress=address, createTime=[-1, 0, 1000, 2000, 3000][index], serviceDuration=100, serviceStartTime=123)
+        db.execute('INSERT INTO PhysicalServer VALUES (' + ','.join('?' for _ in server_columns) + ')', [values[column] for column in server_columns])
+    expected.update(server_class_filter=[("sv1",)], server_health_filter=[("sv2",)], server_connect_filter=[("sv2",)],
+                    server_subnet=[("sv1",), ("sv3",)], server_window=[("sv2",), ("sv3",)])
+    expected["server_belongs_to_tenant"] = [("sv1", "Tenant Alpha"), ("sv2", "租户二"), ("sv4", "Tenant Alpha")]
+    expected["source_PhysicalServer_X_TENANT_VIEW"] = expected["server_belongs_to_tenant"]
+    expected["server_located_at_site"] = [("sv1", "s1"), ("sv2", "s2"), ("sv3", "s1"), ("sv4", "s1"), ("sv4", "s2")]
+    expected["source_PhysicalServer_X_SITE_VIEW"] = expected["server_located_at_site"]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
