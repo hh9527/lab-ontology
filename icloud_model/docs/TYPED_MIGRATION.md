@@ -1,7 +1,7 @@
 # IC 独立声明迁移
 
-迁移覆盖既有全部 50 个载体及其 transform 能力，按批验证后提交；清单记录声明迁移，不代表服务已切换。
-目前独立入口为 `src/typed.telora`，MainService 继续读取既有 `src/model.telora`。
+既有全部 50 个载体及其 transform 声明已按批迁移、验证并提交。
+默认 MainService 已切换到 `src/typed.telora`；显式 hosted 入口复用默认 MainService。`src/model.telora` 仅供显式基线测试／审计引用，服务不引用其 payload。
 新入口不导入旧模型，不解析旧注解；仅验收测试同时加载新旧载荷作对照。
 
 ## 首批范围与依据
@@ -659,3 +659,31 @@ CPU、内存与硬盘利用率复用百分比样本组，保持原始尺度和 A
 SQL 验证包含全部维度、15 个统计、12 个闭合成员 Eq／Ne、UTC 分桶／窗口、全 NULL／空窗口、全部原始数值比较、零／不同 Effcnt、两类 owner 的双根投影／双向 EXISTS／分组统计，以及原始文本和严格 IPv4／CIDR／补集。
 CPU／内存和读／写 I/O 字段采用不同的种子值，存储／FC 具有共享文本身份和各自专属身份，验证不替换字段或错误合并 owner 总体；样本 grain 不包含租户，不补造租户列。
 独立 SQL fixture 使用 650000 fuel，未准备历史累计 SQL。50/50 载体声明及全部既有载体间关系已完成阶段验证；MainService 尚未切换，后续仍须完成实际服务初始化、批量请求及 SQL 执行验收，不将声明完成等同于整体交付。知识发现、知识地图构建和知识测试继续延后。
+
+## MainService 切换与实际产物验收
+
+默认入口公开 typed payload，并以该载荷建立 `ic/transform` 方法；hosted 入口直接重导出同一个 MainService，不再维护另一套 QueryService 或挂载 discovery。当前只发布 transform，不准备知识根、知识地图或发现处理器。旧注解模型仍可由显式测试／审计引用；不参与服务工厂的载荷准备。
+
+在 TMPDIR 中以 400000 初始化 fuel、100000 请求 fuel、2048 MiB 构建默认服务 snapshot 成功。该临时产物为 65548258 bytes，SHA256 `bbdec54b86308631956c2d8d8ae35448f641ff6b6400d5b8ff3f3ff0853891b1`；没有发布或覆盖 demo 环境模型、数据库，也没有启动／重启现有环境。hosted 重导出入口的 only-types 检查通过，类型冲突、未知类型及未证边界均为零。
+
+`check-typed-icloud-service.mjs` 对实际 snapshot 通过以下验收：
+
+- 每个既有 Dataset 各一个公开投影，覆盖全部 50 个入口；按公共每批最多五个 intent 的契约提交，实际执行返回 SQL，核对空表结果与结果列。
+- 有数据的七类请求实际执行 SQLite：行数限制、规范值过滤、严格 IPv4、过滤／组合告警计数、最新整行加混合均值、GraphPair 周期差值排名、GraphUnion 身份去重。
+- 最新整行保留最新记录的 NULL，不回退到旧非空样本；告警计数保留 COUNT(CSN) 的 NULL 行为，未知 severity 不参与已知严重度计数。
+- GraphPair 独立期望为 d2 增加 60、d1 增加 40；Union 合并重叠设备总体后只保留三个身份。
+- 相同请求返回同一准备结果；有效／无效／有效混合批次整体拒绝，queries 为 null 且诊断定位到无效项。
+
+既有 `check-transform-columns-snapshot.mjs` 与 `check-result-limit-snapshot.mjs` 均通过：公开 String／规范值 ID／EpochMillis／DatetimeUtc／Float、nullable、时间窗口边界、遗漏／null／1／100／101 行限制以及调用方输出上限保持兼容。以上均只调用 transform，没有知识请求；所有实际数据库执行仅为 SQLite，未实际执行 PostgreSQL。
+
+可复验命令（产物仅写入 TMPDIR）：
+
+```sh
+bin/telora -C icloud_model build icloud_model --snapshot -o "$TMPDIR/icloud-typed-service.wasm" --initialization-fuel 400000 --request-fuel 100000 --with-memory-limit 2048 --report-usage
+node scripts/check-typed-icloud-service.mjs "$TMPDIR/icloud-typed-service.wasm"
+node scripts/check-transform-columns-snapshot.mjs "$TMPDIR/icloud-typed-service.wasm"
+node scripts/check-result-limit-snapshot.mjs "$TMPDIR/icloud-typed-service.wasm"
+bin/telora -C icloud_model check @src/hosted --only-types
+```
+
+50/50 声明、既有 transform 契约与实际服务切换已完成本地阶段验收。历史各批记录保留当时的未切换状态，以上述当前入口说明为准。公开分支推送及 #64 汇报尚待允许发布；知识工作继续作为后续范围，不影响当前 transform 验收。
