@@ -1175,3 +1175,17 @@ MainService 尚未切换，后续继续迁移其余 28 个来源载体及相关 
 只推进 transform，MainService 尚未切换；不建立知识地图，不执行知识发现或知识测试，不以其作为本阶段评价依据。
 
 本批独立 typed 初始化在 200000 fuel 内通过；原 150000 预算实际耗尽后调整验证预算，隔离工作区不含旧模型或服务，也没有知识初始化。
+
+
+### 阶段 D 进展：Terminal
+
+终端迁移 24 字段、25 维度、五个闭合域及四条来源关系，累计 24/50。
+独立 TerminalId 与设备／PON 身份分开，接入资源的原始 String 通过两种显式引用分别映射，不收紧来源 M:N 上界。
+站点保留 siteId 或 projectId 的 OR 连接与既有声明基数；租户键不自动加入其他关系。
+55 个域成员保留来源编码，包括 status=-1 的已知 Unknown；未声明业务域的 unauthorized／isBlocked 保持原始整数与比较能力，不推断为 Bool。
+blockTime 采用既有待确认的 UTC 毫秒假定，原始 IPv6／IP 文本与严格 IPv4 视图分开。
+
+源 SHA256 与 catalog 一致；16 项 transform 契约与隔离初始化在 200000 fuel 内通过。
+173 组实际 SQLite 对照及空表检查通过，包含全部域成员 Eq/Ne、所有维度、整数比较、OR 连接及四类 EXISTS 计数；PostgreSQL 只核对参数。
+独立 SQL fixture 的 250000 fuel 实际耗尽，调整至 400000 后通过；不在契约中准备累计查询，不增加知识初始化。
+MainService 尚未切换，继续迁移剩余 26 个载体；不执行知识发现、知识地图构建或知识测试。

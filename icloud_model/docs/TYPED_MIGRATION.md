@@ -43,7 +43,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 第十五批已验证 |
 | PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 第十六批已验证 |
 | SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 第十七批已验证 |
-| SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 待迁移 |
+| SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 第十八批已验证 |
 | SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 待迁移 |
 | SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 待迁移 |
 | SourceNetworkAPKPI | `source_NetworkAPKPI` | `NetworkAPKPI` | 待迁移 |
@@ -460,3 +460,23 @@ PostgreSQL 只核对参数，未实际执行；本批没有重跑其他载体全
 SQL fixture 按需独立生成，不在契约初始化中准备累计 SQL。MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
 
 本批独立 typed 初始化在 200000 fuel 内通过；原 150000 预算实际耗尽后调整验证预算，隔离工作区不含旧模型或服务，也没有知识初始化。
+
+
+## 第十八批 Terminal
+
+迁移终端来源的 24 个字段、25 个维度、五个闭合域及设备／PON／站点／租户四条关系。
+终端身份使用独立 TerminalId；接入资源 ID 保留原始 String，分别通过 reference_part 引用设备和 PON 的名义身份，不把二者合为同一类型，也不收紧原有 Many0→Many0 上界。
+站点保留 siteId 或 projectId 两个键的 OR 关系及 Many0→Optional 声明，不推断两者总是相同，不添加租户键；租户关系保持 Many0→Optional。
+业务域包含 55 个已知成员，其中 status 的 -1 是来源明确声明的已知 Unknown 编码，不是任意未知值的兜底成员。
+未声明业务域的 unauthorized、isBlocked 保留原始整数及既有数值比较能力，不擅自收紧为 Bool；vlanId 也不增加范围约束。
+原始 IPv4／IPv6 文本仍可搜索，严格 IPv4 视图单独发布；blockTime 的 UTC 毫秒单位继续待生产确认，非空性沿用旧契约。
+源 EntTerminalElement.logical.yaml SHA256 与 catalog 一致。
+
+16 项 IC transform 契约（200000 fuel）与独立 typed 初始化（200000 fuel）通过。
+SQL fixture 独立按需生成，不在契约初始化阶段准备累计查询；不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
+
+173 组实际 SQLite 新旧查询对照及空表检查通过，覆盖全部维度、55 个域成员 Eq/Ne、五域／租户分组、三种原始整数的全部比较、时间窗口、文本转义、IPv4 子网与补集以及四类关系和 EXISTS 计数。
+站点 fixture 包含两个键相同、分别命中不同目标、只命中 project 和孤立键；保留来源 OR 语义，不将其描述为已验证的生产单目标约束。
+NULL fixture 验证异常值 SQL 行为，不改变非空契约；PostgreSQL 只核对参数，未实际执行。
+本批独立 SQL fixture 实际耗尽 250000 fuel 后调至 400000 并通过，不影响模型初始化预算，没有增加知识准备。
+累计完成 24/50；此前载体 SQL 证据保留为历史记录，本批未重跑其全部查询。
