@@ -24,7 +24,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | Tenant | `tenant` | `X_TENANT_VIEW` | 首批已验证 |
 | Site | `site` | `X_SITE_VIEW` | 第二批已验证 |
 | Port | `port` | `I_EnterpriseNetworkLTP` | 第三批已验证 |
-| InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 待迁移 |
+| InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 第四批已验证 |
 | ServerDevice | `server_device` | `PhysicalServer` | 待迁移 |
 | ServerKpi | `server_kpi` | `ServerDeviceKPI` | 待迁移 |
 | ServerFan | `server_fan` | `PhysicalServerFan` | 待迁移 |
@@ -114,3 +114,22 @@ SQLite 原渲染将 38 项接口类型映射为深层嵌套 CASE，实际投影�
 新增四个直接 SQLite 条件链执行回归；relation model 的 102 个既有 Graph 请求和六组 SQL 对照通过。
 验收夹具合并为一次 Telora 初始化，避免按能力组重复准备新旧模型。
 累计迁移 4/50 个载体、46 个公开维度、三个计数和九个关系，服务未切换。
+
+## 第四批 InterfaceKpi
+
+完整迁移 30 个物理字段、31 个公开维度、16 个度量及两个跨批关系，累计 5/50 个载体。
+样本粒度显式保留 res_id／tenant_id／ts，权威时钟为 Rfc3339Utc。
+旧模型还将 res_id 标记为 key；新声明不将它提升为样本唯一身份，契约测试按完整采样 grain 对比。
+两个端口关系仍按原有 res_id 对应 PortId，不擅自增加租户等式。
+
+四个样本 Group 复用包速率、利用率、暂定字节速率及错误数的统计契约，公开名称在字段绑定时映射。
+使用普通 NumericGroup 保留 interface_out_errors 的既有非采样 Avg，不额外赋予采样角色。
+直接物理列的 NumericGroup 降级为普通字段度量，复合表达式仍保存 row_expression。
+保留三个 UTC 分桶、原始时间筛选权限、Min／Max 摘要角色与单位，不自动添加 Latest 或 Sum。
+暂定 byte/s 与源 bits_per_second 的冲突继续由 #51 跟踪，本阶段不做隐式换算。
+源文件 NetworkDeviceInterfaceKPI.logical.yaml 哈希与 source_catalog.json 一致，非空契约继续沿用基线。
+
+七个契约测试和独立初始化通过，SQL 对照累计 121 组及空表检查。
+实际覆盖全部投影、全部度量、UTC 日分组、闰日与月界、半开窗口和两个端口方向。
+共享直接列降级通过三个普通统计查询及九个 Group 查询回归；没有构建知识图或运行知识测试。
+PostgreSQL 仍只核对参数，没有实际执行。服务入口未切换。

@@ -14,7 +14,13 @@ use std::test as test;
 
 def base_entity: Fn(String) -> edsl::EntityEntry = fn(id) { match array::find(baseline::payload.entities, fn(entry) { entry.id == id }) { Some(entry) => entry, None => fail!("baseline entity missing", id) } };
 pub def physical_sources_fields_and_grains_match_the_baseline: test::Test = test::should_ok(fn() {
-    array::all(payload.entities, fn(entity) { let previous = base_entity(entity.id); entity.table == previous.table && entity.fields == previous.fields && match (entity.dataset, previous.dataset) {
+    array::all(payload.entities, fn(entity) { let previous = base_entity(entity.id); entity.table == previous.table && entity.fields == array::map(previous.fields, fn(field) {
+        # 显式复合 grain 已给出完整样本身份，不把 res_id 单列当成唯一键
+        match entity.dataset {
+            Some(spec) => if array::length(spec.grain) > 1 { field <~ {is_key: False} } else { field },
+            None => field,
+        }
+    }) && match (entity.dataset, previous.dataset) {
         (Some(current), None) => current.kind == edsl::DatasetKind::Entity && current.utc_time == None && current.grain == array::map(array::filter(previous.fields, fn(field) { field.is_key }), fn(field) { field.name }),
         _ => entity.dataset == previous.dataset,
     } })
@@ -30,7 +36,7 @@ pub def all_current_dimension_contracts_are_preserved: test::Test = test::should
                 Some(value) => value.ty == old.ty && value.half_open == old.half_open && value.output_type == old.output_type && value.field == old.field
                     && value.computed == old.computed && value.authorized == old.authorized && value.projectable == old.projectable
                     && value.filterable == old.filterable && value.ops == old.ops && value.input_kinds == old.input_kinds
-                    && value.scope == old.scope && value.canonical_order == old.canonical_order
+                    && value.utc_bucket == old.utc_bucket && value.scope == old.scope && value.canonical_order == old.canonical_order
                     && array::map(value.canonical_values, fn(member) { (member.id, member.wires) }) == array::map(old.canonical_values, fn(member) { (member.id, member.wires) }),
             }
         })
@@ -44,10 +50,13 @@ pub def all_current_record_measures_are_preserved: test::Test = test::should_ok(
     })
 });
 pub def every_relation_between_migrated_datasets_is_preserved: test::Test = test::should_ok(fn() {
-    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 4 && relation.to < 4 });
+    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 5 && relation.to < 5 });
     array::length(expected) == array::length(payload.relations) && array::all(expected, fn(old) { array::any(payload.relations, fn(value) { value.id == old.id && value.from == old.from && value.to == old.to && value.cardinality == old.cardinality && value.key == old.key && value.guard == old.guard }) })
 });
 pub def device_identity_is_id_only: test::Test = test::should_ok(fn() { inventory::device_subject.parts == [{source: "id", target: "id", value: inventory::DeviceId.type, nullable: False}] });
+pub def sample_roles_units_and_statistics_are_preserved: test::Test = test::should_ok(fn() {
+    array::all(payload.entities, fn(entity) { entity.sample_measures == base_entity(entity.id).sample_measures })
+});
 pub def backend_capability_profile_is_preserved: test::Test = test::should_ok(fn() { payload.profile == baseline::payload.profile });
 
 type Pair = struct { id: String, typed: qb::Query, baseline: qb::Query, postgres: qb::Query, columns: Array(intent::ResultColumn), baseline_columns: Array(intent::ResultColumn) };
@@ -101,7 +110,20 @@ pub def port_cases: Value = codec::encode(array::concat([
     [pair("source_EnterpriseNetworkLTP_X_TENANT_VIEW", json::parse(r#"{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"port"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"source_EnterpriseNetworkLTP_X_TENANT_VIEW","from":"p","to":"t"}],"select":[{"node":"p","dimension":"port_name"},{"node":"t","dimension":"tenant_name"}]}"#).unwrap!())],
 ]));
 
+def kpi_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"interface_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def kpi_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "interface_kpi" }), fn(measure) {
+        kpi_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [kpi_case("kpi_window", r#""select":[],"measures":[{"node":"k","measure":"interface_tx"}],"time_windows":[{"node":"k","dimension":"interface_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     kpi_case("kpi_day", r#""select":[{"node":"k","dimension":"interface_kpi_utc_day"}],"measures":[{"node":"k","measure":"interface_tx"}]"#)],
+    array::map(["interface_kpi_of_port", "source_EnterpriseNetworkLTP_NetworkDeviceInterfaceKPI"], fn(relation) {
+        let source = if relation == "interface_kpi_of_port" { "k" } else { "p" };
+        let target = if source == "k" { "p" } else { "k" };
+        pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"interface_kpi"},{"id":"p","entity":"port"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"port_name"}],"measures":[{"node":"k","measure":"interface_tx"}]}`).unwrap!())
+    }),
+]));
 # 一次初始化输出全部对照请求与物理 schema，避免每组查询重复准备旧模型
-type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, schema: Value };
-def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, schema: physical_schema};
+type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, kpi: Value, schema: Value };
+def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, kpi: kpi_cases, schema: physical_schema};
 pub def runtime_fixture: Value = codec::encode(fixture);

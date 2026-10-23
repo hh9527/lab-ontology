@@ -936,3 +936,14 @@ PortId、DeviceId、TenantId 分开约束角色身份，BitsPerSecond 保留带�
 共享渲染改动同时通过 relation model 的 102 个既有 Graph 请求和六组 SQL 对照。
 独立初始化验收显式使用 100000 fuel，工作区仍不含旧模型与服务源码。
 SQL 对照夹具合并到一次初始化，减少重复准备成本；未执行知识测试，服务未切换。
+
+### 阶段 D 进展：InterfaceKpi 与样本模板实际迁移
+
+迁移全部 30 个物理字段、31 个公开维度、16 个度量和两个跨批关系，累计 5/50 个载体。
+Metric 保留完整 res_id／tenant_id／ts grain、Rfc3339Utc 时钟和三个 UTC 分桶；不将单列 res_id 当作样本身份。
+四个样本 Group 复用统计成员和单位，字段绑定独立映射公开名称；保留原有 Primary／SampleSummary 角色。
+interface_out_errors 保留普通 Avg，直接列 NumericGroup 使用字段度量，表达式型 Group 继续使用 row_expression。
+
+单位冲突沿用 #51 的暂定 byte/s 契约，不默默改成 bit/s，也不进行换算。
+七个契约测试、隔离初始化及累计 121 组 SQLite 新旧查询与空表对照通过，覆盖全部投影和度量、闰日月界、UTC 分桶、半开窗口及双向端口关联。
+普通数值统计和表达式 Group 的 SQLite 回归通过；不运行知识测试，服务未切换，剩余载体和完整服务切换继续待办。

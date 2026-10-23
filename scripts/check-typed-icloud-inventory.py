@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"]
 schema = fixture["schema"]
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
@@ -34,6 +34,9 @@ with sqlite3.connect(":memory:") as db:
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
         fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
+        if table == "NetworkDeviceInterfaceKPI":
+            fields = ", ".join(f'"{name}" ' + ("TEXT" if name in {"resId", "tenantId", "ts", "parentId", "projectId", "interfaceName"}
+                              else "INTEGER" if "Errors" in name or "Effcnt" in name else "REAL") for name in columns)
         db.execute(f'CREATE TABLE "{table}" ({fields})')
     db.executemany("INSERT INTO X_TENANT_VIEW (TENANT_ID, TENANT_NAME, INDUSTRY, TENANT_ACCESS_TIME) VALUES (?, ?, ?, ?)", [("t1", "Tenant Alpha", "IT", -1), ("t2", "租户二", "Health", 1000)])
     columns = next(columns for table, columns in schema if table == "I_EntNetworkElement")
@@ -80,6 +83,24 @@ with sqlite3.connect(":memory:") as db:
     expected["port_belongs_to_device"] = [("p1", "d1"), ("p2", "d1")]
     expected["source_EntNetworkElement_EnterpriseNetworkLTP"] = expected["port_belongs_to_device"]
     expected["source_EnterpriseNetworkLTP_X_TENANT_VIEW"] = [("p1", "Tenant Alpha"), ("p2", "租户二")]
+    kpi_columns = next(columns for table, columns in schema if table == "NetworkDeviceInterfaceKPI")
+    for identity, tenant, clock, value in [
+        ("p1", "t1", "2024-02-29T23:00:00Z", 10),
+        ("p1", "t1", "2024-03-01T00:00:00Z", 30),
+        ("p2", "t2", "2024-03-01T01:00:00Z", 20),
+        ("missing", "t1", "2024-03-02T00:00:00Z", 100),
+    ]:
+        values = {name: value for name in kpi_columns}
+        values.update(resId=identity, tenantId=tenant, ts=clock, parentId="parent", projectId="s1", interfaceName=identity)
+        db.execute('INSERT INTO NetworkDeviceInterfaceKPI VALUES (' + ','.join('?' for _ in kpi_columns) + ')', [values[column] for column in kpi_columns])
+    for case in cases:
+        if case["id"].startswith("measure_"):
+            measure = case["id"].removeprefix("measure_")
+            expected[case["id"]] = [(100 if measure.endswith("_max") else 10 if measure.endswith("_min") else 40.0,)]
+    expected["kpi_window"] = [(25.0,)]
+    expected["kpi_day"] = [("2024-02-29T00:00:00Z", 10.0), ("2024-03-01T00:00:00Z", 25.0), ("2024-03-02T00:00:00Z", 100.0)]
+    expected["interface_kpi_of_port"] = [("p1", 20.0), ("p2", 20.0)]
+    expected["source_EnterpriseNetworkLTP_NetworkDeviceInterfaceKPI"] = expected["interface_kpi_of_port"]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
