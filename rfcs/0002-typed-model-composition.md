@@ -863,3 +863,35 @@ Latest 复用原有实现：按权威 UTC 时钟降序，使用 grain 字段稳�
 实际 SQLite 覆盖六组查询：重复 rx／tx 模板、聚合混用、窗口、空表／全 NULL、缺失时钟、最新 NULL、grain 并列、RFC3339 与 epoch 时钟，以及超过 2^53 的精确整数 Latest 和显式 Count Sum。
 SQLite 与 PostgreSQL 参数一致，本阶段未实际执行 PostgreSQL。
 普通非 Metric 来源的数值统计、UTC 分桶独立声明和 IC 全量迁移仍待继续；不通过添加虚构采样粒度将这些来源改造成 Metric。
+
+### 阶段 D 进展：普通数值 Group 与独立 UTC 分桶
+
+新增 `groups::NumericGroup(Value)`、`numeric_group` 和 `numeric_binding`，直接复用封闭表达式与 Dataset 物理列映射。
+该模板声明 Mean／Min／Max，以及 Count／Bytes 类型上的显式 Sum，不要求 Metric、权威时钟或样本 grain，也不产生采样元数据。
+这使在线率等来源可以保留原有普通统计语义，避免为了复用统计模板而虚构采样身份或单位。
+
+```telora
+type ReportedRate = struct(Float);
+def rate_stats: g::NumericGroup(ReportedRate) = g::numeric_group(
+    "reported_rates", ReportedRate.type,
+    [g::Statistic::Mean, g::Statistic::Min, g::Statistic::Max]);
+# numeric_binding(dataset, rate_stats, expression, names) 可以重复绑定不同字段
+# 每个成员显式映射公开名，准备时重检模板、输入类型和完整性
+```
+
+普通统计 Group 的全部成员必须使用同一输入表达式，不能在擦除类型后私下更换某个成员的源或聚合函数。
+没有 grain 的来源仍遵守 Graph 原有阈值身份校验，不因获得统计模板而绕过完整身份要求。
+Int／Count 的 Mean 返回 Number，Count Sum 保留 Integer；全 NULL 和空总体仍无统计值。
+
+新增 `groups::utc_bucket(expression, unit)`，保留来源名义时间类型和编码，结果保守可空。
+支持 UTC epoch、RFC3339 UTC、UTC 日期及 Hour／Day／Month 的原有组合，拒绝 Local 时钟、普通数字和 DateUtc 小时桶。
+例如将 `Expr(Row, s::EpochMillis)` 按 Day 分桶，仍返回 `Expr(Row, s::EpochMillis)`；负 epoch 使用原后端的向下分桶规则。
+
+`DimensionEntry.utc_bucket` 保存显式分桶契约。旧注解入口和独立入口都写入该事实，分桶筛选校验直接读取它，
+无需回到 Row 属性寻找分桶声明。
+同时将 `time::window_filters` 从知识详情读取切换到准备维度／字段契约，消除时间窗请求转换中残余的知识发现依赖。
+
+验收新增普通统计十例、UTC 分桶九例，以及各三组实际 SQLite 查询。
+覆盖重复统计绑定、可加类型、来源筛选、身份拒绝、空表／全 NULL、负 epoch、月界、闰日、UTC 小时／日／月、NULL 分组和半开时间窗。
+PostgreSQL 仅核对参数一致性；未执行知识测试。
+普通统计、样本统计和时间基础入口现已具备，下一步进入 IC 分批独立声明迁移，继续按实际能力缺口补齐，不将当前阶段等同于 IC 已迁移。

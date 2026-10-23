@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 temp_root = Path(os.environ.get("TMPDIR") or Path.home() / ".cache/tmp")
 cases = {
+    "numeric_group_value_type": 'pub def bad: g::Binding(gf::MillisRow) = g::numeric_binding(gf::millis, g::numeric_group("rates", q::BytesPerSecond.type, [g::Statistic::Mean]), gf::ms_amount, [{member: g::Statistic::Mean, publish: "rate"}]);',
     "sample_quantity_type": 'pub def bad: ontology::experimental::samples::Binding(gf::MillisRow) = ontology::experimental::samples::bind(gf::millis, ontology::experimental::samples::group("rate", q::BytesPerSecond.type, ontology::experimental::samples::Statistic::Mean, [], None), model::optional_field(gf::MillisRow.type, q::Bytes.type, "rx"), []);',
     "utc_local_clock_type": 'pub def bad: ontology::experimental::scalars::EpochMillis = ontology::experimental::scalars::LocalEpochMillis(1000);',
     "ipv4_requires_text": 'pub def bad: g::Expr(gf::MillisRow, ontology::experimental::scalars::Ipv4) = g::ipv4(gf::ms_amount);',
