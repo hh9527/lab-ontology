@@ -18,6 +18,8 @@ IC 模型使用上述注解准备入口；relation 模型使用 `experimental::t
 实验 API 的 Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
 维度和聚合度量共用这些表达式；Graph 投影与相关 EXISTS 聚合均检查能力和粒度。
 可空身份缺失任一分量时所有分量投影为 NULL，速率只在正时长上计算，Sum／Max／Avg 保留空集 NULL 语义。
+逻辑 Row 字段与物理列名可通过 `transform::column` 和 `transform::map_columns` 显式绑定；未列出的字段使用同名物理列。
+映射保留字段类型、角色和粒度，准备时拒绝错配与列冲突。Group 表达式和角色关系共同使用已校验的物理映射。
 这些表达式直接生成 QueryAst，不接受任意函数或 SQL 字符串映射；API 与范围见 [RFC 0002](../../rfcs/0002-typed-model-composition.md)。
 
 ```telora

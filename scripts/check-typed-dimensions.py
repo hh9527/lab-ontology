@@ -12,9 +12,9 @@ result = subprocess.run([
     "--request-fuel", "100000", "--with-memory-limit", "1024",
 ], capture_output=True, text=True, check=True, timeout=180)
 cases = json.loads(result.stdout)
-assert [case["id"] for case in cases] == ["projection", "filter"]
+assert [case["id"] for case in cases] == ["projection", "filter", "count"]
 with sqlite3.connect(":memory:") as db:
-    db.execute("CREATE TABLE samples (seq INTEGER, tenant TEXT, device TEXT, amount REAL, ms REAL)")
+    db.execute("CREATE TABLE samples (ROW_NO INTEGER, TENANT_ID TEXT, DEVICE_ID TEXT, BYTES REAL, ELAPSED_MS REAL)")
     db.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?)", [
         (1, "T1", "A", 100, 2000),
         (2, "T2", "A", 90, 3000),
@@ -33,6 +33,7 @@ with sqlite3.connect(":memory:") as db:
             (1.0, None, "T1", "B"), (None, None, "T1", "B"),
         ],
         "filter": [(2.0, 50.0), (1.0, 50.0)],
+        "count": [(8,)],
     }
     for case in cases:
         query = case["query"]
@@ -43,5 +44,5 @@ with sqlite3.connect(":memory:") as db:
     for case in cases:
         query = case["query"]
         bindings = {str(index + 1): value for index, value in enumerate(query["bindings"])}
-        assert db.execute(query["sql"], bindings).fetchall() == []
+        assert db.execute(query["sql"], bindings).fetchall() == ([(0,)] if case["id"] == "count" else [])
 print("Passed Graph computed dimensions: conversions, rates, complete nullable identity, filters, aliases and empty input")

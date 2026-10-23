@@ -9,12 +9,12 @@ assert.equal(cases.length, graph ? 5 : 4);
 const db = new DatabaseSync(':memory:');
 db.exec(`CREATE TABLE samples_ms (
   tenant TEXT, device TEXT, seq INTEGER, name TEXT, category TEXT,
-  rx REAL, tx REAL, elapsed_ms REAL
+  ${graph ? "RX_BYTES REAL, TX_BYTES REAL, DURATION_MS REAL" : "rx REAL, tx REAL, elapsed_ms REAL"}
 );
 CREATE TABLE owners (tenant TEXT, device TEXT, name TEXT);
 CREATE TABLE samples_s (
-  tenant_key TEXT, device_key TEXT, sequence INTEGER, title TEXT, kind TEXT,
-  bytes_in REAL, bytes_out REAL, duration_seconds REAL
+  ${graph ? "TENANT_ID TEXT, DEVICE_ID TEXT" : "tenant_key TEXT, device_key TEXT"}, sequence INTEGER, title TEXT, kind TEXT,
+  ${graph ? "INPUT_BYTES REAL, OUTPUT_BYTES REAL, DURATION_S REAL" : "bytes_in REAL, bytes_out REAL, duration_seconds REAL"}
 );`);
 const rows = [
   ['T1', 'D1', 1, 'alpha', 'router', 100, 10, 1000],
@@ -91,7 +91,8 @@ for (const item of cases) {
 
 // 无 affinity 列保留整数存储，验证 typed rate 的 lowering 主动使用浮点除法。
 db.exec(`DROP TABLE samples_s; CREATE TABLE samples_s (
-  tenant_key, device_key, sequence, title, kind, bytes_in, bytes_out, duration_seconds
+  ${graph ? "TENANT_ID, DEVICE_ID" : "tenant_key, device_key"}, sequence, title, kind,
+  ${graph ? "INPUT_BYTES, OUTPUT_BYTES, DURATION_S" : "bytes_in, bytes_out, duration_seconds"}
 ); INSERT INTO samples_s VALUES ('T1', 'D1', 1, 'integer', 'router', 3, 5, 2);`);
 const integer = run(cases.find((item) => item.id === 's_all').sqlite)[0];
 assert.equal(integer.rx_mean, 1.5);

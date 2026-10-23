@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 temp_root = Path(os.environ.get("TMPDIR") or Path.home() / ".cache/tmp")
 cases = {
+    "column_row_owner": 'pub def bad: transform::ColumnMapping(gf::SecondsRow) = transform::column(model::field(gf::MillisRow.type, q::Bytes.type, "tx"), "BYTES");',
     "nominal_value": 'pub def bad: f::DeviceId = f::TenantId("T1");',
     "identity_member": """pub def bad: model::IdentityPart(f::Inventory, f::DeviceIdentity) = model::identity_part(
         model::field(f::Inventory.type, f::TenantId.type, "tenant"),
@@ -46,10 +47,11 @@ with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root
     tests = workspace / "relation_model/tests"
     tests.mkdir()
     prelude = "mod fixture;\nmod group_fixture;\nuse self::fixture as f;\nuse self::group_fixture as gf;\nuse ontology::experimental::model as model;\nuse ontology::experimental::quantity as q;\nuse ontology::experimental::groups as g;\n"
-    prelude += "use ontology::experimental::relations as r;\nuse ontology::ontology as edsl;\n"
+    prelude += "use ontology::experimental::relations as r;\nuse ontology::experimental::transform as transform;\nuse ontology::ontology as edsl;\n"
     # 先用同一映射的合法版本确认测试工作区可解析和类型闭包成立。
     control = prelude + "pub def good: model::Role(f::Inventory) = model::role(f::inventory, f::device, \"device\", False, f::inventory_parts);\n"
     control += 'pub def group_good: g::Binding(gf::MillisRow) = g::transfer_binding(gf::millis, g::transfer, gf::ms_amount, gf::ms_duration, gf::names("rx"));\n'
+    control += 'pub def column_good: transform::ColumnMapping(gf::MillisRow) = transform::column(model::field(gf::MillisRow.type, q::Bytes.type, "tx"), "BYTES");\n'
     for name, body in [("control", control), *[(name, prelude + body) for name, body in cases.items()]]:
         (tests / name).mkdir()
         shutil.copy2(ROOT / "relation_model/tests/typed_model/fixture.telora", tests / name / "fixture.telora")

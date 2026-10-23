@@ -646,3 +646,56 @@ python3 scripts/check-typed-groups.py
 
 该产物使用五张关系表的当前服务声明；合成流量 Group 由测试模块独立验收。
 这些指标用于记录当前规模，未进行同机基线对照，不能据此声称类型化声明已经缩小产物或改善初始化性能。
+
+
+## 阶段 D：公共 transform 边界与 IC 迁移
+
+### 当前边界与迁移目标
+
+Graph 请求中的 `entity` 继续寻址 Dataset 实例，不根据 Entity 身份类型自动选择物理数据源或建立关系。
+Entity、Dataset 与 Role 的独立含义由类型化作者声明表达；现有 Graph、GraphPair、GraphUnion 和批量原子接受契约保持适用。
+返回列继续采用现有物理类型与 nullable 标记，单位与名义类型用于声明、绑定及表达式检查；公开名义结果模式需要另行版本化，当前不增加知识发现或知识图初始化。
+`experimental` API 继续随实际迁移细化，尚未承诺稳定签名。
+
+IC 迁移目标是当前全部 50 个载体及其已声明的 transform 能力，不能将几个易迁移表的通过等同于整体迁移完成。
+逐批保留源物理列、ID、现有身份粒度、可空性、基数、角色与保护条件；同时保留文本操作、规范／半开放值、IPv4、时间窗口与分桶、样本统计、Latest、过滤度量及关系查询能力。
+同名指标不能因为进入 Group 而改变统计意义，不为已有报告率添加 Sum 或臆造 Bytes／Seconds 计算。
+
+实施顺序如下。
+
+1. 支持 Row 字段到物理列的带类型映射，并在所有表达式和关系中统一使用
+2. 根据现有 IC 字段契约补齐可复用维度策略、规范值、半开放值和逻辑标量声明
+3. 建立报告样本统计 Group 与明确数量类型，补齐时间角色、窗口、分桶和 Latest 的类型化准备
+4. 分批迁移 IC 的 Dataset、Entity 角色和具名关系，按批运行 transform 与数据库等价验收
+5. 保留全部当前查询能力后切换 IC MainService，完成相应初始化、请求转换和 SQL 执行验收
+
+源模型审计以当前目录证据和原始元数据为依据；每批核对相关源文件哈希与字段，不用生成数据证明生产单位或唯一性。
+设备和服务器现有主体身份为 id，不采用 relation 合成夹具的租户复合身份替代；尚未确认的接口数据率单位、I/O 大小字节乘数及样本唯一性继续保留已有显式假定与 TODO。
+
+### 带类型的物理列映射
+
+`transform::column(Field(Row, Value), physical_name)` 生成带 Row 约束的列映射，`transform::map_columns(declaration, mappings)` 设置该声明的显式映射清单。
+未列出的字段保留与 Row 字段同名的默认列；再次设置时替换显式清单。
+映射只改变物理寻址，不改变字段名、名义类型、可空性、角色身份或 grain，不接受 SQL 字符串表达式。
+
+IC Tenant 的逻辑 id 与物理 TENANT_ID、KPI 的 res_id 与 resId 等命名差异是这一能力的实际输入。
+Tenant 和网络设备的相关目录哈希已与本地 `icloud-corpus/metadata` 原文件核对一致。
+
+```telora
+let declared = transform::declare(tenants, [tenant_subject], groups, ["tenant_count"]);
+let mapped = transform::map_columns(declared, [
+    transform::column(m::field(TenantRow.type, TenantId.type, "id"), "TENANT_ID"),
+]);
+```
+
+准备边界重新检查擦除后的 Row、字段、名义类型、可空性和物理标识符，拒绝未知字段、重复逻辑字段、非法列名，以及显式／默认映射之间的物理列冲突。
+为兼容 SQLite 的列名规则，冲突检查忽略 ASCII 大小写。
+不同逻辑字段不能通过列映射意外共用同一个物理列；纯计算和语义转换仍使用封闭 Expr。
+
+Group 在逻辑 Row 字段上检查类型，lowering 后在进入 QueryAst 前统一替换成物理列。
+这条路径覆盖普通与计算维度、可空身份的全部判空列、Group 聚合输入及相关 EXISTS；关系仍通过已登记角色定位逻辑字段，再读取准备结构的物理列。
+记录计数直接使用 grain 字段的物理映射，Graph 节点别名与物理列名保持独立。
+
+验收通过 26 个准备正反例、四个维度／计数测试、23 个 Group 测试、合法类型控制与 12 个编译期拒绝；实际 SQLite 覆盖列重命名、单位换算、身份 NULL、分组／总体聚合、相关 EXISTS、grain 记录计数与空表零计数。
+现有 102 个 graph 用例和六组新旧关系等价查询同时通过。
+IC 的服务入口尚未切换，以上是后续完整迁移所需的声明能力。
