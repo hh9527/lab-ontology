@@ -27,6 +27,8 @@ cases = {
         gf::ms_amount, gf::ms_duration, gf::names("rx"));""",
     "group_category_type": """pub def bad: g::Binding(gf::MillisRow) = g::dimension(gf::millis, gf::category,
         g::input(model::optional_field(gf::MillisRow.type, String.type, "name")), "category", True, []);""",
+    "relation_role_owner": """pub def bad: r::Relation = r::relation("wrong", f::samples, f::device_role,
+        f::inventory, f::device_role, {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional});""",
 }
 with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root) as directory:
     workspace = Path(directory)
@@ -44,6 +46,7 @@ with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root
     tests = workspace / "relation_model/tests"
     tests.mkdir()
     prelude = "mod fixture;\nmod group_fixture;\nuse self::fixture as f;\nuse self::group_fixture as gf;\nuse ontology::experimental::model as model;\nuse ontology::experimental::quantity as q;\nuse ontology::experimental::groups as g;\n"
+    prelude += "use ontology::experimental::relations as r;\nuse ontology::ontology as edsl;\n"
     # 先用同一映射的合法版本确认测试工作区可解析和类型闭包成立。
     control = prelude + "pub def good: model::Role(f::Inventory) = model::role(f::inventory, f::device, \"device\", False, f::inventory_parts);\n"
     control += 'pub def group_good: g::Binding(gf::MillisRow) = g::transfer_binding(gf::millis, g::transfer, gf::ms_amount, gf::ms_duration, gf::names("rx"));\n'

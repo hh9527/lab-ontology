@@ -1,0 +1,83 @@
+# RFC 0002 的 transform 实验：显式 Entity／Dataset／Role 决定连接键。
+use crate::model as baseline;
+use ontology::experimental::model as m;
+use ontology::experimental::relations as r;
+use ontology::ontology as edsl;
+use std::array as array;
+
+type TenantId = struct(String);
+type SiteId = struct(String);
+type DeviceId = struct(String);
+type ConnectionId = struct(String);
+type RouteId = struct(String);
+type TenantIdentity = struct { local: TenantId };
+type SiteIdentity = struct { tenant: TenantId, local: SiteId };
+type DeviceIdentity = struct { tenant: TenantId, local: DeviceId };
+type ConnectionIdentity = struct { tenant: TenantId, local: ConnectionId };
+type RouteIdentity = struct { tenant: TenantId, local: RouteId };
+type TenantRow = struct { id: TenantId };
+type SiteRow = struct { id: SiteId, tenant_id: TenantId };
+type DeviceRow = struct { id: DeviceId, site_id: SiteId, tenant_id: TenantId };
+type ConnectionRow = struct { a_device_id: DeviceId, id: ConnectionId, tenant_id: TenantId, z_device_id: DeviceId };
+type RouteRow = struct { a_device_id: DeviceId, id: RouteId, tenant_id: TenantId, z_device_id: DeviceId };
+
+def tenant: m::Entity(TenantIdentity) = m::entity("tenant_entity", TenantIdentity.type);
+def site: m::Entity(SiteIdentity) = m::entity("site_entity", SiteIdentity.type);
+def device: m::Entity(DeviceIdentity) = m::entity("device_entity", DeviceIdentity.type);
+def connection: m::Entity(ConnectionIdentity) = m::entity("connection_entity", ConnectionIdentity.type);
+def route: m::Entity(RouteIdentity) = m::entity("route_entity", RouteIdentity.type);
+def tenants: m::Dataset(TenantRow) = m::dataset("tenant", "tenants", TenantRow.type, ["id"]);
+def sites: m::Dataset(SiteRow) = m::dataset("site", "sites", SiteRow.type, ["id", "tenant_id"]);
+def devices: m::Dataset(DeviceRow) = m::dataset("device", "devices", DeviceRow.type, ["id", "tenant_id"]);
+def connections: m::Dataset(ConnectionRow) = m::dataset("connection", "connections", ConnectionRow.type, ["id", "tenant_id"]);
+def routes: m::Dataset(RouteRow) = m::dataset("route", "routes", RouteRow.type, ["id", "tenant_id"]);
+
+def tenant_role: for(Row) Fn(m::Dataset(Row), String, String) -> m::Role(Row) = fn(dataset, id, field) {
+    m::role(dataset, tenant, id, False, [m::identity_part(m::field(Row.type, TenantId.type, field), m::field(TenantIdentity.type, TenantId.type, "local"))])
+};
+def scoped_role: for(Row, Identity, Local) Fn(m::Dataset(Row), m::Entity(Identity), TypeOf(Local), String, String) -> m::Role(Row) = fn(dataset, entity, local, id, field) {
+    m::role(dataset, entity, id, False, [
+        m::identity_part(m::field(Row.type, TenantId.type, "tenant_id"), m::field(Identity.type, TenantId.type, "tenant")),
+        m::identity_part(m::field(Row.type, local, field), m::field(Identity.type, local, "local")),
+    ])
+};
+def tenant_subject: m::Role(TenantRow) = tenant_role(tenants, "subject", "id");
+def site_subject: m::Role(SiteRow) = scoped_role(sites, site, SiteId.type, "subject", "id");
+def device_subject: m::Role(DeviceRow) = scoped_role(devices, device, DeviceId.type, "subject", "id");
+def device_site: m::Role(DeviceRow) = scoped_role(devices, site, SiteId.type, "site", "site_id");
+def connection_subject: m::Role(ConnectionRow) = scoped_role(connections, connection, ConnectionId.type, "subject", "id");
+def route_subject: m::Role(RouteRow) = scoped_role(routes, route, RouteId.type, "subject", "id");
+def a: m::Role(ConnectionRow) = scoped_role(connections, device, DeviceId.type, "a", "a_device_id");
+def z: m::Role(ConnectionRow) = scoped_role(connections, device, DeviceId.type, "z", "z_device_id");
+def route_a: m::Role(RouteRow) = scoped_role(routes, device, DeviceId.type, "a", "a_device_id");
+def route_z: m::Role(RouteRow) = scoped_role(routes, device, DeviceId.type, "z", "z_device_id");
+def many_optional: edsl::RelationCardinality = {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional};
+def many_many: edsl::RelationCardinality = {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Many0};
+def connection_a: r::Relation = r::relation("connection_a", connections, a, devices, device_subject, many_optional);
+def connection_z: r::Relation = r::relation("connection_z", connections, z, devices, device_subject, many_optional);
+def upstream_a: r::Relation = r::relation("route_a", routes, route_a, devices, device_subject, many_optional);
+def upstream_z: r::Relation = r::relation("route_z", routes, route_z, devices, device_subject, many_optional);
+def declarations: Array(r::Relation) = [
+    r::relation("site_tenant", sites, tenant_role(sites, "tenant", "tenant_id"), tenants, tenant_subject, many_optional),
+    r::relation("site_tenant_devices", sites, tenant_role(sites, "tenant", "tenant_id"), devices, tenant_role(devices, "tenant", "tenant_id"), many_many),
+    r::relation("device_tenant", devices, tenant_role(devices, "tenant", "tenant_id"), tenants, tenant_subject, many_optional),
+    r::relation("device_site", devices, device_site, sites, site_subject, many_optional),
+    connection_a, connection_z, upstream_a, upstream_z,
+];
+def connected: r::Link = r::link("connected_device", connection_a, connection_z, edsl::LinkDirection::Undirected);
+def upstream: r::Link = r::link("upstream_device", upstream_a, upstream_z, edsl::LinkDirection::Directed);
+
+# 本步替换关系与方向来源；维度、计数声明和 profile 仍复用 transform 基线。
+def relation_payload: edsl::PreparedPayload = baseline::payload <~ {relations:
+    array::concat([r::lower_all(baseline::payload, declarations), [
+        r::lower_alternative(baseline::payload, "connection_endpoint", [connection_a, connection_z], many_many),
+    ]])};
+def payload: edsl::PreparedPayload = relation_payload <~ {business_links: [
+    r::lower_link(relation_payload, connected), r::lower_link(relation_payload, upstream),
+]};
+
+pub use self::{TenantId, SiteId, DeviceId, TenantIdentity, SiteIdentity, DeviceIdentity,
+    TenantRow, SiteRow, DeviceRow, ConnectionRow, RouteRow, tenant, site, device, tenants, sites, devices, connections, routes,
+    tenant_subject, site_subject, device_subject, device_site, a, z, route_a, route_z,
+    many_optional, many_many, connection_a, connection_z, upstream_a, upstream_z,
+    declarations, connected, upstream, payload};

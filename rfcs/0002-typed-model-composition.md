@@ -530,3 +530,33 @@ bin/telora -C relation_model eval @test/typed_groups:runtime_cases --request-fue
 node relation_model/tests/typed-groups-runtime.mjs "$TMPDIR/typed-groups-queries.json"
 python3 scripts/check-typed-model-rejections.py
 ```
+
+## 阶段 C：类型化关系接入 transform
+
+`ontology::experimental::relations` 通过显式 Dataset 和具名 Entity 角色声明关系。
+每一端先验证完整身份，两端必须指向同一 Entity ID 和同一身份类型；连接键由对应身份成员展开，不接受请求覆盖连接键。
+业务连接由两个不同的 hub 角色、一个明确的参与者 Dataset 和显式方向构造，物理端点位置不承担方向推断。
+多个完整角色映射可以显式组成备选关系，备选分支各自保留租户与本地身份。
+
+五张现有关系表的可执行映射见 [typed_relations](../relation_model/src/typed_relations.telora)。
+该实验的 Entity ID 使用 `device_entity` 等名称，Dataset ID 仍使用 `device` 等现有 transform 地址，二者拥有独立含义。
+当前 JSON Graph 中历史字段 `entity` 在此适配实验中仍寻址 Dataset；新 Entity ID 不自动成为查询入口。
+
+当前桥接步骤明确复用旧 transform 的维度、计数声明和 profile，仅将关系键与业务方向改由新角色声明生成。
+桥接时校验物理源、字段编码、可空性及完整 Dataset 粒度与原 transform 结构一致，防止借用不同粒度上的计数证明。
+声明基数仍是可信模型契约，角色的名义类型和完整连接键不等同于数据库外键或基数证明。
+准备层还检查跨关系的 Entity 身份一致性、Dataset 声明一致性、具名角色映射一致性和关系 ID 唯一性。
+公开的已擦除描述经过 `validate_prepared` 重检，不作为不可伪造证明。
+
+验收以 transform 为依据：13 个新正反例覆盖身份、来源、角色、重复 ID、注册边、方向及扩增计数拒绝；
+隔离工作区将现有 graph 测试显式切换到新关系载荷，102 个用例通过。
+六组真实生成 SQL 在同一 SQLite 数据上与旧声明及独立期望值比较，覆盖复合租户身份、A/Z、有向／无向业务连接、EXISTS 粒度、空组和备选端点计数。
+源数据包含跨租户同 ID、重复连接、缺失端点、孤立租户与自连接，不能仅靠新旧实现一致来判定正确。
+
+```sh
+bin/telora -C relation_model test typed_relations --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-relations.py
+```
+
+阶段 C 继续推进 Dataset／成员的独立准备与 transform 结果类型，当前尚未将实验载荷替换到 MainService，也未据此开始 IC 类型化迁移。
+知识地图、知识发现与知识测试按用户要求延后，不作为本阶段的交付或评价依据。

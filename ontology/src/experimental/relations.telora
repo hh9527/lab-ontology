@@ -1,0 +1,138 @@
+# 将独立 Entity 角色绑定为具名 Dataset 关系；只服务 transform。
+use crate::experimental::model as model;
+use crate::ontology as edsl;
+use std::array as array;
+use std::type_desc as td;
+
+type Endpoint = struct { dataset: model::PreparedDataset, role: String };
+type Relation = struct { id: String, from: Endpoint, to: Endpoint, cardinality: edsl::RelationCardinality };
+type Link = struct { id: String, a: Relation, z: Relation, direction: edsl::LinkDirection };
+
+def endpoint: for(Row) Fn(model::Dataset(Row), model::Role(Row)) -> Endpoint = fn(dataset, role) {
+    {dataset: model::prepare(dataset, [role]), role: role.id}
+};
+def role: Fn(Endpoint) -> model::PreparedRole = fn(endpoint) {
+    let checked = model::validate_prepared(endpoint.dataset);
+    match array::find(checked.roles, fn(role) { role.id == endpoint.role }) {
+        Some(value) => value, None => fail!("relation endpoint role does not exist", checked.id, endpoint.role),
+    }
+};
+def validate: Fn(Relation) -> Relation = fn(relation) {
+    let source = role(relation.from);
+    let target = role(relation.to);
+    if relation.id == "" { fail!("typed relation id must be nonempty", relation.id) }
+    else if source.entity != target.entity || source.identity != target.identity {
+        fail!("relation endpoints must describe the same entity identity", relation.id, source.entity, target.entity)
+    } else { relation }
+};
+def relation: for(From, To) Fn(String, model::Dataset(From), model::Role(From), model::Dataset(To), model::Role(To), edsl::RelationCardinality) -> Relation = fn(id, from, from_role, to, to_role, cardinality) {
+    validate({id, from: endpoint(from, from_role), to: endpoint(to, to_role), cardinality})
+};
+def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
+    validate(a); validate(z);
+    let a_role = role(a.to);
+    let z_role = role(z.to);
+    if id == "" || a.id == z.id || a.from.dataset.id != z.from.dataset.id
+        || a.from.dataset.row != z.from.dataset.row || a.from.dataset.source != z.from.dataset.source
+        || a.from.role == z.from.role || a.to.dataset.id != z.to.dataset.id || a.to.role != z.to.role
+        || a.to.dataset.row != z.to.dataset.row || a.to.dataset.source != z.to.dataset.source
+        || a_role.entity != z_role.entity || a_role.identity != z_role.identity {
+        fail!("business link requires distinct hub roles and one explicit participant dataset", id)
+    } else { {id, a, z, direction} }
+};
+
+# 此桥接器显式对接现有 transform 准备结构，物理编码只接受身份标量。
+def storage: Fn(Type) -> Type = fn(ty) {
+    let resolved = if td::kind(ty) == td::TypeDescKind::Ref {
+        match td::resolve(ty) { Ok(value) => value, Err(error) => fail!(error.message, ty) }
+    } else { ty };
+    if td::kind(resolved) == td::TypeDescKind::Newtype { storage(td::children(resolved)[0]) }
+    else { resolved }
+};
+def owner: Fn(edsl::PreparedPayload, Endpoint) -> edsl::EntityEntry = fn(payload, endpoint) {
+    let checked = model::validate_prepared(endpoint.dataset);
+    let entry = match array::find(payload.entities, fn(entry) { entry.id == checked.id }) {
+        Some(value) => value, None => fail!("typed relation dataset is not registered in transform", checked.id),
+    };
+    if entry.table != checked.source || entry.union != None {
+        fail!("typed relation source does not match transform dataset", checked.id)
+    } else {
+        let grain = match entry.dataset {
+            Some(spec) => spec.grain,
+            None => array::map(array::filter(entry.fields, fn(field) { field.is_key }), fn(field) { field.name }),
+        };
+        if grain != checked.grain { fail!("typed relation grain does not match transform dataset", checked.id) }
+        else { entry }
+    }
+};
+def field: Fn(edsl::EntityEntry, model::Part) -> Int = fn(owner, part) {
+    match array::find(owner.fields, fn(field) { field.name == part.source }) {
+        Some(field) => if field.column != part.source || field.ty != storage(part.value) || field.nullable != part.nullable {
+            fail!("typed role field does not match physical transform storage", owner.id, part.source)
+        } else { field.index },
+        None => fail!("typed role field is missing from transform dataset", owner.id, part.source),
+    }
+};
+def lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(payload, declared) {
+    let checked = validate(declared);
+    let from = owner(payload, checked.from);
+    let to = owner(payload, checked.to);
+    let source = role(checked.from);
+    let target = role(checked.to);
+    # 沿目标物理字段顺序输出等式，保持现有 QueryAst 的确定性排序。
+    let target_fields = array::filter(to.fields, fn(field) { array::any(target.parts, fn(part) { part.source == field.name }) });
+    let parts = array::map(target_fields, fn(target_field) {
+        let other = match array::find(target.parts, fn(other) { other.source == target_field.name }) {
+            Some(value) => value, None => fail!("typed relation target identity is incomplete", checked.id),
+        };
+        let part = match array::find(source.parts, fn(part) { part.target == other.target }) {
+            Some(value) => value, None => fail!("typed relation source identity is incomplete", checked.id),
+        };
+        edsl::RelationKey::Eq({from: field(from, part), to: field(to, other)})
+    });
+    {id: checked.id, label: checked.id, summary: "", from: from.index, to: to.index,
+        cardinality: checked.cardinality,
+        key: if array::length(parts) == 1 { parts[0] } else { edsl::RelationKey::And(parts) }, guard: None}
+};
+def lower_all: Fn(edsl::PreparedPayload, Array(Relation)) -> Array(edsl::RelationEntry) = fn(payload, declarations) {
+    let endpoints = array::flat_map(declarations, fn(relation) { [relation.from, relation.to] });
+    array::map(endpoints, fn(endpoint) {
+        let current = role(endpoint);
+        if array::any(endpoints, fn(other) {
+            let candidate = role(other);
+            (candidate.entity == current.entity && candidate.identity != current.identity)
+                || (other.dataset.id == endpoint.dataset.id && (other.dataset.row != endpoint.dataset.row
+                    || other.dataset.source != endpoint.dataset.source || other.dataset.grain != endpoint.dataset.grain
+                    || (other.role == endpoint.role && candidate != current)))
+        }) { fail!("typed relations contain conflicting entity or dataset declarations", endpoint.dataset.id) }
+        else { () }
+    });
+    array::map(declarations, fn(relation) {
+        if array::length(array::filter(declarations, fn(other) { other.id == relation.id })) != 1 {
+            fail!("typed relation ids must be unique", relation.id)
+        } else { lower(payload, relation) }
+    })
+};
+def lower_alternative: Fn(edsl::PreparedPayload, String, Array(Relation), edsl::RelationCardinality) -> edsl::RelationEntry = fn(payload, id, choices, cardinality) {
+    let lowered = lower_all(payload, choices);
+    if id == "" || array::length(lowered) < 2 { fail!("alternative relation requires a name and complete alternatives", id) }
+    else {
+        let first = lowered[0];
+        if !array::all(lowered, fn(other) { other.from == first.from && other.to == first.to }) {
+            fail!("alternative relations must share explicit dataset endpoints", id)
+        } else { first <~ {id, label: id, cardinality, key: edsl::RelationKey::Or(array::map(lowered, fn(relation) { relation.key }))} }
+    }
+};
+def lower_link: Fn(edsl::PreparedPayload, Link) -> edsl::BusinessLinkEntry = fn(payload, declared) {
+    let checked = link(declared.id, declared.a, declared.z, declared.direction);
+    let a = lower(payload, checked.a);
+    let z = lower(payload, checked.z);
+    if !array::any(payload.relations, fn(entry) { entry == a }) || !array::any(payload.relations, fn(entry) { entry == z }) {
+        fail!("business link endpoints must be registered typed relations", declared.id)
+    } else {
+        {id: checked.id, hub: a.from, participant: a.to, a_relation: a.id, z_relation: z.id,
+            direction: checked.direction, guard: None}
+    }
+};
+
+pub use self::{Endpoint, Relation, Link, endpoint, relation, link, validate, lower, lower_all, lower_alternative, lower_link};
