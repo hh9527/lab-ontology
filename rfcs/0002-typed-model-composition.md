@@ -739,3 +739,36 @@ Intent 的输入推断、时间边界和 GraphPair 对齐直接读取查询维�
 bin/telora -C relation_model test typed_policies --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
 python3 scripts/check-typed-policies.py
 ```
+
+### 阶段 D 进展：类型化业务值域与源编码映射
+
+新增 `experimental::values`，将业务值类型与物理编码类型分开声明，并通过 `transform::with_domains` 发布为 Graph 维度。
+例如业务 `State(String)` 可以在一个来源中编码为 Int，在另一个来源中编码为 String；绑定仍要求表达式的 Row 和 Wire 类型准确匹配。
+
+```telora
+type State = struct(String);
+def states: v::Domain(State, Int) = v::domain(
+    "State", State.type, Int.type,
+    [v::member(State("Online"), [0, 2]),
+     v::member(State("Offline"), [1])], False);
+```
+
+`dimension_group` 定义可投影性与 Eq／Ne 能力上限，`bind` 选择源表达式和公开名称，可进一步收窄能力。
+业务成员可以使用 String newtype 或编码为文本的无载荷枚举；源编码目前只支持 Int、String 及其具名包装。
+同一域 ID 不允许指向不同业务类型；不同绑定可以配置各自的源编码表。
+闭合排序通过 `ordered` 显式给出全部业务成员，暂不开放值域排序筛选操作。
+
+半开放值域限于文本编码，保留现有 Graph 输入与输出契约：
+
+- 已知成员输入使用业务 ID，比较时展开所有对应源编码
+- 未知成员使用 `{"unknown":"raw"}`，全集使用 `{"unknowns":true}`
+- 投影包含 `__kind`，已知业务 ID 与同名未知原值仍可区分
+- NULL 保留 NULL；空文本可以是未知原值
+- 闭合值域继续按现有 Graph 规则排除未声明编码；Ne 不扩大为任意原始数据补集
+
+准备过程拒绝重复业务 ID、重复或交叉源编码、空成员、错误编码类型、不完整排序、半开放闭合排序，以及擦除类型后的错误 Dataset 来源和能力扩张。
+物理列重命名复用 Dataset 映射，规范化与筛选复用现有 Graph 实现，不另造第二套编码转换逻辑。
+
+验收覆盖 13 个声明／请求正反例与九组真实 SQLite 查询，包括多编码归一、同名未知值、Unknowns、NULL、空文本和空表。
+SQLite 与 PostgreSQL 的绑定参数一致；本阶段未实际执行 PostgreSQL。
+这是业务离散值域的 transform 入口，逻辑标量、时间角色和 IC 全量迁移仍待继续推进。

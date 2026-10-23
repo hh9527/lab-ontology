@@ -1,0 +1,127 @@
+# 可复用业务值域与源编码映射；只准备 transform 所需的离散值语义。
+use crate::experimental::model as m;
+use crate::experimental::groups as g;
+use crate::ontology as edsl;
+use std::array as array;
+use std::codec as codec;
+use std::type_desc as td;
+use std::value::{Value};
+
+type Member(Business, Wire) = struct { value: Business, wires: Array(Wire) };
+type Definition = struct { id: String, value: Type, wire: Type, values: Array(edsl::CanonicalValueSpec), half_open: Bool, order: Array(String) };
+type Domain(Business, Wire) = struct { definition: Definition };
+type DimensionGroup(Business, Wire) = struct { definition: Definition, projectable: Bool, filters: Array(g::Filter) };
+type Binding(Row) = struct { row: Type, dataset: String, source: String, node: g::Node, nullable: Bool,
+    definition: Definition, group_projectable: Bool, group_filters: Array(g::Filter), id: String, projectable: Bool, filters: Array(g::Filter) };
+type BindingFacts = struct { row: Type, dataset: String, source: String, node: g::Node, nullable: Bool,
+    definition: Definition, group_projectable: Bool, group_filters: Array(g::Filter), id: String, projectable: Bool, filters: Array(g::Filter) };
+def member: for(Business, Wire) Fn(Business, Array(Wire)) -> Member(Business, Wire) = fn(value, wires) { {value, wires} };
+def valid_business_type: Fn(Type) -> Bool = fn(value) {
+    let storage = g::representation(value);
+    storage == String.type || (storage != Bool.type && td::kind(storage) == td::TypeDescKind::Enum
+        && array::all(td::variants(storage), fn(variant) { variant.payload == None }))
+};
+def validate_definition: Fn(Definition) -> Definition = fn(definition) {
+    let storage = g::representation(definition.wire);
+    if definition.id == "" || !valid_business_type(definition.value) {
+        fail!("business domain requires a name and text-valued business type", definition.id)
+    } else if storage != Int.type && storage != String.type {
+        fail!("business domain wire must use integer or text storage", definition.id)
+    } else if definition.half_open && storage != String.type {
+        fail!("half-open business domain requires text wire storage", definition.id)
+    } else if array::length(definition.values) == 0 {
+        fail!("business domain must declare known members", definition.id)
+    } else { () };
+    array::map(definition.values, fn(value) {
+        if value.id == "" || array::length(value.wires) == 0
+            || array::length(array::filter(definition.values, fn(other) { other.id == value.id })) != 1 {
+            fail!("business domain member ids must be distinct and have wire values", definition.id, value.id)
+        } else { () };
+        array::map(value.wires, fn(wire) {
+            let compatible = match wire {
+                edsl::FilterInput::Text(text) => storage == String.type && text != "",
+                edsl::FilterInput::Int(_) => storage == Int.type,
+                _ => False,
+            };
+            if !compatible { fail!("business domain wire does not match its declared type", definition.id, value.id) }
+            else if array::length(array::flat_map(definition.values, fn(other) { array::filter(other.wires, fn(candidate) { candidate == wire }) })) != 1 {
+                fail!("business domain wire values must be disjoint", definition.id, value.id)
+            } else { () }
+        });
+        ()
+    });
+    if definition.half_open && definition.order != [] {
+        fail!("half-open business domain cannot declare a closed order", definition.id)
+    } else if definition.order != [] && (array::length(definition.order) != array::length(definition.values)
+        || !array::all(definition.values, fn(value) { array::length(array::filter(definition.order, fn(id) { id == value.id })) == 1 })) {
+        fail!("business domain order must name every known member exactly once", definition.id)
+    } else { definition }
+};
+def domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(String, TypeOf(Business), TypeOf(Wire), Array(Member(Business, Wire)), Bool) -> Domain(Business, Wire) = fn(id, business, wire, members, half_open) {
+    let values = array::map(members, fn(member) {
+        let name = match codec::encode(member.value) { Value::String(value) => value, _ => fail!("business value must encode to a text id", id) };
+        let wires = array::map(member.wires, fn(value) {
+            match codec::encode(value) {
+                Value::String(text) => edsl::FilterInput::Text(text),
+                Value::Int(number) => edsl::FilterInput::Int(number),
+                _ => fail!("business wire must encode to integer or text", id),
+            }
+        });
+        {id: name, label: name, wires}.ty!(edsl::CanonicalValueSpec)
+    });
+    {definition: validate_definition({id, value: business, wire, values, half_open, order: []})}
+};
+def ordered: for(Business: codec::Encode, Wire) Fn(Domain(Business, Wire), Array(Business)) -> Domain(Business, Wire) = fn(domain, order) {
+    let ids = array::map(order, fn(value) {
+        match codec::encode(value) { Value::String(id) => id, _ => fail!("business order requires text ids", domain.definition.id) }
+    });
+    {definition: validate_definition(domain.definition <~ {order: ids})}
+};
+def validate_filters: Fn(Array(g::Filter)) -> () = fn(filters) {
+    if !array::all(filters, fn(op) { (op == g::Filter::Eq || op == g::Filter::Ne)
+        && array::length(array::filter(filters, fn(other) { other == op })) == 1 }) {
+        fail!("business domain filters support distinct Eq and Ne only")
+    } else { () }
+};
+def dimension_group: for(Business, Wire) Fn(Domain(Business, Wire), Bool, Array(g::Filter)) -> DimensionGroup(Business, Wire) = fn(domain, projectable, filters) {
+    let definition = validate_definition(domain.definition);
+    if definition.value != Business.type || definition.wire != Wire.type { fail!("business domain type witness does not match its parameters", definition.id) } else { () };
+    validate_filters(filters);
+    {definition, projectable, filters}
+};
+def bind: for(Row, Business, Wire) Fn(m::Dataset(Row), DimensionGroup(Business, Wire), g::Expr(Row, Wire), String, Bool, Array(g::Filter)) -> Binding(Row) = fn(dataset, group, input, id, projectable, filters) {
+    m::prepare(dataset, []);
+    let checked = g::checked(input);
+    let definition = validate_definition(group.definition);
+    if definition.value != Business.type || definition.wire != Wire.type { fail!("business domain type witness does not match its parameters", definition.id) } else { () };
+    validate_filters(group.filters); validate_filters(filters);
+    if (projectable && !group.projectable) || !array::all(filters, fn(op) { array::any(group.filters, fn(allowed) { op == allowed }) }) {
+        fail!("business dimension binding cannot expand group capabilities", id)
+    } else {
+        {row: Row.type, dataset: dataset.id, source: dataset.source, node: checked.node, nullable: checked.nullable,
+            definition, group_projectable: group.projectable, group_filters: group.filters, id, projectable, filters}
+    }
+};
+def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
+    {row: binding.row, dataset: binding.dataset, source: binding.source, node: binding.node, nullable: binding.nullable,
+        definition: binding.definition, group_projectable: binding.group_projectable, group_filters: binding.group_filters,
+        id: binding.id, projectable: binding.projectable, filters: binding.filters}
+};
+def prepare: Fn(m::PreparedDataset, Array(BindingFacts)) -> Array(BindingFacts) = fn(dataset, bindings) {
+    m::validate_prepared(dataset);
+    array::map(bindings, fn(binding) {
+        let definition = validate_definition(binding.definition);
+        let shape = g::shape(dataset.row, binding.node);
+        validate_filters(binding.group_filters); validate_filters(binding.filters);
+        if binding.row != dataset.row || binding.dataset != dataset.id || binding.source != dataset.source {
+            fail!("business dimension binding belongs to another dataset", binding.id)
+        } else if shape.value != definition.wire || shape.nullable != binding.nullable {
+            fail!("business dimension source does not match its wire type", binding.id)
+        } else if (binding.projectable && !binding.group_projectable)
+            || !array::all(binding.filters, fn(op) { array::any(binding.group_filters, fn(allowed) { op == allowed }) }) {
+            fail!("business dimension binding cannot expand group capabilities", binding.id)
+        } else { binding }
+    })
+};
+pub use self::{Member, Definition, Domain, DimensionGroup, Binding, BindingFacts,
+    member, domain, ordered, dimension_group, bind, binding_facts, validate_definition, prepare};
