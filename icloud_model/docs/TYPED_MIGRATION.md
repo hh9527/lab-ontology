@@ -46,8 +46,8 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 第十八批已验证 |
 | SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 第十九批已验证 |
 | SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 第二十批已验证 |
-| SourceNetworkAPKPI | `source_NetworkAPKPI` | `NetworkAPKPI` | 待迁移 |
-| SourceNetworkApRadioKPI | `source_NetworkApRadioKPI` | `NetworkApRadioKPI` | 待迁移 |
+| SourceNetworkAPKPI | `source_NetworkAPKPI` | `NetworkAPKPI` | 第二十一批已验证 |
+| SourceNetworkApRadioKPI | `source_NetworkApRadioKPI` | `NetworkApRadioKPI` | 第二十一批已验证 |
 | SourceNetworkCellLinkQualityKPI | `source_NetworkCellLinkQualityKPI` | `NetworkCellLinkQualityKPI` | 待迁移 |
 | SourceNetworkCellLinkTrafficKPI | `source_NetworkCellLinkTrafficKPI` | `NetworkCellLinkTrafficKPI` | 待迁移 |
 | SourceNetworkDeviceBoardKPI | `source_NetworkDeviceBoardKPI` | `NetworkDeviceBoardKPI` | 待迁移 |
@@ -523,3 +523,26 @@ NULL fixture 检查来源异常值的防御行为，不改变非空契约；Post
 SQL fixture 独立按需生成（400000 fuel），本批未重跑其他载体全部历史 SQL；不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
 
 17 项 IC transform 契约在调整后的 250000 fuel 内通过；累计完成 26/50 个既有载体，全部 50 载体及其关系迁移范围保持不变。
+
+
+## 第二十一批 AP 与 Radio 样本
+
+AP 迁移 13 个字段、16 个维度、四个样本组的 12 个公开统计；Radio 迁移 24 个字段、27 个维度、八个样本组的 24 个公开统计及一个三成员闭合频段域。
+两个 Dataset 显式为 Metric，grain 保留 source_resId／source_tenantId／source_ts，UTC 时钟保留 Rfc3339Text。该 grain 的生产唯一性仍待 #51 确认，迁移不作新保证。
+AP 和射频分别使用独立 ResourceId；没有从 parentId／projectId 字段名推断关系，也不把两类资源身份合并。
+
+复用同单位的 Percent／Dbm 样本组；AP 浮点 kbit/s 与射频整数 kbit/s 使用不同名义表示，保留原始数值类型，不作单位换算。
+关联终端使用整数 Count 的均值／最大／最小组，不发布跨时间求和；RSSI 保持旧契约未标单位，不擅自改为 dBm。
+Effcnt 使用独立整数计数类型，仅保留原始比较；Avg 不自动用 Effcnt 加权，不排除零 Effcnt，也不做时间加权或范围钳制。
+Hour／Day／Month 三种 UTC 分桶沿用同一时钟；频段闭合域的 Ne 和分组限定已知编码，未知原始行仍参与不按频段分组的总体。
+字段非空性延续旧契约，样本 NULL fixture 只验证异常来源的 SQL 防御行为。
+
+Radio 源 SHA256 与 catalog 一致。AP 当前外部源 SHA256 为 75d127324ff5d6c7c35aae0795bb4bccf0aa66e7203cb79c26a6fb45791263c8，与 catalog 的 c46c418894cdab56bd0d08191a4f23d1172be5aaf2c4b2e532f9157f765ba63c 不同。
+逐项核对现有字段类型、业务名称、说明、可空性、isPK 和 columnType 一致；当前源另有 hwApMemoryUseRate，本批保持仓库快照，不混入新增字段或度量。
+17 项 transform 契约（250000 fuel）与独立 typed 初始化（200000 fuel）已通过；不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
+
+178 组实际 SQLite 新旧对照及空表检查通过，全部有独立期望值，覆盖 43 个维度、36 个公开统计、代表性单位／整数／Effcnt 的全部数值比较、频段全部成员 Eq/Ne、文本转义及 UTC 小时／日／月分组。
+用例包含同资源同 UTC 时刻的不同租户样本、不等时间间距、负数与超过百分比范围的原始值、零／不同 Effcnt、全 NULL／空窗口和频段未知值；默认统计没有隐式去重、加权、范围钳制或有效性过滤。
+样本计数与度量聚合分别生成请求，保持 Graph 不能混合两种聚合粒度的原有约束；显式 Effcnt 过滤只影响对应请求。
+PostgreSQL 只核对参数，未实际执行；SQL fixture 独立按需生成（450000 fuel），未重跑此前载体全部历史 SQL。
+累计完成 28/50 个既有载体，完整范围不变。MainService 尚未切换，不构建知识地图或执行知识测试。
