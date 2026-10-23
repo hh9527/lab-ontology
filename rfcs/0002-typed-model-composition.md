@@ -1,6 +1,6 @@
 # RFC 0002：以类型约束组合模型，显式区分 Entity 与 Dataset
 
-状态：已接受为探索方向，先推进阶段 A 原型；公共 API 与后续阶段继续评审。日期：2026-10-23。
+状态：已接受为探索方向，阶段 A 原型已完成，推进阶段 B／C 实验；公共 API 继续随实验细化。日期：2026-10-23。
 
 ## 目标
 
@@ -476,4 +476,54 @@ q::rate(q::Bytes(3.0), q::seconds(q::Milliseconds(2000.0)))
 例如 `(100 B, 1 s)`、`(900 B, 9 s)`、`(100 B, 10 s)` 分别得到 `70 B/s` 和 `55 B/s`。
 非正时长样本在这两个实验聚合中都排除，空集或全无效样本返回 None；有效时长上的零字节仍得到零速率。
 
-这部分确定了单位与聚合语义的最小可执行基础。阶段 B 仍需继续完成 Group 定义／绑定、成员命名映射、封闭表达式到查询 AST 的 lowering 和实际 SQLite 计算验收。
+这部分确定了单位与聚合语义的最小可执行基础。下述 Group 实验将这些语义连接到字段绑定与数据库计算。
+
+### 已实现的 Group 原型
+
+实际入口为 `ontology::experimental::groups`。完整作者示例见 [Group 夹具](../relation_model/tests/typed_groups/fixture.telora)，该示例使用独立的合成采样表。
+下面是从夹具提取的实际 API 形状：
+
+```telora
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::quantity as q;
+
+type Sample = struct { seq: Int, rx: Option(q::Bytes), elapsed_ms: Option(q::Milliseconds) };
+def samples: m::Dataset(Sample) = m::dataset("samples", "samples_ms", Sample.type, ["seq"]);
+def rx: g::Binding(Sample) = g::transfer_binding(samples, g::transfer,
+    g::input(m::optional_field(Sample.type, q::Bytes.type, "rx")),
+    g::seconds(g::input(m::optional_field(Sample.type, q::Milliseconds.type, "elapsed_ms"))), [
+        {member: g::TransferMember::AmountTotal, publish: "rx_total"},
+        {member: g::TransferMember::RatePeak, publish: "rx_peak"},
+        {member: g::TransferMember::RateMean, publish: "rx_mean"},
+    ]);
+```
+
+流量模板固定 Sum(amount)、Max(rate) 和 Avg(rate)，绑定参数没有覆盖聚合算子的入口。
+另一份 Dataset 使用 `bytes_in` 与 `duration_seconds`，直接绑定秒类型字段；同一 Dataset 再绑定发送字节字段，显式发布 `tx_*` 成员。
+表达式类型参数约束行拥有者和数量类型；输入可空性在描述中独立保留，所有实验聚合结果都声明为可空。
+准备层同时重检公开描述中的输入类型、完整组成员、聚合口径、源拥有者、输出可空性和发布 ID 唯一性。
+
+`dimension_group` 定义具有一个类型化输入的小型可复用维度组，通过多个 `Binding(Row)` 显式组合名称、分类和度量。
+绑定可以裁剪投影和筛选能力，准备层拒绝超过定义上限的配置；当前单源查询只执行投影与聚合，筛选能力仍是准备事实，筛选请求编译留待关系查询集成。
+`identity_dimensions` 将 Entity 角色的完整身份展开成多个成员，要求每个身份成员都有显式发布映射。
+可选身份任一输入为空时，全部身份投影均为 NULL。聚合时允许出现缺席角色的 NULL 分组，它是记录分组，不代表存在一个共享的 NULL Entity，也不授予实体计数能力。
+
+封闭表达式当前只有字段、毫秒换秒、逐样本速率和完整身份投影；没有任意函数或 SQL 字符串入口，也没有按名称引用其他 Group 成员的依赖边。
+因此跨 Group 依赖与循环目前无法表达；后续若开放成员引用，需要单独增加依赖图及循环检查。
+lowering 复用公共 QueryAst；速率在时长非正或缺失时返回 NULL，并主动进行浮点除法，避免 SQLite 整数存储带来截断。
+`amount_total` 汇总全部非空字节值，包括时长无效的记录；速率聚合只使用字节与有效时长均存在的记录。总体加权速率仍是单独的业务口径，没有混入此模板。
+
+执行验证覆盖两种列名／时间单位、接收／发送重复应用、复合身份、非均匀时长、可空字段、非正时长、空输入与整数存储。
+SQLite 查询已实际执行；PostgreSQL 仅验证生成和参数一致性，尚未在 PostgreSQL 数据库执行。
+数值负载和 source 声明仍是可信输入边界，实验不将类型化字段声明等同于数据库值域、唯一性或引用完整性的证明。
+当前模板是流量组与小型维度组的封闭实验，不代表通用的 Group 声明 API 已定稿。
+
+验收命令：
+
+```sh
+bin/telora -C relation_model test typed_groups --request-fuel 100000 --with-memory-limit 1024
+bin/telora -C relation_model eval @test/typed_groups:runtime_cases --request-fuel 100000 --with-memory-limit 1024 > "$TMPDIR/typed-groups-queries.json"
+node relation_model/tests/typed-groups-runtime.mjs "$TMPDIR/typed-groups-queries.json"
+python3 scripts/check-typed-model-rejections.py
+```

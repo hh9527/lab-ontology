@@ -21,6 +21,12 @@ cases = {
     "duration_unit": "pub def bad: Option(q::BytesPerSecond) = q::rate(q::Bytes(1.0), q::Milliseconds(1000.0));",
     "amount_unit": "pub def bad: q::Bytes = q::add_bytes(q::Bytes(1.0), q::Seconds(1.0));",
     "rate_result": "pub def bad: Option(q::Bytes) = q::rate(q::Bytes(1.0), q::Seconds(1.0));",
+    "group_duration_unit": """pub def bad: g::Binding(gf::MillisRow) = g::transfer_binding(gf::millis, g::transfer,
+        gf::ms_amount, g::input(model::optional_field(gf::MillisRow.type, q::Milliseconds.type, "elapsed_ms")), gf::names("rx"));""",
+    "group_row_owner": """pub def bad: g::Binding(gf::SecondsRow) = g::transfer_binding(gf::secs, g::transfer,
+        gf::ms_amount, gf::ms_duration, gf::names("rx"));""",
+    "group_category_type": """pub def bad: g::Binding(gf::MillisRow) = g::dimension(gf::millis, gf::category,
+        g::input(model::optional_field(gf::MillisRow.type, String.type, "name")), "category", True, []);""",
 }
 with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root) as directory:
     workspace = Path(directory)
@@ -37,12 +43,14 @@ with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root
         shutil.copytree(ROOT / crate / "src", target / "src")
     tests = workspace / "relation_model/tests"
     tests.mkdir()
-    prelude = "mod fixture;\nuse self::fixture as f;\nuse ontology::experimental::model as model;\nuse ontology::experimental::quantity as q;\n"
+    prelude = "mod fixture;\nmod group_fixture;\nuse self::fixture as f;\nuse self::group_fixture as gf;\nuse ontology::experimental::model as model;\nuse ontology::experimental::quantity as q;\nuse ontology::experimental::groups as g;\n"
     # 先用同一映射的合法版本确认测试工作区可解析和类型闭包成立。
     control = prelude + "pub def good: model::Role(f::Inventory) = model::role(f::inventory, f::device, \"device\", False, f::inventory_parts);\n"
+    control += 'pub def group_good: g::Binding(gf::MillisRow) = g::transfer_binding(gf::millis, g::transfer, gf::ms_amount, gf::ms_duration, gf::names("rx"));\n'
     for name, body in [("control", control), *[(name, prelude + body) for name, body in cases.items()]]:
         (tests / name).mkdir()
         shutil.copy2(ROOT / "relation_model/tests/typed_model/fixture.telora", tests / name / "fixture.telora")
+        shutil.copy2(ROOT / "relation_model/tests/typed_groups/fixture.telora", tests / name / "group_fixture.telora")
         (tests / f"{name}.telora").write_text(body)
         result = subprocess.run([
             str(ROOT / "bin/telora"), "-C", str(workspace / "relation_model"),
