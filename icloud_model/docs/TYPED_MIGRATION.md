@@ -22,7 +22,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | --- | --- | --- | --- |
 | Device | `device` | `I_EntNetworkElement` | 首批已验证 |
 | Tenant | `tenant` | `X_TENANT_VIEW` | 首批已验证 |
-| Site | `site` | `X_SITE_VIEW` | 待迁移 |
+| Site | `site` | `X_SITE_VIEW` | 第二批已验证 |
 | Port | `port` | `I_EnterpriseNetworkLTP` | 待迁移 |
 | InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 待迁移 |
 | ServerDevice | `server_device` | `PhysicalServer` | 待迁移 |
@@ -80,3 +80,18 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 每个请求同时比较公开结果列类型与可空性，并核对 SQLite／PostgreSQL 参数；未实际执行 PostgreSQL。
 
 后续每批加入独立声明并扩充对照范围。全部载体、关系和当前查询能力完成，且初始化与批量 transform 验收通过后，再切换 MainService。
+
+## 第二批 Site
+
+完整迁移七个物理字段、六个公开维度及四个跨批关系，累计三个载体、31 个公开维度和六个关系。
+站点身份采用 SiteId，设备的 project_id／ref_parent_subnet 显式绑定两个站点角色。
+两个设备定位关系保留 OR 语义，不能转换为同时匹配的复合身份。
+站点到租户及租户到站点的两个具名关系均保留原方向和基数。
+
+源文件 X_SITE_VIEW.logical.yaml 哈希与 source_catalog.json 一致。
+继续保留基线非空字段契约和 UTC 毫秒假定，不宣称它们已由生产数据确认。
+旧 Site 未显式声明 Dataset，仅以 key 标记 site_id；新声明显式提供同一 grain，测试比较有效身份语义。
+契约测试仍逐项检查物理字段、全部维度执行能力、结果类型、时间角色、编码和所有批内关系。
+SQL 额外验证 online 映射、OR 单路匹配、双路同站点去重、双路不同站点、无匹配及两个租户方向。
+
+包含前批回归的 46 组 SQLite 新旧查询及空表对照全部通过；PostgreSQL 仅比较参数，未实际执行。

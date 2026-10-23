@@ -16,7 +16,7 @@ def evaluate(name):
     ], capture_output=True, text=True, check=True, timeout=240)
     return json.loads(result.stdout)
 
-cases = evaluate("runtime_cases")
+cases = evaluate("runtime_cases") + evaluate("site_relation_cases")
 schema = evaluate("physical_schema")
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
@@ -31,7 +31,7 @@ with sqlite3.connect(":memory:") as db:
     db.create_function("regexp", 2, lambda pattern, value: None if value is None else bool(re.search(pattern, value)))
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
-        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME"} else "TEXT") for name in columns)
+        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME"} else "TEXT") for name in columns)
         db.execute(f'CREATE TABLE "{table}" ({fields})')
     db.executemany("INSERT INTO X_TENANT_VIEW (TENANT_ID, TENANT_NAME, INDUSTRY, TENANT_ACCESS_TIME) VALUES (?, ?, ?, ?)", [("t1", "Tenant Alpha", "IT", -1), ("t2", "租户二", "Health", 1000)])
     columns = next(columns for table, columns in schema if table == "I_EntNetworkElement")
@@ -48,6 +48,21 @@ with sqlite3.connect(":memory:") as db:
         values.update(id=identity, tenantId=tenant, classification=classification, commuState=state,
                       ipAddress=address, createTime=index * 1000 - 1, name=f"Device {identity}")
         db.execute('INSERT INTO I_EntNetworkElement VALUES (' + ','.join('?' for _ in columns) + ')', [values[column] for column in columns])
+    db.executemany('INSERT INTO X_SITE_VIEW (SITE_ID, SITE_NAME, SITE_TYPE, TENANT_ID, PARENT_SITE_ID, SITE_ALIAS, CREATE_TIME) VALUES (?, ?, ?, ?, ?, ?, ?)', [
+        ("s1", "Site One", "onlineSite", "t1", "", "alias1", -1),
+        ("s2", "Site Two", "offlineSite", "t2", "s1", "alias2", 1000),
+    ])
+    # 覆盖仅 project 匹配、仅 subnet 匹配、两路同站点去重、两路不同站点、均不匹配
+    db.executemany('UPDATE I_EntNetworkElement SET projectId=?, refParentSubnet=? WHERE id=?', [
+        ("s1", "missing", "d1"), ("missing", "s2", "d2"), ("s1", "s1", "d3"),
+        ("s1", "s2", "d4"), ("missing", "missing", "d5"),
+    ])
+    expected["site_belongs_to_tenant"] = [("s1", "Tenant Alpha"), ("s2", "租户二")]
+    expected["source_X_TENANT_VIEW_X_SITE_VIEW"] = expected["site_belongs_to_tenant"]
+    expected["site_online"] = [("s1",)]
+    expected_sites = [("d1", "s1"), ("d2", "s2"), ("d3", "s1"), ("d4", "s1"), ("d4", "s2")]
+    expected["device_located_at_site"] = expected_sites
+    expected["source_EntNetworkElement_X_SITE_VIEW"] = expected_sites
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
@@ -66,4 +81,4 @@ with sqlite3.connect(":memory:") as db:
         assert actual == execute(case["baseline"]), ("empty", case["id"])
         if case["id"] in {"count", "tenant_count"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
-print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and both tenant relations")
+print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and all migrated relations")
