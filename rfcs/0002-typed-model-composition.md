@@ -1259,3 +1259,12 @@ Disk／NetworkAdapter／OpticalModule／Port／Processor 共迁移 68 字段／�
 服务器 ID 未公开为维度，关系结果使用既有 server_name 投影，不扩大查询权限。PostgreSQL 仅核对参数。
 原双载荷／隔离初始化 250000 fuel 均实际耗尽，分别调至 350000／300000 后通过，独立 SQL fixture 650000；不准备历史累计 SQL 或知识内容。
 MainService 尚未切换，不执行知识发现、知识地图构建或知识测试，继续剩余 13 个载体及其关系。
+
+
+### 阶段 D 进展：PON 端口、设备及在线率来源
+
+三来源迁移 40 字段、49 维度、九个公开统计与三条设备关联，累计 40/50。端口保持既有 Entity／单列 grain；设备及在线率保持既有 Metric grain 与 UTC 时钟。
+光功率、流量、利用率及未明单位设备字段使用独立名义类型，不补造统计或单位；CPU 百分比继续 #47 暂定假设。在线率专表保持独立总体及待确认尺度，不重缩放或推断 SLA；Effcnt 不隐式驱动权重或过滤。
+端口按 parentId、其余按 resId 连接 PonId，保留 Optional→Many0，不补租户键或分类条件。
+17 项 transform 契约、隔离初始化及 265 组 SQLite 新旧 SQL／独立预期／空表检查通过；PostgreSQL 仅核对参数。验证含不同 parentId／resId、双根关联、双向 EXISTS、设备分组统计、跨租户、NULL 与两表不同在线率样本。多值关联行投影显式指定 Association 粒度。
+初始化预算维持 350000／300000，独立 SQL fixture 为 650000，不准备历史累计 SQL。MainService 尚未切换，继续剩余十载体与来源关系；知识发现、知识地图构建和知识测试不参与初始化或当前验收。

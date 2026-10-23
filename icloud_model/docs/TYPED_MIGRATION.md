@@ -57,9 +57,9 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourcePhysicalServerOpticalModule | `source_PhysicalServerOpticalModule` | `PhysicalServerOpticalModule` | 第二十三批已验证 |
 | SourcePhysicalServerPort | `source_PhysicalServerPort` | `PhysicalServerPort` | 第二十三批已验证 |
 | SourcePhysicalServerProcessor | `source_PhysicalServerProcessor` | `PhysicalServerProcessor` | 第二十三批已验证 |
-| SourcePonDeviceEthernetPortKPI | `source_PonDeviceEthernetPortKPI` | `PonDeviceEthernetPortKPI` | 待迁移 |
-| SourcePonDeviceKPI | `source_PonDeviceKPI` | `PonDeviceKPI` | 待迁移 |
-| SourcePonDeviceOnlineKPI | `source_PonDeviceOnlineKPI` | `PonDeviceOnlineKPI` | 待迁移 |
+| SourcePonDeviceEthernetPortKPI | `source_PonDeviceEthernetPortKPI` | `PonDeviceEthernetPortKPI` | 第二十四批已验证 |
+| SourcePonDeviceKPI | `source_PonDeviceKPI` | `PonDeviceKPI` | 第二十四批已验证 |
+| SourcePonDeviceOnlineKPI | `source_PonDeviceOnlineKPI` | `PonDeviceOnlineKPI` | 第二十四批已验证 |
 | SourceSYS_BackupPower | `source_SYS_BackupPower` | `SYS_BackupPower` | 待迁移 |
 | SourceSYS_Chassis | `source_SYS_Chassis` | `SYS_Chassis` | 待迁移 |
 | SourceSYS_Controller | `source_SYS_Controller` | `SYS_Controller` | 待迁移 |
@@ -598,3 +598,17 @@ cardModel／processorType 等来源仅有说明的字段仍为原始文本，不
 磁盘容量包含 9007199254740993，原始 Int 投影与过滤保持精确，不经 Float；剩余寿命 0010% 仍按文字匹配，处理器自定义类型不被示例枚举排除。
 PostgreSQL 只核对参数，未实际执行；独立 SQL fixture 650000 fuel，本批未重跑其他载体全部历史 SQL。
 累计完成 37/50 个既有载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
+
+## 第二十四批 PON 来源
+
+三载体共迁移 40 字段、49 维度和九个公开样本统计。以太端口来源保留旧 Entity／单列 resId grain，不因 KPI 名称补造 Metric 或统计；设备和在线率来源保留租户／资源／UTC Metric grain。
+UTC 时钟及小时／日／月分桶延续旧声明；Effcnt 为原始整数，不默认参与过滤或权重。
+以太端口光功率、流量与利用率分别使用未确认单位的名义类型，不推定 dBm、字节或百分比。设备 memUsage、neContrlableRate、nePingRespTime 仅保留原始维度，不新增统计或单位。
+设备 CPU 沿用 #47 的已授权百分比假定；在线率专表使用独立的暂定百分比类型，不重缩放、不推断 SLA。设备的 CPU 三统计、在线率三统计与专表在线率三统计各自保留，不合并总体。
+三条 PON→来源关系保持 Optional→Many0；端口按 parentId，其余按 resId 绑定 PonId，不增加租户键或分类过滤。
+源 SHA256：EthernetPort `37ac7ab791999856c8ad6ac5fddfa3cc8976e07e913f761aee716eed86b7f57b`；Device `713d488911be32b66ef1efed74d13d6cd3bcfb4696b7b33a1274fc71a139d1a3`；Online `be1e65f1f980d1fc8fd80859cfe982fe68ead6598f84500824ec771034740ee5`，均与 catalog 一致。
+
+17 项 transform 契约在 350000 fuel 内通过；隔离 typed 初始化在 300000 fuel 内通过，不含旧模型／服务源码。265 组实际 SQLite 新旧对照、独立预期与空表检查通过，PostgreSQL 仅核对参数。
+SQL 覆盖全部维度、九个统计、数值比较、原始计数、UTC 分桶与窗口、显式 Effcnt 过滤、双根关联、双向 EXISTS 和设备分组统计；parentId 与 resId 刻意不同，包含跨租户同资源、孤立引用、NULL 和异常范围数值。在线率专表样本数值与设备表不同，验证不合并总体、不隐式去重或加权。
+设备根的多值投影显式声明 Association 行粒度，EXISTS 保留各根计数；没有为测试收紧来源基数。独立 SQL fixture 使用 650000 fuel，本批未准备或重跑历史累计 SQL。
+累计完成 40/50 个载体；MainService 尚未切换，不构建知识地图、不进行知识发现或知识测试。
