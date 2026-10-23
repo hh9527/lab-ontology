@@ -45,7 +45,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 第十七批已验证 |
 | SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 第十八批已验证 |
 | SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 第十九批已验证 |
-| SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 待迁移 |
+| SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 第二十批已验证 |
 | SourceNetworkAPKPI | `source_NetworkAPKPI` | `NetworkAPKPI` | 待迁移 |
 | SourceNetworkApRadioKPI | `source_NetworkApRadioKPI` | `NetworkApRadioKPI` | 待迁移 |
 | SourceNetworkCellLinkQualityKPI | `source_NetworkCellLinkQualityKPI` | `NetworkCellLinkQualityKPI` | 待迁移 |
@@ -500,3 +500,26 @@ NULL fixture 验证异常值 SQL 行为，不改变非空契约；PostgreSQL 只
 全部用例另有独立期望值，包含完全重复行、同父设备与相同接口的多条行、NULL 和字面量通配符；没有因推断身份而去重。
 PostgreSQL 只核对参数，未实际执行；SQL fixture 独立按需生成（250000 fuel），不准备累计查询。
 累计完成 25/50 个既有载体；此前载体 SQL 保留为历史证据，本批未全量重跑。MainService 尚未切换。
+
+
+## 第二十批 FcSwitch
+
+迁移 FC 来源 34 个字段、35 个维度、七个闭合域的 26 个成员，以及与已迁移载体之间的五条关系。
+独立 FcSwitchId 不与 DeviceId／StorageId 合并；告警 MEDN、物理链路 A/Z 原始文本分别通过 reference_part 引用该身份。
+A/Z 和告警关系保持 Optional→Many0，不增加租户条件、未清除条件、链路业务方向或设备分类范围；重复链路、自环和跨租户来源行保留原始语义。
+站点继续 parentResId 或 projectId 的 OR 键及 Many0→Optional 声明；租户关系保持 Many0→Optional。
+另两条指向 SYS_StoragePort／StorageDeviceKPI 的来源关系依赖未迁移载体，后续补齐，不声称本批已有 CPU 样本能力。
+
+剩余容量字段按来源标签明确的 MB 使用名义 Megabytes；其余容量为 ReportedCapacity，不默认与 MB 互换。
+利用率为 ReportedUtilization，不从相似存储来源推断 0..1 或百分比尺度，也不增加范围检查；端口数量为整数名义类型。
+所有容量只保留原有数值比较，没有新增求和、单位换算或 CPU 指标。原始 IP 文本与严格 IPv4 视图分别发布。
+七域 Ne／分组限定已知编码，未知和 NULL 原始行仍参与总体；不因载体名称过滤非 FC 分类。
+UTC 创建时间毫秒单位和非空性延续原假定，源 FCSwitchDevice.logical.yaml SHA256 与 catalog 一致。
+独立 typed 初始化在 200000 fuel 内通过；双载荷契约原 200000 fuel 实际耗尽后调整验证预算，不引入知识初始化。
+
+147 组实际 SQLite 新旧对照及空表检查通过，覆盖全部维度、七域全部成员 Eq/Ne、六个原始数值字段的全部比较、UTC 窗口、IPv4 子网与补集、五类关系和 EXISTS 防扇出计数，以及按 FC 身份分组的告警／未清除计数。
+重点语义另有独立期望值，包括负数／大于 100 的原始利用率不钳制、跨租户来源连接、A/Z 自环、重复链路、未知分类总体及 OR 站点键。
+NULL fixture 检查来源异常值的防御行为，不改变非空契约；PostgreSQL 只核对参数，未实际执行。
+SQL fixture 独立按需生成（400000 fuel），本批未重跑其他载体全部历史 SQL；不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
+
+17 项 IC transform 契约在调整后的 250000 fuel 内通过；累计完成 26/50 个既有载体，全部 50 载体及其关系迁移范围保持不变。
