@@ -27,9 +27,9 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 第四批已验证 |
 | ServerDevice | `server_device` | `PhysicalServer` | 第五批已验证 |
 | ServerKpi | `server_kpi` | `ServerDeviceKPI` | 第六批已验证 |
-| ServerFan | `server_fan` | `PhysicalServerFan` | 待迁移 |
-| ServerPsu | `server_psu` | `PhysicalServerPSU` | 待迁移 |
-| ServerMemory | `server_memory` | `PhysicalServerMemory` | 待迁移 |
+| ServerFan | `server_fan` | `PhysicalServerFan` | 第七批已验证 |
+| ServerPsu | `server_psu` | `PhysicalServerPSU` | 第七批已验证 |
+| ServerMemory | `server_memory` | `PhysicalServerMemory` | 第七批已验证 |
 | StorageDevice | `storage_device` | `HuaweiStorageDevice` | 待迁移 |
 | Frame | `frame` | `I_EnterpriseFrame` | 待迁移 |
 | NetworkSlot | `network_slot` | `I_EnterpriseSlot` | 待迁移 |
@@ -71,7 +71,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceStorageHardDriveKPI | `source_StorageHardDriveKPI` | `StorageHardDriveKPI` | 待迁移 |
 | SourceT_DEVICE_ALL | `source_T_DEVICE_ALL` | `T_DEVICE_ALL` | 待迁移 |
 
-## 当前验收
+## 首批验收
 
 `python3 scripts/check-typed-icloud-initialization.py` 在没有旧模型和服务源码的隔离工作区初始化 typed 入口，验证独立准备不依赖旧注解。
 
@@ -164,3 +164,23 @@ systemPower 与 peakPower 使用 Watts；averagePower 保持独立来源值类�
 CPU 和内存 Latest 共享行选择，NULL 时钟不参与 Latest，但其数值仍参与普通统计。
 
 新增同一时刻 t1／t2 并列 Latest 断言后，累计 177 组 SQLite 新旧查询及空表检查通过。当前完成 7/50 个载体。
+
+## 第七批 ServerFan／ServerPsu／ServerMemory
+
+三个载体完整迁移 40 个物理字段、32 个公开维度、一个风扇计数和 11 个跨批关系。
+每个部件拥有独立名义主 ID，风扇、PSU、内存身份不能互换。
+三个健康域分别保留既有业务 ID、源整数编码与过滤权限，不把 PSU 的 warning／unknown 合并为其他健康类型。
+内存容量使用 Megabytes，保持来源 MB 编码，不自动推断二进制倍率或转成 Bytes。
+
+ServerDevice 添加来源资源角色，使用 ServerOriginId 作为来源资源身份；服务器主 grain 仍是 ServerId。
+部件 parentResId 对应该来源角色，后续服务器 KPI 仍对应主身份，两者不根据字符串外观自动等同。
+这种角色绑定只表达已有关系键，不额外宣称来源编号在生产数据中的唯一性已经确认。
+三个源文件哈希与 source_catalog.json 一致，非空契约与既有关系基数不变。
+
+SQL 夹具专门区分 sv1 和 origin_sv1，保证错误使用主 ID 的部件不参与父服务器关联。
+同名不同 ID 的两个风扇仍分别计数；租户关系覆盖缺失端点，部件父关系覆盖双向投影。
+内存／服务器／样本必须用 Association 行粒度表达关联行；默认根行粒度下拒绝将服务器 CPU 投影为内存属性。
+
+累计 226 组 SQLite 新旧查询及空表对照通过，独立初始化通过。当前完成 10/50 个载体；PostgreSQL 仅比较参数，服务未切换。
+
+九个 transform 契约测试通过，包含部件行粒度下拒绝服务器样本扩行投影的回归。

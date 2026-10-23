@@ -50,7 +50,7 @@ pub def all_current_record_measures_are_preserved: test::Test = test::should_ok(
     })
 });
 pub def every_relation_between_migrated_datasets_is_preserved: test::Test = test::should_ok(fn() {
-    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 7 && relation.to < 7 });
+    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 10 && relation.to < 10 });
     array::length(expected) == array::length(payload.relations) && array::all(expected, fn(old) { array::any(payload.relations, fn(value) { value.id == old.id && value.from == old.from && value.to == old.to && value.cardinality == old.cardinality && value.key == old.key && value.guard == old.guard }) })
 });
 pub def device_identity_is_id_only: test::Test = test::should_ok(fn() { inventory::device_subject.parts == [{source: "id", target: "id", value: inventory::DeviceId.type, nullable: False}] });
@@ -153,7 +153,38 @@ pub def server_kpi_cases: Value = codec::encode(array::concat([
         pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"server_kpi"},{"id":"v","entity":"server_device"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"v","dimension":"server_name"}],"measures":[{"node":"k","measure":"server_cpu_usage"},{"node":"k","measure":"server_cpu_latest"},{"node":"k","measure":"server_memory_latest"}]}`).unwrap!())
     }),
 ]));
+def component_case: Fn(String, String, String) -> Pair = fn(id, entity, extra) { pair(id, json::parse(`{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"\{entity}"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def component_cases: Value = codec::encode(array::concat([
+    [component_case("fan_health_filter", "server_fan", r#""select":[{"node":"c","dimension":"server_fan_id"}],"filters":[{"node":"c","dimension":"server_fan__healthStatus","op":"Eq","value":"wire__1_fe93bf05"}]"#),
+     component_case("psu_health_filter", "server_psu", r#""select":[{"node":"c","dimension":"server_psu__name"}],"filters":[{"node":"c","dimension":"server_psu_health","op":"Eq","value":"warning"}]"#),
+     component_case("memory_health_filter", "server_memory", r#""select":[{"node":"c","dimension":"server_memory_name"}],"filters":[{"node":"c","dimension":"server_memory__healthStatus","op":"Eq","value":"wire__2_1027a474"}]"#),
+     component_case("fan_count", "server_fan", r#""select":[],"measures":[{"node":"c","measure":"server_fan_count"}]"#)],
+    array::map([
+        ("fan_parent_server", "server_fan", "server_device", "server_name", False),
+        ("source_PhysicalServer_PhysicalServerFan", "server_fan", "server_device", "server_name", True),
+        ("fan_belongs_to_tenant", "server_fan", "tenant", "tenant_name", False),
+        ("source_PhysicalServerFan_X_TENANT_VIEW", "server_fan", "tenant", "tenant_name", False),
+        ("psu_parent_server", "server_psu", "server_device", "server_name", False),
+        ("source_PhysicalServer_PhysicalServerPSU", "server_psu", "server_device", "server_name", True),
+        ("psu_belongs_to_tenant", "server_psu", "tenant", "tenant_name", False),
+        ("source_PhysicalServerPSU_X_TENANT_VIEW", "server_psu", "tenant", "tenant_name", False),
+        ("memory_parent_server", "server_memory", "server_device", "server_name", False),
+        ("source_PhysicalServer_PhysicalServerMemory", "server_memory", "server_device", "server_name", True),
+        ("source_PhysicalServerMemory_X_TENANT_VIEW", "server_memory", "tenant", "tenant_name", False),
+    ], fn(spec) {
+        let dimension = if spec.1 == "server_fan" { "server_fan_name" } else if spec.1 == "server_psu" { "server_psu__name" } else { "server_memory_name" };
+        let source = if spec.4 { "o" } else { "c" };
+        let target = if spec.4 { "c" } else { "o" };
+        let grain = if spec.2 == "tenant" { r#""row_grain":"Association","# } else { "" };
+        pair(spec.0, json::parse(`{"op":"Graph","root":"c",\{grain}"nodes":[{"id":"c","entity":"\{spec.1}"},{"id":"o","entity":"\{spec.2}"}],"edges":[{"relation":"\{spec.0}","from":"\{source}","to":"\{target}"}],"select":[{"node":"c","dimension":"\{dimension}"},{"node":"o","dimension":"\{spec.3}"}]}`).unwrap!())
+    }),
+    [pair("fan_count_for_server", json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"server_fan"},{"id":"v","entity":"server_device"}],"edges":[{"relation":"fan_parent_server","from":"c","to":"v"}],"select":[],"measures":[{"node":"c","measure":"server_fan_count"}],"filters":[{"node":"v","dimension":"server_name","op":"Eq","value":"sv1"}]}"#).unwrap!()),
+     pair("memory_server_sample_rows", json::parse(r#"{"op":"Graph","root":"c","row_grain":"Association","nodes":[{"id":"c","entity":"server_memory"},{"id":"v","entity":"server_device"},{"id":"k","entity":"server_kpi"}],"edges":[{"relation":"memory_parent_server","from":"c","to":"v"},{"relation":"server_kpi_of_server","from":"k","to":"v"}],"select":[{"node":"c","dimension":"server_memory_name"},{"node":"v","dimension":"server_name"},{"node":"k","dimension":"server_cpu_sample"}]}"#).unwrap!())],
+]));
+pub def component_projection_does_not_reinterpret_server_samples_as_component_values: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"server_memory"},{"id":"v","entity":"server_device"},{"id":"k","entity":"server_kpi"}],"edges":[{"relation":"memory_parent_server","from":"c","to":"v"},{"relation":"server_kpi_of_server","from":"k","to":"v"}],"select":[{"node":"c","dimension":"server_memory_name"},{"node":"k","dimension":"server_cpu_sample"}]}"#).unwrap!())
+}, "graph raw projection crosses a multiplying relation");
 # 一次初始化输出全部对照请求与物理 schema，避免每组查询重复准备旧模型
-type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, kpi: Value, server: Value, server_kpi: Value, schema: Value };
-def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, kpi: kpi_cases, server: server_cases, server_kpi: server_kpi_cases, schema: physical_schema};
+type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, kpi: Value, server: Value, server_kpi: Value, components: Value, schema: Value };
+def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, kpi: kpi_cases, server: server_cases, server_kpi: server_kpi_cases, components: component_cases, schema: physical_schema};
 pub def runtime_fixture: Value = codec::encode(fixture);

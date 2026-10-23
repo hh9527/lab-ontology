@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"]
 schema = fixture["schema"]
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
@@ -33,7 +33,7 @@ with sqlite3.connect(":memory:") as db:
     db.create_function("regexp", 2, lambda pattern, value: None if value is None else bool(re.search(pattern, value)))
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
-        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType", "healthStatus", "connectStatus", "serviceDuration", "serviceStartTime"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
+        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType", "healthStatus", "connectStatus", "serviceDuration", "serviceStartTime", "slotId", "ratedPower", "bitWidth", "frequency", "capacity"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
         if table in {"NetworkDeviceInterfaceKPI", "ServerDeviceKPI"}:
             fields = ", ".join(f'"{name}" ' + ("TEXT" if name in {"resId", "tenantId", "ts", "parentId", "projectId", "interfaceName"}
                               else "INTEGER" if "Errors" in name or "Effcnt" in name else "REAL") for name in columns)
@@ -140,6 +140,24 @@ with sqlite3.connect(":memory:") as db:
                     server_latest_window=[(70, 80)], server_latest_tie=[(30, 40)])
     expected["server_kpi_of_server"] = [("sv1", 30.0, None, 90), ("sv2", 534.5, 70, 80)]
     expected["source_PhysicalServer_ServerDeviceKPI"] = expected["server_kpi_of_server"]
+    for table, prefix in [("PhysicalServerFan", "fan"), ("PhysicalServerPSU", "psu"), ("PhysicalServerMemory", "memory")]:
+        component_columns = next(columns for source, columns in schema if source == table)
+        for identity, parent, tenant, health, name in [
+            ("c1", "origin_sv1", "t1", 1, "repeat"), ("c2", "origin_sv1", "t1", -1, "repeat"),
+            ("c3", "sv1", "t2", 0, "wrong_primary"), ("c4", "missing", "missing", -2, "missing"),
+        ]:
+            values = {column: f"{prefix}_{identity}_{column}" for column in component_columns}
+            values.update(id=f"{prefix}_{identity}", parentResId=parent, tenantId=tenant, name=name, healthStatus=health,
+                          slotId=1, ratedPower=500, bitWidth=64, frequency=3200, capacity=16384)
+            db.execute(f'INSERT INTO "{table}" VALUES (' + ','.join('?' for _ in component_columns) + ')', [values[column] for column in component_columns])
+        expected[f"{prefix}_parent_server"] = [("repeat", "sv1"), ("repeat", "sv1")]
+        expected[f"source_PhysicalServer_{table}"] = expected[f"{prefix}_parent_server"]
+        expected[f"source_{table}_X_TENANT_VIEW"] = [("repeat", "Tenant Alpha"), ("repeat", "Tenant Alpha"), ("wrong_primary", "租户二")]
+        if prefix in {"fan", "psu"}:
+            expected[f"{prefix}_belongs_to_tenant"] = expected[f"source_{table}_X_TENANT_VIEW"]
+    expected.update(fan_health_filter=[("fan_c2",)], psu_health_filter=[("repeat",)], memory_health_filter=[("missing",)],
+                    fan_count=[(4,)], fan_count_for_server=[(2,)])
+    expected["memory_server_sample_rows"] = [("repeat", "sv1", value) for value in [10, 30, 50, None] for _ in range(2)]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
@@ -159,6 +177,6 @@ with sqlite3.connect(":memory:") as db:
     for case in cases:
         actual = execute(case["typed"])
         assert actual == execute(case["baseline"]), ("empty", case["id"])
-        if case["id"] in {"count", "tenant_count", "port_count"}:
+        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
 print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and all migrated relations")
