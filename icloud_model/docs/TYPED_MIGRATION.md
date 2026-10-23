@@ -65,8 +65,8 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceSYS_Controller | `source_SYS_Controller` | `SYS_Controller` | 第二十五批已验证 |
 | SourceSYS_Fan | `source_SYS_Fan` | `SYS_Fan` | 第二十五批已验证 |
 | SourceSYS_PowerSupply | `source_SYS_PowerSupply` | `SYS_PowerSupply` | 第二十五批已验证 |
-| SourceSYS_StorageDisk | `source_SYS_StorageDisk` | `SYS_StorageDisk` | 待迁移 |
-| SourceSYS_StoragePort | `source_SYS_StoragePort` | `SYS_StoragePort` | 待迁移 |
+| SourceSYS_StorageDisk | `source_SYS_StorageDisk` | `SYS_StorageDisk` | 第二十六批已验证 |
+| SourceSYS_StoragePort | `source_SYS_StoragePort` | `SYS_StoragePort` | 第二十六批已验证 |
 | SourceStorageDeviceKPI | `source_StorageDeviceKPI` | `StorageDeviceKPI` | 待迁移 |
 | SourceStorageHardDriveKPI | `source_StorageHardDriveKPI` | `StorageHardDriveKPI` | 待迁移 |
 | SourceT_DEVICE_ALL | `source_T_DEVICE_ALL` | `T_DEVICE_ALL` | 待迁移 |
@@ -631,3 +631,18 @@ SQL 覆盖全部维度、九个统计、数值比较、原始计数、UTC 分桶
 验证覆盖全部维度、72 个已知成员的 Eq／Ne、17 个域分组、原始行计数、CPU 数量全部比较、两个日历日期的全部比较／半开窗口、控制器创建时间窗口、文本模式字符及十条关系的投影和双向 EXISTS。
 数据包含跨租户连接、孤立／NULL 引用、设备与组件的相同文本 ID、未知／NULL 编码、零／负 CPU 数量和不作数值解析的 0010% 文本。设备侧多值投影使用 Association 行粒度，组件侧最多一个租户保持根行粒度。
 本批独立 SQL fixture 使用 650000 fuel，没有重跑历史累计 SQL。累计完成 45/50 个载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
+
+## 第二十六批存储磁盘与端口
+
+两来源迁移 49 个字段、51 个维度、十个闭合域的 65 个成员和五条关系。磁盘既有来源无唯一键，保持无键 Dataset，不把 diskId 提升为身份；端口使用独立 PortId。
+磁盘父资源绑定 StorageId；端口原始 parentResId 分别通过 reference_part 显式引用 StorageId 和 FcSwitchId，不合并身份命名空间。存储／FC→组件保持 Optional→Many0，组件→租户保持 Many0→Optional，不补租户键、分类过滤或额外的磁盘／端口关系。
+端口 speed 保持 Int Mbit/s 的名义类型；maxSpeed 为文本 Gbit/s，磁盘容量、剩余天数、磨损率和转速仍为文本，不解析数值、不换算或增加统计。磁盘 virtualDisk 保持 Bool。
+端口 mgmtIp、ipv4Gateway 的严格 IPv4 视图均保留，原始 IPv6／掩码／地址文本继续原有匹配规则。
+
+端口当前源 SHA256 `824b15484d3809fb49bef7d6b1c222f457c47912d15607787f9f4bd1c8ac4934` 与 catalog 一致。磁盘 catalog 为 `2f14055ccc5a05e14fc202f47ae0e291f294a3ae35d5e6b90c49388c4a780df7`，当前文件为 `035cbc08b16e14b168ecdeccceb21b6dbb4309f9a81827979ba515aed1287091`：当前来源新增 id，原有 22 字段经 field_metadata 规范化逐项比较完全一致。本批保持 catalog／旧模型快照，不自动吸收新增身份契约。
+
+无键磁盘不能作为 Graph 计数主体：实际生成触发既有 declared key／dataset grain 拒绝，核对 lowering 的同一基线规则后保留该限制。磁盘验证只包含受支持的投影、关联行和从有键目标出发的 EXISTS 计数，不补造磁盘键来通过测试。
+双载荷契约与隔离初始化均实际耗尽 350000 fuel 后调整至 400000；隔离检查超时上限调整为 240 秒以容纳新预算。17 项 transform 契约及隔离 typed 初始化均在 400000 fuel 内通过。
+237 组实际 SQLite 新旧 SQL 对照、独立预期及空表检查通过，PostgreSQL 仅核对参数。验证涵盖全部维度、65 成员 Eq／Ne、端口五域分组及计数、Bool 比较、整数速率全部比较、两个 IPv4 视图的原始异常地址与四种 CIDR／补集、原始文本和五条关系。
+关联数据包含存储／FC 的相同文本身份、仅存储／仅 FC 的父资源、跨租户连接、孤立／NULL 引用及重复 diskId。设备侧多值投影显式使用 Association；反向关联和有键目标 EXISTS 保持原语义。Bool 以 SQLite 的 1／0 物理表示核对，避免 Python Bool 与整数 repr 排序不同造成误判。
+独立 SQL fixture 为 650000 fuel，本批不重跑历史累计 SQL。累计完成 47/50 载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。

@@ -28,8 +28,8 @@ with tempfile.TemporaryDirectory(prefix="typed-icloud-init-", dir=TEMP_ROOT) as 
     shutil.copytree(ROOT / "icloud_model/src/typed", source / "typed")
     result = subprocess.run([
         str(ROOT / "bin/telora"), "-C", str(workspace / "icloud_model"), "check", "@src/typed",
-        "--initialization-fuel", "350000", "--with-memory-limit", "2048",
-    ], capture_output=True, text=True, timeout=180)
+        "--initialization-fuel", "400000", "--with-memory-limit", "2048",
+    ], capture_output=True, text=True, timeout=240)
     records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     summaries = [record for record in records if record.get("record") == "summary"]
     assert result.returncode == 0 and len(summaries) == 1, (result.stdout, result.stderr)
