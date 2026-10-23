@@ -1285,3 +1285,11 @@ MainService 尚未切换，不执行知识发现、知识地图构建或知识�
 端口源哈希与 catalog 一致；当前磁盘 YAML 新增 id，其余 22 字段规范化元数据与 catalog 完全一致，本批不自动吸收新增身份契约。无键磁盘继续拒绝根计数，不为用例补造身份。
 17 项 transform 契约、隔离初始化与 237 组 SQLite 新旧对照／独立预期／空表检查通过，PostgreSQL 仅核对参数。覆盖全部域成员、Bool、整数速率、IPv4 异常／CIDR／补集、两类父资源、跨租户、重复 diskId 和孤立／NULL 引用。
 双载荷与隔离初始化均实际耗尽 350000 fuel 后调整至 400000 并通过；隔离超时上限 240 秒，独立 SQL fixture 650000。不准备历史累计 SQL 或知识内容；MainService 尚未切换，继续最后三个载体及服务切换验收。
+
+
+### 阶段 D 进展：最后三个 IC 载体
+
+存储设备 KPI／硬盘 KPI／设备检索表共迁移 20 字段、27 维度、15 统计、一个闭合域的 12 成员及两条 owner 关系，累计完成 50/50 载体声明。两个 KPI 保持 (resId, ts) Metric grain 和 UTC 时钟；共享设备样本的原始 resId 显式引用独立 StorageId／FcSwitchId，关系保持 Optional→Many0。未解决的硬盘归属仍不推断。
+百分比样本保持来源尺度，KB I/O 大小使用独立名义类型及样本组，#58 字节倍率继续待确认；不换算、不增加 Sum 或 Effcnt 权重。设备检索表独立 CatalogId、闭合分类、原始文本与严格 IPv4 视图保留，不引入知识准备。三源 SHA256 与 catalog 一致。
+17 项覆盖全部 50 载体的 transform 契约、隔离初始化和 179 组 SQLite 新旧对照／独立预期／空表检查通过，PostgreSQL 仅核对参数。验证含两类 owner 的双根关联、双向 EXISTS 与分组统计、不同 CPU／内存及读／写种子值、全 NULL／空窗口、UTC 分桶和原始数值过滤。
+双载荷与隔离初始化均使用 400000 fuel，独立 SQL fixture 使用 650000。MainService 尚未切换，后续必须完成服务初始化、批量 transform 和 SQL 执行验收后才可宣称 IC 迁移交付完成；知识发现、知识地图构建与知识测试不参与当前验收。

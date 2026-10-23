@@ -67,9 +67,9 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceSYS_PowerSupply | `source_SYS_PowerSupply` | `SYS_PowerSupply` | 第二十五批已验证 |
 | SourceSYS_StorageDisk | `source_SYS_StorageDisk` | `SYS_StorageDisk` | 第二十六批已验证 |
 | SourceSYS_StoragePort | `source_SYS_StoragePort` | `SYS_StoragePort` | 第二十六批已验证 |
-| SourceStorageDeviceKPI | `source_StorageDeviceKPI` | `StorageDeviceKPI` | 待迁移 |
-| SourceStorageHardDriveKPI | `source_StorageHardDriveKPI` | `StorageHardDriveKPI` | 待迁移 |
-| SourceT_DEVICE_ALL | `source_T_DEVICE_ALL` | `T_DEVICE_ALL` | 待迁移 |
+| SourceStorageDeviceKPI | `source_StorageDeviceKPI` | `StorageDeviceKPI` | 第二十七批已验证 |
+| SourceStorageHardDriveKPI | `source_StorageHardDriveKPI` | `StorageHardDriveKPI` | 第二十七批已验证 |
+| SourceT_DEVICE_ALL | `source_T_DEVICE_ALL` | `T_DEVICE_ALL` | 第二十七批已验证 |
 
 ## 首批验收
 
@@ -646,3 +646,16 @@ SQL 覆盖全部维度、九个统计、数值比较、原始计数、UTC 分桶
 237 组实际 SQLite 新旧 SQL 对照、独立预期及空表检查通过，PostgreSQL 仅核对参数。验证涵盖全部维度、65 成员 Eq／Ne、端口五域分组及计数、Bool 比较、整数速率全部比较、两个 IPv4 视图的原始异常地址与四种 CIDR／补集、原始文本和五条关系。
 关联数据包含存储／FC 的相同文本身份、仅存储／仅 FC 的父资源、跨租户连接、孤立／NULL 引用及重复 diskId。设备侧多值投影显式使用 Association；反向关联和有键目标 EXISTS 保持原语义。Bool 以 SQLite 的 1／0 物理表示核对，避免 Python Bool 与整数 repr 排序不同造成误判。
 独立 SQL fixture 为 650000 fuel，本批不重跑历史累计 SQL。累计完成 47/50 载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
+
+## 第二十七批存储样本与设备检索表
+
+最后三来源共迁移 20 字段、27 维度、15 个公开统计、一个闭合域的 12 成员及两条来源关系。两个 KPI Dataset 保持 (resId, ts) Metric grain 与 UTC Rfc3339 时钟、小时／日／月分桶。
+设备 KPI 的原始 resId 分别显式引用 StorageId 与 FcSwitchId；存储／FC→样本均保持 Optional→Many0，不合并两类主体身份，不暗加分类条件或租户键。硬盘 KPI 的归属关系在既有元数据中未解决，本批不补造到 SYS_StorageDisk 的关联。
+CPU、内存与硬盘利用率复用百分比样本组，保持原始尺度和 Avg／Max／Min；I/O 大小使用独立 KB 名义类型及统计组，保留 #58 字节倍率未确认项，不换算字节、不把采样均值当作全局逐操作均值。Effcnt 仍为原始整数，不隐式加权、过滤或推定有效性。
+设备检索表使用独立 CatalogId，CATEGORY 的闭合编码、文本搜索、严格 IPv4 视图和单列 ID grain 保留；不因检索用途增加跨设备关联或知识准备。
+三个源 SHA256 均与 catalog 一致：StorageDeviceKPI `28730dcf4969372310e3d07e5eeafcebab106da0b9753b3c2e2a277ee569747c`；StorageHardDriveKPI `cdb01c0366100661f9a747370a0664292e84771fe50497863cfe1428cbc0fc79`；T_DEVICE_ALL `1753ab56090f1364962b8a6d6d0b32c386af09a3395083ab20b6efe9898b5123`。
+
+17 项覆盖全部 50 载体的 transform 契约与隔离 typed 初始化均在 400000 fuel 内通过。179 组实际 SQLite 新旧对照、独立预期及空表检查通过；PostgreSQL 仅核对参数。
+SQL 验证包含全部维度、15 个统计、12 个闭合成员 Eq／Ne、UTC 分桶／窗口、全 NULL／空窗口、全部原始数值比较、零／不同 Effcnt、两类 owner 的双根投影／双向 EXISTS／分组统计，以及原始文本和严格 IPv4／CIDR／补集。
+CPU／内存和读／写 I/O 字段采用不同的种子值，存储／FC 具有共享文本身份和各自专属身份，验证不替换字段或错误合并 owner 总体；样本 grain 不包含租户，不补造租户列。
+独立 SQL fixture 使用 650000 fuel，未准备历史累计 SQL。50/50 载体声明及全部既有载体间关系已完成阶段验证；MainService 尚未切换，后续仍须完成实际服务初始化、批量请求及 SQL 执行验收，不将声明完成等同于整体交付。知识发现、知识地图构建和知识测试继续延后。
