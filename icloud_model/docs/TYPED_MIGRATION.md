@@ -37,7 +37,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | PonOnuRole | `pon_onu_role` | `I_EntPonElement` | 第十批已验证 |
 | PonOltRole | `pon_olt_role` | `I_EntPonElement` | 第十批已验证 |
 | OnuKpi | `onu_kpi` | `PonDeviceOnuKPI` | 第十一批已验证 |
-| PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 待迁移 |
+| PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 第十二批已验证 |
 | ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 待迁移 |
 | DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 待迁移 |
 | CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 待迁移 |
@@ -263,3 +263,19 @@ Percent、Dbm、DegreesCelsius、BitsPerSecond 区分不同可计算量，四个
 关系对照使用显式 Association 行；按相关 ONU 角色资格统计使用 EXISTS，另有负例保持 M:N 度量放大保护。
 
 本批累计完成 17/50 个载体。源文件 SHA256 与 catalog 一致；12 项 transform 契约在 100000 fuel 内通过，独立初始化通过，累计 453 组实际 SQLite 新旧请求及空表检查通过。PostgreSQL 仅核对参数。
+
+## 第十二批 PON 端口 KPI
+
+迁移 16 个字段、15 个维度（含 UTC 小时／日／月分桶）、18 个 Mean/Min/Max 统计和两条关系。
+保留来源 res_id、tenant_id、ts 采样 grain；来源粒度和全局 ID 范围仍有生产验证假定，不因类型化声明而确认其有效性。
+设备引用必须由 parent_id→PonId 建立，res_id 是不同名义类型的来源端口 ID，不代替设备身份；portName 不加入未经确认的 grain。
+
+将 ONU 与 PON 端口共有的 Dbm、DegreesCelsius、BitsPerSecond 及统计模板放到 pon_quantities，复用不依赖具体 Dataset。
+ONU 的 Percent 保留原语义；PON 端口使用 ReportedPercent 保留 #51 中 one 与百分比显示冲突的待确认假定，不默认互换或缩放。
+有效次数不作为权重，dBm 保持原值 Mean/Min/Max；没有新增 Sum、隐式线性功率转换或未知单位换算。
+
+SQL fixture 覆盖 resId 恰好与设备 ID 相同但 parentId 不匹配、不同端口属于同设备、跨租户、非 OLT 的 PON 父设备、NULL 与 NULL 时钟。
+全部端口统计、UTC 窗口／分桶、两条关系和原 ONU 统计一起验证，不把关联擅自限为 OLT，也不改为 resId 关联。
+当前只准备 transform，MainService 尚未切换，不构建知识地图或运行知识测试。
+
+累计完成 18/50 个载体。源 SHA256 与 catalog 一致；12 项 transform 契约（100000 fuel）、独立初始化及累计 491 组实际 SQLite 对照与空表检查通过。PostgreSQL 仅核对参数。

@@ -1047,3 +1047,12 @@ Percent／Dbm／DegreesCelsius／BitsPerSecond 分离单位并复用四个统计
 MainService 尚未切换，PostgreSQL 仅核对参数。
 
 累计 17/50 个载体；12 项 transform 契约（100000 fuel）、独立初始化、453 组实际 SQLite 对照及空表检查通过，包含全部 ONU 统计和负 dBm 原值统计场景。
+
+### 阶段 D 进展：PON 端口 KPI 与公共单位模板
+
+新增 16 个字段、15 个维度、18 个统计度量及两条关系，累计 18/50 个载体。
+保持 parent_id→PonId 关联，res_id 以不同名义类型表示来源端口，不改为设备身份；来源采样 grain 及全局 ID 范围假定待生产验证。
+ONU 与端口共享 pon_quantities 中的 dBm、摄氏温度、bit/s 类型与 Mean/Min/Max 模板，复用不依赖具体模型声明。
+端口百分比用 ReportedPercent 保留 #51 的尺度冲突；不因显示 % 而确认来源单位或执行换算。
+12 项 transform 契约、独立初始化及累计 491 组实际 SQLite 对照和空表检查通过，包含 resId 碰撞、不同端口同设备、NULL、负功率与原 ONU 统计回归。
+MainService 尚未切换；不构建知识地图或执行知识测试，PostgreSQL 仅核对参数。

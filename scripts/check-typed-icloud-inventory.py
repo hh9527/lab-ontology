@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"] + fixture["pon_port"]
 # 多个角色可共享一张表，按物理列并集合并，不能重复建表或重复装载。
 schema_by_table = {}
 for table, columns in fixture["schema"]:
@@ -269,6 +269,33 @@ with sqlite3.connect(":memory:") as db:
     expected["onu_kpi_of_onu_role"] = [("n1", 10.0), ("n1", 30.0), ("n1", 50.0), ("n2", None)]
     expected["onu_samples_for_parent_olt"] = [("o1", "n1", 10.0), ("o1", "n1", 30.0), ("o1", "n1", 50.0)]
     expected["onu_qualified_mean"] = [(30.0,)]
+    pon_port_columns = next(columns for table, columns in schema if table == "PonDevicePonPortKPI")
+    for identity, parent, tenant, clock, value in [
+        ("port1", "o1", "t1", "2024-02-29T23:00:00Z", 10),
+        ("port1", "o1", "t2", "2024-03-01T00:00:00Z", 30),
+        ("port2", "o1", "t1", "2024-03-01T00:00:00Z", 50),
+        ("port3", "o2", "t2", "2024-03-02T00:00:00Z", None),
+        ("o2", "missing", "t1", "2024-03-01T01:00:00Z", 100),
+        ("port4", "o2", "t2", None, 200),
+        ("port5", "n1", "t1", "2024-03-01T02:00:00Z", 300),
+    ]:
+        values = {column: value for column in pon_port_columns}
+        values.update(resId=identity, parentId=parent, tenantId=tenant, ts=clock, portName=identity, projectId="s1")
+        for column in pon_port_columns:
+            if column.endswith("Effcnt"):
+                values[column] = 1000 if value == 10 else 0
+        values["onuHwOpticsTxPower"] = None if value is None else -value
+        db.execute('INSERT INTO PonDevicePonPortKPI VALUES (' + ','.join('?' for _ in pon_port_columns) + ')', [values[column] for column in pon_port_columns])
+    port_measures = {case["id"].removeprefix("measure_") for case in fixture["pon_port"] if case["id"].startswith("measure_")}
+    assert len(port_measures) == 18
+    for measure in port_measures:
+        negative = measure.startswith("pon_port_optics_tx_power")
+        minimum, maximum = (-300, -10) if negative else (10, 300)
+        expected[f"measure_{measure}"] = [(maximum if measure.endswith("_max") else minimum if measure.endswith("_min") else -115.0 if negative else 115.0,)]
+    expected.update(pon_port_window=[(120.0,)], pon_port_day=[(None, 200.0), ("2024-02-29T00:00:00Z", 10.0), ("2024-03-01T00:00:00Z", 120.0), ("2024-03-02T00:00:00Z", None)])
+    expected["pon_port_kpi_of_device"] = [("o1", 30.0), ("o2", 200.0), ("n1", 300.0)]
+    expected["source_EntPonElementAssociationPonDevicePonPortKPI"] = expected["pon_port_kpi_of_device"]
+    expected["pon_port_parent_rows"] = [("o1", 10.0), ("o1", 30.0), ("o1", 50.0), ("o2", None), ("o2", 200.0), ("n1", 300.0)]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
