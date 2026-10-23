@@ -13,14 +13,30 @@ use std::string as string;
 
 type ColumnBinding = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
 type ColumnMapping(Row) = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
-type Declaration = struct { dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
+type FieldCount(Row) = struct { row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
+type FieldCountFacts = struct { row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
+type Declaration = struct { dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
 type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
 type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
 def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::prepare(dataset, roles);
     let bindings = array::map(groups, g::binding_facts);
     g::prepare_facts(declared, bindings);
-    {dataset: declared, groups: bindings, record_counts, columns: [], domains: [], clock: None, samples: []}
+    {dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+};
+# COUNT(field) 只计算非NULL来源值，不要求字段是主键，也不自动变成DISTINCT
+# 保留来源与类型见证，在擦除后准备时再次检查
+def field_count: for(Row, Value) Fn(m::Dataset(Row), m::Field(Row, Value), String) -> FieldCount(Row) = fn(dataset, field, id) {
+    let checked = m::prepare(dataset, []);
+    let input = g::input(field);
+    if checked.row != Row.type || !qb::is_sql_identifier(id) { fail!("field count requires a valid row and public identifier", id) }
+    else { {row: Row.type, dataset: dataset.id, source: dataset.source, field: field.name, value: Value.type, nullable: input.nullable, id} }
+};
+def with_field_counts: for(Row) Fn(Declaration, Array(FieldCount(Row))) -> Declaration = fn(declared, counts) {
+    if declared.dataset.row != Row.type { fail!("field counts belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {field_counts: array::map(counts, fn(count) {
+        {row: count.row, dataset: count.dataset, source: count.source, field: count.field, value: count.value, nullable: count.nullable, id: count.id}.ty!(FieldCountFacts)
+    })} }
 };
 # Metric 的权威时间必须显式选择，字段类型提供 UTC 语义。
 def metric: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) {
@@ -286,12 +302,24 @@ def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(re
             else { {id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
                 input: edsl::MeasureInput::All, alias: id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry) }
         });
+        let field_counts = array::map(pair.1.field_counts, fn(count) {
+            if count.row != pair.1.dataset.row || count.dataset != pair.1.dataset.id || count.source != pair.1.dataset.source {
+                fail!("field count belongs to another dataset", count.id)
+            } else if !qb::is_sql_identifier(count.id) { fail!("field count requires a valid public identifier", count.id) } else { () };
+            let shape = g::shape(pair.1.dataset.row, g::Node::Column({name: count.field, value: count.value, nullable: count.nullable}));
+            if shape.value != count.value || shape.nullable != count.nullable { fail!("field count type witness is invalid", count.id) } else { () };
+            let field = match array::find(entity.fields, fn(field) { field.name == count.field }) {
+                Some(value) => value, None => fail!("field count input is missing", count.id),
+            };
+            {id: count.id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
+                input: edsl::MeasureInput::All, alias: count.id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry)
+        });
         let reported = array::map(entity.sample_measures, fn(sample) {
             let field = match array::find(entity.fields, fn(field) { field.name == sample.field }) { Some(field) => field, None => fail!("sample field is missing", sample.id) };
             {id: sample.id, entity: entity.index, field: field.index, aggregate: sample.aggregate,
                 input: edsl::MeasureInput::All, alias: sample.id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry)
         });
-        array::concat([grouped, counts, reported])
+        array::concat([grouped, counts, field_counts, reported])
     });
     array::map(dimensions, fn(dimension) {
         if array::length(array::filter(dimensions, fn(other) { other.id == dimension.id })) != 1 {
@@ -350,4 +378,4 @@ def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative)
     prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
 };
 
-pub use self::{Declaration, Prepared, Alternative, ColumnMapping, ColumnBinding, column, map_columns, metric, with_samples, with_domains, declare, prepare, build};
+pub use self::{Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, metric, with_samples, with_domains, declare, prepare, build};
