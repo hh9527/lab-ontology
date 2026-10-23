@@ -52,11 +52,11 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceNetworkCellLinkTrafficKPI | `source_NetworkCellLinkTrafficKPI` | `NetworkCellLinkTrafficKPI` | 第二十二批已验证 |
 | SourceNetworkDeviceBoardKPI | `source_NetworkDeviceBoardKPI` | `NetworkDeviceBoardKPI` | 第二十二批已验证 |
 | SourceNetworkDeviceOnlineKPI | `source_NetworkDeviceOnlineKPI` | `NetworkDeviceOnlineKPI` | 第二十二批已验证 |
-| SourcePhysicalServerDisk | `source_PhysicalServerDisk` | `PhysicalServerDisk` | 待迁移 |
-| SourcePhysicalServerNetworkAdapter | `source_PhysicalServerNetworkAdapter` | `PhysicalServerNetworkAdapter` | 待迁移 |
-| SourcePhysicalServerOpticalModule | `source_PhysicalServerOpticalModule` | `PhysicalServerOpticalModule` | 待迁移 |
-| SourcePhysicalServerPort | `source_PhysicalServerPort` | `PhysicalServerPort` | 待迁移 |
-| SourcePhysicalServerProcessor | `source_PhysicalServerProcessor` | `PhysicalServerProcessor` | 待迁移 |
+| SourcePhysicalServerDisk | `source_PhysicalServerDisk` | `PhysicalServerDisk` | 第二十三批已验证 |
+| SourcePhysicalServerNetworkAdapter | `source_PhysicalServerNetworkAdapter` | `PhysicalServerNetworkAdapter` | 第二十三批已验证 |
+| SourcePhysicalServerOpticalModule | `source_PhysicalServerOpticalModule` | `PhysicalServerOpticalModule` | 第二十三批已验证 |
+| SourcePhysicalServerPort | `source_PhysicalServerPort` | `PhysicalServerPort` | 第二十三批已验证 |
+| SourcePhysicalServerProcessor | `source_PhysicalServerProcessor` | `PhysicalServerProcessor` | 第二十三批已验证 |
 | SourcePonDeviceEthernetPortKPI | `source_PonDeviceEthernetPortKPI` | `PonDeviceEthernetPortKPI` | 待迁移 |
 | SourcePonDeviceKPI | `source_PonDeviceKPI` | `PonDeviceKPI` | 待迁移 |
 | SourcePonDeviceOnlineKPI | `source_PonDeviceOnlineKPI` | `PonDeviceOnlineKPI` | 待迁移 |
@@ -571,3 +571,30 @@ CPU／内存百分比与摄氏温度复用已声明单位的样本组，保持�
 蜂窝 fixture 允许重复 resId 检查原有物理行计数，不将旧单列 key 提升为已确认的生产唯一性事实。
 PostgreSQL 只核对参数，未实际执行；SQL fixture 独立按需生成（600000 fuel），没有准备历史累计查询。
 累计完成 32/50 个载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
+
+
+## 第二十三批服务器组件
+
+五载体共迁移 68 个字段及维度、十个闭合域的 55 个成员、五条服务器来源关系和五条租户来源关系。
+Disk／NetworkAdapter／OpticalModule／Port／Processor 分别使用独立 ComponentId；组件 Dataset 保留 source_id grain。
+服务器关联严格使用 oriResId：光模块连接 neResId，其余四类连接 parentResId；角色绑定 ServerOriginId，不与服务 ServerId 合并。
+服务器→组件和组件→租户均保留 Optional→Many0 的原有声明，不因名称或目标唯一键而收紧，不增加租户复合键或状态过滤。
+parent／port／card 等其他原始字段不额外推断跨组件关系；组件不复制服务器 CPU 样本。
+
+磁盘容量保留 Int GB 的名义 Gigabytes，不转 Float 或 bytes、不新增求和；剩余寿命仍为 String，不按百分比说明解析。
+通道数量和槽位分别采用整数名义类型；处理器频率保留原来仅含 -1 的闭合编码域，不推定 MHz／GHz，也不把未识别编码当作该已知成员。
+cardModel／processorType 等来源仅有说明的字段仍为原始文本，不由示例词生成闭合枚举；光模块 adminStatus 也不擅自收紧。
+网卡创建时间保留 UTC EpochMillis，字段非空性沿用旧契约；NULL fixture 只验证来源异常值 SQL 行为。
+十域分组、投影及 Ne 限定已知编码，未知／NULL 来源行仍参与普通总体和原始关联。
+五个源文件 SHA256 均与 catalog 一致。
+原双载荷与隔离初始化各 250000 fuel 均实际耗尽，分别调整验证预算至 350000 和 300000；不增加知识初始化或历史累积查询准备。
+
+17 项 IC transform 契约在 350000 fuel 内通过；独立 typed 初始化在 300000 fuel 内通过。
+服务器服务 ID 没有公开维度，关联验证投影使用既有 server_name，不为测试增开身份投影权限。
+
+259 组实际 SQLite 新旧对照及空表检查通过，全部有独立期望值；覆盖全部字段维度、55 个域成员 Eq/Ne、十域分组、三种整数列全部比较、网卡 UTC 窗口、文本转义及十条来源关系。
+服务器关系按两个根投影，并分别验证组件→目标和目标→组件 EXISTS 计数；数据包含服务 ID／原始 ID 的相同文本碰撞、重复原始服务器身份、跨租户连接、孤立引用和 NULL。
+重复 oriResId fixture 检查原始连接的防御行为，不将来源 cardinality 或身份唯一性描述为生产已确认事实；EXISTS 保留各根粒度，避免来源多行放大计数。
+磁盘容量包含 9007199254740993，原始 Int 投影与过滤保持精确，不经 Float；剩余寿命 0010% 仍按文字匹配，处理器自定义类型不被示例枚举排除。
+PostgreSQL 只核对参数，未实际执行；独立 SQL fixture 650000 fuel，本批未重跑其他载体全部历史 SQL。
+累计完成 37/50 个既有载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
