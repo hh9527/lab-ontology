@@ -60,11 +60,11 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourcePonDeviceEthernetPortKPI | `source_PonDeviceEthernetPortKPI` | `PonDeviceEthernetPortKPI` | 第二十四批已验证 |
 | SourcePonDeviceKPI | `source_PonDeviceKPI` | `PonDeviceKPI` | 第二十四批已验证 |
 | SourcePonDeviceOnlineKPI | `source_PonDeviceOnlineKPI` | `PonDeviceOnlineKPI` | 第二十四批已验证 |
-| SourceSYS_BackupPower | `source_SYS_BackupPower` | `SYS_BackupPower` | 待迁移 |
-| SourceSYS_Chassis | `source_SYS_Chassis` | `SYS_Chassis` | 待迁移 |
-| SourceSYS_Controller | `source_SYS_Controller` | `SYS_Controller` | 待迁移 |
-| SourceSYS_Fan | `source_SYS_Fan` | `SYS_Fan` | 待迁移 |
-| SourceSYS_PowerSupply | `source_SYS_PowerSupply` | `SYS_PowerSupply` | 待迁移 |
+| SourceSYS_BackupPower | `source_SYS_BackupPower` | `SYS_BackupPower` | 第二十五批已验证 |
+| SourceSYS_Chassis | `source_SYS_Chassis` | `SYS_Chassis` | 第二十五批已验证 |
+| SourceSYS_Controller | `source_SYS_Controller` | `SYS_Controller` | 第二十五批已验证 |
+| SourceSYS_Fan | `source_SYS_Fan` | `SYS_Fan` | 第二十五批已验证 |
+| SourceSYS_PowerSupply | `source_SYS_PowerSupply` | `SYS_PowerSupply` | 第二十五批已验证 |
 | SourceSYS_StorageDisk | `source_SYS_StorageDisk` | `SYS_StorageDisk` | 待迁移 |
 | SourceSYS_StoragePort | `source_SYS_StoragePort` | `SYS_StoragePort` | 待迁移 |
 | SourceStorageDeviceKPI | `source_StorageDeviceKPI` | `StorageDeviceKPI` | 待迁移 |
@@ -612,3 +612,22 @@ UTC 时钟及小时／日／月分桶延续旧声明；Effcnt 为原始整数，
 SQL 覆盖全部维度、九个统计、数值比较、原始计数、UTC 分桶与窗口、显式 Effcnt 过滤、双根关联、双向 EXISTS 和设备分组统计；parentId 与 resId 刻意不同，包含跨租户同资源、孤立引用、NULL 和异常范围数值。在线率专表样本数值与设备表不同，验证不合并总体、不隐式去重或加权。
 设备根的多值投影显式声明 Association 行粒度，EXISTS 保留各根计数；没有为测试收紧来源基数。独立 SQL fixture 使用 650000 fuel，本批未准备或重跑历史累计 SQL。
 累计完成 40/50 个载体；MainService 尚未切换，不构建知识地图、不进行知识发现或知识测试。
+
+## 第二十五批存储组件
+
+备电／机框／控制器／风扇／电源五来源迁移 94 字段及维度、17 个闭合域的 72 个成员和十条既有关系。各组件保留独立 ComponentId 与单列 id grain；父资源绑定 StorageId，不混同组件 ID、oriResId 或其他 parentId。
+存储设备→组件保持 Optional→Many0；组件→租户保持 Many0→Optional，不补租户复合键或来源未声明的组件间关系。
+备电 manufacturedDate 与电源 produceDate 使用 DateUtc；控制器 createTime 使用 EpochMillis，沿用尚待确认的原整数时钟单位假定，不把日历日期当作采样时钟。
+控制器 cpuCount 使用整数名义类型；温度、内存大小、充放电次数等原始文本继续按文本过滤，不因单位说明而解析数值。备电 remainLifeDays 保留原来仅有 -1 的闭合域，未知编码不作为已知成员。域投影／分组／Ne 仅涵盖已知编码，未知和 NULL 来源行仍保留在普通总体和关联中。组件不继承存储设备的 KPI。
+五个当前来源文件 SHA256 均与 catalog 一致：
+
+- SYS_BackupPower：`11cdbd64df591521028d160cb427bf87b5bbc715ee579fcca4dba2a753b2a844`
+- SYS_Chassis：`b8b9d0f34de0a860f278fe9798e43968ebb61e21cd645ee6564c4d08478ea5c1`
+- SYS_Controller：`6f6a652cae2b339473aca3151d99fb4707113b2f103d1e52fa1bbce1341ee3e7`
+- SYS_Fan：`4105c175764a96d6c080a2ab09b05de0f9a7a8c418838e1955c2074ef079afba`
+- SYS_PowerSupply：`f45ca4b05db7ef6105dc6aa97125fd4f79ca2113efd5ea60d62acd4e1d027c75`
+
+17 项 transform 契约在 350000 fuel 内通过。隔离初始化实际耗尽 300000 fuel，调整至 350000 后通过；不包含旧模型与服务源码。331 组实际 SQLite 新旧对照、独立预期和空表检查通过；PostgreSQL 仅核对参数。
+验证覆盖全部维度、72 个已知成员的 Eq／Ne、17 个域分组、原始行计数、CPU 数量全部比较、两个日历日期的全部比较／半开窗口、控制器创建时间窗口、文本模式字符及十条关系的投影和双向 EXISTS。
+数据包含跨租户连接、孤立／NULL 引用、设备与组件的相同文本 ID、未知／NULL 编码、零／负 CPU 数量和不作数值解析的 0010% 文本。设备侧多值投影使用 Association 行粒度，组件侧最多一个租户保持根行粒度。
+本批独立 SQL fixture 使用 650000 fuel，没有重跑历史累计 SQL。累计完成 45/50 个载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
