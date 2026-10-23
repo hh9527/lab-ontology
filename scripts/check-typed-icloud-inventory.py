@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"] + fixture["pon_port"] + fixture["ssid"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"] + fixture["pon_port"] + fixture["ssid"] + fixture["device_samples"]
 # 多个角色可共享一张表，按物理列并集合并，不能重复建表或重复装载。
 schema_by_table = {}
 for table, columns in fixture["schema"]:
@@ -326,6 +326,44 @@ with sqlite3.connect(":memory:") as db:
     expected["ap_ssid_kpi_of_device"] = [("d1", 90, 30.0), ("d2", 200, 200.0), ("d3", 300, 300.0)]
     expected["source_EntNetworkElement_NetworkApRadioSsidKPI"] = expected["ap_ssid_kpi_of_device"]
     expected["ssid_parent_rows"] = [("d1", 10), ("d1", 30), ("d1", 50), ("d2", None), ("d2", 200), ("d3", 300)]
+    device_sample_columns = next(columns for table, columns in schema if table == "NetworkDeviceKPI")
+    for identity, tenant, clock, cpu, memory in [
+        ("d1", "t1", "2024-02-29T23:00:00Z", 10, 20),
+        ("d1", "t2", "2024-03-01T00:00:00Z", 50, 60),
+        ("d1", "t1", "2024-03-01T00:00:00Z", 30, 40),
+        ("d1", "t1", "2024-03-02T00:00:00Z", None, 90),
+        ("d2", "t2", "2024-03-01T01:00:00Z", 70, 80),
+        ("d2", "t2", None, 999, 999),
+        ("missing", "t1", "2024-03-03T00:00:00Z", 100, 110),
+    ]:
+        values = {column: cpu for column in device_sample_columns}
+        values.update(resId=identity, tenantId=tenant, ts=clock, parentId="unrelated", projectId="s1", deviceName=identity, classification="reported", memUsage=memory)
+        for column in device_sample_columns:
+            if column.endswith("Effcnt"):
+                values[column] = 1000 if cpu == 10 else 0
+        db.execute('INSERT INTO NetworkDeviceKPI VALUES (' + ','.join('?' for _ in device_sample_columns) + ')', [values[column] for column in device_sample_columns])
+    device_measures = {case["id"].removeprefix("measure_") for case in fixture["device_samples"] if case["id"].startswith("measure_")}
+    assert len(device_measures) == 23
+    for measure in device_measures:
+        if measure == "device_kpi_sample_count":
+            value = 7
+        elif measure in {"port_count", "used_port_count", "running_port_count"}:
+            value = 1259
+        elif measure == "device_cpu_latest":
+            value = 100
+        elif measure == "device_memory_latest":
+            value = 110
+        elif measure in {"cpu_peak", "memory_peak", "port_count_peak", "used_port_sample_max", "device_online_rate_max", "device_port_usage_max"}:
+            value = 999
+        elif measure.endswith("_min"):
+            value = 20 if measure == "device_memory_sample_min" else 10
+        else:
+            value = 1399 / 7 if measure == "memory_usage" else 1259 / 6
+        expected[f"measure_{measure}"] = [(value,)]
+    expected.update(device_latest_window=[(70, 80)], device_latest_tie=[(30, 40)], device_latest_null=[(None, 90)],
+                    device_eligible_count=[(2, 60.0)], device_sample_day=[(None, 999.0), ("2024-02-29T00:00:00Z", 10.0), ("2024-03-01T00:00:00Z", 50.0), ("2024-03-02T00:00:00Z", None), ("2024-03-03T00:00:00Z", 100.0)])
+    expected["device_kpi_of_device"] = [("d1", 30.0, None, 90, 4), ("d2", 534.5, 70, 80, 2)]
+    expected["source_EntNetworkElement_NetworkDeviceKPI"] = expected["device_kpi_of_device"]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
@@ -349,6 +387,6 @@ with sqlite3.connect(":memory:") as db:
             assert actual == [(0, 0)], ("empty storage counts", actual)
         if case["id"] == "storage_distinct_names":
             assert actual == [(0,)], ("empty distinct names", actual)
-        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server", "slot_count", "count_pon_device", "count_pon_onu_role", "count_pon_olt_role"}:
+        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server", "slot_count", "count_pon_device", "count_pon_onu_role", "count_pon_olt_role", "measure_device_kpi_sample_count"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
 print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all public migrated dimension projections, counts, domain filters, IPv4 and all migrated relations")

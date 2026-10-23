@@ -39,7 +39,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | OnuKpi | `onu_kpi` | `PonDeviceOnuKPI` | 第十一批已验证 |
 | PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 第十二批已验证 |
 | ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 第十三批已验证 |
-| DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 待迁移 |
+| DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 第十四批已验证 |
 | CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 待迁移 |
 | PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 待迁移 |
 | SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 待迁移 |
@@ -295,3 +295,21 @@ SsidId、DeviceId、TenantId 区分来源 SSID、父设备和租户；保持 res
 通用 quantity::Bytes 使用 Float；本来源为 Int，因此使用独立 ByteCount 保留公开整数类型与精度，不隐式转为 Float。
 
 累计完成 19/50 个载体。源 SHA256 与 catalog 一致；12 项 transform 契约使用双模型初始化预算 150000 通过，独立初始化仍为 100000；累计 518 组实际 SQLite 新旧查询及空表检查通过，PostgreSQL 仅核对参数。
+
+## 第十四批 Device KPI
+
+按当前公开载荷迁移 23 个字段、26 个维度、23 个度量和两条设备关系，保持 res_id／tenant_id／ts 复合 grain。
+CPU/内存的 Percent 复用 Mean/Latest/Max/Min 模板，Latest 按 UTC 时钟与剩余完整 grain 排序，共享整行选择并保留最新 NULL。
+端口计数使用 Count 显式声明既有样本 Sum，不变为期末总量；普通 device_kpi_sample_count 保持合格样本计数，不做设备去重。
+ReportedOnlinePercent 保留来源尺度待确认假定，与独立在线率专表不同总体；ReportedPortUsage 不推导 used/total 或 online/total，也不默认转换为百分比。
+有效次数不参与默认加权或有效性过滤，NULL 时钟不进入 Latest 候选，但原始统计不额外排除该行。
+
+SQL 场景覆盖跨租户同刻样本的确定排序、最新 CPU 为 NULL 而内存有值、NULL 时钟的较大值、缺失设备引用，以及筛选后样本计数。
+设备关系保持 resId→DeviceId，不误用 parentId；UTC 窗口在选择 Latest 前应用。
+
+来源版本差异：catalog 中 NetworkDeviceKPI 的 SHA256 与语料仓 685581e 版本一致。
+当前语料仓在 c7982fd 中新增 nePingRespTime，现有字段未变；本批保留旧公开载荷，不把新源字段混入等价迁移。
+后续来源刷新需单独同步该字段及其公开查询能力；不更新一个不包含新字段却声称为当前版本的哈希。
+不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
+
+累计完成 20/50 个既有载体。12 项 transform 契约（双载荷 150000 fuel）、独立初始化（100000）和累计 574 组实际 SQLite 对照及空表检查通过。PostgreSQL 仅核对参数。
