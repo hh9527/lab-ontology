@@ -17,16 +17,21 @@ type ColumnBinding = struct { row: Type, field: String, value: Type, nullable: B
 type ColumnMapping(Row) = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
 type FieldCount(Row) = struct { condition: Option(v::MemberPredicate), row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
 type FieldCountFacts = struct { condition: Option(v::MemberPredicate), row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
+# 计数依赖使用同一 Dataset 的显式引用，不用任意字符串拼接表达式。
+type CountRef(Row) = struct { row: Type, dataset: String, source: String, id: String };
+type CountRefFacts = struct { row: Type, dataset: String, source: String, id: String };
+type ComputedCount(Row) = struct { result: CountRef(Row), left: CountRef(Row), right: CountRef(Row), op: qb::ComputedOp };
+type ComputedCountFacts = struct { result: CountRefFacts, left: CountRefFacts, right: CountRefFacts, op: qb::ComputedOp };
 type RowScope(Row) = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
 type RowScopeFacts = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
-type Declaration = struct { kind: edsl::DatasetKind, scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
+type Declaration = struct { computed_counts: Array(ComputedCountFacts), kind: edsl::DatasetKind, scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
 type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
 type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
 def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::prepare(dataset, roles);
     let bindings = array::map(groups, g::binding_facts);
     g::prepare_facts(declared, bindings);
-    {kind: edsl::DatasetKind::Entity, scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+    {computed_counts: [], kind: edsl::DatasetKind::Entity, scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
 };
 # 固有行范围在所有查询中生效；沿用现有维度的等值解析与域编码契约。
 def scope_equal: for(Row, Scalar: codec::Encode) Fn(m::Dataset(Row), m::Field(Row, Scalar), Scalar) -> RowScope(Row) = fn(dataset, field, value) {
@@ -84,6 +89,32 @@ def with_field_counts: for(Row) Fn(Declaration, Array(FieldCount(Row))) -> Decla
     if declared.dataset.row != Row.type { fail!("field counts belong to another dataset row", declared.dataset.id) }
     else { declared <~ {field_counts: array::map(counts, fn(count) {
         {condition: count.condition, row: count.row, dataset: count.dataset, source: count.source, field: count.field, value: count.value, nullable: count.nullable, id: count.id}.ty!(FieldCountFacts)
+    })} }
+};
+def count_dependency_cycle: Fn(Array(ComputedCountFacts), String, Array(String)) -> Bool = fn(counts, id, visited) {
+    if array::any(visited, fn(previous) { previous == id }) { True }
+    else { match array::find(counts, fn(count) { count.result.id == id }) {
+        None => False,
+        Some(count) => array::any([count.left.id, count.right.id], fn(dependency) { count_dependency_cycle(counts, dependency, array::push(visited, id)) }),
+    } }
+};
+def count_ref: for(Row) Fn(FieldCount(Row)) -> CountRef(Row) = fn(count) {
+    {row: count.row, dataset: count.dataset, source: count.source, id: count.id}
+};
+def count_ref_facts: for(Row) Fn(CountRef(Row)) -> CountRefFacts = fn(reference) {
+    {row: reference.row, dataset: reference.dataset, source: reference.source, id: reference.id}
+};
+def combine_counts: for(Row) Fn(String, qb::ComputedOp, CountRef(Row), CountRef(Row)) -> ComputedCount(Row) = fn(id, op, left, right) {
+    if left.row != Row.type || right.row != Row.type || left.dataset != right.dataset || left.source != right.source {
+        fail!("computed counts require operands from the same dataset", id)
+    } else if !qb::is_sql_identifier(id) { fail!("computed count requires a valid public identifier", id) }
+    else { {result: left <~ {id}, left, right, op} }
+};
+def computed_count_ref: for(Row) Fn(ComputedCount(Row)) -> CountRef(Row) = fn(count) { count.result };
+def with_computed_counts: for(Row) Fn(Declaration, Array(ComputedCount(Row))) -> Declaration = fn(declared, counts) {
+    if declared.dataset.row != Row.type { fail!("computed counts belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {computed_counts: array::map(counts, fn(count) {
+        {result: count_ref_facts(count.result), left: count_ref_facts(count.left), right: count_ref_facts(count.right), op: count.op}.ty!(ComputedCountFacts)
     })} }
 };
 # Metric 的权威时间必须显式选择，字段类型提供 UTC 语义。
@@ -375,7 +406,33 @@ def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(re
             {id: sample.id, entity: entity.index, field: field.index, aggregate: sample.aggregate,
                 input: edsl::MeasureInput::All, alias: sample.id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry)
         });
-        array::concat([grouped, counts, field_counts, reported])
+        let computed = array::map(pair.1.computed_counts, fn(count) {
+            if count_dependency_cycle(pair.1.computed_counts, count.result.id, []) { fail!("computed measure dependency cycle", count.result.id) } else { () };
+            let operation = match count.op { qb::ComputedOp::Add => qb::ScalarFunction::Add, qb::ComputedOp::Sub => qb::ScalarFunction::Sub };
+            if !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Scalar }) || !array::any(profile.allowed_scalars, fn(op) { op == operation }) {
+                fail!("computed count arithmetic is not allowed by the query profile", count.result.id)
+            } else { () };
+            if array::length(pair.1.dataset.grain) == 0 { fail!("computed count requires a grain", count.result.id) } else { () };
+            array::map([count.result, count.left, count.right], fn(reference) {
+                if reference.row != pair.1.dataset.row || reference.dataset != pair.1.dataset.id || reference.source != pair.1.dataset.source {
+                    fail!("computed count reference belongs to another dataset", reference.id)
+                } else if !qb::is_sql_identifier(reference.id) { fail!("computed count requires a valid public identifier", reference.id) } else { () }
+            });
+            let anchor = match array::find(entity.fields, fn(field) { field.name == pair.1.dataset.grain[0] }) { Some(field) => field.index, None => fail!("computed count requires a grain", count.result.id) };
+            {id: count.result.id, entity: entity.index, field: anchor, aggregate: qb::AggregateFunction::Count,
+                input: edsl::MeasureInput::All, alias: count.result.id, requires: [], predicate: None, row_expression: None,
+                computed: Some({op: count.op, left: count.left.id, right: count.right.id})}.ty!(edsl::MeasureEntry)
+        });
+        array::map(pair.1.computed_counts, fn(count) {
+            array::map([count.left, count.right], fn(reference) {
+                if !array::any(field_counts, fn(field) { field.id == reference.id })
+                    && !array::any(counts, fn(field) { field.id == reference.id })
+                    && !array::any(pair.1.computed_counts, fn(other) { other.result.id == reference.id }) {
+                    fail!("computed count requires a declared count operand", reference.id)
+                } else { () }
+            })
+        });
+        array::concat([grouped, counts, field_counts, reported, computed])
     });
     array::map(dimensions, fn(dimension) {
         if array::length(array::filter(dimensions, fn(other) { other.id == dimension.id })) != 1 {
@@ -434,4 +491,4 @@ def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative)
     prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
 };
 
-pub use self::{RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, event, metric, with_samples, with_domains, declare, prepare, build};
+pub use self::{CountRef, ComputedCount, count_ref, computed_count_ref, combine_counts, with_computed_counts, RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, event, metric, with_samples, with_domains, declare, prepare, build};
