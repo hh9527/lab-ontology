@@ -828,3 +828,38 @@ RFC3339 限 UTC 秒精度和 Z 后缀；LocalDateTime 不做时区换算；DateU
 合法控制与 14 个编译期拒绝通过，新增 UTC／Local 毫秒不可互换。
 IC 库类型检查通过，尚未迁移 IC 服务声明。
 Dataset 权威 UTC 时钟的显式选择、样本统计 Group 和 Latest 的独立声明仍待下一步，不由字段时间角色自动推导。
+
+### 阶段 D 进展：Metric 时钟与可复用样本统计 Group
+
+新增 `transform::metric(declared, clock_field)`，显式选择 Metric Dataset 的权威 UTC 字段。
+该字段必须使用 UTC instant 名义类型，不能将 Local 毫秒或 DateUtc 提升成 UTC 时间点。
+Metric 必须有已验证的非空样本 grain；时钟本身可以为空，沿用现有 Latest 对缺失时钟的处理。
+字段类型提供时间语义，配置选择哪个字段是 Dataset 的权威时钟，两者分开表达。
+
+新增 `experimental::samples::Group(Value)`：主统计、附加统计、单位和发布名称均为显式声明。
+模板接受同一名义 Value 的字段，可多次绑定到 rx／tx 等不同物理列；暂只接受字段，不开放任意用户 SQL 或表达式 Latest。
+
+```telora
+def rates: samples::Group(q::BytesPerSecond) = samples::group(
+    "reported_rate", q::BytesPerSecond.type,
+    samples::Statistic::Mean,
+    [samples::Statistic::Min, samples::Statistic::Max, samples::Statistic::Latest],
+    Some("byte/s"));
+# samples::bind(dataset, rates, field, names) 显式给出每个统计的公开名称
+# transform::with_samples(transform::metric(declared, clock), bindings) 发布统计
+```
+
+统计模板支持 Mean、Min、Max、Latest，以及受可加类型约束的显式 Sum。
+新增 `quantity::Count(Int)`；目前只有 Count 和 Bytes 可声明样本 Sum，普通数字、速率和百分比不会自动得到可加语义。
+这用于保留 IC 已有四个端口／终端数量的 Sum 主度量，不将这些能力简化为 Avg。
+单位字符串沿用现有公共契约；名义 Value 检查字段绑定，不依靠单位字符串执行自动换算。
+
+独立准备同时生成原始字段 MeasureEntry 和直接供 transform 读取的采样契约，保留主统计／摘要角色和单位。
+Latest 复用原有实现：按权威 UTC 时钟降序，使用 grain 字段稳定处理同一时刻的并列样本；
+最新行的值为 NULL 时不回退到旧非空值，缺失时钟不参与 Latest，Avg／Min／Max 仍按原始合格样本计算。
+本阶段还加强共享 Latest 校验，擦除后把权威字段换成 Local 角色也会拒绝。
+
+17 个声明／准备正反例通过，覆盖缺失或非法时钟、缺失 grain、能力 profile、重名、名义类型与单位契约、整数返回类型、速率和普通数值的 Sum 拒绝。
+实际 SQLite 覆盖六组查询：重复 rx／tx 模板、聚合混用、窗口、空表／全 NULL、缺失时钟、最新 NULL、grain 并列、RFC3339 与 epoch 时钟，以及超过 2^53 的精确整数 Latest 和显式 Count Sum。
+SQLite 与 PostgreSQL 参数一致，本阶段未实际执行 PostgreSQL。
+普通非 Metric 来源的数值统计、UTC 分桶独立声明和 IC 全量迁移仍待继续；不通过添加虚构采样粒度将这些来源改造成 Metric。

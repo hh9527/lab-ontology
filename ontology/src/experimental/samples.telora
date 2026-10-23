@@ -1,0 +1,63 @@
+# 已上报样本的统计模板；不把 gauge 或速率自动解释成可累加量。
+use crate::experimental::model as m;
+use crate::experimental::groups as g;
+use crate::experimental::scalars as s;
+use crate::experimental::quantity as q;
+use crate::ontology as edsl;
+use crate::query as qb;
+use std::array as array;
+
+type Statistic = enum { Mean, Min, Max, Latest, Sum };
+type Group(Value) = struct { id: String, value: Type, primary: Statistic, summaries: Array(Statistic), unit: Option(String) };
+type Name = struct { statistic: Statistic, publish: String };
+type Binding(Row) = struct { row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, group: String, primary: Statistic, summaries: Array(Statistic), unit: Option(String), names: Array(Name) };
+type BindingFacts = struct { row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, group: String, primary: Statistic, summaries: Array(Statistic), unit: Option(String), names: Array(Name) };
+def validate: Fn(String, Type, Statistic, Array(Statistic), Option(String), Array(Name)) -> () = fn(id, value, primary, summaries, unit, names) {
+    let storage = g::representation(value);
+    let members = array::concat([[primary], summaries]);
+    if id == "" || (storage != Int.type && storage != Float.type) || s::time_role(value) != None {
+        fail!("sample group requires a name and numeric sample type", id)
+    } else if array::any(members, fn(member) { member == Statistic::Sum }) && value != q::Count.type && value != q::Bytes.type {
+        fail!("sample Sum requires an explicitly additive quantity type", id)
+    } else if unit == Some("") { fail!("sample group unit cannot be empty", id) }
+    else if array::any(members, fn(member) { array::length(array::filter(members, fn(other) { other == member })) != 1 }) {
+        fail!("sample group statistics must be distinct", id)
+    } else if array::length(names) != array::length(members) || !array::all(members, fn(member) { array::length(array::filter(names, fn(name) { name.statistic == member })) == 1 }) {
+        fail!("sample binding must name every statistic exactly once", id)
+    } else if array::any(names, fn(name) { !qb::is_sql_identifier(name.publish) || array::length(array::filter(names, fn(other) { other.publish == name.publish })) != 1 }) {
+        fail!("sample binding public names must be distinct SQL identifiers", id)
+    } else { () }
+};
+def group: for(Value) Fn(String, TypeOf(Value), Statistic, Array(Statistic), Option(String)) -> Group(Value) = fn(id, value, primary, summaries, unit) {
+    let names = array::map(array::enumerate(array::concat([[primary], summaries])), fn(pair) { {statistic: pair.1, publish: `member_\{pair.0}`}.ty!(Name) });
+    validate(id, value, primary, summaries, unit, names);
+    {id, value, primary, summaries, unit}
+};
+def bind: for(Row, Value) Fn(m::Dataset(Row), Group(Value), m::Field(Row, Value), Array(Name)) -> Binding(Row) = fn(dataset, group, field, names) {
+    m::prepare(dataset, []);
+    let checked = g::input(field);
+    if group.value != Value.type { fail!("sample group type witness does not match its parameter", group.id) } else { () };
+    validate(group.id, group.value, group.primary, group.summaries, group.unit, names);
+    {row: Row.type, dataset: dataset.id, source: dataset.source, field: field.name, value: Value.type, nullable: checked.nullable,
+        group: group.id, primary: group.primary, summaries: group.summaries, unit: group.unit, names}
+};
+def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
+    {row: binding.row, dataset: binding.dataset, source: binding.source, field: binding.field, value: binding.value, nullable: binding.nullable,
+        group: binding.group, primary: binding.primary, summaries: binding.summaries, unit: binding.unit, names: binding.names}
+};
+def prepare: Fn(m::PreparedDataset, Array(BindingFacts)) -> Array(edsl::SampleMeasureEntry) = fn(dataset, bindings) {
+    m::validate_prepared(dataset);
+    array::flat_map(bindings, fn(binding) {
+        validate(binding.group, binding.value, binding.primary, binding.summaries, binding.unit, binding.names);
+        let shape = g::shape(dataset.row, g::Node::Column({name: binding.field, value: binding.value, nullable: binding.nullable}));
+        if binding.row != dataset.row || binding.dataset != dataset.id || binding.source != dataset.source {
+            fail!("sample binding belongs to another dataset", binding.group)
+        } else if shape.value != binding.value || shape.nullable != binding.nullable { fail!("sample binding field witness is invalid", binding.group) } else { () };
+        array::map(binding.names, fn(name) {
+            {id: name.publish, field: binding.field, unit: binding.unit,
+                aggregate: match name.statistic { Statistic::Sum => qb::AggregateFunction::Sum, Statistic::Mean => qb::AggregateFunction::Avg, Statistic::Min => qb::AggregateFunction::Min, Statistic::Max => qb::AggregateFunction::Max, Statistic::Latest => qb::AggregateFunction::Latest },
+                role: if name.statistic == binding.primary { edsl::SampleMeasureRole::Primary } else { edsl::SampleMeasureRole::SampleSummary }}.ty!(edsl::SampleMeasureEntry)
+        })
+    })
+};
+pub use self::{Statistic, Group, Name, Binding, BindingFacts, group, bind, binding_facts, prepare};

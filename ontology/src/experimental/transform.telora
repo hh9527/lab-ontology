@@ -4,6 +4,7 @@ use crate::experimental::groups as g;
 use crate::experimental::relations as r;
 use crate::experimental::values as v;
 use crate::experimental::scalars as scalars;
+use crate::experimental::samples as samples;
 use crate::ontology as edsl;
 use crate::query as qb;
 use std::array as array;
@@ -12,14 +13,26 @@ use std::string as string;
 
 type ColumnBinding = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
 type ColumnMapping(Row) = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
-type Declaration = struct { dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), columns: Array(ColumnBinding), domains: Array(v::BindingFacts) };
+type Declaration = struct { dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
 type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
 type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
 def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::prepare(dataset, roles);
     let bindings = array::map(groups, g::binding_facts);
     g::prepare_facts(declared, bindings);
-    {dataset: declared, groups: bindings, record_counts, columns: [], domains: []}
+    {dataset: declared, groups: bindings, record_counts, columns: [], domains: [], clock: None, samples: []}
+};
+# Metric 的权威时间必须显式选择，字段类型提供 UTC 语义。
+def metric: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) {
+    g::input(clock);
+    let role = scalars::time_role(Time.type);
+    if clock.owner != declared.dataset.row || clock.owner != Row.type { fail!("metric clock belongs to another dataset row", declared.dataset.id) }
+    else if match role { Some(value) => value.semantics != edsl::TimeSemantics::Utc, None => True } { fail!("metric clock requires a UTC instant type", clock.name) }
+    else { declared <~ {clock: Some(clock.name)} }
+};
+def with_samples: for(Row) Fn(Declaration, Array(samples::Binding(Row))) -> Declaration = fn(declared, bindings) {
+    if declared.dataset.row != Row.type { fail!("sample bindings belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {samples: array::map(bindings, samples::binding_facts)} }
 };
 def with_domains: for(Row) Fn(Declaration, Array(v::Binding(Row))) -> Declaration = fn(declared, bindings) {
     if declared.dataset.row != Row.type { fail!("business dimensions belong to another dataset row", declared.dataset.id) }
@@ -124,12 +137,21 @@ def entity_entry: Fn(Declaration, Int) -> edsl::EntityEntry = fn(declared, index
                 column: columns[field.index], is_key: single_key && dataset.grain[0] == field.name, ty: value.storage}.ty!(edsl::FieldEntry)
         }
     });
+    let sample_measures = samples::prepare(dataset, declared.samples);
+    if array::length(sample_measures) > 0 && declared.clock == None { fail!("sample measures require an explicit metric clock", dataset.id) } else { () };
+    if declared.clock != None && array::length(dataset.grain) == 0 { fail!("metric dataset requires a complete sample grain", dataset.id) } else { () };
+    match declared.clock {
+        None => (),
+        Some(name) => if !array::any(fields, fn(field) { field.name == name && match field.time { Some(role) => role.semantics == edsl::TimeSemantics::Utc, None => False } }) {
+            fail!("metric clock requires a UTC instant field", dataset.id, name)
+        } else { () },
+    };
     let key = match array::find(fields, fn(field) { field.is_key }) { Some(field) => field.index, None => -1 };
     let source = qb::source_with_hint(qb::build_context(), dataset.source, `typed_\{index}`).1;
     {references: [], field_roles: [], index, id: dataset.id, entity_type: dataset.row, table: dataset.source,
         alias: source.alias, source, key_field: key, fields, union: None,
-        dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: edsl::DatasetKind::Entity, grain: dataset.grain, utc_time: None}) },
-        sample_measures: [], description: None, scope: []}
+        dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: if declared.clock == None { edsl::DatasetKind::Entity } else { edsl::DatasetKind::Metric }, grain: dataset.grain, utc_time: declared.clock}) },
+        sample_measures, description: None, scope: []}
 };
 # Group 使用 Row 字段寻址；在进入 QueryAst 前统一替换为已校验物理列。
 def physical_expr: Fn(qb::Expr, Array(edsl::FieldEntry)) -> qb::Expr = fn(expr, fields) {
@@ -263,7 +285,12 @@ def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(re
             else { {id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
                 input: edsl::MeasureInput::All, alias: id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry) }
         });
-        array::concat([grouped, counts])
+        let reported = array::map(entity.sample_measures, fn(sample) {
+            let field = match array::find(entity.fields, fn(field) { field.name == sample.field }) { Some(field) => field, None => fail!("sample field is missing", sample.id) };
+            {id: sample.id, entity: entity.index, field: field.index, aggregate: sample.aggregate,
+                input: edsl::MeasureInput::All, alias: sample.id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry)
+        });
+        array::concat([grouped, counts, reported])
     });
     array::map(dimensions, fn(dimension) {
         if array::length(array::filter(dimensions, fn(other) { other.id == dimension.id })) != 1 {
@@ -322,4 +349,4 @@ def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative)
     prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
 };
 
-pub use self::{Declaration, Prepared, Alternative, ColumnMapping, ColumnBinding, column, map_columns, with_domains, declare, prepare, build};
+pub use self::{Declaration, Prepared, Alternative, ColumnMapping, ColumnBinding, column, map_columns, metric, with_samples, with_domains, declare, prepare, build};
