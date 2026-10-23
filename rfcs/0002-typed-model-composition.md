@@ -580,11 +580,30 @@ Dataset Row 中的名义类型保留在声明与准备模型中，SQL 字段表�
 跨 Dataset 同一 Entity ID 的身份类型必须一致；Group 成员 ID、计数 ID、Dataset ID 和公共边 ID 分别按 transform 契约检查唯一性。
 共享的 `validate_transform_contract` 校验投影、筛选、聚合和 scope 的执行能力，独立入口额外检查源能力；不执行知识目录或知识地图校验。
 
-此入口当前支持物理列维度、非空完整身份投影与记录计数。计算型 Group 度量、计算维度和可空角色整体投影在 Graph 适配边界显式拒绝，保留为下一步 lowering 工作；单 Dataset 的 Group 查询实验仍可执行流量计算。
+此入口支持物理列维度、计算维度、完整身份投影与记录计数。计算型 Group 度量在 Graph 适配边界显式拒绝，保留为下一步 lowering 工作；单 Dataset 的 Group 查询实验仍可执行流量聚合。
 独立准备的 18 个正反例与结果列检查、现有 102 个 graph 用例、六组 SQLite 等价查询和临时快照的批量 transform 验收通过。
 快照验收同时执行生成 SQL，核对跨租户记录、物理列类型和整批原子拒绝行为。
 
 ```sh
 bin/telora -C relation_model test typed_preparation --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
 python3 scripts/check-typed-relations.py
+```
+
+
+### Graph 计算维度与可空身份投影
+
+独立准备入口复用 Group 的封闭表达式 lowering，将 Seconds、Rate 和 Identity 节点编译为现有 QueryAst 标量表达式。
+维度准备结构的字段索引只作为输入锚点；查询表达式保留全部输入列，并通过现有 Graph 实例重定位机制适配请求中的节点别名。
+计算维度的投影和筛选均受 profile 约束，筛选专用的隐藏维度同样检查完整计算表达式所需能力。
+
+身份 Group 在角色任一分量缺失时，所有公开分量返回 NULL，避免将不完整身份的租户部分误认为有效身份。
+速率沿用 Bytes／Seconds 的语义：时长为零、负值或缺失时返回 NULL，零流量与有效正时长得到零速率。
+返回列继续使用现有物理类型与 nullable 标记。
+
+三个针对性测试验证结果类型与能力拒绝；SQLite 实际执行覆盖单位换算、正负零时长、缺失输入、完整／不完整身份、跨租户局部同名身份、计算维度筛选、节点别名和空输入。
+现有 102 个 graph 用例和六组 SQLite 等价查询同时通过。
+
+```sh
+bin/telora -C relation_model test typed_dimensions --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-dimensions.py
 ```
