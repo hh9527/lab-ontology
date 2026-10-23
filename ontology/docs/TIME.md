@@ -1,50 +1,33 @@
-# Time inputs and physical encodings
+# 时间输入与物理编码
 
-Time dimensions have a declared logical input type and a physical column
-encoding. A physical `String` or `Int` does not grant permission to compare a
-time dimension with an ordinary text or integer value. The ontology checks
-each Intent value against the Model's time role before binding it to SQL.
-Relation keys likewise reject incompatible time and plain fields.
+时间维度同时声明逻辑输入类型和物理列编码。物理 `String` 或 `Int` 不意味着可用普通文本或整数比较时间维度。
+本体将每个 Intent 值按模型时间角色校验后才绑定到 SQL；关系键同样拒绝不兼容的时间与普通字段。
 
-| Logical input | Declared encoding | Physical binding | Accepted spelling |
+| 逻辑输入 | 声明编码 | 物理绑定 | 接受格式 |
 | --- | --- | --- | --- |
-| `DateUtc` | `DateText` | String | Valid `YYYY-MM-DD` |
+| `DateUtc` | `DateText` | String | 有效 `YYYY-MM-DD` |
 | `DatetimeUtc` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
-| `LocalDateTime` | `LocalText` | String | Local `YYYY-MM-DD HH:MM:SS` |
-| `EpochMillis` | `EpochMillis` | Int | Unix epoch milliseconds |
+| `LocalDateTime` | `LocalText` | String | 本地 `YYYY-MM-DD HH:MM:SS` |
+| `EpochMillis` | `EpochMillis` | Int | Unix 纪元毫秒 |
 
-`DatetimeUtc` replaces the former `Utc1` and `Rfc3339` logical inputs.
-The space-separated UTC spelling is no longer accepted. `Rfc3339Text`
-names the physical encoding, not a second logical type. Dimension
-`detail.input_docs` publishes the normalized format and a concrete example.
+`DatetimeUtc` 替代旧逻辑输入 `Utc1` 和 `Rfc3339`，不再接受空格分隔的 UTC 格式。
+`Rfc3339Text` 是物理编码名，不是另一逻辑类型。维度的 `detail.input_docs` 发布规范格式及具体示例。
 
-The iCloud contract uses three logical types: `DatetimeUtc`, `DateUtc`, and
-`EpochMillis`. PostgreSQL columns use `timestamptz` (UTC input/output), `date`,
-and `bigint`, respectively. SQLite uses normalized ISO-Z text, date text,
-and INTEGER. A PostgreSQL timestamptz stores an instant, not the original
-timezone; the host must serialize returned timestamps in UTC.
-`DateUtc` is a UTC calendar date with no time of day. Extract dates from
-instants in UTC. Date-only source values keep their declared calendar date.
+IC 契约使用 `DatetimeUtc`、`DateUtc` 和 `EpochMillis` 三种逻辑类型。
+PostgreSQL 分别使用 `timestamptz`（UTC 输入输出）、`date`、`bigint`；SQLite 使用规范 ISO-Z 文本、日期文本和 INTEGER。
+PG timestamptz 保存瞬间，不保存原始时区，宿主必须将返回时间戳序列化为 UTC。
+`DateUtc` 是不含时刻的 UTC 日历日期；从瞬间提取日期时使用 UTC，仅日期的源值保留其声明的日历日期。
 
-The RFC3339 input currently accepts only normalized UTC seconds: offsets and
-fractions must be resolved before submitting the Intent. Fixed-width UTC text
-preserves chronological ordering under raw-column string comparison.
-`EpochMillis` is an absolute instant measured from `1970-01-01T00:00:00Z`;
-its encoding does not depend on a timezone. A UTC/local business description
-does not change its integer representation. A shifted wall-clock integer
-would require a separately specified encoding. LocalDateTime is a date plus clock time without timezone or UTC offset;
-its value has no dependency on the runtime environment. Local wall-clock text is
-distinct from an instant. Resolving an instant or a
-relative period into local wall-clock boundaries may require a timezone and
-ambiguity policy; this interface does not infer either.
+RFC3339 输入目前只接受规范 UTC 秒，偏移和小数秒需在提交 Intent 前处理。
+固定宽度 UTC 文本在原始列字符串比较中保持时间顺序。
+`EpochMillis` 是从 `1970-01-01T00:00:00Z` 起的绝对毫秒数，编码不依赖时区；UTC／本地业务描述不改变整数表示。
+移位的墙上时钟整数需要另行指定编码。LocalDateTime 是无时区或 UTC 偏移的日期加钟表时间，其值不依赖运行环境，也不同于绝对瞬间。
+将瞬间或相对周期解析为本地墙上时间边界可能需要时区及歧义策略，本接口不会推断二者。
 
-Graph Intents accept `time_windows` at the root and within `exists`:
-
-Each temporal Ty knowledge node links to the shared TimeWindow operation
-contract. Follow the returned opaque key to read the interval and boundary rules.
-Type support does not grant field authorization: the dimension must have a time
-role and authorize Lt, plus Ge when a start is present. This is unrelated
-to a dimension's `half_open` business vocabulary contract.
+Graph Intent 在根部及 `exists` 内接受 `time_windows`。
+每个时间 Ty 知识节点链接到共享 TimeWindow 操作契约，应跟随返回的不透明键阅读区间和边界规则。
+类型支持不授予字段权限：维度必须有时间角色并授权 Lt，提供起点时还须授权 Ge。
+这与维度的 `half_open` 业务词汇契约无关。
 
 ```json
 "time_windows": [{
@@ -54,15 +37,13 @@ to a dimension's `half_open` business vocabulary contract.
 }]
 ```
 
-The window is `[start, end)`. The end is required and non-null; start may be omitted or null. Supplied endpoints must be concrete values in the
-dimension's declared logical type. For a raw time dimension, SQL compares the original column to
-allocated bindings (`>= start AND < end`), without database `now()` or
-column-side time transformation. Reversed or invalid endpoints fail before
-Query materialization.
+窗口为 `[start, end)`。终点必填且非 null，起点可省略或为 null。端点必须是维度声明逻辑类型中的具体值。
+对原始时间维度，SQL 将原始列与已分配绑定比较（`>= start AND < end`），不使用数据库 `now()`，也不在列侧做时间变换。
+逆序或无效端点在生成 Query 前失败。
 
-## UTC calendar buckets
+## UTC 日历分桶
 
-Declare fixed bucket dimensions on a field with a UTC time role:
+在具有 UTC 时间角色的字段上声明固定分桶维度：
 
 ```telora
 @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
@@ -72,26 +53,17 @@ Declare fixed bucket dimensions on a field with a UTC time role:
 ts: String,
 ```
 
-The result is the bucket's UTC start, preserving the source logical type.
-DatetimeUtc retains RFC3339 text in SQLite and native timestamptz in PostgreSQL;
-clients serialize it as canonical UTC RFC3339. EpochMillis returns integer
-milliseconds, and DateUtc retains date text/native date (day/month only). A month is
-a calendar month. Local time roles are rejected. Each exact unit/encoding pair
-must be authorized as `qb::ScalarFunction::UtcTimeBucket({unit, encoding})`
-in the query profile. There is no runtime granularity parameter or implicit
-type conversion. NULL remains NULL. Calendar bucketing uses the common range
-0001-01-01 through 9999-12-31; epoch inputs outside this range return NULL.
-Negative epochs floor to the preceding bucket, including -1 millisecond.
-PostgreSQL session timezone does not affect the result.
+结果是桶的 UTC 起点，保留源逻辑类型。DatetimeUtc 在 SQLite 中保留 RFC3339 文本，在 PostgreSQL 中保留原生 timestamptz，客户端序列化为规范 UTC RFC3339。
+EpochMillis 返回整数毫秒，DateUtc 保留日期文本／原生 date，仅支持日与月。月指日历月；本地时间角色被拒绝。
+每个精确的单位／编码组合都必须在查询配置中授权为 `qb::ScalarFunction::UtcTimeBucket({unit, encoding})`。
+没有运行时粒度参数或隐式类型转换。NULL 仍为 NULL。日历分桶采用共同范围 0001-01-01 至 9999-12-31，范围外纪元输入返回 NULL。
+负纪元向前一桶取整，包括 -1 毫秒；结果不受 PG 会话时区影响。
 
-Select the bucket dimension together with a declared measure to group samples.
-Apply the requested half-open window to the raw time dimension so the stored
-clock predicate remains available for index use. Filtering a bucket dimension
-instead compares the explicitly computed bucket start and can select a different
-population. Bucketing does not fill missing periods, alter NULL aggregates,
-change the selected measure's meaning, or authorize summing gauges across time.
+将分桶维度与已声明度量一同选择即可分组样本。请求的半开窗口应作用于原始时间维度，以保持存储时间谓词可利用索引。
+若筛选分桶维度，比较的是显式计算的桶起点，可能选择不同总体。
+分桶不补齐缺失周期、不改变 NULL 聚合或所选度量含义，也不授权跨时间累加仪表值。
 
-The lower bound may be `null` or omitted:
+下界可为 `null` 或省略：
 
 ```json
 "time_windows": [{
@@ -100,22 +72,13 @@ The lower bound may be `null` or omitted:
 }]
 ```
 
-This means all history strictly before the explicit cutoff: SQL has only `< end`.
-Omitted or null `end` is rejected. The caller fixes the end when planning;
-execution never substitutes `now`. With unchanged database contents and fixed
-ordering/tie rules, replaying the same plan yields the same results.
-Omitting `time_windows` entirely continues to mean no time restriction.
+这表示显式截止时间之前的全部历史，SQL 仅有 `< end`。省略或 null 的 `end` 被拒绝。
+调用方在规划时固定终点，执行不会代入 `now`。在数据库内容、排序及并列规则不变时，同一计划重放得到相同结果。
+完全省略 `time_windows` 仍表示无时间限制。
 
-The Agent resolves references such as "now", "three days ago", and calendar
-periods before submitting the Intent. Its reference time and timezone may
-come from the application client or its own environment. It should explain
-the resulting concrete dates and timezone to the user. The transform request
-contains only `intents` (an array of one to five); `ctx`, `"now"`, `{"delta_ms":...}`, and
-`{"calendar":...}` are rejected. The ontology does not read a clock or infer
-a timezone. The absolute Intent is replayable and has the same lowering at a
-later time.
+Agent 在提交 Intent 前解析“现在”“三天前”和日历周期；参考时间及时区可来自应用客户端或自身环境，应向用户解释最终具体日期及时区。
+transform 请求只包含 `intents`（一至五项数组）；`ctx`、`"now"`、`{"delta_ms":...}` 和 `{"calendar":...}` 均被拒绝。
+本体不读取时钟或推断时区。绝对 Intent 可重放，之后的转换结果一致。
 
-Filter, `any_of`, and measure-threshold values can omit `kind`: the declared
-dimension input types or measure output type select the logical input. If a
-JSON value remains ambiguous under the Model declaration, lowering fails.
-Do not supply a `kind` field in the external Intent protocol.
+筛选、`any_of` 和度量阈值可省略 `kind`：维度声明输入类型或度量输出类型决定逻辑输入。
+若 JSON 值在模型声明下仍有歧义，则转换失败。外部 Intent 协议中不要提供 `kind` 字段。

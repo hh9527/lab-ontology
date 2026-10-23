@@ -1,103 +1,54 @@
-# Relation-first acceptance slice
+# 以关系为核心的验收范围
 
-This model is a pressure fixture, not a complete network inventory. Tenant
-IDs identify the namespace; Site, Device, Connection, and Route IDs are
-tenant-scoped and declare `(id, tenant_id)` as their identity grain. A
-connection endpoint matches a device only when both the device ID and tenant
-ID agree. A/Z denote stored endpoint positions, not
-business direction. `connected_device` explicitly declares undirected business
-connectivity over the two endpoint relations, while `upstream_device` declares
-a directed A-to-Z relation on a separate route dataset. No peer semantics are
-inferred from endpoint field names alone.
-`connection_endpoint` separately declares the physical alternative: a device
-participates when its tenant-scoped identity matches the A or Z endpoint.
-This does not imply a device-to-device business connection.
+此模型是压力夹具，不是完整网络资产清单。租户 ID 确定命名空间；Site、Device、Connection、Route 的 ID 均限定在租户内，以 `(id, tenant_id)` 为身份粒度。
+连接端点只有设备 ID 和租户 ID 都一致才匹配设备。A/Z 是存储端点位置，不是业务方向。
+`connected_device` 在两个端点关系上显式声明无向业务连接；`upstream_device` 在独立路由数据集声明 A→Z 有向关系，不从字段名推断对等语义。
+`connection_endpoint` 单独声明物理备选关系：设备的租户内身份匹配 A 或 Z 即参与，但这不表示设备间业务连接。
 
-The following cases specify the intended relation-based Intent contract. The
-`graph` row-query shape now supports rooted, explicitly named instance trees,
-projection of authorized plain dimensions, forward and reverse navigation of
-declared edges, and ordered correlated existence/absence paths of arbitrary
-length. It
-also accepts `count: "<root instance>"` instead of `select` when every outer
-JOIN reaches an endpoint declared `One` or `Optional`; otherwise counting the root requires EXISTS
-so that matching children cannot multiply its rows. It counts the root key
-without reducing a composite grain to one guessed DISTINCT column. It
-also supports grouping by root dimensions while counting a non-root child
-when every edge in the outer join tree is functional when traversed from that
-child. Grouping dimensions may name any declared graph instance because the
-same proof prevents joins from duplicating the counted subject. Each relation
-declares `{from,to}` cardinalities using `One`, `Optional`, `Many0`, or `Many1`.
-Forward traversal reads `to`, reverse traversal reads `from`; these trusted
-Model contracts establish grain preservation independently of key shape.
-The shared-tenant relation declares multiple matches, so counting
-same-tenant devices as children of a particular site is rejected. Branches
-that can duplicate the counted child remain unproven and are rejected; the
-diagnostic identifies the first offending named edge and distinguishes a
-qualifying EXISTS rewrite from choosing a different count subject. By
-default joins are inner; `include_empty: true` for non-root count subjects
-uses LEFT JOINs to retain root groups with zero children. Root filters stay in
-the outer WHERE; filters on nullable instances narrow their individual joined
-sources rather than the outer WHERE, preserving empty root
-groups. EXISTS anchored on the counted instance or its nullable ancestors
-narrows that instance's LEFT JOIN ON condition; unrelated branches remain
-unsupported. Business-link joins are not yet supported in this mode. A count uses a declared key, or a column of the dataset's
-declared non-null identity grain when there is no single-column key. It never
-uses a guessed DISTINCT key; entities without either identity declaration are
-rejected. Identity fields in a single key or any position of a composite
-dataset grain must be non-nullable, or the Model fails preparation before an
-intent can count rows. Composite identity is declared once with
-`@dataset(DatasetKind::Entity, ["reading_id", "tenant_id"], None)`, not by
-marking both fields `@key`. Cardinality does not require a relation key to cover
-every identity field. Model authors remain responsible for the declared
-association, including tenant alignment; business-link identity comparisons
-continue to require complete participant keys.
-It
-rejects missing edges, role mismatches and disconnected nodes. Reverse
-navigation reads the same edge from its other endpoint; it does
-not establish any business-level peer direction or symmetry. Named business
-links do: the Model specifies whether A/Z may be exchanged, and both roles
-must cover the complete participant identity. Graph rows and multi-edge
-EXISTS can reference these links by their business ids; counting connected
-devices uses EXISTS so that multiple link rows do not change device grain.
-Graph filters name a particular entity instance and a declared dimension;
-their values are bound rather than interpolated into SQL. In particular,
-filtering an origin device and a peer device of the same type must use their
-distinct allocated aliases inside the appropriate outer/EXISTS scopes.
-An EXISTS can branch from its root or any previously connected instance, and
-can follow an undirected/directed business link first, then continue along
-ordinary named relations or more declared business links. It can also follow a
-business link after a physical edge, retaining the original root correlation
-and checking business direction at every step. Subsequent physical relations
-may use Model-declared AND/OR connection keys. Unconnected edges and incorrect
-endpoint roles remain invalid.
-The graph Intent is closed at every level: unknown request, node, edge,
-projection, filter or existence fields are rejected as unsupported, never
-ignored when they could narrow the intended result.
-Graph projection also distinguishes unimplemented computed/scoped dimensions
-(`unsupported`) from unauthorized dimensions or dimensions on the wrong
-instance (invalid intent).
-`tests/graph.telora`
-exercises these cases against QueryAst and both SQL materializers.
+下述案例规定目标关系 Intent 契约。`graph` 行查询支持有根、显式命名的实例树、已授权普通维度投影、声明边的正反向导航，以及任意长度的有序相关存在／不存在路径。
+若所有外层 JOIN 到达的端点均声明 One 或 Optional，也接受 `count: "<root instance>"` 代替 select；否则计数根实体必须用 EXISTS，防止匹配子记录扩增行数。
+计数使用根键，不把复合粒度缩成猜测的单列 DISTINCT。
+若从被计数非根子节点出发，外层连接树每条边都是函数性映射，也支持按根维度分组并计数该子节点。
+分组维度可来自任意声明图实例，因为同一证明保证连接不重复计数主体。
+关系用 One、Optional、Many0、Many1 声明 `{from,to}`，正向读取 to，反向读取 from；可信模型基数独立于键形状证明粒度保持。
+共享租户关系声明多匹配，因此拒绝把同租户设备当作特定站点的子记录计数。
+可能复制被计数子节点的分支仍未证明，须拒绝；诊断指出首条问题具名边，区分用 EXISTS 限定的改写与更换计数主体。
 
-These pairs are the implemented minimal-model acceptance cases. Each positive
-case must lower to a QueryAst; each negative case must fail before QueryAst
-construction with a diagnostic identifying the edge, role, or missing proof.
+连接默认是内连接。非根计数主体的 `include_empty:true` 用 LEFT JOIN 保留零子记录的根组。
+根筛选留在外层 WHERE，可空实例筛选收窄各自连接源，不放外层 WHERE，以保留空根组。
+锚定被计数实例或其可空祖先的 EXISTS 收窄该实例的 LEFT JOIN ON；无关分支仍不支持，此模式也尚不支持业务连接。
+计数使用声明键；无单列键时使用声明非空身份粒度中的一列，绝不猜测 DISTINCT 键。
+两种身份声明都没有的实体被拒绝。单键或复合粒度任意位置的身份字段必须非空，否则在 Intent 计数前准备失败。
+复合身份通过一次 `@dataset(DatasetKind::Entity, ["reading_id", "tenant_id"], None)` 声明，不能给两字段都标 `@key`。
+基数不要求关系键覆盖全部身份字段，模型作者负责声明关联及租户对齐；业务连接身份比较仍要求完整参与者键。
 
-| Positive intent | Negative neighbor / required diagnosis |
+缺失边、角色不匹配和不连通节点被拒绝。反向导航只从另一端读取同一边，不建立业务对等方向或对称性。
+具名业务连接才定义这些语义：模型规定 A/Z 能否交换，两个角色都须覆盖完整参与者身份。
+Graph 行和多边 EXISTS 可按业务 ID 引用连接；计数相连设备使用 EXISTS，避免多连接行改变设备粒度。
+图筛选指定具体实体实例和声明维度，值被绑定而非拼入 SQL。
+同类型原设备和对端设备的筛选须使用各自别名，并位于适当外层／EXISTS 作用域。
+
+EXISTS 可从根或任何已连接实例分支；可先走无向／有向业务连接，再走普通关系或更多业务连接，也可在物理边之后走业务连接。
+全过程保持原根相关，并逐步检查业务方向；后续物理关系可使用模型声明 AND／OR 键。
+不连通边及错误端点角色仍非法。
+图 Intent 每一层都封闭：未知请求、节点、边、投影、筛选或存在性字段均按不支持拒绝，不能忽略可能收窄目标结果的字段。
+图投影也区分尚未实现的计算／限定作用域维度（unsupported）与未授权维度或错误实例上的维度（无效 Intent）。
+`tests/graph.telora` 针对 QueryAst 和两种 SQL 生成器验证这些场景。
+
+下列正反例是已实现的最小模型验收。正例必须转换成 QueryAst，反例必须在构造 QueryAst 前失败，并诊断边、角色或缺失证明。
+
+| 正例 | 相邻反例／必要诊断 |
 | --- | --- |
-| From a connection, bind `connection_a` to device `a` and `connection_z` to device `z`; project both device IDs. | Bind `connection_a` to a Site instance: invalid target type and edge ID. |
-| From a device, find connections where it occupies A using the reverse of `connection_a`; independently find connections where it occupies Z using `connection_z`. | Treat A and Z as interchangeable roles without a declared symmetric peer relation: missing business relation proof. |
-| From device `d`, follow `device_site` to site `s`, then `site_tenant` to tenant `t`; test existence without changing the grain of `d`. | Follow `device_site` to a tenant instance: invalid target type at that edge. |
-| From device `d`, test existence of a connection via the reverse of `connection_a` and project/count devices at the explicit `d` grain. | Join all matching connections and count rows as devices: grain amplification, require an explicit count subject. |
-| A connection endpoint and its Device share `tenant_id` as well as device ID. | Join only on device ID while omitting tenant ID: incomplete declared identity key. |
-| Declare Device identity as `(id, tenant_id)` and use the pressure model's tenant-aligned endpoint keys. A different model may declare a trusted single-target relation on other keys. | Use an incomplete endpoint key for a business link that compares participant identities. |
-| Declare a composite-grain Reading and a trusted single-target child relation, including one using a non-identity key. | Mark both fields `@key` instead of declaring a composite grain: ambiguous representative key. |
-| Check existence through `connection_endpoint`, matching A or Z with complete tenant identity, and continue along another named edge. | Connect the same edge to Site instead of Device: invalid relation endpoint role. |
-| Traverse the declared symmetric `connected_device` relation from either endpoint. | Infer symmetry solely from A/Z endpoint declarations: missing business link proof. |
-| Traverse the declared directed `upstream_device` relation from A to Z. | Traverse Z to A without an inverse declaration: direction violation. |
+| 从连接分别将 connection_a 绑定设备 a、connection_z 绑定设备 z，投影两设备 ID。 | connection_a 绑定 Site：目标类型及边 ID 无效。 |
+| 从设备反向走 connection_a 查找占 A 位的连接，独立走 connection_z 查找占 Z 位的连接。 | 未声明对称对等关系就互换 A/Z：缺少业务关系证明。 |
+| 从 d 经 device_site 到 s，再经 site_tenant 到 t，测试存在且不改变 d 粒度。 | device_site 指向租户：该边目标类型无效。 |
+| 从 d 经 connection_a 反向判断连接存在，按显式 d 粒度投影／计数设备。 | 连接全部匹配连接后把行数当设备数：粒度扩增，需显式计数主体。 |
+| 连接端点与 Device 同时共享 tenant_id 和设备 ID。 | 仅连设备 ID、漏租户 ID：声明身份键不完整。 |
+| Device 声明 `(id, tenant_id)`，使用压力模型的租户对齐端点键；其他模型可在别的键上声明可信单目标关系。 | 需要比较参与者身份的业务连接使用不完整端点键。 |
+| 声明复合粒度 Reading 和可信单目标子关系，包括非身份键关系。 | 两字段都标 @key 而非声明复合粒度：代表键有歧义。 |
+| 经 connection_endpoint 按完整租户身份匹配 A 或 Z，再沿另一具名边判断存在。 | 同一边连接 Site 而非 Device：关系端点角色无效。 |
+| 从任一端遍历已声明对称 connected_device。 | 仅从 A/Z 端点推断对称性：缺少业务连接证明。 |
+| 沿声明有向 upstream_device 从 A 到 Z。 | 无逆向声明却从 Z 到 A：违反方向。 |
 
-An otherwise valid but unimplemented composition must report `unsupported`
-separately from invalid model semantics. The Model explicitly establishes
-endpoint identities and symmetric/directed peer semantics; unrelated-branch
-EXISTS under empty-group counting and business-link outer joins remain
-pending.
+合法但尚未实现的组合必须报告 unsupported，与无效模型语义区分。
+模型显式建立端点身份及对称／有向对等语义；空组计数中的无关分支 EXISTS 和业务连接外连接仍待实现。

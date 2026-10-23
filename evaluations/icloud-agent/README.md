@@ -1,77 +1,38 @@
-# IC ontology agent evaluation
+# IC 本体 Agent 评测
 
-Use one numbered question at a time. The trusted host builds the snapshot;
-the MCP adapter starts one persistent `telora-run --serve stdio+jsonl://` child.
-Give the candidate only an Agent-facing guide, one `QUESTION.md`, and access
-to the two MCP tools `info` and `transform` through the restricted
-host endpoint. The Agent's filesystem and shell must not be able
-to read the snapshot, runner, source, tests, `RUBRIC.md`, or earlier transcripts.
-The adapter accepts one to five independent Intents in a single
-`ontology_transform` call; relative time must be resolved by the Agent from
-application or environment context before this call. No request clock is
-injected into the service. It forwards the entire batch to the underlying
-transform service in one call. If all lower successfully, it writes one mode-0600 JSON record
-containing the ordered Intents and generated Queries to the existing
-host-only directory named by `ONTOLOGY_EVAL_OUTPUT_DIR`. The tool returns only
-an acceptance receipt; the Agent cannot retrieve SQL or bindings through the
-two exposed tools. A failed plan returns indexed diagnostics for all plans
-and writes no partial record. Results are not merged or deduplicated across
-plans.
-For OpenCode reruns, use the exact model ID `deepseek/deepseek-flash`.
-Supply the guide and question as host-selected attachments; disable the
-Agent's general file-reading tool entirely.
-Use `AGENT_USAGE.md` as the candidate guide. It carries the generic Intent
-syntax from root `USAGE.md` but replaces the direct service's Query response
-with this adapter's receipt-only workflow. Do not give the Agent build/start
-instructions or artifact paths.
+每次使用一个编号问题。可信宿主构建快照，MCP 适配器启动一个常驻 `telora-run --serve stdio+jsonl://` 子进程。
+只向候选 Agent 提供面向 Agent 的指南、一个 QUESTION.md，以及通过受限宿主端点访问 info 和 transform 两个 MCP 工具的能力。
+Agent 的文件系统和 shell 不得读取快照、runner、源代码、测试、RUBRIC.md 或先前对话记录。
+适配器单次 ontology_transform 接受一至五个独立 Intent。Agent 调用前须从应用或环境上下文解析相对时间，服务不注入请求时钟。
+适配器一次将整批转发给底层 transform；全部成功时，在 ONTOLOGY_EVAL_OUTPUT_DIR 指定的现有宿主专用目录写入权限 0600 的 JSON，包含有序 Intent 和生成 Query。
+工具仅返回接受回执，Agent 无法通过这两个工具获取 SQL 或绑定。
+任一计划失败时返回全部计划的带索引诊断，不写部分记录；不跨计划合并或去重。
+OpenCode 重跑使用精确模型 ID `deepseek/deepseek-flash`。
+指南和问题由宿主选为附件，完全禁用 Agent 通用读文件工具。
+候选指南使用 AGENT_USAGE.md，承接根 USAGE.md 的通用 Intent 语法，但将直接服务 Query 响应替换为仅回执流程。
+不要向 Agent 提供构建／启动说明或产物路径。
 
-Set `ONTOLOGY_EVAL_RUNNER`, `ONTOLOGY_EVAL_ARTIFACT`, and
-`ONTOLOGY_EVAL_OUTPUT_DIR` to absolute host paths before starting the adapter.
-Create the output directory outside the Agent sandbox, with access limited to
-the trusted host and evaluator. It owns the child process and forwards only
-`ic/info` and `ic/transform` JSONL requests. Do not mount the
-runner or artifact into the Agent sandbox. No separate Telora TCP or Unix
-listener is needed, so the Agent cannot bypass the restricted tools by calling
-one directly. Merely copying fewer files into an
-otherwise unrestricted working directory does not meet this evaluation's
-isolation requirement. Verify that the Agent process has no filesystem route
-back to the artifact before claiming a hard-isolated run.
-The adapter supports MCP over stdio, but this evaluation explicitly permits
-the loopback HTTP MCP endpoint for OpenCode 1.18.32. The host still runs
-`telora-run` over stdio and does not expose a second Telora listener. A local
-MCP bridge can forward stdio across two
-host-owned mode-0600 FIFOs without mounting the runner or artifact. Direct MCP
-initialization, tool listing, and knowledge lookup worked through that bridge
-inside a filesystem/PID-isolated sandbox. OpenCode's `local` MCP process,
-however, closed its stdin before sending any request and reported `Connection
-closed`; stdio-only OpenCode access is not a gate for this evaluation.
-The bridge is an experimental transport component, not a completed replacement
-for the current loopback endpoint. The current `opencode.json` remote MCP entry
-has connected from a filesystem/PID-isolated OpenCode process; this verifies
-tool transport, not any business-question result. Keep the source, runner,
-artifact, rubric,
-and host process table outside the Agent sandbox; disabling Agent shell/file
-tools is additional defense, not a substitute for this isolation boundary.
+启动适配器前，将 ONTOLOGY_EVAL_RUNNER、ONTOLOGY_EVAL_ARTIFACT、ONTOLOGY_EVAL_OUTPUT_DIR 设置为宿主绝对路径。
+输出目录位于 Agent 沙箱之外，只允许可信宿主和评测者访问。适配器持有子进程，仅转发 ic/info 和 ic/transform JSONL 请求。
+不要将 runner 或产物挂载进 Agent 沙箱。不需独立 Telora TCP／Unix 监听器，防止 Agent 直接调用绕过受限工具。
+仅向不受限工作目录复制较少文件不满足隔离要求，宣称硬隔离前须确认 Agent 无文件系统路径访问产物。
+适配器支持 stdio MCP，但本评测明确允许 OpenCode 1.18.32 使用回环 HTTP MCP 端点。
+宿主仍通过 stdio 运行 telora-run，不开放第二个 Telora 监听器。
+本地 MCP 桥可通过两个宿主持有、权限 0600 的 FIFO 转发 stdio，无需挂载 runner 或产物。
+在文件系统／PID 隔离沙箱内，桥上的直接 MCP 初始化、工具列表及知识查询已成功；但 OpenCode 的 local MCP 进程在发请求前关闭 stdin，报告 Connection closed，因此纯 stdio OpenCode 访问不是本轮门槛。
+桥只是实验传输组件，尚未完整替代回环端点。
+当前 opencode.json 的 remote MCP 配置已从文件系统／PID 隔离 OpenCode 进程连通，这仅验证传输，不验证任何业务问答。
+源代码、runner、产物、评分准则和宿主进程表均留在沙箱外；禁用 shell／文件工具是附加防护，不替代此隔离边界。
 
-The questions test Model-backed lowering, rejection of unsupported meanings,
-and business interpretation under ambiguity. A successful receipt alone is not
-a universal passing condition: compare the stored Intent and Query with the
-Agent's business-language explanation and the user's actual request.
-`RUBRIC.md` is for the evaluator, not the agent.
-Question files contain only the simulated business request; process instructions
-belong in the generic guide, not in the question. Evaluate the stated business
-purpose before applying a rubric: a corpus SQL shape or an awkward noun in the
-request must not force clarification when the intended population is explicit.
-SQL and bindings are host-only intermediate artifacts in this evaluation;
-production answers should execute the Query and present the returned data.
-Clarification questions should explain the business choice, not ask the user
-to select an Intent field, SQL shape, or join path.
+问题测试模型支持的转换、不支持含义的拒绝，以及歧义下的业务解释。
+成功回执不是通用通过条件，必须将存储的 Intent、Query 与 Agent 业务说明和真实用户请求对照。
+RUBRIC.md 只供评测者使用。问题文件只含模拟业务请求，流程指令放在通用指南中。
+评分前先理解业务目的：总体已明确时，不能因语料 SQL 形状或措辞不自然就强迫澄清。
+SQL 和绑定是宿主专用中间产物，生产答案应执行 Query 并展示数据。
+澄清应解释业务选择，不能要求用户选择 Intent 字段、SQL 形状或连接路径。
 
-The initial runs in `RESULTS.md` used the older artifact-and-runner candidate
-layout. Those observations remain a baseline, not a hard-isolation result;
-they also predate graph edge normalization and the newer Model declarations.
-Record snapshot, guide and service revisions for any new comparison.
+RESULTS.md 的初始运行采用旧产物／runner 候选布局，仅作基线，不是硬隔离结果；它们早于图边规范化及新模型声明。
+新比较须记录快照、指南和服务版本。
 
-The prompts draw on IC corpus families Q0014, Q0050, Q0075, Q0184, Q0328,
-Q0354, Q0428, Q0442, and Q0444. Corpus SQL is an observation, not the business
-definition. Record the snapshot hash and runner version for each run.
+问题来自 IC 语料族 Q0014、Q0050、Q0075、Q0184、Q0328、Q0354、Q0428、Q0442、Q0444。
+语料 SQL 是观察材料，不是业务定义。每次运行记录快照哈希及 runner 版本。

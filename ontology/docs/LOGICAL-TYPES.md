@@ -1,20 +1,16 @@
-# Logical types and field capabilities
+# 逻辑类型与字段能力
 
-Three facts are distinct:
+以下三个事实相互独立：
 
-1. Physical storage encodes values, e.g. String or Int.
-2. A logical type defines the value domain and meaning of operations.
-3. A dimension's filterable/ops declaration selects the capabilities offered
-   for this particular field. It may narrow type operations, never invent them.
+1. 物理存储编码值，如 String 或 Int。
+2. 逻辑类型定义值域及操作含义。
+3. 维度的 filterable／ops 声明选择该字段提供的能力，可以收窄类型操作，不能凭空创造操作。
 
-Indexes, storage and query costs can motivate a field capability restriction.
-The current API does not inspect database indexes or infer permissions from
-them. An Eq-only Text dimension is not evidence that Contains lacks a meaning
-for Text. Conversely, String storage does not give every logical type Text
-operations. The existing time declarations distinguish DatetimeUtc, DateUtc,
-LocalDateTime and EpochMillis under the same principle.
+索引、存储和查询成本可成为限制字段能力的原因，但当前 API 不检查数据库索引，也不从中推断权限。
+仅支持 Eq 的 Text 维度不表示 Contains 对 Text 没有意义；反过来，String 存储也不会赋予所有逻辑类型 Text 操作。
+现有时间声明按同一原则区分 DatetimeUtc、DateUtc、LocalDateTime 和 EpochMillis。
 
-## IPv4 acceptance slice
+## IPv4 验收范围
 
 ```telora
 @edsl::column("ip")
@@ -24,81 +20,50 @@ LocalDateTime and EpochMillis under the same principle.
 ip: Option(String),
 ```
 
-The Model promises canonical dotted-decimal storage: exactly four octets in
-0..255, no leading zeros, whitespace, port, CIDR suffix or alternate notation.
-Option(String) allows SQL NULL, which is missing rather than an address.
-Preparation validates the declaration but does not scan the database to prove
-its encoding. Do not apply this annotation to unknown-format source columns.
+模型承诺规范点分十进制存储：恰好四段 0..255 八位组，无前导零、空白、端口、CIDR 后缀或其他记法。
+Option(String) 允许 SQL NULL，表示缺失而非地址。准备阶段校验声明，不扫描数据库证明编码；未知格式源列不要使用此注解。
 
-Ipv4 defines Eq and Ne over addresses, plus restricted InSubnet and
-NotInSubnet over networks. The example field offers only Eq;
-declaring Ne would also be legal. Contains, StartsWith, EndsWith, lexical
-ordering and Min/Max are not IPv4 operations. Count remains available when
-independently declared. Relations cannot equate Ipv4 to ordinary Text merely
-because both are stored as String. Scope and union predicates retain typed
-inputs. No implicit conversion to a text view is provided.
+Ipv4 定义地址 Eq、Ne 以及受限网络 InSubnet、NotInSubnet。示例字段仅提供 Eq，声明 Ne 也合法。
+Contains、StartsWith、EndsWith、字典序和 Min／Max 不是 IPv4 操作；独立声明的 Count 仍可用。
+关系不能仅因都存为 String 就将 Ipv4 与普通 Text 等同。作用域和并集谓词保留带类型输入，不提供隐式文本视图转换。
 
-Intent still uses an ordinary JSON string, without kind:
+Intent 仍使用普通 JSON 字符串，不带 kind：
 
 ```json
 {"node":"host","dimension":"address","op":"Eq","value":"192.0.2.1"}
 ```
 
-The Model selects Ipv4, validates the value and emits a bound String parameter.
-SQLite and PostgreSQL need no IP parsing for this limited canonical encoding.
-Typed callers use FilterInput::Ipv4, not FilterInput::Text. Field knowledge
-publishes the explicit logical_type; dimension knowledge publishes Ipv4 input
-documentation and the actual field ops. Field links lead to the common
-logical-types knowledge contract.
+模型选择 Ipv4，校验后生成绑定 String 参数。在此受限规范编码下，SQLite 与 PostgreSQL 无需解析 IP。
+带类型调用方使用 FilterInput::Ipv4，而非 FilterInput::Text。
+字段知识发布显式 logical_type，维度知识发布 Ipv4 输入说明及实际字段 ops，字段链接指向通用逻辑类型知识契约。
 
-This is not general IpAddress support: IPv6, native inet
-storage and address ordering require their own semantics and backend plans.
-They are not approximated by text search. Existing iCloud IP columns remain
-unchanged until their representation and desired operations are established.
-Automatic type inference from field names is deliberately absent.
+这不是通用 IpAddress 支持：IPv6、原生 inet 存储及地址排序需要各自语义和后端计划，不用文本搜索近似。
+现有 IC IP 列在表示形式和目标操作明确前保持不变，不从字段名自动推断类型。
 
-For mixed or unproved source strings, a Model may expose a separate computed
-dimension using `canonical_ipv4_view`, Ipv4 inputs and Text output. This is an
-explicit partial conversion: canonical IPv4 text is retained; NULL, IPv6,
-leading zeros, invalid octets and other encodings become NULL. The original
-Text dimension is not retyped. The conversion uses bound regex validation and
-a bound NULL branch; it rejects trailing newlines across regex implementations.
-Its generated regex also uses `?` and negated character classes.
+对混合或未证明格式的源字符串，模型可通过 `canonical_ipv4_view`、Ipv4 输入和 Text 输出暴露独立计算维度。
+这是显式部分转换：规范 IPv4 文本保留，NULL、IPv6、前导零、无效八位组及其他编码变为 NULL，原 Text 维度不改类型。
+转换使用绑定正则校验和绑定 NULL 分支，在不同正则实现下均拒绝尾随换行；生成正则还使用 `?` 及否定字符类。
 
-Row-local computed dimensions can be projected, grouped and counted as distinct
-values without expanding rows. Their projection capabilities are checked at
-preparation even when filtering is disabled; normal graph grain, authorization,
-scope and logical-operation checks still apply. The conversion has a runtime
-validation cost and does not promise source-column range index access.
+行内计算维度可投影、分组或统计不同值而不扩增行数。即使禁用筛选，准备时仍校验投影能力；正常图粒度、授权、作用域和逻辑操作检查继续生效。
+转换有运行时校验成本，不承诺使用源列范围索引。
 
-## Restricted subnet operations
+## 受限子网操作
 
-A field may declare InSubnet and/or NotInSubnet in ops. Intent passes a
-canonical CIDR String without kind, e.g. `"10.4.0.0/16"`. The operator selects
-a network argument; Eq/Ne still require a single address. Typed callers use
-FilterInput::Ipv4Subnet. any_of continues to enumerate addresses, not networks.
+字段可在 ops 中声明 InSubnet 和／或 NotInSubnet。Intent 传递不带 kind 的规范 CIDR 字符串，如 `"10.4.0.0/16"`。
+操作符决定网络参数；Eq／Ne 仍要求单个地址。带类型调用方使用 FilterInput::Ipv4Subnet，any_of 仍枚举地址而非网络。
 
-Every integer mask /0..32 is supported. Network host bits must be zero;
-`10.4.2.3/16` is rejected, not normalized. No IPv6 or alternate mask notation
-is accepted. The same canonical dotted-decimal storage contract is required.
+支持全部整数掩码 /0..32。网络主机位必须为零；`10.4.2.3/16` 被拒绝，不自动规范化。
+不接受 IPv6 或其他掩码记法，仍要求相同规范点分十进制存储契约。
 
-Complete octets form a binary text range: prefix `10.4.` becomes
-`address >= bound("10.4.") AND address < bound("10.4/")`. This excludes
-`10.40.0.1`. SQLite applies COLLATE BINARY; PostgreSQL applies COLLATE "C".
-Partial octets add a generated bound regex, e.g. /20 enumerates the 16 valid
-values of the third octet. /1..7 require only regex, without a prefix prefilter.
-Generated patterns use the common subset: anchors, groups, decimal alternatives,
-`[.]` and `[0-9]{1,3}`. They are not caller-supplied SQL or regex fragments.
-All boundaries and patterns are bindings allocated by the immutable context.
+完整八位组构成二进制文本范围：前缀 `10.4.` 转为 `address >= bound("10.4.") AND address < bound("10.4/")`，排除 `10.40.0.1`。
+SQLite 应用 COLLATE BINARY，PG 应用 COLLATE "C"。部分八位组增加生成的绑定正则，如 /20 枚举第三段的 16 个合法值；/1..7 仅使用正则，没有前缀预筛选。
+生成模式使用公共子集：锚点、分组、十进制备选、`[.]` 和 `[0-9]{1,3}`。这些不是调用方提供的 SQL 或正则片段，全部边界和模式由不可变上下文分配绑定。
 
-/32 uses bound address equality; /0 uses address self-equality. NotInSubnet
-negates the entire membership condition, not just the regex or prefix. NULL
-matches neither operation. No native inet support or SQL reverse parsing is used.
+/32 使用绑定地址相等；/0 使用地址自身相等。NotInSubnet 对整个成员条件取反，而非仅正则或前缀。
+NULL 不匹配任一操作。不使用原生 inet 或 SQL 反向解析。
 
-PostgreSQL supports regex natively. SQLite execution connections must register
-`regexp(pattern, value)`, returning NULL when either argument is NULL and 1/0
-otherwise. The sqlite3 command-line implementation alone does not establish
-this capability for Python or Node library connections. For Node's node:sqlite:
+PG 原生支持正则。SQLite 执行连接必须注册 `regexp(pattern, value)`：任一参数为 NULL 时返回 NULL，否则返回 1／0。
+sqlite3 命令行的实现不代表 Python 或 Node 库连接也具备此能力。Node 的 node:sqlite 示例：
 
 ```js
 db.function('regexp', { deterministic: true }, (pattern, value) => {
@@ -107,15 +72,12 @@ db.function('regexp', { deterministic: true }, (pattern, value) => {
 });
 ```
 
-The range makes index access possible, not mandatory: its index must use the
-same collation (BINARY in SQLite, "C" in PostgreSQL). Database statistics and
-the optimizer still decide the plan; negative membership may not benefit.
+范围条件使索引访问成为可能，并不强制使用。索引必须使用相同排序规则（SQLite BINARY，PG "C"）；数据库统计和优化器决定计划，否定成员判断可能无法受益。
 
-Preparation probes each distinct lowering shape and rejects insufficient scalar
-profiles: Eq/Ne, Ge/Lt, BinaryText, And, RegexMatch and Not as applicable.
-Discovery links the logical-type and filter contracts to the subnet contract.
+准备阶段探测每种不同转换形状，并按需拒绝不足的标量配置：Eq／Ne、Ge／Lt、BinaryText、And、RegexMatch、Not。
+发现将逻辑类型及筛选契约链接到子网契约。
 
-Run the focused execution check from the repository root (Node with node:sqlite):
+从仓库根目录运行专项执行检查，需要支持 node:sqlite 的 Node：
 
 ```sh
 bin/telora -C ontology eval @test/subnets:runtime_cases --request-fuel 10000 > /tmp/subnets.json
@@ -123,34 +85,23 @@ bin/telora -C ontology eval @test/subnets:runtime_views --request-fuel 10000 > /
 node ontology/tests/subnets-runtime.mjs /tmp/subnets.json /tmp/ipv4-views.json
 ```
 
-This executes the generated queries across all masks and address boundaries,
-checks both complements and NULL, and verifies index range access for /16 and /20.
+检查执行全部掩码及地址边界的生成查询，验证两种补集、NULL，以及 /16 和 /20 的索引范围访问。
 
-The equivalent PostgreSQL check uses temporary tables inside a rolled-back
-transaction and executes templates with bound parameters:
+等价 PG 检查在回滚事务内使用临时表，以绑定参数执行模板：
 
 ```sh
 bin/telora -C ontology eval @test/subnets:postgres_runtime --request-fuel 10000 > /tmp/subnets-pg.json
 node ontology/tests/subnets-postgres.mjs /tmp/subnets-pg.json > /tmp/subnets-pg.sql
 psql --dbname postgres --set ON_ERROR_STOP=1 --file /tmp/subnets-pg.sql
 ```
-# Named Business Types
 
-A named business type owns its public identity, member values and physical
-storage encoding. Declare it with `@edsl::value_type(id, storage, members)` on a
-Telora Type and bind a dimension using `@edsl::dimension_type(TypeName.type)`.
-The physical field is the scalar database carrier and must match the declared
-storage type. Type-level annotations define aliases, localized member labels,
-canonical ordering and the half-open contract. Dimensions retain their local
-scope and permitted operations.
+# 具名业务类型
 
-Distinct named types cannot be joined merely because both use String or Int.
-For example, a Dn key and an Id key require the same declared business type to
-connect. No implicit type conversion is performed. Types with different storage
-encodings remain distinct even when their member names coincide.
+具名业务类型拥有公共身份、成员值和物理存储编码。通过 Telora 类型上的 `@edsl::value_type(id, storage, members)` 声明，维度用 `@edsl::dimension_type(TypeName.type)` 绑定。
+物理字段是数据库标量载体，必须匹配声明存储类型。类型级注解定义别名、本地化成员标签、规范顺序和半开放契约；维度保留自身作用域及允许操作。
 
-Knowledge publishes `Ty/{ty}` and `Value/{ty}/{value}`. Type documents
-contain `storage`, `half_open`, `canonical_order` and a single `values` array;
-each member carries its id, label, aliases, localized labels and physical wires.
-Dimensions explicitly publish `ty` and dataset ownership. The independent
-`links` export lets consumers discover dimensions referencing a type.
+不同具名类型不能仅因都使用 String 或 Int 就连接。例如 Dn 键与 Id 键需要相同声明业务类型才能连接，不做隐式转换。
+存储编码不同的类型即使成员名称相同，仍是不同类型。
+
+知识发布 `Ty/{ty}` 和 `Value/{ty}/{value}`。类型文档包含 `storage`、`half_open`、`canonical_order` 和单一 `values` 数组；
+各成员携带 ID、标签、别名、本地化标签及物理编码。维度显式发布 `ty` 和数据集归属，独立 `links` 导出支持发现引用该类型的维度。

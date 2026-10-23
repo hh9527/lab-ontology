@@ -1,93 +1,59 @@
-# Ontology query service
+# 本体查询服务
 
-Use only the host-provided `ontology_info` and `ontology_transform` tools for the `ic` domain. The host runs the service; do not run or inspect an artifact. The host supplies this guide and the question as attachments.
+只使用宿主提供的 ontology_info 和 ontology_transform 工具访问 ic 领域。
+服务由宿主运行，不运行或检查产物，宿主以附件提供本指南和问题。
 
-## Tool protocol and Intent syntax
+## 工具协议与 Intent 语法
 
-Pass the following objects directly as tool arguments:
+直接将以下对象作为工具参数：
 
 ```json
 {"key":"index"}
 {"key":"<key returned by index or links>"}
 ```
 
-Both objects are for `ontology_info`; the first retrieves the index topic.
-`ontology_transform` takes an `intents` array of one to five
-independent Intents.
+两对象都用于 ontology_info，第一个获取索引主题。
+ontology_transform 接受一至五个独立 Intent 组成的 intents 数组。
 
-The index topic returns five discovery routes: datasets, relations, terminology,
-data types and query contracts. Directory entries are `{key,type,label}`; relation
-entries also carry `from`/`to` dataset keys. Large directories lead to smaller
-directories; each list is complete, never truncated. Pass an entry's `key` unchanged
-to `info`. Follow directory entries and `links[].key` values to
-check entity grain, dimensions, measures, business values, time roles, and
-named relations. A `Related` link explains knowledge but does not authorize a
-query traversal. Labels, translations, aliases, and physical column names are
-not substitutes for stable Intent IDs.
+索引主题返回数据集、关系、术语、数据类型、查询契约五条发现路径。
+目录项为 `{key,type,label}`，关系项另含 from／to 数据集键。大目录指向较小目录，列表完整且不截断。
+将条目 key 原样传给 info，沿目录项及 links[].key 检查实体粒度、维度、度量、业务值、时间角色与具名关系。
+Related 链接解释知识，不授权查询遍历。标签、翻译、别名和物理列名不能替代稳定 Intent ID。
 
-Every knowledge node has `{key,type,description,links,detail}`. The string key
-is opaque: do not construct it from a type or business ID, split it, or decode it.
-The response `type` determines the `detail` shape. `Index` and `Directory` enumerate
-children in `detail.entries`, without repeating them in links. Dataset links lead
-to member directories. The terminology route uses `Directory` branches and
-`Terminology` leaves with `{term,description,key}` entries derived from Model annotations. `DataType` describes logical
-values and operations, not field authorization. The tree discovers formal domain
-concepts; terminology is only supplemental
-language assistance, not a second concept system or automatic substitution.
-A term may refer to multiple nodes; interpret the user's meaning, read those
-nodes, and use only Model-defined canonical business IDs in Intent.
-Use index entries to discover the knowledge key and request contracts as well. A shape diagnostic
-includes the offending JSON path and a key that can be passed to `info`.
+每个知识节点含 `{key,type,description,links,detail}`。字符串键不透明，不要从类型或业务 ID 构造、拆分或解码。
+响应 type 决定 detail 形状；Index 和 Directory 在 detail.entries 枚举子项，不在 links 重复。
+Dataset 链接指向成员目录。术语路径使用 Directory 分支和 Terminology 叶子，条目 `{term,description,key}` 来自模型注解。
+DataType 描述逻辑值和操作，不是字段授权。树发现正式领域概念，术语只作语言辅助，不是第二套概念体系或自动替换。
+术语可能指向多个节点，应解释用户含义、读取节点，并只在 Intent 使用模型规范业务 ID。
+也通过索引项发现知识键和请求契约。形状诊断包含问题 JSON 路径及可传 info 的键。
 
-Use the index topic and `info` to discover the Model, then express the user's business
-request as an Intent using discovered stable IDs. Use `transform` diagnostics to
-repair the Intent without changing the requested business meaning. Lowering
-success establishes that an Intent is legal under the Model, not that it answers
-the user's question. Aim to serve the user's business purpose with one accepted
-Intent. When one plan is insufficient, you may offer up to five accepted Intents
-in one `ontology_transform` call. Explain in business terms what each result
-would show and how the separate results help answer the question.
-The service does not merge or deduplicate results across plans, so do not claim
-that it has. If no supported plan gives a useful answer, explain the limitation
-or ask a focused business question. Do not change the user's meaning just to
-obtain a successful transform. Before answering, compare the business meaning
-of the accepted plan or plans with the user's request.
+用索引与 info 发现模型，再以稳定 ID 表达业务请求。借 transform 诊断修复 Intent，不改变业务含义。
+转换成功仅证明模型下合法，不证明回答了问题。优先用一个接受的 Intent 满足目的；不足时一次 ontology_transform 可提交最多五个接受的 Intent。
+用业务语言说明各结果及如何共同回答；服务不跨计划合并或去重，不得声称已做。
+没有有用的受支持计划时解释限制或问聚焦业务问题，不能为转换成功而改变含义；回答前对照计划含义与用户请求。
 
-When one reasonable interpretation is supported, submit its plan or plans and
-tell the user in ordinary business language what each accepted Intent means.
-Make any consequential assumption visible so the user can correct it. Ask a focused
-business question when the request cannot responsibly be interpreted, or when
-the alternatives have materially different meanings and no reasonable default.
-Do not require clarification just because another interpretation is possible.
-Never write SQL yourself or present a Query as the answer. The host retains
-SQL and bindings for its authorized execution layer; the Agent sees only an
-acceptance receipt or structured diagnostics.
+有合理且受支持解释时提交计划，并用普通业务语言说明各 Intent。重要假设要显式呈现以便用户纠正。
+无法负责任解释，或备选含义差异重大且无合理默认值时，才问聚焦业务问题，不能仅因存在另一解释就要求澄清。
+绝不手写 SQL 或把 Query 当答案。宿主为授权执行层保留 SQL 和绑定，Agent 只看接受回执或结构化诊断。
 
-If the request uses relative time, obtain its reference time and timezone from
-the application context or your environment, then calculate concrete boundaries
-before submitting the Intent. Do not send `now`, relative calendar/delta
-expressions, or `ctx` to `ontology_transform`. In the business-language reverse
-explanation, state the concrete start and end times and the timezone used. An
-omitted upper boundary means no upper time restriction, not "until now". If
-the needed reference time or timezone is unavailable, ask for that context.
+相对时间从应用或环境获取参考时间及时区，提交前计算具体边界。不要向 ontology_transform 发送 now、相对日历／时差表达式或 ctx。
+业务反向说明中列出具体起止时间及时区；省略上界表示无上限，不是“截至现在”。缺参考时间或时区时询问上下文。
 
-Submit one or more Intents to `ontology_transform`:
+向 ontology_transform 提交一个或多个 Intent：
 
 ```text
 {"intents":[<Intent>, ...]}
 ```
 
-Even a single plan uses a one-element array. The tool returns one receipt only
-when all plans are accepted; otherwise it reports each plan's status and
-diagnostics by zero-based array index, without storing a partial bundle. In a
-failed batch, `valid:true` means that plan lowered, not that it was persisted.
+单计划也用单元素数组。仅全部接受时返回一个回执，否则按零基索引报告每项状态和诊断，不存储部分批次。
+失败批次中的 valid:true 只表示该计划已转换，不表示已持久化。
 
-Knowledge discovery describes the Model; the generic Intent syntax is below.
-The Model and `transform` decide which combinations have valid business meaning.
+知识发现描述模型，下文给出通用语法；模型和 transform 决定组合是否有合法业务含义。
 
-### Graph Intent syntax
+### Graph Intent 语法
 
-A graph Intent has five required fields, including empty arrays where needed:
+
+Graph Intent 有五个必填字段，必要时使用空数组。示例如下：
 
 ```json
 {"op":"Graph","limit":1000,"root":"item",
@@ -96,67 +62,53 @@ A graph Intent has five required fields, including empty arrays where needed:
  "select":[],"count":"item"}
 ```
 
-`root` names a node instance in `nodes`, not a dataset ID by itself. Each
-node has `id` (unique instance name within this graph) and `entity` (stable
-dataset ID). Each edge has `relation` (stable named relation ID), `from`, and
-`to` (node instance IDs); its direction and endpoint roles must match the
-Model. `edges` may be listed in any order, but must form one rooted tree;
-each edge must introduce one new node reachable from `root`. `select`
-contains objects `{"node":"...","dimension":"..."}`.
-For a count, `count` is the node instance ID to count, not a measure name.
-The required `select` array may be empty when `count` is present.
+root 指定 nodes 中的节点实例，不是单独的数据集 ID。
+每个节点含 id（图内唯一实例名）和 entity（稳定数据集 ID）。
+每条边含 relation（稳定具名关系 ID）、from、to（节点实例 ID），方向与端点角色必须匹配模型。
+edges 顺序任意，但必须形成一棵有根树，每条边引入一个从 root 可达的新节点。
+select 包含 `{"node":"...","dimension":"..."}`。count 是被计数节点实例 ID，不是度量名；有 count 时必填 select 可为空。
 
-Optional top-level graph fields and their shapes:
+可选顶层字段及形状：
 
-| Field | Shape |
+| 字段 | 形状 |
 | --- | --- |
-| `constraints` | Array of edge objects, same shape as `edges` |
-| `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
-| `filters` | Array of `{"node":"...","dimension":"...","op":"Eq","value":...}` |
-| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` is required and non-null; `start` may be `null` or omitted |
-| `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}` |
-| `exists` | Array of existence objects described below |
-| `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}` |
-| `count` | Node instance ID string |
-| `count_value` | `{"node":"...","dimension":"..."}`, for distinct non-null value count |
+| `constraints` | 与 edges 同形状的边对象数组 |
+| `measures` | `{"node":"...","measure":"<stable measure ID>"}` 数组 |
+| `filters` | `{"node":"...","dimension":"...","op":"Eq","value":...}` 数组 |
+| `time_windows` | `{"node":"...","dimension":"...","start":...,"end":...}` 数组；end 必填非 null，start 可省略或为 null |
+| `any_of` | `{"node":"...","dimension":"...","values":[...]}` 数组 |
+| `exists` | 下述存在性对象数组 |
+| `measure_having` | `{"node":"...","measure":"...","op":"...","value":...}` 数组 |
+| `count` | 节点实例 ID 字符串 |
+| `count_value` | `{"node":"...","dimension":"..."}`，统计不同非空值 |
 | `count_having` | `{"op":"...","value":<integer>}` |
-| `count_groups`, `include_empty`, `distinct` | Boolean |
-| `group_by_identity` | Array of node instance ID strings |
-| `row_grain` | `"Root"` or `"Association"` |
-| `order_by` | Array of `{"node":"...","dimension":"...","direction":"Asc|Desc"}` |
-| `take` | Integer |
+| `count_groups`、`include_empty`、`distinct` | 布尔值 |
+| `group_by_identity` | 节点实例 ID 字符串数组 |
+| `row_grain` | `"Root"` 或 `"Association"` |
+| `order_by` | `{"node":"...","dimension":"...","direction":"Asc|Desc"}` 数组 |
+| `take` | 整数 |
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |
 
-Time windows use concrete values in the dimension's declared logical type.
-`end` is required and non-null. An omitted or null `start` means all history
-strictly before `end`. Fix the cutoff when planning; relative expressions are rejected.
+时间窗口为 `[start,end)`，使用声明逻辑类型中的具体值。end 必填非 null，start 省略或 null 表示截止 end 之前全部历史。
+规划时固定截止值，提交前解析 now、经过时长、日历边界及时区影响。服务拒绝相对表达式及请求 ctx。
 
-An existence object has required `anchor` (an outer node instance ID),
-`nodes` (inner node objects), and `edges` (named edge objects connecting
-the anchor to inner nodes). Its edges may be in any order but must form a
-tree rooted at `anchor`. It may also contain `constraints`, `filters`,
-`time_windows`, `any_of`, `having` (same shape as `measure_having`), and
-`negated` (boolean). `exists` qualifies outer entities without multiplying
-their rows; use it when a related one-to-many entity must only establish
-existence. The request may have multiple graph edges and multiple existence
-objects; there is no fixed hop count in the Intent syntax.
+存在性对象必填 anchor（外层节点实例 ID）、nodes（内部节点对象）、edges（连接锚点和内部节点的具名边）。
+边顺序任意，但必须构成以 anchor 为根的树。
+还可包含 constraints、filters、time_windows、any_of、having（与 measure_having 同形状）和布尔 negated。
+exists 限定外层实体而不扩增其行；关联一对多实体只需证明存在时使用它。
+请求可含多条图边和多个存在性对象，语法不固定跳数。
 
-Filter operators are `Eq`, `Ne`, `Gt`, `Ge`, `Lt`, `Le`, `Contains`,
-`NotContains`, `StartsWith`, and `EndsWith`. The Model restricts which
-operators and logical value types each dimension permits. Do not send `kind`:
-the target dimension or measure determines the logical type of its JSON value.
-Typed predicate inputs and canonical wires shown by `info` are Model facts,
-not JSON Intent value syntax.
-Find the Intent syntax entry in the index and follow its returned key and links
-through `<domain>/info`. A diagnostic naming an info key can be
-resolved through `<domain>/info` to repair the Intent. Business-value filters
-use the stable value ID, not its physical wire or localized label.
+筛选操作符为 Eq、Ne、Gt、Ge、Lt、Le、Contains、NotContains、StartsWith、EndsWith。
+模型限制每个维度允许的操作和逻辑值类型。不要发送 kind，目标维度或度量决定 JSON 值逻辑类型。
+info 显示的带类型谓词输入和规范编码是模型事实，不是 JSON Intent 值语法。
+从索引找到 Intent 语法入口，通过 `<domain>/info` 跟随返回键及链接。
+诊断中给出的 info 键可用于读取知识以修复 Intent。业务值筛选使用稳定值 ID，不使用物理编码或本地化标签。
 
-### One deduplicated entity set
 
-Use `GraphUnion` when at least two independently valid graph paths must
-return one deduplicated population of the same entity:
+### 单一去重实体集合
+
+至少两条独立合法图路径要返回同一实体的单个去重总体时使用 GraphUnion：
 
 ```text
 {"op":"GraphUnion","limit":1000,"branches":[
@@ -165,20 +117,16 @@ return one deduplicated population of the same entity:
 ]}
 ```
 
-Each branch has its own complete graph and names the node whose entity should
-appear in the result. All result nodes must denote the same dataset. Select
-the same dimensions in the same order in every branch, including plain
-dimensions for every field of the dataset's full identity grain. Identity
-fields remain visible result columns. Branches are raw-row plans; counts,
-measures, grouping, local ordering, Top-N, and pagination are not supported.
-The union deduplicates complete result rows, not merely display labels. It
-does not merge different entity types or reverse directed relations. For
-different result categories, submit separate Intents instead.
+每个分支有完整图并指定结果实体节点，所有结果节点须属于同一数据集。
+各分支选择相同顺序的相同维度，包含完整身份粒度每个字段的普通维度，身份列保持可见。
+分支是原始行计划，不支持计数、度量、分组、局部排序、Top-N、分页。
+并集去重完整行，不只是展示标签；不合并不同实体类型，不反转有向关系。
+不同结果类别应提交独立 Intent。
 
-### Independent aggregate pair
+### 独立聚合配对
 
-Use `GraphPair` to aggregate two populations independently, explicitly align
-their complete identities, and choose the side of each output column.
+
+GraphPair 分别聚合两个总体，显式对齐完整身份，并选择每个输出列来自哪一侧。
 
 ```text
 {"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
@@ -188,39 +136,25 @@ their complete identities, and choose the side of each output column.
             "direction":"Desc","take":5}}
 ```
 
-Each side has exactly one measure and empty or omitted select. Its
-group_by_identity must exactly match its aligned nodes in order, beginning
-with root. Paired nodes belong to the same entity; their IDs may differ.
-Outer select is required (may be empty); display dimensions must belong to
-aligned nodes and never become alignment keys. Outputs follow select order
-then both measures, using left_<node>_<dimension or measure> and
-right_<node>_<dimension or measure> aliases.
+每侧恰好一个度量，select 为空或省略。group_by_identity 按序与对齐节点完全一致，并从根开始。
+配对节点属于同一实体，ID 可不同。外层 select 必填，可为空；展示维度来自对齐节点，绝不成为对齐键。
+输出先按 select 顺序，再输出两侧度量，别名为 left_<node>_<dimension or measure> 和 right_<node>_<dimension or measure>。
 
-Ranking supports Subtract (minuend/subtrahend), Ratio (numerator/denominator)
-and GrowthRate (current/baseline). Side parameters explicitly choose different
-Left/Right sides. Every rank needs direction Asc|Desc and take 1..1000.
-Numeric measures must be the same measure or declare matching non-null units.
-Exclude NULL measures, zero Ratio denominators and nonpositive GrowthRate
-baselines. Arithmetic uses approximate double precision; a growth rate of
-0.2 means 20%. Ties use complete aligned identities ascending, NULLS FIRST.
+排名支持 Subtract（minuend／subtrahend）、Ratio（numerator／denominator）和 GrowthRate（current／baseline）。
+侧别参数显式选择不同 Left／Right，每次排名需 direction Asc|Desc 和 take 1..1000。
+数值度量须为同一度量或声明相同非空单位。排除 NULL、Ratio 零分母及 GrowthRate 非正基线。
+运算采用近似双精度，增长率 0.2 表示 20%；并列按完整对齐身份升序、NULLS FIRST 决胜。
 
-Populations remain independent; filters, exists, time_windows and
-measure_having stay inside their respective Graph. Operand counts, distinct,
-include_empty, ordering and Top-N remain forbidden. Unranked count_groups:true
-counts all aligned identities and cannot combine with rank_by.
+总体保持独立，filters、exists、time_windows、measure_having 留在各自 Graph 内。
+操作数禁止计数、distinct、include_empty、排序、Top-N。
+无排名的 count_groups:true 统计全部对齐身份，不能与 rank_by 组合。
 
-Old implicit pairs require migration. See the [complete GraphPair contract](../../ontology/docs/GRAPH-PAIR.md)
-for shapes, output aliases, profile requirements and migration steps.
+旧隐式配对需迁移，形状、别名、配置要求和步骤见[完整 GraphPair 契约](../../ontology/docs/GRAPH-PAIR.md)。
 
-`index` and `info` expose knowledge points and references. A successful
-`transform` returns `{"accepted":true,"receipt":"<id>","count":N}`; the host
-stores each submitted Intent and its generated Query under that grouped receipt.
-A failed transform returns indexed structured diagnostics for repair. Neither
-response is a database result. In this evaluation there is no data execution
-layer: return the receipt and your business-language interpretation of each
-planned result, not a fabricated number or SQL.
-When an execution layer is connected, present its returned data instead.
 
-The forwarding adapter sets `limit: 100` on every top-level Intent, overriding
-any supplied value. This limits final output rows independently of business
-`take` and Top-N. A result reaching 100 rows does not establish completeness.
+index 和 info 暴露知识点和引用。成功 transform 返回 `{"accepted":true,"receipt":"<id>","count":N}`，
+宿主在该分组回执下存储每个 Intent 及生成 Query；失败返回带索引结构化诊断供修复。
+两种响应都不是数据库结果。本评测无数据执行层：返回回执并用业务语言解释各计划结果，不能编造数值或 SQL。
+接入执行层后应展示实际返回数据。
+
+转发适配器为每个顶层 Intent 设置 limit:100，覆盖传入值。它独立于业务 take 和 Top-N 限制最终行数，达到 100 行不证明完整。

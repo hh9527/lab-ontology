@@ -1,277 +1,158 @@
-# Initial isolated runs
+# 初始隔离运行
 
-All runs used OpenCode `build` with `deepseek-flash`, the same snapshot SHA-256
-`5e919926ef17dfce5c0bd34155bda909bf89d0ae4d1849d821419d144743bccb`
-and `telora-run` SHA-256
-`b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`.
-The cropped `USAGE.md` SHA-256 was
-`4ec64668d47054624197838c09c14d4b36b3e11e7f261f64cdd3147271ce787a`.
-It predated the graph edge-order clarification now present in root `USAGE.md`.
-Each candidate directory contained only the snapshot, that `ic`-only `USAGE.md`,
-and one `QUESTION.md`. The runner was outside the directory as allowed by the
-question. OpenCode also wrote its own scratch probes under `/tmp/opencode`;
-these were not Model source or evaluator files.
+全部使用 OpenCode build、deepseek-flash，相同快照 SHA-256
+`5e919926ef17dfce5c0bd34155bda909bf89d0ae4d1849d821419d144743bccb`，
+telora-run SHA-256 `b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`。
+裁剪 USAGE.md 的 SHA-256 为 `4ec64668d47054624197838c09c14d4b36b3e11e7f261f64cdd3147271ce787a`，
+早于根文档现有图边顺序澄清。各候选目录仅含快照、仅 IC 的指南和一个 QUESTION.md；按题目允许，runner 在目录外。
+OpenCode 在 /tmp/opencode 写临时探测，不是模型源或评测文件。
 
-| Question | Observation | Evaluation |
+| 问题 | 观察 | 评价 |
 | --- | --- | --- |
-| 07 | Discovered Storage Device, status, subclass and Site relation. Found accepted inner- and left-join count shapes, then asked whether zero qualifying devices count; did not claim a final numeric answer. | Pass on material clarification. It also offered a third population, sites having any storage device; this is useful but more detail than the minimum question required. |
-| 05 | Discovered the guarded directed A-to-Z link. A reverse traversal was rejected with `directed business link cannot be traversed from Z to A`; the agent explained why the undirected peer relation is not a substitute. | Pass on semantic boundary and diagnostic use. |
-| 01, original wording | Discovered and lowered `alarm_site_reference`, grouped by Site identity, filtered uncleared alarms, applied `count_having > 5`, then `count_groups`. | Valid for the original wording, but **not** evidence of the intended multi-hop capability. The question was underspecified and was revised to require Device ownership. |
-| 01, revised wording | Found the correct Alarm-to-Device and Device-to-Site relations, but submitted the edges in Alarm-to-Device-first order. After `graph edge has no endpoint connected to the root`, it tried other aggregations and concluded the request was unsupported. It correctly refused to substitute `alarm_site_reference`. | Safe refusal, but a **false negative** on expressiveness. A root-Site graph with edges ordered Device-to-Site then Alarm-to-Device, `count:"alarm"`, `group_by_identity:["site"]`, `count_having > 5` and `count_groups:true` is accepted by the same snapshot. The correct SQL joins Site, Device, and Alarm, groups by Site identity, and binds `[0,5]`. The generic edge-order requirement was absent from the cropped usage file, and the diagnostic did not explain it. |
-| 01, revised wording with edge-order documentation | Discovered both relations, put Device-to-Site before Alarm-to-Device, and submitted `count:"a"`, `group_by_identity:["s"]`, `count_having > 5`, `count_groups:true`. The service accepted it with bindings `[0,5]`; the agent also distinguished the semantically different direct alarm-site relation. | Pass. The only guide change from the preceding run was the generic root-connected edge-order rule. Cropped guide SHA-256: `f35ebd8a42da01c9663fa3f2ed1a923c8136803a24531cda5209e2f27c986395`. |
-| 02 | Discovered the Device KPI raw sample dimensions, partitioned `top_per` by complete `(device.id, device.tenant_id)` identity, ranked by its declared sample clock, and qualified Site through `EXISTS`. Transform accepted one row per device with both port values and the timestamp from the same sample. | Pass. Its first attempt to combine a measure with `top_per` was repaired after a specific diagnostic. |
-| 03 | Discovered offline GPON, the PON-port Max sample summary and authoritative UTC-second time role. `pon_port_kpi.ts` has no published time dimension (`dimension_ids:[]`), so it refused to present an all-history Max as the requested 30-day Max. | Pass on semantic safety, **coverage gap** on this graph/Model surface. Add a declared filterable PON-port clock dimension and verify the same half-open UTC window; do not change Max to the published Avg. This run does not show a missing ontology-wide time primitive. |
-| 04 | Found no Server health dimension, but used `server_psu_health=warning` to qualify Server and returned the resulting Fan count SQL as the answer. It also inspected raw wasm strings instead of using only the knowledge service. | Fail. Power-supply health does not imply Server health. Successful lowering proves a different query, not the requested one. Raw-binary inspection violates the evaluation protocol. |
-| 06 | Found the exact knowledge distinction between existing Tenant entities and non-null Alarm tenant references including orphans, but declared the wording non-contradictory and returned an Alarm-reference group count as a Tenant-entity count. It also parsed wasm custom sections. | Fail. The request explicitly calls an orphan ID a Tenant entity; the agent should ask to choose entity count or referenced-ID count. Binary parsing violates the evaluation protocol. |
-| 08 | Found Server-to-Site FanOut and verified Site entity count and distinct Site-name projection shapes. Final response asked about parent/project site and online/offline status, but never raised the requested Site-identity-versus-name-cardinality distinction; it also re-asked whether the explicit Kunlun filter applied. | Partial. It paused instead of inventing a number, but the clarification was not targeted at the principal ambiguity. Do not add an online filter without user authority. |
-| 09 | Found Server memory Avg but no declared Max, recognized that `now` and timezone were absent, and stopped before final lowering. It asked about heterogeneous Server scope and peak semantics. | Partial. It missed two decisive time questions: rolling versus calendar month, and whether the Alarm predicate shares the KPI window. Asking whether `critical` also means `major` or whether an Avg can be accepted expands the request rather than resolving its core ambiguity. |
+| 07 | 发现存储设备、状态、子类和站点关系；找到可接受内／左连接计数，再问零设备是否计入；未声称数值答案。 | 重大选择澄清通过。另提供“有任意存储设备的站点”第三总体，有用但超出最小问题。 |
+| 05 | 发现受保护有向 A→Z 连接，反向被诊断 directed business link cannot be traversed from Z to A，解释无向对等关系不能替代。 | 语义边界及诊断使用通过。 |
+| 01，原措辞 | 转换 alarm_site_reference，按站点身份分组，筛未清除，count_having > 5，再 count_groups。 | 对原措辞合法，但不能证明目标多跳能力；问题不充分，后改为要求设备归属。 |
+| 01，修订措辞 | 找到正确告警→设备、设备→站点关系，但先提交告警→设备边。收到 graph edge has no endpoint connected to the root 后尝试其他聚合并判断不支持；正确拒绝替换直接告警站点引用。 | 安全拒绝，但对表达力是假阴性。同快照接受以 Site 为根、先 Device→Site 再 Alarm→Device、count:"alarm"、group_by_identity:["site"]、count_having > 5、count_groups:true。正确 SQL 连三表，按站点身份分组，绑定 [0,5]。裁剪指南漏顺序要求，诊断也未解释。 |
+| 01，增加边顺序说明 | 按 Device→Site、Alarm→Device 顺序提交 count:"a"、group_by_identity:["s"]、count_having > 5、count_groups:true，绑定 [0,5] 获接受，并区分直接告警站点关系。 | 通过。指南只改通用根连通边顺序规则，SHA-256 为 f35ebd8a42da01c9663fa3f2ed1a923c8136803a24531cda5209e2f27c986395。 |
+| 02 | 发现设备 KPI 原始维度，以完整 `(device.id,device.tenant_id)` 做 top_per 分区，按声明时钟排名，以 EXISTS 限定站点；每设备同一行返回两端口值和时间。 | 通过。首次把度量与 top_per 组合，在专门诊断后修复。 |
+| 03 | 发现离线 GPON、PON 端口 Max 摘要和权威 UTC 秒角色；pon_port_kpi.ts 无公开时间维度（dimension_ids:[]），拒绝把全历史 Max 当 30 天 Max。 | 语义安全通过，图／模型覆盖有缺口。应增加可筛选 PON 端口时钟并验证半开窗口，不能将 Max 改 Avg；不代表本体缺通用时间原语。 |
+| 04 | 未发现 Server 健康维度，却用 server_psu_health=warning 限定服务器并把风扇计数 SQL 当答案；还读取原始 wasm 字符串。 | 失败。PSU 健康不能推出 Server 健康，合法转换回答了另一个问题；二进制检查违反协议。 |
+| 06 | 发现现存租户实体与含孤儿的非空告警租户引用之区别，却称措辞无冲突，把引用组数当租户实体数；还解析 wasm 自定义区段。 | 失败。按当时评分应澄清实体或引用 ID 计数；二进制解析违反协议。 |
+| 08 | 发现 Server→Site FanOut，验证实体计数和不同名称投影。最终问父／项目站点及在线状态，未问身份与名称基数区别，还重复询问明确的昆仑筛选。 | 部分通过。未编造数值，但澄清未针对主要歧义；无授权不能添加在线筛选。 |
+| 09 | 发现内存 Avg 无 Max，知道缺 now 和时区，在最终转换前停下，询问异构范围和峰值含义。 | 部分通过。漏滚动／日历月和告警是否共享 KPI 窗口；问 critical 是否包含 major 或能否用 Avg 扩大了请求，未解核心歧义。 |
 
-The six later runs all used the edge-order-clarified cropped guide with SHA-256
-`f35ebd8a42da01c9663fa3f2ed1a923c8136803a24531cda5209e2f27c986395`.
-Across the final version of all nine questions, the qualitative results are
-five passes (01, 02, 03, 05, 07), two partials (08, 09), and two failures
-(04, 06). A pass for 03 means an accurate refusal, not that this Model can
-lower the complete request. These are single runs, not a statistical pass
-rate. The most serious failure mode is accepting a legal Intent with the wrong
-business meaning, especially projecting a child attribute onto its parent or
-calling a reference value an entity.
+后六次均用边顺序澄清指南 `f35ebd8a42da01c9663fa3f2ed1a923c8136803a24531cda5209e2f27c986395`。
+九题最终版定性结果为五通过（01、02、03、05、07）、两部分（08、09）、两失败（04、06）。
+03 通过指准确拒绝，不代表模型可完整转换。均为单次观察，不是统计通过率。
+最严重失败是合法 Intent 却业务含义错误，尤其将子属性赋予父对象或将引用值称实体。
 
-No run executed generated SQL against a business database, so none proves
-answer correctness against production data. A first attempt at the revised
-question 01 was auto-rejected by
-OpenCode's own file permissions before it reached the knowledge service; the
-revised runs above were fresh sessions with scratch files kept inside the
-candidate directory. An initial attempt to use the repository-wide `USAGE.md`
-also failed because `telora-run` was not on `PATH`; it was not used as a
-semantic evaluation. The successful comparison retained the prior standalone
-guide and changed only the edge-order paragraph.
+没有运行把 SQL 交业务数据库执行，不证明生产数据答案正确性。
+修订 01 首次尝试在到知识服务前被 OpenCode 文件权限自动拒绝；表中修订运行是新会话，临时文件留候选目录。
+首次使用仓库全量 USAGE.md 因 telora-run 不在 PATH 而失败，不计语义评测。
+成功比较保留原独立指南，仅改边顺序段落。
 
-## Service-boundary smoke check after the repairs
+## 修复后的服务边界冒烟检查
 
-The updated IC snapshot (SHA-256
-`5960ed744a634ef77217a3fa3b6e5a4dce28b6332a1b0d1445129d786f460904`)
-was built with `--snapshot --with-memory-limit 512`. The trusted host served
-it on loopback. A `bubblewrap` client with only `/usr`, `/lib`, `/lib64`,
-`/proc`, `/dev`, and an empty `/tmp` mounted successfully POSTed to `/ic/index`;
-the same client could not see the host's snapshot path. This validates the
-transport and a possible filesystem boundary, not a complete Agent deployment
-or an OpenCode rerun. No new pass/fail score is assigned to questions 04, 06,
-08, or 09 yet.
+更新 IC 快照 SHA-256 为 `5960ed744a634ef77217a3fa3b6e5a4dce28b6332a1b0d1445129d786f460904`，
+以 --snapshot --with-memory-limit 512 构建，由可信宿主在回环服务。
+bubblewrap 客户端仅挂 /usr、/lib、/lib64、/proc、/dev 和空 /tmp，成功 POST /ic/index，且看不到宿主快照路径。
+这只验证传输及可能的文件系统边界，不是完整 Agent 部署或 OpenCode 重跑；04、06、08、09 暂无新评分。
 
-## Graph regression after nested edge normalization
+## 嵌套边规范化后的图回归
 
-The full `icloud_model/tests/graph` module passed 194/194 cases with
-`--request-fuel 10000` after stable sibling-edge normalization. The two new
-cases require identical SQL and bindings for permuted main-graph and nested
-EXISTS sibling edges. An earlier run at 2000 million fuel reached 154 passes and
-then exhausted the shared module fuel budget; it did not report a failed
-assertion. This verifies the main and nested edge changes against the graph
-module, but it is not an Agent evaluation.
+稳定兄弟边规范化后，完整 icloud_model/tests/graph 用 --request-fuel 10000 通过 194/194。
+两新增案例要求主图及嵌套 EXISTS 兄弟边换序后 SQL、绑定一致。
+先前 2000 百万 fuel 运行通过 154 后耗尽模块共享预算，无断言失败。
+这验证图模块主／嵌套边改动，不是 Agent 评测。
 
-The planned OpenCode rerun of questions 04, 06, 08, and 09 was blocked before
-the first question was sent: the execution permission review identified that
-the question and knowledge-service responses would leave the machine for an
-external model provider. A separate isolated OpenCode startup check with a
-content-free `OK` prompt succeeded. No question content was sent in the
-blocked rerun. The four-question outcome remains unmeasured pending explicit
-authorization or a local model provider.
+计划重跑 04、06、08、09 在发送首题前被执行权限审查阻止：题目和知识响应将离机发给外部模型供应商。
+另一次隔离 OpenCode 启动检查用无内容 OK 提示成功。被阻止运行未发送题目内容，四题结果仍未测量，等待明确授权或本地模型。
 
-## Service-boundary rerun with business-only questions
+## 仅业务问题的服务边界重跑
 
-The earlier `Connection closed` preparation result was superseded: the HTTP MCP
-adapter served actual OpenCode tool calls. The host kept the IC snapshot and
-`telora-run` outside a fresh bubblewrap filesystem for each question. The Agent
-could see only the generic guide, one business-only question, a restricted
-OpenCode configuration, and three MCP tools. The sandbox did not mount the
-repository, runner, or wasm. No database was attached. OpenCode 1.18.32 used
-`deepseek/deepseek-flash`; snapshot SHA-256 was
-`8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`,
-runner SHA-256 was
-`b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`.
+此前 Connection closed 准备结果已被替代：HTTP MCP 适配器实际承接 OpenCode 工具调用。
+每题新 bubblewrap 文件系统，宿主持有 IC 快照和 runner；Agent 仅见通用指南、一个纯业务问题、受限配置和三个 MCP 工具。
+未挂仓库、runner、wasm，无数据库。OpenCode 1.18.32 用 deepseek/deepseek-flash；
+快照 SHA-256 `8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`，
+runner SHA-256 `b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`。
 
-| Question | Observation | Business-semantic assessment |
+| 问题 | 观察 | 业务语义评价 |
 | --- | --- | --- |
-| 04 | Used Server's own `server_health=warning`, `server_class=subrack`, the complete Site name, and `fan_parent_server`; produced a parameterized fan count and explicitly withheld a numeric result. | Pass. No PSU-health substitution or artifact inspection. |
-| 06 | Counted distinct non-null Alarm tenant references with more than five uncleared alarms, including orphan IDs. Called them "tenant entities" in prose. | The query matches the explicit inclusion rule; terminology is inaccurate. The old rubric's mandatory clarification was wrong because the business population was specified. |
-| 08 | Used Kunlun and asset-number filters, then counted distinct `site_id` values through `server_located_at_site`. | Pass on the ordinary meaning of "how many sites". Requiring a distinct-name question would import corpus SQL into the user's request. No numeric result was invented. |
-| 09, initial guide | Found the Server KPI raw-sample Max but invented a request clock and a 30-day Alarm window, tried many unsupported time spellings, and presented a Query before confirming scope. | Fail. Legal lowering did not establish the requested time semantics. |
-| 09, generic time contract added | Finally withheld a Query and asked for the request clock, calendar-vs-rolling window, and global-vs-per-server peak. It still tried one invented `ctx.now` during exploration and did not ask whether the KPI samples share the Alarm window. | Partial. The final business clarification improved, but trace-level clock discipline and window-scope alignment remain unresolved. |
+| 04 | 用服务器自身 server_health=warning、server_class=subrack、完整站点名及 fan_parent_server，生成参数化风扇计数，明确不给数值。 | 通过，无 PSU 替代或产物检查。 |
+| 06 | 统计超过五条未清除告警的不同非空租户引用，含孤儿，文字仍称租户实体。 | 查询符合显式纳入规则，术语不准；旧评分强制澄清错误，因为总体已明确。 |
+| 08 | 用昆仑及资产号筛选，经 server_located_at_site 计不同 site_id。 | “多少站点”通常含义下通过；强要求名称澄清会把语料 SQL 注入请求，未造数值。 |
+| 09，初始指南 | 找到内存原始 Max，却虚构请求时钟、30 天告警窗口，尝试多种不支持时间格式，未定范围就呈现 Query。 | 失败，合法转换不证明时间语义正确。 |
+| 09，增加通用时间契约 | 最后不提供 Query，询问时钟、日历／滚动及全局／逐服务器峰值；探索仍虚构一次 ctx.now，未问 KPI 是否共享告警窗口。 | 部分改善，调用记录的时钟纪律和窗口对齐未解决。 |
 
-The first four runs used the same cropped guide (SHA-256
-`1d5d6ad5633ff57b0c9c13a1fd93fc820099fc06d12c2c3734726fde5f20d9a5`)
-before its generic time-contract clarification; the fifth used guide SHA-256
-`1c12f0107252d279849c08db777fddb8aa8ff6300d35904e4c340cf2aaf1ebfc`.
-All five used one question per new OpenCode session. These are individual
-observations, not pass-rate estimates. The full nine-question business-only
-suite has not yet been rerun. In production SQL/bindings should be executed by
-the authorized backend and replaced by returned data in the user-facing answer.
+前四次用指南 `1d5d6ad5633ff57b0c9c13a1fd93fc820099fc06d12c2c3734726fde5f20d9a5`，
+第五次用 `1c12f0107252d279849c08db777fddb8aa8ff6300d35904e4c340cf2aaf1ebfc`。
+均一题一新会话，是独立观察，不是通过率；完整九题纯业务套件未重跑。
+生产中 SQL／绑定应由授权后端执行，以实际数据替代面向用户的中间输出。
 
-## Host-owned request context follow-up
+## 宿主持有请求上下文的后续验证
 
-The MCP adapter now accepts only `intent` from the Agent for `transform`;
-`ctx` in Agent tool arguments is rejected even if the caller bypasses the tool
-schema. The host can inject a fixed context through `ONTOLOGY_EVAL_CTX_JSON`.
-Without host context, a fresh 09 run did not fabricate one: its final answer
-asked about the Alarm-versus-KPI window, but still asked the business user for
-`ctx.now` and `ctx.tz` protocol values. The guide now distinguishes unavailable
-host context from a business choice.
+MCP 适配器现在仅接受 Agent 的 intent 参数，绕过工具模式传 ctx 也拒绝。
+宿主可通过 ONTOLOGY_EVAL_CTX_JSON 注入固定上下文。
+无宿主上下文的新 09 未虚构时钟，最终询问告警／KPI 窗口，但仍向业务用户索要 ctx.now、ctx.tz 协议值；指南现已区分宿主上下文缺失和业务选择。
 
-With host context `{"now":1790553600000,"tz":480}` supplied only to the
-adapter, another fresh 09 run used the provided clock, identified the
-Alarm-versus-KPI time-scope ambiguity, and asked that question in business
-language. It also showed an illustrative Query before the choice was resolved
-and silently treated "one month" as 30 days. This is an improvement in the
-boundary and clarification, not full semantic success. The adapter's local
-JSON-RPC check rejected Agent-supplied `ctx` with code `-32602`; its tool list
-advertised only `intent` for transform. The other questions were not rerun
-against this revised adapter.
+仅向适配器提供 `{"now":1790553600000,"tz":480}` 后，新 09 使用该时钟，识别告警／KPI 范围歧义并用业务语言提问。
+但选择未定前展示示例 Query，并悄悄把一月当 30 天，因此只是边界／澄清改善，不是完整语义成功。
+本地 JSON-RPC 检查以 -32602 拒绝 Agent ctx，工具列表 transform 仅广告 intent；其他题未按此版重跑。
 
-The updated source passed `check --only-types --lib --tests` in both `ontology`
-and `icloud_model`. `ontology/tests/ontology/intent` passed 15/15; IC
-`tests/knowledge` passed 24/24 with a 30000-million shared request-fuel budget.
-At 10000 million, the IC module exhausted fuel after 22 passes without an
-assertion failure.
+更新源在 ontology 和 icloud_model 均通过 check --only-types --lib --tests。
+ontology/tests/ontology/intent 通过 15/15；IC knowledge 在 30000 百万共享请求 fuel 下通过 24/24，10000 时通过 22 后耗尽，无断言失败。
 
-## Remaining business-only questions under the host-owned interface
+## 宿主接口下的剩余纯业务问题
 
-The same snapshot SHA-256 `8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`
-and no host time context were used for fresh isolated OpenCode sessions. Questions
-01, 02, 03, 05, and 07 initially used guide SHA-256
-`1ba7f982647125f781927ae252f4906490397ce778e3b53b24c254190664958a`.
-The adapter exposed only index, info, and context-free transform arguments.
+相同快照 `8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`，无宿主时间上下文，新隔离会话。
+01、02、03、05、07 初始用指南 `1ba7f982647125f781927ae252f4906490397ce778e3b53b24c254190664958a`，
+适配器仅暴露 index、info 及无上下文 transform 参数。
 
-| Question | Observation | Assessment |
+| 问题 | 观察 | 评价 |
 | --- | --- | --- |
-| 01 | Lowered the Site-to-Device-to-Alarm path, not the Alarm's separate Site reference; grouped by Site identity, applied uncleared and `count_having > 5`, then `count_groups`. | Pass on Model-backed query meaning; no numeric data was claimed. |
-| 02 | Used `top_per` over complete Device identity, read both port values and timestamp from one latest KPI sample, and qualified Site through `exists`. | Pass; the first main-graph Site join was repaired after transform feedback. |
-| 03 | Used the declared GPON (`spl`) and offline values, PON-port raw-sample Max, and the explicit UTC-second window `[2025-03-01 12:00:00, 2025-03-31 12:00:00)`. | Pass. The caller supplied an absolute reference instant in the business request, so no Agent-supplied `ctx` was needed. |
-| 05 | Correctly discovered that the business downstream link is directed A-to-Z, then used undirected physical attachment to count the reverse endpoint as "downstream". | Fail: a legal physical-adjacency query was mislabeled as a different business relation. |
-| 07 | Produced a valid grouped query using an inner join, then noted that zero-device Sites would be excluded and asked whether they should count. | Fail on decision order: a result-changing choice was unresolved when it presented one branch as the Query. |
+| 01 | 沿 Site→Device→Alarm 而非独立告警站点引用，按身份分组，筛未清除及 count_having > 5，再 count_groups。 | 模型业务含义通过，未宣称数值。 |
+| 02 | 完整设备身份 top_per，同一最新 KPI 行读两端口值与时间，以 exists 限定站点。 | 通过，首次主图站点连接经反馈修复。 |
+| 03 | 声明 GPON（spl）及离线值、PON 端口原始 Max、显式 UTC 秒窗口 `[2025-03-01 12:00:00,2025-03-31 12:00:00)`。 | 通过，业务请求给绝对参考时刻，不需 Agent ctx。 |
+| 05 | 发现业务下游为 A→Z，却用无向物理连接把反端计为下游。 | 失败，合法物理邻接查询被标成另一业务关系。 |
+| 07 | 先给合法内连接分组 Query，再说会排除零设备站点并询问是否计入。 | 决策顺序失败，影响结果的选择未定就把分支当答案。 |
 
-A short domain-neutral guide clarification was added: a query for one possible
-reading is exploratory, and another Model concept must not be renamed to match
-the user's words. Fresh 05 and 07 runs used guide SHA-256
-`4e1f34d919e9fb9370de45502e8c156f784713161108b8f21355bd1787ceb614`.
-Neither failure was resolved. In 05, the Agent acknowledged the A-to-Z
-definition but presented A-to-Z and Z-to-A as two "downstream" branches and
-handwrote a `UNION` SQL that was not produced by transform. In 07, it again
-presented the inner-join Query before asking whether zero-device Sites count.
-The prompt change remains a general semantic rule, but these observations do
-not demonstrate that this Agent reliably follows it. They also show why a
-successful transform alone cannot certify alignment with a natural-language
-request. No new database result was generated in any of these sessions.
+新增领域无关指南：一种理解的查询是探索，不能将另一模型概念重命名来匹配用户措辞。
+新 05、07 用 `4e1f34d919e9fb9370de45502e8c156f784713161108b8f21355bd1787ceb614`，两失败均未解决。
+05 承认 A→Z，却将正反两向都称下游并手写非 transform 生成的 UNION；07 仍先呈内连接再问零站点。
+通用规则保留，但不证明该 Agent 稳定遵循，也说明成功 transform 不能认证自然语言对齐。所有会话都未生成数据库结果。
 
-The service's `include_empty:true` lowering was checked separately with the
-07 filters: it used `LEFT JOIN (SELECT * FROM HuaweiStorageDevice WHERE
-subClassName = ?1 AND runningStatus = ?2)` and `count(sd.id) < ?3`, so zero
-qualifying devices remain countable. The zero-site choice is a real business
-ambiguity, not a missing left-join lowering capability.
+独立检查 07 的 include_empty:true：生成 `LEFT JOIN (SELECT * FROM HuaweiStorageDevice WHERE subClassName = ?1 AND runningStatus = ?2)` 和 `count(sd.id) < ?3`，可计零设备。
+零站点选择是业务歧义，不是左连接转换能力缺失。
 
-## Current boundary and unmet acceptance
+## 当前边界与未满足验收
 
-The MCP adapter now owns a persistent `telora-run --serve stdio+jsonl://`
-child instead of connecting to a separately listening Telora service. A local
-JSONL check confirmed an `ic/index` response, a structured transform
-diagnostic, and rejection of Agent-supplied `ctx`; no OpenCode rerun was used
-for this transport change. The runner and snapshot remain host-side.
-The earlier bubblewrap runs disabled Agent shell/file tools and did not mount
-host artifacts, but they did not isolate the PID namespace; they do not prove
-resistance to a future arbitrary-code tool that inspects host process metadata.
-The new child-process transport has not been rerun on a business question
-through OpenCode; the tool handshake check below is narrower.
+MCP 适配器改为持有常驻 telora-run --serve stdio+jsonl:// 子进程，不再连独立 Telora 监听服务。
+本地 JSONL 验证 ic/index、结构化诊断及拒绝 Agent ctx，传输改动未做 OpenCode 重跑，runner 和快照在宿主。
+此前 bubblewrap 禁用 shell／文件工具且不挂宿主产物，但未隔离 PID 命名空间，不能证明抵御未来任意代码工具读取宿主进程元数据。
+新子进程传输尚未通过 OpenCode 业务题重跑，下述握手验证更窄。
 
-## MCP stdio boundary follow-up
+## MCP stdio 边界后续
 
-The evaluation adapter also supports MCP over stdio. A byte-only bridge can
-connect an isolated client to the host adapter through two private FIFOs,
-without mounting `telora-run` or the snapshot in the sandbox. A targeted
-bubblewrap check with filesystem and PID isolation returned
-MCP initialization, the three-tool list, and an `index` knowledge response
-over this channel. In the same mount profile, the snapshot and source paths
-were absent and the host process table was not visible. The host-side snapshot
-for this check was SHA-256
-`e720f4976c84054b82992348b315edc4d39a340bca36eec33e56c488a6fa7154`;
-the runner was SHA-256
-`b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`.
-The machine did not permit an isolated network namespace, so the check shared
-the network namespace, but no MCP or Telora listener was started in that check.
-OpenCode 1.18.32 loaded a temporary `local` MCP configuration and started the
-bridge with the expected FIFO paths, then closed its stdin before sending an
-MCP request and reported `Connection closed`. The temporary configuration was
-reverted; the working OpenCode evaluation still uses loopback HTTP. No new
-question run or end-to-end stdio OpenCode claim follows from this check.
-The same failure occurred with OpenCode and the bridge both running on the
-host, using a temporary in-memory OpenCode configuration; it is not caused by
-bubblewrap mounts or PID isolation. An initial attempt to test PID-isolated
-OpenCode on the HTTP route could not bind the loopback listener in the ordinary
-command sandbox (`listen EPERM`); the later authorized local-listener check
-below supersedes that limitation.
-A minimal standalone MCP stdio server with no ontology, FIFO, runner, or wasm
-dependency also answered `initialize` and `tools/list` correctly when called
-directly, yet OpenCode 1.18.32 reported the same pre-request `Connection
-closed` for it. The probe was removed after the check. This local MCP failure
-must be addressed in the OpenCode client or its runtime environment before a
-stdio-only OpenCode evaluation can replace the current endpoint.
+适配器也支持 stdio MCP。纯字节桥通过两个私有 FIFO 连接隔离客户端与宿主，无需挂 runner 或快照。
+专项文件系统和 PID 隔离 bubblewrap 检查返回初始化、三工具列表及 index；相同挂载下快照和源路径不存在，宿主进程表不可见。
+快照 SHA-256 `e720f4976c84054b82992348b315edc4d39a340bca36eec33e56c488a6fa7154`，
+runner `b996628e5aebaab40b640be17ec1fbd86e169e08d47b190b8016668bb7aa0220`。
+机器不允许隔离网络命名空间，因此共享网络，但该检查未启动 MCP／Telora 监听器。
+OpenCode 1.18.32 加载临时 local MCP 配置并以正确 FIFO 路径启动桥，却在发送 MCP 请求前关闭 stdin，报告 Connection closed。
+临时配置已恢复，正常评测仍用回环 HTTP；不据此宣称新业务题或端到端 stdio 成功。
+OpenCode 和桥同在宿主、使用临时内存配置时也失败，故非 bubblewrap 挂载或 PID 隔离导致。
+初次 PID 隔离 HTTP 检查在普通命令沙箱不能绑定回环（listen EPERM），后续已授权监听检查替代此限制。
+最小独立 stdio MCP 服务不依赖本体、FIFO、runner、wasm，直接调用可正确答 initialize 和 tools/list，OpenCode 仍在请求前 Connection closed。
+探测已删除。须修复 OpenCode 客户端或运行环境，纯 stdio 评测才能替代当前端点。
 
-The current evaluation accepts the restricted loopback MCP entry; stdio-only
-OpenCode access is not a #15 acceptance gate. With the adapter hosted on
-`127.0.0.1:18016`, `opencode mcp list` reported `ontology connected` from a
-bubblewrap process with filesystem and PID namespaces isolated. A check using
-the same mount pattern found neither the snapshot nor source paths, and its
-`/proc` exposed only two sandbox PIDs. The host adapter continued to own the
-snapshot and persistent stdio `telora-run` child. This is a transport/isolation
-handshake only: no business question or Model knowledge was sent to the external
-model, and it does not replace the earlier nine-question semantic observations.
+本轮接受受限回环 MCP，纯 stdio OpenCode 不是 #15 门槛。
+适配器运行在 127.0.0.1:18016，文件系统及 PID 隔离 bubblewrap 中 opencode mcp list 报 ontology connected。
+相同挂载找不到快照／源，/proc 仅两个沙箱 PID，宿主仍持有快照和常驻 stdio 子进程。
+仅验证传输／隔离握手，未向外部模型发送业务题或知识，不替代此前九题语义观察。
 
-The following hard acceptance points are **not yet met**: 05 still relabels a
-physical connection as downstream and once presented handwritten `UNION` SQL;
-07 presents one population before resolving whether zero-device Sites count;
-09 has not consistently resolved calendar/rolling and Alarm/KPI time scope
-before presenting a Query; 06's query follows the explicit orphan-ID rule but
-its prose calls an orphan reference an existing Tenant entity. These are
-observed Agent semantic-alignment failures, not evidence that the legal
-ontology query paths should be deleted. No production data execution layer
-was part of this evaluation; generated SQL remains intermediate output.
+以下硬验收**仍未满足**：05 重命名物理连接为下游且曾手写 UNION；07 未定零站点就给一类总体；
+09 未稳定在呈现 Query 前解决日历／滚动及告警／KPI 窗口；06 查询符合孤儿 ID 纳入规则但文字称其现存实体。
+这些是 Agent 语义对齐失败，不证明应删除合法本体路径。无生产执行层，SQL 仍是中间产物。
 
-This evaluation wave stops at these observed limits. It does not add a second
-semantic-confirmation service or execution gate: that would introduce a
-separate workflow beyond knowledge discovery and Model-backed lowering.
-The unresolved Agent interpretations remain recorded as failed or partial
-results, not reclassified as passing cases.
+本轮止于这些观察限制，不添加第二语义确认服务或执行门槛，否则会引入知识发现与模型转换之外的独立工作流。
+未解决解释仍记录为失败或部分，不改列为通过。
 
-## Receipt-only evaluation protocol
+## 仅回执评测协议
 
-The evaluator and user subsequently revised the acceptance boundary. The
-candidate now submits an Intent to `ontology_transform`; the host stores the
-Intent, optional host context, and generated Query in a private JSON file and
-returns only an opaque receipt. The Agent must explain the accepted Intent in
-business language and compare that explanation with the request. A reasonable
-explicit interpretation can pass without guessing a hidden corpus-SQL shape or
-asking about every possible ambiguity. Model-invalid paths and unvalidated
-handwritten SQL remain unacceptable. Questions 05, 06, 07, and 09 in the rubric
-reflect this revised reading; older score rows above are historical, not new
-scores under this protocol.
+随后评测者和用户修改边界：候选提交 Intent，宿主在私有 JSON 存 Intent、可选宿主上下文及 Query，仅返回不透明回执。
+Agent 须用业务语言解释并与请求对照。合理显式解释可通过，不必猜隐藏语料 SQL 或询问全部可能歧义。
+模型非法路径、未验证手写 SQL 仍不可接受。评分准则 05、06、07、09 已反映新解释，上表旧分数是历史，不是新协议评分。
 
-The receipt boundary passed a direct test and a smoke call against an existing
-IC snapshot: the successful MCP response contained only a receipt, while the
-mode-0600 host record contained the submitted Intent and SQL/bindings. A failed
-Intent returned structured diagnostics and created no record. No OpenCode
-business-question rerun or database execution has yet been performed under
-this protocol, so it does not establish an improved Agent pass rate.
+回执边界通过直接测试及现有 IC 快照冒烟：成功 MCP 仅含回执，0600 宿主记录含 Intent、SQL／绑定；失败返回结构化诊断且不写记录。
+此时尚无该协议下 OpenCode 业务重跑或数据库执行，不证明通过率改善。
 
-## Nine-question rerun with receipt-only tools
+## 仅回执工具九题重跑
 
-This rerun used `deepseek/deepseek-flash`, one fresh isolated OpenCode session
-per question, IC snapshot SHA-256
-`8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`,
-and candidate guide SHA-256
-`4b759793b9ae30da36e5a7968bf5db23f44bb23364fd8734e7c0d1e68bebf9ae`.
-Only the guide, question, and restricted MCP configuration were mounted in
-each Agent's work area. The host kept the snapshot, runner, and mode-0600
-receipt files outside that filesystem. The adapter exposed no SQL/bindings to
-the Agent. All nine OpenCode runs exited successfully; no database was attached.
-The `transform` counts include rejected and exploratory submissions, not just
-the final cited receipt.
+使用 deepseek/deepseek-flash，每题新隔离 OpenCode 会话，快照
+`8edf45f65f25c91df1f37227543f4aadca28e11d937562c97d0cda7163e9ea0b`，指南
+`4b759793b9ae30da36e5a7968bf5db23f44bb23364fd8734e7c0d1e68bebf9ae`。
+Agent 区仅挂指南、题目、受限 MCP 配置，宿主在外保留快照、runner 和 0600 回执，不向 Agent 暴露 SQL／绑定。
+九次均成功退出，无数据库。transform 次数包括拒绝及探索，不只最终回执。
 
 | 题目 | transform 次数 | 按最终回执核对的观察 |
 | --- | ---: | --- |
@@ -285,38 +166,23 @@ the final cited receipt.
 | 08 | 2 | 按昆仑服务器资产号过滤，沿服务器到站点关系按 Site ID 去重计数，未擅加在线条件。 |
 | 09 | 4 | 没有 host 时间时拒绝把无时间窗的探索回执当作答案，也没有自行编造 `now`。 |
 
-For a separate 09 rerun, the host supplied
-`{"now":1790598253999,"tz":480}` (2026-09-28 20:24:13 UTC+8). One transform
-was accepted. The Agent explained that only the critical-Alarm predicate was
-time-limited and the memory peak covered all available KPI samples. It chose
-`{"calendar":"month","offset":-1}` through `now`, which materialized as
-2026-08-01 00:00 through 2026-09-28 20:24 local time, nearly two months. The
-response mentioned a calendar-month boundary and offered a rolling-30-day
-alternative, but did not state these concrete dates. Thus its chosen scope is
-visible enough to invite correction, yet the time-range explanation remains
-less precise than the actual stored Intent. Neither run produced a data answer.
 
-The rerun supports the value of host-only Query persistence and business
-paraphrase, but does not prove that the Agent always checks its paraphrase
-against the submitted Intent: question 05 is a counterexample. Question 07
-shows an exposed, correctable assumption rather than a silent semantic swap.
-Question 09 shows that relative calendar boundaries should be explained as
-actual business dates when the host has resolved them. These are Agent/workflow
-findings; no new ontology lowering defect was established by this rerun.
+另一次 09 由宿主提供 `{"now":1790598253999,"tz":480}`（2026-09-28 20:24:13 UTC+8），一次 transform 接受。
+Agent 说明只限制紧急告警时间，内存峰值覆盖全部 KPI。
+选择从 `{"calendar":"month","offset":-1}` 到 now，实际为本地 2026-08-01 00:00 至 2026-09-28 20:24，近两月。
+回复提到日历月边界并给滚动 30 天备选，却未列具体日期，范围足够可见以便纠正，但解释不如存储 Intent 精确；两次均无数据答案。
 
-## Agent-resolved-time branch rerun (2026-09-29)
+重跑支持宿主专有 Query 持久化与业务复述的价值，但不证明 Agent 总核对复述和 Intent，05 是反例。
+07 是公开可纠正假设而非隐蔽语义替换；09 说明宿主解析相对日历边界后应解释实际业务日期。
+这些是 Agent／工作流发现，本轮未确立新本体转换缺陷。
 
-This run used `deepseek/deepseek-flash`, fresh OpenCode sessions, the
-`feat/agent-resolved-time` snapshot SHA-256
-`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`,
-and Agent guide SHA-256
-`2a2100e1cc8ac78eaecc251bbd49504aae81770c67194804b8cba64601400466`.
-The adapter retained Intent and Query in host-only receipts; the Agent saw only
-receipts or diagnostics. The Agent work directories contained only the guide,
-question, and restricted OpenCode configuration, but this run did **not**
-repeat the earlier bubblewrap filesystem/PID isolation check. It therefore
-measures behavior, not a newly proven hard-isolation boundary. All nine runs
-exited successfully. No SQL was executed against a database.
+## Agent 解析时间分支重跑（2026-09-29）
+
+使用 deepseek/deepseek-flash、新 OpenCode 会话，feat/agent-resolved-time 快照
+`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`，指南
+`2a2100e1cc8ac78eaecc251bbd49504aae81770c67194804b8cba64601400466`。
+宿主回执保留 Intent、Query，Agent 只见回执或诊断。工作目录仅含指南、问题、受限配置，但**未重复**此前 bubblewrap 文件系统／PID 隔离检查，故只测行为，不新证明硬隔离。
+九次均成功退出，未执行数据库 SQL。
 
 | 题目 | transform 次数 | 最终观察 |
 | --- | ---: | --- |
@@ -346,61 +212,35 @@ exited successfully. No SQL was executed against a database.
 可由用户纠正。新的时间契约消除了旧版 09 的相对边界/解释不一致，尚不能
 证明 Agent 总能选对业务时间口径。
 
-## Generic capability-stop prompt, question 05
 
-After the nine-question rerun, only the generic Agent workflow was changed.
-It now requires an accepted Intent for each complete claimed result, forbids
-treating separate receipts as an implicit combined result, and asks the Agent
-to stop when the full meaning cannot be expressed. A second generic sentence
-asks it to distinguish missing Model knowledge from unsupported composition of
-known paths. Neither guide mentions question 05, A/Z roles, or `UNION`.
+## 通用能力不足停止提示：问题 05
 
-Both comparison runs used the same snapshot SHA-256
-`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`,
-model `deepseek/deepseek-flash`, question 05, host-owned receipt adapter, and
-fresh OpenCode sessions. The first candidate guide SHA-256 was
-`de8435cd215d75f0d4243cbf0291a39d367c122bfe91d3f1f5164e8a2e52a89a`;
-the second was
-`40f073556323bb7c1c733d0b5bd47ed1a4b205c441e6fe107d3cceabad84bd7d`.
-As in the previous rerun, these work directories were not newly proven to be
-filesystem/PID-isolated. Transcript durations are observed wall time, not a
-controlled latency benchmark.
+九题重跑后只改通用工作流：每个完整声称结果须有接受的 Intent，不能把独立回执当隐式合并结果，完整含义不可表达时停止。
+另一通用句要求区分模型知识缺失和已知路径组合不支持。两版均未提 05、A/Z 或 UNION。
 
-| Guide | transform calls | Transcript duration | Final behavior |
+两次比较使用相同快照 `a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`、
+deepseek/deepseek-flash、05、宿主回执适配器和新会话。
+首版指南 `de8435cd215d75f0d4243cbf0291a39d367c122bfe91d3f1f5164e8a2e52a89a`，
+次版 `40f073556323bb7c1c733d0b5bd47ed1a4b205c441e6fe107d3cceabad84bd7d`。
+同前轮，未重新证明文件系统／PID 隔离，记录耗时是观察墙钟时间，不是受控延迟基准。
+
+| 指南 | transform 次数 | 记录耗时 | 最终行为 |
 | --- | ---: | ---: | --- |
-| Previous nine-question guide | 36 | ~9m 13s | Claimed two receipts plus a false single-Intent equivalent; the latter used `AND` across the two endpoint filters. |
-| Complete-result/stop rule | 9 | ~2m 21s | Stopped without claiming a complete Intent. It incorrectly attributed the limit partly to absent Model knowledge and suggested adding a flow field. |
-| Stop rule plus evidence-based attribution | 11 | ~2m 30s | Stopped without a complete-result claim and identified unsupported composition of known paths as the principal limit. |
+| 先前九题指南 | 36 | 约 9 分 13 秒 | 声称两回执加错误单 Intent 等价形式，后者把两端点条件 AND。 |
+| 完整结果／停止规则 | 9 | 约 2 分 21 秒 | 停止且不声称完整 Intent，但部分错误归因为模型知识缺失并建议流向字段。 |
+| 停止加证据归因 | 11 | 约 2 分 30 秒 | 不声称完整结果，识别主要限制是已知路径组合不支持。 |
 
-The second candidate still emphasized the conflict between the conventional
-directed meaning of "downstream" and the user's explicit reverse-end inclusion.
-It did not present a partial query as the requested result. This is a clear
-improvement in this one case, not proof that the rule will generalize or that
-prompting can replace the missing Intent set-operation capability. No database
-query was executed.
+第二候选仍强调常规有向“下游”和用户显式反向纳入冲突，但未把部分查询当请求结果。
+该单例明显改善，不证明规则可泛化或提示可替代缺失集合能力，未执行数据库。
 
-The guide was subsequently revised to favor one Intent while allowing up to
-five separately accepted plans when that better serves the user's purpose.
-The comparisons above describe earlier guide versions, not a score for the
-revised multi-plan workflow.
+之后指南改为优先一项、必要时允许最多五个独立接受计划；上表是更早版本，不是新版多计划评分。
 
-With the later MCP batch entry, question 05 was run once more using
-`deepseek/deepseek-flash`, the same IC snapshot SHA-256
-`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`,
-and candidate guide SHA-256
-`54bcce22ccc8c87c3b5ca0e24f569e8a4f64472bb6d1de154a9ca63c8694f43e`.
-The Agent submitted two Intents together and received one grouped receipt.
-The first filters one-way links where the selected device is at A and returns
-Z; the second filters the same link class where it is at Z and returns A.
-Each query projects device ID and name with within-query distinctness. The
-Agent explained the two business slices and explicitly noted that the service
-does not deduplicate across them. This is a useful decomposition, not a single
-unioned result.
+后续 MCP 批量入口又跑一次 05，使用 deepseek/deepseek-flash、同快照
+`a265e27b075a2360e554d2204f3b295db63a27cc7349cfc9a1e96d258ccbef26`，指南
+`54bcce22ccc8c87c3b5ca0e24f569e8a4f64472bb6d1de154a9ca63c8694f43e`。
+Agent 一起提交两 Intent，得到分组回执。第一项筛所选设备在 A 的单向链路返回 Z，第二项筛同类链路设备在 Z 返回 A。
+每项投影设备 ID、名并在查询内去重；解释两个业务切片，明确服务不跨项去重。这是有用分解，不是单一并集。
 
-The question did not supply concrete device or tenant identifiers. The Agent
-bound literal strings `DEV-XXX` and `TEN-XXX` and only then asked for the real
-values. The receipt therefore demonstrates a valid query *shape*, not a query
-ready to return the requested device data. The missing identifiers are a gap
-in the evaluation question, not a failure of the two-path decomposition. No
-database was executed, and this run does not establish behavior for every
-ambiguous request.
+题目未给具体设备和租户 ID，Agent 绑定 DEV-XXX、TEN-XXX 后才询问真实值。
+回执只证明查询*形状*合法，不代表可立即查询目标设备；缺 ID 是题目缺口，不是两路径分解失败。
+无数据库执行，也不证明所有歧义请求下的行为。

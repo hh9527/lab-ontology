@@ -1,10 +1,8 @@
-# QueryAst and SQL materialization
+# QueryAst 与 SQL 生成
 
-`ontology/query` is the backend-neutral, closed query vocabulary. It does not
-know dataset names, business dimensions, or authorization. Ontology lowering
-constructs a `QueryAst`; `ontology/sqlite` or `ontology/postgres` materializes
-it once as a parameterized `Query`. The authoritative type and constructor
-signatures are in [`query.telora`](../src/query.telora).
+`ontology/query` 是与后端无关的封闭查询词汇表，不感知数据集名称、业务维度或授权。
+本体转换构造 `QueryAst`，由 `ontology/sqlite` 或 `ontology/postgres` 一次性生成参数化 `Query`。
+类型和构造函数签名以 [`query.telora`](../src/query.telora) 为准。
 
 ```telora
 use ontology::query as qb;
@@ -27,77 +25,47 @@ def one_row_query: Fn() -> qb::Query = fn() {
 };
 ```
 
-The example illustrates resource allocation and a complete row Plan. See
-[`ontology/tests/postgres.telora`](../tests/postgres.telora) and the ontology
-lowering code for complete query constructions.
+本例展示资源分配及完整的行查询 Plan。完整查询构造参见
+[`ontology/tests/postgres.telora`](../tests/postgres.telora) 和本体转换代码。
 
-## Construction boundary
+## 构造边界
 
-`AggregateFunction::Latest` requires `AggregateCall.latest` containing a closed
-time/grain ordering specification; ordinary calls require `latest:None`.
-Renderers introduce a shared pre-group row number and reduce only the selected
-row for Latest, preserving other aggregates' complete populations. Flat scalar
-subqueries, ranked-key subqueries and direct nested aggregate predicates reject
-Latest. See [Latest measures](LATEST-DESIGN.md) for declarations and semantics.
+`AggregateFunction::Latest` 要求 `AggregateCall.latest` 包含封闭的时间与粒度排序规范；普通聚合要求 `latest:None`。
+渲染器在分组前生成共享行号，Latest 仅归约选中的行，同时保留其他聚合的完整总体。
+扁平标量子查询、排名键子查询和直接嵌套聚合谓词拒绝 Latest。声明和语义见[最新值度量](LATEST-DESIGN.md)。
 
-`BuildCtx` is immutable. Builders take it as input and return a new context
-alongside the allocated resource. `bind(ctx, Val)` registers a scalar and
-returns an expression carrying its binding index; the scalar never becomes
-SQL template text. `source_with_hint(ctx, table, hint)` allocates a unique
-source alias from the hint. Column references use that source handle and a
-trusted column symbol. The model supplies table and column symbols; they are
-validated as identifiers, never accepted as SQL fragments. SQLite emits the
-validated names directly, while PostgreSQL quotes them to preserve case.
+`BuildCtx` 不可变。构造函数接收上下文，并同时返回新上下文与已分配资源。
+`bind(ctx, Val)` 注册标量并返回携带绑定索引的表达式，标量不会成为 SQL 模板文本。
+`source_with_hint(ctx, table, hint)` 根据提示分配唯一源别名。列引用使用该源句柄及可信列符号。
+表、列符号由模型提供，按标识符校验，不能作为 SQL 片段接受。SQLite 直接输出已校验名称，PostgreSQL 加引号以保留大小写。
 
-`Plan` represents a closed relational plan: sources or a derived source,
-projection, filters, joins, correlated existence, grouping, HAVING, ordering,
-paging, and the supported restricted ranking/comparison forms. `QueryPlan`
-chooses a result shape: `Rows`, `DistinctRows`, `SetRows`, `SetCount`,
-`GroupCount`, `JoinedGroups`, or `JoinedGroupCount`. `finish(ctx, plan)` seals
-the allocation context and validated plan into one `QueryAst`; neither
-unfinished `Ctx` nor `Plan` crosses the renderer boundary. The AST cannot
-contain raw SQL, arbitrary functions, or literal fragments.
+`Plan` 表示封闭关系计划：源或派生源、投影、筛选、连接、相关存在判断、分组、HAVING、排序、分页，以及受支持的受限排名与比较形式。
+`QueryPlan` 选择结果形状：`Rows`、`DistinctRows`、`SetRows`、`SetCount`、`GroupCount`、`JoinedGroups` 或 `JoinedGroupCount`。
+`finish(ctx, plan)` 将分配上下文与已校验计划封装为 `QueryAst`；未完成的 `Ctx` 或 `Plan` 不跨越渲染器边界。
+AST 不能包含原始 SQL、任意函数或字面量片段。
 
-`QueryAst.result_limit` is an optional allocated positive integer binding for the
-final output cap. Public Intent lowering supplies it only when `limit` is
-a positive integer; omission, null and `finish` leave it absent, preserving QueryBuilder
-behavior. It is independent of `Plan.limit`,
-partition `take`, joined-group rank `take`, and business profile permissions.
-Both renderers validate its binding and apply it only to the final result SELECT.
-An existing final business limit combines with it using the smaller bound while
-retaining the original ORDER BY; PostgreSQL explicitly casts both CASE operands
-to BIGINT. Nested operands and Latest/window input stages remain unchanged.
+`QueryAst.result_limit` 是可选的已分配正整数绑定，用于最终输出上限。
+公共 Intent 转换仅在 `limit` 是正整数时提供它；省略、null 以及 `finish` 均保持缺省，保留 QueryBuilder 行为。
+它独立于 `Plan.limit`、分区 `take`、连接分组排名 `take` 及业务配置权限。
+两个渲染器均校验其绑定，并仅应用于最终结果 SELECT。若已有最终业务上限，则取较小值且保留原 ORDER BY；PostgreSQL 将 CASE 两侧显式转换为 BIGINT。
+嵌套操作数及 Latest／窗口输入阶段不变。
 
-`JoinedGroups` carries separate `left_identity` / `right_identity` expressions,
-hidden key aliases, and ordered `outputs` with side, column and result alias.
-Key projections must match the identity expressions and belong to operand
-grouping, without including display grouping expressions. Model lowering
-enforces complete identities and display attributes from aligned nodes.
+`JoinedGroups` 携带独立的 `left_identity`／`right_identity` 表达式、隐藏键别名，以及按序排列且包含侧别、列和结果别名的 `outputs`。
+键投影必须匹配身份表达式并属于操作数分组，不能混入展示分组表达式。模型转换强制要求完整身份和来自已对齐节点的展示属性。
 
-`JoinedGroups.rank` supports Subtract, Ratio and GrowthRate with an explicit
-first side (the second side is the opposite) and bound limit 1..1000.
-GrowthRate uses first as current and second as baseline. Renderers exclude
-NULL measures, zero Ratio denominators and nonpositive GrowthRate baselines,
-cast operands to double precision, and also guard division with NULLIF.
-Ties use complete alignment identities ascending, NULLS FIRST. Ranked results
-append numeric `comparison_value` and order by that column; unranked results
-do not add it. JoinedGroupCount rejects ranking. Model lowering checks
-numeric types, units and profile authorization. See [GraphPair](GRAPH-PAIR.md).
+`JoinedGroups.rank` 支持 Subtract、Ratio 和 GrowthRate，显式指定第一侧（第二侧为另一侧）及绑定上限 1..1000。
+GrowthRate 将第一侧作为当前值，第二侧作为基线。渲染器排除 NULL 度量、Ratio 的零分母及 GrowthRate 的非正基线，将操作数转为双精度，并用 NULLIF 保护除法。
+并列时按完整对齐身份升序、NULLS FIRST 决胜。排名结果追加数值列 `comparison_value` 并按该列排序；不排名时不添加该列。
+JoinedGroupCount 拒绝排名。模型转换校验数值类型、单位和配置授权，详见 [GraphPair](GRAPH-PAIR.md)。
 
-Model-backed type and grain checks belong to ontology lowering. The query
-module also validates structural invariants such as source visibility,
-expression shape, and closed operator use. A bare AST caller is responsible
-for the physical schema behind trusted symbols. This split must not be read
-as permission for a renderer to reinterpret a valid AST.
+模型类型和粒度校验属于本体转换层。query 模块还校验源可见性、表达式形状和封闭操作符使用等结构不变量。
+直接调用 AST 的调用方负责可信符号背后的物理模式。此职责划分不允许渲染器重新解释合法 AST。
 
-## Materialization boundary
+## 生成边界
 
-SQLite, PostgreSQL and UQL expose `build_query(QueryAst) -> Query`, where `Query` has
-`sql: String` and `bindings: Array(Val)`. The same allocated binding handle
-becomes `?n` in SQLite and `$n` in PostgreSQL and UQL. `bindings[n-1]` supplies the
-value for handle `n`; repeated references reuse that handle. A renderer
-handles identifier quoting and its own syntax/functions without reverse
-parsing an SQL string or escaping data values into the template.
+SQLite、PostgreSQL 和 UQL 提供 `build_query(QueryAst) -> Query`，其中 `Query` 包含
+`sql: String` 与 `bindings: Array(Val)`。同一绑定句柄在 SQLite 中变为 `?n`，在 PostgreSQL 和 UQL 中变为 `$n`。
+`bindings[n-1]` 提供句柄 `n` 的值；重复引用复用该句柄。渲染器负责标识符引用及自身语法、函数，不反向解析 SQL，也不将数据值转义后拼入模板。
 
 ```telora
 use ontology::sqlite as sqlite;
@@ -105,13 +73,10 @@ use ontology::postgres as postgres;
 use ontology::uql as uql;
 
 let sqlite_query = sqlite::build_query(ast);
-# In a PostgreSQL-backed service, select postgres::build_query instead.
-# In a UQL-backed service, select uql::build_query instead.
+# PostgreSQL 服务选择 postgres::build_query。
+# UQL 服务选择 uql::build_query。
 ```
 
-The service picks one backend when it constructs its lowering function; a
-request cannot mix dialects. See [DIALECT-CONTRACT.md](DIALECT-CONTRACT.md)
-for semantic parity and PostgreSQL admission status, and [UQL.md](UQL.md)
-for the UQL execution contract and verification scope. SQL and bindings are
-intermediate execution artifacts, not user-facing business answers. The
-service protocol is documented in [USAGE.md](../../USAGE.md).
+服务构造转换函数时选择一个后端，请求不能混用方言。语义一致性和 PostgreSQL 准入状态见[方言契约](DIALECT-CONTRACT.md)，
+UQL 执行契约与验证范围见 [UQL](UQL.md)。SQL 和绑定是中间执行产物，不是面向用户的业务答案。
+服务协议见[使用说明](../../USAGE.md)。

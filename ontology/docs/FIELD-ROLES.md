@@ -1,10 +1,8 @@
-# Field roles and object references
+# 字段角色与对象引用
 
-Tracked in issue #33. These declarations expose business use to Agents and
-future report planning. They do not add query operations, automatically
-generate links, resolve objects, or choose a default identity display.
+由议题 #33 跟踪。这些声明向 Agent 和后续报表规划暴露业务用途，不增加查询操作、不自动生成链接、不解析对象，也不选择默认身份展示方式。
 
-## Declaration
+## 声明
 
 ```telora
 @edsl::reference("local", ["tenant_id", "device_id"])
@@ -23,77 +21,51 @@ type Device = struct {
 };
 ```
 
-This example shows semantic declarations only. A complete queryable type
-also needs its usual source, column and capability annotations.
+本例只展示语义声明。完整可查询类型还需要常规的源、列和能力注解。
 
-| Role | Meaning | Does not imply |
+| 角色 | 含义 | 不表示 |
 | --- | --- | --- |
-| Appellation | Participates in identity display/expression | Uniqueness, default display or a display template |
-| Reference | Participates in a declared unique address | That one member of a composite address is sufficient |
-| Classification | Describes a business category | A closed value domain or filter capability |
-| Metric | Describes quantitative use | A unit, aggregation rule or queryable measure |
+| Appellation | 参与身份展示或表达 | 唯一性、默认展示或展示模板 |
+| Reference | 参与已声明的唯一地址 | 复合地址中的单个成员已经足够 |
+| Classification | 描述业务分类 | 闭合值域或筛选能力 |
+| Metric | 描述定量用途 | 单位、聚合规则或可查询度量 |
 
-Roles may overlap: uuid above has Appellation and the derived Reference role.
-No role is guessed from an attribute name. Formal `sample_measure` declarations
-also derive Metric; explicitly labeling the same field Metric does not
-duplicate it. A numeric field or count measure does not automatically become
-Metric. Sample measure metadata defines units and aggregation.
+角色可以重叠：上例 uuid 同时具有 Appellation 和派生的 Reference。不会从属性名猜测角色。
+正式 `sample_measure` 声明也派生 Metric；同一字段再显式标记 Metric 不会重复。
+数值字段或计数度量不会自动成为 Metric。样本度量元数据定义单位和聚合。
 
-## Unique reference sets
+## 唯一引用集合
 
-Each named reference is a trusted claim that its complete tuple uniquely
-determines one object within the declaring dataset/type. Members of one set
-participate together; different sets are alternative addresses. A reference
-is dataset-qualified: the same tuple in another dataset is a different address.
+每个具名引用都是一项可信声明：其完整元组在声明的数据集／类型内唯一确定一个对象。
+同一集合的成员共同参与，不同集合是可替代地址。引用以数据集限定；相同元组在另一数据集中是不同地址。
 
-For two tenants both using device_id D001, (T1, D001) and (T2, D001) are
-different local addresses. D001 alone is incomplete. A global uuid is a
-separate address for the same object. Display names may repeat or change
-without changing either address. Preparation does not inspect stored values
-to prove uniqueness, and this API does not implement address resolution.
+两个租户都使用 device_id D001 时，(T1, D001) 和 (T2, D001) 是不同本地地址，单独 D001 不完整。
+全局 uuid 是同一对象的另一地址。显示名称可以重复或变化，而不改变地址。
+准备阶段不检查存储值来证明唯一性，本 API 也不实现地址解析。
 
-Reference ids and sets must be nonempty; ids are distinct per type; members
-must exist and be distinct. Members may be `T` or `Option(T)`, where T is
-a scalar or closed enum; nonscalar members fail preparation.
-Equivalent sets with reordered members are duplicates. Declaration order is
-preserved but does not assign priority. Direct field_role(Reference) fails:
-membership must come from a complete type-level reference.
+引用 ID 和集合不得为空，ID 在类型内唯一，成员必须存在且互异。成员可为 `T` 或 `Option(T)`，T 必须是标量或闭合枚举；非标量成员导致准备失败。
+仅成员顺序不同的等价集合视为重复。声明顺序被保留，但不代表优先级。
+直接使用 field_role(Reference) 会失败，成员身份必须来自完整的类型级引用。
 
-References do not change primary keys, grain, count identity, joins or query
-authorization. Existing key/grain declarations are not implicitly converted
-into references. A supplied address must contain all members and valid non-NULL
-values; enforcing that input contract belongs to a future address consumer.
+引用不改变主键、粒度、计数身份、连接或查询授权。已有键／粒度声明不会隐式转为引用。
+输入地址必须包含全部成员及有效非 NULL 值；执行这一输入契约属于未来地址消费方的职责。
 
-`Option(T)` expresses field nullability directly in the type system. A
-reference with optional members is unique whenever all its members are
-present; a missing member makes the whole address unavailable. NULL is not
-an address value. Such a reference does not establish a total row identity:
-nullable fields remain forbidden as primary keys or dataset grain members.
-Types without a key or declared grain still support raw field queries and
-relation traversal; object counts and identity grouping require an independently
-declared total identity. Query preparation retains nullability while checking
-operands against T, including joins between T and Option(T).
+`Option(T)` 在类型系统中直接表示可空性。包含可选成员的引用在全部成员存在时唯一；任一成员缺失则整个地址不可用。NULL 不是地址值。
+这种引用不能建立全行身份：主键或数据集粒度成员仍禁止可空字段。
+没有键或声明粒度的类型仍支持原始字段查询和关系遍历；对象计数及身份分组需要独立声明的全行身份。
+查询准备在按 T 校验操作数时保留可空性，包括 T 与 Option(T) 之间的连接。
 
-## Discovery
+## 发现
 
-Dataset detail adds `references: [{id,fields}]` and
-`field_roles: [{field,roles}]`. Field detail adds `roles`, `reference_ids`, and
-`nullable`, derived from the model field's `Option(T)` type.
-Members use model field names, not SQL columns or dimension ids. A model
-field name is not query vocabulary: an Agent still needs an authorized
-dimension or measure to retrieve its value.
+数据集详情增加 `references: [{id,fields}]` 和 `field_roles: [{field,roles}]`。
+字段详情增加 `roles`、`reference_ids`，以及从模型字段 `Option(T)` 派生的 `nullable`。
+成员使用模型字段名，不是 SQL 列名或维度 ID。模型字段名不是查询词汇；Agent 仍需获授权的维度或度量来获取其值。
 
-Roles do not publish otherwise invisible fields. Public discovery filters
-roles by existing visibility and publishes a reference only when all members
-are visible. It never truncates a composite reference. Internal prepared
-metadata retains all declarations. Dataset links lead to the shared
-`syntax/model/field_roles` contract when roles/references are present.
+角色不会发布原本不可见的字段。公共发现按现有可见性筛选角色，只有全部成员可见时才发布引用，绝不截断复合引用。
+内部准备元数据保留全部声明。有角色／引用时，数据集链接指向共享的 `syntax/model/field_roles` 契约。
 
-## Acceptance
+## 验收
 
-`tests/field_roles.telora` covers alternative complete references, overlapping
-roles, public metadata, private fields, unchanged query semantics, metric
-derivation and invalid declarations. The device model publishes its existing
-unique id as a reference, name/alias as Appellation, and classification/vendor
-as Classification. Existing formal metrics derive Metric automatically.
-No uniqueness claim is added for names, IP addresses or serial numbers.
+`tests/field_roles.telora` 覆盖可替代完整引用、重叠角色、公共元数据、私有字段、查询语义不变、Metric 派生和无效声明。
+设备模型将现有唯一 ID 发布为引用，name／alias 标为 Appellation，classification／vendor 标为 Classification。
+已有正式度量自动派生 Metric，不为名称、IP 地址或序列号新增唯一性声明。

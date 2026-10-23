@@ -1,216 +1,138 @@
-# Ontology Service Usage
+# 本体服务使用说明
 
-This file covers packaging, starting, and using an ontology-backed query
-service. Sections 1-3 apply to any model exposing the same three methods.
-Section 4 is this repository's domain inventory; an integrating application
-can replace or omit it. Run the build command from the repository root;
-the runner can start from any directory where the artifact is accessible.
-Sections 1-2 are for the trusted host, not the querying Agent.
+本文介绍基于本体的查询服务如何打包、启动和使用。第 1～3 节适用于暴露相同三个方法的任意模型。
+第 4 节列出本仓库领域，集成应用可替换或省略。构建命令在仓库根目录运行，runner 可从任意能访问产物的目录启动。
+第 1～2 节面向可信宿主，不面向发起查询的 Agent。
 
-This is the current external service and Intent contract. Model-author and
-QueryAst boundaries are documented in [ONTOLOGY.md](ontology/docs/ONTOLOGY.md)
-and [QUERY.md](ontology/docs/QUERY.md). The domain `docs/DOMAIN.md` files
-describe business vocabulary; their `docs/INTENT.md` files point back to this
-shared syntax. `goals/`, the disabled `lab-plan.toml`, and evaluation results
-record earlier experiments, not current API contracts. Telora language and
-CLI documentation belongs to the Telora project, not a copied directory in
-this repository.
+本文是当前外部服务及 Intent 契约。模型作者和 QueryAst 边界见[本体文档](ontology/docs/ONTOLOGY.md)和[查询文档](ontology/docs/QUERY.md)。
+[关系示例](relation_model/README.md)和 [IC 领域指南](icloud_model/docs/DOMAIN.md)说明两个模型，均使用下文共享 Intent 语法。
+评测结果记录早期实验，不是当前 API 契约。Telora 语言和 CLI 文档属于 Telora 项目，不在本仓库复制维护。
 
-## 1. Build a snapshot
+## 1. 构建快照
 
 ```sh
 node scripts/build-knowledge-snapshot.mjs --module <module> \
   --domain <domain> --output <artifact>.wasm
 ```
 
-`<module>` is a Telora workspace member with a `MainService`; it is not the
-domain name used in requests. The build initializes the service and embeds its
-ready state in the Wasm artifact. If a module declares external sources, provide
-all of them with `--source name=path` at build time. Initialization fuel,
-request fuel, and memory limits can be set with the corresponding CLI options
-when deployment requires them. Use a compatible `telora-run` version with the
-resulting experimental artifact.
-The wrapper compiles with `--snapshot`, traverses the actual artifact's visible
-knowledge, and publishes only after checks pass. Repeat `--domain` for every
-domain in a collection (for example `dog`, `spider`, `world`). It writes
-`<artifact>.wasm.knowledge.json` (visible keys/types, counts, Model revisions and
-artifact SHA-256) and `<artifact>.wasm.knowledge-sizes.json` (full size rankings,
-largest entry/link, threshold and runtime verification results).
-The default concrete-document budget is 16,000 characters, measured exactly as
-`JSON.stringify({Document:{Found:node}}, null, 2).length`, not UTF-8 bytes.
-Index metadata is measured but exempt from this budget. The full terminology
-is obtained through a separate capability for consumer-side caching and search.
-Use `--max-node-chars <number>` to set the deployment budget. Oversize fails
-before replacing any previous artifact; `--on-oversize warn` explicitly permits
-publication with a warning report. `--not-found <checks.json>` additionally
-checks hidden keys using a JSON array of `{domain,key}` requests.
-Use `--context <crate-directory>` if the crate context differs from its module
-name. The wrapper forwards repeated `--source` and fuel/memory options.
-`node scripts/check-knowledge-manifest.mjs <artifact>.wasm` verifies the artifact
-hash, revision, counts and real `info` samples after transport or deployment.
-Direct `bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm`
-is available for experiments, but bypasses these publication checks.
+`<module>` 是拥有 `MainService` 的 Telora 工作区成员，不是请求中的领域名。
+构建初始化服务并将就绪状态嵌入 Wasm。若模块声明外部源，构建时用 `--source name=path` 提供全部源。
+部署需要时可通过 CLI 设置初始化 fuel、请求 fuel 和内存上限；实验产物须搭配兼容版本 `telora-run`。
+包装脚本以 `--snapshot` 编译，遍历实际产物的可见知识，检查通过后才发布。
+集合中每个领域重复传入 `--domain`；当前两个服务各暴露一个领域：`relation` 或 `ic`。
+生成 `<artifact>.wasm.knowledge.json`（可见键／类型、计数、模型版本和产物 SHA-256）以及
+`<artifact>.wasm.knowledge-sizes.json`（完整大小排名、最大条目／链接、阈值及运行时验证结果）。
+具体文档默认预算为 16,000 字符，严格按 `JSON.stringify({Document:{Found:node}}, null, 2).length` 测量，而非 UTF-8 字节。
+索引元数据会测量但不受该预算约束。完整术语通过独立能力获取，供消费方缓存与搜索。
+用 `--max-node-chars <number>` 设置部署预算；超限会在替换旧产物前失败，`--on-oversize warn` 显式允许带警告发布。
+`--not-found <checks.json>` 还可用 `{domain,key}` 请求组成的 JSON 数组检查隐藏键。
+包上下文不同于模块名时使用 `--context <crate-directory>`，包装脚本转发重复的 `--source` 及 fuel／内存选项。
+传输或部署后，`node scripts/check-knowledge-manifest.mjs <artifact>.wasm` 校验哈希、版本、计数和真实 `info` 样本。
+实验可直接用 `bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm`，但会绕过发布检查。
 
-## 2. Start the service
+## 2. 启动服务
 
 ```sh
 telora-run <artifact>.wasm --serve stdio+jsonl://
 telora-run <artifact>.wasm --serve http://127.0.0.1:8080
 ```
 
-Keep this process running. Write one JSON request per line to stdin and read
-one JSON response per line from stdout. Do not mix other stdout text into this
-stream. A runner started without `--serve` reads one complete JSON request and
-exits after one response. `telora-run` executes the built artifact without
-the source tree, workspace configuration, or compiler; only the artifact and
-a compatible runner are needed at deployment.
+保持进程运行：向 stdin 每行写一个 JSON 请求，从 stdout 每行读一个 JSON 响应，不要混入其他标准输出。
+不带 `--serve` 的 runner 读取一个完整 JSON 请求，响应一次后退出。
+`telora-run` 执行构建产物，无需源树、工作区配置或编译器；部署只需产物和兼容 runner。
 
-The models in this repository explicitly declare POST routes
-`/<domain>/info` and `/<domain>/transform`. The HTTP body is
-the slot input, without the JSONL `method`/`input` envelope. For example:
+本仓库模型显式声明 POST 路由 `/<domain>/info` 和 `/<domain>/transform`。
+HTTP 请求体就是槽位输入，不含 JSONL 的 `method`／`input` 信封。例如：
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8080/ic/info \
   -H 'Content-Type: application/json' -d '{"key":"index"}'
 ```
 
-`telora-run` has no authentication. Bind only to a host-private loopback or
-Unix socket, and expose these two operations to an Agent through a trusted
-tool adapter or authenticated gateway. The Agent environment must not mount
-the snapshot, runner, source tree, tests, or evaluator material, and must not
-have a shell or file tool that can read the host's deployment directory. Keep
-the gateway's credentials and runner command outside the Agent's context.
-Simply omitting the artifact path from the prompt is not isolation. A local
-tool process with unrestricted host filesystem access is not isolation either.
-Rate limits, request-size limits, access logging, and any SQL execution
-authorization belong to the host. `transform` only produces a Query; it does
-not execute it. `--serve` is the current CLI option; `--bind` belongs to older
-Telora documentation.
+`telora-run` 不提供认证，只绑定宿主私有回环或 Unix socket，并通过可信工具适配器或认证网关向 Agent 暴露这两个操作。
+Agent 环境不得挂载快照、runner、源树、测试或评测材料，也不得拥有能读取宿主部署目录的 shell 或文件工具。
+网关凭据及 runner 命令不进入 Agent 上下文。仅在提示词中省略产物路径不构成隔离；能无限制访问宿主文件系统的本地工具进程也不构成隔离。
+限流、请求大小限制、访问日志和 SQL 执行授权由宿主负责。`transform` 只生成 Query，不执行。
+当前 CLI 选项是 `--serve`，`--bind` 属于旧版 Telora 文档。
 
-## 3. Host request protocol and knowledge facts
+## 3. 宿主请求协议与知识事实
 
-For JSONL, every request has exactly `method` and `input`. The method selects a
-slot; only `input` is passed to that slot. For HTTP, POST the same `input`
-directly to the matching path. The knowledge and query methods are:
+JSONL 请求恰好包含 `method` 和 `input`；method 选择槽位，仅 input 传入该槽位。
+HTTP 则直接把相同 input POST 到对应路径。知识与查询方法如下：
 
 ```json
 {"method":"<domain>/info","input":{"key":"index"}}
 {"method":"<domain>/info","input":{"key":"<key returned by index or links>"}}
 ```
 
-The host collects `index` and discovery roots, then follows every `links[].key`
-reference. `index.detail` contains `{revision,key_patterns,encoding}` and its
-Member links include primitive types. Every node has
-`{key,type,description,links,detail}`. Keys include Dataset, Dimension, Field,
-Measure, Relation, Ty, Value, TimeRole and BusinessLink, with each canonical name
-URI-encoded once. Returned keys are complete stable identities. Labels, aliases
-and physical names do not replace canonical business IDs.
+宿主收集 `index` 和 discovery 根，再跟随全部 `links[].key` 引用。
+`index.detail` 包含 `{revision,key_patterns,encoding}`，Member 链接包含基本类型。
+每个节点含 `{key,type,description,links,detail}`。键包括 Dataset、Dimension、Field、Measure、Relation、Ty、Value、TimeRole 和 BusinessLink，每个规范名称进行一次 URI 编码。
+返回键是完整稳定身份，标签、别名和物理名称不能替代规范业务 ID。
 
-`<domain>/discovery` accepts `{}` and returns
-`{knowledge_contract,intent_contract,revision,roots,key_patterns,vocabulary}`.
-Current contracts are `ontology-knowledge-v2` and `ontology-intent-v1`. Roots
-identify visible Dataset and Relation nodes. The graph contains knowledge facts
-and business constraints. Consumer tools own Agent workflows, query help and
-retrieval examples; the host's info method is an integration interface.
+`<domain>/discovery` 接受 `{}`，返回 `{knowledge_contract,intent_contract,revision,roots,key_patterns,vocabulary}`。
+当前契约为 `ontology-knowledge-v2` 和 `ontology-intent-v1`。根标识可见 Dataset 和 Relation 节点。
+图包含知识事实与业务约束；消费工具负责 Agent 工作流、查询帮助和检索示例，宿主 info 是集成接口。
 
-For dsh-oks, knowledge is a `{meta,origin,data}` resource whose data is a
-canonical-key dictionary. `oks_data` automatically unwraps `.data` and exposes
-`knowledge://#meta` for metadata/provenance. Usage is available separately from
-`oks://help/knowledge` and `oks://help/query`, with retrieval supplied by built-in
-jq programs. The consumer validates contracts before loading the graph.
+对 dsh-oks，知识是 `{meta,origin,data}` 资源，data 为规范键字典。
+`oks_data` 自动解包 `.data`，通过 `knowledge://#meta` 暴露元数据和来源。
+用法分别由 `oks://help/knowledge`、`oks://help/query` 提供，检索由内置 jq 程序实现。
+消费方在加载图前校验契约。
 
-Generate consumer data with:
+生成消费方数据：
 
 ```sh
 node scripts/derive-discovery.mjs --output-prefix bin/icloud_model
 ```
 
-The script writes `.terminology.json`, `.links.json`, `.keys.json` and
-`.report.json`. `--artifact`, `--domain` and `--output-prefix` select the model
-and output. `--keys roots.json` supplies roots instead of calling discovery.
+脚本写入 `.terminology.json`、`.links.json`、`.keys.json` 和 `.report.json`。
+`--artifact`、`--domain`、`--output-prefix` 选择模型与输出，`--keys roots.json` 可提供根以替代 discovery 调用。
 
-Terminology has `{revision,datasets,dimensions,measures,rels,types,values}`.
-Dataset, Relation and business Ty entries contain `{name,doc,aliases}`;
-Dimension and Measure entries add `dataset`; Value entries add `ty`.
-Physical Fields and primitive Types are available through info and are excluded
-from search vocabulary. Aliases and descriptions come from structured metadata,
-localized labels and explicit terms.
+术语结构为 `{revision,datasets,dimensions,measures,rels,types,values}`。
+Dataset、Relation 和业务 Ty 条目含 `{name,doc,aliases}`；Dimension、Measure 增加 `dataset`，Value 增加 `ty`。
+物理 Field 和基本 Type 可通过 info 获取，但不进入搜索词汇。别名和描述来自结构化元数据、本地化标签及显式术语。
 
-Links has `{revision,links:[{source,target,kind}]}`. The consumer indexes it by
-target for reverse discovery. Edges are unique by `(source,target,kind)`;
-different kinds preserve both sides of self-relations. Full definitions and
-local dimension constraints remain in info documents.
+链接结构为 `{revision,links:[{source,target,kind}]}`，消费方按目标索引用于反向发现。
+边按 `(source,target,kind)` 唯一，不同种类保留自关系两侧；完整定义及维度局部约束仍在 info 文档中。
 
-Dimensions identify business projections and filters; Measures identify declared
-aggregations. Their documents supply permitted query capabilities.
+Dimension 标识业务投影与筛选，Measure 标识声明聚合，文档提供允许的查询能力。
 
-Use the index topic and `info` to discover the Model, then express the user's business
-request as an Intent using discovered stable IDs. Use `transform` diagnostics to
-repair the Intent without changing the requested business meaning. Lowering
-success establishes that an Intent is legal under the Model, not that it answers
-the user's question. Aim to serve the user's business purpose with one accepted
-Intent. When one plan is insufficient, you may offer up to five independent
-Intents in one `transform` call. Explain in business terms what each result
-would show and how the separate results help answer the question. The service
-does not merge or deduplicate results across plans, so do not claim that it has.
-If no supported plan gives a useful answer, explain the limitation or ask a
-focused business question. Do not change the user's meaning just to obtain a
-successful transform. SQL and bindings are intermediate output for an
-authorized execution layer, not the basis for clarification or the final
-user-facing result.
+先用索引主题和 `info` 发现模型，再用发现的稳定 ID 将用户业务请求表达为 Intent。
+借助 `transform` 诊断修复 Intent，不改变请求的业务含义。转换成功只说明 Intent 在模型下合法，不证明回答了用户问题。
+优先用一个接受的 Intent 满足业务目的；单计划不足时，可一次 transform 提交最多五个独立 Intent。
+用业务语言解释各结果及其如何共同回答问题。服务不合并或跨计划去重，不能声称已经做了这些工作。
+若没有支持且有用的计划，应解释限制或提出聚焦的业务问题，不能为成功转换而改变用户含义。
+SQL 与绑定是交给获授权执行层的中间输出，不是澄清依据或最终业务结果。
 
-Submit one to five Intents with the same outer envelope. Even one Intent must
-be wrapped in an array:
+一至五个 Intent 使用相同外层信封；即使只有一个也必须放入数组：
 
 ```text
 {"method":"<domain>/transform","input":{"intents":[<Intent>, ...]}}
 ```
 
-Every top-level Intent may declare `limit`, a JSON integer from 1 through
-9,223,372,036,854,775,807 (signed 64-bit). Omission or explicit null preserves existing behavior
-without adding an output cap or binding. Boolean, string,
-floating-point and nonpositive values are rejected with a diagnostic for `limit`.
-GraphPair operands and GraphUnion branches do not require it.
-The model defines `limit` semantics and the valid integer range. External plugins
-declare and enforce their own invocation requirements and result-row limits:
-they may require `limit`, restrict its range, or inject or override it before
-forwarding. When invoking through a plugin, follow that plugin's declared
-requirements.
+每个顶层 Intent 可声明 `limit`，范围为 1 至 9,223,372,036,854,775,807 的 JSON 整数（有符号 64 位）。
+省略或显式 null 保留既有行为，不增加上限或绑定；布尔、字符串、浮点及非正值被拒绝，并返回针对 limit 的诊断。
+GraphPair 操作数和 GraphUnion 分支不要求此字段。
+模型定义 limit 语义及整数范围；外部插件声明并执行自己的调用要求与行数限制，可以要求 limit、收窄范围或在转发前注入／覆盖。
+通过插件调用时遵守其声明要求。
 
-`limit` caps final rows after filtering, aggregation, DISTINCT, ranking,
-partitioned Top-N, pairing and set operations. Business `take` continues to
-select its population; when both constrain the same final ordered rows, the
-SQL uses the smaller bound. Partitioned Top-N runs before the global output cap.
-The cap is a SQL binding, not client-side slicing. Existing ordering is retained;
-without ordering, no particular subset or stable pagination is promised.
-`transform` returns complete SQL and bindings, not database rows. The execution
-layer must return every resulting row, including empty results and results
-exactly at the cap; any additional execution-layer truncation must be disclosed.
-No total count or `hasMore` is computed. Reaching the cap does not establish
-that the result covers the entire population.
+`limit` 在筛选、聚合、DISTINCT、排名、分区 Top-N、配对及集合操作之后限制最终行数。
+业务 `take` 继续选择总体；二者作用于同一最终有序结果时，SQL 取较小值。分区 Top-N 先于全局输出上限执行。
+上限是 SQL 绑定，不是客户端切片。保留已有排序，无排序时不承诺具体子集或稳定分页。
+transform 返回完整 SQL 和绑定，而非数据库行。执行层必须返回全部结果，包括空结果和恰好到上限的结果；额外截断必须披露。
+不计算总数或 `hasMore`，达到上限不代表覆盖整个总体。
 
-The response has `accepted`, `diagnostics`, and `queries`. Each diagnostic
-entry has a zero-based `index` identifying its Intent and a `diagnostic`
-containing `severity`, `message`, and ordered `locs`. For lowering failures
-raised with `fail!`, `locs[0]` is the rule location and `locs[1..]` are
-argument origins in order, including repeated origins. Source-file locations
-carry a source name and `start`/`end` positions: lines start at 1, and each
-`offset` is a zero-based UTF-8 byte offset within that line. Parsed request
-arguments also carry origins. Their internal source ID is `0` (reported as
-`<input>`); both points use `line: 0`, and each `offset` is a UTF-8 byte
-offset in the entire input. This keeps the same location shape without
-building a line index for dynamic input. Other diagnostics may use `locs[0]`
-for the offending input. The array is empty when no Intent produces a
-diagnostic.
-All Intents are checked even if an earlier one fails. Only when every Intent
-succeeds does `queries` contain one Query per
-Intent in the same order; otherwise `queries` is null. A successful batch may
-still have warnings; read them before using its Queries. This is a batch of
-independent plans, not a union into one result set.
+响应包含 `accepted`、`diagnostics`、`queries`。每项诊断有标识 Intent 的零基 `index`，以及含 `severity`、`message`、有序 `locs` 的 `diagnostic`。
+由 `fail!` 抛出的转换失败中，`locs[0]` 为规则位置，`locs[1..]` 按参数顺序列来源，含重复来源。
+源文件位置带源名及 `start`／`end`；行号从 1 开始，offset 是行内零基 UTF-8 字节偏移。
+解析请求参数也携带来源，其内部源 ID 为 0（报告为 `<input>`），两端均用 `line: 0`，offset 为整个输入内的 UTF-8 字节偏移。
+这保留相同位置结构，无需为动态输入建立行索引。其他诊断可能用 `locs[0]` 表示错误输入。
+没有 Intent 产生诊断时数组为空。
+即使前项失败也检查全部 Intent。仅全部成功时 queries 才按原顺序包含每项 Query，否则为 null。
+成功批次仍可能有警告，使用前应阅读。这是独立计划批次，不是合并结果集。
 
-Each successful Query is `{sql, bindings, columns, limit_slot}`. `columns` is an ordered
-array matching the final SQL result, including generated tag and comparison
-columns. Its entries are `{name, type, nullable}`; for example:
+每个成功 Query 为 `{sql, bindings, columns, limit_slot}`。
+`columns` 按最终 SQL 结果排序，包含生成的标签和比较列，每项为 `{name, type, nullable}`，例如：
 
 ```json
 {
@@ -224,66 +146,39 @@ columns. Its entries are `{name, type, nullable}`; for example:
 }
 ```
 
-`limit_slot` is the zero-based index of the final output limit in `bindings`,
-or null when the Intent has no top-level limit. It does not refer to an internal
-Top-N/partition cap. Execution adapters can copy bindings and adjust this slot
-for their own bounded fetch policy; the model returns the requested limit unchanged.
+`limit_slot` 是最终输出上限在 bindings 中的零基索引，顶层无上限时为 null，不指内部 Top-N／分区上限。
+执行适配器可复制 bindings 并调整该槽以实施自身有界获取策略；模型原样返回请求上限。
 
-Columns are derived from the validated model and final projection during
-transform, without opening a database or executing SQL. They remain available
-for empty results and all-NULL columns. The type vocabulary is `Int`, `Float`,
-`Bool`, `String`, `DatetimeUtc`, `EpochMillis`, and `LocalDateTime`. DatetimeUtc
-and EpochMillis retain explicit UTC-instant semantics instead of being reduced to their String/Int storage.
-Calendar bucket dimensions retain the declared time encoding; Min/Max/Latest
-retain a declared instant type when their output is a source value. Count is
-Int; Avg is Float; numeric sums and computed measures follow their output types.
-Named value domains project String business IDs, including half-open value
-and `__kind` columns. A ranked GraphPair appends Float `comparison_value`.
+列在 transform 时从已校验模型及最终投影推导，无需连接数据库或执行 SQL；空结果和全 NULL 列也有模式。
+类型词汇为 `Int`、`Float`、`Bool`、`String`、`DatetimeUtc`、`EpochMillis`、`LocalDateTime`。
+DatetimeUtc 和 EpochMillis 保留显式 UTC 瞬间语义，不降为存储 String／Int。
+日历桶维度保留声明时间编码；Min／Max／Latest 输出源值时保留声明瞬间类型。
+Count 为 Int，Avg 为 Float，数值求和与计算度量遵循自身输出类型。
+具名值域投影 String 业务 ID，包括半开放值及 `__kind` 列；排名 GraphPair 追加 Float `comparison_value`。
 
-`nullable: false` guarantees a non-NULL result under the model contract;
-`true` conservatively permits NULL and does not predict that a result contains
-NULL. Nullability includes optional fields, outer joins, empty aggregate inputs
-and conditional expressions. Predicates and ranking guards do not narrow the
-schema. Logical types describe values; driver-specific Bool and lossless Int
-representations remain the execution adapter's responsibility.
+`nullable:false` 保证模型契约下非 NULL；true 保守允许 NULL，不预测结果必有 NULL。
+可空性考虑可选字段、外连接、空聚合输入和条件表达式，谓词及排名保护不收窄模式。
+逻辑类型描述值，驱动特有 Bool 和无损 Int 表示仍由执行适配器负责。
 
-LocalDateTime represents a date and clock time without a timezone or offset.
-It is a self-contained value, not an instant; converting it to DatetimeUtc or
-EpochMillis requires an explicitly supplied timezone or offset and any necessary
-ambiguity policy for gaps or repeated times. Columns supply no default timezone
-and perform no temporal conversion. EpochMillis denotes an absolute instant even
-when the field has a local business description; a shifted wall-clock integer
-requires a separately specified encoding. Date-only and address values
-retain their primitive representation in this result contract; their field
-semantics remain available in knowledge. Transform uses no ambient clock or
-timezone to infer columns.
+LocalDateTime 表示无时区或偏移的日期与钟表时间，是自足值，不是瞬间。
+转换为 DatetimeUtc 或 EpochMillis 需显式时区／偏移，以及必要的跳时或重复时刻歧义策略。
+列不提供默认时区，也不做时间转换。EpochMillis 即使带本地业务描述仍表示绝对瞬间；移位墙上时间整数需要独立编码。
+仅日期及地址值在结果契约中保留基本表示，字段语义可在知识中查询。transform 不借环境时钟或时区推断列。
 
-GraphPair group counts and Graph group counts use the explicit result alias
-`count` in both SQLite and PostgreSQL. Ordinary count projections retain their
-node-qualified aliases. Low-level dialect builders and `query_intent_lower_factory`
-return `{sql, bindings}`; the public transform batch adds the semantic columns
-contract. `intent::result_columns(payload, validated_intent, ast)` exposes the same
-static schema for integrations that already hold a validated Intent and AST.
+GraphPair 组计数和 Graph 组计数在 SQLite、PG 中均用显式结果别名 `count`，普通计数保留带节点限定的别名。
+低层方言构造器及 `query_intent_lower_factory` 返回 `{sql, bindings}`，公共 transform 批次增加语义列契约。
+`intent::result_columns(payload, validated_intent, ast)` 为已持有校验 Intent 和 AST 的集成提供相同静态模式。
 
-The caller resolves relative time before submitting an Intent. Reference time
-and timezone may come from the application client or the Agent's environment;
-neither is read by the service. Use concrete values in the dimension's declared
-logical type, and state the resulting business dates in the answer. If no
-reliable reference time or timezone is available, ask for the missing context.
-See
-[TIME.md](ontology/docs/TIME.md) for time value and window semantics. Knowledge
-discovery describes the Model; the generic Intent syntax is below. The Model
-and `transform` decide which combinations have valid business meaning.
+调用方在提交 Intent 前解析相对时间。参考时间及时区可来自应用客户端或 Agent 环境，服务不读取。
+使用维度声明逻辑类型的具体值，在答案中说明最终业务日期；缺少可靠参考时间或时区时，应询问缺失上下文。
+时间值和窗口语义见[时间契约](ontology/docs/TIME.md)。知识发现描述模型，下文给出通用 Intent 语法；模型与 transform 决定组合是否具备合法业务含义。
 
-The current iCloud time types are `DatetimeUtc` (RFC3339 UTC seconds,
-`YYYY-MM-DDTHH:MM:SSZ`), `DateUtc` (`YYYY-MM-DD`), and `EpochMillis` (JSON
-integer milliseconds). The former space-separated UTC input is rejected;
-deploy a rebuilt snapshot and discover the current types through `info`.
+当前 IC 时间类型为 `DatetimeUtc`（RFC3339 UTC 秒，`YYYY-MM-DDTHH:MM:SSZ`）、`DateUtc`（`YYYY-MM-DD`）和 `EpochMillis`（JSON 整数毫秒）。
+旧空格分隔 UTC 输入被拒绝，需部署重建快照并通过 info 发现当前类型。
 
-### Graph Intent syntax
+### Graph Intent 语法
 
-A Graph Intent has five required fields, including empty arrays where needed.
-The optional top-level `limit` below adds a final output cap:
+Graph Intent 有五个必填字段，必要时使用空数组。下面可选顶层 limit 增加最终输出上限：
 
 ```json
 {"op":"Graph","limit":1000,"root":"item",
@@ -292,90 +187,62 @@ The optional top-level `limit` below adds a final output cap:
  "select":[],"count":"item"}
 ```
 
-`root` names a node instance in `nodes`, not a dataset ID by itself. Each
-node has `id` (unique instance name within this graph) and `entity` (stable
-dataset ID). Each edge has `relation` (stable named relation ID), `from`, and
-`to` (node instance IDs); its direction and endpoint roles must match the
-Model. `edges` may be listed in any order, but must form one rooted tree;
-each edge must introduce one new node reachable from `root`. `select`
-contains objects `{"node":"...","dimension":"..."}`.
-For a count, `count` is the node instance ID to count, not a measure name.
-The required `select` array may be empty when `count` is present.
+root 指定 nodes 中的节点实例，不是单独的数据集 ID。
+每个节点含 id（图内唯一实例名）和 entity（稳定数据集 ID）。
+每条边含 relation（稳定具名关系 ID）、from、to（节点实例 ID），方向与端点角色必须匹配模型。
+edges 顺序任意，但必须形成一棵有根树，每条边引入一个从 root 可达的新节点。
+select 包含 `{"node":"...","dimension":"..."}`。count 是被计数节点实例 ID，不是度量名；有 count 时必填 select 可为空。
 
-Optional top-level graph fields and their shapes:
+可选顶层字段及形状：
 
-| Field | Shape |
+| 字段 | 形状 |
 | --- | --- |
-| `constraints` | Array of edge objects, same shape as `edges` |
-| `measures` | Array of `{"node":"...","measure":"<stable measure ID>"}` |
-| `filters` | Array of `{"node":"...","dimension":"...","op":"Eq","value":...}` |
-| `time_windows` | Array of `{"node":"...","dimension":"...","start":...,"end":...}`; `end` is required and non-null; `start` may be `null` or omitted |
-| `any_of` | Array of `{"node":"...","dimension":"...","values":[...]}` |
-| `exists` | Array of existence objects described below |
-| `measure_having` | Array of `{"node":"...","measure":"...","op":"...","value":...}` |
-| `count` | Node instance ID string |
-| `count_value` | `{"node":"...","dimension":"..."}`, for distinct non-null value count |
+| `constraints` | 与 edges 同形状的边对象数组 |
+| `measures` | `{"node":"...","measure":"<stable measure ID>"}` 数组 |
+| `filters` | `{"node":"...","dimension":"...","op":"Eq","value":...}` 数组 |
+| `time_windows` | `{"node":"...","dimension":"...","start":...,"end":...}` 数组；end 必填非 null，start 可省略或为 null |
+| `any_of` | `{"node":"...","dimension":"...","values":[...]}` 数组 |
+| `exists` | 下述存在性对象数组 |
+| `measure_having` | `{"node":"...","measure":"...","op":"...","value":...}` 数组 |
+| `count` | 节点实例 ID 字符串 |
+| `count_value` | `{"node":"...","dimension":"..."}`，统计不同非空值 |
 | `count_having` | `{"op":"...","value":<integer>}` |
-| `count_groups`, `include_empty`, `distinct` | Boolean |
-| `group_by_identity` | Array of node instance ID strings |
-| `row_grain` | `"Root"` or `"Association"` |
-| `order_by` | Array of `{"node":"...","dimension":"...","direction":"Asc|Desc"}` |
-| `limit` | Optional on top-level Intent only; positive signed 64-bit integer; final output cap |
-| `take` | Integer |
+| `count_groups`、`include_empty`、`distinct` | 布尔值 |
+| `group_by_identity` | 节点实例 ID 字符串数组 |
+| `row_grain` | `"Root"` 或 `"Association"` |
+| `order_by` | `{"node":"...","dimension":"...","direction":"Asc|Desc"}` 数组 |
+| `limit` | 仅顶层 Intent 可选；正有符号 64 位整数，限制最终输出 |
+| `take` | 整数 |
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |
 
-For aggregate Top-N, `select` names the visible dimensions and `measures`
-names the aggregate being ranked. With no `group_by_identity`, Top-N ranks
-groups of equal projected dimension values, provided the joined graph cannot
-multiply the measure's source rows. A declared `group_by_identity` instead
-keeps separate groups for the named entities: two entities with the same
-visible dimension value may occupy separate rows. If hidden identity keys can
-split visible groups, the transform reports a warning. Use identity grouping
-only when the business question is about individual entities, not dimension
-values such as types or categories.
+聚合 Top-N 中，select 指定可见维度，measures 指定排名聚合。
+无 group_by_identity 时，按相同投影维度值分组排名，前提是连接图不能扩增度量源行。
+显式 group_by_identity 为具名实体保留独立组，同可见值的两个实体可占不同行。
+隐藏身份键可能拆分可见组时，transform 给出警告。仅在问题针对独立实体时使用身份分组，不用于类型或类别等维度值问题。
 
-For aggregate thresholds, discover the shared `Graph aggregate` knowledge
-node: it describes the supported identity and contextual sample populations.
-For filtering, `Declared filter capabilities` explains why the syntax's
-operator vocabulary does not override a dimension's declared `ops`.
-`Ordering and aggregate meaning` explains NULL placement and identity tie
-breakers, and why raw Top-N is not a substitute for grouped Min/Max.
-Find these nodes in `index` and pass their returned keys unchanged to `info`.
-Do not change the business meaning merely to make an Intent lower.
+聚合阈值应发现共享 `Graph aggregate` 知识节点，了解支持的身份及上下文样本总体。
+`Declared filter capabilities` 解释为什么语法操作符不能覆盖维度 ops；`Ordering and aggregate meaning` 解释 NULL 顺序、身份决胜，以及原始 Top-N 不能替代分组 Min／Max。
+从 index 找到节点，原样传返回键给 info，不能仅为完成转换而改变业务含义。
 
-Time windows are `[start, end)` with concrete values in the dimension's declared
-logical type. `end` is required and non-null; an omitted or null `start` means
-all history strictly before `end`. Fix the cutoff when planning. Resolve
-`now`, elapsed durations, calendar boundaries and timezone effects before
-submitting the Intent. The service rejects relative expressions and request
-`ctx`.
+时间窗口为 `[start,end)`，使用声明逻辑类型中的具体值。end 必填非 null，start 省略或 null 表示截止 end 之前全部历史。
+规划时固定截止值，提交前解析 now、经过时长、日历边界及时区影响。服务拒绝相对表达式及请求 ctx。
 
-An existence object has required `anchor` (an outer node instance ID),
-`nodes` (inner node objects), and `edges` (named edge objects connecting
-the anchor to inner nodes). Its edges may be in any order but must form a
-tree rooted at `anchor`. It may also contain `constraints`, `filters`,
-`time_windows`, `any_of`, `having` (same shape as `measure_having`), and
-`negated` (boolean). `exists` qualifies outer entities without multiplying
-their rows; use it when a related one-to-many entity must only establish
-existence. The request may have multiple graph edges and multiple existence
-objects; there is no fixed hop count in the Intent syntax.
+存在性对象必填 anchor（外层节点实例 ID）、nodes（内部节点对象）、edges（连接锚点和内部节点的具名边）。
+边顺序任意，但必须构成以 anchor 为根的树。
+还可包含 constraints、filters、time_windows、any_of、having（与 measure_having 同形状）和布尔 negated。
+exists 限定外层实体而不扩增其行；关联一对多实体只需证明存在时使用它。
+请求可含多条图边和多个存在性对象，语法不固定跳数。
 
-Filter operators are `Eq`, `Ne`, `Gt`, `Ge`, `Lt`, `Le`, `Contains`,
-`NotContains`, `StartsWith`, and `EndsWith`. The Model restricts which
-operators and logical value types each dimension permits. Do not send `kind`:
-the target dimension or measure determines the logical type of its JSON value.
-Typed predicate inputs and canonical wires shown by `info` are Model facts,
-not JSON Intent value syntax.
-Find the Intent syntax entry in the index and follow its returned key and links
-through `<domain>/info`. A diagnostic naming an info key can be
-resolved through `<domain>/info` to repair the Intent. Business-value filters
-use the stable value ID, not its physical wire or localized label.
+筛选操作符为 Eq、Ne、Gt、Ge、Lt、Le、Contains、NotContains、StartsWith、EndsWith。
+模型限制每个维度允许的操作和逻辑值类型。不要发送 kind，目标维度或度量决定 JSON 值逻辑类型。
+info 显示的带类型谓词输入和规范编码是模型事实，不是 JSON Intent 值语法。
+从索引找到 Intent 语法入口，通过 `<domain>/info` 跟随返回键及链接。
+诊断中给出的 info 键可用于读取知识以修复 Intent。业务值筛选使用稳定值 ID，不使用物理编码或本地化标签。
 
-### One deduplicated entity set
+### 单一去重实体集合
 
-Use `GraphUnion` when two or more independently valid graph paths must return one
-deduplicated population of the same entity:
+两条或更多独立合法图路径需要返回同一实体的一个去重总体时使用 GraphUnion：
 
 ```text
 {"op":"GraphUnion","limit":1000,"branches":[
@@ -384,27 +251,18 @@ deduplicated population of the same entity:
 ]}
 ```
 
-Each `Graph` is complete and follows its own declared relations, filters,
-authorization, and grain rules. Its `result_node` may differ from the root
-and from other branches' result nodes. All result nodes must name the same
-dataset. Select only dimensions of that result node, in the same dimension
-order across all branches, including plain dimensions for **every field of the
-dataset's declared identity grain**. This may be a composite identity.
-Identity fields are visible result columns in the current form. Other
-selected dimensions must be the same across branches; SQL `UNION` then
-deduplicates complete result rows without merging distinct entity identities.
+每个 Graph 完整且遵循自身声明关系、筛选、授权与粒度规则。
+result_node 可不同于根及其他分支结果节点，但所有结果节点须属于同一数据集。
+只选择该结果节点的维度，各分支维度顺序相同，必须包含**数据集声明身份粒度的每个字段**对应普通维度，身份可能是复合的。
+当前形式中身份字段是可见结果列，其他选择维度也须跨分支一致；SQL UNION 去重完整结果行，不合并不同实体身份。
 
-`GraphUnion` accepts at least two raw-row branches. A branch may
-qualify rows using `filters`, `exists`, and named graph edges, but cannot use
-counts, measures, identity grouping, local ordering, Top-N, or pagination.
-It cannot reverse a directed relation or turn two separately valid result
-types into one entity. Use separate accepted Intents when the user wants
-distinct result categories rather than one entity set.
+GraphUnion 至少接受两个原始行分支，可用 filters、exists 和具名图边限定行，不能使用计数、度量、身份分组、局部排序、Top-N 或分页。
+不能反转有向关系，也不能将两种独立合法结果类型变成一个实体。
+用户需要不同结果类别而非单实体集合时，使用独立接受的 Intent。
 
-### Independent aggregate pair
+### 独立聚合配对
 
-Use `GraphPair` to aggregate two populations independently, explicitly align
-their complete identities, and choose the side of each output column.
+GraphPair 分别聚合两个总体，显式对齐完整身份，并选择每个输出列来自哪一侧。
 
 ```text
 {"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
@@ -414,58 +272,35 @@ their complete identities, and choose the side of each output column.
             "direction":"Desc","take":5}}
 ```
 
-Each side has exactly one measure and empty or omitted select. Its
-group_by_identity must exactly match its aligned nodes in order, beginning
-with root. Paired nodes belong to the same entity; their IDs may differ.
-Outer select is required (may be empty); display dimensions must belong to
-aligned nodes and never become alignment keys. Outputs follow select order
-then both measures, using left_<node>_<dimension or measure> and
-right_<node>_<dimension or measure> aliases.
+每侧恰好一个度量，select 为空或省略。group_by_identity 按序与对齐节点完全一致，并从根开始。
+配对节点属于同一实体，ID 可不同。外层 select 必填，可为空；展示维度来自对齐节点，绝不成为对齐键。
+输出先按 select 顺序，再输出两侧度量，别名为 left_<node>_<dimension or measure> 和 right_<node>_<dimension or measure>。
 
-Ranking supports Subtract (minuend/subtrahend), Ratio (numerator/denominator)
-and GrowthRate (current/baseline). Side parameters explicitly choose different
-Left/Right sides. Every rank needs direction Asc|Desc and take 1..1000.
-Numeric measures must be the same measure or declare matching non-null units.
-Exclude NULL measures, zero Ratio denominators and nonpositive GrowthRate
-baselines. Arithmetic uses approximate double precision; a growth rate of
-0.2 means 20%. Ties use complete aligned identities ascending, NULLS FIRST.
+排名支持 Subtract（minuend／subtrahend）、Ratio（numerator／denominator）和 GrowthRate（current／baseline）。
+侧别参数显式选择不同 Left／Right，每次排名需 direction Asc|Desc 和 take 1..1000。
+数值度量须为同一度量或声明相同非空单位。排除 NULL、Ratio 零分母及 GrowthRate 非正基线。
+运算采用近似双精度，增长率 0.2 表示 20%；并列按完整对齐身份升序、NULLS FIRST 决胜。
 
-Populations remain independent; filters, exists, time_windows and
-measure_having stay inside their respective Graph. Operand counts, distinct,
-include_empty, ordering and Top-N remain forbidden. Unranked count_groups:true
-counts all aligned identities and cannot combine with rank_by.
+总体保持独立，filters、exists、time_windows、measure_having 留在各自 Graph 内。
+操作数禁止计数、distinct、include_empty、排序、Top-N。
+无排名的 count_groups:true 统计全部对齐身份，不能与 rank_by 组合。
 
-Old implicit pairs require migration. See the [complete GraphPair contract](ontology/docs/GRAPH-PAIR.md)
-for shapes, output aliases, profile requirements and migration steps.
+旧隐式配对需迁移，形状、别名、配置要求和步骤见[完整 GraphPair 契约](ontology/docs/GRAPH-PAIR.md)。
 
-In JSONL service mode, responses use the `telora.service/v1` envelope. On
-success, `ok.Document` holds `Found` or `NotFound`; the Found Index node contains
-the complete `detail.entries` list. `ok` from `transform` contains the
-batch response described above. A rejected Intent is reported as
-`ok.accepted:false` with indexed diagnostics and `queries:null`; malformed
-requests and uncaptured service failures have `error:true` and top-level
-structured diagnostics. Inspect diagnostics and repair the Intent using the
-relevant knowledge points. Each accepted Query contains parameterized `sql`
-and `bindings`, not database results. Pass both together to an authorized
-execution layer; never interpolate values into SQL. Present the resulting data
-to the user in an appropriate form.
-When no execution layer is available, state that only an intermediate Query was
-produced and do not invent results.
+JSONL 服务响应使用 `telora.service/v1` 信封。成功时 ok.Document 包含 Found 或 NotFound，Found Index 节点包含完整 detail.entries 列表。
+transform 的 ok 包含上述批次响应。拒绝 Intent 表现为 `ok.accepted:false`、带索引诊断和 `queries:null`；
+格式错误请求及未捕获服务失败为 `error:true`，带顶层结构化诊断。
+阅读诊断并用相关知识修复 Intent。接受的 Query 含参数化 sql 与 bindings，不是数据库结果。
+将二者一并交给获授权执行层，绝不把值拼入 SQL，并以合适形式向用户展示数据。
+没有执行层时，说明只生成了中间 Query，不得编造结果。
 
-## 4. Domains in this repository
+## 4. 本仓库领域
 
-| Build module | Domain | Scope |
+| 构建模块 | 领域 | 范围 |
 | --- | --- | --- |
-| `example_models` | `dog` | Dog and breed example model |
-| `example_models` | `spider` | Student and school example model |
-| `example_models` | `world` | Geographic example model |
-| `icloud_model` | `ic` | iMaster Cloud modeling-pressure fixture |
+| `relation_model` | `relation` | 精简的租户、站点、设备和连通关系示例 |
+| `icloud_model` | `ic` | iMaster Cloud 建模压力夹具 |
 
-For example, one `example_models` snapshot serves the `dog`, `spider`, and
-`world` domains; `icloud_model` serves `ic` independently. Every domain
-exposes `<domain>/info` and `<domain>/transform`.
-Neither module requires external build sources. Both collections explicitly
-declare the HTTP POST routes listed above. Snapshot builds and index-topic requests were checked
-with the commands above. The `ic` fixture is not a complete production domain
-model. A missing knowledge point or valid lowering path must not be filled in
-by guessing.
+每个模型独立构建快照，暴露 `<domain>/info`、`<domain>/transform`、`<domain>/discovery` 及对应 HTTP POST 路由。
+两个模块均无需外部构建源，最小构建与请求流程见[关系示例](relation_model/README.md)。
+IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。

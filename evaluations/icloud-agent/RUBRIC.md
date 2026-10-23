@@ -1,28 +1,21 @@
-# Evaluator-only rubric
+# 仅供评测者使用的评分准则
 
-Do not place this file in an agent's isolated directory. A valid result
-preserves the question's business meaning; a transform success alone is not
-enough. Credit useful knowledge discovery and structured feedback, and mark
-down fabricated stable IDs, physical-wire guesses, handwritten SQL, or claims
-of database results. The Agent should submit an Intent and explain its meaning
-in business terms; the adapter persists the Intent and Query and returns only
-a receipt. Inspect the host record when evaluating the actual query. A
-reasonable, explicit interpretation is acceptable even if another reading
-exists. Require clarification only for an unresolved material choice without
-a responsible default; do not grade against corpus SQL as a hidden answer.
+不要将本文件放入 Agent 隔离目录。有效结果须保留问题业务含义，转换成功本身不够。
+认可有用的知识发现和结构化反馈；捏造稳定 ID、猜测物理编码、手写 SQL 或声称已有数据库结果应扣分。
+Agent 提交 Intent 并用业务语言解释，适配器持久化 Intent 与 Query，只返回回执；评测实际查询须检查宿主记录。
+即使存在另一种理解，合理且明确的解释也可接受。仅在存在未解决的重大选择且无负责任默认值时要求澄清，不将语料 SQL 当隐藏标准答案。
 
-| Question | Expected decision | Critical checks |
+| 问题 | 预期决策 | 关键检查 |
 | --- | --- | --- |
-| 01 | Lower if the current graph composition admits this site/device/alarm count; otherwise report a precise limitation | Traverse Alarm-to-Device and Device-to-Site, not the separate Alarm-to-Site reference. Group by complete Site identity; Alarm count stays distinct under the Device-to-Site OR relation; `count_having > 5` and outer site-group count. |
-| 02 | Lower with a latest-whole-sample path if discoverable; otherwise report a limitation | Two values and timestamp come from one most recent KPI row per complete Device identity, not independent maxima. Same-name devices do not merge. |
-| 03 | Lower only with a declared Max over the proper PON-port samples and a declared offline classification | Window is `[2025-03-01T12:00:00Z, 2025-03-31T12:00:00Z)`; caller-supplied now, not SQL `now()`; no Avg substitution. A Model gap is an acceptable finding. |
-| 04 | Reject any silent replacement of fan identities by server names, Server health by PSU health, or `warning` by another status | Original IC Q0184 SQL counted distinct server names and used health wire -1 (`error`), although the question requests fans with warning servers. The Model, not target SQL, defines the answer. |
-| 05 | Honor the explicit A/Z inclusion rule | The user expressly includes A when the selected device is at Z. The Agent may describe this as an additional endpoint inclusion rather than literal directed downstream, but must not silently omit it or present unlowered handwritten SQL as a validated result. |
-| 06 | Count distinct non-null referenced tenant IDs, including orphans, while naming the population accurately | The user's inclusion rule is explicit. Existing Tenant entities exclude orphan IDs, so an entity join is wrong; referring to an orphan ID as an existing Tenant entity is also inaccurate. Do not require clarification merely to rename an already specified population. |
-| 07 | Include zero-device sites under the ordinary meaning of fewer than five | A 1-4-only inner join omits a valid zero case; `include_empty` supports 0-4. If the Agent chooses a narrower interpretation, it must make that assumption explicit rather than quietly claiming to answer the question. A site satisfying both OR branches should not double-count its device. |
-| 08 | Count distinct Site identities unless the user asks about distinct names | "How many sites" denotes sites, not display labels. Same-name Site identities can differ; source Q0014's `COUNT(DISTINCT SITE_NAME)` is not proof that the user wants name cardinality. Ask only if the business context actually makes the count subject uncertain. |
-| 09 | State the chosen time scope and peak meaning or ask a focused business question | The Agent resolves reference time from application or environment context into concrete Intent bounds and explains the actual dates and timezone. A rolling month, calendar month, or 30 days and the Alarm-versus-KPI window may differ; a reasonable interpretation can proceed if clearly explained. Do not silently invent a window or substitute Avg for raw-sample Max. |
+| 01 | 当前图组合支持站点／设备／告警计数则转换，否则精确报告限制 | 走 Alarm→Device→Site，不走独立 Alarm→Site 引用。按完整 Site 身份分组；Device→Site OR 关系下告警计数不重复；count_having > 5，再计站点组数。 |
+| 02 | 若可发现最新整行样本路径则转换，否则报告限制 | 每个完整 Device 身份的两值和时间戳来自同一最新 KPI 行，不是各自最大值；同名设备不合并。 |
+| 03 | 仅在正确 PON 端口样本上有声明 Max 及离线分类时转换 | 窗口为 `[2025-03-01T12:00:00Z, 2025-03-31T12:00:00Z)`，使用调用方给定 now，不用 SQL now()，不能用 Avg 替代；发现模型缺口可接受。 |
+| 04 | 拒绝悄悄用服务器名替代风扇身份、PSU 健康替代 Server 健康，或替换 warning 状态 | 原 IC Q0184 SQL 统计不同服务器名且用健康编码 -1（error），问题却要求有 warning 服务器的风扇。答案由模型而非目标 SQL 定义。 |
+| 05 | 遵守显式 A/Z 纳入规则 | 用户明确要求所选设备在 Z 时也纳入 A。可解释为附加端点纳入而非字面有向下游，但不得省略，或把未转换的手写 SQL 当已验证结果。 |
+| 06 | 计数不同非空引用租户 ID，包含孤儿 ID，准确命名总体 | 纳入规则已明确；连接现存 Tenant 会排除孤儿，错误；把孤儿称作现存 Tenant 也不准确。不要仅为重命名已明确总体而要求澄清。 |
+| 07 | “少于五个”的通常含义包括零设备站点 | 仅 1～4 的内连接漏零值，include_empty 支持 0～4。若采用更窄解释须明确，不能悄悄声称已回答；同时匹配 OR 两分支的站点不能重复计设备。 |
+| 08 | 除非用户问不同名称，否则计不同 Site 身份 | “多少站点”指站点，不是展示标签。同名站点身份可不同；Q0014 的 COUNT(DISTINCT SITE_NAME) 不能证明用户想计名称。仅业务上下文确实使主体不明时询问。 |
+| 09 | 说明所选时间范围及峰值含义，或提出聚焦业务问题 | 从应用或环境解析参考时间为具体边界，说明日期及时区。滚动月、日历月、30 天以及告警／KPI 窗口可不同，合理解释可明确后执行；不能暗造窗口或用 Avg 替代原始样本 Max。 |
 
-Question provenance: `imaster-cloud/telora/tools/corpus_batch/results/baseline-s6/shapes.json`
-and `icloud_model/docs/PRESSURE_FAMILIES.md`. The corpus target SQL is a probe,
-not an authoritative semantic contract.
+问题来源：`imaster-cloud/telora/tools/corpus_batch/results/baseline-s6/shapes.json` 和 `icloud_model/docs/PRESSURE_FAMILIES.md`。
+语料目标 SQL 是探测材料，不是权威语义契约。

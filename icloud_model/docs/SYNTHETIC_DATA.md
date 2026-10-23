@@ -1,11 +1,9 @@
-# Synthetic SQLite data
+# 合成 SQLite 数据
 
-`scripts/generate-icloud-data.mjs` creates a queryable SQLite database using
-Node.js 22.13 or newer and its built-in `node:sqlite` module. It requires the
-local `bin/telora` compiler to export the prepared model. No Python, DuckDB,
-package installation or external imaster-cloud checkout is required.
+`scripts/generate-icloud-data.mjs` 使用 Node.js 22.13 及以上和内置 node:sqlite 创建可查询 SQLite 数据库。
+需要本地 bin/telora 导出准备模型，无需 Python、DuckDB、安装包或外部 imaster-cloud 检出。
 
-Run from the lab-ontology repository root:
+从 lab-ontology 根目录运行：
 
 ```sh
 mise x -- node scripts/generate-icloud-data.mjs \
@@ -13,69 +11,43 @@ mise x -- node scripts/generate-icloud-data.mjs \
   --anchor-utc 2026-10-03T12:00:00Z
 ```
 
-The output directory contains:
+输出目录包含：
 
-- `icloud.sqlite`: all 48 physical tables and 822 columns, with join indexes.
-- `model.json`: the prepared model used to build and validate the data.
-- `manifest.json`: options, source/model/database hashes, row counts, time
-  window, carrier coverage, relation coverage and cardinality checks.
+- icloud.sqlite：全部 48 张物理表、822 列及连接索引。
+- model.json：用于构建和验证数据的准备模型。
+- manifest.json：选项、源／模型／数据库哈希、行数、时间窗口、载体覆盖、关系覆盖及基数检查。
 
-The tool combines physical names and field coverage from
-`icloud_model/data/source_catalog.json` with scalar types, time encodings,
-grains, canonical enum wires, scopes and relations from `source_audit:report`.
-The catalog captures imaster-cloud's original metadata. Generated values are
-synthetic examples and do not establish business facts.
+工具将 icloud_model/data/source_catalog.json 中的物理名称和字段覆盖，与 source_audit:report 中的标量类型、时间编码、粒度、规范枚举编码、作用域及关系结合。
+目录记录 imaster-cloud 原始元数据；生成值是合成示例，不建立业务事实。
 
-## Options and scenarios
+## 选项与场景
 
-The defaults are seed `20260926`, 12 base rows per physical table, 32 days of
-hourly KPI samples, and the current UTC minute as the exclusive window end.
-Specify `--anchor-utc` together with the seed to reproduce identical database
-contents. Validation uses the chosen anchor, so historical anchors are valid.
+默认种子 20260926，每物理表 12 个基础行，32 天小时 KPI 样本，以当前 UTC 分钟为排他窗口终点。
+同时指定 anchor-utc 和种子可复现相同数据库内容。验证使用选定锚点，因此历史锚点也合法。
 
-`--resources N` sets the base population (minimum 6), `--days N` sets the KPI
-window, and `--interval-minutes N` sets the sample interval. For example, use
-`--interval-minutes 5` for five-minute samples. ONU KPI populations follow the
-scoped ONU identities and therefore contain fewer series than base tables.
-The tool refuses requests exceeding ten million KPI rows.
+resources N 设置基础总体，最少 6；days N 设置 KPI 窗口；interval-minutes N 设置采样间隔，如 5 表示五分钟。
+ONU KPI 遵循限定 ONU 身份，故序列少于基础表。超过一千万 KPI 行的请求被拒绝。
 
-The resource population covers tenants, sites, network devices and components,
-servers and components, storage, FC switches, PON hierarchies, terminals,
-collaboration devices and physical links. Each of the 17 KPI tables has daily
-variation; different series have rising, falling and steady profiles. Online
-rates include outages. Alarm rows cover six resource families, four severities,
-acknowledged/unacknowledged and cleared/uncleared states. Nullable frame remarks
-include a NULL example. Other fields use deterministic placeholders or
-declared enum wires; detailed physical capacities and device-specific KPI
-applicability are not simulated.
+资源覆盖租户、站点、网络设备及组件、服务器及组件、存储、FC 交换机、PON 层级、终端、协作设备和物理连接。
+17 张 KPI 表均有日变化，不同序列呈上升、下降或平稳趋势；在线率含中断。
+告警覆盖六类资源、四种严重度、已确认／未确认、已清除／未清除状态。
+可空机框备注有 NULL 示例，其他字段用确定性占位值或声明枚举编码；不模拟详细物理容量和设备特定 KPI 适用性。
 
-DatetimeUtc samples are stored as `YYYY-MM-DDTHH:MM:SSZ`, DateUtc as
-`YYYY-MM-DD`, and EpochMillis as SQLite integers. Local integer fields use the
-same synthetic clock as UTC fields; this is a fixture assumption. Zero marks
-absent alarm acknowledgement/clear times.
+DatetimeUtc 存为 YYYY-MM-DDTHH:MM:SSZ，DateUtc 为 YYYY-MM-DD，EpochMillis 为 SQLite 整数。
+本地整数与 UTC 字段使用相同合成时钟，这是夹具假设。零表示不存在的告警确认／清除时间。
 
-Declared dataset grains become unique indexes. Source-only KPI tables use the
-synthetic grain `resId, tenantId, ts` (omitting tenantId when absent), rather than
-treating the source resId marker as globally unique across time. Tables without
-a declared identity receive no invented unique constraint. StorageHardDriveKPI
-uses synthetic disk ownership because the model declares no owner relation.
+声明数据集粒度成为唯一索引。仅源 KPI 表使用合成 resId,tenantId,ts 粒度，无 tenantId 时省略，不把源 resId 标记视为跨时间全局唯一。
+无声明身份的表不虚构唯一约束。StorageHardDriveKPI 使用合成磁盘归属，因为模型无归属关系。
 
-Polymorphic references choose a resource family per row. A row need not match
-every alternative resource relation. The manifest reports matching row pairs,
-distinct matched rows and observed upper bounds for every declared relation.
-It reports cardinality exceptions; it does not install universal foreign keys
-or assert that every source row must match every alternative relation. Current
-default data covers all 50 carriers and all 126 prepared relations, with no
-upper-bound exceptions. It is intended for schema, filter, join, aggregation,
-time-window and comparison query testing, rather than production load sizing.
+多态引用逐行选择资源类别，一行不必匹配每条替代资源关系。
+清单报告每条声明关系的匹配行对、不同匹配行和观察上界，报告基数例外，不安装通用外键或断言每源行匹配每条替代关系。
+默认数据覆盖全部 50 个载体、126 条准备关系，无上界例外。
+用途是模式、筛选、连接、聚合、时间窗口和比较查询测试，不是生产容量规划。
 
-## Publication and verification
+## 发布与验证
 
-The output directory must not exist. Generation builds in a sibling temporary
-directory, checks SQLite integrity, actual row counts, all carrier scopes,
-time encodings and enum wires, then publishes by directory rename. Unique
-grain indexes detect duplicate identities before publication. Failed builds
-remove their temporary output. Existing outputs are preserved.
+输出目录必须不存在。生成在同级临时目录完成，检查 SQLite 完整性、实际行数、全部载体作用域、时间编码及枚举编码后，通过目录重命名发布。
+唯一粒度索引在发布前发现重复身份；失败构建清除临时输出，保留已有输出。
 
 ```sh
 mise x -- node scripts/tests/icloud-data.test.mjs
@@ -83,21 +55,12 @@ mise x -- node scripts/check-icloud-data.mjs bin/icloud-data
 mise x -- node scripts/check-icloud-discovery-pair.mjs bin/icloud-data
 ```
 
-The first command tests reproducibility, complete field/carrier/relation
-coverage, time windows, trends, unique grains, invalid value detection and
-failed publication. The second requires `bin/icloud_model.snapshot.wasm` and
-executes snapshot-generated SQLite queries for all 17 KPI windows, ONU/OLT
-scopes, five resource families' CPU averages and CPU GrowthRate Top-5. A snapshot path can be passed as its second
-argument.
+首条命令测试可复现性、完整字段／载体／关系覆盖、窗口、趋势、唯一粒度、无效值检测和失败发布。
+第二条需要 bin/icloud_model.snapshot.wasm，执行快照生成的全部 17 个 KPI 窗口、ONU／OLT 作用域、五类资源 CPU 平均及 CPU GrowthRate Top-5 的 SQLite 查询；第二参数可指定快照路径。
 
-The discovery/pair check verifies time-identity rejection, legal overlapping
-sample pairing, shared storage/FC owner discovery and period comparisons, and
-directory-only vocabulary enumeration. The 91 device KPI members can be
-enumerated with 15 directory calls and no per-member reads for their IDs.
+发现／配对检查验证时间身份拒绝、合法重叠样本配对、共享存储／FC 主体发现和周期比较，以及仅目录词汇枚举。
+91 个设备 KPI 成员可用 15 次目录调用枚举 ID，无需逐成员读取。
 
-StorageDeviceKPI contains a complete series for every storage device and every
-FC switch, so it has twice the base series count. Publication verifies that
-all five CPU-capable resource families have series and that their alarm-linked
-resources have samples on the alarm UTC day. Collaboration-device alarms are
-reported separately as having no declared CPU source. Alarm occurrence times
-are chosen within the generated sample window, including historical anchors.
+StorageDeviceKPI 对每个存储设备和 FC 交换机都有完整序列，故序列数为基础数量两倍。
+发布验证全部五类有 CPU 能力资源均有序列，且告警关联资源在告警 UTC 当日有样本。
+协作设备告警单独报告为无声明 CPU 源。告警发生时间在生成窗口内选择，包括历史锚点。
