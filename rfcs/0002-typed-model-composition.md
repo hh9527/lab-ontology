@@ -1094,3 +1094,12 @@ Event 显式选择 UTC 发生时间并保留事件 grain，允许来源发生时
 CurrentAlarm 尚未迁移，仍为 20/50；仅推进 transform，不增加知识准备成本。
 
 本项独立 typed IC 初始化在不含旧模型和服务的临时工作区通过（100000 fuel），不准备知识地图。
+
+### 阶段 D 前置能力：类型化关系条件
+
+relations::guarded 用来源 Row 字段、Eq/Ne 和同类型标量表达关系条件，保留名义类型与物理列映射，构造及 lowering 均校验条件。
+关系条件限制关联，不限制源 Dataset 的总体；反向 include_empty 保留零计数组，EXISTS 使用同一条件。
+OR 关系可以合并共享同一条件的分支；不同分支条件在当前单 guard 结构中不可无损表达，显式拒绝而非静默丢失条件。
+8 个实际 SQLite 场景、102 个既有 Graph 请求及 6 组关系 SQL 对照通过，PostgreSQL 仅核对参数。
+CurrentAlarm 尚未迁移，仍为 20/50；只准备 transform，不增加知识准备成本。
+本项最终 9 项条件关系契约与 12 项 IC transform 契约通过，包含擦除后字段／算子篡改和共享条件 OR 的正反例。

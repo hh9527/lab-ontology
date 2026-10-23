@@ -3,10 +3,14 @@ use crate::experimental::model as model;
 use crate::ontology as edsl;
 use crate::query as qb;
 use std::array as array;
+use std::codec as codec;
+use std::value::{Value};
+use crate::experimental::groups as g;
 use std::type_desc as td;
 
 type Endpoint = struct { dataset: model::PreparedDataset, role: String };
-type Relation = struct { id: String, from: Endpoint, to: Endpoint, cardinality: edsl::RelationCardinality };
+type Guard = struct { row: Type, dataset: String, source: String, column: g::Column, op: edsl::FilterOp, input: edsl::FilterInput };
+type Relation = struct { guard: Option(Guard), id: String, from: Endpoint, to: Endpoint, cardinality: edsl::RelationCardinality };
 type Link = struct { id: String, a: Relation, z: Relation, direction: edsl::LinkDirection };
 
 def endpoint: for(Row) Fn(model::Dataset(Row), model::Role(Row)) -> Endpoint = fn(dataset, role) {
@@ -27,7 +31,42 @@ def validate: Fn(Relation) -> Relation = fn(relation) {
     } else { relation }
 };
 def relation: for(From, To) Fn(String, model::Dataset(From), model::Role(From), model::Dataset(To), model::Role(To), edsl::RelationCardinality) -> Relation = fn(id, from, from_role, to, to_role, cardinality) {
-    validate({id, from: endpoint(from, from_role), to: endpoint(to, to_role), cardinality})
+    validate({guard: None, id, from: endpoint(from, from_role), to: endpoint(to, to_role), cardinality})
+};
+# 来源侧关系条件，只支持带类型标量的 Eq/Ne，不改变 Dataset 总体。
+def guarded: for(Row, Scalar: codec::Encode) Fn(Relation, model::Field(Row, Scalar), edsl::FilterOp, Scalar) -> Relation = fn(relation, field, op, value) {
+    let checked = validate(relation);
+    let column = g::input(field);
+    if checked.from.dataset.row != Row.type { fail!("relation guard belongs to another source row", checked.id) } else { () };
+    let input = match codec::encode(value) {
+        Value::String(text) => edsl::FilterInput::Text(text),
+        Value::Int(number) => edsl::FilterInput::Int(number),
+        Value::Float(number) => edsl::FilterInput::Number(number),
+        Value::True => edsl::FilterInput::Bool(True),
+        Value::False => edsl::FilterInput::Bool(False),
+        _ => fail!("relation guard requires a scalar literal", checked.id),
+    };
+    let guard: Guard = {row: Row.type, dataset: checked.from.dataset.id, source: checked.from.dataset.source,
+        column: {name: field.name, value: Scalar.type, nullable: column.nullable}, op, input};
+    prepare_guard(checked, guard);
+    checked <~ {guard: Some(guard)}
+};
+def prepare_guard: Fn(Relation, Guard) -> edsl::ScopePredicate = fn(relation, guard) {
+    if guard.row != relation.from.dataset.row || guard.dataset != relation.from.dataset.id || guard.source != relation.from.dataset.source {
+        fail!("relation guard belongs to another source dataset", relation.id)
+    } else { () };
+    g::shape(guard.row, g::Node::Column(guard.column));
+    let ty = storage(guard.column.value);
+    let compatible = match guard.input {
+        edsl::FilterInput::Text(_) => ty == String.type,
+        edsl::FilterInput::Int(_) => ty == Int.type,
+        edsl::FilterInput::Number(_) => ty == Float.type,
+        edsl::FilterInput::Bool(_) => ty == Bool.type,
+        _ => False,
+    };
+    if guard.op != edsl::FilterOp::Eq && guard.op != edsl::FilterOp::Ne { fail!("relation guard supports only Eq or Ne", relation.id) }
+    else if !compatible { fail!("relation guard literal does not match field storage", relation.id) }
+    else { {field: guard.column.name, op: guard.op, input: guard.input} }
 };
 def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
     validate(a); validate(z);
@@ -80,6 +119,15 @@ def lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(paylo
     let to = owner(payload, checked.to);
     let source = role(checked.from);
     let target = role(checked.to);
+    let guard = match checked.guard {
+        None => None,
+        Some(guard) => {
+            let predicate = prepare_guard(checked, guard);
+            if !array::any(from.fields, fn(field) { field.name == guard.column.name && field.ty == storage(guard.column.value) && field.nullable == guard.column.nullable && qb::is_sql_identifier(field.column) }) {
+                fail!("relation guard field does not match physical transform storage", checked.id)
+            } else { Some(predicate) }
+        },
+    };
     # 沿目标物理字段顺序输出等式，保持现有 QueryAst 的确定性排序。
     let target_fields = array::filter(to.fields, fn(field) { array::any(target.parts, fn(part) { part.source == field.name }) });
     let parts = array::map(target_fields, fn(target_field) {
@@ -93,7 +141,7 @@ def lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(paylo
     });
     {id: checked.id, label: checked.id, summary: "", from: from.index, to: to.index,
         cardinality: checked.cardinality,
-        key: if array::length(parts) == 1 { parts[0] } else { edsl::RelationKey::And(parts) }, guard: None}
+        key: if array::length(parts) == 1 { parts[0] } else { edsl::RelationKey::And(parts) }, guard}
 };
 def lower_all: Fn(edsl::PreparedPayload, Array(Relation)) -> Array(edsl::RelationEntry) = fn(payload, declarations) {
     let endpoints = array::flat_map(declarations, fn(relation) { [relation.from, relation.to] });
@@ -119,8 +167,8 @@ def lower_alternative: Fn(edsl::PreparedPayload, String, Array(Relation), edsl::
     if id == "" || array::length(lowered) < 2 { fail!("alternative relation requires a name and complete alternatives", id) }
     else {
         let first = lowered[0];
-        if !array::all(lowered, fn(other) { other.from == first.from && other.to == first.to }) {
-            fail!("alternative relations must share explicit dataset endpoints", id)
+        if !array::all(lowered, fn(other) { other.from == first.from && other.to == first.to && other.guard == first.guard }) {
+            fail!("alternative relations must share explicit dataset endpoints and guard", id)
         } else { first <~ {id, label: id, cardinality, key: edsl::RelationKey::Or(array::map(lowered, fn(relation) { relation.key }))} }
     }
 };
@@ -136,4 +184,4 @@ def lower_link: Fn(edsl::PreparedPayload, Link) -> edsl::BusinessLinkEntry = fn(
     }
 };
 
-pub use self::{Endpoint, Relation, Link, endpoint, relation, link, validate, lower, lower_all, lower_alternative, lower_link};
+pub use self::{Guard, guarded, Endpoint, Relation, Link, endpoint, relation, link, validate, lower, lower_all, lower_alternative, lower_link};
