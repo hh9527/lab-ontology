@@ -96,9 +96,25 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
     }
 };
 
+# 输入推断只读取查询契约，不构造描述、别名、标签等知识发现内容。
+type DimensionInputContract = struct {
+    dataset: String, field: String, computed: Bool, half_open: Bool, input_kinds: Array(edsl::FilterInputKind),
+};
+def dimension_input_contract: Fn(edsl::PreparedPayload, String) -> DimensionInputContract = fn(payload, id) {
+    let entry = match array::find(payload.dimensions, fn(entry) { entry.id == id }) {
+        Some(entry) => entry, None => fail!(`unknown dimension knowledge point \{id}`, id),
+    };
+    if !entry.authorized { fail!("dimension is not authorized for discovery", id) }
+    else {
+        let entity = payload.entities[entry.entity];
+        {dataset: entity.id, field: entity.fields[entry.field].name, computed: entry.computed,
+            half_open: entry.half_open, input_kinds: entry.input_kinds}
+    }
+};
+
 def inferred_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput =
     fn(payload, dimension, value) {
-        let detail = edsl::visible_dimension_detail(payload, dimension);
+        let detail = dimension_input_contract(payload, dimension);
         if let Value::Object(obj) = value {
             if !detail.half_open { fail!("tagged unknown input requires a half-open domain", dimension, value) }
             else if array::length(dict::keys(obj)) != 1 { fail!("unknown input requires exactly one tag", dimension, value) }
@@ -151,6 +167,16 @@ def inferred_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInpu
         }
     };
 
+def measure_contract: Fn(edsl::PreparedPayload, String) -> edsl::MeasureEntry = fn(payload, id) {
+    match array::find(payload.measures, fn(entry) { entry.id == id }) {
+        Some(entry) => entry, None => fail!(`unknown measure knowledge point \{id}`, id),
+    }
+};
+def measure_sampling_contract: Fn(edsl::PreparedPayload, String) -> Option(edsl::SampleMeasureEntry) = fn(payload, id) {
+    let measure = measure_contract(payload, id);
+    array::find(payload.entities[measure.entity].sample_measures, fn(entry) { entry.id == id })
+};
+
 def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(payload, measure, value) {
     match (edsl::measure_output_type(payload, measure), value) {
         (edsl::OutputType::Text, Value::String(text)) => edsl::FilterInput::Text(text),
@@ -160,8 +186,8 @@ def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput
         (edsl::OutputType::Boolean, Value::True) => edsl::FilterInput::Bool(True),
         (edsl::OutputType::Boolean, Value::False) => edsl::FilterInput::Bool(False),
         _ => do {
-            let detail = edsl::measure_detail(payload, measure);
-            fail!(`value does not match measure \{measure} output type; related knowledge key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Measure, detail.dataset, measure)}`, measure, value)
+            let entry = measure_contract(payload, measure);
+            fail!(`value does not match measure \{measure} output type; related knowledge key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Measure, payload.entities[entry.entity].id, measure)}`, measure, value)
         },
     }
 };
@@ -246,7 +272,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = 
     let op = parse_op(raw.op);
     let value = raw.value;
     let input = if op == edsl::FilterOp::InSubnet || op == edsl::FilterOp::NotInSubnet {
-        let detail = edsl::visible_dimension_detail(payload, dimension);
+        let detail = dimension_input_contract(payload, dimension);
         if detail.input_kinds != [edsl::FilterInputKind::Ipv4] {
             fail!(`subnet operation requires an IPv4 dimension \{dimension}`, dimension, value)
         } else { match value {
@@ -254,7 +280,7 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = 
             _ => fail!(`IPv4 subnet requires a CIDR string`, value),
         } }
     } else if value == Value::String("now") {
-        let detail = edsl::visible_dimension_detail(payload, dimension);
+        let detail = dimension_input_contract(payload, dimension);
         let temporal = array::any(detail.input_kinds, fn(kind) {
             kind == edsl::FilterInputKind::EpochMillis || kind == edsl::FilterInputKind::DatetimeUtc
                 || kind == edsl::FilterInputKind::DateUtc
@@ -297,7 +323,7 @@ def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilt
             _ => (),
         };
         let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
-        let detail = edsl::visible_dimension_detail(payload, raw.dimension);
+        let detail = dimension_input_contract(payload, raw.dimension);
         let role = edsl::time_domain(payload, detail.dataset, detail.field);
         let window: time::Window = {start: match raw.start {
                 None => None,
@@ -501,7 +527,7 @@ def pair_time_alignment: Fn(edsl::PreparedPayload, edsl::GraphRequest, edsl::Gra
         }), fn(field) {
             let bounds = fn(request: edsl::GraphRequest, node: String) {
                 array::filter(request.filters, fn(filter) {
-                    let dimension = edsl::visible_dimension_detail(payload, filter.request.id);
+                    let dimension = dimension_input_contract(payload, filter.request.id);
                     filter.node == node && !dimension.computed && array::any(entity.fields, fn(candidate) {
                         candidate.name == dimension.field && candidate.column == field.column
                     })
@@ -565,7 +591,7 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
         let visible = array::flat_map(selected, fn(item) {
             let alias = `\{item.node}_\{item.dimension}`;
             let prefix = if item.side == qb::PairSide::Left { "left" } else { "right" };
-            let columns = if edsl::visible_dimension_detail(payload, item.dimension).half_open { [alias, `\{alias}__kind`] } else { [alias] };
+            let columns = if dimension_input_contract(payload, item.dimension).half_open { [alias, `\{alias}__kind`] } else { [alias] };
             array::map(columns, fn(column) { {side: item.side, column, alias: `\{prefix}_\{column}`}.ty!(qb::JoinedGroupOutput) })
         });
         let left_measure = left.1.measures[0];
@@ -603,8 +629,8 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                     || (rtype != edsl::OutputType::Integer && rtype != edsl::OutputType::Number) {
                     fail!("aggregate pair rank requires numeric measures", left_measure.measure, right_measure.measure)
                 } else { () };
-                let lmetric = edsl::measure_domain(payload, left_measure.measure).sampling;
-                let rmetric = edsl::measure_domain(payload, right_measure.measure).sampling;
+                let lmetric = measure_sampling_contract(payload, left_measure.measure);
+                let rmetric = measure_sampling_contract(payload, right_measure.measure);
                 if left_measure.measure != right_measure.measure && !match (lmetric, rmetric) {
                     (Some(l), Some(r)) => l.unit != None && l.unit == r.unit,
                     _ => False,

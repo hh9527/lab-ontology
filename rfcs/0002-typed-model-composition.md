@@ -699,3 +699,43 @@ Group 在逻辑 Row 字段上检查类型，lowering 后在进入 QueryAst 前�
 验收通过 26 个准备正反例、四个维度／计数测试、23 个 Group 测试、合法类型控制与 12 个编译期拒绝；实际 SQLite 覆盖列重命名、单位换算、身份 NULL、分组／总体聚合、相关 EXISTS、grain 记录计数与空表零计数。
 现有 102 个 graph 用例和六组新旧关系等价查询同时通过。
 IC 的服务入口尚未切换，以上是后续完整迁移所需的声明能力。
+
+
+### 可复用维度策略与筛选专用成员
+
+DimensionGroup 支持 Eq／Ne、Gt／Ge／Lt／Le，以及 Contains／NotContains／StartsWith／EndsWith。
+`equality_filters`、`numeric_filters` 和 `text_search_filters` 是可复用的策略清单；模型通过带 Value 类型的 DimensionGroup 定义能力上限，绑定可以收紧投影与操作清单。
+数值比较只接受底层为 Int／Float 的值，包括数量 newtype；文本搜索只接受底层为 String 的值，Bool 只支持相等／不等。
+构造和擦除后的准备边界都检查操作适用类型、重复操作与能力上限；执行 profile 只要求绑定实际开放的操作，不因模板允许完整搜索就要求 Eq 专用绑定开放所有字符串运算。
+这不把普通字符串排序解释为业务枚举顺序。
+
+```telora
+let names = g::dimension_group("names", DeviceName.type, True, g::text_search_filters);
+let name = g::dimension(devices, names,
+    g::input(m::optional_field(DeviceRow.type, DeviceName.type, "name")),
+    "device_name", True, g::text_search_filters);
+let qualification = g::dimension(devices, names,
+    g::input(m::optional_field(DeviceRow.type, DeviceName.type, "name")),
+    "device_name_filter", False, [g::Filter::Eq]);
+```
+
+筛选专用成员可用于其已声明的过滤操作，但不能投影、进行 count_value 或用作 top_per 的样本排名字段。
+准备结构用 `authorized` 表示整体可访问性，用 `projectable` 单独限制投影；既有注解模型的 projectable 默认等于 authorized，完全未授权的维度继续拒绝访问。
+这修正了原型将禁止投影误解释为完全禁止筛选的问题。
+
+文本搜索复用现有 QueryAst：Contains／前后缀搜索保持原有大小写规则，百分号与下划线作为字面内容，输入始终进入参数绑定。
+Eq／Ne 保留现有原始标量比较语义；NULL 不满足普通相等／不等或数值比较，不被伪装为空字符串或零。
+数量比较的 JSON 输入仍按底层数字类型校验，Int 拒绝小数阈值，Bool 拒绝数字或字符串替代。
+
+Intent 的输入推断、时间边界和 GraphPair 对齐直接读取查询维度契约，度量类型错误诊断与 GraphPair 单位比较直接读取查询度量和样本元数据。
+这些路径不再为请求解析构造维度／度量的知识发现详情，描述、别名和本地化标签不属于转换依赖。
+为保持现有诊断兼容，相关错误仍可附已有知识键提示；这不执行知识图构建。
+
+验收通过 15 个策略／权限测试和 18 组真实 SQLite 查询，覆盖名义类型适用操作、绑定能力裁剪、输入类型、profile、筛选专用成员的值暴露边界、文字大小写与模式字符、NULL 和空输入。
+回归通过：102 个 graph 用例、六组关系等价查询、38 个 GraphPair 用例、26 个准备用例、19 个 profile 用例与三个 transform 初始化用例。
+当前完整 IC 模型的类型检查同时通过；IC 类型化服务迁移仍未完成，规范／半开放值、IPv4、报告样本统计 Group 与时间准备继续实施。
+
+```sh
+bin/telora -C relation_model test typed_policies --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-policies.py
+```

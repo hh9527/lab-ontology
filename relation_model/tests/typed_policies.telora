@@ -1,0 +1,136 @@
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::quantity as q;
+use ontology::experimental::transform as transform;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+
+type Name = struct(String);
+type Row = struct { seq: Int, name: Option(Name), amount: Option(q::Bytes), count: Int, active: Bool };
+def rows: m::Dataset(Row) = m::dataset("policies", "policy_rows", Row.type, ["seq"]);
+def names: g::DimensionGroup(Name) = g::dimension_group("names", Name.type, True, g::text_search_filters);
+def quantities: g::DimensionGroup(q::Bytes) = g::dimension_group("quantities", q::Bytes.type, True, g::numeric_filters);
+def binding: g::Binding(Row) = g::dimension(rows, names, g::input(m::optional_field(Row.type, Name.type, "name")), "name", True, g::text_search_filters);
+def limited: g::Binding(Row) = g::dimension(rows, names, g::input(m::optional_field(Row.type, Name.type, "name")), "limited", False, [g::Filter::Eq]);
+def declared: transform::Declaration = transform::map_columns(transform::declare(rows, [], [
+    g::dimension(rows, g::dimension_group("seq", Int.type, True, []), g::input(m::field(Row.type, Int.type, "seq")), "seq", True, []),
+    binding, limited,
+    g::dimension(rows, quantities, g::input(m::optional_field(Row.type, q::Bytes.type, "amount")), "amount", True, g::numeric_filters),
+    g::dimension(rows, g::dimension_group("count", Int.type, True, g::numeric_filters), g::input(m::field(Row.type, Int.type, "count")), "counter", True, g::numeric_filters),
+    g::dimension(rows, g::dimension_group("active", Bool.type, True, g::equality_filters), g::input(m::field(Row.type, Bool.type, "active")), "active", True, g::equality_filters),
+], []), [
+    transform::column(m::optional_field(Row.type, Name.type, "name"), "LABEL_TEXT"),
+    transform::column(m::optional_field(Row.type, q::Bytes.type, "amount"), "BYTE_VALUE"),
+    transform::column(m::field(Row.type, Int.type, "count"), "COUNT_VALUE"),
+]);
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column, qb::Operator::Filter, qb::Operator::Bind, qb::Operator::Scalar],
+    allowed_join_kinds: [], allowed_aggregates: [], allow_distinct: False,
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Gt, qb::ScalarFunction::Ge,
+        qb::ScalarFunction::Lt, qb::ScalarFunction::Le, qb::ScalarFunction::Instr, qb::ScalarFunction::Lower,
+        qb::ScalarFunction::Substr, qb::ScalarFunction::Add, qb::ScalarFunction::Sub, qb::ScalarFunction::Length],
+};
+def payload: edsl::PreparedPayload = transform::prepare("policies", [declared], profile).payload;
+def request: Fn(String, String, String) -> Value = fn(dimension, op, value_json) {
+    json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"policies"}],"edges":[],
+        "select":[{"node":"r","dimension":"seq"}],"filters":[{"node":"r","dimension":"\{dimension}","op":"\{op}","value":\{value_json}}]}`).unwrap!()
+};
+pub def nominal_numeric_values_cannot_advertise_text_search: test::Test = test::should_fail_with(fn() {
+    g::dimension_group("bad", q::Bytes.type, True, g::text_search_filters)
+}, "text filters require a text representation");
+pub def nominal_text_values_cannot_advertise_numeric_ordering: test::Test = test::should_fail_with(fn() {
+    g::dimension_group("bad", Name.type, True, g::numeric_filters)
+}, "ordered filters require a numeric representation");
+pub def boolean_values_cannot_advertise_ordering: test::Test = test::should_fail_with(fn() {
+    g::dimension_group("bad", Bool.type, True, g::numeric_filters)
+}, "ordered filters require a numeric representation");
+pub def dimension_policies_cannot_repeat_an_operation: test::Test = test::should_fail_with(fn() {
+    g::dimension_group("duplicate", Name.type, True, [g::Filter::Eq, g::Filter::Eq])
+}, "dimension policy repeats a filter");
+pub def preparation_rechecks_erased_operator_type: test::Test = test::should_fail_with(fn() {
+    let bad = binding.members[0] <~ {filters: [g::Filter::Gt]};
+    g::prepare(rows, [binding <~ {members: [bad]}])
+}, "ordered filters require a numeric representation");
+pub def narrowed_binding_cannot_expand_its_group_ceiling: test::Test = test::should_fail_with(fn() {
+    let equal = g::dimension_group("equality", Name.type, True, [g::Filter::Eq]);
+    g::dimension(rows, equal, g::input(m::optional_field(Row.type, Name.type, "name")), "invalid", True, [g::Filter::Ne])
+}, "dimension binding cannot expand group capabilities");
+pub def request_cannot_expand_a_restricted_binding: test::Test = test::should_fail(fn() {
+    intent::query_intent_ast_factory(payload)(request("limited", "Contains", r#""alpha""#))
+});
+pub def integer_field_rejects_fractional_thresholds: test::Test = test::should_fail(fn() {
+    intent::query_intent_ast_factory(payload)(request("counter", "Gt", "3.5"))
+});
+pub def boolean_field_rejects_numeric_inputs: test::Test = test::should_fail(fn() {
+    intent::query_intent_ast_factory(payload)(request("active", "Eq", "1"))
+});
+pub def complete_search_policy_checks_backend_capabilities: test::Test = test::should_fail_with(fn() {
+    transform::prepare("no-length", [declared], profile <~ {allowed_scalars: array::filter(profile.allowed_scalars, fn(op) { op != qb::ScalarFunction::Length })})
+}, "declared dimension filter uses capabilities not allowed by the query profile");
+type RuntimeCase = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String, String, String) -> RuntimeCase = fn(id, dimension, op, value_json) {
+    let ast = intent::query_intent_ast_factory(payload)(request(dimension, op, value_json));
+    {id, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("eq", "name", "Eq", r#""alpha""#),
+    runtime_case("ne", "name", "Ne", r#""alpha""#),
+    runtime_case("contains", "name", "Contains", r#""alpha""#),
+    runtime_case("not_contains", "name", "NotContains", r#""alpha""#),
+    runtime_case("starts", "name", "StartsWith", r#""alpha""#),
+    runtime_case("ends", "name", "EndsWith", r#""alpha""#),
+    runtime_case("literal_pattern", "name", "Contains", r#""%_""#),
+    runtime_case("literal_prefix", "name", "StartsWith", r#""%_""#),
+    runtime_case("suffix", "name", "EndsWith", r#""literal""#),
+    runtime_case("numeric_gt", "amount", "Gt", "3"),
+    runtime_case("numeric_ge", "amount", "Ge", "3.0"),
+    runtime_case("numeric_lt", "amount", "Lt", "0"),
+    runtime_case("numeric_le", "amount", "Le", "0.0"),
+    runtime_case("numeric_eq", "amount", "Eq", "3"),
+    runtime_case("numeric_ne", "amount", "Ne", "3.0"),
+    runtime_case("int_gt", "counter", "Gt", "3"),
+    runtime_case("bool_ne", "active", "Ne", "false"),
+    runtime_case("restricted_eq", "limited", "Eq", r#""alpha""#),
+]);
+
+pub def filter_only_dimension_cannot_be_projected: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"policies"}],"edges":[],
+        "select":[{"node":"r","dimension":"limited"}]}"#).unwrap!())
+}, "graph projection dimension limited is not authorized on node r");
+pub def filter_only_dimension_cannot_be_counted_as_a_value: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"policies"}],"edges":[],
+        "select":[],"count_value":{"node":"r","dimension":"limited"}}"#).unwrap!())
+}, "graph count_value dimension is not authorized");
+
+pub def entirely_unexposed_dimension_cannot_be_filtered: test::Test = test::should_fail_with(fn() {
+    let hidden = limited <~ {members: [limited.members[0] <~ {filters: []}]};
+    let without_access = transform::prepare("hidden", [declared <~ {groups: [g::binding_facts(hidden)]}], profile).payload;
+    intent::query_intent_ast_factory(without_access)(request("limited", "Eq", r#""alpha""#))
+}, "dimension is not authorized");
+
+pub def filter_only_dimension_cannot_be_used_as_sample_rank: test::Test = test::should_fail_with(fn() {
+    let relation: edsl::RelationEntry = {id: "self_owner", label: "Self owner", summary: "", from: 0, to: 0,
+        cardinality: {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional},
+        key: edsl::RelationKey::Eq({from: 0, to: 0}), guard: None};
+    let ranked = payload <~ {relations: [relation]};
+    intent::query_intent_ast_factory(ranked)(json::parse(r#"{"op":"Graph","root":"r",
+        "nodes":[{"id":"r","entity":"policies"},{"id":"s","entity":"policies"}],
+        "edges":[{"relation":"self_owner","from":"s","to":"r"}],
+        "select":[{"node":"r","dimension":"seq"},{"node":"s","dimension":"seq"}],
+        "top_per":{"owner":"r","sample":"s","rank":"limited","take":1}}"#).unwrap!())
+}, "must be a plain authorized unscoped sample dimension");
+
+pub def restricted_binding_only_requires_its_selected_backend_capabilities: test::Test = test::should_ok(fn() {
+    let restricted = transform::prepare("eq-only", [declared <~ {groups: [declared.groups[0], g::binding_facts(limited)]}],
+        profile <~ {allowed_scalars: [qb::ScalarFunction::Eq]}).payload;
+    let ast = intent::query_intent_ast_factory(restricted)(request("limited", "Eq", r#""alpha""#));
+    sqlite::build_query(ast).bindings == [qb::Val::String("alpha")]
+});

@@ -17,6 +17,7 @@ IC 模型使用上述注解准备入口；relation 模型使用 `experimental::t
 
 实验 API 的 Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
 维度和聚合度量共用这些表达式；Graph 投影与相关 EXISTS 聚合均检查能力和粒度。
+DimensionGroup 提供文本搜索、数值比较和相等策略，绑定可以收紧能力；筛选专用成员允许声明的过滤，但不允许投影、值计数或样本排名。
 可空身份缺失任一分量时所有分量投影为 NULL，速率只在正时长上计算，Sum／Max／Avg 保留空集 NULL 语义。
 逻辑 Row 字段与物理列名可通过 `transform::column` 和 `transform::map_columns` 显式绑定；未列出的字段使用同名物理列。
 映射保留字段类型、角色和粒度，准备时拒绝错配与列冲突。Group 表达式和角色关系共同使用已校验的物理映射。
@@ -62,6 +63,7 @@ SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
 `GraphUnion` 则是单个 Intent，遵循更严格的形状规则并产生一个去重结果集。
 
 内部的 `query_intent_ast_factory(payload)` 返回将单个 Intent 转为已校验 `QueryAst` 的函数。
+输入类型、维度能力和度量单位直接来自查询准备结构，请求解析不构造知识发现详情。
 `query_intent_lower_factory(payload, to_query)` 在其上增加后端渲染器；
 `query_request_method_factory(payload, to_query)` 是示例和 IC 入口使用的批量服务边界。
 这些工厂不同：直接工厂不解析服务请求对象，方法工厂负责解析。
