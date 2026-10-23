@@ -1014,3 +1014,14 @@ SlotId、DeviceId、TenantId、FrameDn 使用不同名义类型，布尔字段�
 九个 transform 契约、独立声明初始化、累计 302 组真实 SQLite 新旧查询和空表检查通过。
 双模型累计 SQL 对照的初始化 fuel 上限增至 200000，独立声明初始化仍在 100000 内完成。
 不准备知识地图、不执行知识发现或知识测试。MainService 未切换，PostgreSQL 仅核对参数。
+
+### 阶段 D 补充：同源角色的固有行范围
+
+PON ONU/OLT 角色迁移需要保留 entity_scope；独立声明新增 scope_equal / with_scope。
+字段与等值字面量共享 Scalar 类型参数，支持文本、整数、浮点、布尔和相应名义包装；可空字段使用非空比较值。
+准备时重新检查 Row、Dataset、source、字段类型与可空性，以及字面量存储类型，范围随 EntityEntry 进入既有 transform。
+多个条件合取，不由用户请求覆盖；沿用维度的等值解析、域编码、物理列映射和参数化行为。
+保留范围字段必须声明过滤维度及 profile 必须允许对应算子的既有要求，维度可以不可投影。
+本阶段只补迁移必需能力，不增加知识准备成本；PON 载体尚未计入完成数量。
+
+本项验证：10 个行范围正反例、9 个实际 SQLite 场景、既有 relation model 102 个 Graph 请求与 6 组 SQL 对照，以及 IC 独立初始化通过。PostgreSQL 仅核对参数。

@@ -10,19 +10,62 @@ use crate::query as qb;
 use std::array as array;
 use std::type_desc as td;
 use std::string as string;
+use std::codec as codec;
+use std::value::{Value};
 
 type ColumnBinding = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
 type ColumnMapping(Row) = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
 type FieldCount(Row) = struct { row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
 type FieldCountFacts = struct { row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
-type Declaration = struct { dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
+type RowScope(Row) = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
+type RowScopeFacts = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
+type Declaration = struct { scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
 type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
 type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
 def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::prepare(dataset, roles);
     let bindings = array::map(groups, g::binding_facts);
     g::prepare_facts(declared, bindings);
-    {dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+    {scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+};
+# 固有行范围在所有查询中生效；沿用现有维度的等值解析与域编码契约。
+def scope_equal: for(Row, Scalar: codec::Encode) Fn(m::Dataset(Row), m::Field(Row, Scalar), Scalar) -> RowScope(Row) = fn(dataset, field, value) {
+    let checked = m::prepare(dataset, []);
+    let input = g::input(field);
+    if checked.row != Row.type { fail!("row scope belongs to another dataset row", dataset.id) } else { () };
+    let literal = match codec::encode(value) {
+        Value::String(text) => edsl::FilterInput::Text(text),
+        Value::Int(number) => edsl::FilterInput::Int(number),
+        Value::Float(number) => edsl::FilterInput::Number(number),
+        Value::True => edsl::FilterInput::Bool(True),
+        Value::False => edsl::FilterInput::Bool(False),
+        _ => fail!("row scope requires a scalar literal", field.name),
+    };
+    {row: Row.type, dataset: dataset.id, source: dataset.source, column: {name: field.name, value: Scalar.type, nullable: input.nullable}, input: literal}
+};
+def with_scope: for(Row) Fn(Declaration, Array(RowScope(Row))) -> Declaration = fn(declared, predicates) {
+    if declared.dataset.row != Row.type { fail!("row scopes belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {scope: array::map(predicates, fn(predicate) {
+        {row: predicate.row, dataset: predicate.dataset, source: predicate.source, column: predicate.column, input: predicate.input}.ty!(RowScopeFacts)
+    })} }
+};
+def prepare_scope: Fn(Declaration) -> Array(edsl::ScopePredicate) = fn(declared) {
+    array::map(declared.scope, fn(predicate) {
+        if predicate.row != declared.dataset.row || predicate.dataset != declared.dataset.id || predicate.source != declared.dataset.source {
+            fail!("row scope belongs to another dataset", declared.dataset.id)
+        } else { () };
+        g::shape(declared.dataset.row, g::Node::Column(predicate.column));
+        let storage = scalar(predicate.column.value).storage;
+        let compatible = match predicate.input {
+            edsl::FilterInput::Text(_) => storage == String.type,
+            edsl::FilterInput::Int(_) => storage == Int.type,
+            edsl::FilterInput::Number(_) => storage == Float.type,
+            edsl::FilterInput::Bool(_) => storage == Bool.type,
+            _ => False,
+        };
+        if !compatible { fail!("row scope literal does not match field storage", predicate.column.name) }
+        else { {field: predicate.column.name, op: edsl::FilterOp::Eq, input: predicate.input}.ty!(edsl::ScopePredicate) }
+    })
 };
 # COUNT(field) 只计算非NULL来源值，不要求字段是主键，也不自动变成DISTINCT
 # 保留来源与类型见证，在擦除后准备时再次检查
@@ -167,7 +210,7 @@ def entity_entry: Fn(Declaration, Int) -> edsl::EntityEntry = fn(declared, index
     {references: [], field_roles: [], index, id: dataset.id, entity_type: dataset.row, table: dataset.source,
         alias: source.alias, source, key_field: key, fields, union: None,
         dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: if declared.clock == None { edsl::DatasetKind::Entity } else { edsl::DatasetKind::Metric }, grain: dataset.grain, utc_time: declared.clock}) },
-        sample_measures, description: None, scope: []}
+        sample_measures, description: None, scope: prepare_scope(declared)}
 };
 # Group 使用 Row 字段寻址；在进入 QueryAst 前统一替换为已校验物理列。
 def physical_expr: Fn(qb::Expr, Array(edsl::FieldEntry)) -> qb::Expr = fn(expr, fields) {
@@ -378,4 +421,4 @@ def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative)
     prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
 };
 
-pub use self::{Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, metric, with_samples, with_domains, declare, prepare, build};
+pub use self::{RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, metric, with_samples, with_domains, declare, prepare, build};

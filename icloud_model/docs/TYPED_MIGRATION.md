@@ -218,3 +218,12 @@ SlotId、DeviceId、TenantId 与 FrameDn 区分不同引用，isDaughterCard 保
 SQL 用例覆盖全部新增维度、状态 Eq/Ne、NULL、布尔真/假、槽位计数和五条关系。
 对照模块同时准备新旧模型和累计请求，将其初始化 fuel 上限改为 200000；独立生产声明初始化仍在 100000 内通过。
 不执行知识发现、知识地图构建、知识测试或源审计报告，MainService 尚未切换。
+
+## PON 迁移前置：固有行范围
+
+ONU/OLT 是同一物理来源的不同固有范围，不得只迁移字段而丢掉分类筛选。
+独立声明新增 `t::with_scope(declaration, [t::scope_equal(dataset, field, value)])`，保留既有范围与域解析语义。
+字段和值共享类型参数，擦除后重新校验来源与字段见证；范围字段仍须有过滤维度（可不可投影），对应算子受 profile 限制。
+此项为 transform 迁移前置，载体完成进度仍为 13/50；不触发知识发现或知识地图构建。
+
+本项验证：10 个行范围正反例、9 个实际 SQLite 场景、既有 relation model 102 个 Graph 请求与 6 组 SQL 对照，以及 IC 独立初始化通过。PostgreSQL 仅核对参数。
