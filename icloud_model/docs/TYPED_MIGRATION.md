@@ -48,10 +48,10 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 第二十批已验证 |
 | SourceNetworkAPKPI | `source_NetworkAPKPI` | `NetworkAPKPI` | 第二十一批已验证 |
 | SourceNetworkApRadioKPI | `source_NetworkApRadioKPI` | `NetworkApRadioKPI` | 第二十一批已验证 |
-| SourceNetworkCellLinkQualityKPI | `source_NetworkCellLinkQualityKPI` | `NetworkCellLinkQualityKPI` | 待迁移 |
-| SourceNetworkCellLinkTrafficKPI | `source_NetworkCellLinkTrafficKPI` | `NetworkCellLinkTrafficKPI` | 待迁移 |
-| SourceNetworkDeviceBoardKPI | `source_NetworkDeviceBoardKPI` | `NetworkDeviceBoardKPI` | 待迁移 |
-| SourceNetworkDeviceOnlineKPI | `source_NetworkDeviceOnlineKPI` | `NetworkDeviceOnlineKPI` | 待迁移 |
+| SourceNetworkCellLinkQualityKPI | `source_NetworkCellLinkQualityKPI` | `NetworkCellLinkQualityKPI` | 第二十二批已验证 |
+| SourceNetworkCellLinkTrafficKPI | `source_NetworkCellLinkTrafficKPI` | `NetworkCellLinkTrafficKPI` | 第二十二批已验证 |
+| SourceNetworkDeviceBoardKPI | `source_NetworkDeviceBoardKPI` | `NetworkDeviceBoardKPI` | 第二十二批已验证 |
+| SourceNetworkDeviceOnlineKPI | `source_NetworkDeviceOnlineKPI` | `NetworkDeviceOnlineKPI` | 第二十二批已验证 |
 | SourcePhysicalServerDisk | `source_PhysicalServerDisk` | `PhysicalServerDisk` | 待迁移 |
 | SourcePhysicalServerNetworkAdapter | `source_PhysicalServerNetworkAdapter` | `PhysicalServerNetworkAdapter` | 待迁移 |
 | SourcePhysicalServerOpticalModule | `source_PhysicalServerOpticalModule` | `PhysicalServerOpticalModule` | 待迁移 |
@@ -546,3 +546,28 @@ Radio 源 SHA256 与 catalog 一致。AP 当前外部源 SHA256 为 75d127324ff5
 样本计数与度量聚合分别生成请求，保持 Graph 不能混合两种聚合粒度的原有约束；显式 Effcnt 过滤只影响对应请求。
 PostgreSQL 只核对参数，未实际执行；SQL fixture 独立按需生成（450000 fuel），未重跑此前载体全部历史 SQL。
 累计完成 28/50 个既有载体，完整范围不变。MainService 尚未切换，不构建知识地图或执行知识测试。
+
+
+## 第二十二批蜂窝链路、单板与在线率
+
+质量来源迁移 16 字段／19 维度，流量来源迁移 14 字段／17 维度；两者旧声明只有原始维度及单列 resId key，没有显式 Metric 或公开样本统计。
+新声明保持旧兼容性的 Entity／单列 grain，不因 KPI 名称补造度量或租户／时间复合身份；该声明不是对生产唯一性的新增确认。
+Rfc3339Text UTC 字段和 Hour／Day／Month 分桶仍可查询；packetLoss、jitter、delay、lqm、traffic、utilization 等分别采用单位／尺度未确认的名义类型，不擅自推定百分比、毫秒或字节。
+Effcnt 仅为原始整数计数列，不驱动过滤、权重或派生运算；站点／链路字段不因名称而新增关联。
+
+单板来源迁移 11 字段／14 维度和九个公开样本统计，继续使用暂定租户／资源／UTC Metric grain，生产唯一性仍待 #51 确认。
+CPU／内存百分比与摄氏温度复用已声明单位的样本组，保持原始 Avg/Max/Min，不默认 Effcnt 加权或有效性过滤。
+在线率专表迁移九字段／12 维度和三个统计，保持独立 NetworkDeviceOnlineKPI 总体，不以 NetworkDeviceKPI 替代。
+在线率采用独立名义百分比表示，但百分比尺度仍为旧待确认假定；不做重缩放、范围钳制、连续可用性或 SLA 推断。
+字段非空性延续旧契约，NULL fixture 用于检查来源异常值的 SQL 防御行为。
+
+四个源文件 SHA256 均与 catalog 一致；17 项 IC transform 契约在 250000 fuel 内通过。
+隔离初始化原 200000 fuel 实际耗尽后调整验证预算至 250000，不引入知识准备或累积查询准备。
+
+独立 typed 初始化在调整后的 250000 fuel 内通过。
+247 组实际 SQLite 新旧对照及空表检查通过，全部有独立期望值；覆盖全部 62 维度、12 个公开统计、七个蜂窝原始浮点字段及代表性单板／在线率字段的全部比较、等值边界、四来源的原始行计数和 UTC 分桶／窗口。
+统计验证含跨租户同资源、不同时间间距、零／不同 Effcnt、全 NULL／空窗口及异常范围原始值，不做隐式去重、加权、有效性过滤或钳制。
+在 NetworkDeviceKPI 中插入值 9999 的独立总体，在线率专表结果不受其影响；站点／链路等原始标识保持文本，不增加关系。
+蜂窝 fixture 允许重复 resId 检查原有物理行计数，不将旧单列 key 提升为已确认的生产唯一性事实。
+PostgreSQL 只核对参数，未实际执行；SQL fixture 独立按需生成（600000 fuel），没有准备历史累计查询。
+累计完成 32/50 个载体；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
