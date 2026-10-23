@@ -13,11 +13,13 @@ def evaluate(name):
         str(ROOT / "bin/telora"), "-C", str(ROOT / "icloud_model"), "eval",
         f"@test/typed_inventory:{name}", "--initialization-fuel", "100000",
         "--request-fuel", "100000", "--with-memory-limit", "2048",
-    ], capture_output=True, text=True, check=True, timeout=240)
+    ], capture_output=True, text=True, timeout=240)
+    assert result.returncode == 0, (name, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
-cases = evaluate("runtime_cases") + evaluate("site_relation_cases")
-schema = evaluate("physical_schema")
+fixture = evaluate("runtime_fixture")
+cases = fixture["inventory"] + fixture["site"] + fixture["port"]
+schema = fixture["schema"]
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
             "subnet": [("d1",), ("d2",)], "count": [(6,)], "tenant_count": [(2,)],
@@ -31,7 +33,7 @@ with sqlite3.connect(":memory:") as db:
     db.create_function("regexp", 2, lambda pattern, value: None if value is None else bool(re.search(pattern, value)))
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
-        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME"} else "TEXT") for name in columns)
+        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
         db.execute(f'CREATE TABLE "{table}" ({fields})')
     db.executemany("INSERT INTO X_TENANT_VIEW (TENANT_ID, TENANT_NAME, INDUSTRY, TENANT_ACCESS_TIME) VALUES (?, ?, ?, ?)", [("t1", "Tenant Alpha", "IT", -1), ("t2", "租户二", "Health", 1000)])
     columns = next(columns for table, columns in schema if table == "I_EntNetworkElement")
@@ -63,14 +65,32 @@ with sqlite3.connect(":memory:") as db:
     expected_sites = [("d1", "s1"), ("d2", "s2"), ("d3", "s1"), ("d4", "s1"), ("d4", "s2")]
     expected["device_located_at_site"] = expected_sites
     expected["source_EntNetworkElement_X_SITE_VIEW"] = expected_sites
+    port_columns = next(columns for table, columns in schema if table == "I_EnterpriseNetworkLTP")
+    for identity, tenant, parent, state, admin, kind, bandwidth, address in [
+        ("p1", "t1", "d1", "active", "test", 65635, 1000.75, "192.0.2.1"),
+        ("p2", "t2", "d1", "inactive", "active", 2, 1000.5, "192.0.2.255"),
+        ("p3", "missing", "missing", "unknown", "inactive", 99999, 0, "2001:db8::1"),
+    ]:
+        values = {name: f"{identity}_{name}" for name in port_columns}
+        values.update(id=identity, tenantId=tenant, refParentNE=parent, name=identity, operState=state,
+                      adminState=admin, ifType=kind, bandwidth=bandwidth, ipAddress=address, ifMtu=1500)
+        db.execute('INSERT INTO I_EnterpriseNetworkLTP VALUES (' + ','.join('?' for _ in port_columns) + ')', [values[column] for column in port_columns])
+    expected.update(port_count=[(3,)], port_up=[("p1",)], port_admin=[("p1",)], port_type=[("p1",)],
+                    port_bandwidth=[("p1",)], port_subnet=[("p1",), ("p2",)])
+    expected["port_belongs_to_device"] = [("p1", "d1"), ("p2", "d1")]
+    expected["source_EntNetworkElement_EnterpriseNetworkLTP"] = expected["port_belongs_to_device"]
+    expected["source_EnterpriseNetworkLTP_X_TENANT_VIEW"] = [("p1", "Tenant Alpha"), ("p2", "租户二")]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
     for case in cases:
         assert case["columns"] == case["baseline_columns"], case["id"]
         assert case["typed"]["bindings"] == case["postgres"]["bindings"], case["id"]
-        actual = sorted(execute(case["typed"]), key=repr)
-        baseline = sorted(execute(case["baseline"]), key=repr)
+        try:
+            actual = sorted(execute(case["typed"]), key=repr)
+            baseline = sorted(execute(case["baseline"]), key=repr)
+        except sqlite3.Error as error:
+            raise AssertionError((case["id"], str(error))) from error
         assert actual == baseline, (case["id"], actual, baseline, case)
         if case["id"] in expected:
             assert actual == sorted(expected[case["id"]], key=repr), (case["id"], actual)
@@ -79,6 +99,6 @@ with sqlite3.connect(":memory:") as db:
     for case in cases:
         actual = execute(case["typed"])
         assert actual == execute(case["baseline"]), ("empty", case["id"])
-        if case["id"] in {"count", "tenant_count"}:
+        if case["id"] in {"count", "tenant_count", "port_count"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
 print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and all migrated relations")

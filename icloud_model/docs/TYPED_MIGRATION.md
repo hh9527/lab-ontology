@@ -23,7 +23,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | Device | `device` | `I_EntNetworkElement` | 首批已验证 |
 | Tenant | `tenant` | `X_TENANT_VIEW` | 首批已验证 |
 | Site | `site` | `X_SITE_VIEW` | 第二批已验证 |
-| Port | `port` | `I_EnterpriseNetworkLTP` | 待迁移 |
+| Port | `port` | `I_EnterpriseNetworkLTP` | 第三批已验证 |
 | InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 待迁移 |
 | ServerDevice | `server_device` | `PhysicalServer` | 待迁移 |
 | ServerKpi | `server_kpi` | `ServerDeviceKPI` | 待迁移 |
@@ -95,3 +95,22 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 SQL 额外验证 online 映射、OR 单路匹配、双路同站点去重、双路不同站点、无匹配及两个租户方向。
 
 包含前批回归的 46 组 SQLite 新旧查询及空表对照全部通过；PostgreSQL 仅比较参数，未实际执行。
+
+## 第三批 Port
+
+迁移全部 17 个物理字段、15 个公开维度、interface_count 和三个跨批关系。
+PortId、DeviceId、TenantId 分开表达身份；带宽使用 BitsPerSecond，避免与字节速率隐式混用。
+保留三个闭合值域的全部业务 ID 与物理编码，包括 38 个整数接口类型。
+原始地址搜索和可空 IPv4 视图分别发布。
+源文件 EnterpriseNetworkLTP.logical.yaml 哈希与 source_catalog.json 一致，字段可空声明仍保持基线契约。
+
+独立初始化随着声明增加超出默认 fuel，隔离验收显式使用与契约测试一致的 100000 初始化 fuel。
+隔离工作区仍不含旧 IC 模型和服务源码，不以加载旧载荷的成功冒充独立准备。
+SQL 夹具覆盖小数带宽边界、状态映射、大整数接口编码、IPv4 及三个关系的方向和缺失端点。
+
+六个契约测试、隔离初始化、累计 70 组 SQLite 新旧查询及空表对照通过。
+SQLite 原渲染将 38 项接口类型映射为深层嵌套 CASE，实际投影触发 parser stack overflow。
+现将连续 ELSE IF 展开为同一个 CASE，保留条件顺序、绑定句柄、NULL 与嵌套 THEN 语义。
+新增四个直接 SQLite 条件链执行回归；relation model 的 102 个既有 Graph 请求和六组 SQL 对照通过。
+验收夹具合并为一次 Telora 初始化，避免按能力组重复准备新旧模型。
+累计迁移 4/50 个载体、46 个公开维度、三个计数和九个关系，服务未切换。
