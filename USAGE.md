@@ -1,6 +1,6 @@
 # 本体服务使用说明
 
-本文介绍基于本体的查询服务如何打包、启动和使用。第 1～3 节适用于暴露相同三个方法的任意模型。
+本文介绍基于本体的查询服务如何打包、启动和使用。当前模型服务只启用 transform，初始化只准备查询所需契约。
 第 4 节列出本仓库领域，集成应用可替换或省略。构建命令在仓库根目录运行，runner 可从任意能访问产物的目录启动。
 第 1～2 节面向可信宿主，不面向发起查询的 Agent。
 
@@ -11,24 +11,14 @@
 ## 1. 构建快照
 
 ```sh
-node scripts/build-knowledge-snapshot.mjs --module <module> \
-  --domain <domain> --output <artifact>.wasm
+bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm
 ```
 
 `<module>` 是拥有 `MainService` 的 Telora 工作区成员，不是请求中的领域名。
 构建初始化服务并将就绪状态嵌入 Wasm。若模块声明外部源，构建时用 `--source name=path` 提供全部源。
 部署需要时可通过 CLI 设置初始化 fuel、请求 fuel 和内存上限；实验产物须搭配兼容版本 `telora-run`。
-包装脚本以 `--snapshot` 编译，遍历实际产物的可见知识，检查通过后才发布。
-集合中每个领域重复传入 `--domain`；当前两个服务各暴露一个领域：`relation` 或 `ic`。
-生成 `<artifact>.wasm.knowledge.json`（可见键／类型、计数、模型版本和产物 SHA-256）以及
-`<artifact>.wasm.knowledge-sizes.json`（完整大小排名、最大条目／链接、阈值及运行时验证结果）。
-具体文档默认预算为 16,000 字符，严格按 `JSON.stringify({Document:{Found:node}}, null, 2).length` 测量，而非 UTF-8 字节。
-索引元数据会测量但不受该预算约束。完整术语通过独立能力获取，供消费方缓存与搜索。
-用 `--max-node-chars <number>` 设置部署预算；超限会在替换旧产物前失败，`--on-oversize warn` 显式允许带警告发布。
-`--not-found <checks.json>` 还可用 `{domain,key}` 请求组成的 JSON 数组检查隐藏键。
-包上下文不同于模块名时使用 `--context <crate-directory>`，包装脚本转发重复的 `--source` 及 fuel／内存选项。
-传输或部署后，`node scripts/check-knowledge-manifest.mjs <artifact>.wasm` 校验哈希、版本、计数和真实 `info` 样本。
-实验可直接用 `bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm`，但会绕过发布检查。
+当前实验直接构建 transform 快照，产物写入临时目录验收，不调用知识发布包装脚本。
+知识地图、节点遍历、知识 sidecar 和知识测试留待后续知识契约阶段处理。
 
 ## 2. 启动服务
 
@@ -41,15 +31,15 @@ telora-run <artifact>.wasm --serve http://127.0.0.1:8080
 不带 `--serve` 的 runner 读取一个完整 JSON 请求，响应一次后退出。
 `telora-run` 执行构建产物，无需源树、工作区配置或编译器；部署只需产物和兼容 runner。
 
-本仓库模型显式声明 POST 路由 `/<domain>/info` 和 `/<domain>/transform`。
+本仓库模型显式声明 POST 路由 `/<domain>/transform`。
 HTTP 请求体就是槽位输入，不含 JSONL 的 `method`／`input` 信封。例如：
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8080/ic/info \
-  -H 'Content-Type: application/json' -d '{"key":"index"}'
+curl -sS -X POST http://127.0.0.1:8080/ic/transform \
+  -H 'Content-Type: application/json' -d '{"intents":[{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device_id"}]}]}'
 ```
 
-`telora-run` 不提供认证，只绑定宿主私有回环或 Unix socket，并通过可信工具适配器或认证网关向 Agent 暴露这两个操作。
+`telora-run` 不提供认证，只绑定宿主私有回环或 Unix socket，并通过可信工具适配器或认证网关向 Agent 暴露查询操作。
 Agent 环境不得挂载快照、runner、源树、测试或评测材料，也不得拥有能读取宿主部署目录的 shell 或文件工具。
 网关凭据及 runner 命令不进入 Agent 上下文。仅在提示词中省略产物路径不构成隔离；能无限制访问宿主文件系统的本地工具进程也不构成隔离。
 限流、请求大小限制、访问日志和 SQL 执行授权由宿主负责。`transform` 只生成 Query，不执行。
@@ -58,7 +48,9 @@ Agent 环境不得挂载快照、runner、源树、测试或评测材料，也�
 ## 3. 宿主请求协议与知识事实
 
 JSONL 请求恰好包含 `method` 和 `input`；method 选择槽位，仅 input 传入该槽位。
-HTTP 则直接把相同 input POST 到对应路径。知识与查询方法如下：
+HTTP 则直接把相同 input POST 到对应路径。当前使用 `<domain>/transform`，请求形状见下文 Intent 说明。
+
+以下知识接口说明作为后续契约演进的参考，当前模型 MainService 未启用 info／discovery，也不在初始化和验收中构建知识地图。
 
 ```json
 {"method":"<domain>/info","input":{"key":"index"}}
@@ -236,9 +228,8 @@ exists 限定外层实体而不扩增其行；关联一对多实体只需证明�
 
 筛选操作符为 Eq、Ne、Gt、Ge、Lt、Le、Contains、NotContains、StartsWith、EndsWith。
 模型限制每个维度允许的操作和逻辑值类型。不要发送 kind，目标维度或度量决定 JSON 值逻辑类型。
-info 显示的带类型谓词输入和规范编码是模型事实，不是 JSON Intent 值语法。
-从索引找到 Intent 语法入口，通过 `<domain>/info` 跟随返回键及链接。
-诊断中给出的 info 键可用于读取知识以修复 Intent。业务值筛选使用稳定值 ID，不使用物理编码或本地化标签。
+带类型谓词输入和规范编码是模型事实，JSON Intent 使用本文定义的值语法。
+当前实验通过模型声明和请求诊断确定允许的 ID 与操作。业务值筛选使用稳定值 ID，不使用物理编码或本地化标签。
 
 ### 单一去重实体集合
 
@@ -301,6 +292,6 @@ transform 的 ok 包含上述批次响应。拒绝 Intent 表现为 `ok.accepted
 | `relation_model` | `relation` | 精简的租户、站点、设备和连通关系示例 |
 | `icloud_model` | `ic` | iMaster Cloud 建模压力夹具 |
 
-每个模型独立构建快照，暴露 `<domain>/info`、`<domain>/transform`、`<domain>/discovery` 及对应 HTTP POST 路由。
+每个模型独立构建快照，暴露 `<domain>/transform` 及对应 HTTP POST 路由。
 两个模块均无需外部构建源，最小构建与请求流程见[关系示例](relation_model/README.md)。
 IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。

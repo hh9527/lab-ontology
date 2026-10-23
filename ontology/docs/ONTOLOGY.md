@@ -6,25 +6,22 @@
 
 知识发布包含事实和已声明的约束。面向 Agent 的用法与工具示例由消费方负责；版本化契约见[知识契约](KNOWLEDGE.md)。
 
-## 一个模型，两种用途
+## 查询模型准备
 
 领域在 Telora 模块中定义带类型的数据集、维度、度量、值、时间角色和具名关系，再通过
-`edsl::build_root(revision, entity_types, profile)` 一次性准备。得到的 `PreparedPayload`
-由查询转换和知识发现共享。完整的小型声明见 [`relation_model`](../../relation_model/src/model.telora)；
-将同一载荷挂载为知识与查询方法的示例见[服务入口](../../relation_model/src/lib.telora)。
+`edsl::build_transform_root(revision, entity_types, profile)` 准备查询所需的 `PreparedPayload`。
+该入口验证字段、值域、权限、关系、粒度和 profile，跳过知识描述、别名、本地化、知识注解与知识类型目录校验。
+当前模型 MainService 只初始化 transform。完整的小型声明见 [`relation_model`](../../relation_model/src/model.telora)，服务挂载见[入口](../../relation_model/src/lib.telora)。
 
 ```telora
 use ontology::ontology as edsl;
 use ontology::intent as intent;
-use ontology::knowledge as knowledge;
 use ontology::sqlite as sqlite;
 use std::value::{ Value };
 
 # `payload` 是领域模型的 PreparedPayload。
 def lower: Fn(Value) -> Value =
-    intent::query_request_method_factory(payload, "public", sqlite::build_query);
-def info: Fn(Value) -> Value =
-    knowledge::knowledge_info_method_factory(payload, "public");
+    intent::query_request_method_factory(payload, sqlite::build_query);
 ```
 
 SQL 后端在构造转换函数时指定，请求本身不能选择后端。入口服务仅将槽位输入传给对应方法，宿主的 JSONL 信封负责选择槽位。
@@ -46,7 +43,7 @@ SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
 - 时间角色声明逻辑类型和物理编码。调用方提供具体时间边界，详见[时间契约](TIME.md)。
 - 逻辑标量类型定义值与操作的语义，独立于物理存储和维度能力子集。初始 IPv4 契约见[逻辑类型](LOGICAL-TYPES.md)。
 
-`build_root` 校验声明并生成准备好的词汇表，供从 `index` 开始的 `info` 和 `transform` 共同使用。
+`build_transform_root` 校验并准备 transform 契约；需要完整知识准备时可显式使用 `build_root`，知识地图建设留待后续阶段。
 维度可见性由模型声明，调用方认证由宿主负责。模型注解决定哪些业务含义合法；Intent 和渲染器都不能增加未声明语义。
 
 ## 转换边界
