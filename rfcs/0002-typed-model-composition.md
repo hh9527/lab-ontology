@@ -794,3 +794,37 @@ Graph 输入使用既有 IPv4 与 CIDR 校验，原始文本可以另行作为�
 验收使用真实 SQLite 执行九组查询，覆盖规范地址、范围外 octet、前导零、IPv6、尾换行、空文本、NULL、空表，以及 /0、/24、/25、/32 和补集。
 SQLite 测试提供 REGEXP 函数；PostgreSQL 仅核对参数一致性。
 逻辑时间类型、时间角色与样本统计能力仍是后续步骤，不由本 IPv4 子项替代。
+
+### 阶段 D 进展：具名时间类型与准备字段时间角色
+
+新增 `scalars::EpochMillis`、`LocalEpochMillis`、`Rfc3339Utc`、`LocalDateTime` 与 `DateUtc`。
+时间类型携带逻辑语义与物理编码的组合，Dataset Row 使用这些类型后，独立准备自动生成字段时间角色；普通 Int／String 不推断成时间。
+Local 毫秒和 UTC 毫秒具有不同名义类型，即使 JSON 都是整数也不能直接替换。
+
+```telora
+type Sample = struct {
+    id: Int,
+    at: s::Rfc3339Utc,
+    received: s::EpochMillis,
+};
+# 公开 at 维度，允许裁剪为所需的时间比较操作
+g::dimension(samples,
+    g::dimension_group("sample_time", s::Rfc3339Utc.type, True, g::time_filters),
+    g::input(m::field(Sample.type, s::Rfc3339Utc.type, "at")),
+    "sample_time", True, g::time_filters)
+```
+
+`FieldEntry.time` 保存准备后的字段时间事实。旧注解入口将 `TimeField` 复制到该字段，独立入口从精确的名义类型生成；
+请求输入校验、时间窗、结果列和时间对齐读取准备契约，不再依赖 Row 上必须存在时间注解。
+公共准备校验同时拒绝时间编码与物理类型或语义不一致的擦除记录。
+
+时间维度只允许 Eq、Ne、Gt、Ge、Lt、Le，保留现有严格输入格式及半开窗口规则。
+RFC3339 限 UTC 秒精度和 Z 后缀；LocalDateTime 不做时区换算；DateUtc 保留日历日期语义。
+这些是来源编码契约，不对既有数据库记录执行清洗，也不把 Local 自动提升为 UTC。
+可空时间字段保留角色和可空结果；反射处理先识别名义类型，再解析引用，避免丢失时间身份。
+
+新增 11 个时间测试与七组实际 SQLite 查询，覆盖闰日、非法输入、毫秒整数、本地时钟、物理列映射、结果类型、可空值、空表与窗口起止边界。
+回归通过现有时间 22 例、分桶八例、Latest 11 例、结果列八例，以及 102 个关系 Graph 用例和六组 SQLite 等价查询。
+合法控制与 14 个编译期拒绝通过，新增 UTC／Local 毫秒不可互换。
+IC 库类型检查通过，尚未迁移 IC 服务声明。
+Dataset 权威 UTC 时钟的显式选择、样本统计 Group 和 Latest 的独立声明仍待下一步，不由字段时间角色自动推导。

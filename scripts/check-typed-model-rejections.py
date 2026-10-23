@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 temp_root = Path(os.environ.get("TMPDIR") or Path.home() / ".cache/tmp")
 cases = {
+    "utc_local_clock_type": 'pub def bad: ontology::experimental::scalars::EpochMillis = ontology::experimental::scalars::LocalEpochMillis(1000);',
     "ipv4_requires_text": 'pub def bad: g::Expr(gf::MillisRow, ontology::experimental::scalars::Ipv4) = g::ipv4(gf::ms_amount);',
     "column_row_owner": 'pub def bad: transform::ColumnMapping(gf::SecondsRow) = transform::column(model::field(gf::MillisRow.type, q::Bytes.type, "tx"), "BYTES");',
     "nominal_value": 'pub def bad: f::DeviceId = f::TenantId("T1");',

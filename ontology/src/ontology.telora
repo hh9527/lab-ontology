@@ -595,6 +595,7 @@ type FilterRequest = struct {
 # ---------------------------------------------------------------------------
 
 type FieldEntry = struct {
+    time: Option(TimeField),
     logical_type: Option(LogicalType),
     nullable: Bool,
     index: Int,
@@ -1381,7 +1382,7 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
     let logical_type = match property::get_field_prop(owner, index, LogicalFieldType.type) {
         Some(declared) => Some(declared.kind), None => None,
     };
-    let result: FieldEntry = { index, name, column, is_key, ty: scalar, nullable, logical_type };
+    let result: FieldEntry = { time: property::get_field_prop(owner, index, TimeField.type), index, name, column, is_key, ty: scalar, nullable, logical_type };
     result
 };
 
@@ -2407,7 +2408,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 if array::length(enumerated) > 0 && value_type == None {
                     fail!("enum dimension requires a named value_type declaration", entity.id, f.name)
                 } else { () };
-                let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                let epoch = match f.time {
                     Some(role) => role.encoding == TimeEncoding::EpochMillis,
                     None => False,
                 };
@@ -2419,15 +2420,15 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 } else { () };
                 let valid_kind = if ipv4 { FilterInputKind::Ipv4 }
                     else if array::length(enumerated) > 0 { FilterInputKind::Text }
-                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    else if match f.time {
                         Some(role) => role.encoding == TimeEncoding::LocalText,
                         None => False,
                     } { FilterInputKind::LocalDateTime }
-                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    else if match f.time {
                         Some(role) => role.encoding == TimeEncoding::Rfc3339Text,
                         None => False,
                     } { FilterInputKind::DatetimeUtc }
-                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    else if match f.time {
                         Some(role) => role.encoding == TimeEncoding::DateText,
                         None => False,
                     } { FilterInputKind::DateUtc }
@@ -2498,7 +2499,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         match property::get_field_prop(entity.entity_type, f.index, UtcBucketDimensionsDef.type) {
             None => [],
             Some(definition) => do {
-                let time = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                let time = match f.time {
                     Some(time) => time,
                     None => fail!("UTC bucket requires a declared UTC time field", entity.id, f.name),
                 };
@@ -2673,8 +2674,8 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
                 fail!("relation fields have different named value types", pair.from, pair.to)
             } else if is_ipv4_field(from_entity.entity_type, from_field) != is_ipv4_field(to_entity.entity_type, to_field) {
                 fail!(`relation fields have different logical address types`, pair.from, pair.to)
-            } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
-                property::get_field_prop(to_entity.entity_type, to_field, TimeField.type)) {
+            } else if match (from_entity.fields[from_field].time,
+                to_entity.fields[to_field].time) {
                 (None, None) => False,
                 (Some(left), Some(right)) => time_logical_type(left) != time_logical_type(right)
                     || left.encoding != right.encoding,
@@ -2727,7 +2728,7 @@ def safe_relation_covers_target_identity: Fn(EntityEntry, Array(RelationPair)) -
 def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool = fn(entity, field, input) {
     if field.logical_type == Some(LogicalType::Ipv4) {
         match input { FilterInput::Ipv4(value) => canonical_ipv4(value), _ => False }
-    } else { match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+    } else { match field.time {
         Some(role) => match (role.encoding, input) {
             (TimeEncoding::Rfc3339Text, FilterInput::DatetimeUtc(value)) => canonical_rfc3339(value),
             (TimeEncoding::DateText, FilterInput::DateUtc(value)) => calendar_date(value),
@@ -2909,7 +2910,7 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
             e.id == target.owner && array::any(e.fields, fn(field) {
                 field.name == target.id && (
                     match e.dataset { Some(spec) => array::any(spec.grain, fn(name) { name == field.name }), None => False }
-                    || property::get_field_prop(e.entity_type, field.index, TimeField.type) != None
+                    || field.time != None
                     || array::any(payload.dimensions, fn(d) { d.entity == e.index && d.authorized && d.field == field.index })
                     || array::any(payload.measures, fn(m) { m.entity == e.index && m.field == field.index })
                     || array::any(e.sample_measures, fn(metric) { metric.field == field.name })
@@ -2939,7 +2940,7 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
         }),
         KnowledgeKind::TimeRole => array::any(payload.entities, fn(e) {
             e.id == target.owner && array::any(e.fields, fn(field) {
-                field.name == target.id && property::get_field_prop(e.entity_type, field.index, TimeField.type) != None
+                field.name == target.id && field.time != None
             })
         }),
     }
@@ -2951,7 +2952,7 @@ def published_field_names: Fn(PreparedPayload, EntityEntry) -> Array(String) = f
     let relations = array::filter(payload.relations, fn(rel) { rel.from == entity.index && rel.id != "" });
     array::map(array::filter(entity.fields, fn(field) {
         (match entity.dataset { Some(spec) => array::any(spec.grain, fn(name) { name == field.name }), None => False })
-        || property::get_field_prop(entity.entity_type, field.index, TimeField.type) != None
+        || field.time != None
         || array::any(dimensions, fn(d) { d.field == field.index })
         || array::any(measures, fn(m) { m.field == field.index })
         || array::any(entity.sample_measures, fn(metric) { metric.field == field.name })
@@ -3218,6 +3219,22 @@ def validate_transform_contract: Fn(PreparedPayload) -> PreparedPayload = fn(pay
     let measures = payload.measures;
     let dimensions = payload.dimensions;
     let profile = payload.profile;
+    array::map(entities, fn(entity) {
+        array::map(entity.fields, fn(field) {
+            match field.time {
+                None => (),
+                Some(role) => {
+                    let compatible = match role.encoding {
+                        TimeEncoding::EpochMillis => field.ty == Int.type && (role.semantics == TimeSemantics::Utc || role.semantics == TimeSemantics::Local),
+                        TimeEncoding::Rfc3339Text => field.ty == String.type && role.semantics == TimeSemantics::Utc,
+                        TimeEncoding::LocalText => field.ty == String.type && role.semantics == TimeSemantics::Local,
+                        TimeEncoding::DateText => field.ty == String.type && role.semantics == TimeSemantics::DateUtc,
+                    };
+                    if !compatible { fail!("prepared time role disagrees with field storage or semantics", entity.id, field.name) } else { () }
+                },
+            }
+        }); ()
+    });
     let measure_profiles_validated = array::all(measures, fn(entry) {
         match entry.computed {
             Some(_) => True,
@@ -3255,7 +3272,7 @@ def validate_transform_contract: Fn(PreparedPayload) -> PreparedPayload = fn(pay
                 [FilterInput::Text(entry.values[0].value)]
             } else {
                 let entity = get_index(payload.entities, entry.entity);
-                let time = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
+                let time = entity.fields[entry.field].time;
                 array::map(entry.input_kinds, fn(kind) {
                     match kind {
                         FilterInputKind::Text => FilterInput::Text(match time {
@@ -3500,7 +3517,7 @@ def time_domain: Fn(PreparedPayload, String, String) -> TimeField = fn(payload, 
         Some(entry) => entry,
         None => fail!(`unknown time field \{id}.\{name}`, id, name),
     };
-    match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+    match field.time {
         Some(role) => role,
         None => fail!(`field \{id}.\{name} has no declared time role`, id, name),
     }
@@ -3628,7 +3645,7 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
             },
         };
         let time_roles: Array(TimeRoleBrief) = array::flat_map(entity.fields, fn(field) {
-            match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+            match field.time {
                 None => [],
                 Some(role) => do {
                     let authoritative = match entity.dataset {
@@ -3886,7 +3903,7 @@ def canonical_rfc3339: Fn(String) -> Bool = fn(value) {
 
 def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bool = fn(payload, entry, input) {
     let entity = get_index(payload.entities, entry.entity);
-    let role = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
+    let role = entity.fields[entry.field].time;
     match role {
         Some(time) => if !entry.computed || match property::get_field_prop(entity.entity_type, entry.field, UtcBucketDimensionsDef.type) {
             Some(definition) => array::any(definition.dimensions, fn(spec) { spec.id == entry.id }),
