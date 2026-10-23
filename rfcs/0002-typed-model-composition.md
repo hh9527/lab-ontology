@@ -412,3 +412,48 @@ DimensionGroup 先覆盖身份投影及可选的名称组；MeasureGroup 先覆�
 - [逻辑类型](../ontology/docs/LOGICAL-TYPES.md)
 - [relation 模型声明](../relation_model/src/model.telora)
 - [relation 验收语义](../relation_model/ACCEPTANCE.md)
+
+## 阶段 A 实验记录
+
+统一跟踪议题为 [#64](https://github.com/hh9527/lab-ontology/issues/64)，各阶段在同一议题汇报，不另建阶段议题。
+
+原型入口为 `ontology::experimental::model`，独立于当前 `ontology::ontology` 准备与服务协议。
+可执行示例见 [relation 测试夹具](../relation_model/tests/typed_model/fixture.telora)，正反例见
+[typed_model 测试](../relation_model/tests/typed_model.telora)。
+
+作者可使用以下实际原型 API 表达映射：
+
+```telora
+use ontology::experimental::model as model;
+
+type TenantId = struct(String);
+type DeviceId = struct(String);
+type DeviceIdentity = struct { tenant: TenantId, local: DeviceId };
+type Inventory = struct { tenant: TenantId, device: DeviceId };
+
+def device: model::Entity(DeviceIdentity) = model::entity("device", DeviceIdentity.type);
+def inventory: model::Dataset(Inventory) = model::dataset(
+    "inventory", "devices", Inventory.type, ["tenant", "device"]);
+def subject: model::Role(Inventory) = model::role(inventory, device, "subject", False, [
+    model::identity_part(model::field(Inventory.type, TenantId.type, "tenant"),
+        model::field(DeviceIdentity.type, TenantId.type, "tenant")),
+    model::identity_part(model::field(Inventory.type, DeviceId.type, "device"),
+        model::field(DeviceIdentity.type, DeviceId.type, "local")),
+]);
+```
+
+静态泛型签名约束字段值类型、Dataset 行类型和 Entity 身份类型；准备阶段检查字段存在、完整身份覆盖、重复成员、可空性和冲突角色。
+同一个 Entity 可映射到不同字段名与行粒度的 Dataset，同一个 Dataset 可具有设备 a／z 两个角色，Dataset 也可不绑定 Entity。
+newtype 的原始 JSON 编码与构造校验已经在这个模型上下文中验证；没有将其等同于数据库已有值的验收。
+
+原型取舍与限制：
+
+- 身份暂要求非空 record，成员为 Int、String 或它们的 newtype 包装；单值身份用一成员 record 表达，后续再验证直接 newtype 身份
+- Dataset 粒度与实体身份分开，空 grain 表示没有声明全行身份；实验不据此授予计数能力
+- `optional_field` 在类型化构造时要求精确的 `Option(Value)`；角色描述擦除类型参数后，准备层按 None／Some 的完整结构检查可空输入
+- 原型的公开 record 不是不可伪造证明；手写声明仍经过准备校验，后续完善擦除边界的表示与名义 Option 证据
+- `prepare` 只处理单个 Dataset，跨 Dataset 的 Entity 注册和一致性校验留待组合准备阶段
+- 本阶段只准备模型事实，不生成知识节点、查询 AST、SQL，也不迁移现有关系模型服务
+
+`scripts/check-typed-model-rejections.py` 在独立临时工作区运行一个合法控制例和四个编译期拒绝例，分别验证名义值、映射值类型、行拥有者和实体身份。
+失败源码不加入普通测试发现路径，因此正常的 `check --tests` 不会因预期编译失败夹具而失败。
