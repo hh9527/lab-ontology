@@ -30,7 +30,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | ServerFan | `server_fan` | `PhysicalServerFan` | 第七批已验证 |
 | ServerPsu | `server_psu` | `PhysicalServerPSU` | 第七批已验证 |
 | ServerMemory | `server_memory` | `PhysicalServerMemory` | 第七批已验证 |
-| StorageDevice | `storage_device` | `HuaweiStorageDevice` | 待迁移 |
+| StorageDevice | `storage_device` | `HuaweiStorageDevice` | 第八批已验证 |
 | Frame | `frame` | `I_EnterpriseFrame` | 待迁移 |
 | NetworkSlot | `network_slot` | `I_EnterpriseSlot` | 待迁移 |
 | PonDevice | `pon_device` | `I_EntPonElement` | 待迁移 |
@@ -184,3 +184,24 @@ SQL 夹具专门区分 sv1 和 origin_sv1，保证错误使用主 ID 的部件�
 累计 226 组 SQLite 新旧查询及空表对照通过，独立初始化通过。当前完成 10/50 个载体；PostgreSQL 仅比较参数，服务未切换。
 
 九个 transform 契约测试通过，包含部件行粒度下拒绝服务器样本扩行投影的回归。
+
+## 第八批 StorageDevice 与字段计数
+
+完整迁移 28 个物理字段、26 个公开维度、两个计数和四个跨批关系。
+StorageId、TenantId、SiteId 约束对应身份角色，两个站点 OR 关系保留方向、基数和所有备选字段。
+七个闭合域保留全部业务 ID 与源编码，Fraction、Megabytes、ReportedCapacity 分开表示尺度和已知／未确认单位。
+Fraction 不额外验证源范围，MB 不推断二进制倍率，未确认容量单位不隐式转为 MB。
+createTime 保持现有 UTC 毫秒假定，不把该假定提升为已确认的生产事实。
+源文件 HuaweiStorageDevice.logical.yaml 哈希与 source_catalog.json 一致，非空契约继续沿用基线。
+
+新增 t::field_count／with_field_counts，保留 COUNT(name) 对 NULL 的行为，不将其替换成记录计数或 DISTINCT。
+同名、NULL 名称和空字符串夹具分别得到四条记录、三个非 NULL 名称、两个不同名称。
+字段计数不要求字段有实体身份；擦除后重新检查 Row、Dataset、source、字段类型、可空性和公开名称。
+十个正反契约与六个实际 SQLite 语义场景通过，同时回归 relation model 的 102 个 Graph 请求和六组 SQL 对照。
+
+引用与 Appellation 字段角色当前仅被知识发现读取，本阶段不增加准备或验收这些元数据的成本。
+发现服务根模块挂载 source_audit 会在初始化计算开发报告并读取知识索引，已将挂载移除。
+开发审计仍可通过 @src/source_audit 显式加载；仅用 --only-types 检查该入口，没有执行知识报告。
+累计 269 组 SQLite 新旧查询及空表对照通过，独立初始化通过，SQL schema 按准备字段标量类型创建，保留小数容量边界。
+
+移除服务根审计挂载后，九个 IC transform 契约在相同 100000 fuel 下全部通过。当前完成 11/50 个载体。

@@ -989,3 +989,19 @@ SQL 夹具区分主 ID 与来源 ID，覆盖错误父资源编码、双向关联
 本批累计 226 组 SQLite 新旧查询及空表检查通过，PostgreSQL 仅核对参数，未实际执行。
 
 九个 transform 契约测试通过，包含部件行粒度下拒绝服务器样本扩行投影的回归。
+
+### 阶段 D 进展：StorageDevice、字段计数与初始化审计解耦
+
+完整迁移 StorageDevice 的 28 个字段、26 个公开维度、两个计数和四个跨批关系，累计 11/50 个载体。
+保留七个闭合域，使用 StorageId／TenantId／SiteId 区分角色身份，容量与比率保留源尺度，不执行未确认的单位换算。
+新增类型化 field_count／with_field_counts，明确 COUNT(field) 的非 NULL 值计数语义，不要求实体 grain，不自动 DISTINCT。
+擦除后重检字段所属 Row、Dataset、source、类型、可空性和公开名；名称计数保留与记录计数的差别。
+十个正反例及六个真实 SQLite 场景验证重复值、NULL、全 NULL、空总体和物理列映射。
+
+引用与名称角色目前只供知识发现读取，不为本次 transform 迁移新增元数据准备成本。
+发现服务根挂载的 source_audit 自动报告仍读取知识索引，已移除根挂载，开发者可按需通过 @src/source_audit 显式访问。
+只用类型检查确认审计入口可解析，不执行知识报告或知识测试。
+独立初始化及累计 269 组 IC SQLite 新旧查询与空表对照通过，relation model 的 102 个 Graph 请求与六组 SQL 对照通过。
+服务未切换，PostgreSQL 仅核对参数，剩余载体与完整切换继续推进。
+
+九个 IC transform 契约在移除开发审计根挂载后，以相同 fuel 全部通过。

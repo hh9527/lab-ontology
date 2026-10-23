@@ -18,8 +18,9 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"]
 schema = fixture["schema"]
+affinities = {table: dict(columns) for table, columns in fixture["affinities"]}
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
             "subnet": [("d1",), ("d2",)], "count": [(6,)], "tenant_count": [(2,)],
@@ -33,10 +34,7 @@ with sqlite3.connect(":memory:") as db:
     db.create_function("regexp", 2, lambda pattern, value: None if value is None else bool(re.search(pattern, value)))
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
-        fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType", "healthStatus", "connectStatus", "serviceDuration", "serviceStartTime", "slotId", "ratedPower", "bitWidth", "frequency", "capacity"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
-        if table in {"NetworkDeviceInterfaceKPI", "ServerDeviceKPI"}:
-            fields = ", ".join(f'"{name}" ' + ("TEXT" if name in {"resId", "tenantId", "ts", "parentId", "projectId", "interfaceName"}
-                              else "INTEGER" if "Errors" in name or "Effcnt" in name else "REAL") for name in columns)
+        fields = ", ".join(f'"{name}" {affinities[table][name]}' for name in columns)
         db.execute(f'CREATE TABLE "{table}" ({fields})')
     db.executemany("INSERT INTO X_TENANT_VIEW (TENANT_ID, TENANT_NAME, INDUSTRY, TENANT_ACCESS_TIME) VALUES (?, ?, ?, ?)", [("t1", "Tenant Alpha", "IT", -1), ("t2", "租户二", "Health", 1000)])
     columns = next(columns for table, columns in schema if table == "I_EntNetworkElement")
@@ -158,6 +156,31 @@ with sqlite3.connect(":memory:") as db:
     expected.update(fan_health_filter=[("fan_c2",)], psu_health_filter=[("repeat",)], memory_health_filter=[("missing",)],
                     fan_count=[(4,)], fan_count_for_server=[(2,)])
     expected["memory_server_sample_rows"] = [("repeat", "sv1", value) for value in [10, 30, 50, None] for _ in range(2)]
+    storage_columns = next(columns for table, columns in schema if table == "HuaweiStorageDevice")
+    for identity, tenant, parent, project, name, running, subclass, power, category, kind, health, connection, fraction, total, free, address, clock in [
+        ("st1", "t1", "s1", "missing", "same", "1", "EnterpriseStorage", "poweron", "HuaweiStorage", "storage", "1", 1, 0.2, 100.5, 80.4, "192.0.2.1", -1),
+        ("st2", "t2", "missing", "s2", "same", "3", "FCSwitchDevice", "poweroff", "FcSwitch", "fcswitch", "2", 9, 0.5, 200.25, 100.125, "2001:db8::1", 0),
+        ("st3", "t1", "s1", "s1", None, "12", "SmisStorageDevice", "poweron", "ThirdPartyStorage", "storage", "1", 0, 1.1, 300, 0, "192.0.2.255", 1000),
+        ("st4", "missing", "s1", "s2", "", "99", "unknown", "unknown", "unknown", "unknown", "unknown", 99, 0, 0, 0, "192.0.2.01", 2000),
+    ]:
+        values = {column: f"{identity}_{column}" for column in storage_columns}
+        values.update(id=identity, tenantId=tenant, parentResId=parent, projectId=project, name=name, runningStatus=running,
+                      subClassName=subclass, powerStatus=power, classification=category, deviceType=kind, healthStatus=health,
+                      connectStatus=connection, usedCapacityRate=fraction, totalStoragePoolCapacity=total, unUsedCapacity=free,
+                      usedCapacity=20, totalCapacity=100, ipAddress=address, createTime=clock)
+        db.execute('INSERT INTO HuaweiStorageDevice VALUES (' + ','.join('?' for _ in storage_columns) + ')', [values[column] for column in storage_columns])
+    expected.update(storage_counts=[(4, 3)], storage_distinct_names=[(2,)], storage_fraction=[("st2",), ("st3",)],
+                    storage_capacity=[("st2",), ("st3",)], storage_subnet=[("st1",), ("st3",)], storage_window=[("st2",), ("st3",)])
+    for dimension, identities in {
+        "storage_running_status": ["st1"], "storage_device_subclass": ["st2"], "storage_device__powerStatus": ["st1", "st3"],
+        "storage_device__classification": ["st1"], "storage_device__deviceType": ["st2"], "storage_device__healthStatus": ["st2"],
+        "storage_device__connectStatus": ["st2"],
+    }.items():
+        expected[f"filter_{dimension}"] = [(identity,) for identity in identities]
+    expected["storage_device_belongs_to_tenant"] = [("st1", "Tenant Alpha"), ("st2", "租户二"), ("st3", "Tenant Alpha")]
+    expected["source_HuaweiStorageDeviceAssociationX_TENANT_VIEW"] = expected["storage_device_belongs_to_tenant"]
+    expected["storage_device_site"] = [("st1", "s1"), ("st2", "s2"), ("st3", "s1"), ("st4", "s1"), ("st4", "s2")]
+    expected["source_HuaweiStorageDeviceAssociationX_SITE_VIEW"] = expected["storage_device_site"]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
@@ -177,6 +200,10 @@ with sqlite3.connect(":memory:") as db:
     for case in cases:
         actual = execute(case["typed"])
         assert actual == execute(case["baseline"]), ("empty", case["id"])
+        if case["id"] == "storage_counts":
+            assert actual == [(0, 0)], ("empty storage counts", actual)
+        if case["id"] == "storage_distinct_names":
+            assert actual == [(0,)], ("empty distinct names", actual)
         if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
 print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and all migrated relations")
