@@ -11,14 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def evaluate(name):
     result = subprocess.run([
         str(ROOT / "bin/telora"), "-C", str(ROOT / "icloud_model"), "eval",
-        f"@test/typed_inventory:{name}", "--initialization-fuel", "200000",
+        f"@test/typed_inventory_runtime:{name}", "--initialization-fuel", "200000",
         "--request-fuel", "100000", "--with-memory-limit", "2048",
     ], capture_output=True, text=True, timeout=240)
     assert result.returncode == 0, (name, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"] + fixture["onu_kpi"]
 # 多个角色可共享一张表，按物理列并集合并，不能重复建表或重复装载。
 schema_by_table = {}
 for table, columns in fixture["schema"]:
@@ -238,6 +238,37 @@ with sqlite3.connect(":memory:") as db:
     expected["source_EntPonElementAssociationEntPonElement"] = [("n1", "o1"), ("n2", "n1"), ("n3", "o1"), ("n4", "o1"), ("n6", "o2")]
     expected["source_EntPonElementAssociationX_TENANT_VIEW"] = [(identity, "Tenant Alpha" if tenant == "t1" else "租户二") for identity, _, _, tenant, *_ in pon_rows if tenant != "missing"]
     expected["source_EntPonElementAssociationX_SITE_VIEW"] = [("o1", "s1"), ("o2", "s2"), ("n1", "s1"), ("n2", "s1"), ("n2", "s2")]
+    onu_columns = next(columns for table, columns in schema if table == "PonDeviceOnuKPI")
+    for identity, tenant, clock, value in [
+        ("n1", "t1", "2024-02-29T23:00:00Z", 10),
+        ("n1", "t2", "2024-03-01T00:00:00Z", 30),
+        ("n1", "t1", "2024-03-01T00:00:00Z", 50),
+        ("n2", "t1", "2024-03-02T00:00:00Z", None),
+        ("n3", "t1", "2024-03-01T01:00:00Z", 100),
+        ("missing", "t1", None, 200),
+        ("o1", "t1", "2024-03-01T02:00:00Z", 300),
+    ]:
+        values = {column: value for column in onu_columns}
+        values.update(resId=identity, tenantId=tenant, ts=clock, parentId="unrelated", projectId="s1")
+        for column in onu_columns:
+            if column.endswith("Effcnt"):
+                values[column] = 1000 if value == 10 else 0
+            if column in {"onuHwOpticsRxPower", "onuHwOpticsTxPower", "hwGponOntOpticsOltRxOntPower"}:
+                values[column] = None if value is None else -value
+        db.execute('INSERT INTO PonDeviceOnuKPI VALUES (' + ','.join('?' for _ in onu_columns) + ')', [values[column] for column in onu_columns])
+    onu_measures = {case["id"].removeprefix("measure_") for case in fixture["onu_kpi"] if case["id"].startswith("measure_")}
+    assert len(onu_measures) == 33
+    for measure in onu_measures:
+        negative = any(measure == prefix or measure.startswith(prefix + "_") for prefix in ["onu_rx_power", "onu_tx_power", "onu_olt_rx"])
+        average = -115.0 if negative else 115.0
+        minimum, maximum = (-300, -10) if negative else (10, 300)
+        expected[f"measure_{measure}"] = [(maximum if measure.endswith("_max") else minimum if measure.endswith("_min") else average,)]
+    expected.update(onu_window=[(120.0,)], onu_day=[(None, 200.0), ("2024-02-29T00:00:00Z", 10.0), ("2024-03-01T00:00:00Z", 120.0), ("2024-03-02T00:00:00Z", None)])
+    expected["onu_kpi_of_pon_device"] = [("n1", 10.0), ("n1", 30.0), ("n1", 50.0), ("n2", None), ("n3", 100.0), ("o1", 300.0)]
+    expected["source_EntPonElementAssociationPonDeviceOnuKPI"] = expected["onu_kpi_of_pon_device"]
+    expected["onu_kpi_of_onu_role"] = [("n1", 10.0), ("n1", 30.0), ("n1", 50.0), ("n2", None)]
+    expected["onu_samples_for_parent_olt"] = [("o1", "n1", 10.0), ("o1", "n1", 30.0), ("o1", "n1", 50.0)]
+    expected["onu_qualified_mean"] = [(30.0,)]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()

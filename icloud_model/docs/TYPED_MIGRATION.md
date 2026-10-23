@@ -36,7 +36,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | PonDevice | `pon_device` | `I_EntPonElement` | 第十批已验证 |
 | PonOnuRole | `pon_onu_role` | `I_EntPonElement` | 第十批已验证 |
 | PonOltRole | `pon_olt_role` | `I_EntPonElement` | 第十批已验证 |
-| OnuKpi | `onu_kpi` | `PonDeviceOnuKPI` | 待迁移 |
+| OnuKpi | `onu_kpi` | `PonDeviceOnuKPI` | 第十一批已验证 |
 | PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 待迁移 |
 | ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 待迁移 |
 | DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 待迁移 |
@@ -244,3 +244,22 @@ SQL 场景覆盖父 ID 指向非 OLT、SPL 不混入 ONU、原始分类名碰撞
 源 EntPonElement.logical.yaml 的 SHA256 与目录一致。累计 382 组实际 SQLite 新旧请求及空表对照通过，独立初始化通过；PostgreSQL 仅核对参数。
 
 本批累计完成 16/50 个载体。九项 transform 契约通过；新增两个内部分类投影拒绝用例在修正错误文本断言后定向复验通过，共 11 项。
+
+## 第十一批 ONU KPI
+
+迁移 30 个字段、31 个维度（含 UTC 小时／日／月分桶）、33 个 Mean/Min/Max 统计度量和三条关系。
+采样 grain 保留 res_id、tenant_id、ts，UTC Rfc3339Utc 时钟显式声明；res_id 使用 PonId。
+Percent、Dbm、DegreesCelsius、BitsPerSecond 区分不同可计算量，四个样本统计模板分别绑定到对应字段。
+保留既有 %、dBm、degC、bit/s 单位，不隐式换算；dBm 保持原值统计，不转为线性功率。
+有效次数只是独立来源字段，不作为默认权重或有效性筛选；未新增 Sum。
+
+真实 SQLite 场景验证全部统计、跨租户同刻样本、NULL、负 dBm、NULL 时钟、UTC 窗口／分桶，以及来源设备与 ONU 角色不同的筛选范围。
+双跳 ONU 样本→ONU 角色→OLT 验证角色范围在组合关系中仍生效，不将 SPL 或 OLT 本身的样本混为 ONU 样本。
+旧关系的 M:N 上界保持不变，不因 nominal Entity 身份而擅自收紧基数。
+不执行知识发现、知识图构建或知识测试，MainService 尚未切换。
+
+契约测试与累计 SQL fixture 拆分：`typed_inventory` 只准备契约，`typed_inventory_runtime:runtime_fixture` 由 SQL 检查脚本按需调用。
+测试覆盖未减少；契约检查不再初始化全部查询，用 100000 fuel 验证，累计 SQL 对照仍用 200000。
+关系对照使用显式 Association 行；按相关 ONU 角色资格统计使用 EXISTS，另有负例保持 M:N 度量放大保护。
+
+本批累计完成 17/50 个载体。源文件 SHA256 与 catalog 一致；12 项 transform 契约在 100000 fuel 内通过，独立初始化通过，累计 453 组实际 SQLite 新旧请求及空表检查通过。PostgreSQL 仅核对参数。

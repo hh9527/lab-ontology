@@ -1036,3 +1036,14 @@ PonId 复用设备身份及父引用，TenantId／SiteId 区分其他来源角�
 不构建知识地图或执行知识测试，MainService 尚未切换。
 
 本批累计完成 16/50 个载体。九项 transform 契约通过；新增两个内部分类投影拒绝用例在修正错误文本断言后定向复验通过，共 11 项。
+
+### 阶段 D 进展：ONU KPI
+
+独立声明新增 ONU KPI 的 30 个字段、31 个维度、33 个样本统计和三条关系。
+Percent／Dbm／DegreesCelsius／BitsPerSecond 分离单位并复用四个统计模板，保留原 %／dBm／degC／bit/s 尺度。
+保留复合采样 grain、UTC 时钟和三个 UTC 分桶，不隐式加总、换算或按有效次数加权。
+现有 M:N 关系基数与防止度量放大的保护保持不变：关系行使用 Association，资格筛选使用显式 EXISTS；二跳行投影包含中间 ONU 角色。
+契约测试与实际 SQL fixture 分离，前者不再预生成累计 SQL；不减少查询对照或契约覆盖，也不准备知识地图。
+MainService 尚未切换，PostgreSQL 仅核对参数。
+
+累计 17/50 个载体；12 项 transform 契约（100000 fuel）、独立初始化、453 组实际 SQLite 对照及空表检查通过，包含全部 ONU 统计和负 dBm 原值统计场景。
