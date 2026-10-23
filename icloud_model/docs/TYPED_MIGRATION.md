@@ -41,7 +41,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 第十三批已验证 |
 | DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 第十四批已验证 |
 | CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 第十五批已验证 |
-| PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 待迁移 |
+| PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 第十六批已验证 |
 | SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 待迁移 |
 | SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 待迁移 |
 | SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 待迁移 |
@@ -422,3 +422,23 @@ PhysicalLink 尚未迁移，仍为 21/50；其 native pair 声明仍需补齐，
 本项是声明准备能力，没有新增 SQL 运算；未增加知识发现／知识测试。
 PhysicalLink 尚未迁移，仍为 21/50；MainService 尚未切换。
 本项 14 项 IC transform 契约通过。
+
+## 第十六批 PhysicalLink
+
+迁移 26 个物理字段、27 个维度、一个字段计数、三个闭合域、五条关系、两个业务连接与一个原生名称配对。
+LinkId 与租户身份分开；A/Z 来源资源字段保留原始文本，通过显式 reference_part 分别引用设备和服务器名义身份，不将两类 ID 合并。
+保留 id grain、UTC 创建时间的原毫秒假定和非空字段契约；来源 speed 是文本，虽然说明包含 Mbit/s，本批不解析、换算或新增数值聚合。
+
+A/Z 两条物理端点关系不限定方向。业务 peer 仅选 bidirectional 并可从两端遍历，downstream 仅选 unidirectional 并沿 A→Z；都不推断设备层级。
+附着设备／服务器的 OR 关系保持 M:N 上界，不因名义身份而收紧基数；自环与双端同设备只保留既有 OR／distinct 语义。
+link_ne_names 配对保留 A/Z 原始字段顺序，不用关联实体名称回填，不把配对解释成可交换方向。
+四个 IPv4 视图显式复用严格转换；原始地址文本继续可查，IPv6、前导零、非法值、尾换行和 NULL 不成为 IPv4，NotInSubnet 仍排除这些值。
+状态 fault 保留来源编码 2/3；闭合域分组及 Ne 限定已知编码，原始未知状态／方向仍参与总体与普通端点查询。
+
+源 EnterprisePhysicalLink.logical.yaml SHA256 与 catalog 一致。
+15 项 IC transform 契约（200000 fuel）、独立 typed 初始化（150000 fuel）以及 91 组实际 SQLite 新旧查询与空表检查通过。
+SQL 验证包含全部维度、三域全部成员的 Eq/Ne、五条关系、双向连接的两种根、单向连接、四个 IPv4 视图的子网与补集、窗口、重复链路、自环、孤立端点与原始名称配对；重点语义另有独立期望值。
+NULL fixture 验证来源异常值的防御行为，不修改非空契约。PostgreSQL 只核对参数，未实际执行。
+SQL fixture 独立按需生成（250000 fuel），没有在契约初始化中预生成累计查询；本批未重跑其余载体全部历史 SQL，已有载体契约一起验证。
+
+累计完成 22/50 个既有载体。MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
