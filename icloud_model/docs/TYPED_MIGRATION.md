@@ -42,7 +42,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | DeviceKpi | `device_kpi` | `NetworkDeviceKPI` | 第十四批已验证 |
 | CurrentAlarm | `current_alarm` | `T_CURRENT_ALARM` | 第十五批已验证 |
 | PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 第十六批已验证 |
-| SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 待迁移 |
+| SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 第十七批已验证 |
 | SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 待迁移 |
 | SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 待迁移 |
 | SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 待迁移 |
@@ -442,3 +442,21 @@ NULL fixture 验证来源异常值的防御行为，不修改非空契约。Post
 SQL fixture 独立按需生成（250000 fuel），没有在契约初始化中预生成累计查询；本批未重跑其余载体全部历史 SQL，已有载体契约一起验证。
 
 累计完成 22/50 个既有载体。MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
+
+
+## 第十七批 Collaboration
+
+迁移协作设备来源的 14 个字段、15 个维度、两个闭合域及租户／告警两条关系，累计 23/50。
+协作设备采用独立名义身份；告警原始 res_id 通过 reference_part 显式引用该身份，不改写为其他设备 ID。
+告警关系仍只按资源 ID 连接，不额外加入租户键或未清除条件，基数保持 Optional→Many0；租户关系保持 Many0→Optional。
+来源没有 CPU 样本或公开度量，不因缺失数据生成零值指标；Graph 行计数仍按 source_id grain 查询。
+UTC 创建时间的毫秒解释和字段非空性延续既有假定，NULL fixture 仅验证来源异常值的 SQL 防御行为。
+原始 IP 文本与严格 IPv4 视图分别保留；闭合域分组和 Ne 仅覆盖已知编码，不排除原始总体中的未知行。
+源 EntCollaborationElement.logical.yaml SHA256 与 catalog 一致。
+
+16 项 IC transform 契约（200000 fuel）以及 33 组实际 SQLite 新旧查询和空表检查通过。
+查询包含全部维度、两域全部成员 Eq/Ne、UTC 窗口、文本转义、IPv4 子网与补集、租户及告警关联、EXISTS 防重复计数和按协作设备分组的告警／未清除计数；重点语义另有独立期望值。
+PostgreSQL 只核对参数，未实际执行；本批没有重跑其他载体全部历史 SQL。
+SQL fixture 按需独立生成，不在契约初始化中准备累计 SQL。MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
+
+本批独立 typed 初始化在 200000 fuel 内通过；原 150000 预算实际耗尽后调整验证预算，隔离工作区不含旧模型或服务，也没有知识初始化。
