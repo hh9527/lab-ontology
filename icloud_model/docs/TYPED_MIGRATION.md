@@ -44,7 +44,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | PhysicalLink | `physical_link` | `EnterprisePhysicalLink` | 第十六批已验证 |
 | SourceEntCollaborationElement | `source_EntCollaborationElement` | `I_EntCollaborationElement` | 第十七批已验证 |
 | SourceEntTerminalElement | `source_EntTerminalElement` | `EntTerminalElement` | 第十八批已验证 |
-| SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 待迁移 |
+| SourceEnterpriseOpticalModule | `source_EnterpriseOpticalModule` | `I_EnterpriseOpticalModule` | 第十九批已验证 |
 | SourceFCSwitchDevice | `source_FCSwitchDevice` | `FCSwitchDevice` | 待迁移 |
 | SourceNetworkAPKPI | `source_NetworkAPKPI` | `NetworkAPKPI` | 待迁移 |
 | SourceNetworkApRadioKPI | `source_NetworkApRadioKPI` | `NetworkApRadioKPI` | 待迁移 |
@@ -480,3 +480,23 @@ SQL fixture 独立按需生成，不在契约初始化阶段准备累计查询�
 NULL fixture 验证异常值 SQL 行为，不改变非空契约；PostgreSQL 只核对参数，未实际执行。
 本批独立 SQL fixture 实际耗尽 250000 fuel 后调至 400000 并通过，不影响模型初始化预算，没有增加知识准备。
 累计完成 24/50；此前载体 SQL 证据保留为历史记录，本批未重跑其全部查询。
+
+
+## 第十九批 NetworkOpticalModule
+
+按仓库既有模型和 source_catalog 快照迁移七个字段及七个维度，来源为 I_EnterpriseOpticalModule。
+旧声明没有唯一键、公开度量、样本或关系，新声明保留无 grain 的 Dataset，不创建缺乏来源依据的 Entity 身份，也不以 neResId／ifName 推断复合主键。
+父设备和项目字段保留原始文本，不因字段名称而新增关联；其他五个字段复用原始文本搜索能力，不赋予版本排序或厂商编号归一化语义。
+字段非空性保持旧契约；NULL fixture 仅验证来源异常值 SQL 行为。
+
+当前外部 EnterpriseOpticalModule.logical.yaml 与仓库快照存在漂移：catalog SHA256 为 006f961216008b3ff93d57366ae6370cf56ee0a5b942fa7ecd87d28c258461b2，当前文件为 3fd564df92ea2e849551b05772383f9977b3091aea3207ccca9ad47d215a5086。
+逐项核对七个既有字段的类型、说明、可空性、isPK 及 columnType 均相同；当前源另有 id／tenantId（其中 id 为来源主键），仓库快照及旧模型均未纳入。
+本批保持既有 transform 基线，不把来源升级混入迁移，不声称当前源没有身份；新增字段、身份和相应关系留待独立源模型升级。
+
+17 项 IC transform 契约与独立 typed 初始化均在 200000 fuel 内通过。
+只准备 transform，不执行知识发现、知识地图构建或知识测试；MainService 尚未切换。
+
+40 组实际 SQLite 新旧对照和空表检查通过，包括全部七维度投影、全字段投影、两个精确标识字段 Eq 及五个搜索字段的全部六种运算（Eq/Ne/Contains/NotContains/StartsWith/EndsWith）。
+全部用例另有独立期望值，包含完全重复行、同父设备与相同接口的多条行、NULL 和字面量通配符；没有因推断身份而去重。
+PostgreSQL 只核对参数，未实际执行；SQL fixture 独立按需生成（250000 fuel），不准备累计查询。
+累计完成 25/50 个既有载体；此前载体 SQL 保留为历史证据，本批未全量重跑。MainService 尚未切换。
