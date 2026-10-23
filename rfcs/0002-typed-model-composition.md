@@ -1025,3 +1025,14 @@ PON ONU/OLT 角色迁移需要保留 entity_scope；独立声明新增 scope_equ
 本阶段只补迁移必需能力，不增加知识准备成本；PON 载体尚未计入完成数量。
 
 本项验证：10 个行范围正反例、9 个实际 SQLite 场景、既有 relation model 102 个 Graph 请求与 6 组 SQL 对照，以及 IC 独立初始化通过。PostgreSQL 仅核对参数。
+
+### 阶段 D 进展：PON 设备与 ONU/OLT 角色
+
+迁移 PonDevice、PonOnuRole、PonOltRole，三个载体共享 22 个物理列，保留 66 个字段声明、68 个维度与五个闭合域。
+角色使用 with_scope 保留分类约束；两个分类维度仅供内部约束，继续禁止公开发现与投影。
+PonId 复用设备身份及父引用，TenantId／SiteId 区分其他来源角色；制造日期为 DateUtc，创建时刻保持既有 LocalEpochMillis 假定。
+四条关系保留源自关联、具备双端范围的 ONU→OLT、租户和两路站点 OR；不因领域名称而改变原始关系的过滤语义。
+累计 382 组 SQLite 新旧请求与空表对照、独立初始化通过；PostgreSQL 仅核对参数。
+不构建知识地图或执行知识测试，MainService 尚未切换。
+
+本批累计完成 16/50 个载体。九项 transform 契约通过；新增两个内部分类投影拒绝用例在修正错误文本断言后定向复验通过，共 11 项。

@@ -18,9 +18,19 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"]
-schema = fixture["schema"]
-affinities = {table: dict(columns) for table, columns in fixture["affinities"]}
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"] + fixture["pon"]
+# 多个角色可共享一张表，按物理列并集合并，不能重复建表或重复装载。
+schema_by_table = {}
+for table, columns in fixture["schema"]:
+    merged = schema_by_table.setdefault(table, [])
+    merged.extend(column for column in columns if column not in merged)
+schema = list(schema_by_table.items())
+affinities = {}
+for table, columns in fixture["affinities"]:
+    merged = affinities.setdefault(table, {})
+    for column, affinity in columns:
+        assert column not in merged or merged[column] == affinity, (table, column, "conflicting role storage")
+        merged[column] = affinity
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
             "subnet": [("d1",), ("d2",)], "count": [(6,)], "tenant_count": [(2,)],
@@ -202,6 +212,32 @@ with sqlite3.connect(":memory:") as db:
     expected["source_EnterpriseFrame_X_TENANT_VIEW"] = [("f1", "Tenant Alpha"), ("f2", "租户二"), ("f5", "Tenant Alpha")]
     expected["source_EnterpriseFrame_EnterpriseSlot"] = [("sl1", "f1"), ("sl2", "f1")]
     expected["source_EnterpriseSlot_X_TENANT_VIEW"] = [("sl1", "Tenant Alpha"), ("sl2", "租户二")]
+    pon_columns = next(columns for table, columns in schema if table == "I_EntPonElement")
+    pon_rows = [
+        ("o1", "ne.category.olt", "", "t1", "s1", "missing", "1", "192.0.2.1", "2024-02-29"),
+        ("o2", "ne.category.olt", "", "t2", "missing", "s2", "0", "192.0.2.2", "2024-03-01"),
+        ("n1", "ne.category.pon.onu", "o1", "t1", "s1", "s1", "2", "192.0.2.3", "2024-03-02"),
+        ("n2", "ne.category.pon.onu", "n1", "t2", "s1", "s2", "3", "2001:db8::1", "2024-02-28"),
+        ("n3", "ne.category.pon.spl", "o1", "missing", "missing", "missing", "4", "192.0.2.5", "2024-02-29"),
+        ("n4", "onu", "o1", "missing", "missing", "missing", "14", "192.0.2.6", "2024-02-29"),
+        ("n5", "ne.category.pon.onu", "missing", "t1", "missing", "missing", "15", "192.0.2.7", "2024-02-29"),
+        ("n6", "ne.category.pon.onu", "o2", "t2", "missing", "missing", "1", "192.0.2.8", "2024-02-29"),
+    ]
+    for index, (identity, classification, parent, tenant, subnet, project, state, address, date) in enumerate(pon_rows):
+        values = {column: identity for column in pon_columns}
+        values.update(id=identity, name=identity, classification=classification, parentOltResId=parent, tenantId=tenant,
+                      refParentSubnet=subnet, projectId=project, commuState=state, ipAddress=address,
+                      manufactureDate=date, createTime=index * 1000 - 1, adminState="Enabled" if index == 0 else "Disabled")
+        db.execute('INSERT INTO I_EntPonElement VALUES (' + ','.join('?' for _ in pon_columns) + ')', [values[column] for column in pon_columns])
+    expected.update(count_pon_device=[(8,)], count_pon_onu_role=[(4,)], count_pon_olt_role=[(2,)],
+                    pon_onu_filter=[("n1",), ("n2",), ("n5",), ("n6",)],
+                    pon_offline=[("o2",), ("n1",), ("n2",), ("n3",), ("n4",), ("n5",)],
+                    pon_admin=[("o1",)], pon_manufactured=[("o2",), ("n1",)],
+                    onu_scope_contradiction=[], olt_scope_wrong_id=[], onu_subnet=[("n1",), ("n5",), ("n6",)])
+    expected["pon_onu_parent_olt"] = [("n1", "o1"), ("n6", "o2")]
+    expected["source_EntPonElementAssociationEntPonElement"] = [("n1", "o1"), ("n2", "n1"), ("n3", "o1"), ("n4", "o1"), ("n6", "o2")]
+    expected["source_EntPonElementAssociationX_TENANT_VIEW"] = [(identity, "Tenant Alpha" if tenant == "t1" else "租户二") for identity, _, _, tenant, *_ in pon_rows if tenant != "missing"]
+    expected["source_EntPonElementAssociationX_SITE_VIEW"] = [("o1", "s1"), ("o2", "s2"), ("n1", "s1"), ("n2", "s1"), ("n2", "s2")]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
@@ -225,6 +261,6 @@ with sqlite3.connect(":memory:") as db:
             assert actual == [(0, 0)], ("empty storage counts", actual)
         if case["id"] == "storage_distinct_names":
             assert actual == [(0,)], ("empty distinct names", actual)
-        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server", "slot_count"}:
+        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server", "slot_count", "count_pon_device", "count_pon_onu_role", "count_pon_olt_role"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
-print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and all migrated relations")
+print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all public migrated dimension projections, counts, domain filters, IPv4 and all migrated relations")

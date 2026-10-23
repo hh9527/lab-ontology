@@ -33,9 +33,9 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | StorageDevice | `storage_device` | `HuaweiStorageDevice` | 第八批已验证 |
 | Frame | `frame` | `I_EnterpriseFrame` | 第九批已验证 |
 | NetworkSlot | `network_slot` | `I_EnterpriseSlot` | 第九批已验证 |
-| PonDevice | `pon_device` | `I_EntPonElement` | 待迁移 |
-| PonOnuRole | `pon_onu_role` | `I_EntPonElement` | 待迁移 |
-| PonOltRole | `pon_olt_role` | `I_EntPonElement` | 待迁移 |
+| PonDevice | `pon_device` | `I_EntPonElement` | 第十批已验证 |
+| PonOnuRole | `pon_onu_role` | `I_EntPonElement` | 第十批已验证 |
+| PonOltRole | `pon_olt_role` | `I_EntPonElement` | 第十批已验证 |
 | OnuKpi | `onu_kpi` | `PonDeviceOnuKPI` | 待迁移 |
 | PonPortKpi | `pon_port_kpi` | `PonDevicePonPortKPI` | 待迁移 |
 | ApRadioSsidKpi | `ap_radio_ssid_kpi` | `NetworkApRadioSsidKPI` | 待迁移 |
@@ -227,3 +227,20 @@ ONU/OLT 是同一物理来源的不同固有范围，不得只迁移字段而丢
 此项为 transform 迁移前置，载体完成进度仍为 13/50；不触发知识发现或知识地图构建。
 
 本项验证：10 个行范围正反例、9 个实际 SQLite 场景、既有 relation model 102 个 Graph 请求与 6 组 SQL 对照，以及 IC 独立初始化通过。PostgreSQL 仅核对参数。
+
+## 第十批 PON 设备与同源 ONU/OLT 角色
+
+三个载体共享 I_EntPonElement 的 22 个物理列，分别保留 22 个字段声明，共 68 个维度（其中两个内部分类维度不可公开访问）。
+PonId 统一设备身份与父设备引用，区别于 TenantId、SiteId；五个闭合域保留全部成员与源编码。
+ManufactureDate 使用 DateUtc，createTime 保持 LocalEpochMillis 及源时钟单位待确认的既有假定，不新增单位或时区换算。
+ONU/OLT 的固有分类范围使用 with_scope 声明，沿用原域映射，文本 onu 本身不代替源编码 ne.category.pon.onu。
+批内四条关系包括不带角色范围的源自关联、具备双端范围的 ONU→OLT、租户引用与两路 OR 站点引用。
+
+SQL 场景覆盖父 ID 指向非 OLT、SPL 不混入 ONU、原始分类名碰撞、公开 ID 条件不能绕过范围、日期过滤、离线多编码与 IPv4。
+同表角色只建表和装载一次，合并列并校验同列存储类型一致；不为每个角色复制数据。
+两个内部分类维度单独验证拒绝公开访问，不加入公开维度投影用例。
+本批不增加知识发现、知识地图构建或知识测试，MainService 尚未切换。
+
+源 EntPonElement.logical.yaml 的 SHA256 与目录一致。累计 382 组实际 SQLite 新旧请求及空表对照通过，独立初始化通过；PostgreSQL 仅核对参数。
+
+本批累计完成 16/50 个载体。九项 transform 契约通过；新增两个内部分类投影拒绝用例在修正错误文本断言后定向复验通过，共 11 项。

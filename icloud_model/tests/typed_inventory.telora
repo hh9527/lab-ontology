@@ -14,7 +14,7 @@ use std::test as test;
 
 def base_entity: Fn(String) -> edsl::EntityEntry = fn(id) { match array::find(baseline::payload.entities, fn(entry) { entry.id == id }) { Some(entry) => entry, None => fail!("baseline entity missing", id) } };
 pub def physical_sources_fields_and_grains_match_the_baseline: test::Test = test::should_ok(fn() {
-    array::all(payload.entities, fn(entity) { let previous = base_entity(entity.id); entity.table == previous.table && entity.fields == array::map(previous.fields, fn(field) {
+    array::all(payload.entities, fn(entity) { let previous = base_entity(entity.id); entity.table == previous.table && entity.scope == previous.scope && entity.fields == array::map(previous.fields, fn(field) {
         # 显式复合 grain 已给出完整样本身份，不把 res_id 单列当成唯一键
         match entity.dataset {
             Some(spec) => if array::length(spec.grain) > 1 { field <~ {is_key: False} } else { field },
@@ -50,7 +50,7 @@ pub def all_current_record_measures_are_preserved: test::Test = test::should_ok(
     })
 });
 pub def every_relation_between_migrated_datasets_is_preserved: test::Test = test::should_ok(fn() {
-    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 13 && relation.to < 13 });
+    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 16 && relation.to < 16 });
     array::length(expected) == array::length(payload.relations) && array::all(expected, fn(old) { array::any(payload.relations, fn(value) { value.id == old.id && value.from == old.from && value.to == old.to && value.cardinality == old.cardinality && value.key == old.key && value.guard == old.guard }) })
 });
 pub def device_identity_is_id_only: test::Test = test::should_ok(fn() { inventory::device_subject.parts == [{source: "id", target: "id", value: inventory::DeviceId.type, nullable: False}] });
@@ -69,7 +69,7 @@ def pair: Fn(String, Value) -> Pair = fn(id, request) {
 def device_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],\{extra}}`).unwrap!()) };
 def join_case: Fn(String) -> Pair = fn(relation) { pair(relation, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"\{relation}","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device_id"},{"node":"t","dimension":"tenant_name"}]}`).unwrap!()) };
 pub def runtime_cases: Value = codec::encode(array::concat([
-    array::map(payload.dimensions, fn(dimension) {
+    array::map(array::filter(payload.dimensions, fn(dimension) { dimension.projectable }), fn(dimension) {
         let entity = payload.entities[dimension.entity];
         pair(`project_\{dimension.id}`, json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"\{entity.id}"}],"edges":[],"select":[{"node":"r","dimension":"\{dimension.id}"}]}`).unwrap!())
     }),
@@ -224,10 +224,34 @@ pub def hardware_cases: Value = codec::encode(array::concat([
         pair(spec.0, json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"\{spec.1}"},{"id":"o","entity":"\{spec.3}"}],"edges":[{"relation":"\{spec.0}","from":"\{source}","to":"\{target}"}],"select":[{"node":"h","dimension":"\{spec.2}"},{"node":"o","dimension":"\{spec.4}"}]}`).unwrap!())
     }),
 ]));
+pub def onu_class_remains_internal: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"pon_onu_role"}],"edges":[],"select":[{"node":"p","dimension":"pon_onu_class"}]}"#).unwrap!())
+}, "graph projection dimension pon_onu_class is not authorized");
+pub def olt_class_remains_internal: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"pon_olt_role"}],"edges":[],"select":[{"node":"p","dimension":"pon_olt_class"}]}"#).unwrap!())
+}, "graph projection dimension pon_olt_class is not authorized");
+def pon_case: Fn(String, String, String) -> Pair = fn(id, entity, extra) { pair(id, json::parse(`{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"\{entity}"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def pon_cases: Value = codec::encode(array::concat([
+    array::map([("pon_device", "pon_id"), ("pon_onu_role", "pon_onu_id"), ("pon_olt_role", "pon_olt_id")], fn(spec) {
+        pon_case(`count_\{spec.0}`, spec.0, `"select":[],"count_value":{"node":"p","dimension":"\{spec.1}"}`)
+    }),
+    [pon_case("pon_onu_filter", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_class","op":"Eq","value":"onu"}]"#),
+     pon_case("pon_offline", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_commu_state","op":"Eq","value":"offline"}]"#),
+     pon_case("pon_admin", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_device__adminState","op":"Eq","value":"wire_Enabled_82f10bda"}]"#),
+     pon_case("pon_manufactured", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_device__manufactureDate","op":"Ge","value":"2024-03-01"}]"#),
+     pon_case("onu_scope_contradiction", "pon_onu_role", r#""select":[{"node":"p","dimension":"pon_onu_id"}],"filters":[{"node":"p","dimension":"pon_onu_id","op":"Eq","value":"n3"}]"#),
+     pon_case("olt_scope_wrong_id", "pon_olt_role", r#""select":[{"node":"p","dimension":"pon_olt_id"}],"filters":[{"node":"p","dimension":"pon_olt_id","op":"Eq","value":"n1"}]"#),
+     pon_case("onu_subnet", "pon_onu_role", r#""select":[{"node":"p","dimension":"pon_onu_id"}],"filters":[{"node":"p","dimension":"pon_onu_role__ipAddress_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#),
+     pair("pon_onu_parent_olt", json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"pon_onu_role"},{"id":"p","entity":"pon_olt_role"}],"edges":[{"relation":"pon_onu_parent_olt","from":"c","to":"p"}],"select":[{"node":"c","dimension":"pon_onu_id"},{"node":"p","dimension":"pon_olt_id"}]}"#).unwrap!()),
+     pair("source_EntPonElementAssociationEntPonElement", json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"pon_device"},{"id":"p","entity":"pon_device"}],"edges":[{"relation":"source_EntPonElementAssociationEntPonElement","from":"p","to":"c"}],"select":[{"node":"c","dimension":"pon_id"},{"node":"p","dimension":"pon_id"}]}"#).unwrap!())],
+    array::map([("source_EntPonElementAssociationX_TENANT_VIEW", "tenant", "tenant_name"), ("source_EntPonElementAssociationX_SITE_VIEW", "site", "site_id")], fn(spec) {
+        pair(spec.0, json::parse(`{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"pon_device"},{"id":"o","entity":"\{spec.1}"}],"edges":[{"relation":"\{spec.0}","from":"p","to":"o"}],"select":[{"node":"p","dimension":"pon_id"},{"node":"o","dimension":"\{spec.2}"}]}`).unwrap!())
+    }),
+]));
 pub def physical_affinities: Value = codec::encode(array::map(payload.entities, fn(entity) { (entity.table, array::map(entity.fields, fn(field) {
     (field.column, if field.ty == Int.type || field.ty == Bool.type { "INTEGER" } else if field.ty == Float.type { "REAL" } else { "TEXT" })
 })) }));
 # 一次初始化输出全部对照请求与物理 schema，避免每组查询重复准备旧模型
-type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, kpi: Value, server: Value, server_kpi: Value, components: Value, storage: Value, hardware: Value, schema: Value, affinities: Value };
-def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, kpi: kpi_cases, server: server_cases, server_kpi: server_kpi_cases, components: component_cases, storage: storage_cases, hardware: hardware_cases, schema: physical_schema, affinities: physical_affinities};
+type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, kpi: Value, server: Value, server_kpi: Value, components: Value, storage: Value, hardware: Value, pon: Value, schema: Value, affinities: Value };
+def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, kpi: kpi_cases, server: server_cases, server_kpi: server_kpi_cases, components: component_cases, storage: storage_cases, hardware: hardware_cases, pon: pon_cases, schema: physical_schema, affinities: physical_affinities};
 pub def runtime_fixture: Value = codec::encode(fixture);
