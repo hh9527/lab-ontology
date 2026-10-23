@@ -7,13 +7,13 @@ type Entity(Identity) = struct { id: String, identity: Type };
 type Dataset(Row) = struct { id: String, source: String, row: Type, grain: Array(String) };
 type Field(Owner, Value) = struct { owner: Type, value: Type, name: String, nullable: Bool };
 type IdentityPart(Row, Identity) = struct {
-    row: Type, identity: Type, source: String, target: String, value: Type, nullable: Bool,
+    row: Type, identity: Type, source: String, target: String, value: Type, nullable: Bool, raw: Option(Type),
 };
 type Role(Row) = struct {
     id: String, entity: String, identity: Type, optional: Bool,
     parts: Array(Part),
 };
-type Part = struct { source: String, target: String, value: Type, nullable: Bool };
+type Part = struct { source: String, target: String, value: Type, nullable: Bool, raw: Option(Type) };
 type PreparedDataset = struct {
     id: String, source: String, row: Type, grain: Array(String), roles: Array(PreparedRole),
 };
@@ -95,7 +95,24 @@ def optional_field: for(Owner, Value) Fn(TypeOf(Owner), TypeOf(Value), String) -
 def identity_part: for(Row, Identity, Value) Fn(Field(Row, Value), Field(Identity, Value)) -> IdentityPart(Row, Identity) = fn(source, target) {
     if target.nullable { fail!("identity target cannot be nullable", target.name) }
     else { {row: source.owner, identity: target.owner, source: source.name, target: target.name,
-        value: source.value, nullable: source.nullable} }
+        value: source.value, nullable: source.nullable, raw: None} }
+};
+
+# 仅原始整数/文本引用可显式采用目标身份的名义类型；编码不变，不允许名义 ID 之间隐式互转。
+def identity_storage: Fn(Type) -> Type = fn(ty) {
+    let value = resolved(ty);
+    if td::kind(value) == td::TypeDescKind::Newtype { identity_storage(td::children(value)[0]) } else { value }
+};
+def validate_reference: Fn(Type, Type) -> () = fn(raw, target) {
+    if (raw != Int.type && raw != String.type) || !identity_value(target) || identity_storage(target) != raw {
+        fail!("explicit identity reference requires raw integer or text with unchanged storage", raw, target)
+    } else { () }
+};
+def reference_part: for(Row, Identity, Raw, Nominal) Fn(Field(Row, Raw), Field(Identity, Nominal)) -> IdentityPart(Row, Identity) = fn(source, target) {
+    if target.nullable { fail!("identity target cannot be nullable", target.name) } else { () };
+    validate_reference(Raw.type, Nominal.type);
+    {row: source.owner, identity: target.owner, source: source.name, target: target.name,
+        value: target.value, nullable: source.nullable, raw: Some(source.value)}
 };
 
 def validate_parts: Fn(Type, Type, Bool, Array(Part)) -> () = fn(row, identity, optional, parts) {
@@ -109,12 +126,13 @@ def validate_parts: Fn(Type, Type, Bool, Array(Part)) -> () = fn(row, identity, 
     } else {
         array::map(parts, fn(part) {
             let actual = field_type(row, part.source);
+            let source_type = match part.raw { None => part.value, Some(raw) => { validate_reference(raw, part.value); raw } };
             let valid = if part.nullable {
                 let variants = td::variants(resolved(actual));
                 array::length(variants) == 2
                     && array::any(variants, fn(variant) { variant.name == "None" && variant.payload == None })
-                    && array::any(variants, fn(variant) { variant.name == "Some" && variant.payload == Some(part.value) })
-            } else { actual == part.value };
+                    && array::any(variants, fn(variant) { variant.name == "Some" && variant.payload == Some(source_type) })
+            } else { actual == source_type };
             if !valid || field_type(identity, part.target) != part.value {
                 fail!("role mapping has incompatible field types", part.source, part.target)
             } else if part.nullable && !optional {
@@ -133,7 +151,7 @@ def role: for(Row, Identity) Fn(Dataset(Row), Entity(Identity), String, Bool, Ar
         let mapped = array::map(parts, fn(part) {
             if part.row != dataset.row || part.identity != entity.identity {
                 fail!("role mapping belongs to a different row or identity", id)
-            } else { {source: part.source, target: part.target, value: part.value, nullable: part.nullable}.ty!(Part) }
+            } else { {source: part.source, target: part.target, value: part.value, nullable: part.nullable, raw: part.raw}.ty!(Part) }
         });
         validate_parts(dataset.row, entity.identity, optional, mapped);
         {id, entity: entity.id, identity: entity.identity, optional, parts: mapped}
@@ -167,4 +185,4 @@ def prepare: for(Row) Fn(Dataset(Row), Array(Role(Row))) -> PreparedDataset = fn
 };
 
 pub use self::{Entity, Dataset, Field, IdentityPart, Role, Part, PreparedDataset, PreparedRole,
-    entity, dataset, field, optional_field, identity_part, role, prepare, validate_prepared};
+    entity, dataset, field, optional_field, reference_part, identity_part, role, prepare, validate_prepared};

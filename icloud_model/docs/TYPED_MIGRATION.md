@@ -361,3 +361,16 @@ CountRef 的 Row 参数和运行时 Dataset/source 见证共同保留来源约�
 7 项计算计数契约通过；6 个实际 SQLite 场景验证嵌套 Add/Sub、负差值、整数结果、独立条件计数、NULL 和空总体；原条件计数的 6 个 SQLite 场景通过。
 PostgreSQL 仅核对参数。CurrentAlarm 尚未迁移，载体进度仍为 20/50；不执行知识发现、知识地图构建或知识测试。
 本项 12 项既有 IC transform 契约通过，MainService 尚未切换。
+
+## CurrentAlarm 前置能力：显式原始身份引用映射
+
+完整告警声明的 MEDN 同时引用 Device 与 Server，来源没有表达可区分两类 ID 的编码；保留原始 String 字段，不把 DeviceId 与 ServerId 合并为一个名义类型。
+新增 model::reference_part：只有原始 Int/String 引用能显式采用目标身份的名义类型，物理存储必须相同，不执行解析、转换或身份存在性推断。
+默认 identity_part 仍要求同一名义类型；reference_part 不接受 DeviceId→ServerId 之类已有名义 ID 的重新解释。
+IdentityPart/Part 保留可选 raw 类型见证，角色准备及擦除后重验来源字段、目标身份、物理存储、可空性和完整身份覆盖。
+映射不改变关系方向、基数或租户键；NULL 来源要求 optional 角色，不将孤立引用当作已存在实体。
+
+8 个实际 SQLite 场景验证原始文本引用、物理列映射、复合租户键、NULL、孤立引用、反向零计数组与 EXISTS；PostgreSQL 仅核对参数。
+原有 20 项 Entity/Dataset 身份契约、102 个 Graph 请求及 6 组实际 SQLite 关系对照通过。
+CurrentAlarm 尚未迁移，仍为 20/50；只推进 transform，不执行知识发现、知识地图构建或知识测试。
+本项 7 项显式引用正反例（含整数正例）和 12 项 IC transform 契约通过，MainService 尚未切换。

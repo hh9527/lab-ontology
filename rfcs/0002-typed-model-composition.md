@@ -1112,3 +1112,12 @@ CountRef(Row) 与 combine_counts 显式表达同一 Dataset 的计数输入及 A
 当前仅补齐计数输入组合，不声称已经支持任意单位的聚合后计算；业务结果名义类型的细化继续随迁移推进。
 7 项契约、6 个实际 SQLite 计算场景及 6 个条件计数回归通过；PostgreSQL 仅核对参数。仍为 20/50，不增加知识准备成本。
 本项 12 项既有 IC transform 契约通过，MainService 尚未切换。
+
+### 阶段 D 前置能力：原始引用到名义身份的显式映射
+
+告警 MEDN 为一个原始来源字段，可引用设备或服务器；独立建模保留 String，通过 reference_part 分别绑定 DeviceId／ServerId，而非合并两种身份类型。
+reference_part 仅允许原始 Int/String 到物理表示相同的身份标量，保留 raw 类型见证并在擦除后重验，不接受已有名义 ID 之间的重新解释。
+默认 identity_part 的名义类型相等要求不变。映射不执行编码转换，不推断引用存在性，不改变完整身份、可空性、基数和来源粒度。
+8 个实际 SQLite 场景、20 项既有身份契约、102 个 Graph 请求和 6 组关系 SQL 对照通过；PostgreSQL 仅核对参数。
+CurrentAlarm 尚未迁移，仍为 20/50，不增加知识准备成本。
+本项 7 项显式引用正反例（含整数正例）和 12 项 IC transform 契约通过，MainService 尚未切换。

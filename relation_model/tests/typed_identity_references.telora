@@ -1,0 +1,57 @@
+use crate::typed_relations as t;
+use ontology::experimental::model as m;
+use ontology::experimental::relations as r;
+use ontology::experimental::transform as transform;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::codec as codec;
+use std::json as json;
+use std::test as test;
+use std::value::{Value};
+
+type RawRow = struct { id: String, tenant_id: t::TenantId, a_device_id: Option(String) };
+type IntIdentity = struct { id: Int };
+def rows: m::Dataset(RawRow) = m::dataset("raw_references", "raw_references", RawRow.type, ["id", "tenant_id"]);
+def parts: Array(m::IdentityPart(RawRow, t::DeviceIdentity)) = [
+    m::identity_part(m::field(RawRow.type, t::TenantId.type, "tenant_id"), m::field(t::DeviceIdentity.type, t::TenantId.type, "tenant")),
+    m::reference_part(m::optional_field(RawRow.type, String.type, "a_device_id"), m::field(t::DeviceIdentity.type, t::DeviceId.type, "local")),
+];
+def reference: m::Role(RawRow) = m::role(rows, t::device, "device_reference", True, parts);
+def relation: r::Relation = r::relation("raw_device", rows, reference, t::devices, t::device_subject, t::many_optional);
+def declaration: transform::Declaration = transform::map_columns(transform::declare(rows, [reference], [], []), [transform::column(m::optional_field(RawRow.type, String.type, "a_device_id"), "MEDN")]);
+def payload: edsl::PreparedPayload = transform::build("raw-references", [declaration, t::datasets[2]], [relation], [], [], t::profile).payload;
+pub def raw_reference_preserves_target_nominal_identity: test::Test = test::should_ok(fn() { reference.parts[1].value == t::DeviceId.type && reference.parts[1].raw == Some(String.type) && payload.relations[0].key == edsl::RelationKey::And([edsl::RelationKey::Eq({from: 2, to: 0}), edsl::RelationKey::Eq({from: 1, to: 2})]) });
+pub def nullable_reference_requires_optional_role: test::Test = test::should_fail_with(fn() { m::role(rows, t::device, "bad", False, parts) }, "nullable identity input requires an optional role");
+pub def nominal_id_cannot_be_reinterpreted: test::Test = test::should_fail_with(fn() { m::reference_part(m::field(t::DeviceRow.type, t::DeviceId.type, "id"), m::field(t::SiteIdentity.type, t::SiteId.type, "local")) }, "explicit identity reference requires raw integer or text with unchanged storage");
+pub def storage_conversion_is_rejected: test::Test = test::should_fail_with(fn() { m::reference_part(m::optional_field(RawRow.type, String.type, "a_device_id"), m::field(IntIdentity.type, Int.type, "id")) }, "explicit identity reference requires raw integer or text with unchanged storage");
+pub def erased_source_witness_is_rechecked: test::Test = test::should_fail_with(fn() {
+    let prepared = m::prepare(rows, [reference]);
+    m::validate_prepared(prepared <~ {roles: [prepared.roles[0] <~ {parts: [reference.parts[0], reference.parts[1] <~ {raw: Some(Int.type)}]}]})
+}, "explicit identity reference requires raw integer or text with unchanged storage");
+pub def deleting_mapping_cannot_bypass_nominal_types: test::Test = test::should_fail_with(fn() {
+    let prepared = m::prepare(rows, [reference]);
+    m::validate_prepared(prepared <~ {roles: [prepared.roles[0] <~ {parts: [reference.parts[0], reference.parts[1] <~ {raw: None}]}]})
+}, "role mapping has incompatible field types");
+type Case = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> Case = fn(id, raw) {
+    let ast = intent::query_intent_ast_factory(payload)(json::parse(raw).unwrap!());
+    {id, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("all", r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"raw_references"}],"edges":[],"select":[],"count":"r"}"#),
+    runtime_case("joined", r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"raw_references"},{"id":"d","entity":"device"}],"edges":[{"relation":"raw_device","from":"r","to":"d"}],"select":[{"node":"d","dimension":"device_id"}]}"#),
+    runtime_case("reverse_empty", r#"{"op":"Graph","root":"d","include_empty":true,"nodes":[{"id":"r","entity":"raw_references"},{"id":"d","entity":"device"}],"edges":[{"relation":"raw_device","from":"r","to":"d"}],"select":[{"node":"d","dimension":"device_id"}],"count":"r","group_by_identity":["d"]}"#),
+    runtime_case("exists", r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"raw_references"}],"edges":[],"select":[],"count":"r","exists":[{"anchor":"r","nodes":[{"id":"d","entity":"device"}],"edges":[{"relation":"raw_device","from":"r","to":"d"}]}]}"#),
+]);
+type IntegerId = struct(Int);
+type IntegerIdentity = struct { id: IntegerId };
+type IntegerRow = struct { id: Int };
+pub def integer_reference_preserves_encoding: test::Test = test::should_ok(fn() {
+    let dataset = m::dataset("integer_refs", "integer_refs", IntegerRow.type, ["id"]);
+    let entity = m::entity("integer_entity", IntegerIdentity.type);
+    let role = m::role(dataset, entity, "reference", False, [m::reference_part(m::field(IntegerRow.type, Int.type, "id"), m::field(IntegerIdentity.type, IntegerId.type, "id"))]);
+    m::prepare(dataset, [role]).roles[0].parts[0].raw == Some(Int.type)
+});
