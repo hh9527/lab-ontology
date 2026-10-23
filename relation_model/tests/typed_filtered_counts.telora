@@ -1,0 +1,46 @@
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::values as v;
+use ontology::experimental::transform as t;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+type State = struct(String);
+type OtherState = struct(String);
+type Row = struct { id: Int, state: Option(String), score: Option(Float) };
+def rows: m::Dataset(Row) = m::dataset("filtered", "filtered_rows", Row.type, ["id"]);
+def domain: v::Domain(State, String) = v::domain("State", State.type, String.type, [v::member(State("yes"), ["wire_yes", "Y"]), v::member(State("no"), ["wire_no"])], False);
+def state: v::Binding(Row) = v::bind(rows, v::dimension_group(domain, True, g::equality_filters), g::input(m::optional_field(Row.type, String.type, "state")), "state", True, g::equality_filters);
+def base: t::Declaration = t::with_domains(t::map_columns(t::declare(rows, [], [], ["records"]), [
+    t::column(m::field(Row.type, Int.type, "id"), "ROW_ID"),
+    t::column(m::optional_field(Row.type, String.type, "state"), "STATE_CODE"),
+    t::column(m::optional_field(Row.type, Float.type, "score"), "RAW_SCORE"),
+]), [state]);
+def matched: t::FieldCount(Row) = t::filtered_count(t::field_count(rows, m::field(Row.type, Int.type, "id"), "matched"), state, State("yes"));
+def scored: t::FieldCount(Row) = t::filtered_count(t::field_count(rows, m::optional_field(Row.type, Float.type, "score"), "scored"), state, State("yes"));
+def declared: t::Declaration = t::with_field_counts(base, [matched, scored]);
+def profile: qb::PlanProfile = {allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project, qb::Operator::Aggregate, qb::Operator::Group, qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind], allowed_aggregates: [qb::AggregateFunction::Count], allowed_join_kinds: [], allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::If, qb::ScalarFunction::And, qb::ScalarFunction::Or, qb::ScalarFunction::IsNotNull], allow_distinct: False};
+def payload: edsl::PreparedPayload = t::prepare("filtered", [declared], profile).payload;
+def predicate: v::MemberPredicate = match matched.condition { Some(value) => value, None => fail!("missing predicate") };
+pub def prepared_predicate_preserves_business_member: test::Test = test::should_ok(fn() { payload.measures[1].predicate == Some({field: "state", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("yes")}) && payload.measures[2].field == 2 && payload.entities[0].fields[1].column == "STATE_CODE" });
+pub def wrong_nominal_type_is_rejected: test::Test = test::should_fail_with(fn() { t::filtered_count(matched, state, OtherState("yes")) }, "business predicate member has incompatible nominal type");
+pub def undeclared_member_is_rejected: test::Test = test::should_fail_with(fn() { t::filtered_count(matched, state, State("missing")) }, "business predicate requires a declared member");
+pub def another_dataset_is_rejected: test::Test = test::should_fail_with(fn() { t::filtered_count(matched <~ {dataset: "other"}, state, State("yes")) }, "filtered count condition belongs to another dataset");
+pub def erased_missing_binding_is_rejected: test::Test = test::should_fail_with(fn() { t::prepare("bad", [declared <~ {domains: []}], profile) }, "business predicate requires its declared dimension binding");
+pub def erased_member_is_rechecked: test::Test = test::should_fail_with(fn() { t::prepare("bad", [t::with_field_counts(base, [matched <~ {condition: Some(predicate <~ {member: "missing"})}])], profile) }, "business predicate requires a declared member");
+pub def erased_binding_is_rechecked: test::Test = test::should_fail_with(fn() { t::prepare("bad", [t::with_field_counts(base, [matched <~ {condition: Some(predicate <~ {binding: predicate.binding <~ {source: "other"}})}])], profile) }, "business dimension binding belongs to another dataset");
+type Case = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> Case = fn(id, extra) {
+    let ast = intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"filtered"}],"edges":[],\{extra}}`).unwrap!());
+    {id, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("total", r#""select":[],"measures":[{"node":"r","measure":"records"},{"node":"r","measure":"matched"},{"node":"r","measure":"scored"}]"#),
+    runtime_case("narrowed", r#""select":[],"measures":[{"node":"r","measure":"records"},{"node":"r","measure":"matched"},{"node":"r","measure":"scored"}],"filters":[{"node":"r","dimension":"state","op":"Eq","value":"no"}]"#),
+]);

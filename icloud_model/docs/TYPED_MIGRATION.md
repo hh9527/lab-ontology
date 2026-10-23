@@ -313,3 +313,14 @@ SQL 场景覆盖跨租户同刻样本的确定排序、最新 CPU 为 NULL 而�
 不执行知识发现、知识地图构建或知识测试，MainService 尚未切换。
 
 累计完成 20/50 个既有载体。12 项 transform 契约（双载荷 150000 fuel）、独立初始化（100000）和累计 574 组实际 SQLite 对照及空表检查通过。PostgreSQL 仅核对参数。
+
+## CurrentAlarm 前置能力：业务成员条件计数
+
+新增 filtered_count，将字段计数与名义业务成员绑定，复用已声明值域的来源编码映射和物理列映射。
+构造时检查业务类型、成员和 Dataset；擦除泛型后的准备阶段重新检查完整绑定，拒绝未声明或被篡改的条件。
+当前仅支持直接列上的已声明成员等值条件，不引入任意 SQL。
+条件只作用于对应度量；COUNT(field) 仍排除该字段的 NULL，不把条件提升成整个 Dataset 的默认范围。
+
+7 项正反例、6 个实际 SQLite 条件计数场景、原字段计数的 6 个 SQLite 场景、relation model 的 102 个 Graph 请求与 6 组 SQL 对照，以及 12 项 IC transform 契约通过。
+PostgreSQL 仅核对参数。CurrentAlarm 尚未迁移，完成数量仍为 20/50；MainService 尚未切换。
+本阶段不准备知识地图、不执行知识发现或知识测试，验收仅依据 transform 能力与对应回归。
