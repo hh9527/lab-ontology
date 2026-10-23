@@ -2,13 +2,16 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-// 输入必须来自 @test/typed_groups:runtime_cases，执行实际生成的 SQL。
+// 输入来自 typed_groups 的 runtime_cases 或 graph_runtime_cases，执行实际生成的 SQL。
 const cases = JSON.parse(readFileSync(process.argv[2] ?? 0, 'utf8'));
+const graph = process.argv[3] === '--graph';
+assert.equal(cases.length, graph ? 5 : 4);
 const db = new DatabaseSync(':memory:');
 db.exec(`CREATE TABLE samples_ms (
   tenant TEXT, device TEXT, seq INTEGER, name TEXT, category TEXT,
   rx REAL, tx REAL, elapsed_ms REAL
 );
+CREATE TABLE owners (tenant TEXT, device TEXT, name TEXT);
 CREATE TABLE samples_s (
   tenant_key TEXT, device_key TEXT, sequence INTEGER, title TEXT, kind TEXT,
   bytes_in REAL, bytes_out REAL, duration_seconds REAL
@@ -32,6 +35,8 @@ for (const row of rows) {
   insertMs.run(...row);
   insertS.run(...row.slice(0, 7), row[7] === null ? null : row[7] / 1000);
 }
+const owners = new Map(rows.filter((row) => row[1] !== null).map((row) => [JSON.stringify(row.slice(0, 2)), row]));
+for (const row of owners.values()) db.prepare('INSERT INTO owners VALUES (?, ?, ?)').run(row[0], row[1], row[3] ?? 'zero');
 const sum = (values) => values.length ? values.reduce((a, b) => a + b, 0) : null;
 const metrics = (group) => {
   const result = {};
@@ -59,9 +64,11 @@ const groupedExpected = [...groups].map(([key, group]) => {
 });
 const sorted = (values) => values.map((value) => ({ ...value }))
   .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-const run = (query) => db.prepare(query.sql).all(...query.bindings);
+const run = (query) => db.prepare(query.sql).all(...query.bindings).map((row) =>
+  graph ? Object.fromEntries(Object.entries(row).map(([key, value]) => [key.replace(/^r_/, ''), value])) : row);
 for (const item of cases) {
-  const expected = item.id.endsWith('_grouped') ? groupedExpected : [metrics(rows)];
+  const expected = item.id.endsWith('_grouped') ? groupedExpected : item.id.endsWith('_exists')
+    ? [{ owner_label: 'alpha' }] : [metrics(rows)];
   assert.deepEqual(sorted(run(item.sqlite)), sorted(expected), item.id);
   assert.deepEqual(item.postgres.bindings, item.sqlite.bindings, `${item.id} dialect bindings`);
   assert.ok(!item.sqlite.sql.includes(' JOIN '), `${item.id} must stay within one Dataset`);
@@ -78,7 +85,7 @@ assert.equal(missing[0].rx_total, 30);
 db.exec('DELETE FROM samples_ms; DELETE FROM samples_s;');
 for (const item of cases) {
   const actual = run(item.sqlite);
-  if (item.id.endsWith('_grouped')) assert.deepEqual(actual, [], item.id);
+  if (item.id.endsWith('_grouped') || item.id.endsWith('_exists')) assert.deepEqual(actual, [], item.id);
   else assert.deepEqual(actual.map((row) => ({ ...row })), [metrics([])], item.id);
 }
 
@@ -90,4 +97,4 @@ const integer = run(cases.find((item) => item.id === 's_all').sqlite)[0];
 assert.equal(integer.rx_mean, 1.5);
 assert.equal(integer.tx_mean, 2.5);
 db.close();
-console.log('Passed 4 generated queries over reused Groups, nominal identity, NULL/invalid/empty inputs and integer-storage rate boundaries.');
+console.log(`Passed ${cases.length} ${graph ? 'Graph' : 'standalone'} queries over reused Groups, nominal identity, NULL/invalid/empty inputs and integer-storage rate boundaries.`);

@@ -761,6 +761,12 @@ type ComputedMeasureEntry = struct {
     right: String,
 };
 
+# 聚合前的逐行表达式，与聚合后依赖其他度量的 computed 分开。
+type MeasureExpression = struct {
+    output_type: OutputType,
+    build: Fn(qb::BuildCtx, qb::Source) -> (qb::BuildCtx, qb::Expr),
+};
+
 type MeasureEntry = struct {
     id: String,
     entity: Int,
@@ -771,6 +777,7 @@ type MeasureEntry = struct {
     requires: Array(Int),
     predicate: Option(ScopePredicate),
     computed: Option(ComputedMeasureEntry),
+    row_expression: Option(MeasureExpression),
 };
 
 type DimensionEntry = struct {
@@ -1769,7 +1776,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
         let primary = match property::get_field_prop(entity.entity_type, f.index, PrimarySampleMeasureSpec.type) {
             Some(spec) => [{id: spec.id, entity: entity.index, field: f.index,
                 aggregate: spec.aggregate, input: MeasureInput::All, alias: spec.id,
-                requires: [], predicate: None, computed: None}.ty!(MeasureEntry)],
+                requires: [], predicate: None, row_expression: None, computed: None}.ty!(MeasureEntry)],
             None => [],
         };
         let plain = match property::get_field_prop(entity.entity_type, f.index, MeasureDef.type) {
@@ -1783,7 +1790,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: resolve_required(entities, spec.requires),
                     predicate: None,
-                    computed: None,
+                    row_expression: None, computed: None,
                 };
                 result
             }),
@@ -1800,7 +1807,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: resolve_required(entities, spec.requires),
                     predicate: Some(spec.predicate),
-                    computed: None,
+                    row_expression: None, computed: None,
                 };
                 result
             }),
@@ -1817,7 +1824,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: [],
                     predicate: None,
-                    computed: None,
+                    row_expression: None, computed: None,
                 };
                 result
             }),
@@ -1834,7 +1841,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: [],
                     predicate: None,
-                    computed: Some({ op: spec.op, left: spec.left, right: spec.right }),
+                    row_expression: None, computed: Some({ op: spec.op, left: spec.left, right: spec.right }),
                 };
                 result
             }),
@@ -1876,19 +1883,31 @@ def measure_value_type: Fn(Array(EntityEntry), Array(MeasureEntry), String) -> O
                 qb::AggregateFunction::Avg => OutputType::Number,
                 qb::AggregateFunction::Sum => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
                 qb::AggregateFunction::Min => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
                 qb::AggregateFunction::Max => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
                 qb::AggregateFunction::Latest => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
             },
         }
@@ -1903,7 +1922,7 @@ def measure_latest_order: Fn(EntityEntry, MeasureEntry, qb::Source) -> Option(qb
     else {
         let field = get_index(entity.fields, entry.field);
         if (field.ty != Int.type && field.ty != Float.type) || entry.input != MeasureInput::All
-            || entry.predicate != None || entry.computed != None || array::length(entry.requires) > 0 {
+            || entry.predicate != None || entry.computed != None || entry.row_expression != None || array::length(entry.requires) > 0 {
             fail!("Latest requires a numeric field without distinct, local filters or external dependencies", entry.id)
         } else { () };
         let dataset = match entity.dataset {
@@ -3208,8 +3227,9 @@ def validate_transform_contract: Fn(PreparedPayload) -> PreparedPayload = fn(pay
                     Some(_) => Some(resolve_measure_predicate_with_context(qb::build_context(), payload, entry).1),
                     None => None,
                 };
+                let input = measure_row_expr(qb::build_context(), payload, entry, entity.source);
                 let call: qb::AggregateCall = {function: entry.aggregate,
-                    arg: qb::column(entity.source, field.column),
+                    arg: input.1,
                     distinct: entry.input == MeasureInput::Distinct, filter: filtered, alias: entry.id,
                     latest: measure_latest_order(entity, entry, entity.source)};
                 if qb::aggregate_profile_accepts(call, profile) { True }
@@ -3357,6 +3377,17 @@ type FilterResolution = struct {
 };
 
 
+
+def measure_row_expr: Fn(qb::BuildCtx, PreparedPayload, MeasureEntry, qb::Source) -> (qb::BuildCtx, qb::Expr) = fn(ctx, payload, entry, source) {
+    match entry.row_expression {
+        Some(expression) => expression.build(ctx, source),
+        None => {
+            let entity = get_index(payload.entities, entry.entity);
+            let field = get_index(entity.fields, entry.field);
+            (ctx, qb::column(source, field.column))
+        },
+    }
+};
 
 def dimension_expr: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry) -> (qb::BuildCtx, qb::Expr) = fn(ctx, payload, entry) {
     let entity = get_index(payload.entities, entry.entity);
@@ -4749,9 +4780,10 @@ def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Arr
                         (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, sample.source.alias)))
                     },
                 };
-                let threshold = qb::bind(filtered.0, to_val(spec.threshold));
+                let input = measure_row_expr(filtered.0, payload, measure, sample.source);
+                let threshold = qb::bind(input.0, to_val(spec.threshold));
                 let having = qb::having_call_filtered_bound(graph_aggregate_op(spec.op), measure.aggregate,
-                    qb::column(sample.source, field.column), measure.input == MeasureInput::Distinct, filtered.1, threshold.1);
+                    input.1, measure.input == MeasureInput::Distinct, filtered.1, threshold.1);
                 (threshold.0, array::push(state.1, having))
             }
         }
@@ -5225,11 +5257,12 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
                         (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, instance.source.alias)))
                     },
                 };
-                let call: qb::AggregateCall = {function: measure.aggregate, arg: qb::column(instance.source, field.column),
+                let input = measure_row_expr(filtered.0, payload, measure, instance.source);
+                let call: qb::AggregateCall = {function: measure.aggregate, arg: input.1,
                     distinct: measure.input == MeasureInput::Distinct, filter: filtered.1, alias,
                     latest: measure_latest_order(entity, measure, instance.source)};
                 let item = qb::SelectItem::Aggregate(call);
-                (filtered.0, item, array::push(cached, item))
+                (input.0, item, array::push(cached, item))
             }
         }
     };
@@ -5990,7 +6023,7 @@ pub use self::{
     CanonicalValueSpec,
     CanonicalAlias,
     EntityEntry,
-    MeasureEntry,
+    MeasureEntry, MeasureExpression,
     DimensionEntry,
     DimensionBrief,
     TimeRoleBrief,

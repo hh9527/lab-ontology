@@ -130,18 +130,33 @@ def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(re
     });
     let dimensions = array::flat_map(array::enumerate(declarations), fn(pair) {
         let members = g::prepare_facts(pair.1.dataset, pair.1.groups);
-        array::map(members, fn(member) { dimension_entry(entities[pair.0], member) })
+        array::map(array::filter(members, fn(member) { member.aggregate == None }), fn(member) { dimension_entry(entities[pair.0], member) })
     });
     let measures = array::flat_map(array::enumerate(declarations), fn(pair) {
         let entity = entities[pair.0];
-        array::map(pair.1.record_counts, fn(id) {
+        let members = g::prepare_facts(pair.1.dataset, pair.1.groups);
+        let grouped = array::map(array::filter(members, fn(member) { member.aggregate != None }), fn(member) {
+            let field = match array::find(entity.fields, fn(field) { field.name == anchor_column(member.node) }) {
+                Some(value) => value, None => fail!("typed measure input field is missing", member.id),
+            };
+            let function = match member.aggregate { Some(value) => value, None => fail!("typed measure requires an aggregate", member.id) };
+            let value = scalar(member.value);
+            let output = if value.storage == Int.type { edsl::OutputType::Integer }
+                else if value.storage == Float.type { edsl::OutputType::Number }
+                else { fail!("typed Group measure requires a numeric result", member.id) };
+            {id: member.id, entity: entity.index, field: field.index, aggregate: function,
+                input: edsl::MeasureInput::All, alias: member.id, requires: [], predicate: None, computed: None,
+                row_expression: Some({output_type: output, build: fn(ctx, source) { g::lower(ctx, source, member.node) }})}.ty!(edsl::MeasureEntry)
+        });
+        let counts = array::map(pair.1.record_counts, fn(id) {
             let field = match array::find(entity.fields, fn(field) { field.name == pair.1.dataset.grain[0] }) {
                 Some(value) => value, None => fail!("record count grain field is missing", id),
             };
             if !qb::is_sql_identifier(id) { fail!("record count id must be a SQL identifier", id) }
             else { {id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
-                input: edsl::MeasureInput::All, alias: id, requires: [], predicate: None, computed: None}.ty!(edsl::MeasureEntry) }
-        })
+                input: edsl::MeasureInput::All, alias: id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry) }
+        });
+        array::concat([grouped, counts])
     });
     array::map(dimensions, fn(dimension) {
         if array::length(array::filter(dimensions, fn(other) { other.id == dimension.id })) != 1 {

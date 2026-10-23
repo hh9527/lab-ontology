@@ -11,7 +11,14 @@
 领域在 Telora 模块中定义带类型的数据集、维度、度量、值、时间角色和具名关系，再通过
 `edsl::build_transform_root(revision, entity_types, profile)` 准备查询所需的 `PreparedPayload`。
 该入口验证字段、值域、权限、关系、粒度和 profile，跳过知识描述、别名、本地化、知识注解与知识类型目录校验。
-当前模型 MainService 只初始化 transform。完整的小型声明见 [`relation_model`](../../relation_model/src/model.telora)，服务挂载见[入口](../../relation_model/src/lib.telora)。
+当前模型 MainService 只初始化 transform。
+IC 模型使用上述注解准备入口；relation 模型使用 `experimental::transform::build`，从类型化 Dataset、Entity 角色、Group 绑定和显式记录计数独立准备同一查询契约。
+完整的小型声明见 [`relation_model`](../../relation_model/src/typed_relations.telora)，服务挂载见[入口](../../relation_model/src/lib.telora)。
+
+实验 API 的 Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
+维度和聚合度量共用这些表达式；Graph 投影与相关 EXISTS 聚合均检查能力和粒度。
+可空身份缺失任一分量时所有分量投影为 NULL，速率只在正时长上计算，Sum／Max／Avg 保留空集 NULL 语义。
+这些表达式直接生成 QueryAst，不接受任意函数或 SQL 字符串映射；API 与范围见 [RFC 0002](../../rfcs/0002-typed-model-composition.md)。
 
 ```telora
 use ontology::ontology as edsl;

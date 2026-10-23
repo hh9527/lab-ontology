@@ -97,3 +97,86 @@ pub def runtime_cases: Value = codec::encode([
     export_case("ms_all", g::query(f::millis, [f::ms_rx, f::ms_tx])),
     export_case("s_all", g::query(f::secs, [f::s_rx, f::s_tx])),
 ]);
+
+# 同一 Group 声明进入 Graph 编译器，沿用实例、粒度与相关聚合语义。
+use ontology::experimental::transform as transform;
+use ontology::experimental::relations as relations;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use std::json as json;
+
+def graph_profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate, qb::Operator::Group,
+        qb::Operator::Filter, qb::Operator::Join, qb::Operator::Exists, qb::Operator::Having],
+    allowed_join_kinds: [qb::JoinKind::Inner],
+    allowed_aggregates: [qb::AggregateFunction::Sum, qb::AggregateFunction::Max, qb::AggregateFunction::Avg, qb::AggregateFunction::Count],
+    allowed_scalars: [qb::ScalarFunction::Div, qb::ScalarFunction::Gt, qb::ScalarFunction::If,
+        qb::ScalarFunction::IsNotNull, qb::ScalarFunction::And, qb::ScalarFunction::Eq], allow_distinct: True,
+};
+def ms_declared: transform::Declaration = transform::declare(f::millis, [f::millis_role],
+    [f::ms_identity, f::ms_label, f::ms_category, f::ms_rx, f::ms_tx], []);
+def s_declared: transform::Declaration = transform::declare(f::secs, [f::seconds_role],
+    [f::s_identity, f::s_label, f::s_category, f::s_rx, f::s_tx], []);
+def ms_payload: edsl::PreparedPayload = transform::prepare("ms-groups", [ms_declared], graph_profile).payload;
+def s_payload: edsl::PreparedPayload = transform::prepare("s-groups", [s_declared], graph_profile).payload;
+def graph_request: Fn(String, Bool) -> Value = fn(dataset, grouped) {
+    json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"\{dataset}"}],"edges":[],
+        "select":\{if grouped { r#"[{"node":"r","dimension":"tenant_id"},{"node":"r","dimension":"device_id"},{"node":"r","dimension":"label"},{"node":"r","dimension":"category"}]"# } else { "[]" }},
+        "measures":[{"node":"r","measure":"rx_total"},{"node":"r","measure":"rx_peak"},{"node":"r","measure":"rx_mean"},
+                    {"node":"r","measure":"tx_total"},{"node":"r","measure":"tx_peak"},{"node":"r","measure":"tx_mean"}]}`).unwrap!()
+};
+pub def graph_group_measures_keep_types_and_nullable_aggregates: test::Test = test::should_ok(fn() {
+    let input = graph_request("millis", False);
+    let ast = intent::query_intent_ast_factory(ms_payload)(input);
+    let columns = intent::result_columns(ms_payload, input, ast);
+    array::length(ms_payload.measures) == 6 && array::length(ms_payload.dimensions) == 4
+        && columns == array::map(["rx_total", "rx_peak", "rx_mean", "tx_total", "tx_peak", "tx_mean"], fn(id) {
+            {name: `r_\{id}`, type: intent::ResultType::Float, nullable: True}
+        })
+});
+pub def graph_group_aggregate_capabilities_are_checked: test::Test = test::should_fail_with(fn() {
+    transform::prepare("no-avg", [ms_declared], graph_profile <~ {allowed_aggregates: [qb::AggregateFunction::Sum, qb::AggregateFunction::Max]})
+}, "declared measure uses aggregate, filter or scalar capabilities not allowed by the query profile");
+pub def graph_group_expression_capabilities_are_checked: test::Test = test::should_fail_with(fn() {
+    transform::prepare("no-div", [ms_declared], graph_profile <~ {allowed_scalars: [qb::ScalarFunction::IsNotNull, qb::ScalarFunction::And, qb::ScalarFunction::Eq]})
+}, "declared measure uses aggregate, filter or scalar capabilities not allowed by the query profile");
+pub def group_and_record_count_cannot_publish_the_same_measure: test::Test = test::should_fail_with(fn() {
+    transform::prepare("same-id", [ms_declared <~ {record_counts: ["rx_total"]}], graph_profile)
+}, "typed transform measure ids must be unique");
+
+# 独立 owner Dataset 与样本 Dataset 共享实体角色，相关聚合保留样本粒度。
+type OwnerRow = struct { tenant: f::TenantId, device: f::DeviceId, name: String };
+def owners: m::Dataset(OwnerRow) = m::dataset("owners", "owners", OwnerRow.type, ["tenant", "device"]);
+def owner_role: m::Role(OwnerRow) = m::role(owners, f::device, "subject", False, [
+    m::identity_part(m::field(OwnerRow.type, f::TenantId.type, "tenant"), m::field(f::Identity.type, f::TenantId.type, "tenant")),
+    m::identity_part(m::field(OwnerRow.type, f::DeviceId.type, "device"), m::field(f::Identity.type, f::DeviceId.type, "local")),
+]);
+def owner_label: g::Binding(OwnerRow) = g::dimension(owners, f::label,
+    g::input(m::field(OwnerRow.type, String.type, "name")), "owner_label", True, [g::Filter::Eq]);
+def remote: transform::Declaration = transform::declare(f::secs, [f::seconds_role], [f::s_rx], []);
+def peer: relations::Relation = relations::relation("peer", owners, owner_role, f::secs, f::seconds_role,
+    {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Many0});
+def peer_payload: edsl::PreparedPayload = transform::build("peer-groups",
+    [transform::declare(owners, [owner_role], [owner_label], []), remote], [peer], [], [], graph_profile).payload;
+def exists_request: Value = json::parse(r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"owners"}],"edges":[],
+    "select":[{"node":"r","dimension":"owner_label"}],
+    "exists":[{"anchor":"r","nodes":[{"id":"sample","entity":"seconds"}],
+        "edges":[{"relation":"peer","from":"r","to":"sample"}],
+        "having":[{"node":"sample","measure":"rx_mean","op":"Gt","value":60.0}]}]}"#).unwrap!();
+pub def graph_group_measure_still_rejects_join_fanout: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(peer_payload)(json::parse(r#"{"op":"Graph","root":"r",
+        "nodes":[{"id":"r","entity":"owners"},{"id":"sample","entity":"seconds"},{"id":"other","entity":"seconds"}],
+        "edges":[{"relation":"peer","from":"r","to":"sample"},{"relation":"peer","from":"r","to":"other"}],"select":[],
+        "measures":[{"node":"sample","measure":"rx_total"}]}"#).unwrap!())
+}, "graph measure source may be multiplied by a joined relation; use correlated EXISTS for qualification");
+def graph_case: Fn(String, edsl::PreparedPayload, Value) -> RuntimeCase = fn(id, payload, input) {
+    export_case(id, intent::query_intent_ast_factory(payload)(input))
+};
+pub def graph_runtime_cases: Value = codec::encode([
+    graph_case("ms_grouped", ms_payload, graph_request("millis", True)),
+    graph_case("s_grouped", s_payload, graph_request("seconds", True)),
+    graph_case("ms_all", ms_payload, graph_request("millis", False)),
+    graph_case("s_all", s_payload, graph_request("seconds", False)),
+    graph_case("ms_exists", peer_payload, exists_request),
+]);

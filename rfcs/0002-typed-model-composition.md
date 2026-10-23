@@ -580,7 +580,7 @@ Dataset Row 中的名义类型保留在声明与准备模型中，SQL 字段表�
 跨 Dataset 同一 Entity ID 的身份类型必须一致；Group 成员 ID、计数 ID、Dataset ID 和公共边 ID 分别按 transform 契约检查唯一性。
 共享的 `validate_transform_contract` 校验投影、筛选、聚合和 scope 的执行能力，独立入口额外检查源能力；不执行知识目录或知识地图校验。
 
-此入口支持物理列维度、计算维度、完整身份投影与记录计数。计算型 Group 度量在 Graph 适配边界显式拒绝，保留为下一步 lowering 工作；单 Dataset 的 Group 查询实验仍可执行流量聚合。
+此入口支持物理列维度、计算维度、完整身份投影、Group 聚合度量与记录计数。Group 度量使用共享 QueryAst 聚合路径，支持 Graph 投影及相关 EXISTS 的 HAVING。
 独立准备的 18 个正反例与结果列检查、现有 102 个 graph 用例、六组 SQLite 等价查询和临时快照的批量 transform 验收通过。
 快照验收同时执行生成 SQL，核对跨租户记录、物理列类型和整批原子拒绝行为。
 
@@ -607,3 +607,42 @@ python3 scripts/check-typed-relations.py
 bin/telora -C relation_model test typed_dimensions --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
 python3 scripts/check-typed-dimensions.py
 ```
+
+
+### Graph Group 度量聚合
+
+`MeasureEntry.row_expression` 描述聚合前的逐行表达式，并携带表达式输出的物理类型。
+它与聚合后依赖其他度量的 `computed` 分开：`Avg(Rate(Bytes, Seconds))` 在每条样本上先计算合法速率，再对非 NULL 结果取平均，不改写为总流量／总时长。
+注解模型的普通字段度量保持 `row_expression: None`。
+
+独立准备入口将 Group 成员按维度和聚合度量分开准备。
+同一 Transfer Group 可重复发布为接收、发送指标，也可绑定到不同列名和时间单位的 Dataset。
+聚合输入在实际 Graph 实例的 Source 上生成，参数分配继续沿用当前 BuildCtx；聚合投影和相关 EXISTS 的 HAVING 使用同一逐行表达式入口。
+Sum、Max、Avg 的返回列保留可空性，空集返回 NULL；记录计数仍单独声明。
+表达式的结果类型独立于锚定输入字段，避免把计算结果误解释成源字段的时间或其他语义。
+
+初始化同时检查聚合函数和输入表达式所需的标量能力。
+现有 Graph 粒度证明保留：多个样本分支导致度量样本可能重复时拒绝，相关聚合使用独立 owner Dataset 与明确的角色映射。
+聚合度量、维度与记录计数的发布 ID 继续按既有规则检查冲突。
+
+验收通过：Group 模块 23 个测试；四组独立查询与五组 Graph 查询实际 SQLite 执行；102 个现有 graph 用例与六组新旧关系等价查询；ontology 的 profile 19 例、结果列 8 例及 Latest 11 例。
+五组 Graph 查询覆盖两个单位布局中的重复 Group、分组／总体聚合、可空身份、无效／缺失输入、空集、无 affinity 整数存储及相关 EXISTS 中的平均速率筛选。
+非均匀时长夹具仍得到逐样本平均速率 70，不能替换为总量／总时长的 55。
+
+```sh
+bin/telora -C relation_model test typed_groups --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-groups.py
+```
+
+阶段 C 的关系与端到端 transform 目标已达成。下一步收敛 IC 迁移范围与 transform 公共类型契约，再推进 IC；知识契约维持延后。
+
+
+### relation 产物观测
+
+本阶段在临时目录构建当前 relation MainService 快照，未更新运行环境。
+单次构建墙钟耗时 4.496 秒，快照文件 12,555,573 字节；`wasm-tools objdump` 显示 5,179 个函数，代码段 10,854,662 字节，数据段 1,456,882 字节，快照自定义段 227,371 字节。
+单独执行 `check @src/typed_relations` 得到静态检查 2.580 秒、执行初始化 2.091 秒，总检查 4.671 秒。
+初始化耗时来自工具报告的 execution_seconds，包含该模块初始化执行，并非仅 `transform::prepare` 的微基准。
+
+该产物使用五张关系表的当前服务声明；合成流量 Group 由测试模块独立验收。
+这些指标用于记录当前规模，未进行同机基线对照，不能据此声称类型化声明已经缩小产物或改善初始化性能。
