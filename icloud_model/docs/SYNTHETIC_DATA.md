@@ -29,9 +29,9 @@ resources N 设置基础总体，最少 6；days N 设置 KPI 窗口；interval-
 ONU KPI 遵循限定 ONU 身份，故序列少于基础表。超过一千万 KPI 行的请求被拒绝。
 
 资源覆盖租户、站点、网络设备及组件、服务器及组件、存储、FC 交换机、PON 层级、终端、协作设备和物理连接。
-17 张 KPI 表均有日变化，不同序列呈上升、下降或平稳趋势；在线率含中断。
+17 张 KPI 表均有日变化，通用指标序列呈上升、下降或平稳趋势；在线率含中断。服务器与存储专用指标采用高／中／低档位，覆盖阈值两侧。
 告警覆盖六类资源、四种严重度、已确认／未确认、已清除／未清除状态。
-可空机框备注有 NULL 示例，其他字段用确定性占位值或声明枚举编码；不模拟详细物理容量和设备特定 KPI 适用性。
+可空机框备注有 NULL 示例，其他字段用确定性占位值或声明枚举编码；不模拟完整物理容量和设备特定 KPI 适用性。
 
 DatetimeUtc 存为 YYYY-MM-DDTHH:MM:SSZ，DateUtc 为 YYYY-MM-DD，EpochMillis 为 SQLite 整数。
 本地整数与 UTC 字段使用相同合成时钟，这是夹具假设。零表示不存在的告警确认／清除时间。
@@ -64,3 +64,31 @@ mise x -- node scripts/check-icloud-discovery-pair.mjs bin/icloud-data
 StorageDeviceKPI 对每个存储设备和 FC 交换机都有完整序列，故序列数为基础数量两倍。
 发布验证全部五类有 CPU 能力资源均有序列，且告警关联资源在告警 UTC 当日有样本。
 协作设备告警单独报告为无声明 CPU 源。告警发生时间在生成窗口内选择，包括历史锚点。
+
+## 参考数据包的生成场景
+
+本工具参考 `icloud-corpus/pack/tables.py` 的服务器、存储和磁盘档位，以及
+`pack/alarms.py` 的快照时间约束。参考包使用独立表结构和场景规模；本工具仍以本仓准备模型与源目录为结构契约。
+生成规则版本记录在 manifest 的 `generation.revision`，当前为 2，`profile` 为 `corpus-inspired`。
+这些档位是合成场景，不扩展模型能力，也不声明与参考包逐行一致。
+
+- 服务器 CPU／内存按百分比生成，systemPower／averagePower／peakPower 使用功率数值档位，peakPower 始终大于 averagePower
+- 存储与 FC 的 CPU／内存覆盖高／中／低负载；磁盘 utility 使用百分比，avgreadiosize／avgwriteiosize 使用独立正数档位，保留模型声明单位
+- 有效样本计数 Effcnt 为 1；在线率的日内中断按经过时间计算，改变采样间隔后仍覆盖每日前四小时
+- 告警到达、确认、清除及末次发生时间保持在锚点之前，未确认／未清除时间仍使用零
+- KPI 建立 `(resId,ts)`，有 parentId 的表另建 `(parentId,ts)`，并执行 ANALYZE
+
+`--storage-gap-hours N` 可为存储台账下标 2、11 的已有设备构造近期缺样，默认 0 表示完整序列。
+N 为非负整数且小于整个 KPI 窗口小时数。FC 序列保持完整；受影响存储仍有历史样本，告警发生日仍有 CPU 样本。
+缺样设备和各自排他终点列在 `generation.seriesGaps`，适用于验证“近期无采样”的反向存在查询。
+例如：
+
+```sh
+node scripts/generate-icloud-data.mjs \
+  --output bin/icloud-data-gaps --anchor-utc 2026-10-03T12:00:00Z \
+  --storage-gap-hours 5
+```
+
+发布前额外检查服务器功率大小关系、存储百分比及磁盘非负值、告警时间顺序及锚点上界。
+检查结果分别记录为 `invalidMetricScenarios` 和 `invalidAlarmTimes`，非空即停止发布。
+固定种子与锚点保证同一生成规则版本可复现；规则版本变化会改变数据哈希。

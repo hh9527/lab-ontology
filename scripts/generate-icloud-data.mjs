@@ -13,6 +13,41 @@ const hash = data => createHash('sha256').update(data).digest('hex');
 const wire = value => Object.values(value)[0];
 const leaves = key => key.Eq ? [key.Eq] : Object.values(key).flatMap(parts => parts.flatMap(leaves));
 
+// Synthetic profiles adapted from icloud-corpus/pack/tables.py. These are
+// generation scenarios, not additional model capabilities or source facts.
+const profiles = {
+  ServerDeviceKPI: {
+    cpuUsage: [[78, 16], [45, 10], [12, 7]], memUsage: [[66, 15], [48, 9], [22, 8]],
+    systemPower: [[860, 160], [540, 80], [300, 40]],
+    averagePower: [[820, 140], [510, 70], [280, 35]],
+    peakPower: [[1180, 190], [760, 95], [420, 50]],
+  },
+  StorageDeviceKPI: {
+    cpuusage: [[86, 10], [40, 10], [10, 6]], memoryusage: [[78, 10], [45, 8], [20, 8]],
+  },
+  StorageHardDriveKPI: {
+    utility: [[85, 8], [45, 12], [12, 8]],
+    avgreadiosize: [[512, 96], [256, 64], [64, 32]],
+    avgwriteiosize: [[410, 80], [200, 48], [48, 24]],
+  },
+};
+
+export function metricValue(table, column, index, sample, interval, random, samples = 1) {
+  const daily = Math.sin(sample * interval / 86400000 * 2 * Math.PI);
+  const profile = profiles[table]?.[column]?.[index % 3];
+  if (/effcnt$/i.test(column)) return 1;
+  if (profile) {
+    const number = Math.max(0, profile[0] + profile[1] * daily + random());
+    return /power|iosize/i.test(column) ? number : Math.min(100, number);
+  }
+  if (/onlineRate/i.test(column)) return index % 6 === 5 && sample * interval % 86400000 < 4 * 3600000 ? 0 : 100;
+  if (/count/i.test(column)) return 8 + index % 8;
+  if (/optics.*power|rssi|noise/i.test(column)) return -20 + daily * 3;
+  if (/power/i.test(column)) return 150 + index * 10 + daily * 20;
+  // High/mid/low populations make both sides of CPU/utilization thresholds reachable.
+  return Math.max(0, Math.min(100, [70, 45, 15][index % 3] + daily * 8 + sample / Math.max(1, samples - 1) * [20, -15, 0][index % 3] + random()));
+}
+
 export function loadModel() {
   const result = spawnSync(join(root, 'bin/telora'), ['-C', 'icloud_model', 'eval', '@src/source_audit:report',
     '--initialization-fuel', '100000', '--request-fuel', '100000', '--with-memory-limit', '2048'],
@@ -36,7 +71,7 @@ function grain(dataset) {
 }
 
 export function generate(options, model = loadModel()) {
-  const { output, seed, resources, days, intervalMinutes, anchor } = options;
+  const { output, seed, resources, days, intervalMinutes, anchor, storageGapHours = 0 } = options;
   const anchorMs = Date.parse(anchor);
   for (const [name, value] of Object.entries({ seed, resources, days, intervalMinutes })) {
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
@@ -44,6 +79,9 @@ export function generate(options, model = loadModel()) {
   if (seed > 0xffffffff) throw new Error('seed must fit an unsigned 32-bit integer');
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(anchor) || !Number.isFinite(anchorMs) || iso(anchorMs) !== anchor) {
     throw new Error('anchor must be a valid UTC timestamp: YYYY-MM-DDTHH:MM:SSZ');
+  }
+  if (!Number.isSafeInteger(storageGapHours) || storageGapHours < 0 || storageGapHours >= days * 24) {
+    throw new Error('storageGapHours must be a nonnegative safe integer smaller than the KPI window in hours');
   }
   const interval = intervalMinutes * 60000;
   const samples = Math.ceil(days * 86400000 / interval);
@@ -173,6 +211,14 @@ export function generate(options, model = loadModel()) {
     });
     if (table === 'PonDeviceOnuKPI') rows.set(table, rows.get(table).filter((row, index, all) => all.findIndex(other => other.resId === row.resId) === index));
   }
+  const seriesGaps = [];
+  if (storageGapHours) rows.get('StorageDeviceKPI').forEach((row, index) => {
+    if (index < resources && [2, 11].includes(index)) seriesGaps.push({
+      table: 'StorageDeviceKPI', resId: row.resId,
+      endExclusive: iso(anchorMs - storageGapHours * 3600000),
+    });
+  });
+  const gapEnds = new Map(seriesGaps.map(gap => [gap.resId, Date.parse(gap.endExclusive)]));
   const alarms = rows.get('T_CURRENT_ALARM');
   alarms.forEach((row, index) => {
     const ownerTable = ['I_EntNetworkElement', 'PhysicalServer', 'HuaweiStorageDevice', 'I_EntPonElement', 'FCSwitchDevice', 'I_EntCollaborationElement'][index % 6];
@@ -186,7 +232,7 @@ export function generate(options, model = loadModel()) {
     row.ACKED = index % 2;
     row.CLEARED = index % 3 === 0 ? 1 : 0;
     const recentSamples = Math.max(1, Math.min(samples, Math.floor(45 * 86400000 / interval)));
-    const occur = anchorMs - days * 86400000 + (samples - 1 - index % recentSamples) * interval;
+    const occur = Math.min((gapEnds.get(owner.id) ?? anchorMs) - 120001, anchorMs - days * 86400000 + (samples - 1 - index % recentSamples) * interval);
     for (const column of ['OCCURUTC', 'OCCURTIME', 'LATESTOCCURUTC', 'LATESTOCCURTIME']) row[column] = occur;
     row.ARRIVEUTC = occur + 1000;
     row.ACKUTC = row.ACKED ? occur + 60000 : 0;
@@ -216,18 +262,12 @@ export function generate(options, model = loadModel()) {
       const metricColumns = new Set(sourceFields.filter(field => field.columnType === 'measure').map(field => field.name));
       for (const [index, base] of rows.get(table).entries()) {
         for (let sample = 0; sample < (metric ? samples : 1); sample++) {
+          if (metric && table === 'StorageDeviceKPI' && startMs + sample * interval >= (gapEnds.get(base.resId) ?? anchorMs)) continue;
           const row = { ...base };
           if (metric) {
             row.ts = iso(startMs + sample * interval);
-            const daily = Math.sin(sample * interval / 86400000 * 2 * Math.PI);
-            const trend = sample / Math.max(1, samples - 1) * (index % 3 === 0 ? 35 : index % 3 === 1 ? -15 : 0);
             for (const field of dataset.fields) if (metricColumns.has(field.column)) {
-              let number = field.column.endsWith('Effcnt') ? 1 : /onlineRate/i.test(field.column)
-                ? (index % 6 === 5 && sample % 24 < 4 ? 0 : 100)
-                : /count/i.test(field.column) ? 8 + index % 8
-                : /optics.*power|rssi|noise/i.test(field.column) ? -20 + daily * 3
-                : /power/i.test(field.column) ? 150 + index * 10 + daily * 20
-                : Math.max(0, Math.min(100, 25 + index % 4 * 10 + daily * 8 + trend + random()));
+              let number = metricValue(table, field.column, index, sample, interval, random, samples);
               if (field.scalar === 'Int') number = Math.round(number);
               if (field.scalar === 'Float') number = Number(number.toFixed(3));
               if (field.scalar === 'Int' || field.scalar === 'Float') row[field.column] = number;
@@ -255,15 +295,19 @@ export function generate(options, model = loadModel()) {
         index(relation.to_table, [pair.to_column]);
       }
     }
-    for (const [table, dataset] of tables) if (dataset.fields.some(field => field.column === 'ts')) index(table, ['ts']);
+    for (const [table, dataset] of tables) if (dataset.fields.some(field => field.column === 'ts')) {
+      index(table, ['ts']);
+      for (const owner of ['resId', 'parentId']) if (dataset.fields.some(field => field.column === owner)) index(table, [owner, 'ts']);
+    }
     db.exec('COMMIT; ANALYZE');
-    const checks = validate(db, model, counts);
-    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
+    const checks = validate(db, model, counts, { anchor });
+    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length || checks.invalidMetricScenarios.length || checks.invalidAlarmTimes.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
     db.close();
     db = undefined;
     const manifest = {
       format: 'icloud-synthetic-data/v1', revision: model.revision,
-      options: { seed, resources, days, intervalMinutes, anchor },
+      options: { seed, resources, days, intervalMinutes, anchor, storageGapHours },
+      generation: { revision: 2, profile: 'corpus-inspired', seriesGaps },
       window: { start: iso(startMs), endExclusive: anchor, samplesPerSeries: samples },
       catalogSha256: hash(catalogBytes), modelSha256: hash(JSON.stringify(model)),
       database: { file: 'icloud.sqlite', sha256: hash(readFileSync(databasePath)) },
@@ -308,10 +352,25 @@ function relationSQL(key) {
   return `(${parts.map(relationSQL).join(operator === 'And' ? ' AND ' : ' OR ')})`;
 }
 
-export function validate(db, model, counts) {
+export function validate(db, model, counts, { anchor } = {}) {
   const checks = { integrity: db.prepare('PRAGMA integrity_check').get().integrity_check,
     emptyTables: [], emptyCarriers: [], invalidTimes: [], invalidEnums: [], relations: [],
-    missingCpuSeries: [], alarmsWithoutCpuSamples: [], unsupportedAlarmCpuResources: [] };
+    missingCpuSeries: [], alarmsWithoutCpuSamples: [], unsupportedAlarmCpuResources: [],
+    invalidMetricScenarios: [], invalidAlarmTimes: [] };
+  for (const [table, predicate] of [
+    ['ServerDeviceKPI', 'peakPower < averagePower OR systemPower < 0 OR averagePower < 0'],
+    ['StorageHardDriveKPI', 'utility < 0 OR utility > 100 OR avgreadiosize < 0 OR avgwriteiosize < 0'],
+    ['StorageDeviceKPI', 'cpuusage < 0 OR cpuusage > 100 OR memoryusage < 0 OR memoryusage > 100'],
+  ]) {
+    const invalid = db.prepare(`SELECT count(*) n FROM ${quote(table)} WHERE ${predicate}`).get().n;
+    if (invalid) checks.invalidMetricScenarios.push({ table, invalid });
+  }
+  const invalidAlarms = db.prepare(`SELECT CSN FROM T_CURRENT_ALARM WHERE ARRIVEUTC < OCCURUTC
+    OR (ACKED=1 AND ACKUTC < OCCURUTC) OR (CLEARED=1 AND CLEARUTC < OCCURUTC)
+    OR (ACKED=0 AND ACKUTC != 0) OR (CLEARED=0 AND CLEARUTC != 0)
+    ${anchor ? 'OR max(OCCURUTC, ARRIVEUTC, LATESTOCCURUTC, ACKUTC, CLEARUTC) >= ?' : ''}`)
+    .all(...(anchor ? [Date.parse(anchor)] : []));
+  checks.invalidAlarmTimes.push(...invalidAlarms.map(row => row.CSN));
   const cpuSources = {
     I_EntNetworkElement: 'NetworkDeviceKPI', PhysicalServer: 'ServerDeviceKPI',
     HuaweiStorageDevice: 'StorageDeviceKPI', FCSwitchDevice: 'StorageDeviceKPI', I_EntPonElement: 'PonDeviceKPI',
@@ -381,13 +440,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     output: { type: 'string', default: 'bin/icloud-data' }, seed: { type: 'string', default: '20260926' },
     resources: { type: 'string', default: '12' }, days: { type: 'string', default: '32' },
     'interval-minutes': { type: 'string', default: '60' },
+    'storage-gap-hours': { type: 'string', default: '0' },
     'anchor-utc': { type: 'string' }, help: { type: 'boolean' },
   } });
   if (values.help) {
-    console.log('Usage: node scripts/generate-icloud-data.mjs [--output DIR] [--seed N] [--resources N>=6]\n  [--days N] [--interval-minutes N] [--anchor-utc YYYY-MM-DDTHH:MM:SSZ]\nRequires Node.js 22.13+ and bin/telora. Creates icloud.sqlite, manifest.json and model.json.\nExisting output directories are preserved. Default: 12 resources/table, 32 days, hourly samples.');
+    console.log('Usage: node scripts/generate-icloud-data.mjs [--output DIR] [--seed N] [--resources N>=6]\n  [--days N] [--interval-minutes N] [--storage-gap-hours N] [--anchor-utc YYYY-MM-DDTHH:MM:SSZ]\nRequires Node.js 22.13+ and bin/telora. Creates icloud.sqlite, manifest.json and model.json.\nExisting output directories are preserved. Default: 12 resources/table, 32 days, hourly samples.');
   } else {
     const manifest = generate({ output: resolve(values.output), seed: Number(values.seed), resources: Number(values.resources),
-      days: Number(values.days), intervalMinutes: Number(values['interval-minutes']),
+      days: Number(values.days), intervalMinutes: Number(values['interval-minutes']), storageGapHours: Number(values['storage-gap-hours']),
       anchor: values['anchor-utc'] ?? iso(Math.floor(Date.now() / 60000) * 60000) });
     console.log(JSON.stringify({ output: resolve(values.output), tables: Object.keys(manifest.tables).length,
       rows: Object.values(manifest.tables).reduce((sum, count) => sum + count, 0),
