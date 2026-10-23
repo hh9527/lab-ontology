@@ -542,7 +542,7 @@ python3 scripts/check-typed-model-rejections.py
 该实验的 Entity ID 使用 `device_entity` 等名称，Dataset ID 仍使用 `device` 等现有 transform 地址，二者拥有独立含义。
 当前 JSON Graph 中历史字段 `entity` 在此适配实验中仍寻址 Dataset；新 Entity ID 不自动成为查询入口。
 
-当前桥接步骤明确复用旧 transform 的维度、计数声明和 profile，仅将关系键与业务方向改由新角色声明生成。
+首个桥接步骤复用旧 transform 的维度、计数声明和 profile，将关系键与业务方向改由新角色声明生成。
 桥接时校验物理源、字段编码、可空性及完整 Dataset 粒度与原 transform 结构一致，防止借用不同粒度上的计数证明。
 声明基数仍是可信模型契约，角色的名义类型和完整连接键不等同于数据库外键或基数证明。
 准备层还检查跨关系的 Entity 身份一致性、Dataset 声明一致性、具名角色映射一致性和关系 ID 唯一性。
@@ -558,5 +558,33 @@ bin/telora -C relation_model test typed_relations --initialization-fuel 100000 -
 python3 scripts/check-typed-relations.py
 ```
 
-阶段 C 继续推进 Dataset／成员的独立准备与 transform 结果类型，当前尚未将实验载荷替换到 MainService，也未据此开始 IC 类型化迁移。
+这一桥接步骤通过后，继续推进下述独立准备入口；IC 类型化迁移仍在后续阶段。
 知识地图、知识发现与知识测试按用户要求延后，不作为本阶段的交付或评价依据。
+
+### 独立 Dataset／成员准备与服务接入
+
+`ontology::experimental::transform::declare` 接受一个带 Row 类型的 Dataset、具名角色、同 Row 的 Group 绑定和显式记录计数发布 ID。
+擦除后的绑定保留定义契约，组合边界通过 `prepare_facts` 重检类型、能力、成员完整性和可空性。
+`transform::build` 从这些声明独立生成原有 transform 编译器所需的准备结构，并要求每个关系端点都匹配已登记 Dataset 的具名角色；关系不能私下改写角色映射。
+关系、备选关系和业务连接显式注册，公共边 ID 冲突在初始化时拒绝。
+
+relation 模型的五张表、三个可查询维度、记录计数、九条关系和两条业务连接均已由新声明独立准备，不读取基线模型的注解或载荷。
+MainService 的 transform 入口使用这份载荷，旧模型仅保留为验收基线。
+查询接口仍沿用现有 Graph 的 Dataset 寻址与基础值表示；内部适配结构中的历史 EntityEntry／DatasetKind 命名不改变新声明中 Entity 与 Dataset 的独立身份。
+
+Dataset Row 中的名义类型保留在声明与准备模型中，SQL 字段表示由 newtype 负载显式展开到 Int、Float、Bool 或 String。
+可空字段保留 NULL 能力，嵌套 Option 因无法在单 SQL 列区分缺失层次而拒绝。
+返回给现有宿主的结果列继续使用物理结果类型与 nullable 标记，例如 Option(Label) 对应可空 String，Bytes 对应 Float；这不等同于已发布单位／名义结果类型的新外部契约。
+
+记录计数必须有非空 Dataset grain，计数列来自声明的非空粒度字段，不授予不同 Entity 角色上的隐式去重计数。
+跨 Dataset 同一 Entity ID 的身份类型必须一致；Group 成员 ID、计数 ID、Dataset ID 和公共边 ID 分别按 transform 契约检查唯一性。
+共享的 `validate_transform_contract` 校验投影、筛选、聚合和 scope 的执行能力，独立入口额外检查源能力；不执行知识目录或知识地图校验。
+
+此入口当前支持物理列维度、非空完整身份投影与记录计数。计算型 Group 度量、计算维度和可空角色整体投影在 Graph 适配边界显式拒绝，保留为下一步 lowering 工作；单 Dataset 的 Group 查询实验仍可执行流量计算。
+独立准备的 18 个正反例与结果列检查、现有 102 个 graph 用例、六组 SQLite 等价查询和临时快照的批量 transform 验收通过。
+快照验收同时执行生成 SQL，核对跨租户记录、物理列类型和整批原子拒绝行为。
+
+```sh
+bin/telora -C relation_model test typed_preparation --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-relations.py
+```

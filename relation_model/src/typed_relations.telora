@@ -1,9 +1,10 @@
 # RFC 0002 的 transform 实验：显式 Entity／Dataset／Role 决定连接键。
-use crate::model as baseline;
 use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
 use ontology::experimental::relations as r;
+use ontology::experimental::transform as transform;
 use ontology::ontology as edsl;
-use std::array as array;
+use ontology::query as qb;
 
 type TenantId = struct(String);
 type SiteId = struct(String);
@@ -67,17 +68,34 @@ def declarations: Array(r::Relation) = [
 def connected: r::Link = r::link("connected_device", connection_a, connection_z, edsl::LinkDirection::Undirected);
 def upstream: r::Link = r::link("upstream_device", upstream_a, upstream_z, edsl::LinkDirection::Directed);
 
-# 本步替换关系与方向来源；维度、计数声明和 profile 仍复用 transform 基线。
-def relation_payload: edsl::PreparedPayload = baseline::payload <~ {relations:
-    array::concat([r::lower_all(baseline::payload, declarations), [
-        r::lower_alternative(baseline::payload, "connection_endpoint", [connection_a, connection_z], many_many),
-    ]])};
-def payload: edsl::PreparedPayload = relation_payload <~ {business_links: [
-    r::lower_link(relation_payload, connected), r::lower_link(relation_payload, upstream),
-]};
+# 输入名义类型与发布名在绑定中显式给出，不读取旧模型注解。
+def id_dimension: for(Row, Value) Fn(m::Dataset(Row), TypeOf(Value), String, String) -> g::Binding(Row) = fn(dataset, value, field, publish) {
+    g::dimension(dataset, g::dimension_group("identity_value", value, True, [g::Filter::Eq]),
+        g::input(m::field(Row.type, value, field)), publish, True, [g::Filter::Eq])
+};
+def datasets: Array(transform::Declaration) = [
+    transform::declare(tenants, [tenant_subject], [id_dimension(tenants, TenantId.type, "id", "tenant_id")], []),
+    transform::declare(sites, [site_subject, tenant_role(sites, "tenant", "tenant_id")], [id_dimension(sites, SiteId.type, "id", "site_id")], []),
+    transform::declare(devices, [device_subject, device_site, tenant_role(devices, "tenant", "tenant_id")], [id_dimension(devices, DeviceId.type, "id", "device_id")], ["device_count"]),
+    transform::declare(connections, [connection_subject, a, z], [], []),
+    transform::declare(routes, [route_subject, route_a, route_z], [], []),
+];
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate,
+        qb::Operator::Filter, qb::Operator::Exists, qb::Operator::Join, qb::Operator::Group],
+    allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
+    allowed_aggregates: [qb::AggregateFunction::Count],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::And, qb::ScalarFunction::IsNotNull], allow_distinct: True,
+};
+def alternatives: Array(transform::Alternative) = [
+    {id: "connection_endpoint", choices: [connection_a, connection_z], cardinality: many_many},
+];
+def prepared: transform::Prepared = transform::build("typed-relation-v1", datasets, declarations, alternatives, [connected, upstream], profile);
+def payload: edsl::PreparedPayload = prepared.payload;
 
 pub use self::{TenantId, SiteId, DeviceId, TenantIdentity, SiteIdentity, DeviceIdentity,
     TenantRow, SiteRow, DeviceRow, ConnectionRow, RouteRow, tenant, site, device, tenants, sites, devices, connections, routes,
     tenant_subject, site_subject, device_subject, device_site, a, z, route_a, route_z,
     many_optional, many_many, connection_a, connection_z, upstream_a, upstream_z,
-    declarations, connected, upstream, payload};
+    declarations, datasets, alternatives, profile, prepared, connected, upstream, payload};

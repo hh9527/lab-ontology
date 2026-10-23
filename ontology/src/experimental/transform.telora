@@ -1,0 +1,205 @@
+# 独立声明到现有 transform 的准备入口，不解析或建立知识地图。
+use crate::experimental::model as m;
+use crate::experimental::groups as g;
+use crate::experimental::relations as r;
+use crate::ontology as edsl;
+use crate::query as qb;
+use std::array as array;
+use std::type_desc as td;
+
+type Declaration = struct { dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String) };
+type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
+type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
+def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
+    let declared = m::prepare(dataset, roles);
+    let bindings = array::map(groups, g::binding_facts);
+    g::prepare_facts(declared, bindings);
+    {dataset: declared, groups: bindings, record_counts}
+};
+type Scalar = struct { storage: Type, nullable: Bool };
+def scalar: Fn(Type) -> Scalar = fn(ty) {
+    let resolved = if td::kind(ty) == td::TypeDescKind::Ref {
+        match td::resolve(ty) { Ok(value) => value, Err(error) => fail!(error.message, ty) }
+    } else { ty };
+    if resolved == Bool.type { {storage: Bool.type, nullable: False} }
+    else { match td::kind(resolved) {
+        td::TypeDescKind::Newtype => scalar(td::children(resolved)[0]),
+        td::TypeDescKind::Enum => {
+            let variants = td::variants(resolved);
+            let some = array::find(variants, fn(variant) { variant.name == "Some" && variant.payload != None });
+            if array::length(variants) != 2 || !array::any(variants, fn(variant) { variant.name == "None" && variant.payload == None }) {
+                fail!("typed transform requires a scalar or optional scalar representation", ty)
+            } else {
+                match some {
+                    Some(variant) => match variant.payload {
+                        Some(value) => {
+                            let payload = scalar(value);
+                            if payload.nullable { fail!("typed transform cannot encode nested optional values in one SQL column", ty) }
+                            else { payload <~ {nullable: True} }
+                        },
+                        None => fail!("optional scalar requires a payload", ty),
+                    },
+                    None => fail!("optional scalar requires Some and None", ty),
+                }
+            }
+        },
+        td::TypeDescKind::Int => {storage: Int.type, nullable: False},
+        td::TypeDescKind::Float => {storage: Float.type, nullable: False},
+        td::TypeDescKind::String => {storage: String.type, nullable: False},
+        _ => fail!("typed transform requires an integer, float, boolean or string representation", ty),
+    } }
+};
+def entity_entry: Fn(Declaration, Int) -> edsl::EntityEntry = fn(declared, index) {
+    let dataset = m::validate_prepared(declared.dataset);
+    let single_key = array::length(dataset.grain) == 1;
+    let fields = array::map(td::fields(dataset.row), fn(field) {
+        let value = scalar(field.ty);
+        if !qb::is_sql_identifier(field.name) { fail!("typed transform physical field must be an identifier", dataset.id, field.name) }
+        else {
+            {logical_type: None, nullable: value.nullable, index: field.index, name: field.name,
+                column: field.name, is_key: single_key && dataset.grain[0] == field.name, ty: value.storage}.ty!(edsl::FieldEntry)
+        }
+    });
+    let key = match array::find(fields, fn(field) { field.is_key }) { Some(field) => field.index, None => -1 };
+    let source = qb::source_with_hint(qb::build_context(), dataset.source, `typed_\{index}`).1;
+    {references: [], field_roles: [], index, id: dataset.id, entity_type: dataset.row, table: dataset.source,
+        alias: source.alias, source, key_field: key, fields, union: None,
+        dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: edsl::DatasetKind::Entity, grain: dataset.grain, utc_time: None}) },
+        sample_measures: [], description: None, scope: []}
+};
+def plain_column: Fn(g::Member) -> String = fn(member) {
+    if member.aggregate != None { fail!("typed Graph preparation does not yet lower aggregate Group expressions", member.id) }
+    else {
+        match member.node {
+            g::Node::Column(column) => column.name,
+            g::Node::Identity(input) => if array::any(input.parts, fn(part) { part.nullable }) {
+                fail!("typed Graph preparation requires explicit nullable-role projection lowering", member.id)
+            } else { input.column.name },
+            _ => fail!("typed Graph preparation does not yet lower computed Group dimensions", member.id),
+        }
+    }
+};
+def dimension_entry: Fn(edsl::EntityEntry, g::Member) -> edsl::DimensionEntry = fn(entity, member) {
+    let column = plain_column(member);
+    let field = match array::find(entity.fields, fn(field) { field.name == column }) {
+        Some(field) => field, None => fail!("typed dimension input field is missing", member.id),
+    };
+    let value = scalar(member.value);
+    let output = if value.storage == String.type { edsl::OutputType::Text }
+        else if value.storage == Int.type { edsl::OutputType::Integer }
+        else if value.storage == Bool.type { edsl::OutputType::Boolean } else { edsl::OutputType::Number };
+    let input = if value.storage == String.type { edsl::FilterInputKind::Text }
+        else if value.storage == Int.type { edsl::FilterInputKind::Int }
+        else if value.storage == Bool.type { edsl::FilterInputKind::Bool } else { edsl::FilterInputKind::Number };
+    let ops = array::map(member.filters, fn(op) {
+        match op {
+            g::Filter::Eq => edsl::FilterOp::Eq,
+            g::Filter::Contains => if value.storage == String.type { edsl::FilterOp::Contains }
+                else { fail!("Contains requires a text representation", member.id) },
+        }
+    });
+    {value_type: None, ty: if value.storage == String.type { "Text" } else if value.storage == Int.type { "Int" } else if value.storage == Bool.type { "Bool" } else { "Number" },
+        half_open: False, id: member.id, entity: entity.index, field: field.index, output_type: output, computed: False,
+        build: fn(ctx, source) { (ctx, source) }, authorized: member.projectable, filterable: array::length(ops) > 0,
+        ops, input_kinds: [input], values: [], canonical_values: [], canonical_order: [], canonical_aliases: [], scope: []}
+};
+def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(revision, declarations, profile) {
+    let datasets = array::map(declarations, fn(declared) {
+        let checked = m::validate_prepared(declared.dataset);
+        array::map(array::flat_map(declared.groups, g::binding_roles), fn(role) {
+            if !array::any(checked.roles, fn(registered) { registered == role }) {
+                fail!("identity dimension role must be registered on its dataset", checked.id, role.id)
+            } else { () }
+        });
+        if array::length(array::filter(declarations, fn(other) { other.dataset.id == checked.id })) != 1 {
+            fail!("typed transform dataset ids must be unique", checked.id)
+        } else if array::length(declared.record_counts) > 0 && array::length(checked.grain) == 0 {
+            fail!("record count requires a declared dataset grain", checked.id)
+        } else { checked }
+    });
+    let roles = array::flat_map(datasets, fn(dataset) { dataset.roles });
+    array::map(roles, fn(role) {
+        if array::any(roles, fn(other) { other.entity == role.entity && other.identity != role.identity }) {
+            fail!("entity id has conflicting identities across datasets", role.entity)
+        } else { () }
+    });
+    let entities = array::map(array::enumerate(declarations), fn(pair) { entity_entry(pair.1, pair.0) });
+    array::map(entities, fn(entity) {
+        if !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Source })
+            || !qb::source_profile_accepts(entity.source, profile) {
+            fail!("typed dataset source is not allowed by the query profile", entity.id)
+        } else { () }
+    });
+    let dimensions = array::flat_map(array::enumerate(declarations), fn(pair) {
+        let members = g::prepare_facts(pair.1.dataset, pair.1.groups);
+        array::map(members, fn(member) { dimension_entry(entities[pair.0], member) })
+    });
+    let measures = array::flat_map(array::enumerate(declarations), fn(pair) {
+        let entity = entities[pair.0];
+        array::map(pair.1.record_counts, fn(id) {
+            let field = match array::find(entity.fields, fn(field) { field.name == pair.1.dataset.grain[0] }) {
+                Some(value) => value, None => fail!("record count grain field is missing", id),
+            };
+            if !qb::is_sql_identifier(id) { fail!("record count id must be a SQL identifier", id) }
+            else { {id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
+                input: edsl::MeasureInput::All, alias: id, requires: [], predicate: None, computed: None}.ty!(edsl::MeasureEntry) }
+        })
+    });
+    array::map(dimensions, fn(dimension) {
+        if array::length(array::filter(dimensions, fn(other) { other.id == dimension.id })) != 1 {
+            fail!("typed transform dimension ids must be unique", dimension.id)
+        } else { () }
+    });
+    array::map(measures, fn(measure) {
+        if array::length(array::filter(measures, fn(other) { other.id == measure.id })) != 1
+            || array::any(dimensions, fn(dimension) { dimension.entity == measure.entity && dimension.id == measure.id }) {
+            fail!("typed transform measure ids must be unique", measure.id)
+        } else { () }
+    });
+    let payload = edsl::validate_transform_contract({revision, entities, dimensions, measures,
+        relations: [], business_links: [], native_pairs: [], profile});
+    {declarations, payload}
+};
+
+# 完整 root 只接受已登记的角色，避免关系端点私下改写 Dataset 的身份声明。
+def registered_endpoint: Fn(Array(Declaration), r::Endpoint) -> () = fn(declarations, endpoint) {
+    let dataset = match array::find(declarations, fn(entry) { entry.dataset.id == endpoint.dataset.id }) {
+        Some(entry) => entry.dataset, None => fail!("relation endpoint dataset is not declared", endpoint.dataset.id),
+    };
+    let role = match array::find(dataset.roles, fn(role) { role.id == endpoint.role }) {
+        Some(value) => value, None => fail!("relation endpoint role is not declared on its dataset", dataset.id, endpoint.role),
+    };
+    if dataset.row != endpoint.dataset.row || dataset.source != endpoint.dataset.source || dataset.grain != endpoint.dataset.grain
+        || !array::any(endpoint.dataset.roles, fn(candidate) { candidate == role }) {
+        fail!("relation endpoint conflicts with the registered dataset role", dataset.id, endpoint.role)
+    } else { () }
+};
+def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative), Array(r::Link), qb::PlanProfile) -> Prepared = fn(revision, declarations, relations, alternatives, links, profile) {
+    let prepared = prepare(revision, declarations, profile);
+    let all_relations = array::concat([relations, array::flat_map(alternatives, fn(alternative) { alternative.choices }),
+        array::flat_map(links, fn(link) { [link.a, link.z] })]);
+    array::map(all_relations, fn(relation) {
+        registered_endpoint(declarations, relation.from);
+        registered_endpoint(declarations, relation.to);
+        r::validate(relation);
+        ()
+    });
+    let lowered = array::concat([r::lower_all(prepared.payload, relations), array::map(alternatives, fn(alternative) {
+        r::lower_alternative(prepared.payload, alternative.id, alternative.choices, alternative.cardinality)
+    })]);
+    array::map(lowered, fn(relation) {
+        if array::length(array::filter(lowered, fn(other) { other.id == relation.id })) != 1 {
+            fail!("typed transform relation ids must be unique", relation.id)
+        } else { () }
+    });
+    array::map(links, fn(link) {
+        if array::length(array::filter(links, fn(other) { other.id == link.id })) != 1
+            || array::any(lowered, fn(relation) { relation.id == link.id }) {
+            fail!("typed transform business link ids must be unique", link.id)
+        } else { () }
+    });
+    let with_relations = prepared.payload <~ {relations: lowered};
+    prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
+};
+
+pub use self::{Declaration, Prepared, Alternative, declare, prepare, build};

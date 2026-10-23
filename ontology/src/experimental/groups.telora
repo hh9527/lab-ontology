@@ -93,6 +93,13 @@ type Member = struct {
     kind: MemberKind,
 };
 type Binding(Row) = struct { row: Type, dataset: String, source: String, contract: BindingContract, members: Array(Member) };
+type BindingFacts = struct { row: Type, dataset: String, source: String, contract: BindingContract, members: Array(Member) };
+def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
+    {row: binding.row, dataset: binding.dataset, source: binding.source, contract: binding.contract, members: binding.members}
+};
+def binding_roles: Fn(BindingFacts) -> Array(model::PreparedRole) = fn(binding) {
+    match binding.contract { BindingContract::Identity(role) => [role], _ => [] }
+};
 def dimension: for(Row, Value) Fn(model::Dataset(Row), DimensionGroup(Value), Expr(Row, Value), String, Bool, Array(Filter)) -> Binding(Row) = fn(dataset, group, source, publish, projectable, filters) {
     model::prepare(dataset, []);
     let valid = checked(source);
@@ -185,7 +192,7 @@ def validate_member_contract: Fn(Member) -> () = fn(member) {
 };
 
 # 声明公开且可手写；组合与编译边界重新检查所有节点和发布名称。
-def validate_binding_contract: for(Row) Fn(model::Dataset(Row), Binding(Row)) -> () = fn(dataset, binding) {
+def validate_binding_contract: Fn(model::PreparedDataset, BindingFacts) -> () = fn(dataset, binding) {
     match binding.contract {
         BindingContract::Dimension => {
             if array::length(binding.members) != 1 || binding.members[0].local != "value" {
@@ -202,8 +209,7 @@ def validate_binding_contract: for(Row) Fn(model::Dataset(Row), Binding(Row)) ->
             else { () }
         },
         BindingContract::Identity(role) => {
-            let typed: model::Role(Row) = {id: role.id, entity: role.entity, identity: role.identity, optional: role.optional, parts: role.parts};
-            model::prepare(dataset, [typed]);
+            model::validate_prepared(dataset <~ {roles: [role]});
             let parts = array::map(role.parts, fn(part) { {name: part.source, value: part.value, nullable: part.nullable}.ty!(Column) });
             if array::length(binding.members) != array::length(parts) || !array::all(role.parts, fn(part) {
                 array::length(array::filter(binding.members, fn(member) {
@@ -216,15 +222,15 @@ def validate_binding_contract: for(Row) Fn(model::Dataset(Row), Binding(Row)) ->
         },
     }
 };
-def prepare: for(Row) Fn(model::Dataset(Row), Array(Binding(Row))) -> Array(Member) = fn(dataset, bindings) {
-    model::prepare(dataset, []);
+def prepare_facts: Fn(model::PreparedDataset, Array(BindingFacts)) -> Array(Member) = fn(dataset, bindings) {
+    model::validate_prepared(dataset);
     let members = array::flat_map(bindings, fn(binding) {
-        if binding.row != Row.type || binding.dataset != dataset.id || binding.source != dataset.source { fail!("group binding belongs to a different dataset", binding.dataset) }
+        if binding.row != dataset.row || binding.dataset != dataset.id || binding.source != dataset.source { fail!("group binding belongs to a different dataset", binding.dataset) }
         else { validate_binding_contract(dataset, binding); binding.members }
     });
     array::map(members, fn(member) {
         validate_member_contract(member);
-        let actual = shape(Row.type, member.node);
+        let actual = shape(dataset.row, member.node);
         if member.group == "" || member.local == "" { fail!("group and local member ids must be nonempty", member.id) }
         else if !qb::is_sql_identifier(member.id) || array::length(array::filter(members, fn(other) { other.id == member.id })) != 1 {
             fail!("group publish ids must be valid and unique", member.id)
@@ -235,6 +241,9 @@ def prepare: for(Row) Fn(model::Dataset(Row), Array(Binding(Row))) -> Array(Memb
             fail!("measure filters require an aggregate predicate contract", member.id)
         } else { member }
     })
+};
+def prepare: for(Row) Fn(model::Dataset(Row), Array(Binding(Row))) -> Array(Member) = fn(dataset, bindings) {
+    prepare_facts(model::prepare(dataset, []), array::map(bindings, binding_facts))
 };
 
 def lower: Fn(qb::BuildCtx, qb::Source, Node) -> (qb::BuildCtx, qb::Expr) = fn(ctx, source, node) {
@@ -294,3 +303,4 @@ pub use self::{Column, Node, Shape, Expr, input, seconds, rate, Filter,
     DimensionGroup, dimension_group, dimension, MeasureGroup, TransferMember, transfer,
     Rename, transfer_binding, Member, Binding, prepare, query};
 pub use self::{identity_dimensions, IdentityName};
+pub use self::{BindingFacts, binding_facts, binding_roles, prepare_facts};

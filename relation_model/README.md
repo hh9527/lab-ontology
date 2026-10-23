@@ -1,7 +1,8 @@
 # 关系模型示例
 
 此精简模型声明租户、站点、设备、连接和有向路由，展示复合身份、具名关系及显式业务连通性。
-声明见 [model.telora](src/model.telora)，支持与拒绝的组合见[验收说明](ACCEPTANCE.md)。
+当前 transform 声明见 [typed_relations.telora](src/typed_relations.telora)，显式区分 Entity 身份、Dataset 行粒度和具名角色，并组合维度与记录计数。
+[model.telora](src/model.telora) 保留为变换等价性基线，支持与拒绝的组合见[验收说明](ACCEPTANCE.md)。
 
 `relation_model` 服务暴露单一领域 `relation`：
 
@@ -26,5 +27,5 @@ bin/telora-run "$TMPDIR/relation-model.wasm" --serve stdio+jsonl://
 
 完整服务及 Intent 契约见[使用说明](../USAGE.md)。
 
-当前 RFC 实验初始化只准备 transform，使用 `build_transform_root` 校验查询类型、权限、关系、粒度和 profile。
+当前 RFC 实验初始化只准备 transform，使用 `experimental::transform::build` 独立准备 Dataset、成员和角色关系，并共享查询权限、粒度和 profile 校验。
 知识地图、info／discovery 初始化和知识测试留待后续知识契约阶段处理。
