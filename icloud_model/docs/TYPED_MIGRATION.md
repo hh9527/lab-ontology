@@ -31,8 +31,8 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | ServerPsu | `server_psu` | `PhysicalServerPSU` | 第七批已验证 |
 | ServerMemory | `server_memory` | `PhysicalServerMemory` | 第七批已验证 |
 | StorageDevice | `storage_device` | `HuaweiStorageDevice` | 第八批已验证 |
-| Frame | `frame` | `I_EnterpriseFrame` | 待迁移 |
-| NetworkSlot | `network_slot` | `I_EnterpriseSlot` | 待迁移 |
+| Frame | `frame` | `I_EnterpriseFrame` | 第九批已验证 |
+| NetworkSlot | `network_slot` | `I_EnterpriseSlot` | 第九批已验证 |
 | PonDevice | `pon_device` | `I_EntPonElement` | 待迁移 |
 | PonOnuRole | `pon_onu_role` | `I_EntPonElement` | 待迁移 |
 | PonOltRole | `pon_olt_role` | `I_EntPonElement` | 待迁移 |
@@ -205,3 +205,16 @@ createTime 保持现有 UTC 毫秒假定，不把该假定提升为已确认的�
 累计 269 组 SQLite 新旧查询及空表对照通过，独立初始化通过，SQL schema 按准备字段标量类型创建，保留小数容量边界。
 
 移除服务根审计挂载后，九个 IC transform 契约在相同 100000 fuel 下全部通过。当前完成 11/50 个载体。
+
+## 第九批 Frame 与 NetworkSlot
+
+迁移两个载体的 24 个物理字段、22 个维度、slot_count 及五条关系；累计 13/50 个载体。
+Frame 的九个可空字段保持可空，没有已声明 grain，不补建主键。
+FrameDn 仅为 Frame 与 Slot 共用的来源引用类型，不声明 DN 唯一性；NULL 引用不参与匹配。
+FrameOperState 的 normal/error 保留多源编码，另有三个独立编码；四个闭合域全部保留原有成员与次序。
+SlotId、DeviceId、TenantId 与 FrameDn 区分不同引用，isDaughterCard 保持 Bool，计数保持记录语义。
+
+九个 transform 契约、独立初始化以及累计 302 组实际 SQLite 新旧查询及空表对照通过。
+SQL 用例覆盖全部新增维度、状态 Eq/Ne、NULL、布尔真/假、槽位计数和五条关系。
+对照模块同时准备新旧模型和累计请求，将其初始化 fuel 上限改为 200000；独立生产声明初始化仍在 100000 内通过。
+不执行知识发现、知识地图构建、知识测试或源审计报告，MainService 尚未切换。

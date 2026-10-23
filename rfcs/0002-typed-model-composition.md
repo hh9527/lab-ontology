@@ -1005,3 +1005,12 @@ SQL 夹具区分主 ID 与来源 ID，覆盖错误父资源编码、双向关联
 服务未切换，PostgreSQL 仅核对参数，剩余载体与完整切换继续推进。
 
 九个 IC transform 契约在移除开发审计根挂载后，以相同 fuel 全部通过。
+
+### 阶段 D 进展：Frame 与 NetworkSlot
+
+累计迁移 13/50 个载体；本批增加 24 个物理字段、22 个维度、一个记录计数和五条关系。
+Frame 保留九个可空字段与空 grain，FrameDn 只表达跨表来源引用，不虚构唯一键。
+SlotId、DeviceId、TenantId、FrameDn 使用不同名义类型，布尔字段保持可计算的 Bool；四个闭合域保留旧编码。
+九个 transform 契约、独立声明初始化、累计 302 组真实 SQLite 新旧查询和空表检查通过。
+双模型累计 SQL 对照的初始化 fuel 上限增至 200000，独立声明初始化仍在 100000 内完成。
+不准备知识地图、不执行知识发现或知识测试。MainService 未切换，PostgreSQL 仅核对参数。

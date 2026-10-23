@@ -11,14 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def evaluate(name):
     result = subprocess.run([
         str(ROOT / "bin/telora"), "-C", str(ROOT / "icloud_model"), "eval",
-        f"@test/typed_inventory:{name}", "--initialization-fuel", "100000",
+        f"@test/typed_inventory:{name}", "--initialization-fuel", "200000",
         "--request-fuel", "100000", "--with-memory-limit", "2048",
     ], capture_output=True, text=True, timeout=240)
     assert result.returncode == 0, (name, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"] + fixture["components"] + fixture["storage"] + fixture["hardware"]
 schema = fixture["schema"]
 affinities = {table: dict(columns) for table, columns in fixture["affinities"]}
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
@@ -181,6 +181,27 @@ with sqlite3.connect(":memory:") as db:
     expected["source_HuaweiStorageDeviceAssociationX_TENANT_VIEW"] = expected["storage_device_belongs_to_tenant"]
     expected["storage_device_site"] = [("st1", "s1"), ("st2", "s2"), ("st3", "s1"), ("st4", "s1"), ("st4", "s2")]
     expected["source_HuaweiStorageDeviceAssociationX_SITE_VIEW"] = expected["storage_device_site"]
+    frame_columns = next(columns for table, columns in schema if table == "I_EnterpriseFrame")
+    for name, dn, device, tenant, state in [
+        ("f1", "dn1", "d1", "t1", 3), ("f2", "dn2", "d2", "t2", 16),
+        ("f3", None, None, None, None), ("f4", "dn4", "missing", "missing", 12),
+        ("f5", "dn5", "d1", "t1", 4),
+    ]:
+        values = {column: None for column in frame_columns}
+        values.update(name=name, frameDn=dn, refParentNE=device, tenantId=tenant, operState=state, adminState=1)
+        db.execute('INSERT INTO I_EnterpriseFrame VALUES (' + ','.join('?' for _ in frame_columns) + ')', [values[column] for column in frame_columns])
+    slot_columns = next(columns for table, columns in schema if table == "I_EnterpriseSlot")
+    for identity, dn, tenant, daughter in [("sl1", "dn1", "t1", True), ("sl2", "dn1", "t2", False), ("sl3", "missing", "missing", False)]:
+        values = {column: identity for column in slot_columns}
+        values.update(id=identity, name=identity, frameNativeId=dn, tenantId=tenant, isDaughterCard=daughter, operstatus=3, adminstatus=1)
+        db.execute('INSERT INTO I_EnterpriseSlot VALUES (' + ','.join('?' for _ in slot_columns) + ')', [values[column] for column in slot_columns])
+    expected.update(frame_normal_Eq=[("f1",), ("f2",)], frame_normal_Ne=[("f4",), ("f5",)], frame_error_Eq=[("f4",)],
+                    slot_daughter=[("sl1",)], slot_main=[("sl2",), ("sl3",)], slot_count=[(3,)])
+    expected["frame_belongs_to_device"] = [("f1", "d1"), ("f2", "d2"), ("f5", "d1")]
+    expected["source_EntNetworkElement_EnterpriseFrame"] = expected["frame_belongs_to_device"]
+    expected["source_EnterpriseFrame_X_TENANT_VIEW"] = [("f1", "Tenant Alpha"), ("f2", "租户二"), ("f5", "Tenant Alpha")]
+    expected["source_EnterpriseFrame_EnterpriseSlot"] = [("sl1", "f1"), ("sl2", "f1")]
+    expected["source_EnterpriseSlot_X_TENANT_VIEW"] = [("sl1", "Tenant Alpha"), ("sl2", "租户二")]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()
@@ -204,6 +225,6 @@ with sqlite3.connect(":memory:") as db:
             assert actual == [(0, 0)], ("empty storage counts", actual)
         if case["id"] == "storage_distinct_names":
             assert actual == [(0,)], ("empty distinct names", actual)
-        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server"}:
+        if case["id"] in {"count", "tenant_count", "port_count", "fan_count", "fan_count_for_server", "slot_count"}:
             assert actual == [(0,)], ("empty count", case["id"], actual)
 print(f"Passed {len(cases)} IC typed/baseline SQLite pairs and empty-table checks, including all migrated dimensions, counts, domain filters, IPv4 and all migrated relations")
