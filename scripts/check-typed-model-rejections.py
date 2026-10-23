@@ -18,6 +18,9 @@ cases = {
         f::inventory_parts);""",
     "entity_identity": """pub def bad: model::Role(f::Inventory) = model::role(f::inventory, f::site, "site", False,
         f::inventory_parts);""",
+    "duration_unit": "pub def bad: Option(q::BytesPerSecond) = q::rate(q::Bytes(1.0), q::Milliseconds(1000.0));",
+    "amount_unit": "pub def bad: q::Bytes = q::add_bytes(q::Bytes(1.0), q::Seconds(1.0));",
+    "rate_result": "pub def bad: Option(q::Bytes) = q::rate(q::Bytes(1.0), q::Seconds(1.0));",
 }
 with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root) as directory:
     workspace = Path(directory)
@@ -34,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root
         shutil.copytree(ROOT / crate / "src", target / "src")
     tests = workspace / "relation_model/tests"
     tests.mkdir()
-    prelude = "mod fixture;\nuse self::fixture as f;\nuse ontology::experimental::model as model;\n"
+    prelude = "mod fixture;\nuse self::fixture as f;\nuse ontology::experimental::model as model;\nuse ontology::experimental::quantity as q;\n"
     # 先用同一映射的合法版本确认测试工作区可解析和类型闭包成立。
     control = prelude + "pub def good: model::Role(f::Inventory) = model::role(f::inventory, f::device, \"device\", False, f::inventory_parts);\n"
     for name, body in [("control", control), *[(name, prelude + body) for name, body in cases.items()]]:
@@ -54,4 +57,4 @@ with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root
             assert any(item.get("locs") and item["locs"][0]["source"].endswith(name)
                        for item in errors), (name, errors)
             print(f"Passed static rejection: {name}")
-print("Passed: valid control and four nominal/owner/identity type rejections")
+print(f"Passed: valid control and {len(cases)} nominal/owner/identity/unit type rejections")

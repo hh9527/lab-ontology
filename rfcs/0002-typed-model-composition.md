@@ -455,5 +455,25 @@ newtype 的原始 JSON 编码与构造校验已经在这个模型上下文中验
 - `prepare` 只处理单个 Dataset，跨 Dataset 的 Entity 注册和一致性校验留待组合准备阶段
 - 本阶段只准备模型事实，不生成知识节点、查询 AST、SQL，也不迁移现有关系模型服务
 
-`scripts/check-typed-model-rejections.py` 在独立临时工作区运行一个合法控制例和四个编译期拒绝例，分别验证名义值、映射值类型、行拥有者和实体身份。
+`scripts/check-typed-model-rejections.py` 在独立临时工作区运行合法控制例和编译期拒绝例，覆盖名义值、映射值类型、行拥有者、实体身份和单位运算。
 失败源码不加入普通测试发现路径，因此正常的 `check --tests` 不会因预期编译失败夹具而失败。
+
+## 阶段 B 单位计算实验
+
+实际入口为 `ontology::experimental::quantity`，当前以具名 newtype 和封闭的函数签名验证单位计算，尚未实现通用量纲代数。
+
+```telora
+use ontology::experimental::quantity as q;
+
+# 显式换算后，结果为 Some(BytesPerSecond(1.5))
+q::rate(q::Bytes(3.0), q::seconds(q::Milliseconds(2000.0)))
+```
+
+`rate(Bytes, Seconds)` 返回 `Option(BytesPerSecond)`，毫秒直接传入、字节与秒相加、将速率结果声明为字节都会在编译期拒绝。
+数量使用 Float 负载，JSON 保留数值表示；物理源数据的单位真实性仍需在 Dataset 绑定边界验证。
+
+实验明确两个聚合口径：`mean_rate` 是有效样本速率的算术平均，`weighted_rate` 是有效样本累计量除以累计时长。
+例如 `(100 B, 1 s)`、`(900 B, 9 s)`、`(100 B, 10 s)` 分别得到 `70 B/s` 和 `55 B/s`。
+非正时长样本在这两个实验聚合中都排除，空集或全无效样本返回 None；有效时长上的零字节仍得到零速率。
+
+这部分确定了单位与聚合语义的最小可执行基础。阶段 B 仍需继续完成 Group 定义／绑定、成员命名映射、封闭表达式到查询 AST 的 lowering 和实际 SQLite 计算验收。
