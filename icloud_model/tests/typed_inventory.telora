@@ -1,0 +1,75 @@
+use crate::typed::{payload};
+use crate::typed::inventory as inventory;
+use crate::model as baseline;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+
+def base_entity: Fn(String) -> edsl::EntityEntry = fn(id) { match array::find(baseline::payload.entities, fn(entry) { entry.id == id }) { Some(entry) => entry, None => fail!("baseline entity missing", id) } };
+pub def physical_sources_fields_and_grains_match_the_baseline: test::Test = test::should_ok(fn() {
+    array::all(payload.entities, fn(entity) { let previous = base_entity(entity.id); entity.table == previous.table && entity.fields == previous.fields && entity.dataset == previous.dataset })
+});
+pub def all_current_dimension_contracts_are_preserved: test::Test = test::should_ok(fn() {
+    array::all(payload.entities, fn(entity) {
+        let previous = base_entity(entity.id);
+        let expected = array::filter(baseline::payload.dimensions, fn(dimension) { dimension.entity == previous.index });
+        let actual = array::filter(payload.dimensions, fn(dimension) { dimension.entity == entity.index });
+        array::length(expected) == array::length(actual) && array::all(expected, fn(old) {
+            match array::find(actual, fn(value) { value.id == old.id }) {
+                None => False,
+                Some(value) => value.ty == old.ty && value.half_open == old.half_open && value.output_type == old.output_type && value.field == old.field
+                    && value.computed == old.computed && value.authorized == old.authorized && value.projectable == old.projectable
+                    && value.filterable == old.filterable && value.ops == old.ops && value.input_kinds == old.input_kinds
+                    && value.scope == old.scope && value.canonical_order == old.canonical_order
+                    && array::map(value.canonical_values, fn(member) { (member.id, member.wires) }) == array::map(old.canonical_values, fn(member) { (member.id, member.wires) }),
+            }
+        })
+    })
+});
+pub def all_current_record_measures_are_preserved: test::Test = test::should_ok(fn() {
+    array::all(payload.entities, fn(entity) {
+        let expected = array::filter(baseline::payload.measures, fn(measure) { measure.entity == base_entity(entity.id).index });
+        let actual = array::filter(payload.measures, fn(measure) { measure.entity == entity.index });
+        array::length(expected) == array::length(actual) && array::all(expected, fn(old) { array::any(actual, fn(value) { value.id == old.id && value.field == old.field && value.aggregate == old.aggregate && value.input == old.input && value.requires == old.requires && value.predicate == old.predicate && value.computed == old.computed && value.row_expression == None }) })
+    })
+});
+pub def every_relation_between_migrated_datasets_is_preserved: test::Test = test::should_ok(fn() {
+    let expected = array::filter(baseline::payload.relations, fn(relation) { relation.from < 2 && relation.to < 2 });
+    array::length(expected) == array::length(payload.relations) && array::all(expected, fn(old) { array::any(payload.relations, fn(value) { value.id == old.id && value.from == old.from && value.to == old.to && value.cardinality == old.cardinality && value.key == old.key && value.guard == old.guard }) })
+});
+pub def device_identity_is_id_only: test::Test = test::should_ok(fn() { inventory::device_subject.parts == [{source: "id", target: "id", value: inventory::DeviceId.type, nullable: False}] });
+pub def backend_capability_profile_is_preserved: test::Test = test::should_ok(fn() { payload.profile == baseline::payload.profile });
+
+type Pair = struct { id: String, typed: qb::Query, baseline: qb::Query, postgres: qb::Query, columns: Array(intent::ResultColumn), baseline_columns: Array(intent::ResultColumn) };
+def pair: Fn(String, Value) -> Pair = fn(id, request) {
+    let actual = intent::query_intent_ast_factory(payload)(request);
+    let expected = intent::query_intent_ast_factory(baseline::payload)(request);
+    {id, typed: sqlite::build_query(actual), baseline: sqlite::build_query(expected), postgres: postgres::build_query(actual),
+        columns: intent::result_columns(payload, request, actual), baseline_columns: intent::result_columns(baseline::payload, request, expected)}
+};
+def device_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],\{extra}}`).unwrap!()) };
+def join_case: Fn(String) -> Pair = fn(relation) { pair(relation, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"\{relation}","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device_id"},{"node":"t","dimension":"tenant_name"}]}`).unwrap!()) };
+pub def runtime_cases: Value = codec::encode(array::concat([
+    array::map(payload.dimensions, fn(dimension) {
+        let entity = payload.entities[dimension.entity];
+        pair(`project_\{dimension.id}`, json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"\{entity.id}"}],"edges":[],"select":[{"node":"r","dimension":"\{dimension.id}"}]}`).unwrap!())
+    }),
+    [join_case("device_belongs_to_tenant"), join_case("source_EntNetworkElement_X_TENANT_VIEW"),
+     device_case("known", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_class","op":"Eq","value":"lb"}]"#),
+     device_case("unknown_collision", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_class","op":"Eq","value":{"unknown":"router"}}]"#),
+     device_case("unknowns", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_class","op":"Eq","value":{"unknowns":true}}]"#),
+     device_case("offline", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_commu_state","op":"Eq","value":"offline"}]"#),
+     device_case("subnet", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_ip_address_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#),
+     device_case("count", r#""select":[],"measures":[{"node":"d","measure":"device_count"}]"#),
+     device_case("group_class", r#""select":[{"node":"d","dimension":"device_class"}],"measures":[{"node":"d","measure":"device_count"}]"#),
+     pair("tenant_count", json::parse(r#"{"op":"Graph","root":"t","nodes":[{"id":"t","entity":"tenant"}],"edges":[],"select":[],"measures":[{"node":"t","measure":"tenant_count"}]}"#).unwrap!()),
+    ],
+]));
+pub def physical_schema: Value = codec::encode(array::map(payload.entities, fn(entity) { (entity.table, array::map(entity.fields, fn(field) { field.column })) }));
