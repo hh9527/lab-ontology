@@ -324,3 +324,16 @@ SQL 场景覆盖跨租户同刻样本的确定排序、最新 CPU 为 NULL 而�
 7 项正反例、6 个实际 SQLite 条件计数场景、原字段计数的 6 个 SQLite 场景、relation model 的 102 个 Graph 请求与 6 组 SQL 对照，以及 12 项 IC transform 契约通过。
 PostgreSQL 仅核对参数。CurrentAlarm 尚未迁移，完成数量仍为 20/50；MainService 尚未切换。
 本阶段不准备知识地图、不执行知识发现或知识测试，验收仅依据 transform 能力与对应回归。
+
+## CurrentAlarm 前置能力：显式 Event Dataset
+
+Declaration 显式携带 DatasetKind，declare 默认 Entity，metric 与 event 分别选择 Metric／Event 并绑定 UTC 时钟。
+事件不再因具有时钟而被推断成 Metric；event 保留事件 grain、可空发生时间和既有物理列映射，不附加“未清除”等固有范围。
+准备阶段重新校验 kind 与时钟的一致性、UTC 字段及非空 grain；拒绝在 Event 上发布 Metric 采样角色。
+当前复用 metric 的时钟校验，因此部分错误文本仍沿用 metric 名称，校验要求相同。
+
+7 项 Event 契约、18 项采样契约（含 Event/Metric 边界）与 12 项 IC transform 契约通过。
+CurrentAlarm 尚未迁移，仍为 20/50；条件关系、计算度量及完整模型迁移继续推进。
+本阶段不执行知识发现、知识地图构建或知识测试。
+
+本项独立 typed IC 初始化在不含旧模型和服务的临时工作区通过（100000 fuel），不准备知识地图。

@@ -19,14 +19,14 @@ type FieldCount(Row) = struct { condition: Option(v::MemberPredicate), row: Type
 type FieldCountFacts = struct { condition: Option(v::MemberPredicate), row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
 type RowScope(Row) = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
 type RowScopeFacts = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
-type Declaration = struct { scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
+type Declaration = struct { kind: edsl::DatasetKind, scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
 type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
 type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
 def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::prepare(dataset, roles);
     let bindings = array::map(groups, g::binding_facts);
     g::prepare_facts(declared, bindings);
-    {scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+    {kind: edsl::DatasetKind::Entity, scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
 };
 # 固有行范围在所有查询中生效；沿用现有维度的等值解析与域编码契约。
 def scope_equal: for(Row, Scalar: codec::Encode) Fn(m::Dataset(Row), m::Field(Row, Scalar), Scalar) -> RowScope(Row) = fn(dataset, field, value) {
@@ -92,7 +92,12 @@ def metric: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration =
     let role = scalars::time_role(Time.type);
     if clock.owner != declared.dataset.row || clock.owner != Row.type { fail!("metric clock belongs to another dataset row", declared.dataset.id) }
     else if match role { Some(value) => value.semantics != edsl::TimeSemantics::Utc, None => True } { fail!("metric clock requires a UTC instant type", clock.name) }
-    else { declared <~ {clock: Some(clock.name)} }
+    else { declared <~ {kind: edsl::DatasetKind::Metric, clock: Some(clock.name)} }
+};
+# Event 显式保留事件 grain 和发生时钟，不因具有时钟而成为 Metric。
+def event: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) {
+    let timed = metric(declared, clock);
+    timed <~ {kind: edsl::DatasetKind::Event}
 };
 def with_samples: for(Row) Fn(Declaration, Array(samples::Binding(Row))) -> Declaration = fn(declared, bindings) {
     if declared.dataset.row != Row.type { fail!("sample bindings belong to another dataset row", declared.dataset.id) }
@@ -201,6 +206,9 @@ def entity_entry: Fn(Declaration, Int) -> edsl::EntityEntry = fn(declared, index
                 column: columns[field.index], is_key: single_key && dataset.grain[0] == field.name, ty: value.storage}.ty!(edsl::FieldEntry)
         }
     });
+    if declared.kind != edsl::DatasetKind::Entity && declared.clock == None { fail!("temporal dataset requires an explicit UTC clock", dataset.id) } else { () };
+    if declared.kind == edsl::DatasetKind::Entity && declared.clock != None { fail!("entity dataset cannot declare a temporal clock", dataset.id) } else { () };
+    if declared.kind == edsl::DatasetKind::Event && array::length(declared.samples) > 0 { fail!("sample measures require a Metric dataset", dataset.id) } else { () };
     let sample_measures = samples::prepare(dataset, declared.samples);
     if array::length(sample_measures) > 0 && declared.clock == None { fail!("sample measures require an explicit metric clock", dataset.id) } else { () };
     if declared.clock != None && array::length(dataset.grain) == 0 { fail!("metric dataset requires a complete sample grain", dataset.id) } else { () };
@@ -214,7 +222,7 @@ def entity_entry: Fn(Declaration, Int) -> edsl::EntityEntry = fn(declared, index
     let source = qb::source_with_hint(qb::build_context(), dataset.source, `typed_\{index}`).1;
     {references: [], field_roles: [], index, id: dataset.id, entity_type: dataset.row, table: dataset.source,
         alias: source.alias, source, key_field: key, fields, union: None,
-        dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: if declared.clock == None { edsl::DatasetKind::Entity } else { edsl::DatasetKind::Metric }, grain: dataset.grain, utc_time: declared.clock}) },
+        dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: declared.kind, grain: dataset.grain, utc_time: declared.clock}) },
         sample_measures, description: None, scope: prepare_scope(declared)}
 };
 # Group 使用 Row 字段寻址；在进入 QueryAst 前统一替换为已校验物理列。
@@ -426,4 +434,4 @@ def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative)
     prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
 };
 
-pub use self::{RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, metric, with_samples, with_domains, declare, prepare, build};
+pub use self::{RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, event, metric, with_samples, with_domains, declare, prepare, build};

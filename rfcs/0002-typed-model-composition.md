@@ -1084,3 +1084,13 @@ MainService 尚未切换，不建立知识地图或执行知识测试。
 构造与擦除后的准备阶段均检查绑定身份和成员，当前支持直接列等值条件，COUNT(field) 保留非 NULL 计数语义。
 7 项正反例、6 个条件计数 SQLite 场景、6 个原字段计数场景、102 个既有 Graph 请求与 6 组关系 SQL 对照、12 项 IC transform 契约通过。PostgreSQL 仅核对参数。
 CurrentAlarm 尚未迁移，仍为 20/50；不增加知识发现、知识地图构建或知识测试成本，相关能力不作为当前阶段的验收依据。
+
+### 阶段 D 前置能力：显式 Event Dataset
+
+Declaration 显式携带 DatasetKind；declare、metric、event 分别声明 Entity、Metric、Event，不再仅凭 clock 推断 Dataset 类型。
+Event 显式选择 UTC 发生时间并保留事件 grain，允许来源发生时间可空，不自动加入未清除等业务范围。
+准备阶段校验种类与时钟的一致性、UTC 字段及 grain，拒绝 Event 发布 Metric 采样角色。
+复用既有时钟校验，部分诊断仍沿用 metric 名称。7 项 Event 契约、18 项采样契约及 12 项 IC transform 契约通过。
+CurrentAlarm 尚未迁移，仍为 20/50；仅推进 transform，不增加知识准备成本。
+
+本项独立 typed IC 初始化在不含旧模型和服务的临时工作区通过（100000 fuel），不准备知识地图。
