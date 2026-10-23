@@ -18,7 +18,7 @@ def evaluate(name):
     return json.loads(result.stdout)
 
 fixture = evaluate("runtime_fixture")
-cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"]
+cases = fixture["inventory"] + fixture["site"] + fixture["port"] + fixture["kpi"] + fixture["server"] + fixture["server_kpi"]
 schema = fixture["schema"]
 expected = {"known": [("d1",), ("d2",)], "unknown_collision": [("d3",)],
             "unknowns": [("d3",), ("d5",)], "offline": [("d2",), ("d3",)],
@@ -34,7 +34,7 @@ with sqlite3.connect(":memory:") as db:
     for table, columns in schema:
         assert all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in [table, *columns])
         fields = ", ".join(f'"{name}" ' + ("INTEGER" if name in {"createTime", "TENANT_ACCESS_TIME", "CREATE_TIME", "ifMtu", "ifType", "healthStatus", "connectStatus", "serviceDuration", "serviceStartTime"} else "REAL" if name == "bandwidth" else "TEXT") for name in columns)
-        if table == "NetworkDeviceInterfaceKPI":
+        if table in {"NetworkDeviceInterfaceKPI", "ServerDeviceKPI"}:
             fields = ", ".join(f'"{name}" ' + ("TEXT" if name in {"resId", "tenantId", "ts", "parentId", "projectId", "interfaceName"}
                               else "INTEGER" if "Errors" in name or "Effcnt" in name else "REAL") for name in columns)
         db.execute(f'CREATE TABLE "{table}" ({fields})')
@@ -94,7 +94,7 @@ with sqlite3.connect(":memory:") as db:
         values.update(resId=identity, tenantId=tenant, ts=clock, parentId="parent", projectId="s1", interfaceName=identity)
         db.execute('INSERT INTO NetworkDeviceInterfaceKPI VALUES (' + ','.join('?' for _ in kpi_columns) + ')', [values[column] for column in kpi_columns])
     for case in cases:
-        if case["id"].startswith("measure_"):
+        if case["id"].startswith("measure_interface"):
             measure = case["id"].removeprefix("measure_")
             expected[case["id"]] = [(100 if measure.endswith("_max") else 10 if measure.endswith("_min") else 40.0,)]
     expected["kpi_window"] = [(25.0,)]
@@ -120,6 +120,26 @@ with sqlite3.connect(":memory:") as db:
     expected["source_PhysicalServer_X_TENANT_VIEW"] = expected["server_belongs_to_tenant"]
     expected["server_located_at_site"] = [("sv1", "s1"), ("sv2", "s2"), ("sv3", "s1"), ("sv4", "s1"), ("sv4", "s2")]
     expected["source_PhysicalServer_X_SITE_VIEW"] = expected["server_located_at_site"]
+    server_kpi_columns = next(columns for table, columns in schema if table == "ServerDeviceKPI")
+    for identity, tenant, clock, cpu, memory in [
+        ("sv1", "t1", "2024-02-29T23:00:00Z", 10, 20),
+        ("sv1", "t1", "2024-03-01T00:00:00Z", 30, 40),
+        ("sv1", "t2", "2024-03-01T00:00:00Z", 50, 60),
+        ("sv1", "t1", "2024-03-02T00:00:00Z", None, 90),
+        ("sv2", "t2", "2024-03-01T01:00:00Z", 70, 80),
+        ("sv2", "t2", None, 999, 999),
+        ("origin_sv1", "t1", "2024-03-03T00:00:00Z", 100, 110),
+    ]:
+        values = {name: 1 for name in server_kpi_columns}
+        values.update(resId=identity, tenantId=tenant, ts=clock, cpuUsage=cpu, memUsage=memory, parentId=identity, projectId="s1")
+        db.execute('INSERT INTO ServerDeviceKPI VALUES (' + ','.join('?' for _ in server_kpi_columns) + ')', [values[column] for column in server_kpi_columns])
+    expected.update(measure_server_cpu_usage=[(1259 / 6,)], measure_server_memory_usage=[(1399 / 7,)],
+                    measure_server_cpu_peak=[(999,)], measure_server_memory_sample_max=[(999,)],
+                    measure_server_cpu_sample_min=[(10,)], measure_server_memory_sample_min=[(20,)],
+                    measure_server_cpu_latest=[(100,)], measure_server_memory_latest=[(110,)],
+                    server_latest_window=[(70, 80)], server_latest_tie=[(30, 40)])
+    expected["server_kpi_of_server"] = [("sv1", 30.0, None, 90), ("sv2", 534.5, 70, 80)]
+    expected["source_PhysicalServer_ServerDeviceKPI"] = expected["server_kpi_of_server"]
     def execute(query):
         bindings = {str(i + 1): value for i, value in enumerate(query["bindings"])}
         return db.execute(query["sql"], bindings).fetchall()

@@ -959,3 +959,17 @@ serviceStartTime 和 serviceDuration 保持普通整数，不根据名称推断�
 增加默认根行粒度拒绝扩行投影的回归，不通过放宽基数校验来迁就迁移。
 八个契约测试、隔离初始化与累计 149 组 SQLite 新旧查询及空表对照通过，覆盖全部投影、负数健康码、连接状态、IPv4、半开时间窗及四个关系。
 无知识地图构建或知识测试，服务未切换；后续继续迁移服务器样本与部件。
+
+### 阶段 D 进展：ServerKpi 与 Latest 实际迁移
+
+完整迁移服务器样本的 15 个物理字段、16 个公开维度、八个样本统计及两个主 ID 关联，累计 7/50 个载体。
+CPU 与内存重用同一个 Percent 统计 Group，公开名称分别映射 Mean／Latest／Max／Min，完整保留 % 单位与 Primary／SampleSummary 角色。
+Metric 使用 res_id／tenant_id／ts grain 与 Rfc3339Utc 时钟；样本 resId 对应 ServerId，不与部件来源使用的 ServerOriginId 混淆。
+三个 UTC 分桶、原始时间比较权限和普通功率样本投影保留现有契约，不自动对百分比赋予 Sum。
+
+八个契约测试和隔离初始化通过，SQLite 夹具实际覆盖最新 NULL、NULL 时钟、同一时间跨租户 grain 并列、窗口与两个具名服务器关联。
+NULL 时钟行仍参与普通统计，但不能成为 Latest；CPU 和内存 Latest 来自同一权威行。
+同时间并列使用完整 grain 排序，额外窗口／行过滤验证 t1 在 t2 前，不以值的大小选最新行。
+未构建知识地图、未执行知识测试，服务保持原载荷。
+
+本批累计 177 组 SQLite 新旧查询与空表对照通过；PostgreSQL 只比较参数，未实际执行。

@@ -26,7 +26,7 @@ Tenant 访问时间和设备创建时间保持 Local 毫秒语义与现有单位
 | Port | `port` | `I_EnterpriseNetworkLTP` | 第三批已验证 |
 | InterfaceKpi | `interface_kpi` | `NetworkDeviceInterfaceKPI` | 第四批已验证 |
 | ServerDevice | `server_device` | `PhysicalServer` | 第五批已验证 |
-| ServerKpi | `server_kpi` | `ServerDeviceKPI` | 待迁移 |
+| ServerKpi | `server_kpi` | `ServerDeviceKPI` | 第六批已验证 |
 | ServerFan | `server_fan` | `PhysicalServerFan` | 待迁移 |
 | ServerPsu | `server_psu` | `PhysicalServerPSU` | 待迁移 |
 | ServerMemory | `server_memory` | `PhysicalServerMemory` | 待迁移 |
@@ -150,3 +150,17 @@ OR 关系夹具覆盖单路匹配、双路同站点去重、双路不同站点�
 服务器到租户和站点的跨端原始投影显式声明 Association 行粒度，并增加默认根行粒度下拒绝扩行投影的回归。
 
 累计 149 组 SQLite 新旧查询及空表检查通过，当前完成 6/50 个载体。PostgreSQL 仅核对参数，服务入口未切换。
+
+## 第六批 ServerKpi
+
+完整迁移 15 个物理字段、16 个公开维度、八个样本统计及两个主 ID 关联。
+CPU 与内存共用 Percent 统计 Group，分别映射 Mean、Latest、Max、Min 公开名称，单位保持 %。
+明确使用 res_id／tenant_id／ts 采样粒度和 Rfc3339Utc 权威时钟，三个 UTC 分桶保持原契约。
+systemPower 与 peakPower 使用 Watts；averagePower 保持独立来源值类型，不推断未在现有公共契约声明的单位。
+
+两个关联都将样本 resId 对应 ServerId，不能改成 ServerOriginId。
+源文件 ServerDeviceKPI.logical.yaml 哈希与 source_catalog.json 一致，既有非空字段契约仍保留。
+八个契约测试和独立初始化通过；SQL 夹具覆盖最新 NULL、缺失时钟、复合 grain 并列、窗口及关联原始 ID 不匹配。
+CPU 和内存 Latest 共享行选择，NULL 时钟不参与 Latest，但其数值仍参与普通统计。
+
+新增同一时刻 t1／t2 并列 Latest 断言后，累计 177 组 SQLite 新旧查询及空表检查通过。当前完成 7/50 个载体。
