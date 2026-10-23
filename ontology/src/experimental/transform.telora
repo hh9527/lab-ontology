@@ -24,14 +24,40 @@ type ComputedCount(Row) = struct { result: CountRef(Row), left: CountRef(Row), r
 type ComputedCountFacts = struct { result: CountRefFacts, left: CountRefFacts, right: CountRefFacts, op: qb::ComputedOp };
 type RowScope(Row) = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
 type RowScopeFacts = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
-type Declaration = struct { computed_counts: Array(ComputedCountFacts), kind: edsl::DatasetKind, scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
+type NativePair(Row) = struct { id: String, first: g::Binding(Row), second: g::Binding(Row) };
+type NativePairFacts = struct { id: String, first: g::BindingFacts, second: g::BindingFacts };
+type Declaration = struct { native_pairs: Array(NativePairFacts), computed_counts: Array(ComputedCountFacts), kind: edsl::DatasetKind, scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
 type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload };
 type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
 def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::prepare(dataset, roles);
     let bindings = array::map(groups, g::binding_facts);
     g::prepare_facts(declared, bindings);
-    {computed_counts: [], kind: edsl::DatasetKind::Entity, scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+    {native_pairs: [], computed_counts: [], kind: edsl::DatasetKind::Entity, scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+};
+def validate_native_pair: Fn(NativePairFacts) -> () = fn(pair) {
+    if pair.id == "" || pair.first.row != pair.second.row || pair.first.dataset != pair.second.dataset || pair.first.source != pair.second.source {
+        fail!("native pair requires dimensions from the same dataset", pair.id)
+    } else if array::length(pair.first.members) != 1 || array::length(pair.second.members) != 1 {
+        fail!("native pair requires single dimension bindings", pair.id)
+    } else {
+        let first = pair.first.members[0];
+        let second = pair.second.members[0];
+        let plain: Fn(g::Member) -> Bool = fn(member) { member.aggregate == None && match member.node { g::Node::Column(_) => True, _ => False } && array::any(member.filters, fn(op) { op == g::Filter::Eq }) };
+        if first.id == second.id || first.value != second.value || !plain(first) || !plain(second)
+            || first.node == second.node {
+            fail!("native pair requires distinct compatible plain equality dimensions", pair.id)
+        } else { () }
+    }
+};
+def native_pair: for(Row) Fn(String, g::Binding(Row), g::Binding(Row)) -> NativePair(Row) = fn(id, first, second) {
+    if first.row != Row.type || second.row != Row.type { fail!("native pair row witness does not match its type", id) } else { () };
+    validate_native_pair({id, first: g::binding_facts(first), second: g::binding_facts(second)});
+    {id, first, second}
+};
+def with_native_pairs: for(Row) Fn(Declaration, Array(NativePair(Row))) -> Declaration = fn(declared, pairs) {
+    if declared.dataset.row != Row.type { fail!("native pairs belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {native_pairs: array::map(pairs, fn(pair) { {id: pair.id, first: g::binding_facts(pair.first), second: g::binding_facts(pair.second)}.ty!(NativePairFacts) })} }
 };
 # 固有行范围在所有查询中生效；沿用现有维度的等值解析与域编码契约。
 def scope_equal: for(Row, Scalar: codec::Encode) Fn(m::Dataset(Row), m::Field(Row, Scalar), Scalar) -> RowScope(Row) = fn(dataset, field, value) {
@@ -445,8 +471,26 @@ def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(re
             fail!("typed transform measure ids must be unique", measure.id)
         } else { () }
     });
+    let native_pairs = array::flat_map(array::enumerate(declarations), fn(pair) {
+        array::map(pair.1.native_pairs, fn(spec) {
+            validate_native_pair(spec);
+            g::prepare_facts(pair.1.dataset, [spec.first, spec.second]);
+            array::map([spec.first, spec.second], fn(binding) {
+                if !array::any(pair.1.groups, fn(declared) { declared == binding }) { fail!("native pair requires its declared dimension bindings", spec.id) } else { () }
+            });
+            let first = match array::find(dimensions, fn(dimension) { dimension.entity == pair.0 && dimension.id == spec.first.members[0].id }) { Some(value) => value, None => fail!("unknown native pair first dimension", spec.id) };
+            let second = match array::find(dimensions, fn(dimension) { dimension.entity == pair.0 && dimension.id == spec.second.members[0].id }) { Some(value) => value, None => fail!("unknown native pair second dimension", spec.id) };
+            if first.computed || second.computed || first.field == second.field || !first.filterable || !second.filterable
+                || first.input_kinds != second.input_kinds || array::length(first.canonical_values) > 0 || array::length(second.canonical_values) > 0 {
+                fail!("native pair requires distinct compatible plain equality dimensions", spec.id)
+            } else { {id: spec.id, entity: pair.0, first: first.id, second: second.id}.ty!(edsl::NativePairEntry) }
+        })
+    });
+    array::map(native_pairs, fn(pair) {
+        if array::length(array::filter(native_pairs, fn(other) { other.id == pair.id })) != 1 { fail!("duplicate native pair id", pair.id) } else { () }
+    });
     let payload = edsl::validate_transform_contract({revision, entities, dimensions, measures,
-        relations: [], business_links: [], native_pairs: [], profile});
+        relations: [], business_links: [], native_pairs, profile});
     {declarations, payload}
 };
 
@@ -491,4 +535,4 @@ def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative)
     prepared <~ {payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link(with_relations, link) })}}
 };
 
-pub use self::{CountRef, ComputedCount, count_ref, computed_count_ref, combine_counts, with_computed_counts, RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, event, metric, with_samples, with_domains, declare, prepare, build};
+pub use self::{NativePair, native_pair, with_native_pairs, CountRef, ComputedCount, count_ref, computed_count_ref, combine_counts, with_computed_counts, RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, event, metric, with_samples, with_domains, declare, prepare, build};

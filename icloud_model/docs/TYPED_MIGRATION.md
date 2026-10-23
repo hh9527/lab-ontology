@@ -410,3 +410,15 @@ NULL fixture 用于验证来源异常值的 SQL 行为，不将旧非空字段�
 NULL fixture 检查原始来源异常值的防御行为，不改变既有非空字段契约。
 PhysicalLink 尚未迁移，仍为 21/50；其 native pair 声明仍需补齐，MainService 尚未切换，不执行知识发现、知识地图构建或知识测试。
 本项 102 个既有 Graph 请求、6 组实际 SQLite 新旧关系对照及 14 项 IC transform 契约通过。
+
+## PhysicalLink 前置能力：原生维度配对声明
+
+新增 transform::native_pair 与 with_native_pairs，以同一 Row 的两个完整维度绑定声明有序配对，准备时生成既有 NativePairEntry。
+两端必须属于同一 Dataset/source，采用相同名义值类型、不同直接物理字段，并支持 Eq；不接受计算表达式、聚合成员或业务编码域。
+准备边界重验两端绑定且要求与 Declaration 中登记的绑定完全一致，拒绝缺失／篡改绑定、同字段别名和重复配对 ID。
+只保留配对元数据，不推断 A/Z 可交换、连接方向或网络层级，不新增查询权限，不构建知识地图。
+
+10 项原生配对契约、102 个既有 Graph 请求和 6 组实际 SQLite 新旧关系对照通过。
+本项是声明准备能力，没有新增 SQL 运算；未增加知识发现／知识测试。
+PhysicalLink 尚未迁移，仍为 21/50；MainService 尚未切换。
+本项 14 项 IC transform 契约通过。
