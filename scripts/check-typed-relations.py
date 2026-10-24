@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="typed-relations-", dir=TEMP_ROOT) as di
     graph = graph.replace(original, "use crate::model::{ Tenant, Site, Device, Connection, Route };\nuse crate::typed_relations::{ payload };")
     (tests / "typed_graph_regression.telora").write_text(graph)
     shutil.copy2(ROOT / "relation_model/tests/typed_relations.telora", tests / "typed_relations.telora")
-    compiler = str(ROOT / "bin/telora")
+    compiler = os.environ.get("TELORA", str(ROOT / "bin/telora"))
     options = ["--initialization-fuel", "100000", "--request-fuel", "1000000", "--with-memory-limit", "1024"]
     result = subprocess.run([compiler, "-C", str(workspace / "relation_model"), "test", "typed_graph_regression", *options],
                             capture_output=True, text=True, timeout=180)
