@@ -13,11 +13,10 @@ type Guard = struct { row: Type, dataset: String, source: String, column: g::Col
 type Relation = struct { guard: Option(Guard), id: String, from: Endpoint, to: Endpoint, cardinality: edsl::RelationCardinality };
 type Link = struct { guard: Option(Guard), id: String, a: Relation, z: Relation, direction: edsl::LinkDirection };
 
-def endpoint: for(Row) Fn(model::Dataset(Row), model::Role(Row)) -> Endpoint = fn(dataset, role) {
-    {dataset: model::prepare(dataset, [role]), role: role.id}
-};
-def role: Fn(Endpoint) -> model::PreparedRole = fn(endpoint) {
-    let checked = model::validate_prepared(endpoint.dataset);
+def endpoint: for(Row) Fn(model::Dataset(Row), model::Role(Row)) -> Endpoint = fn(dataset, role) { {dataset: model::prepare(dataset, [role]), role: role.id} };
+def role: Fn(Endpoint) -> model::PreparedRole = fn(endpoint) { role_mode(endpoint, True) };
+def role_mode: Fn(Endpoint, Bool) -> model::PreparedRole = fn(endpoint, checking) {
+    let checked = if checking { model::validate_prepared(endpoint.dataset) } else { endpoint.dataset };
     match array::find(checked.roles, fn(role) { role.id == endpoint.role }) {
         Some(value) => value, None => fail!("relation endpoint role does not exist", checked.id, endpoint.role),
     }
@@ -31,44 +30,36 @@ def validate: Fn(Relation) -> Relation = fn(relation) {
     } else { relation }
 };
 def relation: for(From, To) Fn(String, model::Dataset(From), model::Role(From), model::Dataset(To), model::Role(To), edsl::RelationCardinality) -> Relation = fn(id, from, from_role, to, to_role, cardinality) {
-    validate({guard: None, id, from: endpoint(from, from_role), to: endpoint(to, to_role), cardinality})
+    {guard: None, id, from: endpoint(from, from_role), to: endpoint(to, to_role), cardinality}
 };
 # 来源侧关系条件，只支持带类型标量的 Eq/Ne，不改变 Dataset 总体。
 def guarded: for(Row, Scalar: codec::Encode) Fn(Relation, model::Field(Row, Scalar), edsl::FilterOp, Scalar) -> Relation = fn(relation, field, op, value) {
-    let checked = validate(relation);
-    let column = g::input(field);
-    if checked.from.dataset.row != Row.type { fail!("relation guard belongs to another source row", checked.id) } else { () };
-    let input = match codec::encode(value) {
-        Value::String(text) => edsl::FilterInput::Text(text),
-        Value::Int(number) => edsl::FilterInput::Int(number),
-        Value::Float(number) => edsl::FilterInput::Number(number),
-        Value::True => edsl::FilterInput::Bool(True),
-        Value::False => edsl::FilterInput::Bool(False),
-        _ => fail!("relation guard requires a scalar literal", checked.id),
-    };
-    let guard: Guard = {row: Row.type, dataset: checked.from.dataset.id, source: checked.from.dataset.source,
-        column: {name: field.name, value: Scalar.type, nullable: column.nullable}, op, input};
-    prepare_guard(checked, guard);
-    checked <~ {guard: Some(guard)}
+    relation <~ {guard: Some({row: Row.type, dataset: relation.from.dataset.id, source: relation.from.dataset.source,
+        column: {name: field.name, value: Scalar.type, nullable: field.nullable}, op, input: scalar_input(value)})}
 };
-def prepare_guard: Fn(Relation, Guard) -> edsl::ScopePredicate = fn(relation, guard) {
-    if guard.row != relation.from.dataset.row || guard.dataset != relation.from.dataset.id || guard.source != relation.from.dataset.source {
-        fail!("relation guard belongs to another source dataset", relation.id)
+def prepare_guard: Fn(Relation, Guard) -> edsl::ScopePredicate = fn(relation, guard) { prepare_guard_mode(relation, guard, True) };
+def prepare_guard_mode: Fn(Relation, Guard, Bool) -> edsl::ScopePredicate = fn(relation, guard, checking) {
+    if checking {
+        if guard.row != relation.from.dataset.row || guard.dataset != relation.from.dataset.id || guard.source != relation.from.dataset.source {
+            fail!("relation guard belongs to another source dataset", relation.id)
+        } else { () };
+        g::shape(guard.row, g::Node::Column(guard.column));
+        let ty = storage(guard.column.value);
+        let compatible = match guard.input {
+            edsl::FilterInput::Text(_) => ty == String.type,
+            edsl::FilterInput::Int(_) => ty == Int.type,
+            edsl::FilterInput::Number(_) => ty == Float.type,
+            edsl::FilterInput::Bool(_) => ty == Bool.type,
+            _ => False,
+        };
+        if guard.op != edsl::FilterOp::Eq && guard.op != edsl::FilterOp::Ne { fail!("relation guard supports only Eq or Ne", relation.id) }
+        else if !compatible { fail!("relation guard literal does not match field storage", relation.id) }
+        else { () }
     } else { () };
-    g::shape(guard.row, g::Node::Column(guard.column));
-    let ty = storage(guard.column.value);
-    let compatible = match guard.input {
-        edsl::FilterInput::Text(_) => ty == String.type,
-        edsl::FilterInput::Int(_) => ty == Int.type,
-        edsl::FilterInput::Number(_) => ty == Float.type,
-        edsl::FilterInput::Bool(_) => ty == Bool.type,
-        _ => False,
-    };
-    if guard.op != edsl::FilterOp::Eq && guard.op != edsl::FilterOp::Ne { fail!("relation guard supports only Eq or Ne", relation.id) }
-    else if !compatible { fail!("relation guard literal does not match field storage", relation.id) }
-    else { {field: guard.column.name, op: guard.op, input: guard.input} }
+    {field: guard.column.name, op: guard.op, input: guard.input}
 };
-def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
+def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) { {guard: None, id, a, z, direction} };
+def validate_link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
     validate(a); validate(z);
     let a_role = role(a.to);
     let z_role = role(z.to);
@@ -83,9 +74,7 @@ def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a
 
 # 条件属于 hub 行上的业务连接，不写回两个端点关系。
 def guarded_link: for(Row, Scalar: codec::Encode) Fn(Link, model::Field(Row, Scalar), edsl::FilterOp, Scalar) -> Link = fn(declared, field, op, value) {
-    let checked = link(declared.id, declared.a, declared.z, declared.direction);
-    let condition = guarded(checked.a, field, op, value).guard;
-    checked <~ {guard: condition}
+    declared <~ {guard: guarded(declared.a, field, op, value).guard}
 };
 
 # 此桥接器显式对接现有 transform 准备结构，物理编码只接受身份标量。
@@ -96,41 +85,42 @@ def storage: Fn(Type) -> Type = fn(ty) {
     if td::kind(resolved) == td::TypeDescKind::Newtype { storage(td::children(resolved)[0]) }
     else { resolved }
 };
-def owner: Fn(edsl::PreparedPayload, Endpoint) -> edsl::EntityEntry = fn(payload, endpoint) {
-    let checked = model::validate_prepared(endpoint.dataset);
+def owner: Fn(edsl::PreparedPayload, Endpoint, Bool) -> edsl::EntityEntry = fn(payload, endpoint, checking) {
+    let checked = if checking { model::validate_prepared(endpoint.dataset) } else { endpoint.dataset };
     let entry = match array::find(payload.entities, fn(entry) { entry.id == checked.id }) {
         Some(value) => value, None => fail!("typed relation dataset is not registered in transform", checked.id),
     };
-    if entry.table != checked.source || entry.union != None {
+    if checking && (entry.table != checked.source || entry.union != None) {
         fail!("typed relation source does not match transform dataset", checked.id)
     } else {
         let grain = match entry.dataset {
             Some(spec) => spec.grain,
             None => array::map(array::filter(entry.fields, fn(field) { field.is_key }), fn(field) { field.name }),
         };
-        if grain != checked.grain { fail!("typed relation grain does not match transform dataset", checked.id) }
+        if checking && grain != checked.grain { fail!("typed relation grain does not match transform dataset", checked.id) }
         else { entry }
     }
 };
-def field: Fn(edsl::EntityEntry, model::Part) -> Int = fn(owner, part) {
+def field: Fn(edsl::EntityEntry, model::Part, Bool) -> Int = fn(owner, part, checking) {
     match array::find(owner.fields, fn(field) { field.name == part.source }) {
-        Some(field) => if !qb::is_sql_identifier(field.column) || field.ty != storage(part.value) || field.nullable != part.nullable {
+        Some(field) => if checking && (!qb::is_sql_identifier(field.column) || field.ty != storage(part.value) || field.nullable != part.nullable) {
             fail!("typed role field does not match physical transform storage", owner.id, part.source)
         } else { field.index },
         None => fail!("typed role field is missing from transform dataset", owner.id, part.source),
     }
 };
-def lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(payload, declared) {
-    let checked = validate(declared);
-    let from = owner(payload, checked.from);
-    let to = owner(payload, checked.to);
-    let source = role(checked.from);
-    let target = role(checked.to);
+def lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(payload, declared) { lower_mode(payload, declared, False) };
+def lower_mode: Fn(edsl::PreparedPayload, Relation, Bool) -> edsl::RelationEntry = fn(payload, declared, checking) {
+    let checked = if checking { validate(declared) } else { declared };
+    let from = owner(payload, checked.from, checking);
+    let to = owner(payload, checked.to, checking);
+    let source = role_mode(checked.from, checking);
+    let target = role_mode(checked.to, checking);
     let guard = match checked.guard {
         None => None,
         Some(guard) => {
-            let predicate = prepare_guard(checked, guard);
-            if !array::any(from.fields, fn(field) { field.name == guard.column.name && field.ty == storage(guard.column.value) && field.nullable == guard.column.nullable && qb::is_sql_identifier(field.column) }) {
+            let predicate = prepare_guard_mode(checked, guard, checking);
+            if checking && !array::any(from.fields, fn(field) { field.name == guard.column.name && field.ty == storage(guard.column.value) && field.nullable == guard.column.nullable && qb::is_sql_identifier(field.column) }) {
                 fail!("relation guard field does not match physical transform storage", checked.id)
             } else { Some(predicate) }
         },
@@ -144,51 +134,118 @@ def lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(paylo
         let part = match array::find(source.parts, fn(part) { part.target == other.target }) {
             Some(value) => value, None => fail!("typed relation source identity is incomplete", checked.id),
         };
-        edsl::RelationKey::Eq({from: field(from, part), to: field(to, other)})
+        edsl::RelationKey::Eq({from: field(from, part, checking), to: field(to, other, checking)})
     });
     {id: checked.id, label: checked.id, summary: "", from: from.index, to: to.index,
         cardinality: checked.cardinality,
         key: if array::length(parts) == 1 { parts[0] } else { edsl::RelationKey::And(parts) }, guard}
 };
-def lower_all: Fn(edsl::PreparedPayload, Array(Relation)) -> Array(edsl::RelationEntry) = fn(payload, declarations) {
-    let endpoints = array::flat_map(declarations, fn(relation) { [relation.from, relation.to] });
-    array::map(endpoints, fn(endpoint) {
-        let current = role(endpoint);
-        if array::any(endpoints, fn(other) {
-            let candidate = role(other);
-            (candidate.entity == current.entity && candidate.identity != current.identity)
-                || (other.dataset.id == endpoint.dataset.id && (other.dataset.row != endpoint.dataset.row
-                    || other.dataset.source != endpoint.dataset.source || other.dataset.grain != endpoint.dataset.grain
-                    || (other.role == endpoint.role && candidate != current)))
-        }) { fail!("typed relations contain conflicting entity or dataset declarations", endpoint.dataset.id) }
-        else { () }
-    });
+def lower_all: Fn(edsl::PreparedPayload, Array(Relation)) -> Array(edsl::RelationEntry) = fn(payload, declarations) { lower_all_mode(payload, declarations, False) };
+def lower_all_mode: Fn(edsl::PreparedPayload, Array(Relation), Bool) -> Array(edsl::RelationEntry) = fn(payload, declarations, checking) {
+    if checking {
+        let endpoints = array::flat_map(declarations, fn(relation) { [relation.from, relation.to] });
+        array::map(endpoints, fn(endpoint) {
+            let current = role(endpoint);
+            if array::any(endpoints, fn(other) {
+                let candidate = role(other);
+                (candidate.entity == current.entity && candidate.identity != current.identity)
+                    || (other.dataset.id == endpoint.dataset.id && (other.dataset.row != endpoint.dataset.row
+                        || other.dataset.source != endpoint.dataset.source || other.dataset.grain != endpoint.dataset.grain
+                        || (other.role == endpoint.role && candidate != current)))
+            }) { fail!("typed relations contain conflicting entity or dataset declarations", endpoint.dataset.id) }
+            else { () }
+        });
+        ()
+    } else { () };
     array::map(declarations, fn(relation) {
-        if array::length(array::filter(declarations, fn(other) { other.id == relation.id })) != 1 {
+        if checking && array::length(array::filter(declarations, fn(other) { other.id == relation.id })) != 1 {
             fail!("typed relation ids must be unique", relation.id)
-        } else { lower(payload, relation) }
+        } else { lower_mode(payload, relation, checking) }
     })
 };
-def lower_alternative: Fn(edsl::PreparedPayload, String, Array(Relation), edsl::RelationCardinality) -> edsl::RelationEntry = fn(payload, id, choices, cardinality) {
-    let lowered = lower_all(payload, choices);
-    if id == "" || array::length(lowered) < 2 { fail!("alternative relation requires a name and complete alternatives", id) }
+def lower_alternative: Fn(edsl::PreparedPayload, String, Array(Relation), edsl::RelationCardinality) -> edsl::RelationEntry = fn(payload, id, choices, cardinality) { lower_alternative_mode(payload, id, choices, cardinality, False) };
+def lower_alternative_mode: Fn(edsl::PreparedPayload, String, Array(Relation), edsl::RelationCardinality, Bool) -> edsl::RelationEntry = fn(payload, id, choices, cardinality, checking) {
+    let lowered = lower_all_mode(payload, choices, checking);
+    if checking && (id == "" || array::length(lowered) < 2) { fail!("alternative relation requires a name and complete alternatives", id) }
     else {
         let first = lowered[0];
-        if !array::all(lowered, fn(other) { other.from == first.from && other.to == first.to && other.guard == first.guard }) {
+        if checking && !array::all(lowered, fn(other) { other.from == first.from && other.to == first.to && other.guard == first.guard }) {
             fail!("alternative relations must share explicit dataset endpoints and guard", id)
         } else { first <~ {id, label: id, cardinality, key: edsl::RelationKey::Or(array::map(lowered, fn(relation) { relation.key }))} }
     }
 };
-def lower_link: Fn(edsl::PreparedPayload, Link) -> edsl::BusinessLinkEntry = fn(payload, declared) {
-    let checked = link(declared.id, declared.a, declared.z, declared.direction);
-    let a = lower(payload, checked.a);
-    let z = lower(payload, checked.z);
-    if !array::any(payload.relations, fn(entry) { entry == a }) || !array::any(payload.relations, fn(entry) { entry == z }) {
+def lower_link: Fn(edsl::PreparedPayload, Link) -> edsl::BusinessLinkEntry = fn(payload, declared) { lower_link_mode(payload, declared, False) };
+def lower_link_mode: Fn(edsl::PreparedPayload, Link, Bool) -> edsl::BusinessLinkEntry = fn(payload, declared, checking) {
+    let checked = if checking { validate_link(declared.id, declared.a, declared.z, declared.direction) } else { declared };
+    let a = lower_mode(payload, checked.a, checking);
+    let z = lower_mode(payload, checked.z, checking);
+    if checking && (!array::any(payload.relations, fn(entry) { entry == a }) || !array::any(payload.relations, fn(entry) { entry == z })) {
         fail!("business link endpoints must be registered typed relations", declared.id)
     } else {
         {id: checked.id, hub: a.from, participant: a.to, a_relation: a.id, z_relation: z.id,
-            direction: checked.direction, guard: match declared.guard { None => None, Some(condition) => lower(payload, checked.a <~ {guard: Some(condition)}).guard }}
+            direction: checked.direction, guard: match declared.guard { None => None, Some(condition) => lower_mode(payload, checked.a <~ {guard: Some(condition)}, checking).guard }}
     }
 };
 
-pub use self::{Guard, guarded_link, guarded, Endpoint, Relation, Link, endpoint, relation, link, validate, lower, lower_all, lower_alternative, lower_link};
+pub use self::{Guard, guarded_link, guarded, Endpoint, Relation, Link, endpoint, relation, link, validate, lower, lower_all, lower_alternative, lower_link, lower_mode, lower_all_mode, lower_alternative_mode, lower_link_mode};
+
+def scalar_input: for(Scalar: codec::Encode) Fn(Scalar) -> edsl::FilterInput = fn(value) { match codec::encode(value) {
+    Value::String(text) => edsl::FilterInput::Text(text), Value::Int(number) => edsl::FilterInput::Int(number),
+    Value::Float(number) => edsl::FilterInput::Number(number), Value::True => edsl::FilterInput::Bool(True), Value::False => edsl::FilterInput::Bool(False),
+    _ => fail!("model predicate requires a scalar literal"),
+} };
+
+# 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
+def checked_endpoint: for(Row) Fn(model::Dataset(Row), model::Role(Row)) -> Endpoint = fn(dataset, role) {
+    {dataset: model::checked_prepare(dataset, [role]), role: role.id}
+};
+def checked_relation: for(From, To) Fn(String, model::Dataset(From), model::Role(From), model::Dataset(To), model::Role(To), edsl::RelationCardinality) -> Relation = fn(id, from, from_role, to, to_role, cardinality) {
+    validate({guard: None, id, from: checked_endpoint(from, from_role), to: checked_endpoint(to, to_role), cardinality})
+};
+def checked_guarded: for(Row, Scalar: codec::Encode) Fn(Relation, model::Field(Row, Scalar), edsl::FilterOp, Scalar) -> Relation = fn(relation, field, op, value) {
+    let checked = validate(relation);
+    let column = g::checked_input(field);
+    if checked.from.dataset.row != Row.type { fail!("relation guard belongs to another source row", checked.id) } else { () };
+    let input = match codec::encode(value) {
+        Value::String(text) => edsl::FilterInput::Text(text),
+        Value::Int(number) => edsl::FilterInput::Int(number),
+        Value::Float(number) => edsl::FilterInput::Number(number),
+        Value::True => edsl::FilterInput::Bool(True),
+        Value::False => edsl::FilterInput::Bool(False),
+        _ => fail!("relation guard requires a scalar literal", checked.id),
+    };
+    let guard: Guard = {row: Row.type, dataset: checked.from.dataset.id, source: checked.from.dataset.source,
+        column: {name: field.name, value: Scalar.type, nullable: column.nullable}, op, input};
+    prepare_guard(checked, guard);
+    checked <~ {guard: Some(guard)}
+};
+def checked_link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
+    validate(a); validate(z);
+    let a_role = role(a.to);
+    let z_role = role(z.to);
+    if id == "" || a.id == z.id || a.from.dataset.id != z.from.dataset.id
+        || a.from.dataset.row != z.from.dataset.row || a.from.dataset.source != z.from.dataset.source
+        || a.from.role == z.from.role || a.to.dataset.id != z.to.dataset.id || a.to.role != z.to.role
+        || a.to.dataset.row != z.to.dataset.row || a.to.dataset.source != z.to.dataset.source
+        || a_role.entity != z_role.entity || a_role.identity != z_role.identity {
+        fail!("business link requires distinct hub roles and one explicit participant dataset", id)
+    } else { {guard: None, id, a, z, direction} }
+};
+def checked_guarded_link: for(Row, Scalar: codec::Encode) Fn(Link, model::Field(Row, Scalar), edsl::FilterOp, Scalar) -> Link = fn(declared, field, op, value) {
+    let checked = checked_link(declared.id, declared.a, declared.z, declared.direction);
+    let condition = checked_guarded(checked.a, field, op, value).guard;
+    checked <~ {guard: condition}
+};
+pub use self::{checked_endpoint, checked_relation, checked_guarded, checked_link, checked_guarded_link};
+
+def checked_lower: Fn(edsl::PreparedPayload, Relation) -> edsl::RelationEntry = fn(payload, declared) { lower_mode(payload, declared, True) };
+pub use self::{checked_lower};
+
+def checked_lower_all: Fn(edsl::PreparedPayload, Array(Relation)) -> Array(edsl::RelationEntry) = fn(payload, declarations) { lower_all_mode(payload, declarations, True) };
+pub use self::{checked_lower_all};
+
+def checked_lower_alternative: Fn(edsl::PreparedPayload, String, Array(Relation), edsl::RelationCardinality) -> edsl::RelationEntry = fn(payload, id, choices, cardinality) { lower_alternative_mode(payload, id, choices, cardinality, True) };
+pub use self::{checked_lower_alternative};
+
+def checked_lower_link: Fn(edsl::PreparedPayload, Link) -> edsl::BusinessLinkEntry = fn(payload, declared) { lower_link_mode(payload, declared, True) };
+pub use self::{checked_lower_link};

@@ -76,25 +76,17 @@ def checked: for(Row, Value) Fn(Expr(Row, Value)) -> Expr(Row, Value) = fn(expr)
     } else { expr }
 };
 def input: for(Row, Value) Fn(model::Field(Row, Value)) -> Expr(Row, Value) = fn(field) {
-    if field.owner != Row.type || field.value != Value.type { fail!("group input witness does not match its type", field.name) }
-    else {
-        let verified = if field.nullable { model::optional_field(Row.type, Value.type, field.name) }
-            else { model::field(Row.type, Value.type, field.name) };
-        checked({row: Row.type, value: Value.type, nullable: verified.nullable,
-            node: Node::Column({name: verified.name, value: Value.type, nullable: verified.nullable})})
-    }
+    {row: Row.type, value: field.value, nullable: field.nullable, node: Node::Column({name: field.name, value: field.value, nullable: field.nullable})}
 };
 def seconds: for(Row) Fn(Expr(Row, quantity::Milliseconds)) -> Expr(Row, quantity::Seconds) = fn(source) {
-    let valid = checked(source);
-    {row: Row.type, value: quantity::Seconds.type, nullable: valid.nullable, node: Node::Seconds(valid.node)}
+    {row: Row.type, value: quantity::Seconds.type, nullable: source.nullable, node: Node::Seconds(source.node)}
 };
 def rate: for(Row) Fn(Expr(Row, quantity::Bytes), Expr(Row, quantity::Seconds)) -> Expr(Row, quantity::BytesPerSecond) = fn(amount, duration) {
-    {row: Row.type, value: quantity::BytesPerSecond.type, nullable: True,
-        node: Node::Rate({amount: checked(amount).node, duration: checked(duration).node})}
+    {row: Row.type, value: quantity::BytesPerSecond.type, nullable: True, node: Node::Rate({amount: amount.node, duration: duration.node})}
 };
 
 def ipv4: for(Row) Fn(Expr(Row, String)) -> Expr(Row, scalars::Ipv4) = fn(source) {
-    {row: Row.type, value: scalars::Ipv4.type, nullable: True, node: Node::Ipv4(checked(source).node)}
+    {row: Row.type, value: scalars::Ipv4.type, nullable: True, node: Node::Ipv4(source.node)}
 };
 
 def bucket_encoding: Fn(Type, qb::UtcBucketUnit) -> qb::UtcBucketEncoding = fn(value, unit) {
@@ -109,9 +101,7 @@ def bucket_encoding: Fn(Type, qb::UtcBucketUnit) -> qb::UtcBucketEncoding = fn(v
         } },
     }
 };
-def utc_bucket: for(Row, Time) Fn(Expr(Row, Time), qb::UtcBucketUnit) -> Expr(Row, Time) = fn(input, unit) {
-    let source = checked(input);
-    bucket_encoding(Time.type, unit);
+def utc_bucket: for(Row, Time) Fn(Expr(Row, Time), qb::UtcBucketUnit) -> Expr(Row, Time) = fn(source, unit) {
     {row: Row.type, value: Time.type, nullable: True, node: Node::UtcBucket({input: source.node, unit})}
 };
 type Filter = enum { Eq, Ne, Gt, Ge, Lt, Le, Contains, NotContains, StartsWith, EndsWith, InSubnet, NotInSubnet };
@@ -152,13 +142,10 @@ def validate_filters: Fn(Type, Array(Filter)) -> () = fn(value, filters) {
 };
 type DimensionPolicy = struct { projectable: Bool, filters: Array(Filter) };
 type MemberKind = enum { Dimension(DimensionPolicy), Transfer(TransferMember), Numeric(Statistic) };
-type BindingContract = enum { Dimension, Transfer(MeasureGroup), Identity(model::PreparedRole), Numeric(NumericGroupFacts) };
+type DimensionGroupFacts = struct { id: String, value: Type, projectable: Bool, filters: Array(Filter) };
+type BindingContract = enum { Dimension, DeferredDimension(DimensionGroupFacts), Transfer(MeasureGroup), Identity(model::PreparedRole), Numeric(NumericGroupFacts) };
 type DimensionGroup(Value) = struct { id: String, value: Type, projectable: Bool, filters: Array(Filter) };
-def dimension_group: for(Value) Fn(String, TypeOf(Value), Bool, Array(Filter)) -> DimensionGroup(Value) = fn(id, value, projectable, filters) {
-    validate_filters(Value.type, filters);
-    if id == "" { fail!("group id must be nonempty", id) }
-    else { {id, value, projectable, filters} }
-};
+def dimension_group: for(Value) Fn(String, TypeOf(Value), Bool, Array(Filter)) -> DimensionGroup(Value) = fn(id, value, projectable, filters) { {id, value, projectable, filters} };
 type Member = struct {
     group: String, local: String, id: String, node: Node, value: Type, nullable: Bool,
     aggregate: Option(qb::AggregateFunction), projectable: Bool, filters: Array(Filter),
@@ -173,18 +160,9 @@ def binding_roles: Fn(BindingFacts) -> Array(model::PreparedRole) = fn(binding) 
     match binding.contract { BindingContract::Identity(role) => [role], _ => [] }
 };
 def dimension: for(Row, Value) Fn(model::Dataset(Row), DimensionGroup(Value), Expr(Row, Value), String, Bool, Array(Filter)) -> Binding(Row) = fn(dataset, group, source, publish, projectable, filters) {
-    model::prepare(dataset, []);
-    validate_filters(Value.type, group.filters);
-    validate_filters(Value.type, filters);
-    let valid = checked(source);
-    if group.id == "" || group.value != Value.type { fail!("dimension group witness does not match its type", group.id) }
-    else if (projectable && !group.projectable) || !array::all(filters, fn(op) { array::any(group.filters, fn(allowed) { allowed == op }) }) {
-        fail!("dimension binding cannot expand group capabilities", publish)
-    } else {
-        {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Dimension, members: [{group: group.id, local: "value", id: publish,
-            node: valid.node, value: valid.value, nullable: valid.nullable,
-            aggregate: None, projectable, filters, kind: MemberKind::Dimension({projectable: group.projectable, filters: group.filters})}]}
-    }
+    {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::DeferredDimension({id: group.id, value: group.value, projectable: group.projectable, filters: group.filters}), members: [{group: group.id, local: "value", id: publish,
+        node: source.node, value: source.value, nullable: source.nullable, aggregate: None, projectable, filters,
+        kind: MemberKind::Dimension({projectable: group.projectable, filters: group.filters})}]}
 };
 
 # 先实验有明确输入签名的流量模板；绑定没有修改聚合算子的入口。
@@ -194,30 +172,16 @@ def transfer: MeasureGroup = {id: "transfer", members: [TransferMember::AmountTo
 type Rename = struct { member: TransferMember, publish: String };
 type Recipe = struct { local: String, node: Node, value: Type, function: qb::AggregateFunction };
 def transfer_binding: for(Row) Fn(model::Dataset(Row), MeasureGroup, Expr(Row, quantity::Bytes), Expr(Row, quantity::Seconds), Array(Rename)) -> Binding(Row) = fn(dataset, group, amount, elapsed, names) {
-    model::prepare(dataset, []);
-    let quantity = checked(amount);
-    let speed = rate(quantity, elapsed);
-    if group.id == "" || array::length(group.members) == 0 { fail!("measure group must declare members", group.id) }
-    else if array::length(names) != array::length(group.members)
-        || !array::all(group.members, fn(member) {
-            array::length(array::filter(group.members, fn(other) { other == member })) == 1
-                && array::length(array::filter(names, fn(name) { name.member == member })) == 1
-        }) { fail!("measure binding must name every member exactly once", group.id) }
-    else {
-        let members = array::map(group.members, fn(member) {
-            let name = match array::find(names, fn(name) { name.member == member }) {
-                Some(value) => value, None => fail!("measure binding is missing a member", group.id),
-            };
-            let recipe: Recipe = match member {
-                TransferMember::AmountTotal => {local: "amount_total", node: quantity.node, value: quantity.value, function: qb::AggregateFunction::Sum},
-                TransferMember::RatePeak => {local: "rate_peak", node: speed.node, value: speed.value, function: qb::AggregateFunction::Max},
-                TransferMember::RateMean => {local: "rate_mean", node: speed.node, value: speed.value, function: qb::AggregateFunction::Avg},
-            };
-            {group: group.id, local: recipe.local, id: name.publish, node: recipe.node,
-                value: recipe.value, nullable: True, aggregate: Some(recipe.function), projectable: True, filters: [], kind: MemberKind::Transfer(member)}.ty!(Member)
-        });
-        {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Transfer(group), members}
-    }
+    let speed = rate(amount, elapsed);
+    {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Transfer(group), members: array::map(names, fn(name) {
+        let recipe: Recipe = match name.member {
+            TransferMember::AmountTotal => {local: "amount_total", node: amount.node, value: amount.value, function: qb::AggregateFunction::Sum},
+            TransferMember::RatePeak => {local: "rate_peak", node: speed.node, value: speed.value, function: qb::AggregateFunction::Max},
+            TransferMember::RateMean => {local: "rate_mean", node: speed.node, value: speed.value, function: qb::AggregateFunction::Avg},
+        };
+        {group: group.id, local: recipe.local, id: name.publish, node: recipe.node, value: recipe.value, nullable: True,
+            aggregate: Some(recipe.function), projectable: True, filters: [], kind: MemberKind::Transfer(name.member)}.ty!(Member)
+    })}
 };
 
 # 普通数值统计不声明采样角色，也不要求 Metric 或时钟。
@@ -241,48 +205,28 @@ def validate_numeric: Fn(String, Type, Array(Statistic)) -> () = fn(id, value, m
         fail!("numeric Sum requires an explicitly additive quantity type", id)
     } else { () }
 };
-def numeric_group: for(Value) Fn(String, TypeOf(Value), Array(Statistic)) -> NumericGroup(Value) = fn(id, value, members) {
-    validate_numeric(id, value, members);
-    {id, value, members}
-};
+def numeric_group: for(Value) Fn(String, TypeOf(Value), Array(Statistic)) -> NumericGroup(Value) = fn(id, value, members) { {id, value, members} };
 def numeric_binding: for(Row, Value) Fn(model::Dataset(Row), NumericGroup(Value), Expr(Row, Value), Array(StatisticName)) -> Binding(Row) = fn(dataset, group, source, names) {
-    model::prepare(dataset, []);
-    let input = checked(source);
-    validate_numeric(group.id, group.value, group.members);
-    if group.value != Value.type { fail!("numeric group type witness does not match its parameter", group.id) }
-    else if array::length(names) != array::length(group.members) || !array::all(group.members, fn(member) { array::length(array::filter(names, fn(name) { name.member == member })) == 1 }) {
-        fail!("numeric binding must name every statistic exactly once", group.id)
-    } else {
-        let members = array::map(group.members, fn(member) {
-            let name = match array::find(names, fn(name) { name.member == member }) { Some(name) => name.publish, None => fail!("missing numeric statistic name", group.id) };
-            {group: group.id, local: statistic_name(member), id: name, node: input.node, value: Value.type, nullable: True,
-                aggregate: Some(statistic_function(member)), projectable: True, filters: [], kind: MemberKind::Numeric(member)}.ty!(Member)
-        });
-        {row: Row.type, dataset: dataset.id, source: dataset.source,
-            contract: BindingContract::Numeric({id: group.id, value: group.value, members: group.members}), members}
-    }
+    {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Numeric({id: group.id, value: group.value, members: group.members}),
+        members: array::map(names, fn(name) {
+            let local = match name.member { Statistic::Mean => "mean", Statistic::Min => "min", Statistic::Max => "max", Statistic::Sum => "sum" };
+            let function = match name.member { Statistic::Mean => qb::AggregateFunction::Avg, Statistic::Min => qb::AggregateFunction::Min, Statistic::Max => qb::AggregateFunction::Max, Statistic::Sum => qb::AggregateFunction::Sum };
+            {group: group.id, local, id: name.publish, node: source.node, value: source.value, nullable: True,
+                aggregate: Some(function), projectable: True, filters: [], kind: MemberKind::Numeric(name.member)}.ty!(Member)
+        })}
 };
 
 type IdentityName = struct { member: String, publish: String };
 def identity_dimensions: for(Row) Fn(model::Dataset(Row), model::Role(Row), Array(IdentityName)) -> Binding(Row) = fn(dataset, role, names) {
-    let verified = model::prepare(dataset, [role]);
-    if array::length(names) != array::length(role.parts) || !array::all(role.parts, fn(part) {
-        array::length(array::filter(names, fn(name) { name.member == part.target })) == 1
-    }) { fail!("identity dimensions must publish the complete identity", role.id) }
-    else {
-        let parts = array::map(role.parts, fn(part) { {name: part.source, value: part.value, nullable: part.nullable}.ty!(Column) });
-        let members = array::map(role.parts, fn(part) {
-            let name = match array::find(names, fn(name) { name.member == part.target }) {
-                Some(value) => value, None => fail!("identity dimension name is missing", part.target),
-            };
+    let parts = array::map(role.parts, fn(part) { {name: part.source, value: part.value, nullable: part.nullable}.ty!(Column) });
+    {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Identity(model::prepare(dataset, [role]).roles[0]),
+        members: array::map(names, fn(name) {
+            let part = match array::find(role.parts, fn(part) { part.target == name.member }) { Some(part) => part, None => fail!("identity dimension target is missing", name.member) };
             {group: `identity_\{role.entity}`, local: part.target, id: name.publish,
-                node: Node::Identity({column: {name: part.source, value: part.value, nullable: part.nullable}, parts}),
-                value: part.value, nullable: array::any(parts, fn(part) { part.nullable }),
-                aggregate: None, projectable: True, filters: [Filter::Eq],
+                node: Node::Identity({column: {name: part.source, value: part.value, nullable: part.nullable}, parts}), value: part.value,
+                nullable: array::any(parts, fn(part) { part.nullable }), aggregate: None, projectable: True, filters: [Filter::Eq],
                 kind: MemberKind::Dimension({projectable: True, filters: [Filter::Eq]})}.ty!(Member)
-        });
-        {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Identity(verified.roles[0]), members}
-    }
+        })}
 };
 
 def validate_member_contract: Fn(Member) -> () = fn(member) {
@@ -324,6 +268,17 @@ def validate_binding_contract: Fn(model::PreparedDataset, BindingFacts) -> () = 
                 fail!("dimension binding must publish its declared member", binding.dataset)
             } else { () }
         },
+        BindingContract::DeferredDimension(group) => {
+            if group.id == "" || array::length(binding.members) != 1 {
+                fail!("dimension binding must publish its declared member", binding.dataset)
+            } else {
+                let member = binding.members[0];
+                if member.group != group.id || member.local != "value" || member.value != group.value
+                    || member.kind != MemberKind::Dimension({projectable: group.projectable, filters: group.filters}) {
+                    fail!("dimension group witness does not match its binding", member.id)
+                } else { () }
+            }
+        },
         BindingContract::Numeric(group) => {
             validate_numeric(group.id, group.value, group.members);
             if array::length(binding.members) != array::length(group.members) || !array::all(binding.members, fn(member) { member.node == binding.members[0].node }) || !array::all(group.members, fn(recipe) {
@@ -353,7 +308,7 @@ def validate_binding_contract: Fn(model::PreparedDataset, BindingFacts) -> () = 
         },
     }
 };
-def prepare_facts: Fn(model::PreparedDataset, Array(BindingFacts)) -> Array(Member) = fn(dataset, bindings) {
+def validate_facts: Fn(model::PreparedDataset, Array(BindingFacts)) -> Array(Member) = fn(dataset, bindings) {
     model::validate_prepared(dataset);
     let members = array::flat_map(bindings, fn(binding) {
         if binding.row != dataset.row || binding.dataset != dataset.id || binding.source != dataset.source { fail!("group binding belongs to a different dataset", binding.dataset) }
@@ -374,7 +329,7 @@ def prepare_facts: Fn(model::PreparedDataset, Array(BindingFacts)) -> Array(Memb
     })
 };
 def prepare: for(Row) Fn(model::Dataset(Row), Array(Binding(Row))) -> Array(Member) = fn(dataset, bindings) {
-    prepare_facts(model::prepare(dataset, []), array::map(bindings, binding_facts))
+    array::flat_map(bindings, fn(binding) { binding.members })
 };
 
 def node_value: Fn(Node) -> Type = fn(node) {
@@ -451,8 +406,130 @@ pub use self::{Column, Node, Shape, Expr, input, seconds, rate, Filter, MemberKi
     DimensionGroup, dimension_group, dimension, MeasureGroup, TransferMember, transfer,
     Rename, transfer_binding, Member, Binding, prepare, query};
 pub use self::{identity_dimensions, IdentityName};
-pub use self::{BindingFacts, binding_facts, binding_roles, prepare_facts, lower, checked, shape, representation, ipv4, ipv4_filters, equality_filters, text_search_filters, numeric_filters, time_filters};
+pub use self::{Recipe, BindingContract, BindingFacts, binding_facts, binding_roles, prepare_facts, lower, checked, shape, representation, ipv4, ipv4_filters, equality_filters, text_search_filters, numeric_filters, time_filters};
 
 pub use self::{Statistic, NumericGroup, NumericGroupFacts, StatisticName, numeric_group, numeric_binding};
 
 pub use self::{utc_bucket, BucketInput};
+
+# 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
+def checked_input: for(Row, Value) Fn(model::Field(Row, Value)) -> Expr(Row, Value) = fn(field) {
+    if field.owner != Row.type || field.value != Value.type { fail!("group input witness does not match its type", field.name) }
+    else {
+        let verified = if field.nullable { model::checked_optional_field(Row.type, Value.type, field.name) }
+            else { model::checked_field(Row.type, Value.type, field.name) };
+        checked({row: Row.type, value: Value.type, nullable: verified.nullable,
+            node: Node::Column({name: verified.name, value: Value.type, nullable: verified.nullable})})
+    }
+};
+def checked_dimension_group: for(Value) Fn(String, TypeOf(Value), Bool, Array(Filter)) -> DimensionGroup(Value) = fn(id, value, projectable, filters) {
+    validate_filters(Value.type, filters);
+    if id == "" { fail!("group id must be nonempty", id) }
+    else { {id, value, projectable, filters} }
+};
+def checked_dimension: for(Row, Value) Fn(model::Dataset(Row), DimensionGroup(Value), Expr(Row, Value), String, Bool, Array(Filter)) -> Binding(Row) = fn(dataset, group, source, publish, projectable, filters) {
+    model::checked_prepare(dataset, []);
+    validate_filters(Value.type, group.filters);
+    validate_filters(Value.type, filters);
+    let valid = checked(source);
+    if group.id == "" || group.value != Value.type { fail!("dimension group witness does not match its type", group.id) }
+    else if (projectable && !group.projectable) || !array::all(filters, fn(op) { array::any(group.filters, fn(allowed) { allowed == op }) }) {
+        fail!("dimension binding cannot expand group capabilities", publish)
+    } else {
+        {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Dimension, members: [{group: group.id, local: "value", id: publish,
+            node: valid.node, value: valid.value, nullable: valid.nullable,
+            aggregate: None, projectable, filters, kind: MemberKind::Dimension({projectable: group.projectable, filters: group.filters})}]}
+    }
+};
+def checked_seconds: for(Row) Fn(Expr(Row, quantity::Milliseconds)) -> Expr(Row, quantity::Seconds) = fn(source) {
+    let valid = checked(source);
+    {row: Row.type, value: quantity::Seconds.type, nullable: valid.nullable, node: Node::Seconds(valid.node)}
+};
+def checked_rate: for(Row) Fn(Expr(Row, quantity::Bytes), Expr(Row, quantity::Seconds)) -> Expr(Row, quantity::BytesPerSecond) = fn(amount, duration) {
+    {row: Row.type, value: quantity::BytesPerSecond.type, nullable: True,
+        node: Node::Rate({amount: checked(amount).node, duration: checked(duration).node})}
+};
+def checked_ipv4: for(Row) Fn(Expr(Row, String)) -> Expr(Row, scalars::Ipv4) = fn(source) {
+    {row: Row.type, value: scalars::Ipv4.type, nullable: True, node: Node::Ipv4(checked(source).node)}
+};
+def checked_utc_bucket: for(Row, Time) Fn(Expr(Row, Time), qb::UtcBucketUnit) -> Expr(Row, Time) = fn(input, unit) {
+    let source = checked(input);
+    bucket_encoding(Time.type, unit);
+    {row: Row.type, value: Time.type, nullable: True, node: Node::UtcBucket({input: source.node, unit})}
+};
+def checked_numeric_group: for(Value) Fn(String, TypeOf(Value), Array(Statistic)) -> NumericGroup(Value) = fn(id, value, members) {
+    validate_numeric(id, value, members);
+    {id, value, members}
+};
+def checked_numeric_binding: for(Row, Value) Fn(model::Dataset(Row), NumericGroup(Value), Expr(Row, Value), Array(StatisticName)) -> Binding(Row) = fn(dataset, group, source, names) {
+    model::checked_prepare(dataset, []);
+    let input = checked(source);
+    validate_numeric(group.id, group.value, group.members);
+    if group.value != Value.type { fail!("numeric group type witness does not match its parameter", group.id) }
+    else if array::length(names) != array::length(group.members) || !array::all(group.members, fn(member) { array::length(array::filter(names, fn(name) { name.member == member })) == 1 }) {
+        fail!("numeric binding must name every statistic exactly once", group.id)
+    } else {
+        let members = array::map(group.members, fn(member) {
+            let name = match array::find(names, fn(name) { name.member == member }) { Some(name) => name.publish, None => fail!("missing numeric statistic name", group.id) };
+            {group: group.id, local: statistic_name(member), id: name, node: input.node, value: Value.type, nullable: True,
+                aggregate: Some(statistic_function(member)), projectable: True, filters: [], kind: MemberKind::Numeric(member)}.ty!(Member)
+        });
+        {row: Row.type, dataset: dataset.id, source: dataset.source,
+            contract: BindingContract::Numeric({id: group.id, value: group.value, members: group.members}), members}
+    }
+};
+def checked_transfer_binding: for(Row) Fn(model::Dataset(Row), MeasureGroup, Expr(Row, quantity::Bytes), Expr(Row, quantity::Seconds), Array(Rename)) -> Binding(Row) = fn(dataset, group, amount, elapsed, names) {
+    model::checked_prepare(dataset, []);
+    let quantity = checked(amount);
+    let speed = checked_rate(quantity, elapsed);
+    if group.id == "" || array::length(group.members) == 0 { fail!("measure group must declare members", group.id) }
+    else if array::length(names) != array::length(group.members)
+        || !array::all(group.members, fn(member) {
+            array::length(array::filter(group.members, fn(other) { other == member })) == 1
+                && array::length(array::filter(names, fn(name) { name.member == member })) == 1
+        }) { fail!("measure binding must name every member exactly once", group.id) }
+    else {
+        let members = array::map(group.members, fn(member) {
+            let name = match array::find(names, fn(name) { name.member == member }) {
+                Some(value) => value, None => fail!("measure binding is missing a member", group.id),
+            };
+            let recipe: Recipe = match member {
+                TransferMember::AmountTotal => {local: "amount_total", node: quantity.node, value: quantity.value, function: qb::AggregateFunction::Sum},
+                TransferMember::RatePeak => {local: "rate_peak", node: speed.node, value: speed.value, function: qb::AggregateFunction::Max},
+                TransferMember::RateMean => {local: "rate_mean", node: speed.node, value: speed.value, function: qb::AggregateFunction::Avg},
+            };
+            {group: group.id, local: recipe.local, id: name.publish, node: recipe.node,
+                value: recipe.value, nullable: True, aggregate: Some(recipe.function), projectable: True, filters: [], kind: MemberKind::Transfer(member)}.ty!(Member)
+        });
+        {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Transfer(group), members}
+    }
+};
+def checked_identity_dimensions: for(Row) Fn(model::Dataset(Row), model::Role(Row), Array(IdentityName)) -> Binding(Row) = fn(dataset, role, names) {
+    let verified = model::checked_prepare(dataset, [role]);
+    if array::length(names) != array::length(role.parts) || !array::all(role.parts, fn(part) {
+        array::length(array::filter(names, fn(name) { name.member == part.target })) == 1
+    }) { fail!("identity dimensions must publish the complete identity", role.id) }
+    else {
+        let parts = array::map(role.parts, fn(part) { {name: part.source, value: part.value, nullable: part.nullable}.ty!(Column) });
+        let members = array::map(role.parts, fn(part) {
+            let name = match array::find(names, fn(name) { name.member == part.target }) {
+                Some(value) => value, None => fail!("identity dimension name is missing", part.target),
+            };
+            {group: `identity_\{role.entity}`, local: part.target, id: name.publish,
+                node: Node::Identity({column: {name: part.source, value: part.value, nullable: part.nullable}, parts}),
+                value: part.value, nullable: array::any(parts, fn(part) { part.nullable }),
+                aggregate: None, projectable: True, filters: [Filter::Eq],
+                kind: MemberKind::Dimension({projectable: True, filters: [Filter::Eq]})}.ty!(Member)
+        });
+        {row: Row.type, dataset: dataset.id, source: dataset.source, contract: BindingContract::Identity(verified.roles[0]), members}
+    }
+};
+def checked_prepare: for(Row) Fn(model::Dataset(Row), Array(Binding(Row))) -> Array(Member) = fn(dataset, bindings) {
+    validate_facts(model::checked_prepare(dataset, []), array::map(bindings, binding_facts))
+};
+pub use self::{checked_input, checked_dimension_group, checked_dimension, checked_seconds, checked_rate, checked_ipv4, checked_utc_bucket, checked_numeric_group, checked_numeric_binding, checked_transfer_binding, checked_identity_dimensions, checked_prepare};
+
+def prepare_facts: Fn(model::PreparedDataset, Array(BindingFacts)) -> Array(Member) = fn(dataset, bindings) {
+    array::flat_map(bindings, fn(binding) { binding.members })
+};
+pub use self::{validate_facts};
