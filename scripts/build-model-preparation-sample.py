@@ -15,6 +15,7 @@ parser.add_argument("package")
 parser.add_argument("--self-check", action="store_true")
 parser.add_argument("--telora", type=Path, help="实验编译器路径；默认使用仓库 bin/telora")
 parser.add_argument("--snapshot", choices=["runtime", "full"], default="runtime", help="运行制品或完整快照对照")
+parser.add_argument("--without-knowledge", action="store_true", help="仅在隔离副本禁用知识发布，用于成本对照")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 compiler = (args.telora or root / "bin/telora").resolve()
@@ -49,9 +50,17 @@ if args.self_check:
         "self_check(revision, declarations, relations, alternatives, links, profile);\n    " + call, 1)
     path.write_text(code)
 
+if args.without_knowledge:
+    path = workspace / args.package / "src/lib.telora"
+    source = path.read_text()
+    line = '        service::publish_metadata("ontology.knowledge", knowledge::export(prepared));\n'
+    assert source.count(line) == 1
+    path.write_text(source.replace(line, ''))
+expected_model_hash = source_hash(workspace / args.package / "src")
+
 artifact = workspace / f"{args.package}.wasm"
 print(json.dumps({"workspace": str(workspace), "artifact": str(artifact),
-                  "selfCheck": args.self_check, "snapshotMode": args.snapshot,
+                  "selfCheck": args.self_check, "snapshotMode": args.snapshot, "knowledgeEnabled": not args.without_knowledge,
                   "compiler": str(compiler), "modelSourceHash": model_hash}), flush=True)
 started = time.monotonic()
 with (workspace / "build.log").open("w") as log:
@@ -61,7 +70,7 @@ with (workspace / "build.log").open("w") as log:
         "--request-fuel", "100000", "--with-memory-limit", "2048", "--report-usage"],
         stdout=log, stderr=log, timeout=600)
 assert result.returncode == 0, (workspace / "build.log").read_text()
-assert source_hash(workspace / args.package / "src") == model_hash
+assert source_hash(workspace / args.package / "src") == expected_model_hash
 phases = {}
 specialization = None
 for line in (workspace / "build.log").read_text().splitlines():
@@ -72,7 +81,7 @@ for line in (workspace / "build.log").read_text().splitlines():
         if record.get("schema") == "telora.runtime-specialization/v1":
             specialization = record
 report = {"artifact": str(artifact), "bytes": artifact.stat().st_size, "selfCheck": args.self_check,
-          "modelSourceHash": model_hash, "snapshotMode": args.snapshot, "wallSeconds": time.monotonic() - started, "phases": phases,
+          "modelSourceHash": model_hash, "snapshotMode": args.snapshot, "knowledgeEnabled": not args.without_knowledge, "wallSeconds": time.monotonic() - started, "phases": phases,
           "compiler": str(compiler), "specialization": specialization}
 (workspace / "measurement.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report))
