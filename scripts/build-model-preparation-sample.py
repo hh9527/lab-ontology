@@ -13,8 +13,11 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("package")
 parser.add_argument("--self-check", action="store_true")
+parser.add_argument("--telora", type=Path, help="实验编译器路径；默认使用仓库 bin/telora")
+parser.add_argument("--snapshot", choices=["runtime", "full"], default="runtime", help="运行制品或完整快照对照")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
+compiler = (args.telora or root / "bin/telora").resolve()
 assert args.package in json.loads((root / "telora-config.json").read_text())["members"]
 temporary = Path(os.environ.get("TMPDIR") or Path.home() / ".cache/tmp")
 temporary.mkdir(parents=True, exist_ok=True)
@@ -48,22 +51,28 @@ if args.self_check:
 
 artifact = workspace / f"{args.package}.wasm"
 print(json.dumps({"workspace": str(workspace), "artifact": str(artifact),
-                  "selfCheck": args.self_check, "modelSourceHash": model_hash}), flush=True)
+                  "selfCheck": args.self_check, "snapshotMode": args.snapshot,
+                  "compiler": str(compiler), "modelSourceHash": model_hash}), flush=True)
 started = time.monotonic()
 with (workspace / "build.log").open("w") as log:
-    result = subprocess.run([str(root / "bin/telora"), "-C", str(workspace / args.package),
-        "build", args.package, "--snapshot", "-o", str(artifact), "--initialization-fuel", "400000",
+    result = subprocess.run([str(compiler), "-C", str(workspace / args.package),
+        "build", args.package, f"--snapshot={args.snapshot}",
+        "-o", str(artifact), "--initialization-fuel", "400000",
         "--request-fuel", "100000", "--with-memory-limit", "2048", "--report-usage"],
         stdout=log, stderr=log, timeout=600)
 assert result.returncode == 0, (workspace / "build.log").read_text()
 assert source_hash(workspace / args.package / "src") == model_hash
 phases = {}
+specialization = None
 for line in (workspace / "build.log").read_text().splitlines():
     if line.startswith("{"):
         record = json.loads(line)
         if record.get("code") == "build-phase-timing":
             phases[record["phase"]] = record["elapsed_seconds"]
+        if record.get("schema") == "telora.runtime-specialization/v1":
+            specialization = record
 report = {"artifact": str(artifact), "bytes": artifact.stat().st_size, "selfCheck": args.self_check,
-          "modelSourceHash": model_hash, "wallSeconds": time.monotonic() - started, "phases": phases}
+          "modelSourceHash": model_hash, "snapshotMode": args.snapshot, "wallSeconds": time.monotonic() - started, "phases": phases,
+          "compiler": str(compiler), "specialization": specialization}
 (workspace / "measurement.json").write_text(json.dumps(report, indent=2) + "\n")
 print(json.dumps(report))

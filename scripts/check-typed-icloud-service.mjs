@@ -5,7 +5,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { withKnowledgeRunner as withTransformRunner } from '../ontology/tools/knowledge-runner.mjs';
 
 const artifact = process.argv[2];
-if (!artifact) throw new Error('Usage: node scripts/check-typed-icloud-service.mjs <typed-service.wasm>');
+if (!artifact) throw new Error('Usage: node scripts/check-typed-icloud-service.mjs <typed-service.wasm> [telora-run]');
+const runner = process.argv[3];
 // 旧声明只用于独立构造物理空表与 50 个公开投影请求，不参与服务初始化。
 const legacy = readFileSync(new URL('../icloud_model/src/model.telora', import.meta.url), 'utf8');
 const tables = new Map();
@@ -107,7 +108,7 @@ try {
     assert.equal(rejected.queries, null);
     assert.ok(rejected.diagnostics.length > 0 && rejected.diagnostics.every(item => item.index === 1));
     console.log('Passed typed MainService: 50 Dataset SQL projections, seeded limits/canonical filters/IPv4/filtered counts/computed counts/Latest/GraphPair/GraphUnion, deterministic requests and atomic mixed-batch rejection; no knowledge requests.');
-  }, { requestFuel: '100000', memory: '2048' });
+  }, { requestFuel: '100000', memory: '2048', ...(runner ? { runner } : {}) });
 } finally {
   database.close();
 }

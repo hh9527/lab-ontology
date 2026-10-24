@@ -52,6 +52,6 @@ def inventory = decl::dataset(DeviceRow.type);
 
 `decl::declare(Row.type, roles, groups, counts)` 保留 spec 的种类、粒度和 UTC 时钟，返回原有 transform 声明；角色和字段映射仍显式给出。初始化只准备 transform，完整模型校验仍由独立 `transform::self_check` 完成，输入校验保留在 transform 路径中。
 
-这一层消除了调用方的开放属性查询，但没有改变 Telora 当前保留全部 Property provider 的策略，因此不代表 Wasm 已经变小。字段属性聚合、旧注解模型迁移和知识发现不在本次范围内。
+这一层通过 trait evidence 封闭调用方的属性需求；A 保持保守的 Property provider 求值，B 的大小收益由通用 Service snapshot 专门化提供。字段属性聚合、旧注解模型迁移和知识发现不在本次范围内。
 
 验证声明证据与编译期拒绝：`python3 scripts/check-typed-declarations.py`；关系回归及 SQLite 等价验证：`python3 scripts/check-typed-relations.py`。
