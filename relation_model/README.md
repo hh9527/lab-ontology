@@ -12,7 +12,7 @@
 
 各方法也有同路径加 `/` 前缀的 HTTP POST 路由。服务生成 SQL 和绑定，由宿主执行。
 
-将兼容 Telora 二进制放在 `bin/telora` 和 `bin/telora-run` 后，从仓库根目录构建：
+将支持构建期双路产出（RFC 0318）和 `std::type_memorizer`（RFC 0319）的 Telora 二进制放在 `bin/telora` 和 `bin/telora-run` 后，从仓库根目录构建：
 
 ```sh
 bin/telora -C relation_model build relation_model --staged -o "$TMPDIR/relation-model.wasm"
@@ -27,7 +27,7 @@ bin/telora-run "$TMPDIR/relation-model.wasm" --serve stdio+jsonl://
 
 完整服务及 Intent 契约见[使用说明](../USAGE.md)。
 
-构建期通过 `experimental::build::stage` 从同一声明准备 transform 与静态知识；插件派生导航和反向链接，运行期不挂载 info／discovery。独立 `transform::self_check` 检查模型，transform 继续校验请求。
+构建期通过 `experimental::world::stage` 从显式 World 清单准备 transform 与静态知识；插件派生导航和反向链接，运行期不挂载 info／discovery。独立 `world::self_check` 检查覆盖与模型约束，transform 继续校验请求。清单见 [explicit_world.telora](src/explicit_world.telora)，实验边界和验收见[显式 Model World](../evaluations/explicit-model-world.md)。
 
 类型级声明通过 `ontology::experimental::declarations` 接入 Telora 的 Property evidence：
 
@@ -56,6 +56,6 @@ def inventory = decl::dataset(DeviceRow.type);
 验证声明证据与编译期拒绝：`python3 scripts/check-typed-declarations.py`；关系回归及 SQLite 等价验证：`python3 scripts/check-typed-relations.py`。
 
 
-当前实验服务通过 `ontology::experimental::build::stage` 在构建期间准备 transform 与静态知识。
-使用支持 RFC 0318 的 Telora 以 `build relation_model --staged -o relation_model.wasm` 构建；
+当前实验服务通过 `ontology::experimental::world::stage` 在构建期间准备 transform 与静态知识。
+使用支持 RFC 0318／0319 的 Telora 以 `build relation_model --staged -o relation_model.wasm` 构建；
 普通运行期不会执行该准备过程。验收与 IC 测量见 [构建期双路产出](../evaluations/build-time-staging.md)。
