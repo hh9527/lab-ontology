@@ -1,0 +1,147 @@
+use crate::typed_relations as t;
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::quantity as q;
+use ontology::experimental::transform as transform;
+use ontology::intent as intent;
+use ontology::query as qb;
+use std::array as array;
+use std::json as json;
+use std::test as test;
+use std::type_desc as td;
+
+pub def new_declarations_prepare_the_complete_relation_transform: test::Test = test::should_ok(fn() {
+    let payload = t::prepared.payload;
+    array::length(payload.entities) == 5 && array::length(payload.dimensions) == 3
+        && array::length(payload.measures) == 1 && payload.entities[2].entity_type == t::DeviceRow.type
+        && td::fields(payload.entities[2].entity_type)[0].ty == t::DeviceId.type
+        && payload.entities[2].fields[0].ty == String.type
+        && payload.measures[0].id == "device_count"
+});
+pub def duplicate_dataset_ids_are_rejected: test::Test = test::should_fail_with(fn() {
+    transform::checked_prepare("duplicate", [t::datasets[0], t::datasets[0]], t::profile)
+}, "typed transform dataset ids must be unique");
+pub def duplicate_dimension_ids_are_rejected: test::Test = test::should_fail_with(fn() {
+    let entry = t::datasets[1];
+    let binding = entry.groups[0];
+    let member = binding.members[0] <~ {id: "tenant_id"};
+    transform::checked_prepare("duplicate-member", [t::datasets[0], entry <~ {groups: [binding <~ {members: [member]}]}], t::profile)
+}, "typed transform dimension ids must be unique");
+pub def duplicate_record_count_ids_are_rejected: test::Test = test::should_fail_with(fn() {
+    transform::checked_prepare("duplicate-count", [t::datasets[2] <~ {record_counts: ["device_count", "device_count"]}], t::profile)
+}, "typed transform measure ids must be unique");
+pub def record_count_requires_an_explicit_row_grain: test::Test = test::should_fail_with(fn() {
+    let dataset = t::datasets[2].dataset <~ {grain: []};
+    transform::checked_prepare("anonymous-count", [t::datasets[2] <~ {dataset}], t::profile)
+}, "record count requires a declared dataset grain");
+pub def prepared_bindings_cannot_move_to_another_dataset: test::Test = test::should_fail_with(fn() {
+    let entry = t::datasets[2];
+    transform::checked_prepare("wrong-owner", [entry <~ {groups: [t::datasets[1].groups[0]]}], t::profile)
+}, "group binding belongs to a different dataset");
+pub def filter_capabilities_are_checked_during_independent_preparation: test::Test = test::should_fail_with(fn() {
+    transform::checked_prepare("no-eq", t::datasets, t::profile <~ {allowed_scalars: []})
+}, "declared dimension filter uses capabilities not allowed by the query profile");
+pub def count_capabilities_are_checked_during_independent_preparation: test::Test = test::should_fail_with(fn() {
+    transform::checked_prepare("no-count", t::datasets, t::profile <~ {allowed_aggregates: []})
+}, "declared measure uses aggregate, filter or scalar capabilities not allowed by the query profile");
+pub def source_capabilities_are_checked_during_independent_preparation: test::Test = test::should_fail_with(fn() {
+    transform::checked_prepare("no-source", t::datasets, t::profile <~ {allowed_operators: [qb::Operator::Column]})
+}, "typed dataset source is not allowed by the query profile");
+pub def cross_dataset_entity_identity_conflicts_are_rejected: test::Test = test::should_fail_with(fn() {
+    let site = t::datasets[1];
+    let role = site.dataset.roles[0] <~ {entity: t::device.id};
+    transform::checked_prepare("conflicting-entity", [site <~ {dataset: site.dataset <~ {roles: [role]}}, t::datasets[2]], t::profile)
+}, "entity id has conflicting identities across datasets");
+pub def relations_cannot_reference_unregistered_roles: test::Test = test::should_fail_with(fn() {
+    let relation = t::connection_a <~ {from: t::connection_a.from <~ {role: "undeclared"}};
+    transform::checked_build("unregistered-role", t::datasets, [relation], [], [], t::profile)
+}, "relation endpoint role is not declared on its dataset");
+pub def relations_cannot_override_registered_role_mappings: test::Test = test::should_fail_with(fn() {
+    let dataset = t::connection_a.from.dataset;
+    let role = dataset.roles[0] <~ {parts: t::z.parts};
+    let relation = t::connection_a <~ {from: t::connection_a.from <~ {dataset: dataset <~ {roles: [role]}}};
+    transform::checked_build("shadow-role", t::datasets, [relation], [], [], t::profile)
+}, "relation endpoint conflicts with the registered dataset role");
+pub def alternative_ids_share_the_relation_namespace: test::Test = test::should_fail_with(fn() {
+    let alternative = t::alternatives[0] <~ {id: "connection_a"};
+    transform::checked_build("duplicate-edge", t::datasets, t::declarations, [alternative], [], t::profile)
+}, "typed transform relation ids must be unique");
+pub def business_links_cannot_shadow_relation_ids: test::Test = test::should_fail_with(fn() {
+    let link = t::connected <~ {id: "connection_a"};
+    transform::checked_build("shadow-edge", t::datasets, t::declarations, t::alternatives, [link], t::profile)
+}, "typed transform business link ids must be unique");
+pub def identity_groups_require_the_registered_role: test::Test = test::should_fail_with(fn() {
+    let identity = g::checked_identity_dimensions(t::devices, t::device_subject,
+        [{member: "tenant", publish: "tenant"}, {member: "local", publish: "local"}]);
+    let declared = transform::checked_declare(t::devices, [], [identity], []);
+    transform::checked_prepare("unregistered-identity", [declared], t::profile)
+}, "identity dimension role must be registered on its dataset");
+
+type Nested = struct { id: Int, label: Option(Option(String)) };
+pub def nested_option_cannot_share_one_sql_null_representation: test::Test = test::should_fail_with(fn() {
+    let dataset = m::checked_dataset("nested", "nested_rows", Nested.type, ["id"]);
+    transform::checked_prepare("nested", [transform::checked_declare(dataset, [], [], [])], t::profile)
+}, "typed transform cannot encode nested optional values in one SQL column");
+
+type Label = struct(String);
+type Row = struct { id: Int, label: Option(Label), bytes: q::Bytes, active: Bool };
+def rows: m::Dataset(Row) = m::dataset("mixed", "mixed_rows", Row.type, ["id"]);
+def label: g::Binding(Row) = g::dimension(rows, g::dimension_group("label", Label.type, True, [g::Filter::Eq]),
+    g::input(m::optional_field(Row.type, Label.type, "label")), "label", True, [g::Filter::Eq]);
+def bytes: g::Binding(Row) = g::dimension(rows, g::dimension_group("bytes", q::Bytes.type, True, [g::Filter::Eq]),
+    g::input(m::field(Row.type, q::Bytes.type, "bytes")), "bytes", True, [g::Filter::Eq]);
+def active: g::Binding(Row) = g::dimension(rows, g::dimension_group("active", Bool.type, True, [g::Filter::Eq]),
+    g::input(m::field(Row.type, Bool.type, "active")), "active", True, [g::Filter::Eq]);
+def mixed: transform::Declaration = transform::declare(rows, [], [label, bytes, active], ["records"]);
+pub def physical_result_columns_preserve_nullability_and_representation: test::Test = test::should_ok(fn() {
+    let payload = transform::prepare("mixed", [mixed], t::profile).payload;
+    let request = json::parse(r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"mixed"}],"edges":[],
+        "select":[{"node":"r","dimension":"label"},{"node":"r","dimension":"bytes"},{"node":"r","dimension":"active"}]}"#).unwrap!();
+    let ast = intent::query_intent_ast_factory(payload)(request);
+    let columns = intent::result_columns(payload, request, ast);
+    columns == [
+        {name: "r_label", type: intent::ResultType::String, nullable: True},
+        {name: "r_bytes", type: intent::ResultType::Float, nullable: False},
+        {name: "r_active", type: intent::ResultType::Bool, nullable: False},
+    ]
+});
+pub def nontext_contains_is_rejected_at_preparation: test::Test = test::should_fail_with(fn() {
+    let input = g::checked_input(m::checked_field(Row.type, q::Bytes.type, "bytes"));
+    let group = g::checked_dimension_group("bad-text", q::Bytes.type, True, [g::Filter::Contains]);
+    let binding = g::checked_dimension(rows, group, input, "bad", True, [g::Filter::Contains]);
+    transform::checked_prepare("bad-filter", [transform::checked_declare(rows, [], [binding], [])], t::profile)
+}, "text filters require a text representation");
+
+# 列映射只改变物理寻址；擦除后的公开描述同样在准备边界检查。
+def tenant_column: transform::ColumnMapping(t::TenantRow) = transform::column(m::field(t::TenantRow.type, t::TenantId.type, "id"), "TENANT_ID");
+def mapped_tenant: transform::Declaration = transform::map_columns(t::datasets[0], [tenant_column]);
+pub def physical_column_mapping_preserves_nominal_row_and_grain: test::Test = test::should_ok(fn() {
+    let entity = transform::prepare("mapped-tenant", [mapped_tenant], t::profile).payload.entities[0];
+    entity.fields[0].name == "id" && entity.fields[0].column == "TENANT_ID"
+        && entity.entity_type == t::TenantRow.type && entity.fields[0].is_key
+});
+pub def physical_column_mappings_cannot_move_to_another_row: test::Test = test::should_fail_with(fn() {
+    transform::checked_map_columns(t::datasets[1], [tenant_column])
+}, "typed column mappings belong to a different dataset row");
+pub def physical_column_mapping_rejects_sql_expressions: test::Test = test::should_fail_with(fn() {
+    transform::checked_column(m::checked_field(t::TenantRow.type, t::TenantId.type, "id"), "coalesce(id, 0)")
+}, "typed column mapping requires a valid owner, value and physical identifier");
+pub def physical_column_mapping_rejects_repeated_logical_fields: test::Test = test::should_fail_with(fn() {
+    transform::checked_prepare("repeated-column", [transform::checked_map_columns(t::datasets[0], [tenant_column, tenant_column])], t::profile)
+}, "typed column mapping repeats a logical field");
+pub def physical_column_mapping_rechecks_erased_field_type: test::Test = test::should_fail_with(fn() {
+    let mapping = mapped_tenant.columns[0] <~ {value: t::SiteId.type};
+    transform::checked_prepare("wrong-type", [mapped_tenant <~ {columns: [mapping]}], t::profile)
+}, "typed column mapping field witness does not match its row");
+pub def physical_column_mapping_rejects_missing_logical_fields: test::Test = test::should_fail_with(fn() {
+    let mapping = mapped_tenant.columns[0] <~ {field: "missing"};
+    transform::checked_prepare("missing-field", [mapped_tenant <~ {columns: [mapping]}], t::profile)
+}, "typed column mapping field does not exist");
+pub def physical_column_mapping_rechecks_erased_physical_names: test::Test = test::should_fail_with(fn() {
+    let mapping = mapped_tenant.columns[0] <~ {column: "id; drop table tenants"};
+    transform::checked_prepare("unsafe-name", [mapped_tenant <~ {columns: [mapping]}], t::profile)
+}, "typed column mapping physical name must be an identifier");
+pub def mapped_columns_cannot_collide_with_implicit_columns: test::Test = test::should_fail_with(fn() {
+    let column = transform::checked_column(m::checked_field(t::SiteRow.type, t::SiteId.type, "id"), "TENANT_ID");
+    transform::checked_prepare("collision", [transform::checked_map_columns(t::datasets[1], [column])], t::profile)
+}, "typed column mappings collide on a physical column");

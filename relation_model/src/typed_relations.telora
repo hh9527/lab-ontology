@@ -1,0 +1,122 @@
+# RFC 0002 的 transform 实验：显式 Entity／Dataset／Role 决定连接键。
+use ontology::experimental::model as m;
+use ontology::experimental::declarations as decl;
+use ontology::experimental::groups as g;
+use ontology::experimental::relations as r;
+use ontology::experimental::transform as transform;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+
+type TenantId = struct(String);
+type SiteId = struct(String);
+type DeviceId = struct(String);
+type ConnectionId = struct(String);
+type RouteId = struct(String);
+@edsl::entity_id("tenant_entity")
+type TenantIdentity = struct { local: TenantId };
+@edsl::entity_id("site_entity")
+type SiteIdentity = struct { tenant: TenantId, local: SiteId };
+@edsl::entity_id("device_entity")
+type DeviceIdentity = struct { tenant: TenantId, local: DeviceId };
+@edsl::entity_id("connection_entity")
+type ConnectionIdentity = struct { tenant: TenantId, local: ConnectionId };
+@edsl::entity_id("route_entity")
+type RouteIdentity = struct { tenant: TenantId, local: RouteId };
+@edsl::entity_id("tenant")
+@edsl::entity_source("tenants", "tenant")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id"], None)
+type TenantRow = struct { id: TenantId };
+@edsl::entity_id("site")
+@edsl::entity_source("sites", "site")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+type SiteRow = struct { id: SiteId, tenant_id: TenantId };
+@edsl::entity_id("device")
+@edsl::entity_source("devices", "device")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+type DeviceRow = struct { id: DeviceId, site_id: SiteId, tenant_id: TenantId };
+@edsl::entity_id("connection")
+@edsl::entity_source("connections", "connection")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+type ConnectionRow = struct { a_device_id: DeviceId, id: ConnectionId, tenant_id: TenantId, z_device_id: DeviceId };
+@edsl::entity_id("route")
+@edsl::entity_source("routes", "route")
+@edsl::dataset(edsl::DatasetKind::Entity, ["id", "tenant_id"], None)
+type RouteRow = struct { a_device_id: DeviceId, id: RouteId, tenant_id: TenantId, z_device_id: DeviceId };
+
+def tenant: m::Entity(TenantIdentity) = decl::entity(TenantIdentity.type);
+def site: m::Entity(SiteIdentity) = decl::entity(SiteIdentity.type);
+def device: m::Entity(DeviceIdentity) = decl::entity(DeviceIdentity.type);
+def connection: m::Entity(ConnectionIdentity) = decl::entity(ConnectionIdentity.type);
+def route: m::Entity(RouteIdentity) = decl::entity(RouteIdentity.type);
+def tenants: m::Dataset(TenantRow) = decl::dataset(TenantRow.type);
+def sites: m::Dataset(SiteRow) = decl::dataset(SiteRow.type);
+def devices: m::Dataset(DeviceRow) = decl::dataset(DeviceRow.type);
+def connections: m::Dataset(ConnectionRow) = decl::dataset(ConnectionRow.type);
+def routes: m::Dataset(RouteRow) = decl::dataset(RouteRow.type);
+
+def tenant_role: for(Row) Fn(m::Dataset(Row), String, String) -> m::Role(Row) = fn(dataset, id, field) {
+    m::role(dataset, tenant, id, False, [m::identity_part(m::field(Row.type, TenantId.type, field), m::field(TenantIdentity.type, TenantId.type, "local"))])
+};
+def scoped_role: for(Row, Identity, Local) Fn(m::Dataset(Row), m::Entity(Identity), TypeOf(Local), String, String) -> m::Role(Row) = fn(dataset, entity, local, id, field) {
+    m::role(dataset, entity, id, False, [
+        m::identity_part(m::field(Row.type, TenantId.type, "tenant_id"), m::field(Identity.type, TenantId.type, "tenant")),
+        m::identity_part(m::field(Row.type, local, field), m::field(Identity.type, local, "local")),
+    ])
+};
+def tenant_subject: m::Role(TenantRow) = tenant_role(tenants, "subject", "id");
+def site_subject: m::Role(SiteRow) = scoped_role(sites, site, SiteId.type, "subject", "id");
+def device_subject: m::Role(DeviceRow) = scoped_role(devices, device, DeviceId.type, "subject", "id");
+def device_site: m::Role(DeviceRow) = scoped_role(devices, site, SiteId.type, "site", "site_id");
+def connection_subject: m::Role(ConnectionRow) = scoped_role(connections, connection, ConnectionId.type, "subject", "id");
+def route_subject: m::Role(RouteRow) = scoped_role(routes, route, RouteId.type, "subject", "id");
+def a: m::Role(ConnectionRow) = scoped_role(connections, device, DeviceId.type, "a", "a_device_id");
+def z: m::Role(ConnectionRow) = scoped_role(connections, device, DeviceId.type, "z", "z_device_id");
+def route_a: m::Role(RouteRow) = scoped_role(routes, device, DeviceId.type, "a", "a_device_id");
+def route_z: m::Role(RouteRow) = scoped_role(routes, device, DeviceId.type, "z", "z_device_id");
+def many_optional: edsl::RelationCardinality = {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional};
+def many_many: edsl::RelationCardinality = {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Many0};
+def connection_a: r::Relation = r::relation("connection_a", connections, a, devices, device_subject, many_optional);
+def connection_z: r::Relation = r::relation("connection_z", connections, z, devices, device_subject, many_optional);
+def upstream_a: r::Relation = r::relation("route_a", routes, route_a, devices, device_subject, many_optional);
+def upstream_z: r::Relation = r::relation("route_z", routes, route_z, devices, device_subject, many_optional);
+def declarations: Array(r::Relation) = [
+    r::relation("site_tenant", sites, tenant_role(sites, "tenant", "tenant_id"), tenants, tenant_subject, many_optional),
+    r::relation("site_tenant_devices", sites, tenant_role(sites, "tenant", "tenant_id"), devices, tenant_role(devices, "tenant", "tenant_id"), many_many),
+    r::relation("device_tenant", devices, tenant_role(devices, "tenant", "tenant_id"), tenants, tenant_subject, many_optional),
+    r::relation("device_site", devices, device_site, sites, site_subject, many_optional),
+    connection_a, connection_z, upstream_a, upstream_z,
+];
+def connected: r::Link = r::link("connected_device", connection_a, connection_z, edsl::LinkDirection::Undirected);
+def upstream: r::Link = r::link("upstream_device", upstream_a, upstream_z, edsl::LinkDirection::Directed);
+
+# 输入名义类型与发布名在绑定中显式给出，不读取旧模型注解。
+def id_dimension: for(Row, Value) Fn(m::Dataset(Row), TypeOf(Value), String, String) -> g::Binding(Row) = fn(dataset, value, field, publish) {
+    g::dimension(dataset, g::dimension_group("identity_value", value, True, [g::Filter::Eq]),
+        g::input(m::field(Row.type, value, field)), publish, True, [g::Filter::Eq])
+};
+def datasets: Array(transform::Declaration) = [
+    decl::declare(TenantRow.type, [tenant_subject], [id_dimension(tenants, TenantId.type, "id", "tenant_id")], []),
+    decl::declare(SiteRow.type, [site_subject, tenant_role(sites, "tenant", "tenant_id")], [id_dimension(sites, SiteId.type, "id", "site_id")], []),
+    decl::declare(DeviceRow.type, [device_subject, device_site, tenant_role(devices, "tenant", "tenant_id")], [id_dimension(devices, DeviceId.type, "id", "device_id")], ["device_count"]),
+    decl::declare(ConnectionRow.type, [connection_subject, a, z], [], []),
+    decl::declare(RouteRow.type, [route_subject, route_a, route_z], [], []),
+];
+def profile: qb::PlanProfile = {
+    allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column,
+        qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate,
+        qb::Operator::Filter, qb::Operator::Exists, qb::Operator::Join, qb::Operator::Group],
+    allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
+    allowed_aggregates: [qb::AggregateFunction::Count],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::And, qb::ScalarFunction::IsNotNull], allow_distinct: True,
+};
+def alternatives: Array(transform::Alternative) = [
+    {id: "connection_endpoint", choices: [connection_a, connection_z], cardinality: many_many},
+];
+def prepared: transform::Prepared = transform::build("typed-relation-v1", datasets, declarations, alternatives, [connected, upstream], profile);
+def payload: edsl::PreparedPayload = prepared.payload;
+
+pub use self::{TenantId, SiteId, DeviceId, TenantIdentity, SiteIdentity, DeviceIdentity,
+    TenantRow, SiteRow, DeviceRow, ConnectionRow, RouteRow, tenant, site, device, tenants, sites, devices, connections, routes,
+    tenant_subject, site_subject, device_subject, device_site, a, z, route_a, route_z,
+    many_optional, many_many, connection_a, connection_z, upstream_a, upstream_z,
+    declarations, datasets, alternatives, profile, prepared, connected, upstream, payload};

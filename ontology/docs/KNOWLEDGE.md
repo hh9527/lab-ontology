@@ -1,7 +1,32 @@
-# 知识发现
+# 模型知识契约
 
 模型发布领域知识事实：稳定身份、描述、关系、逻辑类型、值和已声明业务约束。
 工具用法、请求语法、检索方法和 Agent 工作流由消费方负责。宿主收集完整图，并可向 Agent 暴露紧凑投影。
+
+## 当前静态知识 v4
+
+IC／relation 通过 `ontology::experimental::build::stage` 在构建期间从 transform 的同一准备结果导出知识。
+Wasm custom section `telora.build.information` 的 envelope 为 `{version:1,entries:{...}}`；
+`entries["ontology.knowledge"]` 携带 `ontology-knowledge-v4` 领域契约及 `facts`、`items`。
+每条事实为 `{key,value,references}`，key 是规范稳定地址，references 显式指向其他事实。
+消费方必须校验契约与引用闭合，再从事实派生成员导航、语义链接和反向链接；展示条目不授予查询权限。
+
+Entity 表达独立业务身份，Dataset 表达行类型、来源、粒度与时钟；Role 以完整身份映射关联 Dataset 与 Entity。
+DimensionGroup／MeasureGroup 表达可复用能力，绑定表达输入映射和发布成员。关系显式引用端点角色。
+这些是不同种类的事实，不能仅按表名或字段同名合并。具体地址以输出 key 为准，不能推测或重写。
+
+Int、Float、Bool、String 及内置 Option、Array、Dict 不生成类型节点，也就没有其反向链接。
+类型字段内联表达，例如 `Array(Option(Dict(types/<业务类型地址>)))`；其中具名业务类型的引用仍保留。
+具名 newtype、具名枚举保留节点，不能因底层为标量或结构类似 Option 而忽略。
+
+P1 支撑运行期程序，P2 支撑上述外部知识；运行期不重跑准备或发现。
+dsh-oks 直接读取 custom section，并可从 `<model>.knowledge-items.json` 补充名称和文档。
+插件兼容旧 `telora.service.metadata`；重复或损坏的新段以及两个段重复声明同一知识条目均拒绝。
+当前模型不挂载下述可选 info／discovery 接口。
+
+## 可选库接口：info／discovery
+
+下文描述仍保留的库兼容接口，其 v3 协议与当前静态 v4 不是同一运输或地址契约。
 
 工程边界采用版本管理：discovery 声明 `knowledge_contract: "ontology-knowledge-v3"` 和 `intent_contract: "ontology-intent-v1"`。
 消费方必须显式拒绝不兼容快照。更新 Intent 语法时须同时审查消费方的版本化工具帮助及解析测试；修改知识描述须保留业务语义，不能加入工具操作指令。

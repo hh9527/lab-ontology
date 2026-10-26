@@ -1,0 +1,58 @@
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::transform as t;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+type Row = struct { id: Int, label: Option(String), score: Option(Float) };
+def rows: m::Dataset(Row) = m::dataset("counts", "count_rows", Row.type, ["id"]);
+def unscoped: t::Declaration = t::with_field_counts(t::map_columns(t::declare(rows, [], [
+    g::dimension(rows, g::dimension_group("labels", String.type, True, g::equality_filters), g::input(m::optional_field(Row.type, String.type, "label")), "label", True, g::equality_filters),
+], ["records"]), [
+    t::column(m::field(Row.type, Int.type, "id"), "ROW_ID"),
+    t::column(m::optional_field(Row.type, String.type, "label"), "DISPLAY_NAME"),
+    t::column(m::optional_field(Row.type, Float.type, "score"), "RAW_SCORE"),
+]), [t::field_count(rows, m::optional_field(Row.type, String.type, "label"), "named"), t::field_count(rows, m::optional_field(Row.type, Float.type, "score"), "scored")]);
+def profile: qb::PlanProfile = {allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project, qb::Operator::Aggregate, qb::Operator::Group, qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind], allowed_aggregates: [qb::AggregateFunction::Count], allowed_join_kinds: [], allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::And], allow_distinct: False};
+def declared: t::Declaration = t::with_scope(unscoped, [t::scope_equal(rows, m::optional_field(Row.type, String.type, "label"), "onu")]);
+def payload: edsl::PreparedPayload = t::prepare("counts", [declared], profile).payload;
+
+pub def scope_preserves_logical_field_and_physical_mapping: test::Test = test::should_ok(fn() { payload.entities[0].scope == [{field: "label", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Text("onu")}] && payload.entities[0].fields[1].column == "DISPLAY_NAME" });
+pub def numeric_scopes_preserve_scalar_types: test::Test = test::should_ok(fn() {
+    let numeric = t::declare(rows, [], [
+        g::dimension(rows, g::dimension_group("ids", Int.type, False, g::equality_filters), g::input(m::field(Row.type, Int.type, "id")), "id", False, g::equality_filters),
+        g::dimension(rows, g::dimension_group("scores", Float.type, False, g::equality_filters), g::input(m::optional_field(Row.type, Float.type, "score")), "score", False, g::equality_filters),
+    ], []);
+    let scoped = t::with_scope(numeric, [t::scope_equal(rows, m::field(Row.type, Int.type, "id"), 7), t::scope_equal(rows, m::optional_field(Row.type, Float.type, "score"), 1.5)]);
+    t::prepare("numeric", [scoped], profile).payload.entities[0].scope == [{field: "id", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Int(7)}, {field: "score", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Number(1.5)}]
+});
+type Flag = struct { enabled: Bool };
+pub def bool_scope_is_supported: test::Test = test::should_ok(fn() {
+    let flags = m::dataset("flags", "flag_rows", Flag.type, []);
+    let scoped = t::with_scope(t::declare(flags, [], [g::dimension(flags, g::dimension_group("enabled", Bool.type, False, g::equality_filters), g::input(m::field(Flag.type, Bool.type, "enabled")), "enabled", False, g::equality_filters)], []), [t::scope_equal(flags, m::field(Flag.type, Bool.type, "enabled"), False)]);
+    t::prepare("flags", [scoped], profile).payload.entities[0].scope == [{field: "enabled", op: edsl::FilterOp::Eq, input: edsl::FilterInput::Bool(False)}]
+});
+def predicate: t::RowScopeFacts = declared.scope[0];
+pub def erased_dataset_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {dataset: "other"}]}], profile) }, "row scope belongs to another dataset");
+pub def erased_source_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {source: "other"}]}], profile) }, "row scope belongs to another dataset");
+pub def erased_row_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {row: Int.type}]}], profile) }, "row scope belongs to another dataset");
+pub def erased_field_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {column: predicate.column <~ {name: "missing"}}]}], profile) }, "group input field does not exist");
+pub def erased_type_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {column: predicate.column <~ {value: Float.type}}]}], profile) }, "group input field has incompatible type");
+pub def erased_nullability_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {column: predicate.column <~ {nullable: False}}]}], profile) }, "group input field has incompatible type");
+pub def erased_literal_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {scope: [predicate <~ {input: edsl::FilterInput::Int(1)}]}], profile) }, "row scope literal does not match field storage");
+type Case = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> Case = fn(id, extra) {
+    let ast = intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"counts"}],"edges":[],\{extra}}`).unwrap!());
+    {id, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("total", r#""select":[],"measures":[{"node":"c","measure":"records"},{"node":"c","measure":"named"}]"#),
+    runtime_case("project", r#""select":[{"node":"c","dimension":"label"}]"#),
+    runtime_case("contradiction", r#""select":[{"node":"c","dimension":"label"}],"filters":[{"node":"c","dimension":"label","op":"Eq","value":"olt"}]"#),
+]);

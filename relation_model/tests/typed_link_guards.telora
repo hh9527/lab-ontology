@@ -1,0 +1,33 @@
+use crate::typed_relations as t;
+use ontology::experimental::model as m;
+use ontology::experimental::relations as r;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::test as test;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+
+def guarded: r::Link = r::guarded_link(t::connected, m::field(t::ConnectionRow.type, t::DeviceId.type, "a_device_id"), edsl::FilterOp::Ne, t::DeviceId("3"));
+def directed: r::Link = r::guarded_link(t::upstream <~ {a: t::connection_a, z: t::connection_z}, m::field(t::ConnectionRow.type, t::DeviceId.type, "a_device_id"), edsl::FilterOp::Ne, t::DeviceId("3"));
+def guard: r::Guard = match guarded.guard { Some(value) => value, None => fail!("missing guard") };
+def payload: edsl::PreparedPayload = t::payload <~ {business_links: [r::lower_link(t::payload, guarded), r::lower_link(t::payload, directed)], profile: t::profile <~ {allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::And, qb::ScalarFunction::IsNotNull]}};
+pub def hub_guard_does_not_modify_endpoint_relations: test::Test = test::should_ok(fn() { guarded.a == t::connection_a && guarded.z == t::connection_z && payload.business_links[0].guard == Some({field: "a_device_id", op: edsl::FilterOp::Ne, input: edsl::FilterInput::Text("3")}) });
+pub def participant_field_cannot_guard_hub: test::Test = test::should_fail_with(fn() { r::checked_guarded_link(t::connected, m::checked_field(t::DeviceRow.type, t::DeviceId.type, "id"), edsl::FilterOp::Eq, t::DeviceId("A")) }, "relation guard belongs to another source row");
+pub def erased_hub_guard_source_is_rechecked: test::Test = test::should_fail_with(fn() { r::checked_lower_link(t::payload, guarded <~ {guard: Some(guard <~ {source: "other"})}) }, "relation guard belongs to another source dataset");
+pub def erased_guard_operator_is_rechecked: test::Test = test::should_fail_with(fn() { r::checked_lower_link(t::payload, guarded <~ {guard: Some(guard <~ {op: edsl::FilterOp::Gt})}) }, "relation guard supports only Eq or Ne");
+pub def erased_guard_storage_is_rechecked: test::Test = test::should_fail_with(fn() { r::checked_lower_link(t::payload, guarded <~ {guard: Some(guard <~ {input: edsl::FilterInput::Int(3)})}) }, "relation guard literal does not match field storage");
+type Case = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> Case = fn(id, raw) {
+    let ast = intent::query_intent_ast_factory(payload)(json::parse(raw).unwrap!());
+    {id, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("all", r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"connection"}],"edges":[],"select":[],"count":"c"}"#),
+    runtime_case("endpoints", r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"connection"},{"id":"d","entity":"device"}],"edges":[{"relation":"connection_a","from":"c","to":"d"}],"select":[{"node":"d","dimension":"device_id"}]}"#),
+    runtime_case("peer", r#"{"op":"Graph","root":"a","row_grain":"Association","distinct":true,"nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],"edges":[{"relation":"connected_device","from":"a","to":"z"}],"select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]}"#),
+    runtime_case("directed", r#"{"op":"Graph","root":"a","row_grain":"Association","distinct":true,"nodes":[{"id":"a","entity":"device"},{"id":"z","entity":"device"}],"edges":[{"relation":"upstream_device","from":"a","to":"z"}],"select":[{"node":"a","dimension":"device_id"},{"node":"z","dimension":"device_id"}]}"#),
+]);

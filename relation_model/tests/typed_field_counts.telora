@@ -1,0 +1,47 @@
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::transform as t;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+type Row = struct { id: Int, label: Option(String), score: Option(Float) };
+def rows: m::Dataset(Row) = m::dataset("counts", "count_rows", Row.type, ["id"]);
+def declared: t::Declaration = t::with_field_counts(t::map_columns(t::declare(rows, [], [
+    g::dimension(rows, g::dimension_group("labels", String.type, True, []), g::input(m::optional_field(Row.type, String.type, "label")), "label", True, []),
+], ["records"]), [
+    t::column(m::field(Row.type, Int.type, "id"), "ROW_ID"),
+    t::column(m::optional_field(Row.type, String.type, "label"), "DISPLAY_NAME"),
+    t::column(m::optional_field(Row.type, Float.type, "score"), "RAW_SCORE"),
+]), [t::field_count(rows, m::optional_field(Row.type, String.type, "label"), "named"), t::field_count(rows, m::optional_field(Row.type, Float.type, "score"), "scored")]);
+def profile: qb::PlanProfile = {allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project, qb::Operator::Aggregate, qb::Operator::Group, qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind], allowed_aggregates: [qb::AggregateFunction::Count], allowed_join_kinds: [], allowed_scalars: [qb::ScalarFunction::Eq], allow_distinct: False};
+def payload: edsl::PreparedPayload = t::prepare("counts", [declared], profile).payload;
+def count: t::FieldCountFacts = declared.field_counts[0];
+pub def field_count_preserves_physical_field_and_all_input: test::Test = test::should_ok(fn() { payload.measures[1].field == 1 && payload.measures[1].input == edsl::MeasureInput::All && payload.measures[1].row_expression == None });
+pub def field_count_does_not_require_identity: test::Test = test::should_ok(fn() {
+    let ungrained = m::dataset("ungrained", "count_rows", Row.type, []);
+    let prepared = t::prepare("ungrained", [t::with_field_counts(t::declare(ungrained, [], [], []), [t::field_count(ungrained, m::optional_field(Row.type, String.type, "label"), "named")])], profile);
+    prepared.payload.entities[0].dataset == None && prepared.payload.measures[0].field == 1
+});
+pub def erased_dataset_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {dataset: "other"}]}], profile) }, "field count belongs to another dataset");
+pub def erased_source_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {source: "other"}]}], profile) }, "field count belongs to another dataset");
+pub def erased_row_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {row: String.type}]}], profile) }, "field count belongs to another dataset");
+pub def erased_field_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {field: "missing"}]}], profile) }, "group input field does not exist");
+pub def erased_type_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {value: Float.type}]}], profile) }, "group input field has incompatible type");
+pub def erased_nullability_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {nullable: False}]}], profile) }, "group input field has incompatible type");
+pub def erased_public_name_is_rechecked: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {id: "bad name"}]}], profile) }, "field count requires a valid public identifier");
+pub def duplicate_record_count_name_is_rejected: test::Test = test::should_fail_with(fn() { t::checked_prepare("bad", [declared <~ {field_counts: [count <~ {id: "records"}]}], profile) }, "typed transform measure ids must be unique");
+type Case = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> Case = fn(id, extra) {
+    let ast = intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"counts"}],"edges":[],\{extra}}`).unwrap!());
+    {id, sqlite: sqlite::build_query(ast), postgres: postgres::build_query(ast)}
+};
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("total", r#""select":[],"measures":[{"node":"c","measure":"records"},{"node":"c","measure":"named"},{"node":"c","measure":"scored"}]"#),
+    runtime_case("grouped", r#""select":[{"node":"c","dimension":"label"}],"measures":[{"node":"c","measure":"named"},{"node":"c","measure":"records"}]"#),
+]);

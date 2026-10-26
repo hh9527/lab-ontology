@@ -595,6 +595,7 @@ type FilterRequest = struct {
 # ---------------------------------------------------------------------------
 
 type FieldEntry = struct {
+    time: Option(TimeField),
     logical_type: Option(LogicalType),
     nullable: Bool,
     index: Int,
@@ -761,6 +762,12 @@ type ComputedMeasureEntry = struct {
     right: String,
 };
 
+# 聚合前的逐行表达式，与聚合后依赖其他度量的 computed 分开。
+type MeasureExpression = struct {
+    output_type: OutputType,
+    build: Fn(qb::BuildCtx, qb::Source) -> (qb::BuildCtx, qb::Expr),
+};
+
 type MeasureEntry = struct {
     id: String,
     entity: Int,
@@ -771,9 +778,11 @@ type MeasureEntry = struct {
     requires: Array(Int),
     predicate: Option(ScopePredicate),
     computed: Option(ComputedMeasureEntry),
+    row_expression: Option(MeasureExpression),
 };
 
 type DimensionEntry = struct {
+    utc_bucket: Option(UtcBucketDimensionSpec),
     value_type: Option(Type),
     ty: String,
     half_open: Bool,
@@ -784,6 +793,7 @@ type DimensionEntry = struct {
     computed: Bool,
     build: Fn(qb::BuildCtx, qb::Expr) -> (qb::BuildCtx, qb::Expr),
     authorized: Bool,
+    projectable: Bool,
     filterable: Bool,
     ops: Array(FilterOp),
     input_kinds: Array(FilterInputKind),
@@ -1373,7 +1383,7 @@ def build_field: Fn(Type, Int, String, Type) -> FieldEntry = fn(owner, index, na
     let logical_type = match property::get_field_prop(owner, index, LogicalFieldType.type) {
         Some(declared) => Some(declared.kind), None => None,
     };
-    let result: FieldEntry = { index, name, column, is_key, ty: scalar, nullable, logical_type };
+    let result: FieldEntry = { time: property::get_field_prop(owner, index, TimeField.type), index, name, column, is_key, ty: scalar, nullable, logical_type };
     result
 };
 
@@ -1769,7 +1779,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
         let primary = match property::get_field_prop(entity.entity_type, f.index, PrimarySampleMeasureSpec.type) {
             Some(spec) => [{id: spec.id, entity: entity.index, field: f.index,
                 aggregate: spec.aggregate, input: MeasureInput::All, alias: spec.id,
-                requires: [], predicate: None, computed: None}.ty!(MeasureEntry)],
+                requires: [], predicate: None, row_expression: None, computed: None}.ty!(MeasureEntry)],
             None => [],
         };
         let plain = match property::get_field_prop(entity.entity_type, f.index, MeasureDef.type) {
@@ -1783,7 +1793,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: resolve_required(entities, spec.requires),
                     predicate: None,
-                    computed: None,
+                    row_expression: None, computed: None,
                 };
                 result
             }),
@@ -1800,7 +1810,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: resolve_required(entities, spec.requires),
                     predicate: Some(spec.predicate),
-                    computed: None,
+                    row_expression: None, computed: None,
                 };
                 result
             }),
@@ -1817,7 +1827,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: [],
                     predicate: None,
-                    computed: None,
+                    row_expression: None, computed: None,
                 };
                 result
             }),
@@ -1834,7 +1844,7 @@ def collect_entity_measures: Fn(Array(EntityEntry), EntityEntry) -> Array(Measur
                     alias: spec.id,
                     requires: [],
                     predicate: None,
-                    computed: Some({ op: spec.op, left: spec.left, right: spec.right }),
+                    row_expression: None, computed: Some({ op: spec.op, left: spec.left, right: spec.right }),
                 };
                 result
             }),
@@ -1876,19 +1886,31 @@ def measure_value_type: Fn(Array(EntityEntry), Array(MeasureEntry), String) -> O
                 qb::AggregateFunction::Avg => OutputType::Number,
                 qb::AggregateFunction::Sum => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
                 qb::AggregateFunction::Min => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
                 qb::AggregateFunction::Max => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
                 qb::AggregateFunction::Latest => {
                     let entity = get_index(entities, entry.entity);
-                    field_output_type(get_index(entity.fields, entry.field).ty)
+                    match entry.row_expression {
+                        Some(expression) => expression.output_type,
+                        None => field_output_type(get_index(entity.fields, entry.field).ty),
+                    }
                 },
             },
         }
@@ -1903,7 +1925,7 @@ def measure_latest_order: Fn(EntityEntry, MeasureEntry, qb::Source) -> Option(qb
     else {
         let field = get_index(entity.fields, entry.field);
         if (field.ty != Int.type && field.ty != Float.type) || entry.input != MeasureInput::All
-            || entry.predicate != None || entry.computed != None || array::length(entry.requires) > 0 {
+            || entry.predicate != None || entry.computed != None || entry.row_expression != None || array::length(entry.requires) > 0 {
             fail!("Latest requires a numeric field without distinct, local filters or external dependencies", entry.id)
         } else { () };
         let dataset = match entity.dataset {
@@ -1917,6 +1939,9 @@ def measure_latest_order: Fn(EntityEntry, MeasureEntry, qb::Source) -> Option(qb
         let time = match array::find(entity.fields, fn(field) { field.name == time_name }) {
             Some(field) => field, None => fail!("unknown Latest time field", time_name),
         };
+        if match time.time { Some(role) => role.semantics != TimeSemantics::Utc, None => True } {
+            fail!("Latest requires an authoritative UTC instant role", entry.id, time_name)
+        } else { () };
         Some({time: qb::column_ref(source, time.column), ties: array::map(array::filter(dataset.grain, fn(name) {
             name != time_name
         }), fn(name) {
@@ -2387,7 +2412,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 if array::length(enumerated) > 0 && value_type == None {
                     fail!("enum dimension requires a named value_type declaration", entity.id, f.name)
                 } else { () };
-                let epoch = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                let epoch = match f.time {
                     Some(role) => role.encoding == TimeEncoding::EpochMillis,
                     None => False,
                 };
@@ -2399,15 +2424,15 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                 } else { () };
                 let valid_kind = if ipv4 { FilterInputKind::Ipv4 }
                     else if array::length(enumerated) > 0 { FilterInputKind::Text }
-                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    else if match f.time {
                         Some(role) => role.encoding == TimeEncoding::LocalText,
                         None => False,
                     } { FilterInputKind::LocalDateTime }
-                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    else if match f.time {
                         Some(role) => role.encoding == TimeEncoding::Rfc3339Text,
                         None => False,
                     } { FilterInputKind::DatetimeUtc }
-                    else if match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                    else if match f.time {
                         Some(role) => role.encoding == TimeEncoding::DateText,
                         None => False,
                     } { FilterInputKind::DateUtc }
@@ -2478,7 +2503,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
         match property::get_field_prop(entity.entity_type, f.index, UtcBucketDimensionsDef.type) {
             None => [],
             Some(definition) => do {
-                let time = match property::get_field_prop(entity.entity_type, f.index, TimeField.type) {
+                let time = match f.time {
                     Some(time) => time,
                     None => fail!("UTC bucket requires a declared UTC time field", entity.id, f.name),
                 };
@@ -2505,7 +2530,7 @@ def collect_entity_dimensions: Fn(EntityEntry) -> Array(DimensionEntry) = fn(ent
                     let build = fn(ctx: qb::BuildCtx, column: qb::Expr) { (ctx, qb::scalar(function, [column])) };
                     dimension_entry(entity.index, f.index, spec.id, output, True, build, True, True,
                         [FilterOp::Eq, FilterOp::Ne, FilterOp::Lt, FilterOp::Le, FilterOp::Gt, FilterOp::Ge],
-                        [input], [], [], [], [], field_scope(entity.entity_type, f.index), False)
+                        [input], [], [], [], [], field_scope(entity.entity_type, f.index), False) <~ {utc_bucket: Some(spec)}
                 })
             },
         }
@@ -2546,7 +2571,7 @@ def dimension_entry: Fn(Int, Int, String, OutputType, Bool, Fn(qb::BuildCtx, qb:
     let ty = if array::length(input_kinds) == 1 { input_ty(input_kinds[0]) } else {
         match output_type { OutputType::Text => "Text", OutputType::Integer => "Int", OutputType::Number => "Number", OutputType::Boolean => "Bool" }
     };
-    let result: DimensionEntry = { value_type: None, ty, id, entity, field, output_type, computed, build, authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open };
+    let result: DimensionEntry = { utc_bucket: None, value_type: None, ty, id, entity, field, output_type, computed, build, authorized, projectable: authorized, filterable, ops, input_kinds, values, canonical_values, canonical_order, canonical_aliases, scope, half_open };
     result
 };
 
@@ -2653,8 +2678,8 @@ def resolve_relation_key: Fn(EntityEntry, EntityEntry, DeclaredRelationKey) -> R
                 fail!("relation fields have different named value types", pair.from, pair.to)
             } else if is_ipv4_field(from_entity.entity_type, from_field) != is_ipv4_field(to_entity.entity_type, to_field) {
                 fail!(`relation fields have different logical address types`, pair.from, pair.to)
-            } else if match (property::get_field_prop(from_entity.entity_type, from_field, TimeField.type),
-                property::get_field_prop(to_entity.entity_type, to_field, TimeField.type)) {
+            } else if match (from_entity.fields[from_field].time,
+                to_entity.fields[to_field].time) {
                 (None, None) => False,
                 (Some(left), Some(right)) => time_logical_type(left) != time_logical_type(right)
                     || left.encoding != right.encoding,
@@ -2707,7 +2732,7 @@ def safe_relation_covers_target_identity: Fn(EntityEntry, Array(RelationPair)) -
 def guard_input_matches_field: Fn(EntityEntry, FieldEntry, FilterInput) -> Bool = fn(entity, field, input) {
     if field.logical_type == Some(LogicalType::Ipv4) {
         match input { FilterInput::Ipv4(value) => canonical_ipv4(value), _ => False }
-    } else { match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+    } else { match field.time {
         Some(role) => match (role.encoding, input) {
             (TimeEncoding::Rfc3339Text, FilterInput::DatetimeUtc(value)) => canonical_rfc3339(value),
             (TimeEncoding::DateText, FilterInput::DateUtc(value)) => calendar_date(value),
@@ -2889,7 +2914,7 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
             e.id == target.owner && array::any(e.fields, fn(field) {
                 field.name == target.id && (
                     match e.dataset { Some(spec) => array::any(spec.grain, fn(name) { name == field.name }), None => False }
-                    || property::get_field_prop(e.entity_type, field.index, TimeField.type) != None
+                    || field.time != None
                     || array::any(payload.dimensions, fn(d) { d.entity == e.index && d.authorized && d.field == field.index })
                     || array::any(payload.measures, fn(m) { m.entity == e.index && m.field == field.index })
                     || array::any(e.sample_measures, fn(metric) { metric.field == field.name })
@@ -2919,7 +2944,7 @@ def knowledge_target_declared: Fn(PreparedPayload, KnowledgeTarget) -> Bool = fn
         }),
         KnowledgeKind::TimeRole => array::any(payload.entities, fn(e) {
             e.id == target.owner && array::any(e.fields, fn(field) {
-                field.name == target.id && property::get_field_prop(e.entity_type, field.index, TimeField.type) != None
+                field.name == target.id && field.time != None
             })
         }),
     }
@@ -2931,7 +2956,7 @@ def published_field_names: Fn(PreparedPayload, EntityEntry) -> Array(String) = f
     let relations = array::filter(payload.relations, fn(rel) { rel.from == entity.index && rel.id != "" });
     array::map(array::filter(entity.fields, fn(field) {
         (match entity.dataset { Some(spec) => array::any(spec.grain, fn(name) { name == field.name }), None => False })
-        || property::get_field_prop(entity.entity_type, field.index, TimeField.type) != None
+        || field.time != None
         || array::any(dimensions, fn(d) { d.field == field.index })
         || array::any(measures, fn(m) { m.field == field.index })
         || array::any(entity.sample_measures, fn(metric) { metric.field == field.name })
@@ -3075,7 +3100,7 @@ def filter_profile_scalars: Fn(DimensionEntry, FilterOp) -> Array(qb::ScalarFunc
     }
 };
 
-def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn(revision, entity_types, profile) {
+def prepare_root: Fn(String, Array(Type), qb::PlanProfile, Bool) -> PreparedPayload = fn(revision, entity_types, profile, prepare_knowledge) {
     let n = array::length(entity_types);
     let entities = check_entity_aliases(check_entity_ids(array::map(int_range(n), fn(i) {
         build_entity(get_index(entity_types, i), i)
@@ -3089,7 +3114,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
             fail!("measure input requires a physical column", measure.id, entity.id, field.name)
         } else { True }
     });
-    let descriptions_ok = check_measure_descriptions(entities, measures);
+    let descriptions_ok = if prepare_knowledge { check_measure_descriptions(entities, measures) } else { True };
     let dimensions = check_dimension_ids(array::flat_map(entities, fn(e) { collect_entity_dimensions(e) }));
     let dimension_columns_ok = array::all(dimensions, fn(dimension) {
         let entity = get_index(entities, dimension.entity);
@@ -3098,7 +3123,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
             fail!("dimension source requires a physical column", dimension.id, entity.id, field.name)
         } else { True }
     });
-    let dimension_descriptions_ok = check_dimension_descriptions(entities, dimensions);
+    let dimension_descriptions_ok = if prepare_knowledge { check_dimension_descriptions(entities, dimensions) } else { True };
     let native_pairs = array::flat_map(entities, fn(e) {
         let declared = match property::get_type_prop(e.entity_type, NativePairDef.type) {
             Some(definition) => definition.pairs, None => [],
@@ -3184,6 +3209,36 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
         native_pairs,
         profile,
     };
+    let checked_transform = validate_transform_contract(payload);
+    let types_ok = if prepare_knowledge { check_value_types(payload) } else { True };
+    let aliases_ok = if prepare_knowledge { check_knowledge_aliases(payload) } else { True };
+    let localized_ok = if prepare_knowledge { check_localized_knowledge(payload) } else { True };
+    let annotations_ok = if prepare_knowledge { check_knowledge_annotations(payload) } else { True };
+    if types_ok && profile_ok && computed_profile_ok && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && aliases_ok && localized_ok && annotations_ok { checked_transform } else { checked_transform }
+};
+
+# 查询准备结构共享的执行能力校验，独立于注解解析与知识发布。
+def validate_transform_contract: Fn(PreparedPayload) -> PreparedPayload = fn(payload) {
+    let entities = payload.entities;
+    let measures = payload.measures;
+    let dimensions = payload.dimensions;
+    let profile = payload.profile;
+    array::map(entities, fn(entity) {
+        array::map(entity.fields, fn(field) {
+            match field.time {
+                None => (),
+                Some(role) => {
+                    let compatible = match role.encoding {
+                        TimeEncoding::EpochMillis => field.ty == Int.type && (role.semantics == TimeSemantics::Utc || role.semantics == TimeSemantics::Local),
+                        TimeEncoding::Rfc3339Text => field.ty == String.type && role.semantics == TimeSemantics::Utc,
+                        TimeEncoding::LocalText => field.ty == String.type && role.semantics == TimeSemantics::Local,
+                        TimeEncoding::DateText => field.ty == String.type && role.semantics == TimeSemantics::DateUtc,
+                    };
+                    if !compatible { fail!("prepared time role disagrees with field storage or semantics", entity.id, field.name) } else { () }
+                },
+            }
+        }); ()
+    });
     let measure_profiles_validated = array::all(measures, fn(entry) {
         match entry.computed {
             Some(_) => True,
@@ -3194,8 +3249,9 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
                     Some(_) => Some(resolve_measure_predicate_with_context(qb::build_context(), payload, entry).1),
                     None => None,
                 };
+                let input = measure_row_expr(qb::build_context(), payload, entry, entity.source);
                 let call: qb::AggregateCall = {function: entry.aggregate,
-                    arg: qb::column(entity.source, field.column),
+                    arg: input.1,
                     distinct: entry.input == MeasureInput::Distinct, filter: filtered, alias: entry.id,
                     latest: measure_latest_order(entity, entry, entity.source)};
                 if qb::aggregate_profile_accepts(call, profile) { True }
@@ -3204,7 +3260,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
         }
     });
     let dimension_projection_profiles_validated = array::all(dimensions, fn(entry) {
-        if !entry.authorized { True }
+        if !entry.authorized || !entry.projectable { True }
         else {
             let output = dimension_output_with_context(qb::build_context(), payload, entry);
             if qb::predicate_profile_accepts(output.1, profile) { True }
@@ -3220,7 +3276,7 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
                 [FilterInput::Text(entry.values[0].value)]
             } else {
                 let entity = get_index(payload.entities, entry.entity);
-                let time = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
+                let time = entity.fields[entry.field].time;
                 array::map(entry.input_kinds, fn(kind) {
                     match kind {
                         FilterInputKind::Text => FilterInput::Text(match time {
@@ -3297,11 +3353,18 @@ def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn
             } else { True },
         }
     });
-    let types_ok = check_value_types(payload);
-    let aliases_ok = check_knowledge_aliases(payload);
-    let localized_ok = check_localized_knowledge(payload);
-    let annotations_ok = check_knowledge_annotations(payload);
-    if types_ok && profile_ok && computed_profile_ok && measure_profiles_validated && dimension_profiles_validated && descriptions_ok && dimension_descriptions_ok && measure_columns_ok && dimension_columns_ok && dimension_scopes_validated && entity_scopes_validated && aliases_ok && localized_ok && annotations_ok { payload } else { payload }
+    if measure_profiles_validated && dimension_projection_profiles_validated && dimension_profiles_validated
+        && dimension_scopes_validated && entity_scopes_validated { payload } else { payload }
+};
+
+# 查询准备只验证 transform 所需的字段、值域、权限、关系、粒度和 profile。
+def build_transform_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn(revision, entity_types, profile) {
+    prepare_root(revision, entity_types, profile, False)
+};
+
+# 需要发布知识时显式使用完整准备入口；当前模型服务使用查询准备入口。
+def build_root: Fn(String, Array(Type), qb::PlanProfile) -> PreparedPayload = fn(revision, entity_types, profile) {
+    prepare_root(revision, entity_types, profile, True)
 };
 
 # ---------------------------------------------------------------------------
@@ -3337,6 +3400,17 @@ type FilterResolution = struct {
 
 
 
+def measure_row_expr: Fn(qb::BuildCtx, PreparedPayload, MeasureEntry, qb::Source) -> (qb::BuildCtx, qb::Expr) = fn(ctx, payload, entry, source) {
+    match entry.row_expression {
+        Some(expression) => expression.build(ctx, source),
+        None => {
+            let entity = get_index(payload.entities, entry.entity);
+            let field = get_index(entity.fields, entry.field);
+            (ctx, qb::column(source, field.column))
+        },
+    }
+};
+
 def dimension_expr: Fn(qb::BuildCtx, PreparedPayload, DimensionEntry) -> (qb::BuildCtx, qb::Expr) = fn(ctx, payload, entry) {
     let entity = get_index(payload.entities, entry.entity);
     let field = get_index(entity.fields, entry.field);
@@ -3370,10 +3444,7 @@ def dimension_brief: Fn(PreparedPayload, DimensionEntry) -> DimensionBrief = fn(
         Some(declared) => array::find(declared.notes, fn(item) { item.id == entry.id }),
         None => None,
     };
-    let bucket = match property::get_field_prop(entity.entity_type, field.index, UtcBucketDimensionsDef.type) {
-        Some(definition) => array::find(definition.dimensions, fn(spec) { spec.id == entry.id }),
-        None => None,
-    };
+    let bucket = entry.utc_bucket;
     let scope: Array(DimensionScopeBrief) = array::map(entry.scope, fn(predicate) {
         {field: predicate.field, op: predicate.op, input: predicate.input}
     });
@@ -3447,7 +3518,7 @@ def time_domain: Fn(PreparedPayload, String, String) -> TimeField = fn(payload, 
         Some(entry) => entry,
         None => fail!(`unknown time field \{id}.\{name}`, id, name),
     };
-    match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+    match field.time {
         Some(role) => role,
         None => fail!(`field \{id}.\{name} has no declared time role`, id, name),
     }
@@ -3575,7 +3646,7 @@ def dataset_brief: Fn(PreparedPayload, EntityEntry, Bool) -> DatasetBrief = fn(p
             },
         };
         let time_roles: Array(TimeRoleBrief) = array::flat_map(entity.fields, fn(field) {
-            match property::get_field_prop(entity.entity_type, field.index, TimeField.type) {
+            match field.time {
                 None => [],
                 Some(role) => do {
                     let authoritative = match entity.dataset {
@@ -3833,12 +3904,9 @@ def canonical_rfc3339: Fn(String) -> Bool = fn(value) {
 
 def validate_time_filter: Fn(PreparedPayload, DimensionEntry, FilterInput) -> Bool = fn(payload, entry, input) {
     let entity = get_index(payload.entities, entry.entity);
-    let role = property::get_field_prop(entity.entity_type, entry.field, TimeField.type);
+    let role = entity.fields[entry.field].time;
     match role {
-        Some(time) => if !entry.computed || match property::get_field_prop(entity.entity_type, entry.field, UtcBucketDimensionsDef.type) {
-            Some(definition) => array::any(definition.dimensions, fn(spec) { spec.id == entry.id }),
-            None => False,
-        } {
+        Some(time) => if !entry.computed || entry.utc_bucket != None {
             match time.encoding {
                 TimeEncoding::DateText => match input {
                     FilterInput::DateUtc(value) => if calendar_date(value) { True }
@@ -4728,9 +4796,10 @@ def graph_aggregate_having: Fn(qb::BuildCtx, PreparedPayload, GraphInstance, Arr
                         (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, sample.source.alias)))
                     },
                 };
-                let threshold = qb::bind(filtered.0, to_val(spec.threshold));
+                let input = measure_row_expr(filtered.0, payload, measure, sample.source);
+                let threshold = qb::bind(input.0, to_val(spec.threshold));
                 let having = qb::having_call_filtered_bound(graph_aggregate_op(spec.op), measure.aggregate,
-                    qb::column(sample.source, field.column), measure.input == MeasureInput::Distinct, filtered.1, threshold.1);
+                    input.1, measure.input == MeasureInput::Distinct, filtered.1, threshold.1);
                 (threshold.0, array::push(state.1, having))
             }
         }
@@ -5204,11 +5273,12 @@ def graph_measure_projection: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Ar
                         (resolved.0, Some(retarget_inner_expr(resolved.1, entity.alias, instance.source.alias)))
                     },
                 };
-                let call: qb::AggregateCall = {function: measure.aggregate, arg: qb::column(instance.source, field.column),
+                let input = measure_row_expr(filtered.0, payload, measure, instance.source);
+                let call: qb::AggregateCall = {function: measure.aggregate, arg: input.1,
                     distinct: measure.input == MeasureInput::Distinct, filter: filtered.1, alias,
                     latest: measure_latest_order(entity, measure, instance.source)};
                 let item = qb::SelectItem::Aggregate(call);
-                (filtered.0, item, array::push(cached, item))
+                (input.0, item, array::push(cached, item))
             }
         }
     };
@@ -5241,7 +5311,7 @@ def graph_top_per: Fn(qb::BuildCtx, PreparedPayload, GraphRequest, Array(GraphIn
                 fail!("graph top-per sample requires a nonempty declared sampling grain", spec.sample)
             } else if rank.entity != sample.entity {
             fail!(`graph top-per rank \{spec.rank} must be a plain authorized dimension on sample \{spec.sample}`, spec.rank, spec.sample)
-            } else if rank.computed || !rank.authorized || array::length(rank.scope) > 0 {
+            } else if rank.computed || !rank.authorized || !rank.projectable || array::length(rank.scope) > 0 {
             fail!(`graph top-per rank \{spec.rank} must be a plain authorized unscoped sample dimension`, spec.rank)
             } else if array::any(rank.input_kinds, fn(kind) { kind == FilterInputKind::Ipv4 })
                 || array::length(rank.values) > 0 || rank.output_type == OutputType::Boolean
@@ -5593,7 +5663,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                 };
                 if dimension.entity != instance.entity {
                     fail!(`graph projection dimension \{item.dimension} does not belong to node \{item.node}`, item.node, item.dimension)
-                } else if !dimension.authorized {
+                } else if !dimension.authorized || !dimension.projectable {
                     fail!(`graph projection dimension \{item.dimension} is not authorized on node \{item.node}`, item.node, item.dimension)
                 } else if array::length(dimension.scope) > 0 {
                     fail!("unsupported graph scoped dimension projection", item.node, item.dimension)
@@ -5682,7 +5752,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                     };
                     if dimension.entity != instance.entity {
                         fail!("graph count_value dimension does not belong to its named node", item.node, item.dimension)
-                    } else if !dimension.authorized {
+                    } else if !dimension.authorized || !dimension.projectable {
                         fail!("graph count_value dimension is not authorized", item.node, item.dimension)
                     } else if array::length(dimension.scope) > 0 {
                         fail!("graph count_value requires an unscoped dimension", item.node, item.dimension)
@@ -5969,7 +6039,7 @@ pub use self::{
     CanonicalValueSpec,
     CanonicalAlias,
     EntityEntry,
-    MeasureEntry,
+    MeasureEntry, MeasureExpression,
     DimensionEntry,
     DimensionBrief,
     TimeRoleBrief,
@@ -6032,7 +6102,7 @@ pub use self::{
     scope,
     entity_scope,
     knowledge_graph,
-    build_root,
+    build_root, build_transform_root, validate_transform_contract,
     graph_node,
     lower_graph,
     native_pair_domain,

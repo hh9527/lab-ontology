@@ -1,6 +1,6 @@
 # 本体服务使用说明
 
-本文介绍基于本体的查询服务如何打包、启动和使用。第 1～3 节适用于暴露相同三个方法的任意模型。
+本文介绍基于本体的查询服务如何打包、启动和使用。当前模型服务只启用 transform；构建期从同一模型准备查询契约与静态知识，运行期恢复查询状态。
 第 4 节列出本仓库领域，集成应用可替换或省略。构建命令在仓库根目录运行，runner 可从任意能访问产物的目录启动。
 第 1～2 节面向可信宿主，不面向发起查询的 Agent。
 
@@ -8,27 +8,17 @@
 [关系示例](relation_model/README.md)和 [IC 领域指南](icloud_model/docs/DOMAIN.md)说明两个模型，均使用下文共享 Intent 语法。
 评测结果记录早期实验，不是当前 API 契约。Telora 语言和 CLI 文档属于 Telora 项目，不在本仓库复制维护。
 
-## 1. 构建快照
+## 1. 构建运行期制品
 
 ```sh
-node scripts/build-knowledge-snapshot.mjs --module <module> \
-  --domain <domain> --output <artifact>.wasm
+bin/telora -C <module> build <module> --staged -o <artifact>.wasm
 ```
 
 `<module>` 是拥有 `MainService` 的 Telora 工作区成员，不是请求中的领域名。
-构建初始化服务并将就绪状态嵌入 Wasm。若模块声明外部源，构建时用 `--source name=path` 提供全部源。
-部署需要时可通过 CLI 设置初始化 fuel、请求 fuel 和内存上限；实验产物须搭配兼容版本 `telora-run`。
-包装脚本以 `--snapshot` 编译，遍历实际产物的可见知识，检查通过后才发布。
-集合中每个领域重复传入 `--domain`；当前两个服务各暴露一个领域：`relation` 或 `ic`。
-生成 `<artifact>.wasm.knowledge.json`（可见键／类型、计数、模型版本和产物 SHA-256）以及
-`<artifact>.wasm.knowledge-sizes.json`（完整大小排名、最大条目／链接、阈值及运行时验证结果）。
-具体文档默认预算为 16,000 字符，严格按 `JSON.stringify({Document:{Found:node}}, null, 2).length` 测量，而非 UTF-8 字节。
-索引元数据会测量但不受该预算约束。完整术语通过独立能力获取，供消费方缓存与搜索。
-用 `--max-node-chars <number>` 设置部署预算；超限会在替换旧产物前失败，`--on-oversize warn` 显式允许带警告发布。
-`--not-found <checks.json>` 还可用 `{domain,key}` 请求组成的 JSON 数组检查隐藏键。
-包上下文不同于模块名时使用 `--context <crate-directory>`，包装脚本转发重复的 `--source` 及 fuel／内存选项。
-传输或部署后，`node scripts/check-knowledge-manifest.mjs <artifact>.wasm` 校验哈希、版本、计数和真实 `info` 样本。
-实验可直接用 `bin/telora -C <module> build <module> --snapshot -o <artifact>.wasm`，但会绕过发布检查。
+构建期间执行封闭的准备程序 A，P1 支撑运行期程序 B，P2 写入 `telora.build.information` custom section。
+本仓库模型无需外部构建源；`--staged` 拒绝运行期外部输入和 `--source`，不能通过重新导入配置改变准备结果。
+`--staged=full` 保留完整代码用于对照；默认裁剪仅构建期可达的代码，保留运行期输入校验。
+部署需要时可设置初始化 fuel、请求 fuel 和内存上限；产物须搭配兼容版本 `telora-run`。
 
 ## 2. 启动服务
 
@@ -41,15 +31,15 @@ telora-run <artifact>.wasm --serve http://127.0.0.1:8080
 不带 `--serve` 的 runner 读取一个完整 JSON 请求，响应一次后退出。
 `telora-run` 执行构建产物，无需源树、工作区配置或编译器；部署只需产物和兼容 runner。
 
-本仓库模型显式声明 POST 路由 `/<domain>/info` 和 `/<domain>/transform`。
+本仓库模型显式声明 POST 路由 `/<domain>/transform`。
 HTTP 请求体就是槽位输入，不含 JSONL 的 `method`／`input` 信封。例如：
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8080/ic/info \
-  -H 'Content-Type: application/json' -d '{"key":"index"}'
+curl -sS -X POST http://127.0.0.1:8080/ic/transform \
+  -H 'Content-Type: application/json' -d '{"intents":[{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device_id"}]}]}'
 ```
 
-`telora-run` 不提供认证，只绑定宿主私有回环或 Unix socket，并通过可信工具适配器或认证网关向 Agent 暴露这两个操作。
+`telora-run` 不提供认证，只绑定宿主私有回环或 Unix socket，并通过可信工具适配器或认证网关向 Agent 暴露查询操作。
 Agent 环境不得挂载快照、runner、源树、测试或评测材料，也不得拥有能读取宿主部署目录的 shell 或文件工具。
 网关凭据及 runner 命令不进入 Agent 上下文。仅在提示词中省略产物路径不构成隔离；能无限制访问宿主文件系统的本地工具进程也不构成隔离。
 限流、请求大小限制、访问日志和 SQL 执行授权由宿主负责。`transform` 只生成 Query，不执行。
@@ -58,46 +48,21 @@ Agent 环境不得挂载快照、runner、源树、测试或评测材料，也�
 ## 3. 宿主请求协议与知识事实
 
 JSONL 请求恰好包含 `method` 和 `input`；method 选择槽位，仅 input 传入该槽位。
-HTTP 则直接把相同 input POST 到对应路径。知识与查询方法如下：
+HTTP 则直接把相同 input POST 到对应路径。当前使用 `<domain>/transform`，请求形状见下文 Intent 说明。
 
-```json
-{"method":"<domain>/info","input":{"key":"index"}}
-{"method":"<domain>/info","input":{"key":"<key returned by index or links>"}}
-```
-
-宿主收集 `index` 和 discovery 根，再跟随全部 `links[].key` 引用。
-`index.detail` 包含 `{revision,key_patterns,encoding}`，Member 链接包含基本类型。
-每个节点含 `{key,type,description,links,detail}`。键包括 Dataset、Dimension、Field、Measure、Relation、Ty、Value、TimeRole 和 BusinessLink，每个规范名称进行一次 URI 编码。
-返回键是完整稳定身份，标签、别名和物理名称不能替代规范业务 ID。
-
-`<domain>/discovery` 接受 `{}`，返回 `{knowledge_contract,intent_contract,revision,roots,key_patterns,vocabulary}`。
-当前契约为 `ontology-knowledge-v2` 和 `ontology-intent-v1`。根标识可见 Dataset 和 Relation 节点。
-图包含知识事实与业务约束；消费工具负责 Agent 工作流、查询帮助和检索示例，宿主 info 是集成接口。
+当前 IC／relation 不挂载 info／discovery。宿主直接从 Wasm 的 `telora.build.information` 读取
+`ontology.knowledge`，领域契约为 `ontology-knowledge-v4`，包含事实、引用与展示条目。
+Entity 描述业务身份，Dataset 描述物理行及粒度，Role 显式连接二者；DimensionGroup／MeasureGroup 可复用并通过绑定发布成员。
+插件校验引用闭合，并派生导航和反向链接。Int／Float／Bool／String 及 Option／Array／Dict 内联表达，不生成类型节点；具名业务类型保留节点。
+可选展示 sidecar 仅补充名称和文档。模型事实、引用、协议及兼容库接口见[知识契约](ontology/docs/KNOWLEDGE.md)。
 
 对 dsh-oks，知识是 `{meta,origin,data}` 资源，data 为规范键字典。
-`oks_data` 自动解包 `.data`，通过 `knowledge://#meta` 暴露元数据和来源。
-用法分别由 `oks://help/knowledge`、`oks://help/query` 提供，检索由内置 jq 程序实现。
-消费方在加载图前校验契约。
-
-生成消费方数据：
-
-```sh
-node scripts/derive-discovery.mjs --output-prefix bin/icloud_model
-```
-
-脚本写入 `.terminology.json`、`.links.json`、`.keys.json` 和 `.report.json`。
-`--artifact`、`--domain`、`--output-prefix` 选择模型与输出，`--keys roots.json` 可提供根以替代 discovery 调用。
-
-术语结构为 `{revision,datasets,dimensions,measures,rels,types,values}`。
-Dataset、Relation 和业务 Ty 条目含 `{name,doc,aliases}`；Dimension、Measure 增加 `dataset`，Value 增加 `ty`。
-物理 Field 和基本 Type 可通过 info 获取，但不进入搜索词汇。别名和描述来自结构化元数据、本地化标签及显式术语。
-
-链接结构为 `{revision,links:[{source,target,kind}]}`，消费方按目标索引用于反向发现。
-边按 `(source,target,kind)` 唯一，不同种类保留自关系两侧；完整定义及维度局部约束仍在 info 文档中。
+`oks_data` 自动解包 `.data`；用法由 `oks://help/knowledge`、`oks://help/query` 提供。
+消费方从静态知识发现稳定业务 ID，再构造 Intent，不通过运行期遍历重建知识图。
 
 Dimension 标识业务投影与筛选，Measure 标识声明聚合，文档提供允许的查询能力。
 
-先用索引主题和 `info` 发现模型，再用发现的稳定 ID 将用户业务请求表达为 Intent。
+先用宿主发布的静态知识发现模型，再用发现的稳定 ID 将用户业务请求表达为 Intent。
 借助 `transform` 诊断修复 Intent，不改变请求的业务含义。转换成功只说明 Intent 在模型下合法，不证明回答了用户问题。
 优先用一个接受的 Intent 满足业务目的；单计划不足时，可一次 transform 提交最多五个独立 Intent。
 用业务语言解释各结果及其如何共同回答问题。服务不合并或跨计划去重，不能声称已经做了这些工作。
@@ -174,7 +139,7 @@ GraphPair 组计数和 Graph 组计数在 SQLite、PG 中均用显式结果别�
 时间值和窗口语义见[时间契约](ontology/docs/TIME.md)。知识发现描述模型，下文给出通用 Intent 语法；模型与 transform 决定组合是否具备合法业务含义。
 
 当前 IC 时间类型为 `DatetimeUtc`（RFC3339 UTC 秒，`YYYY-MM-DDTHH:MM:SSZ`）、`DateUtc`（`YYYY-MM-DD`）和 `EpochMillis`（JSON 整数毫秒）。
-旧空格分隔 UTC 输入被拒绝，需部署重建快照并通过 info 发现当前类型。
+旧空格分隔 UTC 输入被拒绝，需部署重建制品并通过静态知识发现当前类型。
 
 ### Graph Intent 语法
 
@@ -223,7 +188,7 @@ select 包含 `{"node":"...","dimension":"..."}`。count 是被计数节点实�
 
 聚合阈值应发现共享 `Graph aggregate` 知识节点，了解支持的身份及上下文样本总体。
 `Declared filter capabilities` 解释为什么语法操作符不能覆盖维度 ops；`Ordering and aggregate meaning` 解释 NULL 顺序、身份决胜，以及原始 Top-N 不能替代分组 Min／Max。
-从 index 找到节点，原样传返回键给 info，不能仅为完成转换而改变业务含义。
+通过宿主知识索引找到节点，使用返回的规范键，不能仅为完成转换而改变业务含义。
 
 时间窗口为 `[start,end)`，使用声明逻辑类型中的具体值。end 必填非 null，start 省略或 null 表示截止 end 之前全部历史。
 规划时固定截止值，提交前解析 now、经过时长、日历边界及时区影响。服务拒绝相对表达式及请求 ctx。
@@ -236,9 +201,8 @@ exists 限定外层实体而不扩增其行；关联一对多实体只需证明�
 
 筛选操作符为 Eq、Ne、Gt、Ge、Lt、Le、Contains、NotContains、StartsWith、EndsWith。
 模型限制每个维度允许的操作和逻辑值类型。不要发送 kind，目标维度或度量决定 JSON 值逻辑类型。
-info 显示的带类型谓词输入和规范编码是模型事实，不是 JSON Intent 值语法。
-从索引找到 Intent 语法入口，通过 `<domain>/info` 跟随返回键及链接。
-诊断中给出的 info 键可用于读取知识以修复 Intent。业务值筛选使用稳定值 ID，不使用物理编码或本地化标签。
+带类型谓词输入和规范编码是模型事实，JSON Intent 使用本文定义的值语法。
+当前实验通过模型声明和请求诊断确定允许的 ID 与操作。业务值筛选使用稳定值 ID，不使用物理编码或本地化标签。
 
 ### 单一去重实体集合
 
@@ -301,6 +265,6 @@ transform 的 ok 包含上述批次响应。拒绝 Intent 表现为 `ok.accepted
 | `relation_model` | `relation` | 精简的租户、站点、设备和连通关系示例 |
 | `icloud_model` | `ic` | iMaster Cloud 建模压力夹具 |
 
-每个模型独立构建快照，暴露 `<domain>/info`、`<domain>/transform`、`<domain>/discovery` 及对应 HTTP POST 路由。
+每个模型独立构建快照，暴露 `<domain>/transform` 及对应 HTTP POST 路由。
 两个模块均无需外部构建源，最小构建与请求流程见[关系示例](relation_model/README.md)。
 IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。

@@ -1,0 +1,261 @@
+use crate::typed::{payload};
+use crate::typed::inventory as inventory;
+use crate::model as baseline;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+
+type Pair = struct { id: String, typed: qb::Query, baseline: qb::Query, postgres: qb::Query, columns: Array(intent::ResultColumn), baseline_columns: Array(intent::ResultColumn) };
+def pair: Fn(String, Value) -> Pair = fn(id, request) {
+    let actual = intent::query_intent_ast_factory(payload)(request);
+    let expected = intent::query_intent_ast_factory(baseline::payload)(request);
+    {id, typed: sqlite::build_query(actual), baseline: sqlite::build_query(expected), postgres: postgres::build_query(actual),
+        columns: intent::result_columns(payload, request, actual), baseline_columns: intent::result_columns(baseline::payload, request, expected)}
+};
+def device_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],\{extra}}`).unwrap!()) };
+def join_case: Fn(String) -> Pair = fn(relation) { pair(relation, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"\{relation}","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device_id"},{"node":"t","dimension":"tenant_name"}]}`).unwrap!()) };
+pub def runtime_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.dimensions, fn(dimension) { dimension.projectable }), fn(dimension) {
+        let entity = payload.entities[dimension.entity];
+        pair(`project_\{dimension.id}`, json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"\{entity.id}"}],"edges":[],"select":[{"node":"r","dimension":"\{dimension.id}"}]}`).unwrap!())
+    }),
+    [pair("site_online", json::parse(r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"site"}],"edges":[],"select":[{"node":"s","dimension":"site_id"}],"filters":[{"node":"s","dimension":"site_type","op":"Eq","value":"online"}]}"#).unwrap!()),
+     join_case("device_belongs_to_tenant"), join_case("source_EntNetworkElement_X_TENANT_VIEW"),
+     device_case("known", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_class","op":"Eq","value":"lb"}]"#),
+     device_case("unknown_collision", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_class","op":"Eq","value":{"unknown":"router"}}]"#),
+     device_case("unknowns", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_class","op":"Eq","value":{"unknowns":true}}]"#),
+     device_case("offline", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_commu_state","op":"Eq","value":"offline"}]"#),
+     device_case("subnet", r#""select":[{"node":"d","dimension":"device_id"}],"filters":[{"node":"d","dimension":"device_ip_address_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#),
+     device_case("count", r#""select":[],"measures":[{"node":"d","measure":"device_count"}]"#),
+     device_case("group_class", r#""select":[{"node":"d","dimension":"device_class"}],"measures":[{"node":"d","measure":"device_count"}]"#),
+     pair("tenant_count", json::parse(r#"{"op":"Graph","root":"t","nodes":[{"id":"t","entity":"tenant"}],"edges":[],"select":[],"measures":[{"node":"t","measure":"tenant_count"}]}"#).unwrap!()),
+    ],
+]));
+pub def site_relation_cases: Value = codec::encode(array::concat([array::map(["device_located_at_site", "source_EntNetworkElement_X_SITE_VIEW"], fn(relation) {
+    pair(relation, json::parse(`{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"s","entity":"site"}],"edges":[{"relation":"\{relation}","from":"d","to":"s"}],"select":[{"node":"d","dimension":"device_id"},{"node":"s","dimension":"site_id"}]}`).unwrap!())
+}), array::map(["site_belongs_to_tenant", "source_X_TENANT_VIEW_X_SITE_VIEW"], fn(relation) {
+    let source = if relation == "site_belongs_to_tenant" { "s" } else { "t" };
+    let target = if source == "s" { "t" } else { "s" };
+    pair(relation, json::parse(`{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"site"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"s","dimension":"site_id"},{"node":"t","dimension":"tenant_name"}]}`).unwrap!())
+})]));
+pub def physical_schema: Value = codec::encode(array::map(payload.entities, fn(entity) { (entity.table, array::map(entity.fields, fn(field) { field.column })) }));
+
+def port_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"port"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def port_cases: Value = codec::encode(array::concat([
+    [port_case("port_count", r#""select":[],"measures":[{"node":"p","measure":"interface_count"}]"#),
+     port_case("port_up", r#""select":[{"node":"p","dimension":"port_name"}],"filters":[{"node":"p","dimension":"port_oper_status","op":"Eq","value":"up"}]"#),
+     port_case("port_admin", r#""select":[{"node":"p","dimension":"port_name"}],"filters":[{"node":"p","dimension":"port__adminState","op":"Eq","value":"wire_test_35f03aff"}]"#),
+     port_case("port_type", r#""select":[{"node":"p","dimension":"port_name"}],"filters":[{"node":"p","dimension":"port__ifType","op":"Eq","value":"wire_65635_bc384e3d"}]"#),
+     port_case("port_bandwidth", r#""select":[{"node":"p","dimension":"port_name"}],"filters":[{"node":"p","dimension":"port__bandwidth","op":"Gt","value":1000.5}]"#),
+     port_case("port_subnet", r#""select":[{"node":"p","dimension":"port_name"}],"filters":[{"node":"p","dimension":"port__ipAddress_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#)],
+    array::map(["port_belongs_to_device", "source_EntNetworkElement_EnterpriseNetworkLTP"], fn(relation) {
+        let source = if relation == "port_belongs_to_device" { "p" } else { "d" };
+        let target = if source == "p" { "d" } else { "p" };
+        pair(relation, json::parse(`{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"port"},{"id":"d","entity":"device"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"port_name"},{"node":"d","dimension":"device_id"}]}`).unwrap!())
+    }),
+    [pair("source_EnterpriseNetworkLTP_X_TENANT_VIEW", json::parse(r#"{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"port"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"source_EnterpriseNetworkLTP_X_TENANT_VIEW","from":"p","to":"t"}],"select":[{"node":"p","dimension":"port_name"},{"node":"t","dimension":"tenant_name"}]}"#).unwrap!())],
+]));
+
+def kpi_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"interface_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def kpi_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "interface_kpi" }), fn(measure) {
+        kpi_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [kpi_case("kpi_window", r#""select":[],"measures":[{"node":"k","measure":"interface_tx"}],"time_windows":[{"node":"k","dimension":"interface_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     kpi_case("kpi_day", r#""select":[{"node":"k","dimension":"interface_kpi_utc_day"}],"measures":[{"node":"k","measure":"interface_tx"}]"#)],
+    array::map(["interface_kpi_of_port", "source_EnterpriseNetworkLTP_NetworkDeviceInterfaceKPI"], fn(relation) {
+        let source = if relation == "interface_kpi_of_port" { "k" } else { "p" };
+        let target = if source == "k" { "p" } else { "k" };
+        pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"interface_kpi"},{"id":"p","entity":"port"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"port_name"}],"measures":[{"node":"k","measure":"interface_tx"}]}`).unwrap!())
+    }),
+]));
+def server_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"v","nodes":[{"id":"v","entity":"server_device"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def server_cases: Value = codec::encode(array::concat([
+    [server_case("server_class_filter", r#""select":[{"node":"v","dimension":"server_name"}],"filters":[{"node":"v","dimension":"server_class","op":"Eq","value":"rack"}]"#),
+     server_case("server_health_filter", r#""select":[{"node":"v","dimension":"server_name"}],"filters":[{"node":"v","dimension":"server_health","op":"Eq","value":"error"}]"#),
+     server_case("server_connect_filter", r#""select":[{"node":"v","dimension":"server_name"}],"filters":[{"node":"v","dimension":"server_device__connectStatus","op":"Eq","value":"wire_5_c6f5830f"}]"#),
+     server_case("server_subnet", r#""select":[{"node":"v","dimension":"server_name"}],"filters":[{"node":"v","dimension":"server_ip_address_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#),
+     server_case("server_window", r#""select":[{"node":"v","dimension":"server_name"}],"time_windows":[{"node":"v","dimension":"server_device__createTime","start":0,"end":2000}]"#)],
+    array::map(["server_belongs_to_tenant", "source_PhysicalServer_X_TENANT_VIEW"], fn(relation) {
+        pair(relation, json::parse(`{"op":"Graph","root":"v","row_grain":"Association","nodes":[{"id":"v","entity":"server_device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"\{relation}","from":"v","to":"t"}],"select":[{"node":"v","dimension":"server_name"},{"node":"t","dimension":"tenant_name"}]}`).unwrap!())
+    }),
+    array::map(["server_located_at_site", "source_PhysicalServer_X_SITE_VIEW"], fn(relation) {
+        pair(relation, json::parse(`{"op":"Graph","root":"v","row_grain":"Association","nodes":[{"id":"v","entity":"server_device"},{"id":"s","entity":"site"}],"edges":[{"relation":"\{relation}","from":"v","to":"s"}],"select":[{"node":"v","dimension":"server_name"},{"node":"s","dimension":"site_id"}]}`).unwrap!())
+    }),
+]));
+def server_kpi_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"server_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def server_kpi_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "server_kpi" }), fn(measure) {
+        server_kpi_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [server_kpi_case("server_latest_window", r#""select":[],"measures":[{"node":"k","measure":"server_cpu_latest"},{"node":"k","measure":"server_memory_latest"}],"time_windows":[{"node":"k","dimension":"server_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     server_kpi_case("server_latest_tie", r#""select":[],"measures":[{"node":"k","measure":"server_cpu_latest"},{"node":"k","measure":"server_memory_latest"}],"filters":[{"node":"k","dimension":"server_kpi__parentId","op":"Eq","value":"sv1"}],"time_windows":[{"node":"k","dimension":"server_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#)],
+    array::map(["server_kpi_of_server", "source_PhysicalServer_ServerDeviceKPI"], fn(relation) {
+        let source = if relation == "server_kpi_of_server" { "k" } else { "v" };
+        let target = if source == "k" { "v" } else { "k" };
+        pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"server_kpi"},{"id":"v","entity":"server_device"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"v","dimension":"server_name"}],"measures":[{"node":"k","measure":"server_cpu_usage"},{"node":"k","measure":"server_cpu_latest"},{"node":"k","measure":"server_memory_latest"}]}`).unwrap!())
+    }),
+]));
+def component_case: Fn(String, String, String) -> Pair = fn(id, entity, extra) { pair(id, json::parse(`{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"\{entity}"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def component_cases: Value = codec::encode(array::concat([
+    [component_case("fan_health_filter", "server_fan", r#""select":[{"node":"c","dimension":"server_fan_id"}],"filters":[{"node":"c","dimension":"server_fan__healthStatus","op":"Eq","value":"wire__1_fe93bf05"}]"#),
+     component_case("psu_health_filter", "server_psu", r#""select":[{"node":"c","dimension":"server_psu__name"}],"filters":[{"node":"c","dimension":"server_psu_health","op":"Eq","value":"warning"}]"#),
+     component_case("memory_health_filter", "server_memory", r#""select":[{"node":"c","dimension":"server_memory_name"}],"filters":[{"node":"c","dimension":"server_memory__healthStatus","op":"Eq","value":"wire__2_1027a474"}]"#),
+     component_case("fan_count", "server_fan", r#""select":[],"measures":[{"node":"c","measure":"server_fan_count"}]"#)],
+    array::map([
+        ("fan_parent_server", "server_fan", "server_device", "server_name", False),
+        ("source_PhysicalServer_PhysicalServerFan", "server_fan", "server_device", "server_name", True),
+        ("fan_belongs_to_tenant", "server_fan", "tenant", "tenant_name", False),
+        ("source_PhysicalServerFan_X_TENANT_VIEW", "server_fan", "tenant", "tenant_name", False),
+        ("psu_parent_server", "server_psu", "server_device", "server_name", False),
+        ("source_PhysicalServer_PhysicalServerPSU", "server_psu", "server_device", "server_name", True),
+        ("psu_belongs_to_tenant", "server_psu", "tenant", "tenant_name", False),
+        ("source_PhysicalServerPSU_X_TENANT_VIEW", "server_psu", "tenant", "tenant_name", False),
+        ("memory_parent_server", "server_memory", "server_device", "server_name", False),
+        ("source_PhysicalServer_PhysicalServerMemory", "server_memory", "server_device", "server_name", True),
+        ("source_PhysicalServerMemory_X_TENANT_VIEW", "server_memory", "tenant", "tenant_name", False),
+    ], fn(spec) {
+        let dimension = if spec.1 == "server_fan" { "server_fan_name" } else if spec.1 == "server_psu" { "server_psu__name" } else { "server_memory_name" };
+        let source = if spec.4 { "o" } else { "c" };
+        let target = if spec.4 { "c" } else { "o" };
+        let grain = if spec.2 == "tenant" { r#""row_grain":"Association","# } else { "" };
+        pair(spec.0, json::parse(`{"op":"Graph","root":"c",\{grain}"nodes":[{"id":"c","entity":"\{spec.1}"},{"id":"o","entity":"\{spec.2}"}],"edges":[{"relation":"\{spec.0}","from":"\{source}","to":"\{target}"}],"select":[{"node":"c","dimension":"\{dimension}"},{"node":"o","dimension":"\{spec.3}"}]}`).unwrap!())
+    }),
+    [pair("fan_count_for_server", json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"server_fan"},{"id":"v","entity":"server_device"}],"edges":[{"relation":"fan_parent_server","from":"c","to":"v"}],"select":[],"measures":[{"node":"c","measure":"server_fan_count"}],"filters":[{"node":"v","dimension":"server_name","op":"Eq","value":"sv1"}]}"#).unwrap!()),
+     pair("memory_server_sample_rows", json::parse(r#"{"op":"Graph","root":"c","row_grain":"Association","nodes":[{"id":"c","entity":"server_memory"},{"id":"v","entity":"server_device"},{"id":"k","entity":"server_kpi"}],"edges":[{"relation":"memory_parent_server","from":"c","to":"v"},{"relation":"server_kpi_of_server","from":"k","to":"v"}],"select":[{"node":"c","dimension":"server_memory_name"},{"node":"v","dimension":"server_name"},{"node":"k","dimension":"server_cpu_sample"}]}"#).unwrap!())],
+]));
+def storage_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"storage_device"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def storage_cases: Value = codec::encode(array::concat([
+    array::map([
+        ("storage_running_status", "normal"), ("storage_device_subclass", "fc_switch_device"),
+        ("storage_device__powerStatus", "wire_poweron_719ada0e"), ("storage_device__classification", "wire_HuaweiStorage_314c393a"),
+        ("storage_device__deviceType", "wire_fcswitch_a16c3357"), ("storage_device__healthStatus", "wire_2_8807c846"),
+        ("storage_device__connectStatus", "wire_9_cfd024ae"),
+    ], fn(spec) { storage_case(`filter_\{spec.0}`, `"select":[{"node":"s","dimension":"storage_device_id"}],"filters":[{"node":"s","dimension":"\{spec.0}","op":"Eq","value":"\{spec.1}"}]`) }),
+    [storage_case("storage_counts", r#""select":[],"measures":[{"node":"s","measure":"storage_device_count"},{"node":"s","measure":"storage_device_named_count"}]"#),
+     storage_case("storage_distinct_names", r#""select":[],"count_value":{"node":"s","dimension":"storage_device__name"}"#),
+     storage_case("storage_fraction", r#""select":[{"node":"s","dimension":"storage_device_id"}],"filters":[{"node":"s","dimension":"storage_device__usedCapacityRate","op":"Gt","value":0.4}]"#),
+     storage_case("storage_capacity", r#""select":[{"node":"s","dimension":"storage_device_id"}],"filters":[{"node":"s","dimension":"storage_device__totalStoragePoolCapacity","op":"Gt","value":100.5}]"#),
+     storage_case("storage_subnet", r#""select":[{"node":"s","dimension":"storage_device_id"}],"filters":[{"node":"s","dimension":"storage_device__ipAddress_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#),
+     storage_case("storage_window", r#""select":[{"node":"s","dimension":"storage_device_id"}],"time_windows":[{"node":"s","dimension":"storage_device__createTime","start":0,"end":2000}]"#)],
+    array::map([
+        ("storage_device_belongs_to_tenant", "tenant", "tenant_name"),
+        ("source_HuaweiStorageDeviceAssociationX_TENANT_VIEW", "tenant", "tenant_name"),
+        ("storage_device_site", "site", "site_id"),
+        ("source_HuaweiStorageDeviceAssociationX_SITE_VIEW", "site", "site_id"),
+    ], fn(spec) { pair(spec.0, json::parse(`{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"storage_device"},{"id":"o","entity":"\{spec.1}"}],"edges":[{"relation":"\{spec.0}","from":"s","to":"o"}],"select":[{"node":"s","dimension":"storage_device_id"},{"node":"o","dimension":"\{spec.2}"}]}`).unwrap!()) }),
+]));
+def hardware_case: Fn(String, String, String) -> Pair = fn(id, entity, extra) { pair(id, json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"\{entity}"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def hardware_cases: Value = codec::encode(array::concat([
+    array::map([("normal", "Eq"), ("normal", "Ne"), ("error", "Eq")], fn(spec) {
+        hardware_case(`frame_\{spec.0}_\{spec.1}`, "frame", `"select":[{"node":"h","dimension":"frame_name"}],"filters":[{"node":"h","dimension":"frame_oper_state","op":"\{spec.1}","value":"\{spec.0}"}]`)
+    }),
+    array::map([True, False], fn(value) { hardware_case(if value { "slot_daughter" } else { "slot_main" }, "network_slot", `"select":[{"node":"h","dimension":"slot_id"}],"filters":[{"node":"h","dimension":"slot_is_daughter_card","op":"Eq","value":\{if value { "true" } else { "false" }}}]`) }),
+    [hardware_case("slot_count", "network_slot", r#""select":[],"measures":[{"node":"h","measure":"slot_count"}]"#)],
+    array::map([
+        ("frame_belongs_to_device", "frame", "frame_name", "device", "device_id", False),
+        ("source_EntNetworkElement_EnterpriseFrame", "frame", "frame_name", "device", "device_id", True),
+        ("source_EnterpriseFrame_X_TENANT_VIEW", "frame", "frame_name", "tenant", "tenant_name", False),
+        ("source_EnterpriseFrame_EnterpriseSlot", "network_slot", "slot_id", "frame", "frame_name", True),
+        ("source_EnterpriseSlot_X_TENANT_VIEW", "network_slot", "slot_id", "tenant", "tenant_name", False),
+    ], fn(spec) {
+        let source = if spec.5 { "o" } else { "h" };
+        let target = if spec.5 { "h" } else { "o" };
+        pair(spec.0, json::parse(`{"op":"Graph","root":"h","nodes":[{"id":"h","entity":"\{spec.1}"},{"id":"o","entity":"\{spec.3}"}],"edges":[{"relation":"\{spec.0}","from":"\{source}","to":"\{target}"}],"select":[{"node":"h","dimension":"\{spec.2}"},{"node":"o","dimension":"\{spec.4}"}]}`).unwrap!())
+    }),
+]));
+def pon_case: Fn(String, String, String) -> Pair = fn(id, entity, extra) { pair(id, json::parse(`{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"\{entity}"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def pon_cases: Value = codec::encode(array::concat([
+    array::map([("pon_device", "pon_id"), ("pon_onu_role", "pon_onu_id"), ("pon_olt_role", "pon_olt_id")], fn(spec) {
+        pon_case(`count_\{spec.0}`, spec.0, `"select":[],"count_value":{"node":"p","dimension":"\{spec.1}"}`)
+    }),
+    [pon_case("pon_onu_filter", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_class","op":"Eq","value":"onu"}]"#),
+     pon_case("pon_offline", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_commu_state","op":"Eq","value":"offline"}]"#),
+     pon_case("pon_admin", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_device__adminState","op":"Eq","value":"wire_Enabled_82f10bda"}]"#),
+     pon_case("pon_manufactured", "pon_device", r#""select":[{"node":"p","dimension":"pon_id"}],"filters":[{"node":"p","dimension":"pon_device__manufactureDate","op":"Ge","value":"2024-03-01"}]"#),
+     pon_case("onu_scope_contradiction", "pon_onu_role", r#""select":[{"node":"p","dimension":"pon_onu_id"}],"filters":[{"node":"p","dimension":"pon_onu_id","op":"Eq","value":"n3"}]"#),
+     pon_case("olt_scope_wrong_id", "pon_olt_role", r#""select":[{"node":"p","dimension":"pon_olt_id"}],"filters":[{"node":"p","dimension":"pon_olt_id","op":"Eq","value":"n1"}]"#),
+     pon_case("onu_subnet", "pon_onu_role", r#""select":[{"node":"p","dimension":"pon_onu_id"}],"filters":[{"node":"p","dimension":"pon_onu_role__ipAddress_ipv4","op":"InSubnet","value":"192.0.2.0/24"}]"#),
+     pair("pon_onu_parent_olt", json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"pon_onu_role"},{"id":"p","entity":"pon_olt_role"}],"edges":[{"relation":"pon_onu_parent_olt","from":"c","to":"p"}],"select":[{"node":"c","dimension":"pon_onu_id"},{"node":"p","dimension":"pon_olt_id"}]}"#).unwrap!()),
+     pair("source_EntPonElementAssociationEntPonElement", json::parse(r#"{"op":"Graph","root":"c","nodes":[{"id":"c","entity":"pon_device"},{"id":"p","entity":"pon_device"}],"edges":[{"relation":"source_EntPonElementAssociationEntPonElement","from":"p","to":"c"}],"select":[{"node":"c","dimension":"pon_id"},{"node":"p","dimension":"pon_id"}]}"#).unwrap!())],
+    array::map([("source_EntPonElementAssociationX_TENANT_VIEW", "tenant", "tenant_name"), ("source_EntPonElementAssociationX_SITE_VIEW", "site", "site_id")], fn(spec) {
+        pair(spec.0, json::parse(`{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"pon_device"},{"id":"o","entity":"\{spec.1}"}],"edges":[{"relation":"\{spec.0}","from":"p","to":"o"}],"select":[{"node":"p","dimension":"pon_id"},{"node":"o","dimension":"\{spec.2}"}]}`).unwrap!())
+    }),
+]));
+def onu_kpi_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"onu_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def onu_kpi_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "onu_kpi" }), fn(measure) {
+        onu_kpi_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [onu_kpi_case("onu_window", r#""select":[],"measures":[{"node":"k","measure":"onu_receive_usage"}],"time_windows":[{"node":"k","dimension":"onu_kpi_ts","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     onu_kpi_case("onu_day", r#""select":[{"node":"k","dimension":"onu_utc_day"}],"measures":[{"node":"k","measure":"onu_receive_usage"}]"#)],
+    array::map([
+        ("onu_kpi_of_pon_device", "pon_device", "pon_id", False),
+        ("onu_kpi_of_onu_role", "pon_onu_role", "pon_onu_id", False),
+        ("source_EntPonElementAssociationPonDeviceOnuKPI", "pon_device", "pon_id", True),
+    ], fn(spec) {
+        let source = if spec.3 { "p" } else { "k" };
+        let target = if spec.3 { "k" } else { "p" };
+        pair(spec.0, json::parse(`{"op":"Graph","root":"k","row_grain":"Association","nodes":[{"id":"k","entity":"onu_kpi"},{"id":"p","entity":"\{spec.1}"}],"edges":[{"relation":"\{spec.0}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"\{spec.2}"},{"node":"k","dimension":"onu_receive_usage_sample"}]}`).unwrap!())
+    }),
+    [pair("onu_qualified_mean", json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"onu_kpi"}],"edges":[],"select":[],"measures":[{"node":"k","measure":"onu_receive_usage"}],"exists":[{"anchor":"k","nodes":[{"id":"p","entity":"pon_onu_role"}],"edges":[{"relation":"onu_kpi_of_onu_role","from":"k","to":"p"}],"filters":[{"node":"p","dimension":"pon_onu_id","op":"Eq","value":"n1"}]}]}"#).unwrap!()),
+     pair("onu_samples_for_parent_olt", json::parse(r#"{"op":"Graph","root":"k","row_grain":"Association","nodes":[{"id":"k","entity":"onu_kpi"},{"id":"c","entity":"pon_onu_role"},{"id":"p","entity":"pon_olt_role"}],"edges":[{"relation":"onu_kpi_of_onu_role","from":"k","to":"c"},{"relation":"pon_onu_parent_olt","from":"c","to":"p"}],"select":[{"node":"p","dimension":"pon_olt_id"},{"node":"c","dimension":"pon_onu_id"},{"node":"k","dimension":"onu_receive_usage_sample"}]}"#).unwrap!())],
+]));
+def pon_port_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"pon_port_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def pon_port_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "pon_port_kpi" }), fn(measure) {
+        pon_port_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [pon_port_case("pon_port_window", r#""select":[],"measures":[{"node":"k","measure":"pon_port_receive_usage"}],"time_windows":[{"node":"k","dimension":"pon_port_kpi_ts","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     pon_port_case("pon_port_day", r#""select":[{"node":"k","dimension":"pon_port_kpi_utc_day"}],"measures":[{"node":"k","measure":"pon_port_receive_usage"}]"#)],
+    array::map(["pon_port_kpi_of_device", "source_EntPonElementAssociationPonDevicePonPortKPI"], fn(relation) {
+        let source = if relation == "pon_port_kpi_of_device" { "k" } else { "p" };
+        let target = if source == "k" { "p" } else { "k" };
+        pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"pon_port_kpi"},{"id":"p","entity":"pon_device"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"pon_id"}],"measures":[{"node":"k","measure":"pon_port_receive_usage"}]}`).unwrap!())
+    }),
+    [pair("pon_port_parent_rows", json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"pon_port_kpi"},{"id":"p","entity":"pon_device"}],"edges":[{"relation":"pon_port_kpi_of_device","from":"k","to":"p"}],"select":[{"node":"p","dimension":"pon_id"},{"node":"k","dimension":"pon_port_receive_sample"}]}"#).unwrap!())],
+]));
+def ssid_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"ap_radio_ssid_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def ssid_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "ap_radio_ssid_kpi" }), fn(measure) {
+        ssid_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [ssid_case("ssid_window", r#""select":[],"measures":[{"node":"k","measure":"ap_ssid_connected_terminals"},{"node":"k","measure":"ap_ssid_connected_terminals_sample_avg"}],"time_windows":[{"node":"k","dimension":"ap_ssid_sample_time","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     ssid_case("ssid_day", r#""select":[{"node":"k","dimension":"ap_radio_ssid_kpi_utc_day"}],"measures":[{"node":"k","measure":"ap_ssid_connected_terminals"}]"#),
+     ssid_case("ssid_names", r#""select":[{"node":"k","dimension":"ap_radio_ssid_kpi__ssidName"}],"measures":[{"node":"k","measure":"ap_ssid_connected_terminals"},{"node":"k","measure":"ap_ssid_connected_terminals_sample_avg"}]"#)],
+    array::map(["ap_ssid_kpi_of_device", "source_EntNetworkElement_NetworkApRadioSsidKPI"], fn(relation) {
+        let source = if relation == "ap_ssid_kpi_of_device" { "k" } else { "p" };
+        let target = if source == "k" { "p" } else { "k" };
+        pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"ap_radio_ssid_kpi"},{"id":"p","entity":"device"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"device_id"}],"measures":[{"node":"k","measure":"ap_ssid_connected_terminals"},{"node":"k","measure":"ap_ssid_connected_terminals_sample_avg"}]}`).unwrap!())
+    }),
+    [pair("ssid_parent_rows", json::parse(r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"ap_radio_ssid_kpi"},{"id":"p","entity":"device"}],"edges":[{"relation":"ap_ssid_kpi_of_device","from":"k","to":"p"}],"select":[{"node":"p","dimension":"device_id"},{"node":"k","dimension":"ap_ssid_connected_terminals_raw"}]}"#).unwrap!())],
+]));
+def device_sample_case: Fn(String, String) -> Pair = fn(id, extra) { pair(id, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"}],"edges":[],\{extra}}`).unwrap!()) };
+pub def device_sample_cases: Value = codec::encode(array::concat([
+    array::map(array::filter(payload.measures, fn(measure) { payload.entities[measure.entity].id == "device_kpi" }), fn(measure) {
+        device_sample_case(`measure_\{measure.id}`, `"select":[],"measures":[{"node":"k","measure":"\{measure.id}"}]`)
+    }),
+    [device_sample_case("device_latest_window", r#""select":[],"measures":[{"node":"k","measure":"device_cpu_latest"},{"node":"k","measure":"device_memory_latest"}],"time_windows":[{"node":"k","dimension":"device_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     device_sample_case("device_latest_tie", r#""select":[],"measures":[{"node":"k","measure":"device_cpu_latest"},{"node":"k","measure":"device_memory_latest"}],"filters":[{"node":"k","dimension":"device_kpi_res_id","op":"Eq","value":"d1"}],"time_windows":[{"node":"k","dimension":"device_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#),
+     device_sample_case("device_latest_null", r#""select":[],"measures":[{"node":"k","measure":"device_cpu_latest"},{"node":"k","measure":"device_memory_latest"}],"filters":[{"node":"k","dimension":"device_kpi_res_id","op":"Eq","value":"d1"}]"#),
+     device_sample_case("device_sample_day", r#""select":[{"node":"k","dimension":"device_kpi_utc_day"}],"measures":[{"node":"k","measure":"cpu_usage"}]"#),
+     device_sample_case("device_eligible_count", r#""select":[],"measures":[{"node":"k","measure":"device_kpi_sample_count"},{"node":"k","measure":"cpu_usage"}],"filters":[{"node":"k","dimension":"device_cpu_sample","op":"Gt","value":40}],"time_windows":[{"node":"k","dimension":"device_kpi_ts_raw","start":"2024-03-01T00:00:00Z","end":"2024-03-02T00:00:00Z"}]"#)],
+    array::map(["device_kpi_of_device", "source_EntNetworkElement_NetworkDeviceKPI"], fn(relation) {
+        let source = if relation == "device_kpi_of_device" { "k" } else { "p" };
+        let target = if source == "k" { "p" } else { "k" };
+        pair(relation, json::parse(`{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"},{"id":"p","entity":"device"}],"edges":[{"relation":"\{relation}","from":"\{source}","to":"\{target}"}],"select":[{"node":"p","dimension":"device_id"}],"measures":[{"node":"k","measure":"cpu_usage"},{"node":"k","measure":"device_cpu_latest"},{"node":"k","measure":"device_memory_latest"},{"node":"k","measure":"device_kpi_sample_count"}]}`).unwrap!())
+    }),
+]));
+pub def physical_affinities: Value = codec::encode(array::map(payload.entities, fn(entity) { (entity.table, array::map(entity.fields, fn(field) {
+    (field.column, if field.ty == Int.type || field.ty == Bool.type { "INTEGER" } else if field.ty == Float.type { "REAL" } else { "TEXT" })
+})) }));
+# 一次初始化输出全部对照请求与物理 schema，避免每组查询重复准备旧模型
+type RuntimeFixture = struct { inventory: Value, site: Value, port: Value, kpi: Value, server: Value, server_kpi: Value, components: Value, storage: Value, hardware: Value, pon: Value, onu_kpi: Value, pon_port: Value, ssid: Value, device_samples: Value, schema: Value, affinities: Value };
+def fixture: RuntimeFixture = {inventory: runtime_cases, site: site_relation_cases, port: port_cases, kpi: kpi_cases, server: server_cases, server_kpi: server_kpi_cases, components: component_cases, storage: storage_cases, hardware: hardware_cases, pon: pon_cases, onu_kpi: onu_kpi_cases, pon_port: pon_port_cases, ssid: ssid_cases, device_samples: device_sample_cases, schema: physical_schema, affinities: physical_affinities};
+pub def runtime_fixture: Value = codec::encode(fixture);

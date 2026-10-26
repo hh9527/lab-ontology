@@ -1,0 +1,659 @@
+# 独立声明到现有 transform 的准备入口，不解析或建立知识地图。
+use crate::experimental::model as m;
+use crate::experimental::groups as g;
+use crate::experimental::relations as r;
+use crate::experimental::values as v;
+use crate::experimental::scalars as scalars;
+use crate::experimental::samples as samples;
+use crate::ontology as edsl;
+use crate::query as qb;
+use std::array as array;
+use std::type_desc as td;
+use std::string as string;
+use std::codec as codec;
+use std::value::{Value};
+
+type ColumnBinding = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
+type ColumnMapping(Row) = struct { row: Type, field: String, value: Type, nullable: Bool, column: String };
+type FieldCount(Row) = struct { condition: Option(v::MemberPredicate), row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
+type FieldCountFacts = struct { condition: Option(v::MemberPredicate), row: Type, dataset: String, source: String, field: String, value: Type, nullable: Bool, id: String };
+# 计数依赖使用同一 Dataset 的显式引用，不用任意字符串拼接表达式。
+type CountRef(Row) = struct { row: Type, dataset: String, source: String, id: String };
+type CountRefFacts = struct { row: Type, dataset: String, source: String, id: String };
+type ComputedCount(Row) = struct { result: CountRef(Row), left: CountRef(Row), right: CountRef(Row), op: qb::ComputedOp };
+type ComputedCountFacts = struct { result: CountRefFacts, left: CountRefFacts, right: CountRefFacts, op: qb::ComputedOp };
+type RowScope(Row) = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
+type RowScopeFacts = struct { row: Type, dataset: String, source: String, column: g::Column, input: edsl::FilterInput };
+type NativePair(Row) = struct { id: String, first: g::Binding(Row), second: g::Binding(Row) };
+type NativePairFacts = struct { id: String, first: g::BindingFacts, second: g::BindingFacts };
+type Declaration = struct { native_pairs: Array(NativePairFacts), computed_counts: Array(ComputedCountFacts), kind: edsl::DatasetKind, scope: Array(RowScopeFacts), dataset: m::PreparedDataset, groups: Array(g::BindingFacts), record_counts: Array(String), field_counts: Array(FieldCountFacts), columns: Array(ColumnBinding), domains: Array(v::BindingFacts), clock: Option(String), samples: Array(samples::BindingFacts) };
+type Prepared = struct { declarations: Array(Declaration), payload: edsl::PreparedPayload, relations: Array(r::Relation), alternatives: Array(Alternative) };
+type Alternative = struct { id: String, choices: Array(r::Relation), cardinality: edsl::RelationCardinality };
+def declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
+    let prepared = m::prepare(dataset, roles);
+    {native_pairs: [], computed_counts: [], kind: edsl::DatasetKind::Entity, scope: [], dataset: prepared,
+        groups: array::map(groups, g::binding_facts), record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+};
+def validate_native_pair: Fn(NativePairFacts) -> () = fn(pair) {
+    if pair.id == "" || pair.first.row != pair.second.row || pair.first.dataset != pair.second.dataset || pair.first.source != pair.second.source {
+        fail!("native pair requires dimensions from the same dataset", pair.id)
+    } else if array::length(pair.first.members) != 1 || array::length(pair.second.members) != 1 {
+        fail!("native pair requires single dimension bindings", pair.id)
+    } else {
+        let first = pair.first.members[0];
+        let second = pair.second.members[0];
+        let plain: Fn(g::Member) -> Bool = fn(member) { member.aggregate == None && match member.node { g::Node::Column(_) => True, _ => False } && array::any(member.filters, fn(op) { op == g::Filter::Eq }) };
+        if first.id == second.id || first.value != second.value || !plain(first) || !plain(second)
+            || first.node == second.node {
+            fail!("native pair requires distinct compatible plain equality dimensions", pair.id)
+        } else { () }
+    }
+};
+def native_pair: for(Row) Fn(String, g::Binding(Row), g::Binding(Row)) -> NativePair(Row) = fn(id, first, second) { {id, first, second} };
+def with_native_pairs: for(Row) Fn(Declaration, Array(NativePair(Row))) -> Declaration = fn(declared, pairs) {
+    declared <~ {native_pairs: array::map(pairs, fn(pair) { {id: pair.id, first: g::binding_facts(pair.first), second: g::binding_facts(pair.second)}.ty!(NativePairFacts) })}
+};
+# 固有行范围在所有查询中生效；沿用现有维度的等值解析与域编码契约。
+def scope_equal: for(Row, Scalar: codec::Encode) Fn(m::Dataset(Row), m::Field(Row, Scalar), Scalar) -> RowScope(Row) = fn(dataset, field, value) {
+    {row: Row.type, dataset: dataset.id, source: dataset.source, column: {name: field.name, value: Scalar.type, nullable: field.nullable}, input: scalar_input(value)}
+};
+def with_scope: for(Row) Fn(Declaration, Array(RowScope(Row))) -> Declaration = fn(declared, predicates) {
+    declared <~ {scope: array::map(predicates, fn(predicate) { {row: predicate.row, dataset: predicate.dataset, source: predicate.source, column: predicate.column, input: predicate.input}.ty!(RowScopeFacts) })}
+};
+def prepare_scope: Fn(Declaration, Bool) -> Array(edsl::ScopePredicate) = fn(declared, validate) {
+    array::map(declared.scope, fn(predicate) {
+        if validate {
+            if predicate.row != declared.dataset.row || predicate.dataset != declared.dataset.id || predicate.source != declared.dataset.source {
+                fail!("row scope belongs to another dataset", declared.dataset.id)
+            } else { () };
+            g::shape(declared.dataset.row, g::Node::Column(predicate.column));
+            let storage = scalar(predicate.column.value).storage;
+            let compatible = match predicate.input {
+                edsl::FilterInput::Text(_) => storage == String.type,
+                edsl::FilterInput::Int(_) => storage == Int.type,
+                edsl::FilterInput::Number(_) => storage == Float.type,
+                edsl::FilterInput::Bool(_) => storage == Bool.type,
+                _ => False,
+            };
+            if !compatible { fail!("row scope literal does not match field storage", predicate.column.name) } else { () }
+        } else { () };
+        {field: predicate.column.name, op: edsl::FilterOp::Eq, input: predicate.input}.ty!(edsl::ScopePredicate)
+    })
+};
+# COUNT(field) 只计算非NULL来源值，不要求字段是主键，也不自动变成DISTINCT
+# 保留来源与类型见证，在擦除后准备时再次检查
+def field_count: for(Row, Value) Fn(m::Dataset(Row), m::Field(Row, Value), String) -> FieldCount(Row) = fn(dataset, field, id) { {condition: None, row: Row.type, dataset: dataset.id, source: dataset.source, field: field.name, value: Value.type, nullable: field.nullable, id} };
+def filtered_count: for(Row, Business: codec::Encode) Fn(FieldCount(Row), v::Binding(Row), Business) -> FieldCount(Row) = fn(count, binding, member) {
+    let id = match codec::encode(member) { Value::String(value) => value, _ => fail!("business predicate member must encode to text", binding.id) };
+    count <~ {condition: Some({binding: v::binding_facts(binding), member: id})}
+};
+def with_field_counts: for(Row) Fn(Declaration, Array(FieldCount(Row))) -> Declaration = fn(declared, counts) {
+    declared <~ {field_counts: array::map(counts, fn(count) { {condition: count.condition, row: count.row, dataset: count.dataset, source: count.source, field: count.field, value: count.value, nullable: count.nullable, id: count.id}.ty!(FieldCountFacts) })}
+};
+def count_dependency_cycle: Fn(Array(ComputedCountFacts), String, Array(String)) -> Bool = fn(counts, id, visited) {
+    if array::any(visited, fn(previous) { previous == id }) { True }
+    else { match array::find(counts, fn(count) { count.result.id == id }) {
+        None => False,
+        Some(count) => array::any([count.left.id, count.right.id], fn(dependency) { count_dependency_cycle(counts, dependency, array::push(visited, id)) }),
+    } }
+};
+def count_ref: for(Row) Fn(FieldCount(Row)) -> CountRef(Row) = fn(count) {
+    {row: count.row, dataset: count.dataset, source: count.source, id: count.id}
+};
+def count_ref_facts: for(Row) Fn(CountRef(Row)) -> CountRefFacts = fn(reference) {
+    {row: reference.row, dataset: reference.dataset, source: reference.source, id: reference.id}
+};
+def combine_counts: for(Row) Fn(String, qb::ComputedOp, CountRef(Row), CountRef(Row)) -> ComputedCount(Row) = fn(id, op, left, right) { {result: left <~ {id}, left, right, op} };
+def computed_count_ref: for(Row) Fn(ComputedCount(Row)) -> CountRef(Row) = fn(count) { count.result };
+def with_computed_counts: for(Row) Fn(Declaration, Array(ComputedCount(Row))) -> Declaration = fn(declared, counts) {
+    declared <~ {computed_counts: array::map(counts, fn(count) {
+        let facts: Fn(CountRef(Row)) -> CountRefFacts = fn(reference) { {row: reference.row, dataset: reference.dataset, source: reference.source, id: reference.id} };
+        {result: facts(count.result), left: facts(count.left), right: facts(count.right), op: count.op}.ty!(ComputedCountFacts)
+    })}
+};
+# Metric 的权威时间必须显式选择，字段类型提供 UTC 语义。
+def metric: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) { declared <~ {kind: edsl::DatasetKind::Metric, clock: Some(clock.name)} };
+# Event 显式保留事件 grain 和发生时钟，不因具有时钟而成为 Metric。
+def event: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) { declared <~ {kind: edsl::DatasetKind::Event, clock: Some(clock.name)} };
+def with_samples: for(Row) Fn(Declaration, Array(samples::Binding(Row))) -> Declaration = fn(declared, bindings) { declared <~ {samples: array::map(bindings, samples::binding_facts)} };
+def with_domains: for(Row) Fn(Declaration, Array(v::Binding(Row))) -> Declaration = fn(declared, bindings) { declared <~ {domains: array::map(bindings, v::binding_facts)} };
+# Row 字段映射到可信物理列，不接受 SQL 表达式或改变字段类型。
+def column: for(Row, Value) Fn(m::Field(Row, Value), String) -> ColumnMapping(Row) = fn(field, name) { {row: Row.type, field: field.name, value: Value.type, nullable: field.nullable, column: name} };
+def map_columns: for(Row) Fn(Declaration, Array(ColumnMapping(Row))) -> Declaration = fn(declared, mappings) {
+    declared <~ {columns: array::map(mappings, fn(mapping) { {row: mapping.row, field: mapping.field, value: mapping.value, nullable: mapping.nullable, column: mapping.column}.ty!(ColumnBinding) })}
+};
+# SQL 标识符仅接受 ASCII；两种主要 SQL 后端均不能靠大小写区分未引用列。
+def identifier_key: Fn(String) -> String = fn(name) {
+    array::fold([["A", "a"], ["B", "b"], ["C", "c"], ["D", "d"], ["E", "e"], ["F", "f"],
+        ["G", "g"], ["H", "h"], ["I", "i"], ["J", "j"], ["K", "k"], ["L", "l"], ["M", "m"],
+        ["N", "n"], ["O", "o"], ["P", "p"], ["Q", "q"], ["R", "r"], ["S", "s"], ["T", "t"],
+        ["U", "u"], ["V", "v"], ["W", "w"], ["X", "x"], ["Y", "y"], ["Z", "z"]],
+        name, fn(value, pair) { string::replace(value, pair[0], pair[1]) })
+};
+type Scalar = struct { storage: Type, nullable: Bool };
+def scalar: Fn(Type) -> Scalar = fn(ty) {
+    let resolved = if td::kind(ty) == td::TypeDescKind::Ref {
+        match td::resolve(ty) { Ok(value) => value, Err(error) => fail!(error.message, ty) }
+    } else { ty };
+    if resolved == Bool.type { {storage: Bool.type, nullable: False} }
+    else { match td::kind(resolved) {
+        td::TypeDescKind::Newtype => scalar(td::children(resolved)[0]),
+        td::TypeDescKind::Enum => {
+            let variants = td::variants(resolved);
+            let some = array::find(variants, fn(variant) { variant.name == "Some" && variant.payload != None });
+            if array::length(variants) != 2 || !array::any(variants, fn(variant) { variant.name == "None" && variant.payload == None }) {
+                fail!("typed transform requires a scalar or optional scalar representation", ty)
+            } else {
+                match some {
+                    Some(variant) => match variant.payload {
+                        Some(value) => {
+                            let payload = scalar(value);
+                            if payload.nullable { fail!("typed transform cannot encode nested optional values in one SQL column", ty) }
+                            else { payload <~ {nullable: True} }
+                        },
+                        None => fail!("optional scalar requires a payload", ty),
+                    },
+                    None => fail!("optional scalar requires Some and None", ty),
+                }
+            }
+        },
+        td::TypeDescKind::Int => {storage: Int.type, nullable: False},
+        td::TypeDescKind::Float => {storage: Float.type, nullable: False},
+        td::TypeDescKind::String => {storage: String.type, nullable: False},
+        _ => fail!("typed transform requires an integer, float, boolean or string representation", ty),
+    } }
+};
+def physical_columns: Fn(Declaration) -> Array(String) = fn(declared) {
+    let fields = td::fields(declared.dataset.row);
+    array::map(declared.columns, fn(mapping) {
+        let field = match array::find(fields, fn(field) { field.name == mapping.field }) {
+            Some(value) => value, None => fail!("typed column mapping field does not exist", declared.dataset.id, mapping.field),
+        };
+        let actual = if mapping.nullable {
+            let variants = td::variants(field.ty);
+            array::length(variants) == 2
+                && array::any(variants, fn(variant) { variant.name == "None" && variant.payload == None })
+                && array::any(variants, fn(variant) { variant.name == "Some" && variant.payload == Some(mapping.value) })
+        } else { field.ty == mapping.value };
+        if mapping.row != declared.dataset.row || !actual { fail!("typed column mapping field witness does not match its row", declared.dataset.id, mapping.field) }
+        else if !qb::is_sql_identifier(mapping.column) { fail!("typed column mapping physical name must be an identifier", mapping.column) }
+        else if array::length(array::filter(declared.columns, fn(other) { other.field == mapping.field })) != 1 {
+            fail!("typed column mapping repeats a logical field", mapping.field)
+        } else { () }
+    });
+    let columns = array::map(fields, fn(field) {
+        match array::find(declared.columns, fn(mapping) { mapping.field == field.name }) {
+            Some(mapping) => mapping.column,
+            None => field.name,
+        }
+    });
+    let keys = array::map(columns, identifier_key);
+    array::map(array::enumerate(columns), fn(pair) {
+        if !qb::is_sql_identifier(pair.1) { fail!("typed transform physical field must be an identifier", pair.1) }
+        else if array::length(array::filter(keys, fn(key) { key == keys[pair.0] })) != 1 {
+            fail!("typed column mappings collide on a physical column", declared.dataset.id, pair.1)
+        } else { pair.1 }
+    })
+};
+def entity_entry: Fn(Declaration, Int, Bool) -> edsl::EntityEntry = fn(declared, index, validate) {
+    let dataset = if validate { m::validate_prepared(declared.dataset) } else { declared.dataset };
+    let single_key = array::length(dataset.grain) == 1;
+    let columns = if validate { physical_columns(declared) } else {
+        array::map(td::fields(dataset.row), fn(field) {
+            match array::find(declared.columns, fn(mapping) { mapping.field == field.name }) {
+                Some(mapping) => mapping.column, None => field.name,
+            }
+        })
+    };
+    let fields = array::map(td::fields(dataset.row), fn(field) {
+        let value = scalar(field.ty);
+        if validate && !qb::is_sql_identifier(field.name) { fail!("typed transform physical field must be an identifier", dataset.id, field.name) }
+        else {
+            {time: scalars::field_time_role(field.ty), logical_type: None, nullable: value.nullable, index: field.index, name: field.name,
+                column: columns[field.index], is_key: single_key && dataset.grain[0] == field.name, ty: value.storage}.ty!(edsl::FieldEntry)
+        }
+    });
+    if validate && declared.kind != edsl::DatasetKind::Entity && declared.clock == None { fail!("temporal dataset requires an explicit UTC clock", dataset.id) } else { () };
+    if validate && declared.kind == edsl::DatasetKind::Entity && declared.clock != None { fail!("entity dataset cannot declare a temporal clock", dataset.id) } else { () };
+    if validate && declared.kind == edsl::DatasetKind::Event && array::length(declared.samples) > 0 { fail!("sample measures require a Metric dataset", dataset.id) } else { () };
+    let sample_measures = if validate { samples::validate_bindings(dataset, declared.samples) } else { samples::lower(declared.samples) };
+    if validate {
+        if array::length(sample_measures) > 0 && declared.clock == None { fail!("sample measures require an explicit metric clock", dataset.id) } else { () };
+        if declared.clock != None && array::length(dataset.grain) == 0 { fail!("metric dataset requires a complete sample grain", dataset.id) } else { () };
+        match declared.clock {
+            None => (),
+            Some(name) => if !array::any(fields, fn(field) { field.name == name && match field.time { Some(role) => role.semantics == edsl::TimeSemantics::Utc, None => False } }) {
+                fail!("metric clock requires a UTC instant field", dataset.id, name)
+            } else { () },
+        };
+        ()
+    } else { () };
+    let key = match array::find(fields, fn(field) { field.is_key }) { Some(field) => field.index, None => -1 };
+    let source = qb::source_with_hint(qb::build_context(), dataset.source, `typed_\{index}`).1;
+    {references: [], field_roles: [], index, id: dataset.id, entity_type: dataset.row, table: dataset.source,
+        alias: source.alias, source, key_field: key, fields, union: None,
+        dataset: if array::length(dataset.grain) == 0 { None } else { Some({kind: declared.kind, grain: dataset.grain, utc_time: declared.clock}) },
+        sample_measures, description: None, scope: prepare_scope(declared, validate)}
+};
+# Group 使用 Row 字段寻址；在进入 QueryAst 前统一替换为已校验物理列。
+def physical_expr: Fn(qb::Expr, Array(edsl::FieldEntry)) -> qb::Expr = fn(expr, fields) {
+    match expr {
+        qb::Expr::Column(column) => match array::find(fields, fn(field) { field.name == column.column }) {
+            Some(field) => qb::Expr::Column(column <~ {column: field.column}),
+            None => fail!("typed expression references an unmapped row field", column.column),
+        },
+        qb::Expr::AllocatedBind(_) => expr,
+        qb::Expr::Scalar(call) => qb::Expr::Scalar(call <~ {args: array::map(call.args, fn(arg) { physical_expr(arg, fields) })}),
+    }
+};
+def lower_member: Fn(qb::BuildCtx, qb::Source, Array(edsl::FieldEntry), g::Node) -> (qb::BuildCtx, qb::Expr) = fn(ctx, source, fields, node) {
+    let lowered = g::lower(ctx, source, node);
+    (lowered.0, physical_expr(lowered.1, fields))
+};
+# 现有准备结构保留一个锚定字段；完整表达式由 Group lowering 生成。
+def anchor_column: Fn(g::Node) -> String = fn(node) {
+    match node {
+        g::Node::Column(column) => column.name,
+        g::Node::Seconds(input) => anchor_column(input),
+        g::Node::Ipv4(input) => anchor_column(input),
+        g::Node::UtcBucket(bucket) => anchor_column(bucket.input),
+        g::Node::Rate(inputs) => anchor_column(inputs.amount),
+        g::Node::Identity(input) => input.column.name,
+    }
+};
+def dimension_entry: Fn(edsl::EntityEntry, g::Member) -> edsl::DimensionEntry = fn(entity, member) {
+    if member.aggregate != None { fail!("typed Graph preparation does not yet lower aggregate Group expressions", member.id) } else { () };
+    let column = anchor_column(member.node);
+    let field = match array::find(entity.fields, fn(field) { field.name == column }) {
+        Some(field) => field, None => fail!("typed dimension input field is missing", member.id),
+    };
+    let value = scalar(member.value);
+    let output = if value.storage == String.type { edsl::OutputType::Text }
+        else if value.storage == Int.type { edsl::OutputType::Integer }
+        else if value.storage == Bool.type { edsl::OutputType::Boolean } else { edsl::OutputType::Number };
+    let input = if let Some(role) = scalars::time_role(member.value) { scalars::input_kind(role) } else if member.value == scalars::Ipv4.type { edsl::FilterInputKind::Ipv4 } else if value.storage == String.type { edsl::FilterInputKind::Text }
+        else if value.storage == Int.type { edsl::FilterInputKind::Int }
+        else if value.storage == Bool.type { edsl::FilterInputKind::Bool } else { edsl::FilterInputKind::Number };
+    let ops = array::map(member.filters, fn(op) {
+        match op {
+            g::Filter::InSubnet => edsl::FilterOp::InSubnet,
+            g::Filter::NotInSubnet => edsl::FilterOp::NotInSubnet,
+            g::Filter::Eq => edsl::FilterOp::Eq,
+            g::Filter::Ne => edsl::FilterOp::Ne,
+            g::Filter::Gt => edsl::FilterOp::Gt,
+            g::Filter::Ge => edsl::FilterOp::Ge,
+            g::Filter::Lt => edsl::FilterOp::Lt,
+            g::Filter::Le => edsl::FilterOp::Le,
+            g::Filter::Contains => edsl::FilterOp::Contains,
+            g::Filter::NotContains => edsl::FilterOp::NotContains,
+            g::Filter::StartsWith => edsl::FilterOp::StartsWith,
+            g::Filter::EndsWith => edsl::FilterOp::EndsWith,
+        }
+    });
+    {utc_bucket: match member.node { g::Node::UtcBucket(bucket) => Some({id: member.id, unit: bucket.unit}), _ => None }, value_type: None, ty: if let Some(role) = scalars::time_role(member.value) { match role.encoding { edsl::TimeEncoding::EpochMillis => "EpochMillis", edsl::TimeEncoding::Rfc3339Text => "DatetimeUtc", edsl::TimeEncoding::DateText => "DateUtc", edsl::TimeEncoding::LocalText => "LocalDateTime" } } else if member.value == scalars::Ipv4.type { "Ipv4" } else if value.storage == String.type { "Text" } else if value.storage == Int.type { "Int" } else if value.storage == Bool.type { "Bool" } else { "Number" },
+        half_open: False, id: member.id, entity: entity.index, field: field.index, output_type: output, computed: match member.node { g::Node::Column(_) => False, _ => True },
+        build: fn(ctx, base) { lower_member(ctx, entity.source, entity.fields, member.node) }, authorized: member.projectable || array::length(ops) > 0, projectable: member.projectable, filterable: array::length(ops) > 0,
+        ops, input_kinds: [input], values: [], canonical_values: [], canonical_order: [], canonical_aliases: [], scope: []}
+};
+def domain_entry: Fn(edsl::EntityEntry, v::BindingFacts) -> edsl::DimensionEntry = fn(entity, binding) {
+    let policy = {projectable: binding.group_projectable, filters: binding.group_filters};
+    let member: g::Member = {group: binding.definition.id, local: "value", id: binding.id, node: binding.node,
+        value: binding.definition.wire, nullable: binding.nullable, aggregate: None, projectable: binding.projectable,
+        filters: binding.filters, kind: g::MemberKind::Dimension(policy)};
+    let base = dimension_entry(entity, member);
+    base <~ {value_type: Some(binding.definition.value), ty: binding.definition.id, half_open: binding.definition.half_open,
+        output_type: edsl::OutputType::Text, input_kinds: [edsl::FilterInputKind::Text],
+        canonical_values: binding.definition.values, canonical_order: binding.definition.order}
+};
+# prepare/build 默认只做 transform 必需的准备；self_check 显式校验模型。
+def prepare_trusted: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(revision, declarations, profile) {
+    prepare_impl(revision, declarations, profile, False)
+};
+def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(revision, declarations, profile) {
+    prepare_impl(revision, declarations, profile, False)
+};
+def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepared = fn(revision, declarations, profile, validate) {
+    if validate {
+        let datasets = array::map(declarations, fn(declared) {
+            let checked = m::validate_prepared(declared.dataset);
+            array::map(array::flat_map(declared.groups, g::binding_roles), fn(role) {
+                if !array::any(checked.roles, fn(registered) { registered == role }) {
+                    fail!("identity dimension role must be registered on its dataset", checked.id, role.id)
+                } else { () }
+            });
+            if array::length(array::filter(declarations, fn(other) { other.dataset.id == checked.id })) != 1 {
+                fail!("typed transform dataset ids must be unique", checked.id)
+            } else if array::length(declared.record_counts) > 0 && array::length(checked.grain) == 0 {
+                fail!("record count requires a declared dataset grain", checked.id)
+            } else { checked }
+        });
+        let roles = array::flat_map(datasets, fn(dataset) { dataset.roles });
+        array::map(roles, fn(role) {
+            if array::any(roles, fn(other) { other.entity == role.entity && other.identity != role.identity }) {
+                fail!("entity id has conflicting identities across datasets", role.entity)
+            } else { () }
+        });
+        ()
+    } else { () };
+    let entities = array::map(array::enumerate(declarations), fn(pair) { entity_entry(pair.1, pair.0, validate) });
+    if validate {
+        array::map(entities, fn(entity) {
+            if !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Source })
+                || !qb::source_profile_accepts(entity.source, profile) {
+                fail!("typed dataset source is not allowed by the query profile", entity.id)
+            } else { () }
+        });
+        ()
+    } else { () };
+    let dimensions = array::flat_map(array::enumerate(declarations), fn(pair) {
+        let members = if validate { g::validate_facts(pair.1.dataset, pair.1.groups) } else { array::flat_map(pair.1.groups, fn(binding) { binding.members }) };
+        let domains = if validate { v::validate_bindings(pair.1.dataset, pair.1.domains) } else { pair.1.domains };
+        array::concat([array::map(array::filter(members, fn(member) { member.aggregate == None }), fn(member) { dimension_entry(entities[pair.0], member) }),
+            array::map(domains, fn(binding) { domain_entry(entities[pair.0], binding) })])
+    });
+    if validate {
+        let domain_bindings = array::flat_map(declarations, fn(declared) { declared.domains });
+        array::map(domain_bindings, fn(binding) {
+            if array::any(domain_bindings, fn(other) { other.definition.id == binding.definition.id && other.definition.value != binding.definition.value }) {
+                fail!("business domain id has conflicting value types", binding.definition.id)
+            } else { () }
+        });
+        ()
+    } else { () };
+    let measures = array::flat_map(array::enumerate(declarations), fn(pair) {
+        let entity = entities[pair.0];
+        let members = if validate { g::validate_facts(pair.1.dataset, pair.1.groups) } else { array::flat_map(pair.1.groups, fn(binding) { binding.members }) };
+        let grouped = array::map(array::filter(members, fn(member) { member.aggregate != None }), fn(member) {
+            let field = match array::find(entity.fields, fn(field) { field.name == anchor_column(member.node) }) {
+                Some(value) => value, None => fail!("typed measure input field is missing", member.id),
+            };
+            let function = match member.aggregate { Some(value) => value, None => fail!("typed measure requires an aggregate", member.id) };
+            let value = scalar(member.value);
+            let output = if value.storage == Int.type { edsl::OutputType::Integer }
+                else if value.storage == Float.type { edsl::OutputType::Number }
+                else { fail!("typed Group measure requires a numeric result", member.id) };
+            {id: member.id, entity: entity.index, field: field.index, aggregate: function,
+                input: edsl::MeasureInput::All, alias: member.id, requires: [], predicate: None, computed: None,
+                row_expression: match member.node { g::Node::Column(_) => None, _ => Some({output_type: output, build: fn(ctx, source) { lower_member(ctx, source, entity.fields, member.node) }}) }}.ty!(edsl::MeasureEntry)
+        });
+        let counts = array::map(pair.1.record_counts, fn(id) {
+            let field = match array::find(entity.fields, fn(field) { field.name == pair.1.dataset.grain[0] }) {
+                Some(value) => value, None => fail!("record count grain field is missing", id),
+            };
+            if validate && !qb::is_sql_identifier(id) { fail!("record count id must be a SQL identifier", id) }
+            else { {id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
+                input: edsl::MeasureInput::All, alias: id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry) }
+        });
+        let field_counts = array::map(pair.1.field_counts, fn(count) {
+            if validate {
+                if count.row != pair.1.dataset.row || count.dataset != pair.1.dataset.id || count.source != pair.1.dataset.source {
+                    fail!("field count belongs to another dataset", count.id)
+                } else if !qb::is_sql_identifier(count.id) { fail!("field count requires a valid public identifier", count.id) } else { () };
+                let shape = g::shape(pair.1.dataset.row, g::Node::Column({name: count.field, value: count.value, nullable: count.nullable}));
+                if shape.value != count.value || shape.nullable != count.nullable { fail!("field count type witness is invalid", count.id) } else { () };
+                ()
+            } else { () };
+            let field = match array::find(entity.fields, fn(field) { field.name == count.field }) {
+                Some(value) => value, None => fail!("field count input is missing", count.id),
+            };
+            {id: count.id, entity: entity.index, field: field.index, aggregate: qb::AggregateFunction::Count,
+                input: edsl::MeasureInput::All, alias: count.id, requires: [], predicate: match count.condition { None => None, Some(predicate) => Some(if validate { v::prepare_predicate(pair.1.dataset, pair.1.domains, predicate) } else { v::lower_predicate(predicate) }) }, row_expression: None, computed: None}.ty!(edsl::MeasureEntry)
+        });
+        let reported = array::map(entity.sample_measures, fn(sample) {
+            let field = match array::find(entity.fields, fn(field) { field.name == sample.field }) { Some(field) => field, None => fail!("sample field is missing", sample.id) };
+            {id: sample.id, entity: entity.index, field: field.index, aggregate: sample.aggregate,
+                input: edsl::MeasureInput::All, alias: sample.id, requires: [], predicate: None, row_expression: None, computed: None}.ty!(edsl::MeasureEntry)
+        });
+        let computed = array::map(pair.1.computed_counts, fn(count) {
+            if validate {
+                if count_dependency_cycle(pair.1.computed_counts, count.result.id, []) { fail!("computed measure dependency cycle", count.result.id) } else { () };
+                let operation = match count.op { qb::ComputedOp::Add => qb::ScalarFunction::Add, qb::ComputedOp::Sub => qb::ScalarFunction::Sub };
+                if !array::any(profile.allowed_operators, fn(op) { op == qb::Operator::Scalar }) || !array::any(profile.allowed_scalars, fn(op) { op == operation }) {
+                    fail!("computed count arithmetic is not allowed by the query profile", count.result.id)
+                } else { () };
+                if array::length(pair.1.dataset.grain) == 0 { fail!("computed count requires a grain", count.result.id) } else { () };
+                array::map([count.result, count.left, count.right], fn(reference) {
+                    if reference.row != pair.1.dataset.row || reference.dataset != pair.1.dataset.id || reference.source != pair.1.dataset.source {
+                        fail!("computed count reference belongs to another dataset", reference.id)
+                    } else if !qb::is_sql_identifier(reference.id) { fail!("computed count requires a valid public identifier", reference.id) } else { () }
+                });
+                ()
+            } else { () };
+            let anchor = match array::find(entity.fields, fn(field) { field.name == pair.1.dataset.grain[0] }) { Some(field) => field.index, None => fail!("computed count requires a grain", count.result.id) };
+            {id: count.result.id, entity: entity.index, field: anchor, aggregate: qb::AggregateFunction::Count,
+                input: edsl::MeasureInput::All, alias: count.result.id, requires: [], predicate: None, row_expression: None,
+                computed: Some({op: count.op, left: count.left.id, right: count.right.id})}.ty!(edsl::MeasureEntry)
+        });
+        if validate {
+            array::map(pair.1.computed_counts, fn(count) {
+                array::map([count.left, count.right], fn(reference) {
+                    if !array::any(field_counts, fn(field) { field.id == reference.id })
+                        && !array::any(counts, fn(field) { field.id == reference.id })
+                        && !array::any(pair.1.computed_counts, fn(other) { other.result.id == reference.id }) {
+                        fail!("computed count requires a declared count operand", reference.id)
+                    } else { () }
+                })
+            });
+            ()
+        } else { () };
+        array::concat([grouped, counts, field_counts, reported, computed])
+    });
+    if validate {
+        array::map(dimensions, fn(dimension) {
+            if array::length(array::filter(dimensions, fn(other) { other.id == dimension.id })) != 1 {
+                fail!("typed transform dimension ids must be unique", dimension.id)
+            } else { () }
+        });
+        array::map(measures, fn(measure) {
+            if array::length(array::filter(measures, fn(other) { other.id == measure.id })) != 1
+                || array::any(dimensions, fn(dimension) { dimension.entity == measure.entity && dimension.id == measure.id }) {
+                fail!("typed transform measure ids must be unique", measure.id)
+            } else { () }
+        });
+        ()
+    } else { () };
+    let native_pairs = array::flat_map(array::enumerate(declarations), fn(pair) {
+        array::map(pair.1.native_pairs, fn(spec) {
+            if validate {
+                validate_native_pair(spec);
+                g::validate_facts(pair.1.dataset, [spec.first, spec.second]);
+                array::map([spec.first, spec.second], fn(binding) {
+                    if !array::any(pair.1.groups, fn(declared) { declared == binding }) { fail!("native pair requires its declared dimension bindings", spec.id) } else { () }
+                });
+                ()
+            } else { () };
+            let first = match array::find(dimensions, fn(dimension) { dimension.entity == pair.0 && dimension.id == spec.first.members[0].id }) { Some(value) => value, None => fail!("unknown native pair first dimension", spec.id) };
+            let second = match array::find(dimensions, fn(dimension) { dimension.entity == pair.0 && dimension.id == spec.second.members[0].id }) { Some(value) => value, None => fail!("unknown native pair second dimension", spec.id) };
+            if validate && (first.computed || second.computed || first.field == second.field || !first.filterable || !second.filterable
+                || first.input_kinds != second.input_kinds || array::length(first.canonical_values) > 0 || array::length(second.canonical_values) > 0) {
+                fail!("native pair requires distinct compatible plain equality dimensions", spec.id)
+            } else { {id: spec.id, entity: pair.0, first: first.id, second: second.id}.ty!(edsl::NativePairEntry) }
+        })
+    });
+    if validate {
+        array::map(native_pairs, fn(pair) {
+            if array::length(array::filter(native_pairs, fn(other) { other.id == pair.id })) != 1 { fail!("duplicate native pair id", pair.id) } else { () }
+        });
+        ()
+    } else { () };
+    let payload: edsl::PreparedPayload = {revision, entities, dimensions, measures,
+        relations: [], business_links: [], native_pairs, profile};
+    let payload = if validate { edsl::validate_transform_contract(payload) } else { payload };
+    {declarations, payload, relations: [], alternatives: []}
+};
+
+# 完整 root 只接受已登记的角色，避免关系端点私下改写 Dataset 的身份声明。
+def registered_endpoint: Fn(Array(Declaration), r::Endpoint) -> () = fn(declarations, endpoint) {
+    let dataset = match array::find(declarations, fn(entry) { entry.dataset.id == endpoint.dataset.id }) {
+        Some(entry) => entry.dataset, None => fail!("relation endpoint dataset is not declared", endpoint.dataset.id),
+    };
+    let role = match array::find(dataset.roles, fn(role) { role.id == endpoint.role }) {
+        Some(value) => value, None => fail!("relation endpoint role is not declared on its dataset", dataset.id, endpoint.role),
+    };
+    if dataset.row != endpoint.dataset.row || dataset.source != endpoint.dataset.source || dataset.grain != endpoint.dataset.grain
+        || !array::any(endpoint.dataset.roles, fn(candidate) { candidate == role }) {
+        fail!("relation endpoint conflicts with the registered dataset role", dataset.id, endpoint.role)
+    } else { () }
+};
+def build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative), Array(r::Link), qb::PlanProfile) -> Prepared = fn(revision, declarations, relations, alternatives, links, profile) {
+    build_impl(revision, declarations, relations, alternatives, links, profile, False)
+};
+def build_trusted: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative), Array(r::Link), qb::PlanProfile) -> Prepared = fn(revision, declarations, relations, alternatives, links, profile) {
+    build_impl(revision, declarations, relations, alternatives, links, profile, False)
+};
+def build_impl: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative), Array(r::Link), qb::PlanProfile, Bool) -> Prepared = fn(revision, declarations, relations, alternatives, links, profile, validate) {
+    let prepared = prepare_impl(revision, declarations, profile, validate);
+    if validate {
+        let all_relations = array::concat([relations, array::flat_map(alternatives, fn(alternative) { alternative.choices }),
+            array::flat_map(links, fn(link) { [link.a, link.z] })]);
+        array::map(all_relations, fn(relation) {
+            registered_endpoint(declarations, relation.from);
+            registered_endpoint(declarations, relation.to);
+            r::validate(relation);
+            ()
+        });
+        ()
+    } else { () };
+    let lowered = array::concat([r::lower_all_mode(prepared.payload, relations, validate), array::map(alternatives, fn(alternative) {
+        r::lower_alternative_mode(prepared.payload, alternative.id, alternative.choices, alternative.cardinality, validate)
+    })]);
+    if validate {
+        array::map(lowered, fn(relation) {
+            if array::length(array::filter(lowered, fn(other) { other.id == relation.id })) != 1 {
+                fail!("typed transform relation ids must be unique", relation.id)
+            } else { () }
+        });
+        array::map(links, fn(link) {
+            if array::length(array::filter(links, fn(other) { other.id == link.id })) != 1
+                || array::any(lowered, fn(relation) { relation.id == link.id }) {
+                fail!("typed transform business link ids must be unique", link.id)
+            } else { () }
+        });
+        ()
+    } else { () };
+    let with_relations = prepared.payload <~ {relations: lowered};
+    prepared <~ {relations: array::concat([relations, array::flat_map(links, fn(link) { [link.a, link.z] })]), alternatives, payload: with_relations <~ {business_links: array::map(links, fn(link) { r::lower_link_mode(with_relations, link, validate) })}}
+};
+
+pub use self::{NativePairFacts, CountRefFacts, ComputedCountFacts, NativePair, native_pair, with_native_pairs, CountRef, ComputedCount, count_ref, computed_count_ref, combine_counts, with_computed_counts, RowScope, RowScopeFacts, scope_equal, with_scope, Declaration, Prepared, prepare_trusted, Alternative, FieldCount, FieldCountFacts, filtered_count, field_count, with_field_counts, ColumnMapping, ColumnBinding, column, map_columns, event, metric, with_samples, with_domains, declare, prepare, build, build_trusted};
+
+def scalar_input: for(Scalar: codec::Encode) Fn(Scalar) -> edsl::FilterInput = fn(value) { match codec::encode(value) {
+    Value::String(text) => edsl::FilterInput::Text(text), Value::Int(number) => edsl::FilterInput::Int(number),
+    Value::Float(number) => edsl::FilterInput::Number(number), Value::True => edsl::FilterInput::Bool(True), Value::False => edsl::FilterInput::Bool(False),
+    _ => fail!("model predicate requires a scalar literal"),
+} };
+
+# 显式检查同一份模型声明，成功返回 True；不校验运行期输入。
+def self_check: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative), Array(r::Link), qb::PlanProfile) -> Bool = fn(revision, declarations, relations, alternatives, links, profile) {
+    build_impl(revision, declarations, relations, alternatives, links, profile, True);
+    True
+};
+# 严格准备入口供自检驱动及迁移既有诊断测试使用。
+def checked_build: Fn(String, Array(Declaration), Array(r::Relation), Array(Alternative), Array(r::Link), qb::PlanProfile) -> Prepared = fn(revision, declarations, relations, alternatives, links, profile) {
+    build_impl(revision, declarations, relations, alternatives, links, profile, True)
+};
+pub use self::{self_check, checked_build};
+
+# 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
+def checked_declare: for(Row) Fn(m::Dataset(Row), Array(m::Role(Row)), Array(g::Binding(Row)), Array(String)) -> Declaration = fn(dataset, roles, groups, record_counts) {
+    let declared = m::checked_prepare(dataset, roles);
+    let bindings = array::map(groups, g::binding_facts);
+    g::validate_facts(declared, bindings);
+    {native_pairs: [], computed_counts: [], kind: edsl::DatasetKind::Entity, scope: [], dataset: declared, groups: bindings, record_counts, field_counts: [], columns: [], domains: [], clock: None, samples: []}
+};
+def checked_metric: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) {
+    g::checked_input(clock);
+    let role = scalars::time_role(Time.type);
+    if clock.owner != declared.dataset.row || clock.owner != Row.type { fail!("metric clock belongs to another dataset row", declared.dataset.id) }
+    else if match role { Some(value) => value.semantics != edsl::TimeSemantics::Utc, None => True } { fail!("metric clock requires a UTC instant type", clock.name) }
+    else { declared <~ {kind: edsl::DatasetKind::Metric, clock: Some(clock.name)} }
+};
+def checked_event: for(Row, Time) Fn(Declaration, m::Field(Row, Time)) -> Declaration = fn(declared, clock) {
+    let timed = checked_metric(declared, clock);
+    timed <~ {kind: edsl::DatasetKind::Event}
+};
+def checked_with_samples: for(Row) Fn(Declaration, Array(samples::Binding(Row))) -> Declaration = fn(declared, bindings) {
+    if declared.dataset.row != Row.type { fail!("sample bindings belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {samples: array::map(bindings, samples::binding_facts)} }
+};
+def checked_column: for(Row, Value) Fn(m::Field(Row, Value), String) -> ColumnMapping(Row) = fn(field, name) {
+    let checked = if field.nullable { m::checked_optional_field(Row.type, Value.type, field.name) }
+        else { m::checked_field(Row.type, Value.type, field.name) };
+    if field.owner != Row.type || field.value != Value.type || !qb::is_sql_identifier(name) {
+        fail!("typed column mapping requires a valid owner, value and physical identifier", field.name, name)
+    } else { {row: Row.type, field: checked.name, value: Value.type, nullable: checked.nullable, column: name} }
+};
+def checked_map_columns: for(Row) Fn(Declaration, Array(ColumnMapping(Row))) -> Declaration = fn(declared, mappings) {
+    if declared.dataset.row != Row.type { fail!("typed column mappings belong to a different dataset row", declared.dataset.id) }
+    else { declared <~ {columns: array::map(mappings, fn(mapping) {
+        {row: mapping.row, field: mapping.field, value: mapping.value, nullable: mapping.nullable, column: mapping.column}.ty!(ColumnBinding)
+    })} }
+};
+def checked_with_domains: for(Row) Fn(Declaration, Array(v::Binding(Row))) -> Declaration = fn(declared, bindings) {
+    if declared.dataset.row != Row.type { fail!("business dimensions belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {domains: array::map(bindings, v::binding_facts)} }
+};
+def checked_field_count: for(Row, Value) Fn(m::Dataset(Row), m::Field(Row, Value), String) -> FieldCount(Row) = fn(dataset, field, id) {
+    let checked = m::checked_prepare(dataset, []);
+    let input = g::checked_input(field);
+    if checked.row != Row.type || !qb::is_sql_identifier(id) { fail!("field count requires a valid row and public identifier", id) }
+    else { {condition: None, row: Row.type, dataset: dataset.id, source: dataset.source, field: field.name, value: Value.type, nullable: input.nullable, id} }
+};
+def checked_filtered_count: for(Row, Business: codec::Encode) Fn(FieldCount(Row), v::Binding(Row), Business) -> FieldCount(Row) = fn(count, binding, member) {
+    if count.row != binding.row || count.dataset != binding.dataset || count.source != binding.source {
+        fail!("filtered count condition belongs to another dataset", count.id)
+    } else { count <~ {condition: Some(v::checked_member_predicate(binding, member))} }
+};
+def checked_with_field_counts: for(Row) Fn(Declaration, Array(FieldCount(Row))) -> Declaration = fn(declared, counts) {
+    if declared.dataset.row != Row.type { fail!("field counts belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {field_counts: array::map(counts, fn(count) {
+        {condition: count.condition, row: count.row, dataset: count.dataset, source: count.source, field: count.field, value: count.value, nullable: count.nullable, id: count.id}.ty!(FieldCountFacts)
+    })} }
+};
+def checked_combine_counts: for(Row) Fn(String, qb::ComputedOp, CountRef(Row), CountRef(Row)) -> ComputedCount(Row) = fn(id, op, left, right) {
+    if left.row != Row.type || right.row != Row.type || left.dataset != right.dataset || left.source != right.source {
+        fail!("computed counts require operands from the same dataset", id)
+    } else if !qb::is_sql_identifier(id) { fail!("computed count requires a valid public identifier", id) }
+    else { {result: left <~ {id}, left, right, op} }
+};
+def checked_with_computed_counts: for(Row) Fn(Declaration, Array(ComputedCount(Row))) -> Declaration = fn(declared, counts) {
+    if declared.dataset.row != Row.type { fail!("computed counts belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {computed_counts: array::map(counts, fn(count) {
+        {result: count_ref_facts(count.result), left: count_ref_facts(count.left), right: count_ref_facts(count.right), op: count.op}.ty!(ComputedCountFacts)
+    })} }
+};
+def checked_scope_equal: for(Row, Scalar: codec::Encode) Fn(m::Dataset(Row), m::Field(Row, Scalar), Scalar) -> RowScope(Row) = fn(dataset, field, value) {
+    let checked = m::checked_prepare(dataset, []);
+    let input = g::checked_input(field);
+    if checked.row != Row.type { fail!("row scope belongs to another dataset row", dataset.id) } else { () };
+    let literal = match codec::encode(value) {
+        Value::String(text) => edsl::FilterInput::Text(text),
+        Value::Int(number) => edsl::FilterInput::Int(number),
+        Value::Float(number) => edsl::FilterInput::Number(number),
+        Value::True => edsl::FilterInput::Bool(True),
+        Value::False => edsl::FilterInput::Bool(False),
+        _ => fail!("row scope requires a scalar literal", field.name),
+    };
+    {row: Row.type, dataset: dataset.id, source: dataset.source, column: {name: field.name, value: Scalar.type, nullable: input.nullable}, input: literal}
+};
+def checked_with_scope: for(Row) Fn(Declaration, Array(RowScope(Row))) -> Declaration = fn(declared, predicates) {
+    if declared.dataset.row != Row.type { fail!("row scopes belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {scope: array::map(predicates, fn(predicate) {
+        {row: predicate.row, dataset: predicate.dataset, source: predicate.source, column: predicate.column, input: predicate.input}.ty!(RowScopeFacts)
+    })} }
+};
+def checked_native_pair: for(Row) Fn(String, g::Binding(Row), g::Binding(Row)) -> NativePair(Row) = fn(id, first, second) {
+    if first.row != Row.type || second.row != Row.type { fail!("native pair row witness does not match its type", id) } else { () };
+    validate_native_pair({id, first: g::binding_facts(first), second: g::binding_facts(second)});
+    {id, first, second}
+};
+def checked_with_native_pairs: for(Row) Fn(Declaration, Array(NativePair(Row))) -> Declaration = fn(declared, pairs) {
+    if declared.dataset.row != Row.type { fail!("native pairs belong to another dataset row", declared.dataset.id) }
+    else { declared <~ {native_pairs: array::map(pairs, fn(pair) { {id: pair.id, first: g::binding_facts(pair.first), second: g::binding_facts(pair.second)}.ty!(NativePairFacts) })} }
+};
+pub use self::{checked_declare, checked_metric, checked_event, checked_with_samples, checked_column, checked_map_columns, checked_with_domains, checked_field_count, checked_filtered_count, checked_with_field_counts, checked_combine_counts, checked_with_computed_counts, checked_scope_equal, checked_with_scope, checked_native_pair, checked_with_native_pairs};
+
+def checked_prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(revision, declarations, profile) {
+    prepare_impl(revision, declarations, profile, True)
+};
+pub use self::{checked_prepare};

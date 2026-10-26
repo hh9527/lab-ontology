@@ -6,25 +6,32 @@
 
 知识发布包含事实和已声明的约束。面向 Agent 的用法与工具示例由消费方负责；版本化契约见[知识契约](KNOWLEDGE.md)。
 
-## 一个模型，两种用途
+## 查询模型准备
 
-领域在 Telora 模块中定义带类型的数据集、维度、度量、值、时间角色和具名关系，再通过
-`edsl::build_root(revision, entity_types, profile)` 一次性准备。得到的 `PreparedPayload`
-由查询转换和知识发现共享。完整的小型声明见 [`relation_model`](../../relation_model/src/model.telora)；
-将同一载荷挂载为知识与查询方法的示例见[服务入口](../../relation_model/src/lib.telora)。
+IC 与 relation 均采用类型化 Dataset、Entity 角色、Group 绑定及显式记录计数声明。
+`experimental::transform::prepare/build` 默认信任模型，准备查询所需的 `PreparedPayload`；
+发布前用独立 `transform::self_check` 完整检查同一组声明。运行期始终校验输入。
+`experimental::build::stage` 在封闭构建期从同一准备结果产出查询状态与静态知识；服务仅挂载 transform。
+类型化声明签名见 [`experimental`](../src/experimental/)；注解式 `edsl::build_transform_root` 仍作为库接口保留。
+完整的小型声明见 [`relation_model`](../../relation_model/src/typed_relations.telora)，服务挂载见[入口](../../relation_model/src/lib.telora)。
+
+实验 API 的 Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
+维度和聚合度量共用这些表达式；Graph 投影与相关 EXISTS 聚合均检查能力和粒度。
+DimensionGroup 提供文本搜索、数值比较和相等策略，绑定可以收紧能力；筛选专用成员允许声明的过滤，但不允许投影、值计数或样本排名。
+可空身份缺失任一分量时所有分量投影为 NULL，速率只在正时长上计算，Sum／Max／Avg 保留空集 NULL 语义。
+逻辑 Row 字段与物理列名可通过 `transform::column` 和 `transform::map_columns` 显式绑定；未列出的字段使用同名物理列。
+映射保留字段类型、角色和粒度，准备时拒绝错配与列冲突。Group 表达式和角色关系共同使用已校验的物理映射。
+这些表达式直接生成 QueryAst，不接受任意函数或 SQL 字符串映射；API 与范围见 [RFC 0002](../../rfcs/0002-typed-model-composition.md)。
 
 ```telora
 use ontology::ontology as edsl;
 use ontology::intent as intent;
-use ontology::knowledge as knowledge;
 use ontology::sqlite as sqlite;
 use std::value::{ Value };
 
 # `payload` 是领域模型的 PreparedPayload。
 def lower: Fn(Value) -> Value =
-    intent::query_request_method_factory(payload, "public", sqlite::build_query);
-def info: Fn(Value) -> Value =
-    knowledge::knowledge_info_method_factory(payload, "public");
+    intent::query_request_method_factory(payload, sqlite::build_query);
 ```
 
 SQL 后端在构造转换函数时指定，请求本身不能选择后端。入口服务仅将槽位输入传给对应方法，宿主的 JSONL 信封负责选择槽位。
@@ -46,7 +53,7 @@ SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
 - 时间角色声明逻辑类型和物理编码。调用方提供具体时间边界，详见[时间契约](TIME.md)。
 - 逻辑标量类型定义值与操作的语义，独立于物理存储和维度能力子集。初始 IPv4 契约见[逻辑类型](LOGICAL-TYPES.md)。
 
-`build_root` 校验声明并生成准备好的词汇表，供从 `index` 开始的 `info` 和 `transform` 共同使用。
+`build_transform_root` 校验并准备 transform 契约；需要完整知识准备时可显式使用 `build_root`，当前类型化模型通过 `experimental::build::stage` 导出静态知识。
 维度可见性由模型声明，调用方认证由宿主负责。模型注解决定哪些业务含义合法；Intent 和渲染器都不能增加未声明语义。
 
 ## 转换边界
@@ -56,6 +63,7 @@ SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
 `GraphUnion` 则是单个 Intent，遵循更严格的形状规则并产生一个去重结果集。
 
 内部的 `query_intent_ast_factory(payload)` 返回将单个 Intent 转为已校验 `QueryAst` 的函数。
+输入类型、维度能力和度量单位直接来自查询准备结构，请求解析不构造知识发现详情。
 `query_intent_lower_factory(payload, to_query)` 在其上增加后端渲染器；
 `query_request_method_factory(payload, to_query)` 是示例和 IC 入口使用的批量服务边界。
 这些工厂不同：直接工厂不解析服务请求对象，方法工厂负责解析。

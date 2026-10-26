@@ -1,14 +1,17 @@
 # RFC 0002：以类型约束组合模型，显式区分 Entity 与 Dataset
 
-状态：已接受为探索方向，先推进阶段 A 原型；公共 API 与后续阶段继续评审。日期：2026-10-23。
+状态：当前 transform 范围的阶段 A／B／C 与阶段 D 本地实现及验收完成；IC MainService 已切换到独立 typed 载荷，公开同步待完成。experimental API 尚未承诺稳定签名。更新日期：2026-10-24。
+
+当前实施范围按用户确认聚焦 transform：初始化只准备查询所需契约，暂停知识地图、info／discovery 初始化、知识导出和知识测试。
+阶段验收以类型化声明、请求变换、QueryAst 与数据库执行结果为依据；下文知识发现设计保留为后续工作，不阻塞当前实现。
 
 ## 目标
 
 让模型作者借助 Telora 的名义类型、参数化类型与构造校验表达业务约束，通过显式映射复用维度和度量。
 首先在 `relation_model` 中探索作者体验与语义边界，再确定公共 API、知识契约与查询协议的演进。
 
-本 RFC 提供未来建模的具体图景。文中的新 `model::` API 是提案记法，不是已实现接口，也不要求 Telora 增加同名语法。
-本文不改变当前 `ontology`、IC 模型、服务协议或部署环境。
+下文建模图景中的 `model::` API 保留为设计记法；实际实验接口位于 `ontology::experimental`，实现记录见后文各阶段。没有要求 Telora 增加同名语法。
+当前实现已演进 ontology、relation 与 IC 的类型化声明，保留既有 transform 协议；未改变部署环境。知识相关设计仍待后续实施。
 
 ## 已确认的方向与待验证的方案
 
@@ -412,3 +415,906 @@ DimensionGroup 先覆盖身份投影及可选的名称组；MeasureGroup 先覆�
 - [逻辑类型](../ontology/docs/LOGICAL-TYPES.md)
 - [relation 模型声明](../relation_model/src/model.telora)
 - [relation 验收语义](../relation_model/ACCEPTANCE.md)
+
+## 阶段 A 实验记录
+
+统一跟踪议题为 [#64](https://github.com/hh9527/lab-ontology/issues/64)，各阶段在同一议题汇报，不另建阶段议题。
+
+原型入口为 `ontology::experimental::model`，独立于当前 `ontology::ontology` 准备与服务协议。
+可执行示例见 [relation 测试夹具](../relation_model/tests/typed_model/fixture.telora)，正反例见
+[typed_model 测试](../relation_model/tests/typed_model.telora)。
+
+作者可使用以下实际原型 API 表达映射：
+
+```telora
+use ontology::experimental::model as model;
+
+type TenantId = struct(String);
+type DeviceId = struct(String);
+type DeviceIdentity = struct { tenant: TenantId, local: DeviceId };
+type Inventory = struct { tenant: TenantId, device: DeviceId };
+
+def device: model::Entity(DeviceIdentity) = model::entity("device", DeviceIdentity.type);
+def inventory: model::Dataset(Inventory) = model::dataset(
+    "inventory", "devices", Inventory.type, ["tenant", "device"]);
+def subject: model::Role(Inventory) = model::role(inventory, device, "subject", False, [
+    model::identity_part(model::field(Inventory.type, TenantId.type, "tenant"),
+        model::field(DeviceIdentity.type, TenantId.type, "tenant")),
+    model::identity_part(model::field(Inventory.type, DeviceId.type, "device"),
+        model::field(DeviceIdentity.type, DeviceId.type, "local")),
+]);
+```
+
+静态泛型签名约束字段值类型、Dataset 行类型和 Entity 身份类型；准备阶段检查字段存在、完整身份覆盖、重复成员、可空性和冲突角色。
+同一个 Entity 可映射到不同字段名与行粒度的 Dataset，同一个 Dataset 可具有设备 a／z 两个角色，Dataset 也可不绑定 Entity。
+newtype 的原始 JSON 编码与构造校验已经在这个模型上下文中验证；没有将其等同于数据库已有值的验收。
+
+原型取舍与限制：
+
+- 身份暂要求非空 record，成员为 Int、String 或它们的 newtype 包装；单值身份用一成员 record 表达，后续再验证直接 newtype 身份
+- Dataset 粒度与实体身份分开，空 grain 表示没有声明全行身份；实验不据此授予计数能力
+- `optional_field` 在类型化构造时要求精确的 `Option(Value)`；角色描述擦除类型参数后，准备层按 None／Some 的完整结构检查可空输入
+- 原型的公开 record 不是不可伪造证明；手写声明仍经过准备校验，后续完善擦除边界的表示与名义 Option 证据
+- `prepare` 只处理单个 Dataset，跨 Dataset 的 Entity 注册和一致性校验留待组合准备阶段
+- 本阶段只准备模型事实，不生成知识节点、查询 AST、SQL，也不迁移现有关系模型服务
+
+`scripts/check-typed-model-rejections.py` 在独立临时工作区运行合法控制例和编译期拒绝例，覆盖名义值、映射值类型、行拥有者、实体身份和单位运算。
+失败源码不加入普通测试发现路径，因此正常的 `check --tests` 不会因预期编译失败夹具而失败。
+
+## 阶段 B 单位计算实验
+
+实际入口为 `ontology::experimental::quantity`，当前以具名 newtype 和封闭的函数签名验证单位计算，尚未实现通用量纲代数。
+
+```telora
+use ontology::experimental::quantity as q;
+
+# 显式换算后，结果为 Some(BytesPerSecond(1.5))
+q::rate(q::Bytes(3.0), q::seconds(q::Milliseconds(2000.0)))
+```
+
+`rate(Bytes, Seconds)` 返回 `Option(BytesPerSecond)`，毫秒直接传入、字节与秒相加、将速率结果声明为字节都会在编译期拒绝。
+数量使用 Float 负载，JSON 保留数值表示；物理源数据的单位真实性仍需在 Dataset 绑定边界验证。
+
+实验明确两个聚合口径：`mean_rate` 是有效样本速率的算术平均，`weighted_rate` 是有效样本累计量除以累计时长。
+例如 `(100 B, 1 s)`、`(900 B, 9 s)`、`(100 B, 10 s)` 分别得到 `70 B/s` 和 `55 B/s`。
+非正时长样本在这两个实验聚合中都排除，空集或全无效样本返回 None；有效时长上的零字节仍得到零速率。
+
+这部分确定了单位与聚合语义的最小可执行基础。下述 Group 实验将这些语义连接到字段绑定与数据库计算。
+
+### 已实现的 Group 原型
+
+实际入口为 `ontology::experimental::groups`。完整作者示例见 [Group 夹具](../relation_model/tests/typed_groups/fixture.telora)，该示例使用独立的合成采样表。
+下面是从夹具提取的实际 API 形状：
+
+```telora
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::quantity as q;
+
+type Sample = struct { seq: Int, rx: Option(q::Bytes), elapsed_ms: Option(q::Milliseconds) };
+def samples: m::Dataset(Sample) = m::dataset("samples", "samples_ms", Sample.type, ["seq"]);
+def rx: g::Binding(Sample) = g::transfer_binding(samples, g::transfer,
+    g::input(m::optional_field(Sample.type, q::Bytes.type, "rx")),
+    g::seconds(g::input(m::optional_field(Sample.type, q::Milliseconds.type, "elapsed_ms"))), [
+        {member: g::TransferMember::AmountTotal, publish: "rx_total"},
+        {member: g::TransferMember::RatePeak, publish: "rx_peak"},
+        {member: g::TransferMember::RateMean, publish: "rx_mean"},
+    ]);
+```
+
+流量模板固定 Sum(amount)、Max(rate) 和 Avg(rate)，绑定参数没有覆盖聚合算子的入口。
+另一份 Dataset 使用 `bytes_in` 与 `duration_seconds`，直接绑定秒类型字段；同一 Dataset 再绑定发送字节字段，显式发布 `tx_*` 成员。
+表达式类型参数约束行拥有者和数量类型；输入可空性在描述中独立保留，所有实验聚合结果都声明为可空。
+准备层同时重检公开描述中的输入类型、完整组成员、聚合口径、源拥有者、输出可空性和发布 ID 唯一性。
+
+`dimension_group` 定义具有一个类型化输入的小型可复用维度组，通过多个 `Binding(Row)` 显式组合名称、分类和度量。
+绑定可以裁剪投影和筛选能力，准备层拒绝超过定义上限的配置；当前单源查询只执行投影与聚合，筛选能力仍是准备事实，筛选请求编译留待关系查询集成。
+`identity_dimensions` 将 Entity 角色的完整身份展开成多个成员，要求每个身份成员都有显式发布映射。
+可选身份任一输入为空时，全部身份投影均为 NULL。聚合时允许出现缺席角色的 NULL 分组，它是记录分组，不代表存在一个共享的 NULL Entity，也不授予实体计数能力。
+
+封闭表达式当前只有字段、毫秒换秒、逐样本速率和完整身份投影；没有任意函数或 SQL 字符串入口，也没有按名称引用其他 Group 成员的依赖边。
+因此跨 Group 依赖与循环目前无法表达；后续若开放成员引用，需要单独增加依赖图及循环检查。
+lowering 复用公共 QueryAst；速率在时长非正或缺失时返回 NULL，并主动进行浮点除法，避免 SQLite 整数存储带来截断。
+`amount_total` 汇总全部非空字节值，包括时长无效的记录；速率聚合只使用字节与有效时长均存在的记录。总体加权速率仍是单独的业务口径，没有混入此模板。
+
+执行验证覆盖两种列名／时间单位、接收／发送重复应用、复合身份、非均匀时长、可空字段、非正时长、空输入与整数存储。
+SQLite 查询已实际执行；PostgreSQL 仅验证生成和参数一致性，尚未在 PostgreSQL 数据库执行。
+数值负载和 source 声明仍是可信输入边界，实验不将类型化字段声明等同于数据库值域、唯一性或引用完整性的证明。
+当前模板是流量组与小型维度组的封闭实验，不代表通用的 Group 声明 API 已定稿。
+
+验收命令：
+
+```sh
+bin/telora -C relation_model test typed_groups --request-fuel 100000 --with-memory-limit 1024
+bin/telora -C relation_model eval @test/typed_groups:runtime_cases --request-fuel 100000 --with-memory-limit 1024 > "$TMPDIR/typed-groups-queries.json"
+node relation_model/tests/typed-groups-runtime.mjs "$TMPDIR/typed-groups-queries.json"
+python3 scripts/check-typed-model-rejections.py
+```
+
+## 阶段 C：类型化关系接入 transform
+
+`ontology::experimental::relations` 通过显式 Dataset 和具名 Entity 角色声明关系。
+每一端先验证完整身份，两端必须指向同一 Entity ID 和同一身份类型；连接键由对应身份成员展开，不接受请求覆盖连接键。
+业务连接由两个不同的 hub 角色、一个明确的参与者 Dataset 和显式方向构造，物理端点位置不承担方向推断。
+多个完整角色映射可以显式组成备选关系，备选分支各自保留租户与本地身份。
+
+五张现有关系表的可执行映射见 [typed_relations](../relation_model/src/typed_relations.telora)。
+该实验的 Entity ID 使用 `device_entity` 等名称，Dataset ID 仍使用 `device` 等现有 transform 地址，二者拥有独立含义。
+当前 JSON Graph 中历史字段 `entity` 在此适配实验中仍寻址 Dataset；新 Entity ID 不自动成为查询入口。
+
+首个桥接步骤复用旧 transform 的维度、计数声明和 profile，将关系键与业务方向改由新角色声明生成。
+桥接时校验物理源、字段编码、可空性及完整 Dataset 粒度与原 transform 结构一致，防止借用不同粒度上的计数证明。
+声明基数仍是可信模型契约，角色的名义类型和完整连接键不等同于数据库外键或基数证明。
+准备层还检查跨关系的 Entity 身份一致性、Dataset 声明一致性、具名角色映射一致性和关系 ID 唯一性。
+公开的已擦除描述经过 `validate_prepared` 重检，不作为不可伪造证明。
+
+验收以 transform 为依据：13 个新正反例覆盖身份、来源、角色、重复 ID、注册边、方向及扩增计数拒绝；
+隔离工作区将现有 graph 测试显式切换到新关系载荷，102 个用例通过。
+六组真实生成 SQL 在同一 SQLite 数据上与旧声明及独立期望值比较，覆盖复合租户身份、A/Z、有向／无向业务连接、EXISTS 粒度、空组和备选端点计数。
+源数据包含跨租户同 ID、重复连接、缺失端点、孤立租户与自连接，不能仅靠新旧实现一致来判定正确。
+
+```sh
+bin/telora -C relation_model test typed_relations --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-relations.py
+```
+
+这一桥接步骤通过后，继续推进下述独立准备入口；IC 类型化迁移仍在后续阶段。
+知识地图、知识发现与知识测试按用户要求延后，不作为本阶段的交付或评价依据。
+
+### 独立 Dataset／成员准备与服务接入
+
+`ontology::experimental::transform::declare` 接受一个带 Row 类型的 Dataset、具名角色、同 Row 的 Group 绑定和显式记录计数发布 ID。
+擦除后的绑定保留定义契约，组合边界通过 `prepare_facts` 重检类型、能力、成员完整性和可空性。
+`transform::build` 从这些声明独立生成原有 transform 编译器所需的准备结构，并要求每个关系端点都匹配已登记 Dataset 的具名角色；关系不能私下改写角色映射。
+关系、备选关系和业务连接显式注册，公共边 ID 冲突在初始化时拒绝。
+
+relation 模型的五张表、三个可查询维度、记录计数、九条关系和两条业务连接均已由新声明独立准备，不读取基线模型的注解或载荷。
+MainService 的 transform 入口使用这份载荷，旧模型仅保留为验收基线。
+查询接口仍沿用现有 Graph 的 Dataset 寻址与基础值表示；内部适配结构中的历史 EntityEntry／DatasetKind 命名不改变新声明中 Entity 与 Dataset 的独立身份。
+
+Dataset Row 中的名义类型保留在声明与准备模型中，SQL 字段表示由 newtype 负载显式展开到 Int、Float、Bool 或 String。
+可空字段保留 NULL 能力，嵌套 Option 因无法在单 SQL 列区分缺失层次而拒绝。
+返回给现有宿主的结果列继续使用物理结果类型与 nullable 标记，例如 Option(Label) 对应可空 String，Bytes 对应 Float；这不等同于已发布单位／名义结果类型的新外部契约。
+
+记录计数必须有非空 Dataset grain，计数列来自声明的非空粒度字段，不授予不同 Entity 角色上的隐式去重计数。
+跨 Dataset 同一 Entity ID 的身份类型必须一致；Group 成员 ID、计数 ID、Dataset ID 和公共边 ID 分别按 transform 契约检查唯一性。
+共享的 `validate_transform_contract` 校验投影、筛选、聚合和 scope 的执行能力，独立入口额外检查源能力；不执行知识目录或知识地图校验。
+
+此入口支持物理列维度、计算维度、完整身份投影、Group 聚合度量与记录计数。Group 度量使用共享 QueryAst 聚合路径，支持 Graph 投影及相关 EXISTS 的 HAVING。
+独立准备的 18 个正反例与结果列检查、现有 102 个 graph 用例、六组 SQLite 等价查询和临时快照的批量 transform 验收通过。
+快照验收同时执行生成 SQL，核对跨租户记录、物理列类型和整批原子拒绝行为。
+
+```sh
+bin/telora -C relation_model test typed_preparation --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-relations.py
+```
+
+
+### Graph 计算维度与可空身份投影
+
+独立准备入口复用 Group 的封闭表达式 lowering，将 Seconds、Rate 和 Identity 节点编译为现有 QueryAst 标量表达式。
+维度准备结构的字段索引只作为输入锚点；查询表达式保留全部输入列，并通过现有 Graph 实例重定位机制适配请求中的节点别名。
+计算维度的投影和筛选均受 profile 约束，筛选专用的隐藏维度同样检查完整计算表达式所需能力。
+
+身份 Group 在角色任一分量缺失时，所有公开分量返回 NULL，避免将不完整身份的租户部分误认为有效身份。
+速率沿用 Bytes／Seconds 的语义：时长为零、负值或缺失时返回 NULL，零流量与有效正时长得到零速率。
+返回列继续使用现有物理类型与 nullable 标记。
+
+三个针对性测试验证结果类型与能力拒绝；SQLite 实际执行覆盖单位换算、正负零时长、缺失输入、完整／不完整身份、跨租户局部同名身份、计算维度筛选、节点别名和空输入。
+现有 102 个 graph 用例和六组 SQLite 等价查询同时通过。
+
+```sh
+bin/telora -C relation_model test typed_dimensions --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-dimensions.py
+```
+
+
+### Graph Group 度量聚合
+
+`MeasureEntry.row_expression` 描述聚合前的逐行表达式，并携带表达式输出的物理类型。
+它与聚合后依赖其他度量的 `computed` 分开：`Avg(Rate(Bytes, Seconds))` 在每条样本上先计算合法速率，再对非 NULL 结果取平均，不改写为总流量／总时长。
+注解模型的普通字段度量保持 `row_expression: None`。
+
+独立准备入口将 Group 成员按维度和聚合度量分开准备。
+同一 Transfer Group 可重复发布为接收、发送指标，也可绑定到不同列名和时间单位的 Dataset。
+聚合输入在实际 Graph 实例的 Source 上生成，参数分配继续沿用当前 BuildCtx；聚合投影和相关 EXISTS 的 HAVING 使用同一逐行表达式入口。
+Sum、Max、Avg 的返回列保留可空性，空集返回 NULL；记录计数仍单独声明。
+表达式的结果类型独立于锚定输入字段，避免把计算结果误解释成源字段的时间或其他语义。
+
+初始化同时检查聚合函数和输入表达式所需的标量能力。
+现有 Graph 粒度证明保留：多个样本分支导致度量样本可能重复时拒绝，相关聚合使用独立 owner Dataset 与明确的角色映射。
+聚合度量、维度与记录计数的发布 ID 继续按既有规则检查冲突。
+
+验收通过：Group 模块 23 个测试；四组独立查询与五组 Graph 查询实际 SQLite 执行；102 个现有 graph 用例与六组新旧关系等价查询；ontology 的 profile 19 例、结果列 8 例及 Latest 11 例。
+五组 Graph 查询覆盖两个单位布局中的重复 Group、分组／总体聚合、可空身份、无效／缺失输入、空集、无 affinity 整数存储及相关 EXISTS 中的平均速率筛选。
+非均匀时长夹具仍得到逐样本平均速率 70，不能替换为总量／总时长的 55。
+
+```sh
+bin/telora -C relation_model test typed_groups --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-groups.py
+```
+
+阶段 C 的关系与端到端 transform 目标已达成。下一步收敛 IC 迁移范围与 transform 公共类型契约，再推进 IC；知识契约维持延后。
+
+
+### relation 产物观测
+
+本阶段在临时目录构建当前 relation MainService 快照，未更新运行环境。
+单次构建墙钟耗时 4.496 秒，快照文件 12,555,573 字节；`wasm-tools objdump` 显示 5,179 个函数，代码段 10,854,662 字节，数据段 1,456,882 字节，快照自定义段 227,371 字节。
+单独执行 `check @src/typed_relations` 得到静态检查 2.580 秒、执行初始化 2.091 秒，总检查 4.671 秒。
+初始化耗时来自工具报告的 execution_seconds，包含该模块初始化执行，并非仅 `transform::prepare` 的微基准。
+
+该产物使用五张关系表的当前服务声明；合成流量 Group 由测试模块独立验收。
+这些指标用于记录当前规模，未进行同机基线对照，不能据此声称类型化声明已经缩小产物或改善初始化性能。
+
+
+## 阶段 D：公共 transform 边界与 IC 迁移
+
+### 当前边界与迁移目标
+
+Graph 请求中的 `entity` 继续寻址 Dataset 实例，不根据 Entity 身份类型自动选择物理数据源或建立关系。
+Entity、Dataset 与 Role 的独立含义由类型化作者声明表达；现有 Graph、GraphPair、GraphUnion 和批量原子接受契约保持适用。
+返回列继续采用现有物理类型与 nullable 标记，单位与名义类型用于声明、绑定及表达式检查；公开名义结果模式需要另行版本化，当前不增加知识发现或知识图初始化。
+`experimental` API 继续随实际迁移细化，尚未承诺稳定签名。
+
+IC 迁移目标是当前全部 50 个载体及其已声明的 transform 能力，不能将几个易迁移表的通过等同于整体迁移完成。
+逐批保留源物理列、ID、现有身份粒度、可空性、基数、角色与保护条件；同时保留文本操作、规范／半开放值、IPv4、时间窗口与分桶、样本统计、Latest、过滤度量及关系查询能力。
+同名指标不能因为进入 Group 而改变统计意义，不为已有报告率添加 Sum 或臆造 Bytes／Seconds 计算。
+
+实施顺序如下。
+
+1. 支持 Row 字段到物理列的带类型映射，并在所有表达式和关系中统一使用
+2. 根据现有 IC 字段契约补齐可复用维度策略、规范值、半开放值和逻辑标量声明
+3. 建立报告样本统计 Group 与明确数量类型，补齐时间角色、窗口、分桶和 Latest 的类型化准备
+4. 分批迁移 IC 的 Dataset、Entity 角色和具名关系，按批运行 transform 与数据库等价验收
+5. 保留全部当前查询能力后切换 IC MainService，完成相应初始化、请求转换和 SQL 执行验收
+
+源模型审计以当前目录证据和原始元数据为依据；每批核对相关源文件哈希与字段，不用生成数据证明生产单位或唯一性。
+设备和服务器现有主体身份为 id，不采用 relation 合成夹具的租户复合身份替代；尚未确认的接口数据率单位、I/O 大小字节乘数及样本唯一性继续保留已有显式假定与 TODO。
+
+### 带类型的物理列映射
+
+`transform::column(Field(Row, Value), physical_name)` 生成带 Row 约束的列映射，`transform::map_columns(declaration, mappings)` 设置该声明的显式映射清单。
+未列出的字段保留与 Row 字段同名的默认列；再次设置时替换显式清单。
+映射只改变物理寻址，不改变字段名、名义类型、可空性、角色身份或 grain，不接受 SQL 字符串表达式。
+
+IC Tenant 的逻辑 id 与物理 TENANT_ID、KPI 的 res_id 与 resId 等命名差异是这一能力的实际输入。
+Tenant 和网络设备的相关目录哈希已与本地 `icloud-corpus/metadata` 原文件核对一致。
+
+```telora
+let declared = transform::declare(tenants, [tenant_subject], groups, ["tenant_count"]);
+let mapped = transform::map_columns(declared, [
+    transform::column(m::field(TenantRow.type, TenantId.type, "id"), "TENANT_ID"),
+]);
+```
+
+准备边界重新检查擦除后的 Row、字段、名义类型、可空性和物理标识符，拒绝未知字段、重复逻辑字段、非法列名，以及显式／默认映射之间的物理列冲突。
+为兼容 SQLite 的列名规则，冲突检查忽略 ASCII 大小写。
+不同逻辑字段不能通过列映射意外共用同一个物理列；纯计算和语义转换仍使用封闭 Expr。
+
+Group 在逻辑 Row 字段上检查类型，lowering 后在进入 QueryAst 前统一替换成物理列。
+这条路径覆盖普通与计算维度、可空身份的全部判空列、Group 聚合输入及相关 EXISTS；关系仍通过已登记角色定位逻辑字段，再读取准备结构的物理列。
+记录计数直接使用 grain 字段的物理映射，Graph 节点别名与物理列名保持独立。
+
+验收通过 26 个准备正反例、四个维度／计数测试、23 个 Group 测试、合法类型控制与 12 个编译期拒绝；实际 SQLite 覆盖列重命名、单位换算、身份 NULL、分组／总体聚合、相关 EXISTS、grain 记录计数与空表零计数。
+现有 102 个 graph 用例和六组新旧关系等价查询同时通过。
+IC 的服务入口尚未切换，以上是后续完整迁移所需的声明能力。
+
+
+### 可复用维度策略与筛选专用成员
+
+DimensionGroup 支持 Eq／Ne、Gt／Ge／Lt／Le，以及 Contains／NotContains／StartsWith／EndsWith。
+`equality_filters`、`numeric_filters` 和 `text_search_filters` 是可复用的策略清单；模型通过带 Value 类型的 DimensionGroup 定义能力上限，绑定可以收紧投影与操作清单。
+数值比较只接受底层为 Int／Float 的值，包括数量 newtype；文本搜索只接受底层为 String 的值，Bool 只支持相等／不等。
+构造和擦除后的准备边界都检查操作适用类型、重复操作与能力上限；执行 profile 只要求绑定实际开放的操作，不因模板允许完整搜索就要求 Eq 专用绑定开放所有字符串运算。
+这不把普通字符串排序解释为业务枚举顺序。
+
+```telora
+let names = g::dimension_group("names", DeviceName.type, True, g::text_search_filters);
+let name = g::dimension(devices, names,
+    g::input(m::optional_field(DeviceRow.type, DeviceName.type, "name")),
+    "device_name", True, g::text_search_filters);
+let qualification = g::dimension(devices, names,
+    g::input(m::optional_field(DeviceRow.type, DeviceName.type, "name")),
+    "device_name_filter", False, [g::Filter::Eq]);
+```
+
+筛选专用成员可用于其已声明的过滤操作，但不能投影、进行 count_value 或用作 top_per 的样本排名字段。
+准备结构用 `authorized` 表示整体可访问性，用 `projectable` 单独限制投影；既有注解模型的 projectable 默认等于 authorized，完全未授权的维度继续拒绝访问。
+这修正了原型将禁止投影误解释为完全禁止筛选的问题。
+
+文本搜索复用现有 QueryAst：Contains／前后缀搜索保持原有大小写规则，百分号与下划线作为字面内容，输入始终进入参数绑定。
+Eq／Ne 保留现有原始标量比较语义；NULL 不满足普通相等／不等或数值比较，不被伪装为空字符串或零。
+数量比较的 JSON 输入仍按底层数字类型校验，Int 拒绝小数阈值，Bool 拒绝数字或字符串替代。
+
+Intent 的输入推断、时间边界和 GraphPair 对齐直接读取查询维度契约，度量类型错误诊断与 GraphPair 单位比较直接读取查询度量和样本元数据。
+这些路径不再为请求解析构造维度／度量的知识发现详情，描述、别名和本地化标签不属于转换依赖。
+为保持现有诊断兼容，相关错误仍可附已有知识键提示；这不执行知识图构建。
+
+验收通过 15 个策略／权限测试和 18 组真实 SQLite 查询，覆盖名义类型适用操作、绑定能力裁剪、输入类型、profile、筛选专用成员的值暴露边界、文字大小写与模式字符、NULL 和空输入。
+回归通过：102 个 graph 用例、六组关系等价查询、38 个 GraphPair 用例、26 个准备用例、19 个 profile 用例与三个 transform 初始化用例。
+当前完整 IC 模型的类型检查同时通过；IC 类型化服务迁移仍未完成，规范／半开放值、IPv4、报告样本统计 Group 与时间准备继续实施。
+
+```sh
+bin/telora -C relation_model test typed_policies --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 1024
+python3 scripts/check-typed-policies.py
+```
+
+### 阶段 D 进展：类型化业务值域与源编码映射
+
+新增 `experimental::values`，将业务值类型与物理编码类型分开声明，并通过 `transform::with_domains` 发布为 Graph 维度。
+例如业务 `State(String)` 可以在一个来源中编码为 Int，在另一个来源中编码为 String；绑定仍要求表达式的 Row 和 Wire 类型准确匹配。
+
+```telora
+type State = struct(String);
+def states: v::Domain(State, Int) = v::domain(
+    "State", State.type, Int.type,
+    [v::member(State("Online"), [0, 2]),
+     v::member(State("Offline"), [1])], False);
+```
+
+`dimension_group` 定义可投影性与 Eq／Ne 能力上限，`bind` 选择源表达式和公开名称，可进一步收窄能力。
+业务成员可以使用 String newtype 或编码为文本的无载荷枚举；源编码目前只支持 Int、String 及其具名包装。
+同一域 ID 不允许指向不同业务类型；不同绑定可以配置各自的源编码表。
+闭合排序通过 `ordered` 显式给出全部业务成员，暂不开放值域排序筛选操作。
+
+半开放值域限于文本编码，保留现有 Graph 输入与输出契约：
+
+- 已知成员输入使用业务 ID，比较时展开所有对应源编码
+- 未知成员使用 `{"unknown":"raw"}`，全集使用 `{"unknowns":true}`
+- 投影包含 `__kind`，已知业务 ID 与同名未知原值仍可区分
+- NULL 保留 NULL；空文本可以是未知原值
+- 闭合值域继续按现有 Graph 规则排除未声明编码；Ne 不扩大为任意原始数据补集
+
+准备过程拒绝重复业务 ID、重复或交叉源编码、空成员、错误编码类型、不完整排序、半开放闭合排序，以及擦除类型后的错误 Dataset 来源和能力扩张。
+物理列重命名复用 Dataset 映射，规范化与筛选复用现有 Graph 实现，不另造第二套编码转换逻辑。
+
+验收覆盖 13 个声明／请求正反例与九组真实 SQLite 查询，包括多编码归一、同名未知值、Unknowns、NULL、空文本和空表。
+SQLite 与 PostgreSQL 的绑定参数一致；本阶段未实际执行 PostgreSQL。
+这是业务离散值域的 transform 入口，逻辑标量、时间角色和 IC 全量迁移仍待继续推进。
+
+
+### 阶段 D 进展：类型化 IPv4 部分转换
+
+新增 `experimental::scalars::Ipv4` 和 `groups::ipv4`，用封闭表达式将文本源显式转换为可空 IPv4 逻辑值。
+`Expr(Row, String)` 转换后成为 `Expr(Row, Ipv4)`；即使源字段非空，结果也可能为 NULL。
+底层使用现有 `canonical_ipv4_view`，只接受无前导零的四段十进制地址，保留原始规范地址，不修复非法格式。
+
+```telora
+g::dimension(rows,
+    g::dimension_group("addresses", s::Ipv4.type, True, g::ipv4_filters),
+    g::ipv4(g::input(m::optional_field(Row.type, String.type, "raw"))),
+    "ip", True, g::ipv4_filters)
+```
+
+IPv4 类型只允许 Eq、Ne、InSubnet、NotInSubnet；普通文本类型不能发布子网操作。
+Graph 输入使用既有 IPv4 与 CIDR 校验，原始文本可以另行作为搜索维度发布。
+表达式仍走统一物理列映射与 profile 校验；转换和子网补集排除非法源值与 NULL。
+
+验收使用真实 SQLite 执行九组查询，覆盖规范地址、范围外 octet、前导零、IPv6、尾换行、空文本、NULL、空表，以及 /0、/24、/25、/32 和补集。
+SQLite 测试提供 REGEXP 函数；PostgreSQL 仅核对参数一致性。
+逻辑时间类型、时间角色与样本统计能力仍是后续步骤，不由本 IPv4 子项替代。
+
+### 阶段 D 进展：具名时间类型与准备字段时间角色
+
+新增 `scalars::EpochMillis`、`LocalEpochMillis`、`Rfc3339Utc`、`LocalDateTime` 与 `DateUtc`。
+时间类型携带逻辑语义与物理编码的组合，Dataset Row 使用这些类型后，独立准备自动生成字段时间角色；普通 Int／String 不推断成时间。
+Local 毫秒和 UTC 毫秒具有不同名义类型，即使 JSON 都是整数也不能直接替换。
+
+```telora
+type Sample = struct {
+    id: Int,
+    at: s::Rfc3339Utc,
+    received: s::EpochMillis,
+};
+# 公开 at 维度，允许裁剪为所需的时间比较操作
+g::dimension(samples,
+    g::dimension_group("sample_time", s::Rfc3339Utc.type, True, g::time_filters),
+    g::input(m::field(Sample.type, s::Rfc3339Utc.type, "at")),
+    "sample_time", True, g::time_filters)
+```
+
+`FieldEntry.time` 保存准备后的字段时间事实。旧注解入口将 `TimeField` 复制到该字段，独立入口从精确的名义类型生成；
+请求输入校验、时间窗、结果列和时间对齐读取准备契约，不再依赖 Row 上必须存在时间注解。
+公共准备校验同时拒绝时间编码与物理类型或语义不一致的擦除记录。
+
+时间维度只允许 Eq、Ne、Gt、Ge、Lt、Le，保留现有严格输入格式及半开窗口规则。
+RFC3339 限 UTC 秒精度和 Z 后缀；LocalDateTime 不做时区换算；DateUtc 保留日历日期语义。
+这些是来源编码契约，不对既有数据库记录执行清洗，也不把 Local 自动提升为 UTC。
+可空时间字段保留角色和可空结果；反射处理先识别名义类型，再解析引用，避免丢失时间身份。
+
+新增 11 个时间测试与七组实际 SQLite 查询，覆盖闰日、非法输入、毫秒整数、本地时钟、物理列映射、结果类型、可空值、空表与窗口起止边界。
+回归通过现有时间 22 例、分桶八例、Latest 11 例、结果列八例，以及 102 个关系 Graph 用例和六组 SQLite 等价查询。
+合法控制与 14 个编译期拒绝通过，新增 UTC／Local 毫秒不可互换。
+IC 库类型检查通过，尚未迁移 IC 服务声明。
+Dataset 权威 UTC 时钟的显式选择、样本统计 Group 和 Latest 的独立声明仍待下一步，不由字段时间角色自动推导。
+
+### 阶段 D 进展：Metric 时钟与可复用样本统计 Group
+
+新增 `transform::metric(declared, clock_field)`，显式选择 Metric Dataset 的权威 UTC 字段。
+该字段必须使用 UTC instant 名义类型，不能将 Local 毫秒或 DateUtc 提升成 UTC 时间点。
+Metric 必须有已验证的非空样本 grain；时钟本身可以为空，沿用现有 Latest 对缺失时钟的处理。
+字段类型提供时间语义，配置选择哪个字段是 Dataset 的权威时钟，两者分开表达。
+
+新增 `experimental::samples::Group(Value)`：主统计、附加统计、单位和发布名称均为显式声明。
+模板接受同一名义 Value 的字段，可多次绑定到 rx／tx 等不同物理列；暂只接受字段，不开放任意用户 SQL 或表达式 Latest。
+
+```telora
+def rates: samples::Group(q::BytesPerSecond) = samples::group(
+    "reported_rate", q::BytesPerSecond.type,
+    samples::Statistic::Mean,
+    [samples::Statistic::Min, samples::Statistic::Max, samples::Statistic::Latest],
+    Some("byte/s"));
+# samples::bind(dataset, rates, field, names) 显式给出每个统计的公开名称
+# transform::with_samples(transform::metric(declared, clock), bindings) 发布统计
+```
+
+统计模板支持 Mean、Min、Max、Latest，以及受可加类型约束的显式 Sum。
+新增 `quantity::Count(Int)`；目前只有 Count 和 Bytes 可声明样本 Sum，普通数字、速率和百分比不会自动得到可加语义。
+这用于保留 IC 已有四个端口／终端数量的 Sum 主度量，不将这些能力简化为 Avg。
+单位字符串沿用现有公共契约；名义 Value 检查字段绑定，不依靠单位字符串执行自动换算。
+
+独立准备同时生成原始字段 MeasureEntry 和直接供 transform 读取的采样契约，保留主统计／摘要角色和单位。
+Latest 复用原有实现：按权威 UTC 时钟降序，使用 grain 字段稳定处理同一时刻的并列样本；
+最新行的值为 NULL 时不回退到旧非空值，缺失时钟不参与 Latest，Avg／Min／Max 仍按原始合格样本计算。
+本阶段还加强共享 Latest 校验，擦除后把权威字段换成 Local 角色也会拒绝。
+
+17 个声明／准备正反例通过，覆盖缺失或非法时钟、缺失 grain、能力 profile、重名、名义类型与单位契约、整数返回类型、速率和普通数值的 Sum 拒绝。
+实际 SQLite 覆盖六组查询：重复 rx／tx 模板、聚合混用、窗口、空表／全 NULL、缺失时钟、最新 NULL、grain 并列、RFC3339 与 epoch 时钟，以及超过 2^53 的精确整数 Latest 和显式 Count Sum。
+SQLite 与 PostgreSQL 参数一致，本阶段未实际执行 PostgreSQL。
+普通非 Metric 来源的数值统计、UTC 分桶独立声明和 IC 全量迁移仍待继续；不通过添加虚构采样粒度将这些来源改造成 Metric。
+
+### 阶段 D 进展：普通数值 Group 与独立 UTC 分桶
+
+新增 `groups::NumericGroup(Value)`、`numeric_group` 和 `numeric_binding`，直接复用封闭表达式与 Dataset 物理列映射。
+该模板声明 Mean／Min／Max，以及 Count／Bytes 类型上的显式 Sum，不要求 Metric、权威时钟或样本 grain，也不产生采样元数据。
+这使在线率等来源可以保留原有普通统计语义，避免为了复用统计模板而虚构采样身份或单位。
+
+```telora
+type ReportedRate = struct(Float);
+def rate_stats: g::NumericGroup(ReportedRate) = g::numeric_group(
+    "reported_rates", ReportedRate.type,
+    [g::Statistic::Mean, g::Statistic::Min, g::Statistic::Max]);
+# numeric_binding(dataset, rate_stats, expression, names) 可以重复绑定不同字段
+# 每个成员显式映射公开名，准备时重检模板、输入类型和完整性
+```
+
+普通统计 Group 的全部成员必须使用同一输入表达式，不能在擦除类型后私下更换某个成员的源或聚合函数。
+没有 grain 的来源仍遵守 Graph 原有阈值身份校验，不因获得统计模板而绕过完整身份要求。
+Int／Count 的 Mean 返回 Number，Count Sum 保留 Integer；全 NULL 和空总体仍无统计值。
+
+新增 `groups::utc_bucket(expression, unit)`，保留来源名义时间类型和编码，结果保守可空。
+支持 UTC epoch、RFC3339 UTC、UTC 日期及 Hour／Day／Month 的原有组合，拒绝 Local 时钟、普通数字和 DateUtc 小时桶。
+例如将 `Expr(Row, s::EpochMillis)` 按 Day 分桶，仍返回 `Expr(Row, s::EpochMillis)`；负 epoch 使用原后端的向下分桶规则。
+
+`DimensionEntry.utc_bucket` 保存显式分桶契约。旧注解入口和独立入口都写入该事实，分桶筛选校验直接读取它，
+无需回到 Row 属性寻找分桶声明。
+同时将 `time::window_filters` 从知识详情读取切换到准备维度／字段契约，消除时间窗请求转换中残余的知识发现依赖。
+
+验收新增普通统计十例、UTC 分桶九例，以及各三组实际 SQLite 查询。
+覆盖重复统计绑定、可加类型、来源筛选、身份拒绝、空表／全 NULL、负 epoch、月界、闰日、UTC 小时／日／月、NULL 分组和半开时间窗。
+PostgreSQL 仅核对参数一致性；未执行知识测试。
+普通统计、样本统计和时间基础入口现已具备，下一步进入 IC 分批独立声明迁移，继续按实际能力缺口补齐，不将当前阶段等同于 IC 已迁移。
+
+### 阶段 D 进展：IC 首批独立声明迁移
+
+新增 `icloud_model/src/typed.telora` 与 `typed/inventory.telora`，从 Tenant、EntNetworkElement 开始迁移。
+首批包含两表全部 26 个物理字段、25 个公开维度、两个计数和批内两个具名关系，而不是仅提供演示字段。
+设备身份为单独的 DeviceId，租户为 TenantId；Entity、Dataset 和 subject／tenant 角色显式分开。
+分类使用 DeviceClass 业务类型与 String 源编码映射，保留半开放值域；通信状态保留闭合域。
+原始 IP 搜索与可空 IPv4 转换独立发布，Local 毫秒字段保持现有语义和单位假定。
+
+新声明不导入旧模型、不读取旧注解。MainService 仍使用原载荷，待完整迁移再切换。
+验收在测试中同时加载新旧载荷作对照；另用不含旧 IC 模型源码的隔离工作区检查 typed 入口可独立初始化。
+直接检查正常 crate 子模块会同时加载 crate 根的旧载荷，不能把该路径当作独立初始化的证明。
+
+六个契约测试逐项比较物理字段、时间角色、grain、全部维度能力、域编码、计数和批内关系。
+35 组真实 SQLite 新旧查询及空表对照通过，包括所有迁移维度的投影、公开结果类型／可空性、域筛选与分组、IPv4 以及两个租户关系。
+PostgreSQL 仅核对参数一致性；没有进行知识发现或知识测试。
+
+[IC 迁移清单](../icloud_model/docs/TYPED_MIGRATION.md) 记录全部 50 个载体，目前完成首批两个；其余载体、跨批关系与服务切换保持待办。
+本批按等价迁移保留既有非空字段契约，不把源目录允许 NULL 的字段改写为已确认非空事实；后续若修改可空性需单独验证查询与公开结果变化。
+
+### 阶段 D 进展：Site 与跨批备选关系
+
+新增 Site 独立声明，迁移全部七个物理字段和六个公开维度，累计 3/50 个载体。
+SiteId 同时约束站点身份与设备的两个站点引用角色，保留现有两个 OR 定位关系和两个站点／租户关系。
+不将备选身份压缩为复合身份，SQL 对照覆盖单路匹配、同站点双路去重和不同站点双路命中。
+旧 Site 的隐式 key 在新声明中写为显式 grain；契约测试按有效身份比较，字段与查询结果类型保持原契约。
+独立初始化和六个契约测试通过；验收仍不构建知识地图、不运行知识测试，服务入口保持原载荷。
+
+包含前批回归的 46 组 SQLite 新旧查询及空表对照全部通过；PostgreSQL 仅比较参数，未实际执行。
+
+### 阶段 D 进展：Port 与大闭合值域投影
+
+迁移 Port 全部 17 个物理字段、15 个公开维度、interface_count 和三个跨批关系，累计 4/50 个载体。
+PortId、DeviceId、TenantId 分开约束角色身份，BitsPerSecond 保留带宽单位，三个闭合域保留全部编码。
+38 项整数接口类型的完整投影暴露 SQLite 嵌套 CASE 解析栈溢出；共享渲染器将连续 ELSE IF 展开为单个 CASE。
+不删除编码、不缩小投影能力，额外执行四个 SQLite 条件链用例，验证 NULL、首个匹配、嵌套 THEN 和最终 ELSE。
+
+六个 IC 契约测试、独立初始化、70 组 SQLite 新旧查询及空表对照通过。
+共享渲染改动同时通过 relation model 的 102 个既有 Graph 请求和六组 SQL 对照。
+独立初始化验收显式使用 100000 fuel，工作区仍不含旧模型与服务源码。
+SQL 对照夹具合并到一次初始化，减少重复准备成本；未执行知识测试，服务未切换。
+
+### 阶段 D 进展：InterfaceKpi 与样本模板实际迁移
+
+迁移全部 30 个物理字段、31 个公开维度、16 个度量和两个跨批关系，累计 5/50 个载体。
+Metric 保留完整 res_id／tenant_id／ts grain、Rfc3339Utc 时钟和三个 UTC 分桶；不将单列 res_id 当作样本身份。
+四个样本 Group 复用统计成员和单位，字段绑定独立映射公开名称；保留原有 Primary／SampleSummary 角色。
+interface_out_errors 保留普通 Avg，直接列 NumericGroup 使用字段度量，表达式型 Group 继续使用 row_expression。
+
+单位冲突沿用 #51 的暂定 byte/s 契约，不默默改成 bit/s，也不进行换算。
+七个契约测试、隔离初始化及累计 121 组 SQLite 新旧查询与空表对照通过，覆盖全部投影和度量、闰日月界、UTC 分桶、半开窗口及双向端口关联。
+普通数值统计和表达式 Group 的 SQLite 回归通过；不运行知识测试，服务未切换，剩余载体和完整服务切换继续待办。
+
+### 阶段 D 进展：ServerDevice 与关系行粒度
+
+完整迁移 ServerDevice 的 23 个物理字段、19 个公开维度和四个跨批关系，累计 6/50 个载体。
+ServerId 与 ServerOriginId 分开建模，主身份保持 id，保留后续部件使用 oriResId 的来源关联语义。
+分类、健康、连接状态分别保留 13／7／4 项闭合域编码，createTime 使用 UTC EpochMillis。
+serviceStartTime 和 serviceDuration 保持普通整数，不根据名称推断未确认的时间角色。
+
+两个 OR 站点关系与两个租户关系保留原有方向和基数；原有 Many 上界要求跨端原始投影显式指定 Association 行粒度。
+增加默认根行粒度拒绝扩行投影的回归，不通过放宽基数校验来迁就迁移。
+八个契约测试、隔离初始化与累计 149 组 SQLite 新旧查询及空表对照通过，覆盖全部投影、负数健康码、连接状态、IPv4、半开时间窗及四个关系。
+无知识地图构建或知识测试，服务未切换；后续继续迁移服务器样本与部件。
+
+### 阶段 D 进展：ServerKpi 与 Latest 实际迁移
+
+完整迁移服务器样本的 15 个物理字段、16 个公开维度、八个样本统计及两个主 ID 关联，累计 7/50 个载体。
+CPU 与内存重用同一个 Percent 统计 Group，公开名称分别映射 Mean／Latest／Max／Min，完整保留 % 单位与 Primary／SampleSummary 角色。
+Metric 使用 res_id／tenant_id／ts grain 与 Rfc3339Utc 时钟；样本 resId 对应 ServerId，不与部件来源使用的 ServerOriginId 混淆。
+三个 UTC 分桶、原始时间比较权限和普通功率样本投影保留现有契约，不自动对百分比赋予 Sum。
+
+八个契约测试和隔离初始化通过，SQLite 夹具实际覆盖最新 NULL、NULL 时钟、同一时间跨租户 grain 并列、窗口与两个具名服务器关联。
+NULL 时钟行仍参与普通统计，但不能成为 Latest；CPU 和内存 Latest 来自同一权威行。
+同时间并列使用完整 grain 排序，额外窗口／行过滤验证 t1 在 t2 前，不以值的大小选最新行。
+未构建知识地图、未执行知识测试，服务保持原载荷。
+
+本批累计 177 组 SQLite 新旧查询与空表对照通过；PostgreSQL 只比较参数，未实际执行。
+
+### 阶段 D 进展：服务器部件与来源资源角色
+
+完整迁移 ServerFan／ServerPsu／ServerMemory 三个载体的 40 个物理字段、32 个公开维度、一个风扇计数和 11 个跨批关系，累计 10/50 个载体。
+三个部件主身份使用各自名义类型；ServerDevice 增加 ServerOriginId 来源资源角色，部件 parentResId 关联该角色，服务器 KPI 继续关联 ServerId 主身份。
+角色只表达既有字段等式，不自动声称两套编码相同，也不将来源编号唯一性视作已验证生产事实。
+三个健康类型保持独立闭合域；内存容量使用 Megabytes 保留 MB 编码，不推断二进制倍率或隐式换算。
+
+SQL 夹具区分主 ID 与来源 ID，覆盖错误父资源编码、双向关联、缺失租户及同名不同 ID 的风扇计数。
+内存／服务器／KPI 显式输出 Association 行；默认部件行粒度拒绝跨扩行关系直接投影服务器 CPU 样本。
+关联行粒度依据实际遍历方向和基数选择，仅在投影路径确实扩行时使用 Association，不改动原有粒度校验。
+独立初始化通过；不构建知识地图、不运行知识测试，服务未切换。
+
+本批累计 226 组 SQLite 新旧查询及空表检查通过，PostgreSQL 仅核对参数，未实际执行。
+
+九个 transform 契约测试通过，包含部件行粒度下拒绝服务器样本扩行投影的回归。
+
+### 阶段 D 进展：StorageDevice、字段计数与初始化审计解耦
+
+完整迁移 StorageDevice 的 28 个字段、26 个公开维度、两个计数和四个跨批关系，累计 11/50 个载体。
+保留七个闭合域，使用 StorageId／TenantId／SiteId 区分角色身份，容量与比率保留源尺度，不执行未确认的单位换算。
+新增类型化 field_count／with_field_counts，明确 COUNT(field) 的非 NULL 值计数语义，不要求实体 grain，不自动 DISTINCT。
+擦除后重检字段所属 Row、Dataset、source、类型、可空性和公开名；名称计数保留与记录计数的差别。
+十个正反例及六个真实 SQLite 场景验证重复值、NULL、全 NULL、空总体和物理列映射。
+
+引用与名称角色目前只供知识发现读取，不为本次 transform 迁移新增元数据准备成本。
+发现服务根挂载的 source_audit 自动报告仍读取知识索引，已移除根挂载，开发者可按需通过 @src/source_audit 显式访问。
+只用类型检查确认审计入口可解析，不执行知识报告或知识测试。
+独立初始化及累计 269 组 IC SQLite 新旧查询与空表对照通过，relation model 的 102 个 Graph 请求与六组 SQL 对照通过。
+服务未切换，PostgreSQL 仅核对参数，剩余载体与完整切换继续推进。
+
+九个 IC transform 契约在移除开发审计根挂载后，以相同 fuel 全部通过。
+
+### 阶段 D 进展：Frame 与 NetworkSlot
+
+累计迁移 13/50 个载体；本批增加 24 个物理字段、22 个维度、一个记录计数和五条关系。
+Frame 保留九个可空字段与空 grain，FrameDn 只表达跨表来源引用，不虚构唯一键。
+SlotId、DeviceId、TenantId、FrameDn 使用不同名义类型，布尔字段保持可计算的 Bool；四个闭合域保留旧编码。
+九个 transform 契约、独立声明初始化、累计 302 组真实 SQLite 新旧查询和空表检查通过。
+双模型累计 SQL 对照的初始化 fuel 上限增至 200000，独立声明初始化仍在 100000 内完成。
+不准备知识地图、不执行知识发现或知识测试。MainService 未切换，PostgreSQL 仅核对参数。
+
+### 阶段 D 补充：同源角色的固有行范围
+
+PON ONU/OLT 角色迁移需要保留 entity_scope；独立声明新增 scope_equal / with_scope。
+字段与等值字面量共享 Scalar 类型参数，支持文本、整数、浮点、布尔和相应名义包装；可空字段使用非空比较值。
+准备时重新检查 Row、Dataset、source、字段类型与可空性，以及字面量存储类型，范围随 EntityEntry 进入既有 transform。
+多个条件合取，不由用户请求覆盖；沿用维度的等值解析、域编码、物理列映射和参数化行为。
+保留范围字段必须声明过滤维度及 profile 必须允许对应算子的既有要求，维度可以不可投影。
+本阶段只补迁移必需能力，不增加知识准备成本；PON 载体尚未计入完成数量。
+
+本项验证：10 个行范围正反例、9 个实际 SQLite 场景、既有 relation model 102 个 Graph 请求与 6 组 SQL 对照，以及 IC 独立初始化通过。PostgreSQL 仅核对参数。
+
+### 阶段 D 进展：PON 设备与 ONU/OLT 角色
+
+迁移 PonDevice、PonOnuRole、PonOltRole，三个载体共享 22 个物理列，保留 66 个字段声明、68 个维度与五个闭合域。
+角色使用 with_scope 保留分类约束；两个分类维度仅供内部约束，继续禁止公开发现与投影。
+PonId 复用设备身份及父引用，TenantId／SiteId 区分其他来源角色；制造日期为 DateUtc，创建时刻保持既有 LocalEpochMillis 假定。
+四条关系保留源自关联、具备双端范围的 ONU→OLT、租户和两路站点 OR；不因领域名称而改变原始关系的过滤语义。
+累计 382 组 SQLite 新旧请求与空表对照、独立初始化通过；PostgreSQL 仅核对参数。
+不构建知识地图或执行知识测试，MainService 尚未切换。
+
+本批累计完成 16/50 个载体。九项 transform 契约通过；新增两个内部分类投影拒绝用例在修正错误文本断言后定向复验通过，共 11 项。
+
+### 阶段 D 进展：ONU KPI
+
+独立声明新增 ONU KPI 的 30 个字段、31 个维度、33 个样本统计和三条关系。
+Percent／Dbm／DegreesCelsius／BitsPerSecond 分离单位并复用四个统计模板，保留原 %／dBm／degC／bit/s 尺度。
+保留复合采样 grain、UTC 时钟和三个 UTC 分桶，不隐式加总、换算或按有效次数加权。
+现有 M:N 关系基数与防止度量放大的保护保持不变：关系行使用 Association，资格筛选使用显式 EXISTS；二跳行投影包含中间 ONU 角色。
+契约测试与实际 SQL fixture 分离，前者不再预生成累计 SQL；不减少查询对照或契约覆盖，也不准备知识地图。
+MainService 尚未切换，PostgreSQL 仅核对参数。
+
+累计 17/50 个载体；12 项 transform 契约（100000 fuel）、独立初始化、453 组实际 SQLite 对照及空表检查通过，包含全部 ONU 统计和负 dBm 原值统计场景。
+
+### 阶段 D 进展：PON 端口 KPI 与公共单位模板
+
+新增 16 个字段、15 个维度、18 个统计度量及两条关系，累计 18/50 个载体。
+保持 parent_id→PonId 关联，res_id 以不同名义类型表示来源端口，不改为设备身份；来源采样 grain 及全局 ID 范围假定待生产验证。
+ONU 与端口共享 pon_quantities 中的 dBm、摄氏温度、bit/s 类型与 Mean/Min/Max 模板，复用不依赖具体模型声明。
+端口百分比用 ReportedPercent 保留 #51 的尺度冲突；不因显示 % 而确认来源单位或执行换算。
+12 项 transform 契约、独立初始化及累计 491 组实际 SQLite 对照和空表检查通过，包含 resId 碰撞、不同端口同设备、NULL、负功率与原 ONU 统计回归。
+MainService 尚未切换；不构建知识地图或执行知识测试，PostgreSQL 仅核对参数。
+
+### 阶段 D 进展：AP Radio SSID KPI
+
+新增 12 个字段、13 个维度、8 个统计和两条 parentId 设备关系。
+Count 显式声明原始连接数样本 Sum/Mean，不解释成跨时刻去重终端数或快照。
+来源字节数使用 ByteCount(Int)，保留旧接口的整数存储与输出；通用 quantity::Bytes 为 Float，不能直接替换以免隐式改变类型和精度。
+字节模板只复用 Mean/Min/Max，不新增跨时刻 Sum、增量、速率或复位修正；有效次数不作为默认权重。
+保持复合采样 grain 与 UTC 分桶；同名 SSID 的均值按原始采样行计算，不先对每个 SSID 求均值再等权平均。
+独立声明初始化仍在 100000 fuel 内；新旧载荷共同准备的契约测试本阶段使用 150000，不预生成累计 SQL 用例。
+只准备 transform，MainService 尚未切换，不建立知识地图或执行知识测试。
+
+本批累计 19/50 个载体；12 项 transform 契约、独立初始化及 518 组实际 SQLite 对照与空表检查通过。PostgreSQL 仅核对参数。
+
+### 阶段 D 进展：Device KPI
+
+迁移当前公开载荷的 23 个字段、26 个维度、23 个度量和两条关系，累计 20/50 个既有载体。
+保持 CPU/内存共享整行 Latest、完整采样 grain、最新 NULL、同刻确定排序以及 NULL 时钟不候选的语义。
+Count 显式保留端口计数样本 Sum；普通样本计数不去重设备。在线率与设备端口占比使用不同名义类型，保留未知尺度和总体差异，不推导比例公式或按有效次数加权。
+12 项 transform 契约、独立初始化及累计 574 组实际 SQLite 新旧查询和空表检查通过，PostgreSQL 仅核对参数。
+来源审计发现当前语料仓 c7982fd 新增 nePingRespTime；仓内 catalog SHA 与 685581e 版本一致，既有字段未变。本批保留旧公开契约，来源新增字段另行刷新，避免虚报当前源覆盖。
+MainService 尚未切换，不建立知识地图或执行知识测试。
+
+### 阶段 D 前置能力：业务成员条件计数
+
+为 CurrentAlarm 补充 filtered_count：用名义业务类型和已声明成员表达字段计数条件，通过值域解析来源编码；条件只作用于该度量，不收窄整个 Dataset。
+构造与擦除后的准备阶段均检查绑定身份和成员，当前支持直接列等值条件，COUNT(field) 保留非 NULL 计数语义。
+7 项正反例、6 个条件计数 SQLite 场景、6 个原字段计数场景、102 个既有 Graph 请求与 6 组关系 SQL 对照、12 项 IC transform 契约通过。PostgreSQL 仅核对参数。
+CurrentAlarm 尚未迁移，仍为 20/50；不增加知识发现、知识地图构建或知识测试成本，相关能力不作为当前阶段的验收依据。
+
+### 阶段 D 前置能力：显式 Event Dataset
+
+Declaration 显式携带 DatasetKind；declare、metric、event 分别声明 Entity、Metric、Event，不再仅凭 clock 推断 Dataset 类型。
+Event 显式选择 UTC 发生时间并保留事件 grain，允许来源发生时间可空，不自动加入未清除等业务范围。
+准备阶段校验种类与时钟的一致性、UTC 字段及 grain，拒绝 Event 发布 Metric 采样角色。
+复用既有时钟校验，部分诊断仍沿用 metric 名称。7 项 Event 契约、18 项采样契约及 12 项 IC transform 契约通过。
+CurrentAlarm 尚未迁移，仍为 20/50；仅推进 transform，不增加知识准备成本。
+
+本项独立 typed IC 初始化在不含旧模型和服务的临时工作区通过（100000 fuel），不准备知识地图。
+
+### 阶段 D 前置能力：类型化关系条件
+
+relations::guarded 用来源 Row 字段、Eq/Ne 和同类型标量表达关系条件，保留名义类型与物理列映射，构造及 lowering 均校验条件。
+关系条件限制关联，不限制源 Dataset 的总体；反向 include_empty 保留零计数组，EXISTS 使用同一条件。
+OR 关系可以合并共享同一条件的分支；不同分支条件在当前单 guard 结构中不可无损表达，显式拒绝而非静默丢失条件。
+8 个实际 SQLite 场景、102 个既有 Graph 请求及 6 组关系 SQL 对照通过，PostgreSQL 仅核对参数。
+CurrentAlarm 尚未迁移，仍为 20/50；只准备 transform，不增加知识准备成本。
+本项最终 9 项条件关系契约与 12 项 IC transform 契约通过，包含擦除后字段／算子篡改和共享条件 OR 的正反例。
+
+### 阶段 D 前置能力：计数输入的聚合后计算
+
+CountRef(Row) 与 combine_counts 显式表达同一 Dataset 的计数输入及 Add/Sub 依赖，with_computed_counts 绑定发布名；支持嵌套及任意声明顺序。
+准备阶段检查完整来源见证、已声明计数依赖、循环、重复名与算术 profile；不接受任意字符串 SQL，不允许普通数值或其他单位混入计数输入。
+计数算术不证明人口互斥或去重语义；weighted severe score 可复用输入和依赖，但不能因为它来自计数相加就解释为告警事件数。
+当前仅补齐计数输入组合，不声称已经支持任意单位的聚合后计算；业务结果名义类型的细化继续随迁移推进。
+7 项契约、6 个实际 SQLite 计算场景及 6 个条件计数回归通过；PostgreSQL 仅核对参数。仍为 20/50，不增加知识准备成本。
+本项 12 项既有 IC transform 契约通过，MainService 尚未切换。
+
+### 阶段 D 前置能力：原始引用到名义身份的显式映射
+
+告警 MEDN 为一个原始来源字段，可引用设备或服务器；独立建模保留 String，通过 reference_part 分别绑定 DeviceId／ServerId，而非合并两种身份类型。
+reference_part 仅允许原始 Int/String 到物理表示相同的身份标量，保留 raw 类型见证并在擦除后重验，不接受已有名义 ID 之间的重新解释。
+默认 identity_part 的名义类型相等要求不变。映射不执行编码转换，不推断引用存在性，不改变完整身份、可空性、基数和来源粒度。
+8 个实际 SQLite 场景、20 项既有身份契约、102 个 Graph 请求和 6 组关系 SQL 对照通过；PostgreSQL 仅核对参数。
+CurrentAlarm 尚未迁移，仍为 20/50，不增加知识准备成本。
+本项 7 项显式引用正反例（含整数正例）和 12 项 IC transform 契约通过，MainService 尚未切换。
+
+### 阶段 D 进展：CurrentAlarm 事件模型
+
+迁移 46 个字段、42 个维度、六个度量、六个闭合域及十条关系，累计 21/50。
+Event 显式保留 csn grain 与 UTC 发生时钟；原始 MEDN 通过显式映射引用设备、服务器、存储和 PON 身份，避免将不同名义 ID 合并。
+业务站点关系保留 != "3" guard，来源站点关系保留无 guard 的物理语义，不因业务解释而统一两种关系。
+三个条件计数复用业务成员映射；critical+major 和二次加 critical 复用嵌套计算依赖，后者仍按加权分数使用。计数组合的结果名义类型及任意单位的聚合后计算仍需后续细化。
+闭合域 Ne／分组只计算已知值，未知编码和 NULL 原始行仍参与不按该域分组的总体；current 不自动限定为未清除。
+
+14 项 IC transform 契约、隔离 typed 初始化和 128 组实际 SQLite 新旧请求及空表检查通过；PostgreSQL 仅核对参数。
+随声明规模提升，双载荷契约预算从 150000 调至 200000，独立 typed 初始化从 100000 调至 150000；告警 SQL fixture 按需独立生成，不在契约初始化阶段预生成累积查询。
+来源 SHA256 与 catalog 一致；时钟单位、本地编码及字段非空性保持原假定，未额外确认生产事实。
+MainService 尚未切换，不建立知识地图或执行知识测试。
+
+### 阶段 D 前置能力：带 hub 条件的业务连接
+
+guarded_link 将条件绑定在业务连接自身，A/Z 物理端点关系保持独立；双向与单向业务连接可分别保留各自的来源方向条件。
+构造与 lowering 重验 hub 来源、字段、Eq/Ne 和字面量类型，复用普通关系条件的物理列校验；双向遍历不改变条件所指的原始 hub 字段。
+5 项契约与 8 个实际 SQLite 场景通过，包含普通端点总体不受影响、两种方向、自环、租户完整身份和空总体；PostgreSQL 仅核对参数。
+PhysicalLink 尚未迁移，仍为 21/50；下一步补齐 native pair 声明。只准备 transform，不增加知识准备成本。
+本项 102 个既有 Graph 请求、6 组实际 SQLite 新旧关系对照及 14 项 IC transform 契约通过。
+
+### 阶段 D 前置能力：原生维度配对
+
+native_pair / with_native_pairs 接受同一 Dataset 的两个完整维度绑定，生成既有有序 NativePairEntry，不读取旧注解。
+两端要求相同名义值类型、不同直接字段、Eq 能力及完整声明登记；擦除后重验来源、结构与绑定一致性，拒绝计算表达式、聚合和同字段别名。
+配对不等于 A/Z 可交换，也不推断连接方向或网络层级。该能力只生成轻量声明，不构建知识地图或扩展查询权限。
+10 项配对契约、102 个既有 Graph 请求和 6 组关系 SQL 对照通过。本项没有新增 SQL 运算，不执行知识测试。
+PhysicalLink 尚未迁移，仍为 21/50。
+本项 14 项 IC transform 契约通过。
+
+### 阶段 D 进展：PhysicalLink
+
+迁移 26 字段、27 维度、一个计数、三个闭合域、五条关系、两个业务连接及有序名称配对，累计 22/50。
+A/Z 来源字段通过显式映射分别引用设备和服务器身份，物理端点不附加方向范围；peer 与 downstream 各自保留 hub 方向条件，前者可双向遍历，后者只允许 A→Z。
+设备／服务器 OR 附着关系保持 M:N 基数；自环、重复链路和有序原始名称配对沿用既有语义，不推断层级或交换 A/Z。
+四个严格 IPv4 视图复用类型化转换，原始文本与视图分开；speed 保持来源文本，不因说明中的单位而新增计算能力。
+源 SHA256 与 catalog 一致，字段非空性和 UTC 毫秒语义延续原假定。
+
+15 项 IC transform 契约、独立 typed 初始化及 91 组实际 SQLite 新旧请求和空表检查通过，包含完整域过滤、全部维度、方向／OR 关系、双向根、自环和 IPv4 子网补集。PostgreSQL 仅核对参数。
+契约初始化 200000 fuel、独立初始化 150000、独立 SQL fixture 250000；不在契约中准备累计 SQL，不构建知识地图或执行知识测试。
+MainService 尚未切换，后续继续迁移其余 28 个来源载体及相关 transform 能力。
+
+
+### 阶段 D 进展：Collaboration
+
+协作设备迁移 14 字段、15 维度、两个闭合域与两条关系，累计 23/50。
+独立名义身份通过显式原始引用与告警关联，保留 ID-only 键、Optional→Many0 基数及已清除事件，不暗加租户过滤。
+来源未提供 CPU 样本或公开度量，本批不补造指标；普通行计数依照既有 source_id grain。
+严格 IPv4 视图、原始文本、闭合域已知值范围及 UTC 毫秒／非空性假定均延续旧模型。
+源 SHA256 与 catalog 一致；16 项 transform 契约、33 组实际 SQLite 对照和空表检查通过，包含关联 EXISTS 防扇出及分组告警条件计数。PostgreSQL 仅核对参数。
+只推进 transform，MainService 尚未切换；不建立知识地图，不执行知识发现或知识测试，不以其作为本阶段评价依据。
+
+本批独立 typed 初始化在 200000 fuel 内通过；原 150000 预算实际耗尽后调整验证预算，隔离工作区不含旧模型或服务，也没有知识初始化。
+
+
+### 阶段 D 进展：Terminal
+
+终端迁移 24 字段、25 维度、五个闭合域及四条来源关系，累计 24/50。
+独立 TerminalId 与设备／PON 身份分开，接入资源的原始 String 通过两种显式引用分别映射，不收紧来源 M:N 上界。
+站点保留 siteId 或 projectId 的 OR 连接与既有声明基数；租户键不自动加入其他关系。
+55 个域成员保留来源编码，包括 status=-1 的已知 Unknown；未声明业务域的 unauthorized／isBlocked 保持原始整数与比较能力，不推断为 Bool。
+blockTime 采用既有待确认的 UTC 毫秒假定，原始 IPv6／IP 文本与严格 IPv4 视图分开。
+
+源 SHA256 与 catalog 一致；16 项 transform 契约与隔离初始化在 200000 fuel 内通过。
+173 组实际 SQLite 对照及空表检查通过，包含全部域成员 Eq/Ne、所有维度、整数比较、OR 连接及四类 EXISTS 计数；PostgreSQL 只核对参数。
+独立 SQL fixture 的 250000 fuel 实际耗尽，调整至 400000 后通过；不在契约中准备累计查询，不增加知识初始化。
+MainService 尚未切换，继续迁移剩余 26 个载体；不执行知识发现、知识地图构建或知识测试。
+
+
+### 阶段 D 进展：无身份的网络光模块来源
+
+按仓库快照迁移网络光模块的七字段和七维度，累计 25/50。
+旧模型没有唯一键、度量、样本或关系，本批仅声明无 grain 的 Dataset，不推断 Entity 身份或父设备关系，也不把 neResId／ifName 组合成主键。
+17 项 IC transform 契约、200000 fuel 的隔离初始化及 40 组实际 SQLite 对照／空表检查通过。
+全部 SQL 用例有独立期望值，包含完全重复行和字面量通配符，覆盖七维度和全部原始文本搜索运算；不新增去重。PostgreSQL 仅核对参数。
+
+当前外部源文件 SHA256 与仓库 catalog 不同，新增 id／tenantId；七个既有字段的类型、说明、可空性、isPK 与 columnType 逐项一致。
+本批以仓库快照为迁移基线，不将新增源主键或字段混入现有能力迁移；源升级后应另行建模身份，不能从此无 grain 声明反推当前外部源无主键。
+详细哈希及差异记录在 TYPED_MIGRATION.md。只推进 transform，不执行知识发现、知识地图构建或知识测试；MainService 尚未切换，剩余 25 个载体继续推进。
+
+
+### 阶段 D 进展：FC 交换机来源
+
+迁移 FC 来源 34 字段、35 维度、七个闭合域及与已迁移载体间的五条关系，累计 26/50。
+FcSwitchId 与已有设备／存储身份分离，告警和物理链路 A/Z 通过显式原始引用映射；保留原有方向和基数，不自动添加租户、分类、未清除或链路业务条件。
+站点继续 parentResId 或 projectId 的 OR 连接；两条指向存储端口／存储 KPI 的关系待对应载体迁移时补齐，当前不补造 CPU 样本。
+剩余容量按明确 MB 标签建模，其余容量和利用率分别使用单位／尺度未确认的名义类型，不推断换算、范围或聚合能力。
+26 个闭合域成员保留原始编码；未知分类行仍在总体中，IPv4 视图与原始文本分开。
+
+源 SHA256 与 catalog 一致；17 项 IC transform 契约、独立 typed 初始化和 147 组实际 SQLite 对照及空表检查通过。
+SQL 包含全部维度／域成员、所有容量比较、窗口、五类关系、OR 键、跨租户行、自环／重复链路、EXISTS 防扇出及分组告警条件计数；PostgreSQL 仅核对参数。
+双载荷契约 200000 fuel 实际耗尽后调至 250000 并通过，独立 typed 初始化仍在 200000 内通过；SQL fixture 独立按需生成（400000）。
+不准备累计 SQL 或知识内容，不执行知识发现、知识地图构建或知识测试；MainService 尚未切换，继续剩余 24 个载体。
+
+
+### 阶段 D 进展：AP 与射频样本
+
+AP 与 Radio 两载体共迁移 37 字段、43 维度和 36 个公开统计，累计 28/50。
+分别声明 Metric、暂定租户／资源／UTC grain 及 Rfc3339Text 时钟，#51 的生产唯一性确认仍未完成。
+复用 Percent／Dbm 与关联终端统计组，浮点和整数 kbit/s 采用不同名义表示；RSSI 不补造单位。
+Effcnt 作为独立整数来源列可显式过滤，默认 Avg/Max/Min 均针对原始样本，不自动过滤、加权、求和或钳制范围。
+三种 UTC 分桶与频段闭合域保留旧语义，不从 parentId 等字段名增加关系。
+
+17 项 transform 契约、独立 typed 初始化以及 178 组实际 SQLite 对照和空表检查通过；SQL 全部有独立期望值，覆盖跨租户同资源／同 UTC 样本、不等间距、全 NULL／空窗口、全部公开统计与频段成员。
+样本计数与度量聚合采用独立请求，保持 Graph 的单聚合粒度约束。PostgreSQL 仅核对参数。
+双载荷契约 250000 fuel，独立 typed 初始化 200000，独立 SQL fixture 450000；不预生成累计 SQL 或知识内容。
+Radio 源 SHA256 与 catalog 一致；AP 当前外部源新增 hwApMemoryUseRate，既有字段逐项契约一致，本批保持仓库快照，不混入源升级。
+详细哈希与差异记录在 TYPED_MIGRATION.md；MainService 尚未切换，不执行知识发现、知识地图构建或知识测试，继续剩余 22 个载体。
+
+
+### 阶段 D 进展：蜂窝链路、单板与在线率
+
+四个来源共迁移 50 字段、62 维度及 12 个公开样本统计，累计 32/50。
+蜂窝质量／流量旧声明只有原始维度和单列 resId key，本批保持 Entity／单列 grain 的兼容契约，不因 KPI 名称创建 Metric、统计或复合样本身份，也不确认生产唯一性。
+质量、流量等未明单位的浮点字段使用分别命名的名义类型，不推定百分比、毫秒或字节；Effcnt 只是原始整数列。
+单板保留既有 Metric grain、CPU／内存百分比和温度统计；在线率专表保持独立总体及待确认的百分比尺度，不替代 NetworkDeviceKPI，不推断 SLA 或连续可用性。
+UTC 时钟与小时／日／月分桶保留；没有从站点、链路或父资源字段名推断关系。
+
+四源 SHA256 与 catalog 一致。17 项 IC transform 契约、隔离初始化及 247 组实际 SQLite 对照／空表检查通过，全部 SQL 有独立期望值。
+验证涵盖全部维度／统计、数值比较的等值边界、跨租户及 UTC 月边界、全 NULL／空窗口、零 Effcnt 和异常范围原始值；旧设备 KPI 表的 9999 在线率哨兵不影响专表结果。
+PostgreSQL 只核对参数；双载荷契约 250000 fuel，隔离初始化实际耗尽 200000 后调整至 250000 并通过，独立 SQL fixture 600000。
+不准备历史累计 SQL 或知识内容，不执行知识发现、知识地图构建或知识测试；MainService 尚未切换，继续剩余 18 个载体及跨载体关系。
+
+
+### 阶段 D 进展：服务器组件
+
+Disk／NetworkAdapter／OpticalModule／Port／Processor 共迁移 68 字段／维度、十个闭合域和十条来源关系，累计 37/50。
+各组件使用独立名义身份，父资源引用 ServerOriginId：光模块使用 neResId，其余使用 parentResId，不以 ServerId 替代。
+来源服务器→组件、组件→租户关系保持 Optional→Many0，不因名称或目标主键而收紧，也不暗加租户键。
+磁盘容量保持 Int GB 的名义类型，剩余寿命保持文本；处理器频率继续原来的 -1 编码域，不补造数值单位。cardModel／processorType 等示例说明不生成闭合域。
+网卡 UTC 毫秒时间、字段非空性和来源未确认假定均沿用；组件不复制服务器样本能力。
+
+五源 SHA256 与 catalog 一致；17 项 IC transform 契约、隔离初始化和 259 组实际 SQLite 对照／空表检查通过，SQL 全部有独立期望值。
+验证包含全部域成员、双根关联、两个方向 EXISTS、服务／原始身份碰撞、重复原始身份、跨租户行、大于 2^53 的精确整数容量及原始百分比文本。
+服务器 ID 未公开为维度，关系结果使用既有 server_name 投影，不扩大查询权限。PostgreSQL 仅核对参数。
+原双载荷／隔离初始化 250000 fuel 均实际耗尽，分别调至 350000／300000 后通过，独立 SQL fixture 650000；不准备历史累计 SQL 或知识内容。
+MainService 尚未切换，不执行知识发现、知识地图构建或知识测试，继续剩余 13 个载体及其关系。
+
+
+### 阶段 D 进展：PON 端口、设备及在线率来源
+
+三来源迁移 40 字段、49 维度、九个公开统计与三条设备关联，累计 40/50。端口保持既有 Entity／单列 grain；设备及在线率保持既有 Metric grain 与 UTC 时钟。
+光功率、流量、利用率及未明单位设备字段使用独立名义类型，不补造统计或单位；CPU 百分比继续 #47 暂定假设。在线率专表保持独立总体及待确认尺度，不重缩放或推断 SLA；Effcnt 不隐式驱动权重或过滤。
+端口按 parentId、其余按 resId 连接 PonId，保留 Optional→Many0，不补租户键或分类条件。
+17 项 transform 契约、隔离初始化及 265 组 SQLite 新旧 SQL／独立预期／空表检查通过；PostgreSQL 仅核对参数。验证含不同 parentId／resId、双根关联、双向 EXISTS、设备分组统计、跨租户、NULL 与两表不同在线率样本。多值关联行投影显式指定 Association 粒度。
+初始化预算维持 350000／300000，独立 SQL fixture 为 650000，不准备历史累计 SQL。MainService 尚未切换，继续剩余十载体与来源关系；知识发现、知识地图构建和知识测试不参与初始化或当前验收。
+
+
+### 阶段 D 进展：存储设备组件
+
+备电／机框／控制器／风扇／电源迁移 94 字段及维度、17 个闭合域的 72 个成员和十条关系，累计 45/50。组件父资源使用 StorageId；设备→组件保持 Optional→Many0，组件→租户保持 Many0→Optional，不补租户键或组件之间的关系。
+备电制造日期和电源生产日期采用 DateUtc；控制器创建时间继续尚待确认的 EpochMillis 假定。CPU 数量使用整数名义类型；原始温度、内存大小、充放电次数等文本不按单位说明隐式解析，备电剩余天数继续原来的 -1 闭合编码域。
+五源 SHA256 均与 catalog 一致。17 项 transform 契约、独立初始化和 331 组 SQLite 新旧对照／独立预期／空表检查通过，PostgreSQL 仅核对参数。验证包含全部域成员、日历日期比较与窗口、双根设备关联和双向 EXISTS、孤立／NULL 引用、跨租户连接及设备／组件相同文本 ID。
+初始化实际耗尽 300000 fuel 后调整至 350000 并通过，双载荷契约保持 350000，独立 SQL fixture 使用 650000；不准备历史累计 SQL。MainService 尚未切换，继续最后五载体及其关联；知识发现、知识地图和知识测试不参与当前初始化或验收。
+
+
+### 阶段 D 进展：存储磁盘与端口
+
+两来源迁移 49 字段、51 维度、十个闭合域的 65 成员和五条关系，累计 47/50。磁盘保持既有无键 Dataset，diskId 不作为唯一身份；端口使用独立 PortId，原始 parentResId 分别显式引用 StorageId 与 FcSwitchId。存储／FC→组件保持 Optional→Many0，组件→租户保持 Many0→Optional。
+端口整数 speed 用 Mbit/s 名义类型；文本 maxSpeed、磁盘容量／寿命／磨损率不解析或隐式换算，不增加统计。端口两个严格 IPv4 视图及原始地址文本规则保留。
+端口源哈希与 catalog 一致；当前磁盘 YAML 新增 id，其余 22 字段规范化元数据与 catalog 完全一致，本批不自动吸收新增身份契约。无键磁盘继续拒绝根计数，不为用例补造身份。
+17 项 transform 契约、隔离初始化与 237 组 SQLite 新旧对照／独立预期／空表检查通过，PostgreSQL 仅核对参数。覆盖全部域成员、Bool、整数速率、IPv4 异常／CIDR／补集、两类父资源、跨租户、重复 diskId 和孤立／NULL 引用。
+双载荷与隔离初始化均实际耗尽 350000 fuel 后调整至 400000 并通过；隔离超时上限 240 秒，独立 SQL fixture 650000。不准备历史累计 SQL 或知识内容；MainService 尚未切换，继续最后三个载体及服务切换验收。
+
+
+### 阶段 D 进展：最后三个 IC 载体
+
+存储设备 KPI／硬盘 KPI／设备检索表共迁移 20 字段、27 维度、15 统计、一个闭合域的 12 成员及两条 owner 关系，累计完成 50/50 载体声明。两个 KPI 保持 (resId, ts) Metric grain 和 UTC 时钟；共享设备样本的原始 resId 显式引用独立 StorageId／FcSwitchId，关系保持 Optional→Many0。未解决的硬盘归属仍不推断。
+百分比样本保持来源尺度，KB I/O 大小使用独立名义类型及样本组，#58 字节倍率继续待确认；不换算、不增加 Sum 或 Effcnt 权重。设备检索表独立 CatalogId、闭合分类、原始文本与严格 IPv4 视图保留，不引入知识准备。三源 SHA256 与 catalog 一致。
+17 项覆盖全部 50 载体的 transform 契约、隔离初始化和 179 组 SQLite 新旧对照／独立预期／空表检查通过，PostgreSQL 仅核对参数。验证含两类 owner 的双根关联、双向 EXISTS 与分组统计、不同 CPU／内存及读／写种子值、全 NULL／空窗口、UTC 分桶和原始数值过滤。
+双载荷与隔离初始化均使用 400000 fuel，独立 SQL fixture 使用 650000。MainService 尚未切换，后续必须完成服务初始化、批量 transform 和 SQL 执行验收后才可宣称 IC 迁移交付完成；知识发现、知识地图构建与知识测试不参与当前验收。
+
+
+### 阶段 D 交付：IC MainService 切换
+
+全部 50 载体及既有 transform 能力完成逐批迁移和对照后，默认 MainService 改用独立 typed payload。旧注解模型仅用于显式基线／审计；hosted 入口重导出同一 MainService，当前只挂载 ic/transform，不准备知识根、发现处理器或知识地图。
+默认服务临时 snapshot 在 400000 初始化 fuel、100000 请求 fuel、2048 MiB 内成功构建；hosted 重导出入口的类型闭包检查通过。实际 snapshot 覆盖全部 50 Dataset 的公开投影和空表 SQL 执行，并对有数据的规范值／IPv4 过滤、过滤及组合计数、最新整行与均值、GraphPair 周期差值、GraphUnion 身份去重、行数限制、确定性及混合批次整体拒绝执行独立结果验收。
+公开结果列／时间参数检查、遗漏与 null／1／100／101 行限制以及调用方输出上限的既有 snapshot 检查全部通过。实际执行数据库仅为 SQLite；历史各批 PostgreSQL 证据仍限于 SQL／参数对照，不扩大为实际执行声明。
+当前 transform 实现及本地验收完成，细节和复验命令见 TYPED_MIGRATION.md；公开推送与 #64 汇报待完成。历史记录中的未切换描述保留为阶段事实，不代表当前入口。未启动或重启 demo 环境，未构建知识地图或执行知识发现／知识测试。
+
+### 2026-10-24：模型自检与默认 transform 准备分离
+
+ontology 的默认声明构造器与 `prepare/build` 改为只保留声明事实并执行 transform 必需的准备。
+模型无需切换 API；发布前通过 `transform::self_check` 对同一组声明显式执行完整检查。
+请求形状、名称引用、值类型、操作能力和原子批次拒绝继续在运行期验证。
+显式 `checked_*` 入口保留立即诊断能力，相关负向测试改为显式调用这些入口。
+
+先用 JS 生成样本验证普通默认 API、采样、业务域、关系与坏模型自检，再以未修改源码的 IC 验证收益。
+IC 运行期 snapshot 从约 65.549 MB 降为 51.180 MB，构建从 168.750 秒降为 14.963 秒，
+准备阶段从 157.538 秒降为 4.394 秒；全部 50 Dataset SQL 与带数据 transform 验收通过。
+独立自检构建本轮约 155.456 秒，校验成本被分离但没有消失；完整发布必须另计该成本。
+默认 API 的收益不依赖 IC 专用逻辑。知识能力保持延后，不参与初始化或验收。
+
+本阶段不预计算或序列化 transform 初始化结果，也不修改编译器的 TypeId 契约。
+共享函数中的校验分支可能仍保留在 wasm 中；逻辑分离不等于完全可达性裁剪。
+详见 `ontology/docs/STAGED_TRANSFORM_EXPERIMENT.md` 的命令、范围与测量限制。

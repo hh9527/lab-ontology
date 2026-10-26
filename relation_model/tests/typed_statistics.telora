@@ -1,0 +1,51 @@
+use ontology::experimental::model as m;
+use ontology::experimental::groups as g;
+use ontology::experimental::quantity as q;
+use ontology::experimental::scalars as s;
+use ontology::experimental::transform as t;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as qb;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::value::{Value};
+use std::test as test;
+
+type ReportedRate = struct(Float);
+type Row = struct { owner: String, value: Option(ReportedRate), other: Option(ReportedRate), items: q::Count };
+def rows: m::Dataset(Row) = m::dataset("rates", "rate_rows", Row.type, []);
+def statistics: g::NumericGroup(ReportedRate) = g::numeric_group("reported_rates", ReportedRate.type, [g::Statistic::Mean, g::Statistic::Min, g::Statistic::Max]);
+def names: Fn(String) -> Array(g::StatisticName) = fn(prefix) { [{member: g::Statistic::Mean, publish: `\{prefix}_avg`}, {member: g::Statistic::Min, publish: `\{prefix}_min`}, {member: g::Statistic::Max, publish: `\{prefix}_max`}] };
+def first: g::Binding(Row) = g::numeric_binding(rows, statistics, g::input(m::optional_field(Row.type, ReportedRate.type, "value")), names("value"));
+def second: g::Binding(Row) = g::numeric_binding(rows, statistics, g::input(m::optional_field(Row.type, ReportedRate.type, "other")), names("other"));
+def declared: t::Declaration = t::map_columns(t::declare(rows, [], [
+    g::dimension(rows, g::dimension_group("owners", String.type, True, g::equality_filters), g::input(m::field(Row.type, String.type, "owner")), "owner", True, g::equality_filters),
+    first, second,
+    g::numeric_binding(rows, g::numeric_group("counts", q::Count.type, [g::Statistic::Sum, g::Statistic::Mean]), g::input(m::field(Row.type, q::Count.type, "items")), [{member: g::Statistic::Sum, publish: "items_sum"}, {member: g::Statistic::Mean, publish: "items_avg"}]),
+], []), [t::column(m::optional_field(Row.type, ReportedRate.type, "value"), "RATE_VALUE")]);
+def profile: qb::PlanProfile = {allowed_operators: [qb::Operator::Source, qb::Operator::Column, qb::Operator::Project, qb::Operator::Aggregate, qb::Operator::Group, qb::Operator::Having, qb::Operator::Order, qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Filter], allowed_aggregates: [qb::AggregateFunction::Avg, qb::AggregateFunction::Min, qb::AggregateFunction::Max, qb::AggregateFunction::Sum], allowed_join_kinds: [], allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Gt], allow_distinct: False};
+def payload: edsl::PreparedPayload = t::prepare("rates", [declared], profile).payload;
+def ast: Fn(String) -> qb::QueryAst = fn(extra) { intent::query_intent_ast_factory(payload)(json::parse(`{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"rates"}],"edges":[],\{extra}}`).unwrap!()) };
+type RuntimeCase = struct { id: String, sqlite: qb::Query, postgres: qb::Query };
+def runtime_case: Fn(String, String) -> RuntimeCase = fn(id, extra) { let query = ast(extra); {id, sqlite: sqlite::build_query(query), postgres: postgres::build_query(query)} };
+pub def runtime_cases: Value = codec::encode([
+    runtime_case("grouped", r#""select":[{"node":"r","dimension":"owner"}],"measures":[{"node":"r","measure":"value_avg"},{"node":"r","measure":"value_min"},{"node":"r","measure":"value_max"},{"node":"r","measure":"other_avg"},{"node":"r","measure":"items_sum"},{"node":"r","measure":"items_avg"}]"#),
+    runtime_case("total", r#""select":[],"measures":[{"node":"r","measure":"value_avg"},{"node":"r","measure":"value_min"},{"node":"r","measure":"value_max"},{"node":"r","measure":"items_sum"}]"#),
+    runtime_case("filtered", r#""select":[{"node":"r","dimension":"owner"}],"measures":[{"node":"r","measure":"value_avg"}],"filters":[{"node":"r","dimension":"owner","op":"Eq","value":"a"}]"#),
+]);
+pub def ordinary_statistics_do_not_invent_metric_metadata: test::Test = test::should_ok(fn() { payload.entities[0].dataset == None && payload.entities[0].sample_measures == [] });
+pub def rates_are_not_additive: test::Test = test::should_fail_with(fn() { g::checked_numeric_group("bad", ReportedRate.type, [g::Statistic::Sum]) }, "numeric Sum requires an explicitly additive quantity type");
+pub def time_is_not_a_numeric_statistic: test::Test = test::should_fail_with(fn() { g::checked_numeric_group("bad", s::EpochMillis.type, [g::Statistic::Mean]) }, "numeric group requires a name, numeric value type and statistics");
+pub def every_member_needs_a_name: test::Test = test::should_fail_with(fn() { g::checked_numeric_binding(rows, statistics, g::checked_input(m::checked_optional_field(Row.type, ReportedRate.type, "value")), []) }, "numeric binding must name every statistic exactly once");
+pub def group_statistics_cannot_repeat: test::Test = test::should_fail_with(fn() { g::checked_numeric_group("bad", ReportedRate.type, [g::Statistic::Mean, g::Statistic::Mean]) }, "numeric group statistics must be distinct");
+pub def erased_group_cannot_drop_members: test::Test = test::should_fail_with(fn() { g::checked_prepare(rows, [first <~ {members: [first.members[0]]}]) }, "numeric binding must preserve its complete group");
+pub def erased_recipe_cannot_change_aggregate: test::Test = test::should_fail_with(fn() { g::checked_prepare(rows, [first <~ {members: array::map(first.members, fn(member) { member <~ {aggregate: Some(qb::AggregateFunction::Sum)} })}]) }, "numeric binding cannot override its group recipe");
+pub def erased_group_cannot_mix_source_expressions: test::Test = test::should_fail_with(fn() { g::checked_prepare(rows, [first <~ {members: [first.members[0], first.members[1] <~ {node: second.members[1].node}, first.members[2]]}]) }, "numeric binding must preserve its complete group");
+pub def integer_mean_has_number_result: test::Test = test::should_ok(fn() { edsl::measure_output_type(payload, "items_avg") == edsl::OutputType::Number && edsl::measure_output_type(payload, "items_sum") == edsl::OutputType::Integer });
+
+pub def statistics_do_not_bypass_threshold_identity_proofs: test::Test = test::should_fail_with(fn() {
+    ast(r#""select":[{"node":"r","dimension":"owner"}],"measures":[{"node":"r","measure":"value_avg"}],"measure_having":[{"node":"r","measure":"value_avg","op":"Gt","value":50}]"#)
+}, "graph measure threshold requires complete root identity");
