@@ -3,11 +3,29 @@
 模型发布领域知识事实：稳定身份、描述、关系、逻辑类型、值和已声明业务约束。
 工具用法、请求语法、检索方法和 Agent 工作流由消费方负责。宿主收集完整图，并可向 Agent 暴露紧凑投影。
 
-## 当前静态知识 v4
+## 构建期发布与静态程序
 
-IC／relation 通过 `ontology::experimental::build::stage` 在构建期间从 transform 的同一准备结果导出知识。
-Wasm custom section `telora.build.information` 的 envelope 为 `{version:1,entries:{...}}`；
-`entries["ontology.knowledge"]` 携带 `ontology-knowledge-v4` 领域契约及 `facts`、`items`。
+IC／relation 通过 `ontology::experimental::build::stage` 从 transform 的同一 Prepared 导出模型 JSON。
+Wasm custom section `telora.build.information` 使用 `{version:1,entries:{...}}` envelope。
+`entries["ontology.knowledge"]` 为 `{knowledge_contract:"ontology-knowledge-javascript-v1",program,data}`。
+
+program 是 ontology 的固定 JS 函数体，同一版本对所有模型完全一致。模型标注只派生 JSON，不生成 JS 源码。
+data 为 `{revision,instructions}`，instructions 的每项为 `[operation,...args]`。当前顺序为完整类型表 types、Entity、Dataset、能力和关系；领域操作由静态程序解释，插件无需理解其含义。
+
+插件 JSON.parse 构建信息后执行：
+
+```js
+const buildKnowledge = new Function("data", publication.program);
+const { graph, vocabulary } = buildKnowledge(publication.data);
+```
+
+插件信任模型代码，直接同步执行。静态程序使用 Map／Set 和原地更新，负责规范地址、SHA256 Group 哈希、类型内联、节点展开与事实合并；输入 JSON 保持不变。构图状态只在一次调用中使用，不经跨调用序列化。
+
+最终 graph 使用 `ontology-knowledge-v4` 图结构，含 facts 和 items。vocabulary 每项为 `{key,kind,name,doc,aliases,owner,ownerValue}`，用于 `va_ask`。插件验证词条身份及唯一性，外部展示文件可补充说明和别名。编译、执行或验证错误直接拒绝加载，成功结果按模型及外部展示身份缓存。
+
+库的 `knowledge::export` 保留完整图等价验收参考实现；默认构建使用 `knowledge::publication`。
+
+## 最终知识事实
 每条事实为 `{key,value,references}`，key 是规范稳定地址，references 显式指向其他事实。
 消费方必须校验契约与引用闭合，再从事实派生成员导航、语义链接和反向链接；展示条目不授予查询权限。
 
@@ -21,12 +39,12 @@ Int、Float、Bool、String 及内置 Option、Array、Dict 不生成类型节�
 
 P1 支撑运行期程序，P2 支撑上述外部知识；运行期不重跑准备或发现。
 dsh-oks 直接读取 custom section，并可从 `<model>.knowledge-items.json` 补充名称和文档。
-插件兼容旧 `telora.service.metadata`；重复或损坏的新段以及两个段重复声明同一知识条目均拒绝。
+插件只读取 `telora.build.information`；重复或损坏的新段均拒绝，旧 `telora.service.metadata` 不作为知识来源。
 当前模型不挂载下述可选 info／discovery 接口。
 
 ## 可选库接口：info／discovery
 
-下文描述仍保留的库兼容接口，其 v3 协议与当前静态 v4 不是同一运输或地址契约。
+下文仅记录仍保留的独立库接口，插件不消费这些接口，其 v3 协议与构建期发布及最终 v4 图不是同一运输或地址契约。
 
 工程边界采用版本管理：discovery 声明 `knowledge_contract: "ontology-knowledge-v3"` 和 `intent_contract: "ontology-intent-v1"`。
 消费方必须显式拒绝不兼容快照。更新 Intent 语法时须同时审查消费方的版本化工具帮助及解析测试；修改知识描述须保留业务语义，不能加入工具操作指令。
@@ -241,3 +259,5 @@ node scripts/benchmark-host-knowledge.mjs \
 `--runner` 可指定隔离的 release runner，`--baseline` 可指定
 `scripts/benchmark-knowledge.mjs --full` 生成的知识图摘要，逐节点核对 SHA-256 和字节数。
 设计及边界见 [RFC 0001](../../rfcs/0001-host-knowledge-index.md)。
+
+静态 JS 源码为 `ontology/src/experimental/knowledge.js`，通过 `python3 scripts/embed-knowledge-program.py` 生成 Telora 字符串；`--check` 检查漂移。协议设计见 [RFC 0005](../../rfcs/0005-programmed-knowledge-discovery.md)。

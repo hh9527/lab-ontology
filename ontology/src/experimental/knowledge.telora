@@ -13,6 +13,7 @@ use std::json as json;
 use std::hash as hash;
 use std::codec as codec;
 use std::value::{Value};
+use crate::experimental::knowledge_program as knowledge_program;
 
 type TypeField = struct {name: String, type: String};
 type TypeVariant = struct {name: String, payload: Option(String)};
@@ -297,4 +298,174 @@ def export: Fn(t::Prepared) -> Value = fn(prepared) {
     });
     object([("knowledge_contract", codec::encode("ontology-knowledge-v4")), ("intent_contract", codec::encode("ontology-intent-v1")), ("addressing", codec::encode("node-member-uri-v1")), ("revision", codec::encode(prepared.payload.revision)), ("facts", codec::encode(dict::values(merged))), ("items", codec::encode([].ty!(Array(Value))))])
 };
-pub use self::{export, type_id};
+def raw_group_value: Fn(g::BindingFacts) -> Value = fn(binding) {
+    match binding.contract {
+        g::BindingContract::DeferredDimension(group) => object([("name", codec::encode(group.id)), ("type", codec::encode(type_id(group.value))), ("projectable", codec::encode(group.projectable)), ("filters", codec::encode(group.filters))]),
+        g::BindingContract::Transfer(group) => object([("name", codec::encode(group.id)), ("members", codec::encode(group.members))]),
+        g::BindingContract::Numeric(group) => object([("name", codec::encode(group.id)), ("type", codec::encode(type_id(group.value))), ("members", codec::encode(group.members))]),
+        g::BindingContract::Identity(role) => object([("name", codec::encode("identity")), ("entity", codec::encode(role.entity)), ("type", codec::encode(type_id(role.identity)))]),
+        g::BindingContract::Dimension => {
+            let member = binding.members[0];
+            let policy = match member.kind { g::MemberKind::Dimension(policy) => policy, _ => fail!("dimension contract has no dimension policy", member.id) };
+            object([("name", codec::encode(member.group)), ("type", codec::encode(type_id(member.value))),
+                ("projectable", codec::encode(policy.projectable)), ("filters", codec::encode(policy.filters))])
+        },
+    }
+};
+# 从同一 Prepared 采集紧凑语义描述；规范地址与完整图由静态 knowledge.js 构造。
+# 类型闭包与去重保持原算法，与图组装的位置独立。
+def raw_column: Fn(g::Column) -> Value = fn(c) {
+    object([("name", codec::encode(c.name)), ("type", codec::encode(type_id(c.value))), ("nullable", codec::encode(c.nullable))])
+};
+def raw_expression: Fn(g::Node) -> Value = fn(node) {
+    match node {
+        g::Node::Column(c) => object([("op", Value::String("column")), ("input", raw_column(c))]),
+        g::Node::Seconds(input) => object([("op", Value::String("seconds")), ("input", raw_expression(input))]),
+        g::Node::Ipv4(input) => object([("op", Value::String("ipv4")), ("input", raw_expression(input))]),
+        g::Node::UtcBucket(bucket) => object([("op", Value::String("utc_bucket")), ("input", raw_expression(bucket.input)), ("unit", codec::encode(bucket.unit))]),
+        g::Node::Rate(inputs) => object([("op", Value::String("rate")), ("amount", raw_expression(inputs.amount)), ("duration", raw_expression(inputs.duration))]),
+        g::Node::Identity(input) => object([("op", Value::String("identity")), ("column", raw_column(input.column)), ("parts", Value::Array(array::map(input.parts, raw_column)))]),
+    }
+};
+def raw_type: Fn(Type) -> Value = fn(ty) {
+    let body = resolved(ty);
+    object([
+        ("id", codec::encode(type_id(ty))), ("inline", codec::encode(inline_type(ty))),
+        ("builtin", codec::encode(if ty == Int.type { Some("Int") } else if ty == Float.type { Some("Float") }
+            else if ty == Bool.type { Some("Bool") } else if ty == String.type { Some("String") } else { None })),
+        ("name", codec::encode(td::name(ty))), ("kind", codec::encode(td::kind(ty))),
+        ("representation", codec::encode(if body != ty { Some(type_id(body)) } else { None })),
+        ("arguments", codec::encode(array::map(td::children(ty), type_id))),
+        ("field_types", codec::encode(if td::kind(body) == td::TypeDescKind::Struct {
+            array::map(td::fields(body), fn(f) { {name: f.name, type: type_id(f.ty)}.ty!(TypeField) })
+        } else { [] })),
+        ("variants", codec::encode(if td::kind(body) == td::TypeDescKind::Enum {
+            array::map(td::variants(body), fn(v) { {name: v.name, payload: match v.payload { Some(p) => Some(type_id(p)), None => None }}.ty!(TypeVariant) })
+        } else { [] })),
+        ("dependencies", codec::encode(array::map(type_dependencies(ty), type_id)))
+    ])
+};
+def raw_binding: Fn(g::BindingFacts) -> Value = fn(binding) {
+    let group = raw_group_value(binding);
+    object([("group", group), ("group_kind", codec::encode(group_root(binding))),
+        ("types", codec::encode(array::flat_map(binding.members, fn(m) { array::map(array::concat([[m.value], expression_types(m.node)]), type_id) }))),
+        ("members", codec::encode(array::map(binding.members, fn(m) {
+            {local: m.local, publish: m.id, input: raw_expression(m.node), type: type_id(m.value), nullable: m.nullable,
+                aggregate: m.aggregate, projectable: m.projectable, filters: m.filters, kind: m.kind}.ty!(BindingMember)
+        })))])
+};
+def raw_domain: Fn(v::BindingFacts) -> Value = fn(b) {
+    object([("id", codec::encode(b.id)), ("input", raw_expression(b.node)),
+        ("nullable", codec::encode(b.nullable)), ("projectable", codec::encode(b.projectable)), ("filters", codec::encode(b.filters)),
+        ("definition", object([("name", codec::encode(b.definition.id)), ("type", codec::encode(type_id(b.definition.value))),
+            ("wire", codec::encode(type_id(b.definition.wire))), ("canonical_values", codec::encode(b.definition.values)),
+            ("half_open", codec::encode(b.definition.half_open)), ("order", codec::encode(b.definition.order)),
+            ("projectable", codec::encode(b.group_projectable)), ("filters", codec::encode(b.group_filters))]))])
+};
+def raw_sample: Fn(samples::BindingFacts) -> Value = fn(b) {
+    object([("definition", object([("name", codec::encode(b.group)), ("type", codec::encode(type_id(b.value))),
+        ("primary", codec::encode(b.primary)), ("summaries", codec::encode(b.summaries)), ("unit", codec::encode(b.unit))])),
+        ("field", codec::encode(b.field)), ("nullable", codec::encode(b.nullable)), ("names", codec::encode(b.names))])
+};
+def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset) {
+    object([
+        ("id", codec::encode(d.dataset.id)), ("source", codec::encode(d.dataset.source)),
+        ("row", codec::encode(type_id(d.dataset.row))), ("grain", codec::encode(d.dataset.grain)),
+        ("kind", codec::encode(d.kind)), ("scope", codec::encode(dataset.scope)), ("clock", codec::encode(d.clock)),
+        ("roles", Value::Array(array::map(d.dataset.roles, fn(r) {
+            object([("id", codec::encode(r.id)), ("entity", codec::encode(r.entity)),
+                ("identity", codec::encode(type_id(r.identity))), ("optional", codec::encode(r.optional)),
+                ("parts", codec::encode(array::map(r.parts, fn(p) {
+                    {source: p.source, target: p.target, type: type_id(p.value), nullable: p.nullable,
+                        raw: match p.raw { Some(raw) => Some(type_id(raw)), None => None }}.ty!(RolePart)
+                })))])
+        }))),
+        ("fields", Value::Array(array::map(dataset.fields, fn(f) {
+            object([("name", codec::encode(f.name)), ("column", codec::encode(f.column)),
+                ("type", codec::encode(type_id(f.ty))), ("nullable", codec::encode(f.nullable)),
+                ("key", codec::encode(f.is_key)), ("time", codec::encode(f.time)), ("logical_type", codec::encode(f.logical_type))])
+        }))),
+        ("bindings", Value::Array(array::map(d.groups, raw_binding))),
+        ("domains", Value::Array(array::map(d.domains, raw_domain))),
+        ("samples", Value::Array(array::map(d.samples, raw_sample)))
+    ])
+};
+def raw_relation_key: Fn(edsl::EntityEntry, edsl::EntityEntry, edsl::RelationKey) -> Value = fn(from, to, key) {
+    match key {
+        edsl::RelationKey::Eq(pair) => object([("op", Value::String("eq")), ("from", codec::encode(from.fields[pair.from].name)), ("to", codec::encode(to.fields[pair.to].name))]),
+        edsl::RelationKey::And(keys) => object([("op", Value::String("and")), ("inputs", Value::Array(array::map(keys, fn(k) { raw_relation_key(from, to, k) })))]),
+        edsl::RelationKey::Or(keys) => object([("op", Value::String("or")), ("inputs", Value::Array(array::map(keys, fn(k) { raw_relation_key(from, to, k) })))]),
+    }
+};
+def raw_capabilities: Fn(edsl::PreparedPayload) -> Value = fn(payload) {
+    let dims = array::map(payload.dimensions, fn(d) {
+        object([("dataset", codec::encode(payload.entities[d.entity].id)), ("id", codec::encode(d.id)),
+            ("authorized", codec::encode(d.authorized)), ("projectable", codec::encode(d.projectable)),
+            ("filterable", codec::encode(d.filterable)), ("ops", codec::encode(d.ops)),
+            ("input_kinds", codec::encode(d.input_kinds)), ("output_type", codec::encode(d.output_type)),
+            ("computed", codec::encode(d.computed)), ("utc_bucket", codec::encode(d.utc_bucket)),
+            ("canonical_values", codec::encode(d.canonical_values)), ("canonical_order", codec::encode(d.canonical_order)),
+            ("half_open", codec::encode(d.half_open)), ("scope", codec::encode(d.scope)),
+            ("field", codec::encode(payload.entities[d.entity].fields[d.field].name))])
+    });
+    let measures = array::map(payload.measures, fn(m) {
+        object([("dataset", codec::encode(payload.entities[m.entity].id)), ("id", codec::encode(m.id)),
+            ("anchor_field", codec::encode(payload.entities[m.entity].fields[m.field].name)),
+            ("aggregate", codec::encode(m.aggregate)), ("input", codec::encode(m.input)), ("predicate", codec::encode(m.predicate)),
+            ("computed", codec::encode(m.computed)), ("requires", codec::encode(array::map(m.requires, fn(index) { payload.entities[index].id }))),
+            ("sampling", codec::encode(array::find(payload.entities[m.entity].sample_measures, fn(s) { s.id == m.id })))])
+    });
+    let relations = array::map(payload.relations, fn(r) {
+        object([("id", codec::encode(r.id)), ("from_dataset", codec::encode(payload.entities[r.from].id)),
+            ("to_dataset", codec::encode(payload.entities[r.to].id)), ("cardinality", codec::encode(r.cardinality)),
+            ("key", raw_relation_key(payload.entities[r.from], payload.entities[r.to], r.key)), ("guard", codec::encode(r.guard))])
+    });
+    let links = array::map(payload.business_links, fn(l) {
+        object([("id", codec::encode(l.id)), ("hub", codec::encode(payload.entities[l.hub].id)),
+            ("participant", codec::encode(payload.entities[l.participant].id)), ("a_relation", codec::encode(l.a_relation)),
+            ("z_relation", codec::encode(l.z_relation)), ("direction", codec::encode(l.direction)), ("guard", codec::encode(l.guard))])
+    });
+    object([("dimensions", Value::Array(dims)), ("measures", Value::Array(measures)),
+        ("relations", Value::Array(relations)), ("links", Value::Array(links))])
+};
+def raw_endpoint: Fn(String, String) -> Value = fn(dataset, role) {
+    object([("dataset", codec::encode(dataset)), ("role", codec::encode(role))])
+};
+def raw_relation_sources: Fn(t::Prepared) -> Value = fn(prepared) {
+    object([("relations", Value::Array(array::map(prepared.relations, fn(r) {
+        object([("id", codec::encode(r.id)), ("from", raw_endpoint(r.from.dataset.id, r.from.role)), ("to", raw_endpoint(r.to.dataset.id, r.to.role))])
+    }))), ("alternatives", Value::Array(array::map(prepared.alternatives, fn(a) {
+        object([("id", codec::encode(a.id)), ("choices", Value::Array(array::map(a.choices, fn(r) {
+            object([("from", raw_endpoint(r.from.dataset.id, r.from.role)), ("to", raw_endpoint(r.to.dataset.id, r.to.role))])
+        })))])
+    })))])
+};
+def publication: Fn(t::Prepared) -> Value = fn(prepared) {
+    let seeds = array::flat_map(prepared.declarations, fn(d) {
+        array::concat([[d.dataset.row], array::map(d.dataset.roles, fn(r) { r.identity }),
+            array::map(d.samples, fn(b) { b.value }), array::flat_map(d.domains, fn(b) { [b.definition.value, b.definition.wire] }),
+            array::flat_map(d.groups, fn(b) { array::flat_map(b.members, fn(m) { array::concat([[m.value], expression_types(m.node)]) }) })])
+    });
+    let types = collect_types(seeds, []);
+
+    let instructions = array::concat([
+        [Value::Array([codec::encode("types"), Value::Array(array::map(types, raw_type))])],
+        array::flat_map(prepared.declarations, fn(d) {
+            array::map(d.dataset.roles, fn(r) {
+                Value::Array([codec::encode("entity"), object([
+                    ("entity", codec::encode(r.entity)), ("identity", codec::encode(type_id(r.identity)))
+                ])])
+            })
+        }),
+        array::map(array::enumerate(prepared.declarations), fn(pair) {
+            Value::Array([codec::encode("dataset"), raw_dataset(pair.1, prepared.payload.entities[pair.0])])
+        }),
+        [Value::Array([codec::encode("capabilities"), raw_capabilities(prepared.payload)]),
+         Value::Array([codec::encode("relations"), raw_relation_sources(prepared)])]
+    ]);
+    object([("knowledge_contract", codec::encode("ontology-knowledge-javascript-v1")),
+        ("program", codec::encode(knowledge_program::program)),
+        ("data", object([("revision", codec::encode(prepared.payload.revision)), ("instructions", Value::Array(instructions))]))])
+};
+
+pub use self::{export, type_id, publication};

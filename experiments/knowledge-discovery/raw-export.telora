@@ -1,0 +1,80 @@
+# 隔离实验：以下内容注入 knowledge 模块；只覆盖 JS Dataset 样本。
+# 类型闭包算法保持原样，实验只考察图物化的位置。
+def raw_column: Fn(g::Column) -> Value = fn(c) {
+    object([("name", codec::encode(c.name)), ("type", codec::encode(type_id(c.value))), ("nullable", codec::encode(c.nullable))])
+};
+def raw_expression: Fn(g::Node) -> Value = fn(node) {
+    match node {
+        g::Node::Column(c) => object([("op", Value::String("column")), ("input", raw_column(c))]),
+        _ => fail!("discovery experiment only supports generated column expressions"),
+    }
+};
+def raw_type: Fn(Type) -> Value = fn(ty) {
+    let body = resolved(ty);
+    object([
+        ("id", codec::encode(type_id(ty))), ("inline", codec::encode(inline_type(ty))),
+        ("name", codec::encode(td::name(ty))), ("kind", codec::encode(td::kind(ty))),
+        ("representation", codec::encode(if body != ty { Some(type_id(body)) } else { None })),
+        ("arguments", codec::encode(array::map(td::children(ty), type_id))),
+        ("field_types", codec::encode(if td::kind(body) == td::TypeDescKind::Struct {
+            array::map(td::fields(body), fn(f) { {name: f.name, type: type_id(f.ty)}.ty!(TypeField) })
+        } else { [] })),
+        ("variants", codec::encode(if td::kind(body) == td::TypeDescKind::Enum {
+            array::map(td::variants(body), fn(v) { {name: v.name, payload: match v.payload { Some(p) => Some(type_id(p)), None => None }}.ty!(TypeVariant) })
+        } else { [] })),
+        ("dependencies", codec::encode(array::map(type_dependencies(ty), type_id)))
+    ])
+};
+def raw_binding: Fn(g::BindingFacts) -> Value = fn(binding) {
+    let group = match binding.contract {
+        g::BindingContract::DeferredDimension(group) => object([
+            ("name", codec::encode(group.id)), ("type", codec::encode(type_id(group.value))),
+            ("projectable", codec::encode(group.projectable)), ("filters", codec::encode(group.filters))]),
+        _ => fail!("discovery experiment requires generated dimension groups"),
+    };
+    object([("group", group),
+        ("types", codec::encode(array::flat_map(binding.members, fn(m) { array::map(array::concat([[m.value], expression_types(m.node)]), type_id) }))),
+        ("members", codec::encode(array::map(binding.members, fn(m) {
+            {local: m.local, publish: m.id, input: raw_expression(m.node), type: type_id(m.value), nullable: m.nullable,
+                aggregate: m.aggregate, projectable: m.projectable, filters: m.filters, kind: m.kind}.ty!(BindingMember)
+        })))])
+};
+def raw_dataset: Fn(t::Declaration, edsl::EntityEntry, edsl::PreparedPayload, Int) -> Value = fn(d, dataset, payload, index) {
+    if d.domains != [] || d.samples != [] { fail!("discovery experiment does not cover domains or samples") } else { () };
+    object([
+        ("id", codec::encode(d.dataset.id)), ("source", codec::encode(d.dataset.source)),
+        ("row", codec::encode(type_id(d.dataset.row))), ("grain", codec::encode(d.dataset.grain)),
+        ("kind", codec::encode(d.kind)), ("scope", codec::encode(dataset.scope)), ("clock", codec::encode(d.clock)),
+        ("roles", Value::Array(array::map(d.dataset.roles, fn(r) {
+            object([("id", codec::encode(r.id)), ("entity", codec::encode(r.entity)),
+                ("identity", codec::encode(type_id(r.identity))), ("optional", codec::encode(r.optional)),
+                ("parts", codec::encode(array::map(r.parts, fn(p) {
+                    {source: p.source, target: p.target, type: type_id(p.value), nullable: p.nullable,
+                        raw: match p.raw { Some(raw) => Some(type_id(raw)), None => None }}.ty!(RolePart)
+                })))])
+        }))),
+        ("fields", Value::Array(array::map(dataset.fields, fn(f) {
+            if f.time != None { fail!("discovery experiment does not cover time roles") } else { () };
+            object([("name", codec::encode(f.name)), ("column", codec::encode(f.column)),
+                ("type", codec::encode(type_id(f.ty))), ("nullable", codec::encode(f.nullable)),
+                ("key", codec::encode(f.is_key)), ("time", codec::encode(f.time)), ("logical_type", codec::encode(f.logical_type))])
+        }))),
+        ("bindings", Value::Array(array::map(d.groups, raw_binding))),
+        ("dimensions", Value::Array(array::map(array::filter(payload.dimensions, fn(m) { m.entity == index }), fn(m) {
+            object([("id", codec::encode(m.id)), ("field", codec::encode(m.field)),
+                ("authorized", codec::encode(m.authorized)), ("projectable", codec::encode(m.projectable)),
+                ("filterable", codec::encode(m.filterable)), ("ops", codec::encode(m.ops)),
+                ("input_kinds", codec::encode(m.input_kinds)), ("output_type", codec::encode(m.output_type)),
+                ("computed", codec::encode(m.computed)), ("utc_bucket", codec::encode(m.utc_bucket)),
+                ("canonical_values", codec::encode(m.canonical_values)), ("canonical_order", codec::encode(m.canonical_order)),
+                ("half_open", codec::encode(m.half_open)), ("scope", codec::encode(m.scope))])
+        }))),
+        ("measures", Value::Array(array::map(array::filter(payload.measures, fn(m) { m.entity == index }), fn(m) {
+            if m.requires != [] || m.computed != None { fail!("discovery experiment only covers independent record counts") } else { () };
+            object([("id", codec::encode(m.id)), ("field", codec::encode(m.field)),
+                ("aggregate", codec::encode(m.aggregate)), ("input", codec::encode(m.input)),
+                ("predicate", codec::encode(m.predicate)), ("computed", codec::encode(m.computed)),
+                ("requires", codec::encode(m.requires)), ("sampling", codec::encode(array::find(dataset.sample_measures, fn(s) { s.id == m.id })))])
+        })))
+    ])
+};

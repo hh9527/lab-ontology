@@ -25,6 +25,18 @@ lock['packages'] = {name: lock['packages'][name] for name in packages}
 result = subprocess.run([str(args.telora.resolve()), '-C', str(workspace / 'relation_model'), 'eval', '@test/inline_type_knowledge:publication', '--initialization-fuel', '400000'], capture_output=True, text=True, timeout=120)
 assert result.returncode == 0, result.stderr
 publication = json.loads(result.stdout)
+# 同一夹具通过正式插件采集，验证容器与具名类型在新路径保持语义。
+result = subprocess.run([str(args.telora.resolve()), '-C', str(workspace / 'relation_model'), 'eval', '@test/inline_type_knowledge:javascript_publication', '--initialization-fuel', '400000'], capture_output=True, text=True, timeout=120)
+assert result.returncode == 0, result.stderr
+compact = workspace / 'compact.json'; compact.write_text(result.stdout)
+plugin = ROOT.parent / 'dsh-oks'
+collected = workspace / 'collected.json'
+result = subprocess.run(['node', '--import', str(plugin / 'packages/dsh-oks/scripts/markdown-loader.mjs'), str(plugin / 'scripts/collect-model-knowledge.mjs'), str(compact), str(collected)], capture_output=True, text=True, timeout=120)
+assert result.returncode == 0, result.stderr
+actual = json.loads(collected.read_text())['graph']
+def canonical(graph):
+    return {**graph, 'facts': sorted([{**fact, 'references': sorted(set(fact['references']))} for fact in graph['facts']], key=lambda fact: fact['key'])}
+assert canonical(actual) == canonical(publication), 'programmed inline type graph differs'
 facts = {fact['key']: fact for fact in publication['facts']}
 for fact in facts.values():
     assert all(reference in facts for reference in fact['references']), fact

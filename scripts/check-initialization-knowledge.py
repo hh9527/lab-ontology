@@ -78,6 +78,11 @@ for mode in ['full', 'runtime']:
     artifacts[mode] = artifact
 full, runtime = [metadata(artifacts[mode]) for mode in ['full', 'runtime']]
 assert full == runtime
+# 使用正式插件将程序式发布整理成既有 v4 事实，再检查共享绑定。
+compact = workspace / 'compact.json'; compact.write_text(json.dumps(runtime))
+collected = workspace / 'collected.json'; plugin = ROOT.parent / 'dsh-oks'
+run(['node', '--import', plugin / 'packages/dsh-oks/scripts/markdown-loader.mjs', plugin / 'scripts/collect-model-knowledge.mjs', compact, collected])
+runtime = json.loads(collected.read_text())['graph']
 assert "<TypeId:" not in json.dumps(runtime)
 facts = {fact['key']: fact for fact in runtime['facts']}
 for fact in facts.values():

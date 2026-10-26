@@ -51,10 +51,12 @@ JSONL 请求恰好包含 `method` 和 `input`；method 选择槽位，仅 input 
 HTTP 则直接把相同 input POST 到对应路径。当前使用 `<domain>/transform`，请求形状见下文 Intent 说明。
 
 当前 IC／relation 不挂载 info／discovery。宿主直接从 Wasm 的 `telora.build.information` 读取
-`ontology.knowledge`，领域契约为 `ontology-knowledge-v4`，包含事实、引用与展示条目。
+`ontology.knowledge`，发布 `ontology-knowledge-javascript-v1` 的静态 JS 与模型 JSON 指令。
+同一 ontology 版本共用固定 JS，模型标注只派生 JSON。宿主用 `new Function("data", program)` 物化构图函数，
+传入 JSON.parse 后的 data，得到 v4 图及 vocabulary；词表用于 `va_ask`。
 Entity 描述业务身份，Dataset 描述物理行及粒度，Role 显式连接二者；DimensionGroup／MeasureGroup 可复用并通过绑定发布成员。
 插件校验引用闭合，并派生导航和反向链接。Int／Float／Bool／String 及 Option／Array／Dict 内联表达，不生成类型节点；具名业务类型保留节点。
-可选展示 sidecar 仅补充名称和文档。模型事实、引用、协议及兼容库接口见[知识契约](ontology/docs/KNOWLEDGE.md)。
+可选展示 sidecar 仅补充名称和文档。模型事实、引用、协议及独立库接口见[知识契约](ontology/docs/KNOWLEDGE.md)。
 
 对 dsh-oks，知识是 `{meta,origin,data}` 资源，data 为规范键字典。
 `oks_data` 自动解包 `.data`；用法由 `oks://help/knowledge`、`oks://help/query` 提供。
