@@ -89,7 +89,7 @@ try {
       assert.deepEqual(result.map(row => row[`k_${dimension}`]), buckets);
       assert.deepEqual(result.map(row => row[`k_${measure}`]), values);
       const node = await info(`Dimension/${entity}/${dimension}`);
-      assert.equal(node.detail.ty, 'DatetimeUtc');
+      assert.equal(node.detail.ty, 'DateTimeUtc');
       assert.ok(node.links.some(link => link.key === 'Schema/syntax/operations/utc_time_bucket'));
     }
     // Empty-valued populations must not turn into zero or an absent row.

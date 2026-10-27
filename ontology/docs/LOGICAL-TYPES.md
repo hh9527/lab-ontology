@@ -8,7 +8,7 @@
 
 索引、存储和查询成本可成为限制字段能力的原因，但当前 API 不检查数据库索引，也不从中推断权限。
 仅支持 Eq 的 Text 维度不表示 Contains 对 Text 没有意义；反过来，String 存储也不会赋予所有逻辑类型 Text 操作。
-现有时间声明按同一原则区分 DatetimeUtc、DateUtc、LocalDateTime 和 EpochMillis。
+现有时间声明按同一原则区分 DateTimeUtc、Date、DateTime 和 EpochMillis。
 
 ## IPv4 验收范围
 

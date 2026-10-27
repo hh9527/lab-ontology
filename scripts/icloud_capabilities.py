@@ -56,9 +56,9 @@ def time_spec(field):
     props = field.get("properties", {})
     ty = field["type"]["type"]
     if ty == "string" and props.get("dte.time.format.pattern") == "YYYY-MM-DD":
-        return ("DateUtc", "DateText", "DateUtc", None)
+        return ("Date", "DateText", "Date", None)
     if ty == "datetime" or (ty == "string" and props.get("dte.semantic.type") == "time"):
-        return ("Utc", "Rfc3339Text", "DatetimeUtc", "UTC instant stored as normalized YYYY-MM-DDTHH:MM:SSZ text on SQLite.")
+        return ("Utc", "Rfc3339Text", "DateTimeUtc", "UTC instant stored as normalized YYYY-MM-DDTHH:MM:SSZ text on SQLite.")
     if ty in {"integer", "long"} and (field.get("columnType") == "timestamp"
             or props.get("dte.displayName") == "EMSBaseClass.createTime"):
         return ("Utc", "EpochMillis", "EpochMillis", "TODO: Confirm source integer clock unit; provisionally use Unix epoch milliseconds.")

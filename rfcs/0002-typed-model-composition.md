@@ -1318,3 +1318,7 @@ IC 运行期 snapshot 从约 65.549 MB 降为 51.180 MB，构建从 168.750 秒�
 本阶段不预计算或序列化 transform 初始化结果，也不修改编译器的 TypeId 契约。
 共享函数中的校验分支可能仍保留在 wasm 中；逻辑分离不等于完全可达性裁剪。
 详见 `ontology/docs/STAGED_TRANSFORM_EXPERIMENT.md` 的命令、范围与测量限制。
+
+### 2026-10-27：时间类型命名与语义整理
+
+时间类型统一为 `Date`、`DateTime`、`DateTimeUtc` 与 `EpochMillis`。`Date` 和 `DateTime` 均不带时区；UTC 日期提取属于转换规则。删除 `LocalEpochMillis`，毫秒纪元值统一表示绝对时刻；底层声明和擦除后的合同均拒绝 Local 与 EpochMillis 的组合。`DateTimeTz`（保留时区身份）和 `DateTimeOffset`（仅偏移量）暂未实现。现有逻辑输入名称同步调整，旧名称不是协议别名。

@@ -118,7 +118,7 @@ SQLite 原渲染将 38 项接口类型映射为深层嵌套 CASE，实际投影�
 ## 第四批 InterfaceKpi
 
 完整迁移 30 个物理字段、31 个公开维度、16 个度量及两个跨批关系，累计 5/50 个载体。
-样本粒度显式保留 res_id／tenant_id／ts，权威时钟为 Rfc3339Utc。
+样本粒度显式保留 res_id／tenant_id／ts，权威时钟为 DateTimeUtc。
 旧模型还将 res_id 标记为 key；新声明不将它提升为样本唯一身份，契约测试按完整采样 grain 对比。
 两个端口关系仍按原有 res_id 对应 PortId，不擅自增加租户等式。
 
@@ -155,7 +155,7 @@ OR 关系夹具覆盖单路匹配、双路同站点去重、双路不同站点�
 
 完整迁移 15 个物理字段、16 个公开维度、八个样本统计及两个主 ID 关联。
 CPU 与内存共用 Percent 统计 Group，分别映射 Mean、Latest、Max、Min 公开名称，单位保持 %。
-明确使用 res_id／tenant_id／ts 采样粒度和 Rfc3339Utc 权威时钟，三个 UTC 分桶保持原契约。
+明确使用 res_id／tenant_id／ts 采样粒度和 DateTimeUtc 权威时钟，三个 UTC 分桶保持原契约。
 systemPower 与 peakPower 使用 Watts；averagePower 保持独立来源值类型，不推断未在现有公共契约声明的单位。
 
 两个关联都将样本 resId 对应 ServerId，不能改成 ServerOriginId。
@@ -232,7 +232,7 @@ ONU/OLT 是同一物理来源的不同固有范围，不得只迁移字段而丢
 
 三个载体共享 I_EntPonElement 的 22 个物理列，分别保留 22 个字段声明，共 68 个维度（其中两个内部分类维度不可公开访问）。
 PonId 统一设备身份与父设备引用，区别于 TenantId、SiteId；五个闭合域保留全部成员与源编码。
-ManufactureDate 使用 DateUtc，createTime 保持 LocalEpochMillis 及源时钟单位待确认的既有假定，不新增单位或时区换算。
+ManufactureDate 使用 Date，createTime 保持 EpochMillis 及源时钟单位待确认的既有假定，不新增单位或时区换算。
 ONU/OLT 的固有分类范围使用 with_scope 声明，沿用原域映射，文本 onu 本身不代替源编码 ne.category.pon.onu。
 批内四条关系包括不带角色范围的源自关联、具备双端范围的 ONU→OLT、租户引用与两路 OR 站点引用。
 
@@ -248,7 +248,7 @@ SQL 场景覆盖父 ID 指向非 OLT、SPL 不混入 ONU、原始分类名碰撞
 ## 第十一批 ONU KPI
 
 迁移 30 个字段、31 个维度（含 UTC 小时／日／月分桶）、33 个 Mean/Min/Max 统计度量和三条关系。
-采样 grain 保留 res_id、tenant_id、ts，UTC Rfc3339Utc 时钟显式声明；res_id 使用 PonId。
+采样 grain 保留 res_id、tenant_id、ts，UTC DateTimeUtc 时钟显式声明；res_id 使用 PonId。
 Percent、Dbm、DegreesCelsius、BitsPerSecond 区分不同可计算量，四个样本统计模板分别绑定到对应字段。
 保留既有 %、dBm、degC、bit/s 单位，不隐式换算；dBm 保持原值统计，不转为线性功率。
 有效次数只是独立来源字段，不作为默认权重或有效性筛选；未新增 Sum。
@@ -617,7 +617,7 @@ SQL 覆盖全部维度、九个统计、数值比较、原始计数、UTC 分桶
 
 备电／机框／控制器／风扇／电源五来源迁移 94 字段及维度、17 个闭合域的 72 个成员和十条既有关系。各组件保留独立 ComponentId 与单列 id grain；父资源绑定 StorageId，不混同组件 ID、oriResId 或其他 parentId。
 存储设备→组件保持 Optional→Many0；组件→租户保持 Many0→Optional，不补租户复合键或来源未声明的组件间关系。
-备电 manufacturedDate 与电源 produceDate 使用 DateUtc；控制器 createTime 使用 EpochMillis，沿用尚待确认的原整数时钟单位假定，不把日历日期当作采样时钟。
+备电 manufacturedDate 与电源 produceDate 使用 Date；控制器 createTime 使用 EpochMillis，沿用尚待确认的原整数时钟单位假定，不把日历日期当作采样时钟。
 控制器 cpuCount 使用整数名义类型；温度、内存大小、充放电次数等原始文本继续按文本过滤，不因单位说明而解析数值。备电 remainLifeDays 保留原来仅有 -1 的闭合域，未知编码不作为已知成员。域投影／分组／Ne 仅涵盖已知编码，未知和 NULL 来源行仍保留在普通总体和关联中。组件不继承存储设备的 KPI。
 五个当前来源文件 SHA256 均与 catalog 一致：
 
@@ -674,7 +674,7 @@ CPU／内存和读／写 I/O 字段采用不同的种子值，存储／FC 具有
 - GraphPair 独立期望为 d2 增加 60、d1 增加 40；Union 合并重叠设备总体后只保留三个身份。
 - 相同请求返回同一准备结果；有效／无效／有效混合批次整体拒绝，queries 为 null 且诊断定位到无效项。
 
-既有 `check-transform-columns-snapshot.mjs` 与 `check-result-limit-snapshot.mjs` 均通过：公开 String／规范值 ID／EpochMillis／DatetimeUtc／Float、nullable、时间窗口边界、遗漏／null／1／100／101 行限制以及调用方输出上限保持兼容。以上均只调用 transform，没有知识请求；所有实际数据库执行仅为 SQLite，未实际执行 PostgreSQL。
+既有 `check-transform-columns-snapshot.mjs` 与 `check-result-limit-snapshot.mjs` 均通过：公开 String／规范值 ID／EpochMillis／DateTimeUtc／Float、nullable、时间窗口边界、遗漏／null／1／100／101 行限制以及调用方输出上限保持兼容。以上均只调用 transform，没有知识请求；所有实际数据库执行仅为 SQLite，未实际执行 PostgreSQL。
 
 可复验命令（产物仅写入 TMPDIR）：
 
@@ -687,3 +687,7 @@ bin/telora -C icloud_model check @src/hosted --only-types
 ```
 
 50/50 声明、既有 transform 契约与实际服务切换已完成本地阶段验收。历史各批记录保留当时的未切换状态，以上述当前入口说明为准。当前分支已推送并在 #64 跟踪；静态知识及构建期专门化的最新验收见[构建期双路产出](../../evaluations/build-time-staging.md)。前述 65 MB snapshot 为历史测量。
+
+## 类型反向引用策略
+
+IC 的时间字段统一引用标准 Date、DateTimeUtc、EpochMillis 标量；Date 与 DateTime 不带时区，EpochMillis 表示绝对时刻。所有类型默认关闭反向引用；IC 的 90 个规范业务值域显式开启，支持从检索命中的业务值追溯到维度及 Dataset。身份、行结构、单位与通用时间标量保持默认关闭。类型节点与字段／维度的正向类型引用、自有成员结构，以及 Entity、Dataset、Relation 导航均保留。需要按业务类型反查使用者时，在对应类型上声明 `@knowledge::reverse_references(True)`，不根据 String／Int 存储表示自动继承。

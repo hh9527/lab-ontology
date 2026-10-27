@@ -24,8 +24,8 @@ type OwnerId${n} = struct(String);
 type State${n} = struct(String);
 type Identity${n} = struct { id: OwnerId${n} };
 type Owner${n} = struct { id: OwnerId${n}, state: Int, name: String, peer: String, ip: String, bytes: q::Bytes, elapsed: q::Milliseconds, load: Option(Float) };
-type Reading${n} = struct { owner: OwnerId${n}, ts: s::Rfc3339Utc, value: Option(Float) };
-type Event${n} = struct { id: String, owner: String, ts: s::Rfc3339Utc };
+type Reading${n} = struct { owner: OwnerId${n}, ts: s::DateTimeUtc, value: Option(Float) };
+type Event${n} = struct { id: String, owner: String, ts: s::DateTimeUtc };
 type Hub${n} = struct { id: String, a: OwnerId${n}, z: OwnerId${n}, tag: String };
 def entity${n}: m::Entity(Identity${n}) = m::entity("owner_${n}", Identity${n}.type);
 def owners${n}: m::Dataset(Owner${n}) = m::dataset("owners_${n}", "owner_rows_${n}", Owner${n}.type, ["id"]);
@@ -51,10 +51,10 @@ def owner_decl${n}: t::Declaration = t::with_native_pairs(t::with_scope(t::with_
 ], ["owner_count_${n}"]), [t::column(m::field(Owner${n}.type, String.type, "name"), "DISPLAY_NAME")]), [state_binding${n}]), [field_count${n}, on_count${n}]), [t::combine_counts("off_count_${n}", qb::ComputedOp::Sub, t::count_ref(field_count${n}), t::count_ref(on_count${n}))]), [t::scope_equal(owners${n}, m::field(Owner${n}.type, String.type, "peer"), "visible")]), [t::native_pair("text_pair_${n}", name${n}, peer${n})]);
 def sample_group${n}: samples::Group(Float) = samples::group("gauge", Float.type, samples::Statistic::Mean, [samples::Statistic::Latest, samples::Statistic::Max], Some("%"));
 def reading_decl${n}: t::Declaration = t::with_samples(t::metric(t::declare(readings${n}, [reading_owner${n}], [
-    g::dimension(readings${n}, g::dimension_group("clock", s::Rfc3339Utc.type, True, g::time_filters), g::input(m::field(Reading${n}.type, s::Rfc3339Utc.type, "ts")), "reading_ts_${n}", True, g::time_filters),
-    g::dimension(readings${n}, g::dimension_group("bucket", s::Rfc3339Utc.type, True, g::time_filters), g::utc_bucket(g::input(m::field(Reading${n}.type, s::Rfc3339Utc.type, "ts")), qb::UtcBucketUnit::Hour), "reading_hour_${n}", True, g::time_filters),
-], []), m::field(Reading${n}.type, s::Rfc3339Utc.type, "ts")), [samples::bind(readings${n}, sample_group${n}, m::optional_field(Reading${n}.type, Float.type, "value"), [{statistic: samples::Statistic::Mean, publish: "reading_avg_${n}"}, {statistic: samples::Statistic::Latest, publish: "reading_latest_${n}"}, {statistic: samples::Statistic::Max, publish: "reading_max_${n}"}])]);
-def event_decl${n}: t::Declaration = t::event(t::declare(events${n}, [event_owner${n}], [g::dimension(events${n}, g::dimension_group("event_id", String.type, True, g::equality_filters), g::input(m::field(Event${n}.type, String.type, "id")), "event_id_${n}", True, g::equality_filters)], ["event_count_${n}"]), m::field(Event${n}.type, s::Rfc3339Utc.type, "ts"));
+    g::dimension(readings${n}, g::dimension_group("clock", s::DateTimeUtc.type, True, g::time_filters), g::input(m::field(Reading${n}.type, s::DateTimeUtc.type, "ts")), "reading_ts_${n}", True, g::time_filters),
+    g::dimension(readings${n}, g::dimension_group("bucket", s::DateTimeUtc.type, True, g::time_filters), g::utc_bucket(g::input(m::field(Reading${n}.type, s::DateTimeUtc.type, "ts")), qb::UtcBucketUnit::Hour), "reading_hour_${n}", True, g::time_filters),
+], []), m::field(Reading${n}.type, s::DateTimeUtc.type, "ts")), [samples::bind(readings${n}, sample_group${n}, m::optional_field(Reading${n}.type, Float.type, "value"), [{statistic: samples::Statistic::Mean, publish: "reading_avg_${n}"}, {statistic: samples::Statistic::Latest, publish: "reading_latest_${n}"}, {statistic: samples::Statistic::Max, publish: "reading_max_${n}"}])]);
+def event_decl${n}: t::Declaration = t::event(t::declare(events${n}, [event_owner${n}], [g::dimension(events${n}, g::dimension_group("event_id", String.type, True, g::equality_filters), g::input(m::field(Event${n}.type, String.type, "id")), "event_id_${n}", True, g::equality_filters)], ["event_count_${n}"]), m::field(Event${n}.type, s::DateTimeUtc.type, "ts"));
 def hub_decl${n}: t::Declaration = t::declare(hubs${n}, [hub_a${n}, hub_z${n}], [g::dimension(hubs${n}, g::dimension_group("hub_id", String.type, True, g::equality_filters), g::input(m::field(Hub${n}.type, String.type, "id")), "hub_id_${n}", True, g::equality_filters)], ["hub_count_${n}"]);
 def relation_a${n}: r::Relation = r::relation("hub_a_${n}", hubs${n}, hub_a${n}, owners${n}, subject${n}, {from: edsl::Cardinality::Many0, to: edsl::Cardinality::One});
 def relation_z${n}: r::Relation = r::relation("hub_z_${n}", hubs${n}, hub_z${n}, owners${n}, subject${n}, {from: edsl::Cardinality::Many0, to: edsl::Cardinality::One});
@@ -87,7 +87,7 @@ def profile: qb::PlanProfile = {
     allowed_operators: [qb::Operator::Source, qb::Operator::Project, qb::Operator::Column, qb::Operator::Bind, qb::Operator::Scalar, qb::Operator::Aggregate, qb::Operator::Filter, qb::Operator::Exists, qb::Operator::Join, qb::Operator::Group, qb::Operator::Having, qb::Operator::Order, qb::Operator::Partition, qb::Operator::Limit, qb::Operator::Offset],
     allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
     allowed_aggregates: [qb::AggregateFunction::Count, qb::AggregateFunction::Avg, qb::AggregateFunction::Max, qb::AggregateFunction::Min, qb::AggregateFunction::Sum, qb::AggregateFunction::Latest],
-    allowed_scalars: [qb::ScalarFunction::If, qb::ScalarFunction::RegexMatch, qb::ScalarFunction::Not, qb::ScalarFunction::BinaryText, qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Gt, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt, qb::ScalarFunction::Le, qb::ScalarFunction::And, qb::ScalarFunction::Or, qb::ScalarFunction::IsNotNull, qb::ScalarFunction::Sub, qb::ScalarFunction::Div, qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::DatetimeUtc})],
+    allowed_scalars: [qb::ScalarFunction::If, qb::ScalarFunction::RegexMatch, qb::ScalarFunction::Not, qb::ScalarFunction::BinaryText, qb::ScalarFunction::Eq, qb::ScalarFunction::Ne, qb::ScalarFunction::Gt, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt, qb::ScalarFunction::Le, qb::ScalarFunction::And, qb::ScalarFunction::Or, qb::ScalarFunction::IsNotNull, qb::ScalarFunction::Sub, qb::ScalarFunction::Div, qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::DateTimeUtc})],
     allow_distinct: True,
 };
 `;

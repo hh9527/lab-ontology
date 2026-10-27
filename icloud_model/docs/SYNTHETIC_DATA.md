@@ -33,7 +33,7 @@ ONU KPI 遵循限定 ONU 身份，故序列少于基础表。超过一千万 KPI
 告警覆盖六类资源、四种严重度、已确认／未确认、已清除／未清除状态。
 可空机框备注有 NULL 示例，其他字段用确定性占位值或声明枚举编码；不模拟完整物理容量和设备特定 KPI 适用性。
 
-DatetimeUtc 存为 YYYY-MM-DDTHH:MM:SSZ，DateUtc 为 YYYY-MM-DD，EpochMillis 为 SQLite 整数。
+DateTimeUtc 存为 YYYY-MM-DDTHH:MM:SSZ，Date 为 YYYY-MM-DD，EpochMillis 为 SQLite 整数。
 本地整数与 UTC 字段使用相同合成时钟，这是夹具假设。零表示不存在的告警确认／清除时间。
 
 声明数据集粒度成为唯一索引。仅源 KPI 表使用合成 resId,tenantId,ts 粒度，无 tenantId 时省略，不把源 resId 标记视为跨时间全局唯一。

@@ -66,7 +66,7 @@ function expression(s, e) {
 function types(s, items) {
   for (const t of items) s.types.set(t.id, t);
   for (const t of items) if (!t.inline) merge(s, typeref(s, t.id), {
-    name: t.name, kind: t.kind, representation: t.representation === null ? null : typeref(s, t.representation),
+    name: t.name, kind: t.kind, reverse_references: t.reverse_references === true, representation: t.representation === null ? null : typeref(s, t.representation),
     arguments: t.arguments.map(x => typeref(s, x)), field_types: t.field_types.map(c => column(s, c)),
     variants: t.variants.map(v => v.payload === null ? { ...v } : { ...v, payload: typeref(s, v.payload) }),
   }, t.dependencies.flatMap(x => typerefs(s, x)));

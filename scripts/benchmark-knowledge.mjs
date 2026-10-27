@@ -26,7 +26,7 @@ const report = await withKnowledgeRunner(resolve(values.artifact), async (info, 
   const discovery = await request(`${values.domain}/discovery`, {});
   const firstResponseMs = performance.now() - started;
   const samples = [];
-  for (const key of ['index', 'Ty/DatetimeUtc', 'Dataset/tenant', 'Dataset/onu_kpi',
+  for (const key of ['index', 'Ty/DateTimeUtc', 'Dataset/tenant', 'Dataset/onu_kpi',
     'Dimension/onu_kpi/onu_kpi__cpuUsage', 'Dimension/current_alarm/alarm_tenant_id']) {
     assert((await info(values.domain, { key })).Document?.Found, `Missing benchmark key: ${key}`);
     const durations = [];

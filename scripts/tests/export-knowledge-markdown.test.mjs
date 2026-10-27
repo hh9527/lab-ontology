@@ -70,27 +70,27 @@ test('renders association kinds as direct references without a links wrapper', (
 test('links nested type documentation, prose, vocabulary entries, values and computed dependencies', () => {
   const source = node('Dimension/a/status', 'Dimension', {
     dataset: 'a', id: 'status', ty: 'status',
-    input_docs: [{ kind: 'DatetimeUtc', text: 'Use DatetimeUtc, not DatetimeUtcExtra; see Ty/DatetimeUtc.' }],
+    input_docs: [{ kind: 'DateTimeUtc', text: 'Use DateTimeUtc, not DateTimeUtcExtra; see Ty/DateTimeUtc.' }],
     values: [{ id: 'ready', label: 'Ready' }], canonical_order: ['ready'],
     sampling: { id: 'count', field: 'status' }, computed: { left: 'count', right: 'count', op: 'Add' },
   });
-  source.description.summary = 'DatetimeUtc and Int are logical types.';
+  source.description.summary = 'DateTimeUtc and Int are logical types.';
   const md = renderMarkdown([
     source,
     node('Dataset/a', 'Dataset', { id: 'a' }),
     node('Field/a/status', 'Field', { dataset: 'a', id: 'status' }),
     node('Value/status/ready', 'Value', { ty: 'status', id: 'ready' }),
     node('Measure/a/count', 'Measure', { dataset: 'a', id: 'count' }),
-    node('Ty/DatetimeUtc', 'Ty', { id: 'DatetimeUtc' }),
+    node('Ty/DateTimeUtc', 'Ty', { id: 'DateTimeUtc' }),
     node('Ty/Int', 'Ty', { id: 'Int' }),
-    node('Terminology/types', 'Terminology', { entries: [{ key: 'Ty/DatetimeUtc', id: 'DatetimeUtc', label: 'UTC instant', term: 'UTC' }] }),
+    node('Terminology/types', 'Terminology', { entries: [{ key: 'Ty/DateTimeUtc', id: 'DateTimeUtc', label: 'UTC instant', term: 'UTC' }] }),
   ], {});
-  assert(md.includes('kind: [DatetimeUtc](#Ty/DatetimeUtc)'));
-  assert(md.includes('Use [DatetimeUtc](#Ty/DatetimeUtc), not DatetimeUtcExtra; see [Ty/DatetimeUtc](#Ty/DatetimeUtc).'));
-  assert(md.includes('[DatetimeUtc](#Ty/DatetimeUtc) and [Int](#Ty/Int) are logical types.'));
+  assert(md.includes('kind: [DateTimeUtc](#Ty/DateTimeUtc)'));
+  assert(md.includes('Use [DateTimeUtc](#Ty/DateTimeUtc), not DateTimeUtcExtra; see [Ty/DateTimeUtc](#Ty/DateTimeUtc).'));
+  assert(md.includes('[DateTimeUtc](#Ty/DateTimeUtc) and [Int](#Ty/Int) are logical types.'));
   assert(md.includes('id: [ready](#Value/status/ready), label: [Ready](#Value/status/ready)'));
   assert(md.includes('**canonical_order**: [[ready](#Value/status/ready)]'));
   assert(md.includes('id: [count](#Measure/a/count), field: [status](#Field/a/status)'));
   assert(md.includes('left: [count](#Measure/a/count), right: [count](#Measure/a/count)'));
-  assert(md.includes('id: [DatetimeUtc](#Ty/DatetimeUtc), label: [UTC instant](#Ty/DatetimeUtc), term: [UTC](#Ty/DatetimeUtc)'));
+  assert(md.includes('id: [DateTimeUtc](#Ty/DateTimeUtc), label: [UTC instant](#Ty/DateTimeUtc), term: [UTC](#Ty/DateTimeUtc)'));
 });

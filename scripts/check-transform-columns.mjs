@@ -20,8 +20,8 @@ const valueMatches = (type, value) => {
     // logical value and does not dictate a driver's lossless integer transport.
     case 'Int': case 'EpochMillis': return Number.isInteger(Number(value));
     case 'Float': return Number.isFinite(Number(value));
-    case 'LocalDateTime': return typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?$/.test(value);
-    case 'DatetimeUtc': return value instanceof Date ? Number.isFinite(value.getTime()) : typeof value === 'string' && /(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
+    case 'DateTime': return typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?$/.test(value);
+    case 'DateTimeUtc': return value instanceof Date ? Number.isFinite(value.getTime()) : typeof value === 'string' && /(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
     default: return false;
   }
 };
@@ -37,7 +37,7 @@ try {
     cases.push(...JSON.parse(execFileSync('bin/telora', ['-C', crate, 'eval',
       `@src/${module}:${binding}`, '--initialization-fuel', '100000', '--with-memory-limit', '2048'], { encoding: 'utf8' })));
   }
-  const ddl = 'CREATE TABLE readings(id BIGINT, value BIGINT, ts TEXT, epoch BIGINT, ratio DOUBLE PRECISION, active BOOLEAN, label TEXT, local_epoch BIGINT, local_text TEXT); '
+  const ddl = 'CREATE TABLE readings(id BIGINT, value BIGINT, ts TEXT, epoch BIGINT, ratio DOUBLE PRECISION, active BOOLEAN, label TEXT, wall_time BIGINT, local_text TEXT); '
     + 'CREATE TABLE owners(id INTEGER, label TEXT); CREATE TABLE samples(id INTEGER, owner INTEGER, ts BIGINT, value INTEGER)';
   sqlite.exec(ddl);
   await postgres.exec(ddl.replace('ts TEXT', 'ts TIMESTAMPTZ'));

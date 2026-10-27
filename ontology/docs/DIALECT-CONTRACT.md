@@ -45,7 +45,7 @@ SQLite 与 PostgreSQL 消费相同的结构校验 AST。不能用 PG 强制转�
 | 绑定／列／源 | `?n`，按需引用标识符 | 保留分配的 `$n` 句柄和物理标识符身份，包括嵌套作用域绑定。 |
 | 标量文本 | `substr`、`instr`、`lower`、`length` | `instr` 从 1 计数，不存在时为 0；默认 SQLite 的 `lower` 仅折叠 ASCII A-Z，PG 依赖排序规则。使用明确等价的排序规则或实现，测试非 ASCII 与 NULL。 |
 | 相对 UTC 日 | `strftime`，绑定 UTC 锚点和整数时长 | 保持相同规范 UTC 秒文本及日期边界，不依赖会话时区或隐式 `now()`。后续日历／纪元操作属于 #11。 |
-| UTC 小时／日／月分桶 | 保持类型的桶起点；UTC 文本／日期用日历函数，纪元小时／日用精确整数向下取整 | `UtcTimeBucket({unit,encoding})` 是封闭标量。PG 在 UTC 截断并保留原生 timestamptz／date 类型；SQLite 保留声明的文本编码。八种组合在逻辑类型序列化后执行等价，覆盖分组平均、原始半开窗口、负纪元、NULL、闰日、月年边界、范围限制和三种 PG 会话时区。DateUtc 没有小时桶。 |
+| UTC 小时／日／月分桶 | 保持类型的桶起点；UTC 文本／日期用日历函数，纪元小时／日用精确整数向下取整 | `UtcTimeBucket({unit,encoding})` 是封闭标量。PG 在 UTC 截断并保留原生 timestamptz／date 类型；SQLite 保留声明的文本编码。八种组合在逻辑类型序列化后执行等价，覆盖分组平均、原始半开窗口、负纪元、NULL、闰日、月年边界、范围限制和三种 PG 会话时区。Date 没有小时桶。 |
 | 聚合／HAVING | `FILTER (WHERE ...)`、计算聚合、参数化阈值 | 检查 NULL、空输入、distinct 与 filter 交互、计算输出及绑定顺序。 |
 | 关联谓词 | 相关 EXISTS、复合键、私有别名、JOIN ON 谓词 | 检查 INNER／LEFT 连接、零匹配主体、OR 键、私有别名及独立限定粒度。 |
 | 分页／排序 | `LIMIT ?`、`LIMIT -1 OFFSET ?`；ASC 的 NULL 在前、DESC 在后 | PG 仅偏移不能用 SQLite 的 `LIMIT -1`。PG 的 ASC 必须渲染 `NULLS FIRST`、DESC 必须渲染 `NULLS LAST`，其默认值相反。比较稳定 Top-N 排名，不承诺隐式顺序。 |

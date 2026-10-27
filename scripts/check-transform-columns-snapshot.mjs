@@ -21,7 +21,7 @@ await withKnowledgeRunner(artifact, async (_, request) => {
   assert.deepEqual(response.queries.map(query => query.columns.map(column => [column.name, column.type])), [
     [['x_device_name', 'String']],
     [['x_alarm_severity', 'String'], ['x_current_alarm__CLEARUTC', 'EpochMillis']],
-    [['x_device_kpi_ts_raw', 'DatetimeUtc']],
+    [['x_device_kpi_ts_raw', 'DateTimeUtc']],
     [['x_cpu_usage', 'Float']],
     [['x_device_create_ms', 'EpochMillis']],
   ]);
@@ -47,5 +47,5 @@ await withKnowledgeRunner(artifact, async (_, request) => {
     assert.equal(rejected.queries, null);
     assert.match(JSON.stringify(rejected.diagnostics), /end.*required|end.*missing/);
   }
-  console.log('Published transform columns: String/canonical IDs/EpochMillis/DatetimeUtc/Float/local business label with epoch encoding, ordering, nullability and rejected-batch contract passed without a database.');
+  console.log('Published transform columns: String/canonical IDs/EpochMillis/DateTimeUtc/Float/local business label with epoch encoding, ordering, nullability and rejected-batch contract passed without a database.');
 });

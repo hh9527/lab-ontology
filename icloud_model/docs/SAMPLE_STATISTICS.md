@@ -106,7 +106,7 @@ PhysicalLinkType 为源编码 1、7、8、9、99 发布 lldp、csp、server_inte
 
 17 个 KPI 时间戳载体均声明 UTC 小时／日／月分桶，ID 为 `<dataset>_utc_hour`、`_utc_day`、`_utc_month`，ONU 用精简 `onu_utc_*`。
 选择分桶及声明度量，筛选原始样本时间维度，需要时间趋势时按桶排序。
-桶输出仍为 DatetimeUtc，表示桶起点，不是标签或时长。知识将每个桶链接到共享操作契约，声明桶不会补造源载体缺失度量。
+桶输出仍为 DateTimeUtc，表示桶起点，不是标签或时长。知识将每个桶链接到共享操作契约，声明桶不会补造源载体缺失度量。
 
 tests/sample_meanings.telora 检查真实产品模型：显式 Avg／Max／Min SQL 与绑定、主体分组、峰值 HAVING／排名、原始趋势、达标样本计数、
 拒绝未定义 Sum 和聚合覆盖、替代知识链接及歧义术语。历史合成夹具有意保持不变。

@@ -117,8 +117,8 @@ transform 返回完整 SQL 和绑定，而非数据库行。执行层必须返�
 执行适配器可复制 bindings 并调整该槽以实施自身有界获取策略；模型原样返回请求上限。
 
 列在 transform 时从已校验模型及最终投影推导，无需连接数据库或执行 SQL；空结果和全 NULL 列也有模式。
-类型词汇为 `Int`、`Float`、`Bool`、`String`、`DatetimeUtc`、`EpochMillis`、`LocalDateTime`。
-DatetimeUtc 和 EpochMillis 保留显式 UTC 瞬间语义，不降为存储 String／Int。
+类型词汇为 `Int`、`Float`、`Bool`、`String`、`DateTimeUtc`、`EpochMillis`、`DateTime`。
+DateTimeUtc 和 EpochMillis 保留显式 UTC 瞬间语义，不降为存储 String／Int。
 日历桶维度保留声明时间编码；Min／Max／Latest 输出源值时保留声明瞬间类型。
 Count 为 Int，Avg 为 Float，数值求和与计算度量遵循自身输出类型。
 具名值域投影 String 业务 ID，包括半开放值及 `__kind` 列；排名 GraphPair 追加 Float `comparison_value`。
@@ -127,8 +127,8 @@ Count 为 Int，Avg 为 Float，数值求和与计算度量遵循自身输出类
 可空性考虑可选字段、外连接、空聚合输入和条件表达式，谓词及排名保护不收窄模式。
 逻辑类型描述值，驱动特有 Bool 和无损 Int 表示仍由执行适配器负责。
 
-LocalDateTime 表示无时区或偏移的日期与钟表时间，是自足值，不是瞬间。
-转换为 DatetimeUtc 或 EpochMillis 需显式时区／偏移，以及必要的跳时或重复时刻歧义策略。
+DateTime 表示无时区或偏移的日期与钟表时间，是自足值，不是瞬间。
+转换为 DateTimeUtc 或 EpochMillis 需显式时区／偏移，以及必要的跳时或重复时刻歧义策略。
 列不提供默认时区，也不做时间转换。EpochMillis 即使带本地业务描述仍表示绝对瞬间；移位墙上时间整数需要独立编码。
 仅日期及地址值在结果契约中保留基本表示，字段语义可在知识中查询。transform 不借环境时钟或时区推断列。
 
@@ -140,7 +140,7 @@ GraphPair 组计数和 Graph 组计数在 SQLite、PG 中均用显式结果别�
 使用维度声明逻辑类型的具体值，在答案中说明最终业务日期；缺少可靠参考时间或时区时，应询问缺失上下文。
 时间值和窗口语义见[时间契约](ontology/docs/TIME.md)。知识发现描述模型，下文给出通用 Intent 语法；模型与 transform 决定组合是否具备合法业务含义。
 
-当前 IC 时间类型为 `DatetimeUtc`（RFC3339 UTC 秒，`YYYY-MM-DDTHH:MM:SSZ`）、`DateUtc`（`YYYY-MM-DD`）和 `EpochMillis`（JSON 整数毫秒）。
+当前 IC 时间类型为 `DateTimeUtc`（RFC3339 UTC 秒，`YYYY-MM-DDTHH:MM:SSZ`）、`Date`（`YYYY-MM-DD`）和 `EpochMillis`（JSON 整数毫秒）。
 旧空格分隔 UTC 输入被拒绝，需部署重建制品并通过静态知识发现当前类型。
 
 ### Graph Intent 语法
@@ -270,3 +270,7 @@ transform 的 ok 包含上述批次响应。拒绝 Intent 表现为 `ok.accepted
 每个模型独立构建快照，暴露 `<domain>/transform` 及对应 HTTP POST 路由。
 两个模块均无需外部构建源，最小构建与请求流程见[关系示例](relation_model/README.md)。
 IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。
+
+## NeoSight 模型
+
+`ns_model/` 使用显式 World、独立 Entity/Dataset、复用维度与采样度量 Group。源时间单位待确认项、迁移边界和构建命令见 [NS 模型](ns_model/README.md)。

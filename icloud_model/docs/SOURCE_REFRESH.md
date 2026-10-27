@@ -26,7 +26,7 @@ TODO(#58)：转换前确认千字节对应的字节乘数。磁盘身份及归�
 单位假定为 `%`，TODO(#47)：与源元数据确认。总体及权重语义见[样本统计](SAMPLE_STATISTICS.md)，协作设备没有声明 CPU 源。
 
 `icloud-source-v7` 引入显式 GraphPair 身份对齐、逐列输出侧和比较操作数，源声明不变。
-之前的 v6 用 DatetimeUtc ISO-Z 替换空格分隔 KPI 时钟，并发布 DateUtc 逻辑日期，v4 样本统计定义不变。
+之前的 v6 用 DateTimeUtc ISO-Z 替换空格分隔 KPI 时钟，并发布 Date 逻辑日期，v4 样本统计定义不变。
 样本／Avg／Max／Min ID、NULL、阈值及未解决设备端口利用率公式见[样本统计](SAMPLE_STATISTICS.md)。
 
 - 物理状态列是 EnterprisePhysicalLink.linkStatus；link_status 仍是模型字段名，不是物理拼写。
@@ -46,7 +46,7 @@ TODO(#58)：转换前确认千字节对应的字节乘数。磁盘身份及归�
 
 - 设备和服务器粒度使用原始主键 id。
 - 整理过的 KPI 载体也保留原始主键标记，其独立业务粒度标识采样行。Tenant.TENANT_ID 与 Site.SITE_ID 是补充业务身份，因原 isPK 为 N 而显式记录。
-- 原始整数时间戳都用标准 EpochMillis；源未确立单位时声明带 TODO。按 #44，datetime KPI 用已确认 UTC 语义的 DatetimeUtc，SQLite 编码为 YYYY-MM-DDTHH:MM:SSZ，替代 #41 空格分隔 Utc1 假设。源声明 YYYY-MM-DD 制造日期用 DateUtc。这些暂定决策写在作者审计材料，不转嫁为查询 Agent 的问题；知识发布当前模型契约，见[时间覆盖](TIME_COVERAGE.md)。
+- 原始整数时间戳都用标准 EpochMillis；源未确立单位时声明带 TODO。按 #44，datetime KPI 用已确认 UTC 语义的 DateTimeUtc，SQLite 编码为 YYYY-MM-DDTHH:MM:SSZ，替代 #41 空格分隔 Utc1 假设。源声明 YYYY-MM-DD 制造日期用 Date。这些暂定决策写在作者审计材料，不转嫁为查询 Agent 的问题；知识发布当前模型契约，见[时间覆盖](TIME_COVERAGE.md)。
 - 移除固定 subject／authorize 层，查询与发现工厂仅绑定准备模型及相关后端／领域。维度可见性仍属模型能力，认证由宿主负责。
 - 仅源载体暴露原始字段，不虚构采样粒度。在线率 Avg／Min／Max 表示存储值算术平均或极值，不按时间或有效计数加权，不建立样本唯一性或推断数值比例。时间按上述显式约定。UUID／IP 用 String，float／double 用 Float，integer／long 用 Int。目录保留可空性，运行时标量类型描述非空值，不构成 NOT NULL 断言。
 - 每个源枚举编码都有表示。EnterpriseSlot.operstatus 的内嵌 JSON 格式错误，其 12 个值显式从当前 network/entity_sets/slot_values.telora 恢复。

@@ -26,7 +26,7 @@ def basis(field, encoding):
         return {"kind": "SourceDatePattern", "requires_confirmation": False,
                 "evidence": "dte.time.format.pattern=YYYY-MM-DD"}
     if encoding == "Rfc3339Text" and field["type"]["type"] == "datetime":
-        return {"kind": "DatetimeUtcContract", "requires_confirmation": False,
+        return {"kind": "DateTimeUtcContract", "requires_confirmation": False,
                 "evidence": "Source datetime; confirmed UTC semantics; SQLite contract YYYY-MM-DDTHH:MM:SSZ (#44)"}
     if encoding == "EpochMillis":
         description = field.get("description", "").lower()
@@ -51,7 +51,7 @@ def audit(report, catalog):
             if raw["type"]["type"] == "datetime" and (
                     not field["time"] or field["time"]["encoding"] != "Rfc3339Text"
                     or field["time"]["semantics"] != "Utc"):
-                errors.append(f"source datetime requires DatetimeUtc/Rfc3339Text: {dataset['id']}.{field['name']}")
+                errors.append(f"source datetime requires DateTimeUtc/Rfc3339Text: {dataset['id']}.{field['name']}")
             if not field["time"] and not is_source_time(raw):
                 continue
             dims = [dim for dim in report["dimensions"] if dim["dataset"] == dataset["id"]

@@ -13,15 +13,15 @@ result = subprocess.run([
 ], capture_output=True, text=True, check=True, timeout=180)
 cases = json.loads(result.stdout)
 expected = {"window": [2], "utc_ge": [2, 3], "utc_lt": [1, 2], "epoch_ge": [2, 3],
-            "local_epoch_lt": [1, 4], "local_ge": [2, 3], "date_eq": [1, 2]}
+            "wall_time_lt": [1, 2, 4], "local_ge": [2, 3], "date_eq": [1, 2]}
 assert {case["id"] for case in cases} == expected.keys()
 with sqlite3.connect(":memory:") as db:
-    db.execute("CREATE TABLE clock_rows (seq INTEGER, UTC_TEXT TEXT, epoch INTEGER, local_epoch INTEGER, local TEXT, date TEXT)")
+    db.execute("CREATE TABLE clock_rows (seq INTEGER, UTC_TEXT TEXT, epoch INTEGER, wall_time TEXT, local TEXT, date TEXT)")
     db.executemany("INSERT INTO clock_rows VALUES (?, ?, ?, ?, ?, ?)", [
-        (1, "2024-02-29T11:59:59Z", 999, 999, "2024-02-29 11:59:59", "2024-02-29"),
-        (2, "2024-02-29T12:00:00Z", 1000, 1000, "2024-02-29 12:00:00", "2024-02-29"),
-        (3, "2024-03-01T00:00:00Z", 1001, 1001, "2024-03-01 00:00:00", "2024-03-01"),
-        (4, None, -1, -1, "2024-02-28 00:00:00", "2024-02-28"),
+        (1, "2024-02-29T11:59:59Z", 999, "2024-02-29 11:59:59", "2024-02-29 11:59:59", "2024-02-29"),
+        (2, "2024-02-29T12:00:00Z", 1000, "2024-02-29 12:00:00", "2024-02-29 12:00:00", "2024-02-29"),
+        (3, "2024-03-01T00:00:00Z", 1001, "2024-03-01 00:00:00", "2024-03-01 00:00:00", "2024-03-01"),
+        (4, None, -1, "2024-02-28 00:00:00", "2024-02-28 00:00:00", "2024-02-28"),
     ])
     for case in cases:
         query = case["sqlite"]
