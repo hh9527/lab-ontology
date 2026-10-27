@@ -274,3 +274,12 @@ IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或�
 ## NeoSight 模型
 
 `ns_model/` 使用显式 World、独立 Entity/Dataset、复用维度与采样度量 Group。源时间单位待确认项、迁移边界和构建命令见 [NS 模型](ns_model/README.md)。
+
+### NS 演示数据
+
+```sh
+node scripts/generate-ns-data.mjs --output bin/ns-data --anchor-utc 2026-10-27T00:00:00Z
+node scripts/tests/ns-data.test.mjs
+```
+
+生成数据包含 151 张表、2,118 列、资源关系与 KPI 时间序列，输出 SQLite 和可复查清单。实际模型 SQL 验收及基数例外见 [NS 演示数据说明](ns_model/docs/SYNTHETIC_DATA.md)。

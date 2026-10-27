@@ -10,6 +10,7 @@
 - `src/domains.telora`：140 个业务值域及其源编码映射，显式开启类型反向引用，支持业务名词从值追溯到维度和 Dataset
 - `src/units.telora`：按源单位合同复用名义类型；单位证据和待确认假定保留在源声明记录中，不隐含可加性或单位转换
 - `src/model.telora`：显式 World 清单；覆盖检查不自动发现或补全模型
+- `data/generation-contract.json`：与类型化声明同次生成的演示数据合同，包含最终类型和源码哈希
 
 同一身份空间可以在一个 Dataset 中承担多个角色。例如子网身份分别用于自身主键和父子网引用。关系只连接显式声明的身份角色，不因为两个字段都使用 String 就推断可连接。
 
@@ -57,3 +58,7 @@ node ns_model/tools/check_transform.mjs "$TMPDIR/ns.wasm"
 根目录 `telora-config.json` 统一设置配额；fuel 单位为百万，内存单位为 MiB。构建阶段为 `buildtimeFuel: 150000`、`buildtimeMemoryLimit: 256`；初始化为 `initializationFuel: 5000`，请求为 `requestFuel: 10000`，两者共享 `memoryLimit: 64`。这些字段需要支持阶段配额的 Telora 版本。
 
 NS 带知识发布的实测构建消耗 122,790,062,443 fuel，准备结束时线性内存 122,486,784 字节，完整构建约 72.8 秒。构建 fuel 留约 22% 余量。这不是完整模型自检的配额保证；自检仍需单独诊断。
+
+## 演示数据
+
+使用 `node scripts/generate-ns-data.mjs --output bin/ns-data` 生成 SQLite 数据和覆盖清单。固定种子、窗口及实际模型 SQL 验收方式见[演示数据说明](docs/SYNTHETIC_DATA.md)。

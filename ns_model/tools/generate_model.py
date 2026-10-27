@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate explicit typed declarations from the checked-in migration contract."""
 import json
+import hashlib
 import re
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -102,7 +103,7 @@ for name,v in M['domains'].items():
     domain_lines.extend([f'@knowledge_policy::reverse_references(True)\npub type {ty} = struct(String);',f'pub def {name}: v::Domain({ty}, {wire}) = v::domain({Q(v["name"])}, {ty}.type, {wire}.type, {A(members)}, {str(v["halfOpen"]) });'])
     type_names.append(f'domains::{ty}.type')
 (ROOT/'src/domains.telora').write_text(PRE+'\n'.join(domain_lines)+'\n')
-roles={};decls=[]
+roles={};decls=[];published_specs={}
 for d in D.values():
     name=N[d['id']];lines=[PRE,'use crate::identities as ids;','use crate::groups as groups;','use crate::domains as domains;']
     fields=[]
@@ -145,6 +146,7 @@ for d in D.values():
         if any(stat=='Sum' for stat,_ in specs):
             issues.append({'kind':'unconfirmed_additive_sample','dataset':d['id'],'field':f['name'],'omitted':[public for stat,public in specs if stat=='Sum']})
             specs=[(stat,public) for stat,public in specs if stat!='Sum']
+        published_specs[d['id'],f['name']]=[{'id':p,'statistic':'Mean' if stat=='Avg' else stat} for stat,p in specs]
         if specs:
             stat=lambda x:'Mean' if x=='Avg' else x
             key=('samples',ty,unit,tuple(x[0] for x in specs));primary=stat(specs[0][0]);rest=A('sample::Statistic::'+stat(x[0]) for x in specs[1:]);un='None' if unit is None else f'Some({Q(unit)})'
@@ -177,4 +179,31 @@ world=PRE+'\nuse crate::identities as ids;\nuse crate::domains as domains;\nuse 
 world+=f'pub def model_world: w::World = {{revision: "ns/typed-v1", types: {A("w::type_entry("+x+")" for x in type_names+[ty+".type" for ty in scalar_types])}, entities: {A(entity_names)}, datasets: {A(decls)}, relations: {A(rels)}, alternatives: [], links: [], profile: profile::profile}};\n'
 (ROOT/'src/model.telora').write_text(world)
 (ROOT/'data/migration-decisions.json').write_text(json.dumps({'issues':issues,'pathDeclarations':M['paths'],'sourceRelations':M['catalog']['relations']},ensure_ascii=False,indent=2)+'\n')
+# A compact fixture contract uses the same resolved types and nullability as
+# the emitted model. Data generation does not reinterpret legacy time annotations.
+contract_datasets=[]
+for d in D.values():
+    fields=[]
+    for f in d['fields']:
+        domain=S(f['dimension_type'][0][0]).removesuffix('.type') if f['dimension_type'] else None
+        fields.append({
+            'name':f['name'], 'column':f['column'], 'storage':f['storage'],
+            'type':TY[d['id'],f['name']], 'nullable':nullable(d,f), 'domain':domain,
+            'dimensions':[{'id':dim[0],'projectable':dim[1],'filterable':dim[2]} for dim in f['dimension']],
+            'metric':bool(f['measure_family'] or f['sample_measure'] or f['sample_aggregate']),
+            'unit':next((u for (u,_),n in unit_types.items() if TY[d['id'],f['name']]=='units::'+n),None),
+            'sourceTimeEncoding':S(f['time_field'][0][1]) if f['time_field'] else None,
+            'measures':published_specs[d['id'],f['name']],
+        })
+    contract_datasets.append({k:d[k] for k in ['id','table','kind','internal','grain','clock']} | {'fields':fields})
+contract={
+    'version':1, 'sourceCommit':M['sourceCommit'],
+    'sourceSha256':hashlib.sha256((ROOT/'data/source-model.json').read_bytes()).hexdigest(),
+    'generatedHashes':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((ROOT/'src').rglob('*.telora'))},
+    'datasets':contract_datasets,
+    'relations':[{k:r[k] for k in ['id','from','to','cardinality','guard']} | {'pairs':pairs(r['key'])} for r in M['relations']],
+    'domains':{name:{'name':v['name'],'wire':v['wire'],'halfOpen':v['halfOpen'],
+        'members':[{'id':x['id'],'label':x['label'],'wires':[w['args'][0] for w in x['wires']]} for x in v['values']]} for name,v in M['domains'].items()},
+}
+(ROOT/'data/generation-contract.json').write_text(json.dumps(contract,ensure_ascii=False,indent=2)+'\n')
 print(json.dumps({'datasets':len(D),'fields':len(F),'identities':len(components),'relations':len(rels),'groups':len(groups),'decisions':len(issues)}))

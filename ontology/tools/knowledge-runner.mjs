@@ -3,10 +3,10 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-export async function withKnowledgeRunner(artifact, use, { requestFuel = '100000', memory = '1024',
+export async function withKnowledgeRunner(artifact, use, { requestFuel = '100000', memory = '1024', artifactLimits = false,
   runner = fileURLToPath(new URL('../../bin/telora-run', import.meta.url)) } = {}) {
   const child = spawn(runner,
-    [artifact, '--serve', 'stdio+jsonl://', '--request-fuel', requestFuel, '--with-memory-limit', memory]);
+    [artifact, '--serve', 'stdio+jsonl://', ...(artifactLimits ? [] : ['--request-fuel', requestFuel, '--with-memory-limit', memory])]);
   const closed = new Promise(resolve => child.once('close', resolve));
   child.stderr.pipe(process.stderr);
   const reader = createInterface({ input: child.stdout });
