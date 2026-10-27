@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix="typed-declarations-", dir=TEMP_ROOT) as
     assert result.returncode == 0 and len(summaries) == 1, (result.stdout, result.stderr)
     assert summaries[0]["total"] == 4 and summaries[0]["failed"] == 0 and not summaries[0]["aborted"], summaries
     print("Passed 4 declaration evidence cases", flush=True)
-    prelude = "use ontology::experimental::declarations as d;\nuse ontology::ontology as edsl;\n"
+    prelude = "use ontology::declarations as d;\nuse ontology::ontology as edsl;\n"
     cases = {
         "missing_entity": ('type Row = struct { id: String };\npub def bad = d::entity(Row.type);', "does not implement EntityModel"),
         "missing_source": ('@edsl::entity_id("row")\ntype Row = struct { id: String };\npub def bad = d::dataset(Row.type);', "does not implement DatasetModel"),

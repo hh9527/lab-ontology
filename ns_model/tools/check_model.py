@@ -24,11 +24,11 @@ pub mod domains;
 pub mod datasets;
 pub mod units;
 mod profile;
-use ontology::experimental::world as w;
+use ontology::world as w;
 use std::codec as codec;
 use std::value::{Value};
-use ontology::experimental::transform as t;
-use ontology::experimental::relations as r;
+use ontology::transform as t;
+use ontology::relations as r;
 use std::array as array;
 pub def checked: Value = do {
     let world = model::model_world;

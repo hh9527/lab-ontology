@@ -42,7 +42,7 @@ model_hash = source_hash(root / args.package / "src")
 assert source_hash(workspace / args.package / "src") == model_hash
 if args.self_check:
     # 通用测试驱动：只改变隔离库的 root 包装器，不修改模型声明或模型服务。
-    path = workspace / "ontology/src/experimental/transform.telora"
+    path = workspace / "ontology/src/transform.telora"
     code = path.read_text()
     call = "build_impl(revision, declarations, relations, alternatives, links, profile, False)"
     assert call in code
@@ -53,9 +53,9 @@ if args.self_check:
 if args.without_knowledge:
     path = workspace / args.package / "src/lib.telora"
     source = path.read_text()
-    line = 'use ontology::experimental::build as build;\n'
+    line = 'use ontology::world as build;\n'
     assert source.count(line) == 1
-    expression = 'build::stage(fn() { prepared }, fn(payload) {\n    intent::query_request_method_factory(payload, sqlite::build_query)\n})'
+    expression = 'build::stage_prepared(build::define(prepared.payload.revision, prepared.declarations, prepared.relations, prepared.alternatives, [], prepared.payload.profile), fn() { prepared }, fn(payload) {\n    intent::query_request_method_factory(payload, sqlite::build_query)\n})'
     assert source.count(expression) == 1
     path.write_text(source.replace(line, '').replace(expression,
         'intent::query_request_method_factory(prepared.payload, sqlite::build_query)'))

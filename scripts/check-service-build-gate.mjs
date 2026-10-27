@@ -17,7 +17,7 @@ for (const mode of ['false', 'source-mismatch', 'dependency-mismatch']) {
   const a = join(directory, 'a', verification.split('/').at(-1));
   const b = join(directory, 'b', runtime.split('/').at(-1));
   const path = mode === 'dependency-mismatch'
-    ? join(directory, 'b/ontology/src/experimental/staged.telora') : join(a, 'src/lib.telora');
+    ? join(directory, 'b/ontology/src/staged.telora') : join(a, 'src/lib.telora');
   const original = readFileSync(path, 'utf8');
   const changed = mode === 'false' ? original.replace('Value::True', 'Value::False')
     : mode === 'source-mismatch' ? original.replace('dataset-scale-v1', 'different-model') : `${original}\n// changed dependency\n`;

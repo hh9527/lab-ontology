@@ -81,9 +81,9 @@ JS 指令版 new Function 编译约 0.46 ms，包含在构图时间中。JS 后�
 从 lab-ontology 根目录执行，旁边需有已构建的 dsh-oks 工作区：
 
 ```sh
-python3 experiments/javascript-knowledge/generate.py
-python3 experiments/javascript-knowledge/run.py <publication-5.json> <publication-10.json> <publication-20.json> <publication-40.json> <ic-publication.json>
-node --import ../dsh-oks/packages/dsh-oks/scripts/markdown-loader.mjs experiments/javascript-knowledge/check.mjs <feature-publication.json>
+python3 benchmarks/javascript-knowledge/generate.py
+python3 benchmarks/javascript-knowledge/run.py <publication-5.json> <publication-10.json> <publication-20.json> <publication-40.json> <ic-publication.json>
+node --import ../dsh-oks/packages/dsh-oks/scripts/markdown-loader.mjs benchmarks/javascript-knowledge/check.mjs <feature-publication.json>
 ```
 
 `generate.py` 只写隔离临时工作区，导出当前格式的对照 publication 和独立 `.data.json`；不修改原模型。IC publication 可由 `scripts/check-programmed-knowledge.py icloud_model` 在隔离目录获得。

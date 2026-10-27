@@ -5,7 +5,7 @@
 
 ## 构建期发布与静态程序
 
-IC／relation 通过 `ontology::experimental::build::stage` 从 transform 的同一 Prepared 导出模型 JSON。
+IC／relation 通过 `ontology::build::stage` 从 transform 的同一 Prepared 导出模型 JSON。
 Wasm custom section `telora.build.information` 使用 `{version:1,entries:{...}}` envelope。
 `entries["ontology.knowledge"]` 为 `{knowledge_contract:"ontology-knowledge-javascript-v1",program,data}`。
 
@@ -260,4 +260,4 @@ node scripts/benchmark-host-knowledge.mjs \
 `scripts/benchmark-knowledge.mjs --full` 生成的知识图摘要，逐节点核对 SHA-256 和字节数。
 设计及边界见 [RFC 0001](../../rfcs/0001-host-knowledge-index.md)。
 
-静态 JS 源码为 `ontology/src/experimental/knowledge.js`，通过 `python3 scripts/embed-knowledge-program.py` 生成 Telora 字符串；`--check` 检查漂移。协议设计见 [RFC 0005](../../rfcs/0005-programmed-knowledge-discovery.md)。
+静态 JS 源码为 `ontology/src/knowledge.js`，通过 `python3 scripts/embed-knowledge-program.py` 生成 Telora 字符串；`--check` 检查漂移。协议设计见 [RFC 0005](../../rfcs/0005-programmed-knowledge-discovery.md)。

@@ -34,9 +34,14 @@ collected = workspace / 'collected.json'
 result = subprocess.run(['node', '--import', str(plugin / 'packages/dsh-oks/scripts/markdown-loader.mjs'), str(plugin / 'scripts/collect-model-knowledge.mjs'), str(compact), str(collected)], capture_output=True, text=True, timeout=120)
 assert result.returncode == 0, result.stderr
 actual = json.loads(collected.read_text())['graph']
-def canonical(graph):
-    return {**graph, 'facts': sorted([{**fact, 'references': sorted(set(fact['references']))} for fact in graph['facts']], key=lambda fact: fact['key'])}
-assert canonical(actual) == canonical(publication), 'programmed inline type graph differs'
+from knowledge_comparison import normalize_graph
+expected_facts = {f['key']: f for f in normalize_graph(publication)['facts']}
+actual_facts = {f['key']: f for f in normalize_graph(actual)['facts']}
+assert all(actual_facts.get(k) == v for k, v in expected_facts.items()), 'programmed inline type graph differs'
+# The fixture replaces reflection rows but deliberately retains the original payload.
+# World also discovers the original row from that payload; the old exporter does not.
+extra = set(actual_facts) - set(expected_facts)
+assert len(extra) == 1 and actual_facts[next(iter(extra))]['value']['name'].endswith('::TenantRow'), extra
 facts = {fact['key']: fact for fact in publication['facts']}
 for fact in facts.values():
     assert all(reference in facts for reference in fact['references']), fact

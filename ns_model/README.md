@@ -1,6 +1,6 @@
 # NeoSight 类型化模型
 
-模型以 `World` 显式列出类型、身份、Dataset 和 Relation，发布 `ns/transform`，生成 SQLite 查询。构建采用 A/B 两阶段；A 准备 transform 数据和知识发布信息，运行期 B 消费已准备的数据。
+模型以 `World` 声明 Dataset 和 Relation，自动发现关联 Entity 与具名类型，发布 `ns/transform`，生成 SQLite 查询。构建采用 A/B 两阶段；A 准备 transform 数据和知识发布信息，运行期 B 消费已准备的数据。
 
 ## 模型组织
 
@@ -9,7 +9,7 @@
 - `src/groups.telora`：按类型、过滤能力及统计策略复用 DimensionGroup、采样 MeasureGroup
 - `src/domains.telora`：140 个业务值域及其源编码映射，显式开启类型反向引用，支持业务名词从值追溯到维度和 Dataset
 - `src/units.telora`：按源单位合同复用名义类型；单位证据和待确认假定保留在源声明记录中，不隐含可加性或单位转换
-- `src/model.telora`：显式 World 清单；覆盖检查不自动发现或补全模型
+- `src/model.telora`：World 根声明；从根自动发现关联 Entity 与具名类型，未引用类型不发布
 - `data/generation-contract.json`：与类型化声明同次生成的演示数据合同，包含最终类型和源码哈希
 
 同一身份空间可以在一个 Dataset 中承担多个角色。例如子网身份分别用于自身主键和父子网引用。关系只连接显式声明的身份角色，不因为两个字段都使用 String 就推断可连接。

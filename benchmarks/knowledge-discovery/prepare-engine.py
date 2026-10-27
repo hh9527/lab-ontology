@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import json
 root=Path(__file__).resolve().parents[3]/'dsh-oks'
-# lab-ontology/experiments/knowledge-discovery -> workspace sibling dsh-oks
+# lab-ontology/benchmarks/knowledge-discovery -> workspace sibling dsh-oks
 assert root.is_dir(),root
 base=Path(os.environ.get('TMPDIR') or Path.home()/'.cache/tmp');base.mkdir(parents=True,exist_ok=True)
 out=Path(tempfile.mkdtemp(prefix='discovery-jq-engine-',dir=base))

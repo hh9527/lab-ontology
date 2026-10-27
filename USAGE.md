@@ -273,7 +273,7 @@ IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或�
 
 ## NeoSight 模型
 
-`ns_model/` 使用显式 World、独立 Entity/Dataset、复用维度与采样度量 Group。源时间单位待确认项、迁移边界和构建命令见 [NS 模型](ns_model/README.md)。
+`ns_model/` 使用 `ontology::world` 声明独立根，自动发现 Entity 与具名类型，无需手工注册类型；复用维度与采样度量 Group。源时间单位待确认项、迁移边界和构建命令见 [NS 模型](ns_model/README.md)。
 
 ### NS 演示数据
 

@@ -78,9 +78,9 @@ ${Array.from({ length: dimensionCount - 1 }, (_, j) => `    g::dimension(dataset
 `;
   }).join('\n');
   let generated = `# 同构 Dataset 规模实验；所有声明均进入 Service 的 transform payload。
-use ontology::experimental::model as m;
-use ontology::experimental::groups as g;
-use ontology::experimental::transform as t;
+use ontology::model as m;
+use ontology::groups as g;
+use ontology::transform as t;
 use ontology::query as qb;
 use ontology::intent as intent;
 use ontology::sqlite as sqlite;
@@ -113,7 +113,7 @@ pub type MainService = struct {
 };
 `;
   if (values.staged) {
-    generated = 'use ontology::experimental::staged as staged;\n' + generated;
+    generated = 'use ontology::staged as staged;\n' + generated;
     for (const [module, names] of Object.entries({ m: ['entity', 'dataset', 'field', 'identity_part', 'role'],
       g: ['input', 'dimension_group', 'dimension'], t: ['declare'] })) {
       for (const name of names) generated = generated.replaceAll(`${module}::${name}(`, `staged::${name}(`);

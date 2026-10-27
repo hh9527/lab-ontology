@@ -1,0 +1,191 @@
+# World 知识发布：缓存具名描述，引用点使用紧凑类型文本。
+use crate::knowledge as k;
+use crate::field_type_info as fti;
+use crate::transform as t;
+use crate::groups as g;
+use crate::values as v;
+use crate::samples as samples;
+use crate::knowledge_policy as policy;
+use crate::knowledge_program as knowledge_program;
+use crate::ontology as edsl;
+use std::array as array;
+use std::codec as codec;
+use std::dict as dict;
+use std::pipeline as pipeline;
+use std::type_memorizer as memo;
+use std::type_desc as td;
+use std::value::{Value};
+use crate::knowledge::{type_id, object, group_root, resolved, type_dependencies, expression_types, raw_capabilities, raw_relation_sources};
+
+type TypeField = struct {name: String, type: String};
+type TypeVariant = struct {name: String, payload: Option(String)};
+type RolePart = struct {source: String, target: String, type: String, nullable: Bool, raw: Option(String)};
+type RolePair = struct {from: String, to: String};
+type BindingMember = struct {local: String, publish: String, input: Value, type: String, nullable: Bool, aggregate: Option(crate::query::AggregateFunction), projectable: Bool, filters: Array(g::Filter), kind: g::MemberKind};
+def field_info: Fn(Type) -> String = fn(ty) { type_id(ty) };
+type FieldInfo = struct { id: String, text: String, references: Array(String) };
+def raw_type: Fn(Type, Type, Array(Type), Array(td::FieldDesc), Array(td::VariantDesc)) -> Value = fn(ty, body, dependencies, fields, variants) {
+    object([
+        ("id", codec::encode(type_id(ty))), ("inline", codec::encode(False)),
+        ("reverse_references", codec::encode(policy::allows_reverse_references(ty))),
+        ("name", codec::encode(td::name(ty))), ("kind", codec::encode(td::kind(ty))),
+        ("representation", codec::encode(if body != ty { Some(field_info(body)) } else { None })),
+        ("arguments", codec::encode(array::map(td::children(ty), field_info))),
+        ("field_types", codec::encode(if td::kind(body) == td::TypeDescKind::Struct {
+            array::map(fields, fn(f) { {name: f.name, type: field_info(f.ty)}.ty!(TypeField) })
+        } else { [] })),
+        ("variants", codec::encode(if td::kind(body) == td::TypeDescKind::Enum {
+            array::map(variants, fn(v) { {name: v.name, payload: match v.payload { Some(p) => Some(field_info(p)), None => None }}.ty!(TypeVariant) })
+        } else { [] })),
+        ("dependencies", codec::encode(array::map(dependencies, field_info)))
+    ])
+};
+def raw_group_value: Fn(g::BindingFacts) -> Value = fn(binding) {
+    match binding.contract {
+        g::BindingContract::DeferredDimension(group) => object([("name", codec::encode(group.id)), ("type", codec::encode(field_info(group.value))), ("projectable", codec::encode(group.projectable)), ("filters", codec::encode(group.filters))]),
+        g::BindingContract::Transfer(group) => object([("name", codec::encode(group.id)), ("members", codec::encode(group.members))]),
+        g::BindingContract::Numeric(group) => object([("name", codec::encode(group.id)), ("type", codec::encode(field_info(group.value))), ("members", codec::encode(group.members))]),
+        g::BindingContract::Identity(role) => object([("name", codec::encode("identity")), ("entity", codec::encode(role.entity)), ("type", codec::encode(field_info(role.identity)))]),
+        g::BindingContract::Dimension => {
+            let member = binding.members[0];
+            let policy = match member.kind { g::MemberKind::Dimension(policy) => policy, _ => fail!("dimension contract has no dimension policy", member.id) };
+            object([("name", codec::encode(member.group)), ("type", codec::encode(field_info(member.value))),
+                ("projectable", codec::encode(policy.projectable)), ("filters", codec::encode(policy.filters))])
+        },
+    }
+};
+# 从同一 Prepared 采集紧凑语义描述；规范地址与完整图由静态 knowledge.js 构造。
+def raw_column: Fn(g::Column) -> Value = fn(c) {
+    object([("name", codec::encode(c.name)), ("type", codec::encode(field_info(c.value))), ("nullable", codec::encode(c.nullable))])
+};
+def raw_expression: Fn(g::Node) -> Value = fn(node) {
+    match node {
+        g::Node::Column(c) => object([("op", Value::String("column")), ("input", raw_column(c))]),
+        g::Node::Seconds(input) => object([("op", Value::String("seconds")), ("input", raw_expression(input))]),
+        g::Node::Ipv4(input) => object([("op", Value::String("ipv4")), ("input", raw_expression(input))]),
+        g::Node::UtcBucket(bucket) => object([("op", Value::String("utc_bucket")), ("input", raw_expression(bucket.input)), ("unit", codec::encode(bucket.unit))]),
+        g::Node::Rate(inputs) => object([("op", Value::String("rate")), ("amount", raw_expression(inputs.amount)), ("duration", raw_expression(inputs.duration))]),
+        g::Node::Identity(input) => object([("op", Value::String("identity")), ("column", raw_column(input.column)), ("parts", Value::Array(array::map(input.parts, raw_column)))]),
+    }
+};
+def raw_binding: Fn(g::BindingFacts) -> Value = fn(binding) {
+    let group = raw_group_value(binding);
+    object([("group", group), ("group_kind", codec::encode(group_root(binding))),
+        ("types", codec::encode(array::flat_map(binding.members, fn(m) { array::map(array::concat([[m.value], expression_types(m.node)]), field_info) }))),
+        ("members", codec::encode(array::map(binding.members, fn(m) {
+            {local: m.local, publish: m.id, input: raw_expression(m.node), type: field_info(m.value), nullable: m.nullable,
+                aggregate: m.aggregate, projectable: m.projectable, filters: m.filters, kind: m.kind}.ty!(BindingMember)
+        })))])
+};
+def raw_domain: Fn(v::BindingFacts) -> Value = fn(b) {
+    object([("id", codec::encode(b.id)), ("input", raw_expression(b.node)),
+        ("nullable", codec::encode(b.nullable)), ("projectable", codec::encode(b.projectable)), ("filters", codec::encode(b.filters)),
+        ("definition", object([("name", codec::encode(b.definition.id)), ("type", codec::encode(field_info(b.definition.value))),
+            ("wire", codec::encode(field_info(b.definition.wire))), ("canonical_values", codec::encode(b.definition.values)),
+            ("half_open", codec::encode(b.definition.half_open)), ("order", codec::encode(b.definition.order)),
+            ("projectable", codec::encode(b.group_projectable)), ("filters", codec::encode(b.group_filters))]))])
+};
+def raw_sample: Fn(samples::BindingFacts) -> Value = fn(b) {
+    object([("definition", object([("name", codec::encode(b.group)), ("type", codec::encode(field_info(b.value))),
+        ("primary", codec::encode(b.primary)), ("summaries", codec::encode(b.summaries)), ("unit", codec::encode(b.unit))])),
+        ("field", codec::encode(b.field)), ("nullable", codec::encode(b.nullable)), ("names", codec::encode(b.names))])
+};
+def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset) {
+    object([
+        ("id", codec::encode(d.dataset.id)), ("source", codec::encode(d.dataset.source)),
+        ("row", codec::encode(field_info(d.dataset.row))), ("grain", codec::encode(d.dataset.grain)),
+        ("kind", codec::encode(d.kind)), ("scope", codec::encode(dataset.scope)), ("clock", codec::encode(d.clock)),
+        ("roles", Value::Array(array::map(d.dataset.roles, fn(r) {
+            object([("id", codec::encode(r.id)), ("entity", codec::encode(r.entity)),
+                ("identity", codec::encode(field_info(r.identity))), ("optional", codec::encode(r.optional)),
+                ("parts", codec::encode(array::map(r.parts, fn(p) {
+                    {source: p.source, target: p.target, type: field_info(p.value), nullable: p.nullable,
+                        raw: match p.raw { Some(raw) => Some(field_info(raw)), None => None }}.ty!(RolePart)
+                })))])
+        }))),
+        ("fields", Value::Array(array::map(dataset.fields, fn(f) {
+            object([("name", codec::encode(f.name)), ("column", codec::encode(f.column)),
+                ("type", codec::encode(field_info(f.ty))), ("nullable", codec::encode(f.nullable)),
+                ("key", codec::encode(f.is_key)), ("time", codec::encode(f.time)), ("logical_type", codec::encode(f.logical_type))])
+        }))),
+        ("bindings", Value::Array(array::map(d.groups, raw_binding))),
+        ("domains", Value::Array(array::map(d.domains, raw_domain))),
+        ("samples", Value::Array(array::map(d.samples, raw_sample)))
+    ])
+};
+# 每个具名定义的描述和引用只生成一次；内部结构由字段投影缓存处理。
+type RootInfo = struct { types: Array(Type), fields: Array(Type), description: Value };
+def root_infos: memo::TypeMemorizer(RootInfo) = memo::type_memorizer(fn(ty) {
+    let body = resolved(ty);
+    let kind = td::kind(body);
+    let members = if kind == td::TypeDescKind::Struct { td::fields(body) } else { [] };
+    let variants = if kind == td::TypeDescKind::Enum { td::variants(body) } else { [] };
+    let fields = array::concat([td::children(ty), if body != ty { [body] } else { [] },
+        array::map(members, fn(f) { f.ty }),
+        array::flat_map(variants, fn(v) { match v.payload { Some(p) => [p], None => [] } }),
+        if kind != td::TypeDescKind::Struct && kind != td::TypeDescKind::Enum { td::children(body) } else { [] }]);
+    {types: array::flat_map(fields, fn(child) { fti::generate_field_type_info(fti::memorizer, child).0 }),
+     fields, description: raw_type(ty, body, fields, members, variants)}.ty!(RootInfo)
+});
+def root_info: Fn(Type) -> RootInfo = fn(ty) { memo::computed_with_type(root_infos, ty) };
+def referenced_types: Fn(Array(Type)) -> Array(Type) = fn(types) {
+    array::flat_map(types, fn(ty) { fti::generate_field_type_info(fti::memorizer, ty).0 })
+};
+def unique_types: Fn(Array(Type)) -> Array(Type) = fn(types) {
+    pipeline::run(pipeline::from_array(types) |> pipeline::distinct_by(type_id) |> pipeline::collect())
+};
+def discover_indexed: Fn(Array(Type), Dict(Type)) -> Array(Type) = fn(pending, seen) {
+    let fresh = array::filter(unique_types(pending), fn(ty) { dict::get(seen, type_id(ty)) == None });
+    if fresh == [] { dict::values(seen) }
+    else {
+        let combined = pipeline::merge(pipeline::from_array(dict::values(seen)), pipeline::from_array(fresh));
+        let next = pipeline::run(combined |> pipeline::collect_dict(type_id, fn(ty) { ty }));
+        discover_indexed(array::flat_map(fresh, fn(ty) { root_info(ty).types }), next)
+    }
+};
+def discover_types: Fn(Array(Type)) -> Array(Type) = fn(seeds) {
+    discover_indexed(referenced_types(seeds), {}.ty!(Dict(Type)))
+};
+# 与实际输出字段共用来源；不需要递归收集匿名结构闭包。
+def declaration_types: Fn(Array(t::Declaration)) -> Array(Type) = fn(declarations) {
+    array::flat_map(declarations, fn(d) { array::concat([
+        [d.dataset.row], array::map(d.dataset.roles, fn(r) { r.identity }),
+        array::flat_map(d.dataset.roles, fn(r) { array::flat_map(r.parts, fn(p) {
+            array::concat([[p.value], match p.raw { Some(ty) => [ty], None => [] }])
+        }) }), array::map(d.columns, fn(c) { c.value }),
+        array::map(d.samples, fn(b) { b.value }),
+        array::flat_map(d.domains, fn(b) { array::concat([[b.definition.value, b.definition.wire], expression_types(b.node)]) }),
+        array::flat_map(d.groups, fn(b) { array::concat([[b.row],
+            match b.contract {
+                g::BindingContract::DeferredDimension(group) => [group.value],
+                g::BindingContract::Numeric(group) => [group.value],
+                g::BindingContract::Identity(role) => [role.identity], _ => [],
+            }, array::flat_map(b.members, fn(m) { array::concat([[m.value], expression_types(m.node)]) })]) })
+    ]) })
+};
+def publication_from: Fn(t::Prepared, Array(Type), Array((String, Type)), Array(Type)) -> Value = fn(prepared, types, entities, source_types) {
+    let roots = unique_types(array::filter(types, fn(ty) { td::name(ty) != None && !k::inline_type(ty) }));
+    let fields = unique_types(array::concat([roots,
+        array::flat_map(roots, fn(ty) { root_info(ty).fields }), source_types,
+        array::map(entities, fn(e) { e.1 }),
+        array::flat_map(prepared.payload.entities, fn(e) { array::map(e.fields, fn(f) { f.ty }) })]));
+    let instructions = array::concat([
+        [Value::Array([codec::encode("types"), Value::Array(array::map(roots, fn(ty) { root_info(ty).description }))]),
+         Value::Array([codec::encode("field_types"), codec::encode(array::map(fields, fn(ty) {
+             let info = fti::generate_field_type_info(fti::memorizer, ty).1;
+             {id: type_id(ty), text: info.text, references: info.references}.ty!(FieldInfo)
+         }))])],
+        array::map(entities, fn(entity) { Value::Array([codec::encode("entity"), object([
+            ("entity", codec::encode(entity.0)), ("identity", codec::encode(field_info(entity.1)))
+        ])]) }),
+        array::map(array::enumerate(prepared.declarations), fn(pair) {
+            Value::Array([codec::encode("dataset"), raw_dataset(pair.1, prepared.payload.entities[pair.0])])
+        }),
+        [Value::Array([codec::encode("capabilities"), raw_capabilities(prepared.payload)]),
+         Value::Array([codec::encode("relations"), raw_relation_sources(prepared)])]
+    ]);
+    object([("knowledge_contract", codec::encode("ontology-knowledge-javascript-v1")),
+        ("program", codec::encode(knowledge_program::program)),
+        ("data", object([("revision", codec::encode(prepared.payload.revision)), ("instructions", Value::Array(instructions))]))])
+};
+pub use self::{publication_from, discover_types, declaration_types};

@@ -27,13 +27,13 @@ bin/telora-run "$TMPDIR/relation-model.wasm" --serve stdio+jsonl://
 
 完整服务及 Intent 契约见[使用说明](../USAGE.md)。
 
-构建期通过 `experimental::world::stage` 从显式 World 清单准备 transform 与静态知识；插件派生导航和反向链接，运行期不挂载 info／discovery。独立 `world::self_check` 检查覆盖与模型约束，transform 继续校验请求。清单见 [explicit_world.telora](src/explicit_world.telora)，实验边界和验收见[显式 Model World](../evaluations/explicit-model-world.md)。
+构建期通过 `world::stage` 从显式 World 清单准备 transform 与静态知识；插件派生导航和反向链接，运行期不挂载 info／discovery。独立 `world::self_check` 检查覆盖与模型约束，transform 继续校验请求。清单见 [explicit_world.telora](src/explicit_world.telora)，实验边界和验收见[显式 Model World](../evaluations/explicit-model-world.md)。
 
-类型级声明通过 `ontology::experimental::declarations` 接入 Telora 的 Property evidence：
+类型级声明通过 `ontology::declarations` 接入 Telora 的 Property evidence：
 
 ```telora
 use ontology::ontology as edsl;
-use ontology::experimental::declarations as decl;
+use ontology::declarations as decl;
 
 @edsl::entity_id("device_identity")
 type DeviceIdentity = struct { id: String };
@@ -56,6 +56,6 @@ def inventory = decl::dataset(DeviceRow.type);
 验证声明证据与编译期拒绝：`python3 scripts/check-typed-declarations.py`；关系回归及 SQLite 等价验证：`python3 scripts/check-typed-relations.py`。
 
 
-当前实验服务通过 `ontology::experimental::world::stage` 在构建期间准备 transform 与静态知识。
+当前实验服务通过 `ontology::world::stage` 在构建期间准备 transform 与静态知识。
 使用支持 RFC 0318／0319 的 Telora 以 `build relation_model --staged -o relation_model.wasm` 构建；
 普通运行期不会执行该准备过程。验收与 IC 测量见 [构建期双路产出](../evaluations/build-time-staging.md)。

@@ -90,7 +90,7 @@ Date、DateTime、DateTimeUtc、EpochMillis 的类型节点与字段到类型的
 业务类型可以显式选择策略：
 
 ```telora
-use ontology::experimental::knowledge as knowledge;
+use ontology::knowledge as knowledge;
 
 @knowledge::reverse_references(False)
 type SharedCode = struct(String);

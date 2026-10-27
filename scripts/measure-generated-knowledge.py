@@ -32,7 +32,7 @@ generated = subprocess.run(['node', str(ROOT / 'scripts/generate-dataset-scale-s
     check=True, capture_output=True, text=True)
 workspace = Path(json.loads(generated.stdout)['output'])
 cases = json.loads((workspace / 'experiment.json').read_text())['cases']
-knowledge = workspace / 'ontology/src/experimental/knowledge.telora'
+knowledge = workspace / 'ontology/src/knowledge.telora'
 original = knowledge.read_text()
 start = original.index('    let seeds =', original.index('def export:'))
 passes = original.index('    let passes =', start)
@@ -77,8 +77,8 @@ def export_source(stage):
 for case in cases:
     path = workspace / case['name'] / 'src/lib.telora'
     source = path.read_text()
-    source = 'use ontology::experimental::build as build;\n' + source
-    source = source.replace('type QueryService =', '''def lower: Fn(Value) -> Value = build::stage(fn() { prepared }, fn(payload) {
+    source = 'use ontology::world as build;\n' + source
+    source = source.replace('type QueryService =', '''def lower: Fn(Value) -> Value = build::stage_prepared(build::define(prepared.payload.revision, prepared.declarations, prepared.relations, prepared.alternatives, [], prepared.payload.profile), fn() { prepared }, fn(payload) {
     intent::query_request_method_factory(payload, sqlite::build_query)
 });
 type QueryService =''')

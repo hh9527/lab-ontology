@@ -4,7 +4,7 @@ import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {collectProgrammedKnowledge} from '../../dsh-oks/packages/dsh-oks/src/programmed-knowledge.ts';
 import {derivePublishedKnowledge} from '../../dsh-oks/packages/dsh-oks/src/published-knowledge.ts';
-const source=readFileSync(new URL('../ontology/src/experimental/knowledge.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../ontology/src/knowledge.js',import.meta.url),'utf8');
 const declarations=source.slice(0,source.indexOf('if (!data ||'));
 const helpers=new Function(declarations+'\nreturn {sha256,address,json};')();
 for(const value of ['', 'abc', '中文/🙂', 'a'.repeat(10000)]) assert.equal(helpers.sha256(value),createHash('sha256').update(value).digest('hex'));

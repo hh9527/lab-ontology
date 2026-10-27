@@ -25,7 +25,7 @@ generated = json.loads(run(['node', ROOT / 'scripts/generate-dataset-scale-sampl
     '--counts', args.counts, '--dimensions', '10', '--field-types', 'distinct']).stdout)
 workspace = Path(generated['output'])
 print(json.dumps({'workspace': str(workspace)}), flush=True)
-knowledge_file = workspace / 'ontology/src/experimental/knowledge.telora'
+knowledge_file = workspace / 'ontology/src/knowledge.telora'
 knowledge_source = knowledge_file.read_text()
 assert 'memo::computed_with_type(type_ids, ty)' in knowledge_source
 cases = generated['cases']
@@ -88,26 +88,19 @@ for case in cases:
         n = case['count']
         # The generator knows every declaration; the manifest is emitted from
         # those inputs, not discovered through runtime reflection.
-        names = ['TenantId', 'ItemId'] + [f'TextValue{i}_{j}' for i in range(1, n + 1) for j in range(1, 10)]
-        names += [name for i in range(1, n + 1) for name in [f'Identity{i}', f'Row{i}']]
         manifest = '''
-use ontology::experimental::world as world;
-use ontology::experimental::build as staged_build;
-def model_world: world::World = {
-    revision: "dataset-scale-v1",
-    types: [TYPES], entities: [ENTITIES], datasets: declarations,
-    relations: [], alternatives: [], links: [], profile,
-};
+use ontology::world as world;
+use ontology::world as staged_build;
+def model_world: world::World = world::define("dataset-scale-v1", declarations, [], [], [], profile);
 def lower: Fn(Value) -> Value = STAGE(fn(payload) { intent::query_request_method_factory(payload, sqlite::build_query) });
-'''.replace('TYPES', ', '.join(f'world::type_entry({ty}.type)' for ty in names))
-        manifest = manifest.replace('ENTITIES', ', '.join(f'world::entity(entity{i})' for i in range(1, n + 1)))
+'''
     graphs = {}
     measurements = {}
     for variant in (['discovery', 'memo'] if name == 'icloud_model' else ['discovery', 'world', 'world_memo']):
         memo = variant in ['memo', 'world_memo']
         knowledge_file.write_text(knowledge_source if memo else knowledge_source.replace('memo::computed_with_type(type_ids, ty)', 'compute_type_id(ty)'))
         if name != 'icloud_model':
-            stage = 'staged_build::stage(fn() { prepared }, ' if variant == 'discovery' else 'world::stage(model_world, '
+            stage = 'staged_build::stage_prepared(staged_build::define(prepared.payload.revision, prepared.declarations, prepared.relations, prepared.alternatives, [], prepared.payload.profile), fn() { prepared }, ' if variant == 'discovery' else 'world::stage(model_world, '
             source = original.replace('type QueryService =', manifest.replace('STAGE(', stage) + '\ntype QueryService =')
             source = source.replace('{lower: intent::query_request_method_factory(prepared.payload, sqlite::build_query)}', '{lower: lower}')
             path.write_text(source)

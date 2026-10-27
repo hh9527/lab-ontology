@@ -47,4 +47,4 @@ python3 scripts/check-initialization-knowledge.py
 
 插件测试须以新协议制品配置 `OKS_WORKSPACE` 后运行 `pnpm run check`。采集默认批量 128、总预算 60 s、单次 jq 最长 10 s、单次输出 64 MiB，最多 100000 keys／10000 轮；超预算直接失败。
 
-本轮未合入、未部署，10923／10924 未变更。早期 JS 性能原型记录位于 `experiments/knowledge-discovery/README.md`，与正式实现测量分别记录。
+本轮未合入、未部署，10923／10924 未变更。早期 JS 性能原型记录位于 `benchmarks/knowledge-discovery/README.md`，与正式实现测量分别记录。

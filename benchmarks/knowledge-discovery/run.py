@@ -24,7 +24,7 @@ out=Path(tempfile.mkdtemp(prefix='discovery-experiment-',dir=base))
 gen=subprocess.run(['node',str(ROOT/'scripts/generate-dataset-scale-samples.mjs'),'--output',str(out/'workspace'),
  '--counts',args.counts,'--dimensions',str(args.dimensions),'--field-types',args.field_types],capture_output=True,text=True,check=True)
 workspace=Path(json.loads(gen.stdout)['output']);cases=json.loads((workspace/'experiment.json').read_text())['cases']
-knowledge=workspace/'ontology/src/experimental/knowledge.telora';original=knowledge.read_text()
+knowledge=workspace/'ontology/src/knowledge.telora';original=knowledge.read_text()
 start=original.index('def export:');seed_start=original.index('    let seeds =',start);seed_end=original.index('    let passes =',seed_start)
 program=(HERE/'expand.jq').read_text()
 raw_source=original[:start]+(HERE/'raw-export.telora').read_text()+'''\ndef export: Fn(t::Prepared) -> Value = fn(prepared) {
@@ -44,8 +44,8 @@ pub use self::{export, type_id};
 '''
 for case in cases:
  path=workspace/case['name']/'src/lib.telora';s=path.read_text()
- s='use ontology::experimental::build as build;\n'+s
- s=s.replace('type QueryService =','''def lower: Fn(Value) -> Value = build::stage(fn() { prepared }, fn(payload) {
+ s='use ontology::world as build;\n'+s
+ s=s.replace('type QueryService =','''def lower: Fn(Value) -> Value = build::stage_prepared(build::define(prepared.payload.revision, prepared.declarations, prepared.relations, prepared.alternatives, [], prepared.payload.profile), fn() { prepared }, fn(payload) {
     intent::query_request_method_factory(payload, sqlite::build_query)
 });
 type QueryService =''').replace('lower: intent::query_request_method_factory(prepared.payload, sqlite::build_query)','lower: lower')

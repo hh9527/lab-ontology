@@ -39,7 +39,7 @@ function sha256(text) {
   }
   return hash.map(value => (value >>> 0).toString(16).padStart(8, '0')).join('');
 }
-function initialize(revision) { return { revision, facts: new Map(), types: new Map() }; }
+function initialize(revision) { return { revision, facts: new Map(), types: new Map(), fieldTypes: new Map(), pendingTypes: [] }; }
 function merge(state, key, value, references = []) {
   const previous = state.facts.get(key);
   if (previous) {
@@ -48,13 +48,14 @@ function merge(state, key, value, references = []) {
   } else state.facts.set(key, { key, value, references: new Set(references) });
 }
 function typeref(state, id) {
-  const t = state.types.get(id);
-  if (!t) throw new Error(`Unknown type ${id}`);
-  return t.inline ? t.builtin ?? `${t.kind === 'Array' ? 'Array' : t.kind === 'Dict' ? 'Dict' : 'Option'}(${t.arguments.map(x => typeref(state, x)).join(', ')})` : address('types', id);
+  const info = state.fieldTypes.get(id);
+  if (!info) throw new Error(`Unknown field type ${id}`);
+  return info.text;
 }
 function typerefs(state, id) {
-  const t = state.types.get(id);
-  return t.inline ? t.arguments.flatMap(x => typerefs(state, x)) : [typeref(state, id)];
+  const info = state.fieldTypes.get(id);
+  if (!info) throw new Error(`Unknown field type ${id}`);
+  return info.references;
 }
 const column = (s, c) => ({ ...c, type: typeref(s, c.type) });
 function expression(s, e) {
@@ -65,7 +66,11 @@ function expression(s, e) {
 }
 function types(s, items) {
   for (const t of items) s.types.set(t.id, t);
-  for (const t of items) if (!t.inline) merge(s, typeref(s, t.id), {
+  s.pendingTypes = items;
+}
+function field_types(s, items) {
+  for (const info of items) s.fieldTypes.set(info.id, info);
+  for (const t of s.pendingTypes) if (!t.inline) merge(s, address('types', t.id), {
     name: t.name, kind: t.kind, reverse_references: t.reverse_references === true, representation: t.representation === null ? null : typeref(s, t.representation),
     arguments: t.arguments.map(x => typeref(s, x)), field_types: t.field_types.map(c => column(s, c)),
     variants: t.variants.map(v => v.payload === null ? { ...v } : { ...v, payload: typeref(s, v.payload) }),
@@ -86,7 +91,7 @@ function binding(s, dataset, b) {
 function domain(s, dataset, b) {
   const definition = { ...b.definition, type: typeref(s, b.definition.type), wire: typeref(s, b.definition.wire) };
   const group = address('dimension_groups', sha256(json(definition))), key = member(dataset, 'bindings', json(['domain', b.id]));
-  if (!s.types.get(b.definition.type).inline) {
+  if (typerefs(s, b.definition.type).includes(typeref(s, b.definition.type))) {
     for (const v of b.definition.canonical_values) merge(s, `${typeref(s, b.definition.type)}#values/${encode(v.id)}`, { wires: v.wires }, typerefs(s, b.definition.type));
     merge(s, typeref(s, b.definition.type), { canonical_order: b.definition.order, half_open: b.definition.half_open, wire: typeref(s, b.definition.wire) }, typerefs(s, b.definition.wire));
   }
@@ -173,7 +178,7 @@ function finish(s) {
 if (!data || typeof data.revision !== 'string' || !data.revision || !Array.isArray(data.instructions)) {
   throw new Error('Invalid ontology knowledge instructions');
 }
-const operations = {types, entity, dataset, capabilities, relations};
+const operations = {types, field_types, entity, dataset, capabilities, relations};
 const state = initialize(data.revision);
 for (const [index, instruction] of data.instructions.entries()) {
   if (!Array.isArray(instruction) || instruction.length !== 2 || typeof instruction[0] !== 'string' || !Object.hasOwn(operations, instruction[0])) {
@@ -181,7 +186,8 @@ for (const [index, instruction] of data.instructions.entries()) {
   }
   const [operation, argument] = instruction;
   if ((index === 0) !== (operation === 'types')) throw new Error('Knowledge types must be declared first and once');
+  if ((index === 1) !== (operation === 'field_types')) throw new Error('Field type information must be declared second and once');
   operations[operation](state, argument);
 }
-if (data.instructions.length === 0) throw new Error('Missing knowledge types instruction');
+if (data.instructions.length < 2) throw new Error('Missing knowledge type declarations');
 return finish(state);

@@ -73,8 +73,8 @@ items = [{ key, data }, ...]
 ## 复验
 
 ```sh
-python3 experiments/knowledge-discovery/prepare-engine.py
-python3 experiments/knowledge-discovery/run.py \
+python3 benchmarks/knowledge-discovery/prepare-engine.py
+python3 benchmarks/knowledge-discovery/run.py \
   --engine <上一步输出的隔离 oks_wti.wasm> \
   --counts 5,10,20,40 --dimensions 10 --field-types distinct
 ```
@@ -82,7 +82,7 @@ python3 experiments/knowledge-discovery/run.py \
 批次复验可对同一个实验 publication 调用：
 
 ```sh
-node experiments/knowledge-discovery/collect.mjs \
+node benchmarks/knowledge-discovery/collect.mjs \
   <engine.wasm> <sample-discovery.json> <output-graph.json> 5 3
 ```
 

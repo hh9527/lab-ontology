@@ -420,14 +420,14 @@ DimensionGroup 先覆盖身份投影及可选的名称组；MeasureGroup 先覆�
 
 统一跟踪议题为 [#64](https://github.com/hh9527/lab-ontology/issues/64)，各阶段在同一议题汇报，不另建阶段议题。
 
-原型入口为 `ontology::experimental::model`，独立于当前 `ontology::ontology` 准备与服务协议。
+原型入口为 `ontology::model`，独立于当前 `ontology::ontology` 准备与服务协议。
 可执行示例见 [relation 测试夹具](../relation_model/tests/typed_model/fixture.telora)，正反例见
 [typed_model 测试](../relation_model/tests/typed_model.telora)。
 
 作者可使用以下实际原型 API 表达映射：
 
 ```telora
-use ontology::experimental::model as model;
+use ontology::model as model;
 
 type TenantId = struct(String);
 type DeviceId = struct(String);
@@ -463,10 +463,10 @@ newtype 的原始 JSON 编码与构造校验已经在这个模型上下文中验
 
 ## 阶段 B 单位计算实验
 
-实际入口为 `ontology::experimental::quantity`，当前以具名 newtype 和封闭的函数签名验证单位计算，尚未实现通用量纲代数。
+实际入口为 `ontology::quantity`，当前以具名 newtype 和封闭的函数签名验证单位计算，尚未实现通用量纲代数。
 
 ```telora
-use ontology::experimental::quantity as q;
+use ontology::quantity as q;
 
 # 显式换算后，结果为 Some(BytesPerSecond(1.5))
 q::rate(q::Bytes(3.0), q::seconds(q::Milliseconds(2000.0)))
@@ -483,13 +483,13 @@ q::rate(q::Bytes(3.0), q::seconds(q::Milliseconds(2000.0)))
 
 ### 已实现的 Group 原型
 
-实际入口为 `ontology::experimental::groups`。完整作者示例见 [Group 夹具](../relation_model/tests/typed_groups/fixture.telora)，该示例使用独立的合成采样表。
+实际入口为 `ontology::groups`。完整作者示例见 [Group 夹具](../relation_model/tests/typed_groups/fixture.telora)，该示例使用独立的合成采样表。
 下面是从夹具提取的实际 API 形状：
 
 ```telora
-use ontology::experimental::model as m;
-use ontology::experimental::groups as g;
-use ontology::experimental::quantity as q;
+use ontology::model as m;
+use ontology::groups as g;
+use ontology::quantity as q;
 
 type Sample = struct { seq: Int, rx: Option(q::Bytes), elapsed_ms: Option(q::Milliseconds) };
 def samples: m::Dataset(Sample) = m::dataset("samples", "samples_ms", Sample.type, ["seq"]);
@@ -533,7 +533,7 @@ python3 scripts/check-typed-model-rejections.py
 
 ## 阶段 C：类型化关系接入 transform
 
-`ontology::experimental::relations` 通过显式 Dataset 和具名 Entity 角色声明关系。
+`ontology::relations` 通过显式 Dataset 和具名 Entity 角色声明关系。
 每一端先验证完整身份，两端必须指向同一 Entity ID 和同一身份类型；连接键由对应身份成员展开，不接受请求覆盖连接键。
 业务连接由两个不同的 hub 角色、一个明确的参与者 Dataset 和显式方向构造，物理端点位置不承担方向推断。
 多个完整角色映射可以显式组成备选关系，备选分支各自保留租户与本地身份。
@@ -563,7 +563,7 @@ python3 scripts/check-typed-relations.py
 
 ### 独立 Dataset／成员准备与服务接入
 
-`ontology::experimental::transform::declare` 接受一个带 Row 类型的 Dataset、具名角色、同 Row 的 Group 绑定和显式记录计数发布 ID。
+`ontology::transform::declare` 接受一个带 Row 类型的 Dataset、具名角色、同 Row 的 Group 绑定和显式记录计数发布 ID。
 擦除后的绑定保留定义契约，组合边界通过 `prepare_facts` 重检类型、能力、成员完整性和可空性。
 `transform::build` 从这些声明独立生成原有 transform 编译器所需的准备结构，并要求每个关系端点都匹配已登记 Dataset 的具名角色；关系不能私下改写角色映射。
 关系、备选关系和业务连接显式注册，公共边 ID 冲突在初始化时拒绝。

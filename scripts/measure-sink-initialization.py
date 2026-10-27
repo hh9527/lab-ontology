@@ -52,16 +52,16 @@ for case in cases:
     if case['name'] == 'icloud_model':
         continue
     path = workspace / case['name'] / 'src/lib.telora'
-    source = 'use ontology::experimental::build as staged_build;\n' + path.read_text()
-    source = source.replace('type QueryService =', '''def lower: Fn(Value) -> Value = staged_build::stage(fn() { prepared }, fn(payload) {
+    source = 'use ontology::world as staged_build;\n' + path.read_text()
+    source = source.replace('type QueryService =', '''def lower: Fn(Value) -> Value = staged_build::stage_prepared(staged_build::define(prepared.payload.revision, prepared.declarations, prepared.relations, prepared.alternatives, [], prepared.payload.profile), fn() { prepared }, fn(payload) {
     intent::query_request_method_factory(payload, sqlite::build_query)
 });
 type QueryService =''')
     source = source.replace('lower: intent::query_request_method_factory(prepared.payload, sqlite::build_query)', 'lower: lower')
     path.write_text(source)
-knowledge = workspace / 'ontology/src/experimental/knowledge.telora'
+knowledge = workspace / 'ontology/src/knowledge.telora'
 current_source = knowledge.read_text()
-original = run(['git', 'show', args.baseline_ref + ':ontology/src/experimental/knowledge.telora'], cwd=ROOT).stdout
+original = run(['git', 'show', args.baseline_ref + ':ontology/src/knowledge.telora'], cwd=ROOT).stdout
 start = original.index('def collect_types:')
 end = original.index('def type_fact:', start)
 indexed = '''use std::pipeline as pipeline;

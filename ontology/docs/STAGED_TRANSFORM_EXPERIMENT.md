@@ -4,7 +4,7 @@ ontology 的默认声明构造器保留类型约束和自检需要的事实；`p
 必需的准备。模型使用现有 `model/groups/samples/values/relations/transform` API 即可获得该行为，
 无需切换建模入口。发布前显式执行模型自检，运行期继续验证请求形状、名称、类型和操作权限。
 
-当前已通过 `experimental::build::stage` 在构建期预计算准备结果，保留同次构建的 TypeId，并输出静态知识。当前验收见[构建期双路产出](../../evaluations/build-time-staging.md)。
+当前已通过 `world::stage` 在构建期预计算准备结果，保留同次构建的 TypeId，并输出静态知识。当前验收见[构建期双路产出](../../evaluations/build-time-staging.md)。
 
 下文保留自检分离及 Bool 传递的历史实验；其中大小、耗时和限制不代表当前实现。
 
@@ -16,7 +16,7 @@ ontology 的默认声明构造器保留类型约束和自检需要的事实；`p
 - `checked_*`：显式严格构造或准备，供需要立即诊断的调用方使用；既有负向诊断测试显式采用该入口
 - `groups::validate_facts`、`samples/values::validate_bindings`：显式检查对应的擦除后事实
 
-`experimental::staged` 是早期生成实验的兼容别名，转发到默认 API；没有独立的构造或 lowering 实现。
+`staged` 是早期生成实验的兼容别名，转发到默认 API；没有独立的构造或 lowering 实现。
 它的 `self_check` 检查无关系声明，`self_check_root` 检查完整 root。
 
 支持 Entity／Event／Metric、可空字段与身份映射、维度／度量组、采样统计、业务域、物理列映射、

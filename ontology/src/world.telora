@@ -1,34 +1,49 @@
-# 显式模型边界实验：具名定义由应用提供，检查引用覆盖，不补全成员。
-use crate::experimental::model as m;
-use crate::experimental::transform as t;
-use crate::experimental::relations as r;
-use crate::experimental::groups as g;
-use crate::experimental::knowledge as k;
+# World 定义模型边界；引用类型与内嵌知识由统一路径自动收集。
+use crate::model as m;
+use crate::transform as t;
+use crate::relations as r;
+use crate::groups as g;
+use crate::knowledge as k;
+use crate::field_knowledge as fk;
+use crate::field_type_info as fti;
 use crate::query as qb;
 use std::array as array;
+use std::pipeline as pipeline;
 use std::type_desc as td;
 use std::build as build;
 use std::value::{Value};
 
-def type_entry: Fn(Type) -> Type = fn(ty) { ty };
-
 type Entity = struct { id: String, identity: Type };
 def entity: for(I) Fn(m::Entity(I)) -> Entity = fn(value) { {id: value.id, identity: value.identity} };
 type World = struct {
-    revision: String, types: Array(Type), entities: Array(Entity), datasets: Array(t::Declaration),
+    revision: String, entities: Array(Entity), datasets: Array(t::Declaration),
     relations: Array(r::Relation), alternatives: Array(t::Alternative), links: Array(r::Link), profile: qb::PlanProfile,
 };
+# World 声明 Dataset 和关系；类型从引用自动收集。
+def define: Fn(String, Array(t::Declaration), Array(r::Relation), Array(t::Alternative), Array(r::Link), qb::PlanProfile) -> World = fn(revision, datasets, relations, alternatives, links, profile) {
+    {revision, datasets, relations, alternatives, links, profile, entities: []}
+};
+def with_entities: Fn(World, Array(Entity)) -> World = fn(world, entities) { world <~ {entities} };
+def resolved_entities: Fn(World) -> Array(Entity) = fn(world) {
+    let roles = array::flat_map(world.datasets, fn(d) { array::concat([d.dataset.roles,
+        array::flat_map(d.groups, g::binding_roles)]) });
+    let entries = array::concat([world.entities, array::map(roles, fn(r) { {id: r.entity, identity: r.identity}.ty!(Entity) })]);
+    pipeline::run(pipeline::from_array(entries) |> pipeline::distinct_by(fn(e) { e.id }) |> pipeline::collect())
+};
+def resolved_types: Fn(World) -> Array(Type) = fn(world) {
+    fk::discover_types(array::concat([fk::declaration_types(world.datasets),
+        array::map(resolved_entities(world), fn(e) { e.identity })]))
+};
+type ResolvedWorld = struct { model: World, types: Array(Type), entities: Array(Entity) };
 type Issue = struct { code: String, path: String, message: String };
 def issue: Fn(String, String, String) -> Array(Issue) = fn(code, path, message) { [{code, path, message}] };
-def builtin: Fn(Type) -> Bool = fn(ty) { ty == Int.type || ty == Float.type || ty == Bool.type || ty == String.type };
-def named: Fn(Type) -> Bool = fn(ty) { !builtin(ty) && td::name(ty) != None };
 # 只展开定义内部的结构；到另一个具名类型即停止，不发现或收集模型节点。
-def reference_issues: Fn(World, Type, String) -> Array(Issue) = fn(world, ty, path) {
-    if builtin(ty) { [] }
-    else if named(ty) {
-        if array::any(world.types, fn(provided) { provided == ty }) { [] }
-        else { issue("missing_type", path, `type \{k::type_id(ty)} is not provided`) }
-    } else { array::flat_map(k::type_dependencies(ty), fn(child) { reference_issues(world, child, path) }) }
+def reference_issues: Fn(ResolvedWorld, Type, String) -> Array(Issue) = fn(world, ty, path) {
+    let referenced = fti::generate_field_type_info(fti::memorizer, ty).0;
+    array::flat_map(referenced, fn(required) {
+        if array::any(world.types, fn(provided) { provided == required }) { [] }
+        else { issue("missing_type", path, `type \{k::type_id(required)} is not provided`) }
+    })
 };
 def binding_types: Fn(g::BindingFacts) -> Array(Type) = fn(binding) {
     array::concat([[binding.row], array::flat_map(binding.members, fn(member) {
@@ -40,7 +55,7 @@ def binding_types: Fn(g::BindingFacts) -> Array(Type) = fn(binding) {
         _ => [],
     }])
 };
-def role_issues: Fn(World, m::PreparedRole, String) -> Array(Issue) = fn(world, role, path) {
+def role_issues: Fn(ResolvedWorld, m::PreparedRole, String) -> Array(Issue) = fn(world, role, path) {
     array::concat([
         if array::any(world.entities, fn(entity) { entity.id == role.entity && entity.identity == role.identity }) { [] }
         else { issue("missing_entity", path, `entity \{role.entity} with this identity is not provided`) },
@@ -52,8 +67,8 @@ def role_issues: Fn(World, m::PreparedRole, String) -> Array(Issue) = fn(world, 
         })
     ])
 };
-def endpoint_issues: Fn(World, r::Endpoint, String) -> Array(Issue) = fn(world, endpoint, path) {
-    match array::find(world.datasets, fn(d) { d.dataset.id == endpoint.dataset.id }) {
+def endpoint_issues: Fn(ResolvedWorld, r::Endpoint, String) -> Array(Issue) = fn(world, endpoint, path) {
+    match array::find(world.model.datasets, fn(d) { d.dataset.id == endpoint.dataset.id }) {
         None => issue("missing_dataset", path, `dataset \{endpoint.dataset.id} is not provided`),
         Some(d) => if d.dataset.row != endpoint.dataset.row || d.dataset.source != endpoint.dataset.source || d.dataset.grain != endpoint.dataset.grain {
             issue("conflicting_dataset", path, "endpoint differs from the provided dataset")
@@ -64,22 +79,22 @@ def endpoint_issues: Fn(World, r::Endpoint, String) -> Array(Issue) = fn(world, 
         } },
     }
 };
-def relation_reference: Fn(World, r::Relation, String) -> Array(Issue) = fn(world, relation, path) {
-    if array::any(world.relations, fn(provided) { provided == relation }) { [] }
+def relation_reference: Fn(ResolvedWorld, r::Relation, String) -> Array(Issue) = fn(world, relation, path) {
+    if array::any(world.model.relations, fn(provided) { provided == relation }) { [] }
     else { issue("missing_relation", path, `relation \{relation.id} is not provided with this definition`) }
 };
 # 数组成员检查仅用于独立自检；后续可用 telora typeid 索引替换。
 def coverage: Fn(World) -> Array(Issue) = fn(world) {
+    let declared = world;
+    let world = {model: world, types: resolved_types(world), entities: resolved_entities(world)}.ty!(ResolvedWorld);
     array::concat([
-        array::flat_map(array::enumerate(world.types), fn(pair) {
-            let path = `types[\{pair.0}]`;
-            array::concat([
-                if !named(pair.1) { issue("invalid_type_entry", path, "provide named model types; builtins and structures are internal") } else { [] },
-                if array::any(array::enumerate(world.types), fn(other) { other.0 < pair.0 && other.1 == pair.1 }) {
-                    issue("duplicate_type", path, "type is provided more than once")
-                } else { [] },
-                array::flat_map(k::type_dependencies(pair.1), fn(child) { reference_issues(world, child, path) })
-            ])
+        array::flat_map(array::enumerate(declared.entities), fn(pair) {
+            if array::any(array::enumerate(declared.entities), fn(other) { other.0 < pair.0 && other.1.id == pair.1.id }) {
+                issue("duplicate_entity", `entities/\{pair.1.id}`, "entity id is provided more than once")
+            } else { [] }
+        }),
+        array::flat_map(world.types, fn(ty) {
+            array::flat_map(k::type_dependencies(ty), fn(child) { reference_issues(world, child, `types/\{k::type_id(ty)}`) })
         }),
         array::flat_map(array::enumerate(world.entities), fn(pair) {
             let path = `entities/\{pair.1.id}`;
@@ -88,7 +103,7 @@ def coverage: Fn(World) -> Array(Issue) = fn(world) {
                     issue("duplicate_entity", path, "entity id is provided more than once")
                 } else { [] }])
         }),
-        array::flat_map(array::enumerate(world.datasets), fn(pair) {
+        array::flat_map(array::enumerate(world.model.datasets), fn(pair) {
             let d = pair.1;
             let path = `datasets/\{d.dataset.id}`;
             let used = array::concat([[d.dataset.row], array::flat_map(d.groups, binding_types),
@@ -97,7 +112,7 @@ def coverage: Fn(World) -> Array(Issue) = fn(world) {
                 array::map(d.scope, fn(s) { s.column.value }), array::map(d.field_counts, fn(c) { c.value }),
                 array::flat_map(d.native_pairs, fn(p) { array::concat([binding_types(p.first), binding_types(p.second)]) })]);
             array::concat([
-                if array::any(array::enumerate(world.datasets), fn(other) { other.0 < pair.0 && other.1.dataset.id == d.dataset.id }) {
+                if array::any(array::enumerate(world.model.datasets), fn(other) { other.0 < pair.0 && other.1.dataset.id == d.dataset.id }) {
                     issue("duplicate_dataset", path, "dataset id is provided more than once")
                 } else { [] },
                 array::flat_map(used, fn(ty) { reference_issues(world, ty, path) }),
@@ -106,19 +121,19 @@ def coverage: Fn(World) -> Array(Issue) = fn(world) {
                 })
             ])
         }),
-        array::flat_map(array::enumerate(world.relations), fn(pair) {
+        array::flat_map(array::enumerate(world.model.relations), fn(pair) {
             let relation = pair.1;
             let path = `relations/\{relation.id}`;
             array::concat([
-                if array::any(array::enumerate(world.relations), fn(other) { other.0 < pair.0 && other.1.id == relation.id }) {
+                if array::any(array::enumerate(world.model.relations), fn(other) { other.0 < pair.0 && other.1.id == relation.id }) {
                     issue("duplicate_relation", path, "relation id is provided more than once")
                 } else { [] },
                 endpoint_issues(world, relation.from, `\{path}/from`), endpoint_issues(world, relation.to, `\{path}/to`),
                 match relation.guard { Some(guard) => reference_issues(world, guard.column.value, path), None => [] }
             ])
         }),
-        array::flat_map(world.alternatives, fn(a) { array::flat_map(a.choices, fn(choice) { relation_reference(world, choice, `alternatives/\{a.id}`) }) }),
-        array::flat_map(world.links, fn(link) { array::concat([
+        array::flat_map(world.model.alternatives, fn(a) { array::flat_map(a.choices, fn(choice) { relation_reference(world, choice, `alternatives/\{a.id}`) }) }),
+        array::flat_map(world.model.links, fn(link) { array::concat([
             relation_reference(world, link.a, `links/\{link.id}/a`), relation_reference(world, link.z, `links/\{link.id}/z`),
             match link.guard { Some(guard) => reference_issues(world, guard.column.value, `links/\{link.id}`), None => [] }
         ]) })
@@ -126,31 +141,28 @@ def coverage: Fn(World) -> Array(Issue) = fn(world) {
 };
 def self_check: Fn(World) -> Bool = fn(world) {
     let issues = coverage(world);
-    if issues != [] { fail!("explicit world does not cover its definitions", issues) } else { () };
-    array::map(world.entities, fn(entity) { m::validate_identity(entity.identity) });
+    if issues != [] { fail!("world does not cover its definitions", issues) } else { () };
+    array::map(resolved_entities(world), fn(entity) { m::validate_identity(entity.identity) });
     t::self_check(world.revision, world.datasets, world.relations, world.alternatives, world.links, world.profile)
-};
-# 结构投影可重复，不使用全局 visited；静态 JS 按结构标识整理节点。
-def local_structure: Fn(Type) -> Array(Type) = fn(ty) {
-    if builtin(ty) || named(ty) { [] }
-    else { array::concat([[ty], array::flat_map(k::type_dependencies(ty), local_structure)]) }
-};
-def knowledge_types: Fn(World) -> Array(Type) = fn(world) {
-    array::concat([[type_entry(Int.type), type_entry(Float.type), type_entry(Bool.type), type_entry(String.type)], array::flat_map(world.types, fn(ty) {
-        array::concat([[ty], array::flat_map(k::type_dependencies(ty), local_structure)])
-    })])
 };
 def prepare: Fn(World) -> t::Prepared = fn(world) {
     t::build(world.revision, world.datasets, world.relations, world.alternatives, world.links, world.profile)
         <~ {relations: world.relations}
 };
 def publication: Fn(World, t::Prepared) -> Value = fn(world, prepared) {
-    k::publication_from(prepared, knowledge_types(world), array::map(world.entities, fn(entity) { (entity.id, entity.identity) }))
+    let entities = resolved_entities(world);
+    let source_types = array::concat([fk::declaration_types(world.datasets), array::map(entities, fn(e) { e.identity })]);
+    let types = fk::discover_types(source_types);
+    fk::publication_from(prepared, types, array::map(entities, fn(entity) { (entity.id, entity.identity) }), source_types)
 };
-def stage: for(B) Fn(World, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, program) {
+def stage_prepared: for(B) Fn(World, Fn() -> t::Prepared, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, prepare_model, program) {
     build::stage(fn() {
-        let prepared = prepare(world);
+        let prepared = prepare_model();
         {runtime: prepared.payload, information: {"ontology.knowledge": publication(world, prepared)}}
     }, program)
 };
-pub use self::{type_entry, Entity, entity, World, Issue, coverage, self_check, prepare, publication, stage};
+def stage: for(B) Fn(World, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, program) {
+    stage_prepared(world, fn() { prepare(world) }, program)
+};
+pub use self::{Entity, entity, World, define, with_entities,
+    resolved_types, resolved_entities, Issue, coverage, self_check, prepare, publication, stage, stage_prepared};

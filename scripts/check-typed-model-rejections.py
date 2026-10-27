@@ -11,9 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 temp_root = Path(os.environ.get("TMPDIR") or Path.home() / ".cache/tmp")
 cases = {
     "numeric_group_value_type": 'pub def bad: g::Binding(gf::MillisRow) = g::numeric_binding(gf::millis, g::numeric_group("rates", q::BytesPerSecond.type, [g::Statistic::Mean]), gf::ms_amount, [{member: g::Statistic::Mean, publish: "rate"}]);',
-    "sample_quantity_type": 'pub def bad: ontology::experimental::samples::Binding(gf::MillisRow) = ontology::experimental::samples::bind(gf::millis, ontology::experimental::samples::group("rate", q::BytesPerSecond.type, ontology::experimental::samples::Statistic::Mean, [], None), model::optional_field(gf::MillisRow.type, q::Bytes.type, "rx"), []);',
-    "utc_local_clock_type": 'pub def bad: ontology::experimental::scalars::EpochMillis = ontology::experimental::scalars::DateTime("2024-02-29 12:00:00");',
-    "ipv4_requires_text": 'pub def bad: g::Expr(gf::MillisRow, ontology::experimental::scalars::Ipv4) = g::ipv4(gf::ms_amount);',
+    "sample_quantity_type": 'pub def bad: ontology::samples::Binding(gf::MillisRow) = ontology::samples::bind(gf::millis, ontology::samples::group("rate", q::BytesPerSecond.type, ontology::samples::Statistic::Mean, [], None), model::optional_field(gf::MillisRow.type, q::Bytes.type, "rx"), []);',
+    "utc_local_clock_type": 'pub def bad: ontology::scalars::EpochMillis = ontology::scalars::DateTime("2024-02-29 12:00:00");',
+    "ipv4_requires_text": 'pub def bad: g::Expr(gf::MillisRow, ontology::scalars::Ipv4) = g::ipv4(gf::ms_amount);',
     "column_row_owner": 'pub def bad: transform::ColumnMapping(gf::SecondsRow) = transform::column(model::field(gf::MillisRow.type, q::Bytes.type, "tx"), "BYTES");',
     "nominal_value": 'pub def bad: f::DeviceId = f::TenantId("T1");',
     "identity_member": """pub def bad: model::IdentityPart(f::Inventory, f::DeviceIdentity) = model::identity_part(
@@ -50,8 +50,8 @@ with tempfile.TemporaryDirectory(prefix="typed-model-rejections-", dir=temp_root
         shutil.copytree(ROOT / crate / "src", target / "src")
     tests = workspace / "relation_model/tests"
     tests.mkdir()
-    prelude = "mod fixture;\nmod group_fixture;\nuse self::fixture as f;\nuse self::group_fixture as gf;\nuse ontology::experimental::model as model;\nuse ontology::experimental::quantity as q;\nuse ontology::experimental::groups as g;\n"
-    prelude += "use ontology::experimental::relations as r;\nuse ontology::experimental::transform as transform;\nuse ontology::ontology as edsl;\n"
+    prelude = "mod fixture;\nmod group_fixture;\nuse self::fixture as f;\nuse self::group_fixture as gf;\nuse ontology::model as model;\nuse ontology::quantity as q;\nuse ontology::groups as g;\n"
+    prelude += "use ontology::relations as r;\nuse ontology::transform as transform;\nuse ontology::ontology as edsl;\n"
     # 先用同一映射的合法版本确认测试工作区可解析和类型闭包成立。
     control = prelude + "pub def good: model::Role(f::Inventory) = model::role(f::inventory, f::device, \"device\", False, f::inventory_parts);\n"
     control += 'pub def group_good: g::Binding(gf::MillisRow) = g::transfer_binding(gf::millis, g::transfer, gf::ms_amount, gf::ms_duration, gf::names("rx"));\n'

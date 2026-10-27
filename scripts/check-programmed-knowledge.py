@@ -48,9 +48,9 @@ def normalize(p):
  return {**p,'facts':sorted([{**f,'references':sorted(set(f['references']))} for f in facts],key=lambda f:f['key'])}
 report={'workspace':str(workspace),'model':args.package,'variants':{}}
 print(json.dumps(report),flush=True)
-factory=workspace/'ontology/src/experimental/build.telora';source=factory.read_text();graphs={}
+factory=workspace/'ontology/src/build.telora';source=factory.read_text();graphs={}
 for variant in ['baseline','programmed']:
- factory.write_text(source.replace('knowledge::publication(prepared)','knowledge::export(prepared)') if variant=='baseline' else source)
+ factory.write_text(source.replace('knowledge_world::publication(knowledge_world::define(prepared.payload.revision, prepared.declarations, prepared.relations, prepared.alternatives, [], prepared.payload.profile), prepared)','knowledge::export(prepared)') if variant=='baseline' else source)
  artifact=workspace/f'{variant}.wasm'
  if variant=='baseline' and args.reuse:
   stderr=(workspace/f'{variant}.log').read_text()
