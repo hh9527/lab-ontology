@@ -112,7 +112,7 @@ function entity(s, r) {
   merge(s, address('entities', r.entity), { identity: typeref(s, r.identity) }, typerefs(s, r.identity));
 }
 function dataset(s, d) {
-  merge(s, address('datasets', d.id), { source: d.source, row: typeref(s, d.row), grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock }, typerefs(s, d.row));
+  merge(s, address('datasets', d.id), { source: d.source, row: typeref(s, d.row), grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [] }, typerefs(s, d.row));
   for (const r of d.roles) {
     merge(s, member(d.id, 'roles', r.id), { entity: address('entities', r.entity), identity: typeref(s, r.identity), optional: r.optional,
       parts: r.parts.map(p => ({ ...p, type: typeref(s, p.type), raw: p.raw === null ? null : typeref(s, p.raw) })) },

@@ -12,13 +12,13 @@ const instants = [
   '2000-02-29T23:59:59Z', '2024-02-29T23:59:59Z', '2024-03-01T00:00:00Z',
   '2024-12-31T23:59:59Z', '2025-01-01T00:00:00Z', '9999-12-31T23:59:59Z',
 ];
-const rows = instants.map((ts, index) => [index, ts, Date.parse(ts), ts.slice(0, 10), index + 1]);
+const rows = instants.map((ts, index) => [index, new Date(ts).toISOString(), Date.parse(ts), ts.slice(0, 10), index + 1]);
 rows.push([rows.length, '1969-12-31T23:59:59Z', -1, '1969-12-31', 10]);
 rows.push([rows.length, null, null, null, 10]);
 rows.push([rows.length, null, -62135596800001, null, 10]);
 rows.push([rows.length, null, 253402300800000, null, 10]);
-for (const [ts, value] of [['2024-02-29T12:00:00Z', 30], ['2024-03-02T00:00:00Z', 999]]) {
-  rows.push([rows.length, ts, Date.parse(ts), ts.slice(0, 10), value]);
+for (const [ts, value] of [['2024-02-29T12:00:00Z', 30], ['2024-03-02T00:00:00Z', 999], ['2024-02-29T23:59:59.999Z', 19], ['2024-03-01T00:00:00.001Z', 9]]) {
+  rows.push([rows.length, new Date(ts).toISOString(), Date.parse(ts), ts.slice(0, 10), value]);
 }
 const expected = (row, encoding, unit) => {
   const input = row[encoding === 'datetime' ? 1 : encoding === 'epoch' ? 2 : 3];
@@ -30,13 +30,13 @@ const expected = (row, encoding, unit) => {
   date.setUTCMinutes(0, 0, 0);
   if (unit !== 'hour') date.setUTCHours(0);
   if (encoding === 'epoch') return date.getTime();
-  const iso = date.toISOString().replace('.000Z', 'Z');
+  const iso = date.toISOString();
   return encoding === 'date' ? iso.slice(0, 10) : iso;
 };
 const normalized = (result, encoding) => result.map(row => {
   const value = Object.values(row)[0];
   return value === null ? null : encoding === 'epoch' ? Number(value)
-    : value instanceof Date ? value.toISOString().replace('.000Z', 'Z') : value;
+    : value instanceof Date ? value.toISOString() : value;
 }).sort((a, b) => a === null ? b === null ? 0 : -1 : b === null ? 1 : a < b ? -1 : a > b ? 1 : 0);
 const db = new DatabaseSync(':memory:');
 let pg;
@@ -62,21 +62,21 @@ try {
       assert.equal(type, { datetime: 'timestamp with time zone', date: 'date', epoch: 'bigint' }[spec.encoding]);
       // Serialize native PG results explicitly; JS date parsers mishandle years 0001..0099.
       const projection = spec.encoding === 'datetime'
-        ? `to_char(${value} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`
+        ? `to_char(${value} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`
         : spec.encoding === 'date' ? `to_char(${value}, 'YYYY-MM-DD')` : value;
       const actual = await pg.query(`SELECT ${projection} AS value FROM (${spec.postgres.sql}) AS t`, spec.postgres.bindings);
       assert.deepEqual(normalized(actual.rows, spec.encoding), wanted,
         `PostgreSQL ${timezone} ${spec.encoding}/${spec.unit}`);
     }
   }
-  const wantedGroups = [['2024-02-29T00:00:00Z', 19], ['2024-03-01T00:00:00Z', 9]];
+  const wantedGroups = [['2024-02-29T00:00:00.000Z', 19], ['2024-03-01T00:00:00.000Z', 9]];
   const groupedRows = result => result.map(row => [row.s_sample_datetime_day instanceof Date
-    ? row.s_sample_datetime_day.toISOString().replace('.000Z', 'Z') : row.s_sample_datetime_day, row.s_sample_mean])
+    ? row.s_sample_datetime_day.toISOString() : row.s_sample_datetime_day, row.s_sample_mean])
     .sort((a, b) => a[0].localeCompare(b[0]));
   assert.deepEqual(groupedRows(db.prepare(grouped.sqlite.sql).all(...grouped.sqlite.bindings)), wantedGroups);
   if (pg) for (const timezone of ['UTC', 'Asia/Shanghai', 'America/New_York']) {
     await pg.exec(`SET TIME ZONE '${timezone}'`);
-    const sql = `SELECT to_char(t.s_sample_datetime_day AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS s_sample_datetime_day,
+    const sql = `SELECT to_char(t.s_sample_datetime_day AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS s_sample_datetime_day,
       t.s_sample_mean FROM (${grouped.postgres.sql}) AS t`;
     assert.deepEqual(groupedRows((await pg.query(sql, grouped.postgres.bindings)).rows), wantedGroups);
   }

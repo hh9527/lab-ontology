@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { normalizeUtcMillis } from './utc-milliseconds.mjs';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const quote = name => `"${name.replaceAll('"', '""')}"`;
-const iso = ms => new Date(ms).toISOString().replace('.000Z', 'Z');
+const iso = ms => new Date(ms).toISOString();
 const hash = data => createHash('sha256').update(data).digest('hex');
 const wire = value => Object.values(value)[0];
 const leaves = key => key.Eq ? [key.Eq] : Object.values(key).flatMap(parts => parts.flatMap(leaves));
@@ -31,30 +31,64 @@ const profiles = {
     avgwriteiosize: [[410, 80], [200, 48], [48, 24]],
   },
 };
+const resourceNames = {
+  X_TENANT_VIEW: '企业租户', X_SITE_VIEW: '园区站点', I_EntNetworkElement: '园区交换机',
+  PhysicalServer: '业务服务器', HuaweiStorageDevice: '存储阵列', FCSwitchDevice: '存储交换机',
+  I_EntPonElement: '光接入设备', I_EntCollaborationElement: '会议终端',
+  I_EnterpriseNetworkLTP: '网络接口', I_EnterpriseSlot: '设备板卡', SYS_StorageDisk: '存储磁盘',
+};
 
-export function metricValue(table, column, index, sample, interval, random, samples = 1) {
-  const daily = Math.sin(sample * interval / 86400000 * 2 * Math.PI);
+export function metricValue(table, column, index, sample, interval, random, samples = 1, startMs = 0) {
+  const elapsed = sample * interval;
+  // A synthetic UTC+08 business clock: peaks around afternoon, quiet nights,
+  // lower weekends and occasional resource-specific incidents.
+  const clock = new Date(startMs + elapsed + 8 * 3600000);
+  const hour = clock.getUTCHours() + clock.getUTCMinutes() / 60;
+  const daily = Math.cos((hour - 14 - index % 4 * 0.3) / 24 * 2 * Math.PI);
+  const weekday = ![0, 6].includes(clock.getUTCDay());
+  const incident = (Math.floor(elapsed / 86400000) + index) % 11 === 3
+    ? Math.exp(-Math.pow((hour - 15) / 1.2, 2)) : 0;
+  const progress = sample / Math.max(1, samples - 1);
+  const trend = progress * [18, -12, 2][index % 3];
+  const load = (0.28 + 0.6 * (daily + 1) / 2) * (weekday ? 1 : 0.76);
+  const variation = Math.sin(elapsed / 3600000 * 0.73 + index) * 0.7;
   const profile = profiles[table]?.[column]?.[index % 3];
   if (/effcnt$/i.test(column)) return 1;
+  const noise = (random() - 0.5) * 1.2;
   if (profile) {
-    const number = Math.max(0, profile[0] + profile[1] * daily + random());
+    const number = Math.max(0, profile[0] + profile[1] * daily + trend * 0.25
+      + (index % 7 - 3) * 0.5 + variation + noise + incident * profile[1]);
     return /power|iosize/i.test(column) ? number : Math.min(100, number);
   }
-  if (/onlineRate/i.test(column)) return index % 6 === 5 && sample * interval % 86400000 < 4 * 3600000 ? 0 : 100;
-  if (/count/i.test(column)) return 8 + index % 8;
-  if (/optics.*power|rssi|noise/i.test(column)) return -20 + daily * 3;
+  if (/onlineRate/i.test(column)) return index % 6 === 5 && elapsed % 86400000 < 4 * 3600000 || incident > 0.7 ? 0 : 100;
+  if (/optics.*power/i.test(column)) return (/tx/i.test(column) ? -4 : -20) + daily * 1.5 - incident * 3;
+  if (/rssi/i.test(column)) return -65 + daily * 7 - incident * 8;
+  if (/noise/i.test(column)) return -96 + daily * 3 + incident * 7;
+  if (/temperature/i.test(column)) return 33 + load * 25 + index % 5 + incident * 20 + noise;
+  if (/loss|retry.*rate|PortPER/i.test(column)) return Math.max(0, 0.08 + load * 0.15 + incident * 3 + noise * 0.03);
+  if (/errors?|BipError/i.test(column)) return Math.round(load * 2 + incident * (20 + index % 5));
+  if (/jitter/i.test(column)) return 0.3 + load * 2 + incident * 12;
+  if (/delay|PingRespTime/i.test(column)) return 2 + load * 12 + incident * 80;
+  if (/^(portCount|adminStatusCount)$/i.test(column)) return 48;
+  if (/^(portUsedCount|operStatusCount)$/i.test(column)) return Math.round(48 * load);
+  if (/count|Terminals/i.test(column)) return Math.round(8 + (20 + index % 8 * 8) * load + incident * 10);
+  if (/speed|traffic|octets|bytes|Ethport.*Rate/i.test(column)) {
+    const scale = /bytes|octets(?!speed)/i.test(column) ? 100000000 : 100000;
+    return Math.max(0, scale * (1 + index % 6 * 0.35) * (load + incident * 0.25 + noise * 0.005));
+  }
   if (/power/i.test(column)) return 150 + index * 10 + daily * 20;
   // High/mid/low populations make both sides of CPU/utilization thresholds reachable.
-  return Math.max(0, Math.min(100, [70, 45, 15][index % 3] + daily * 8 + sample / Math.max(1, samples - 1) * [20, -15, 0][index % 3] + random()));
+  return Math.max(0, Math.min(100, [68, 45, 18][index % 3] + daily * 9 + trend
+    + (index % 7 - 3) * 0.8 + variation + noise + incident * 18));
 }
 
 export function loadModel() {
-  const result = spawnSync(join(root, 'bin/telora'), ['-C', 'icloud_model', 'eval', '@src/source_audit:report',
-    '--initialization-fuel', '100000', '--request-fuel', '100000', '--with-memory-limit', '2048'],
-  { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(result.stderr || 'Model export failed');
-  return JSON.parse(result.stdout);
+  const contract = JSON.parse(readFileSync(join(root, 'icloud_model/data/generation-contract.json')));
+  if (contract.format !== 'icloud-generation-contract/v1') throw new Error('Unsupported IC generation contract');
+  if (contract.catalogSha256 !== hash(readFileSync(join(root, 'icloud_model/data/source_catalog.json')))) {
+    throw new Error('Stale IC generation contract: update generation-contract.json with source_catalog.json');
+  }
+  return contract.model;
 }
 
 function grain(dataset) {
@@ -71,15 +105,13 @@ function grain(dataset) {
 }
 
 export function generate(options, model = loadModel()) {
-  const { output, seed, resources, days, intervalMinutes, anchor, storageGapHours = 0 } = options;
+  const { output, seed, resources, days, intervalMinutes, anchor: inputAnchor, storageGapHours = 0, alarmsPerResourcePerDay = 2 } = options;
+  const anchor = normalizeUtcMillis(inputAnchor);
   const anchorMs = Date.parse(anchor);
-  for (const [name, value] of Object.entries({ seed, resources, days, intervalMinutes })) {
+  for (const [name, value] of Object.entries({ seed, resources, days, intervalMinutes, alarmsPerResourcePerDay })) {
     if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
   }
   if (seed > 0xffffffff) throw new Error('seed must fit an unsigned 32-bit integer');
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(anchor) || !Number.isFinite(anchorMs) || iso(anchorMs) !== anchor) {
-    throw new Error('anchor must be a valid UTC timestamp: YYYY-MM-DDTHH:MM:SSZ');
-  }
   if (!Number.isSafeInteger(storageGapHours) || storageGapHours < 0 || storageGapHours >= days * 24) {
     throw new Error('storageGapHours must be a nonnegative safe integer smaller than the KPI window in hours');
   }
@@ -87,6 +119,7 @@ export function generate(options, model = loadModel()) {
   const samples = Math.ceil(days * 86400000 / interval);
   if (resources < 6) throw new Error('resources must be at least 6 to cover PON and polymorphic scenarios');
   if (samples * resources * 18 > 10000000) throw new Error('Requested data exceeds 10 million KPI rows');
+  if ((days + 1) * resources * alarmsPerResourcePerDay * 1.6 > 1000000) throw new Error('Requested data exceeds 1 million alarm rows');
   if (existsSync(output)) throw new Error(`Output already exists: ${output}`);
   const catalogBytes = readFileSync(join(root, 'icloud_model/data/source_catalog.json'));
   const catalog = JSON.parse(catalogBytes);
@@ -129,7 +162,7 @@ export function generate(options, model = loadModel()) {
     if (/^(id|resId|CSN|TENANT_ID|oriResId|frameDn)$/i.test(column)) return id(dataset.table, index);
     if (/ipAddress|IPADDRESS/i.test(column)) return `192.0.2.${index % 254 + 1}`;
     if (/mac/i.test(column)) return `02:00:00:00:${Math.floor(index / 256).toString(16).padStart(2, '0')}:${(index % 256).toString(16).padStart(2, '0')}`;
-    if (/name/i.test(column)) return `${dataset.table} ${index + 1}`;
+    if (/name/i.test(column)) return `${resourceNames[dataset.table] ?? dataset.table}-${String(index + 1).padStart(2, '0')}`;
     return `${column}-${index + 1}`;
   }
   for (const [table, dataset] of tables) {
@@ -219,28 +252,48 @@ export function generate(options, model = loadModel()) {
     });
   });
   const gapEnds = new Map(seriesGaps.map(gap => [gap.resId, Date.parse(gap.endExclusive)]));
-  const alarms = rows.get('T_CURRENT_ALARM');
-  alarms.forEach((row, index) => {
-    const ownerTable = ['I_EntNetworkElement', 'PhysicalServer', 'HuaweiStorageDevice', 'I_EntPonElement', 'FCSwitchDevice', 'I_EntCollaborationElement'][index % 6];
-    const owner = rows.get(ownerTable)[index];
-    row.MEDN = owner.id;
-    row.TENANTID = owner.tenantId;
-    row.STREXT13 = owner.projectId ?? id('X_SITE_VIEW', index);
-    row.MENAME = owner.name;
-    row.CSN = index + 1;
-    row.SEVERITY = index % 4 + 1;
-    row.ACKED = index % 2;
-    row.CLEARED = index % 3 === 0 ? 1 : 0;
-    const recentSamples = Math.max(1, Math.min(samples, Math.floor(45 * 86400000 / interval)));
-    const occur = Math.min((gapEnds.get(owner.id) ?? anchorMs) - 120001, anchorMs - days * 86400000 + (samples - 1 - index % recentSamples) * interval);
-    for (const column of ['OCCURUTC', 'OCCURTIME', 'LATESTOCCURUTC', 'LATESTOCCURTIME']) row[column] = occur;
-    row.ARRIVEUTC = occur + 1000;
-    row.ACKUTC = row.ACKED ? occur + 60000 : 0;
-    row.CLEARUTC = row.CLEARED ? occur + 120000 : 0;
-    row.CLEARTIME = row.CLEARUTC;
-    row.ENDUTC = row.CLEARUTC;
-    row.COMMENTUTC = row.ACKUTC;
-  });
+  const alarmTemplates = rows.get('T_CURRENT_ALARM');
+  const alarms = [];
+  const startMs = anchorMs - days * 86400000;
+  for (let day = Math.floor(startMs / 86400000) * 86400000, dayIndex = 0; day < anchorMs; day += 86400000, dayIndex++) {
+    const begin = Math.max(startMs, day);
+    const end = Math.min(anchorMs, day + 86400000);
+    const weekday = ![0, 6].includes(new Date(day).getUTCDay());
+    const volume = resources * alarmsPerResourcePerDay;
+    const count = Math.max(6, Math.round(volume * (weekday ? 1.1 : 0.8)
+      * (1 + 0.18 * Math.sin(dayIndex * 0.8) + (dayIndex % 13 === 4 ? 0.35 : 0))));
+    for (let slot = 0; slot < count; slot++) {
+      const row = { ...alarmTemplates[slot % alarmTemplates.length] };
+      const index = (Math.floor(slot / 6) + dayIndex * 5) % resources;
+      const eventIndex = alarms.length;
+      const family = ['I_EntNetworkElement', 'PhysicalServer', 'HuaweiStorageDevice', 'I_EntPonElement', 'FCSwitchDevice', 'I_EntCollaborationElement'][slot % 6];
+      const owner = rows.get(family)[index];
+      row.MEDN = owner.id;
+      row.TENANTID = owner.tenantId;
+      row.STREXT13 = owner.projectId ?? id('X_SITE_VIEW', index);
+      row.MENAME = owner.name;
+      row.CSN = eventIndex + 1;
+      const severity = (slot * 7 + dayIndex * 11) % 20;
+      row.SEVERITY = severity < 2 ? 1 : severity < 7 ? 2 : severity < 15 ? 3 : 4;
+      const recent = dayIndex >= days - 2;
+      row.ACKED = (slot + dayIndex) % 5 === 0 ? 0 : 1;
+      row.CLEARED = (slot + dayIndex) % (recent ? 3 : 13) === 0 ? 0 : 1;
+      row.ALARMNAME = ['CPU 利用率过高', '内存使用率过高', '链路质量下降', '设备短时离线', '设备温度过高', '端口错误率升高'][Math.floor(slot / 6) % 6];
+      row.LOCATION = owner.projectId ?? owner.name;
+      const duration = Math.min(120000, Math.max(0, end - begin - 1));
+      const occur = Math.max(startMs, Math.min((gapEnds.get(owner.id) ?? anchorMs) - duration - 1,
+        Math.floor(begin + (slot + 0.2 + random() * 0.6) / count * Math.max(1, end - begin - duration))));
+      for (const column of ['OCCURUTC', 'OCCURTIME', 'LATESTOCCURUTC', 'LATESTOCCURTIME']) row[column] = occur;
+      row.ARRIVEUTC = occur + Math.min(1000, duration);
+      row.ACKUTC = row.ACKED ? occur + Math.floor(duration / 2) : 0;
+      row.CLEARUTC = row.CLEARED ? occur + duration : 0;
+      row.CLEARTIME = row.CLEARUTC;
+      row.ENDUTC = row.CLEARUTC;
+      row.COMMENTUTC = row.ACKUTC;
+      alarms.push(row);
+    }
+  }
+  rows.set('T_CURRENT_ALARM', alarms);
   rows.get('I_EnterpriseFrame').at(-1).remark = null;
   mkdirSync(dirname(output), { recursive: true });
   const staging = mkdtempSync(join(dirname(output), '.icloud-data-'));
@@ -267,7 +320,7 @@ export function generate(options, model = loadModel()) {
           if (metric) {
             row.ts = iso(startMs + sample * interval);
             for (const field of dataset.fields) if (metricColumns.has(field.column)) {
-              let number = metricValue(table, field.column, index, sample, interval, random, samples);
+              let number = metricValue(table, field.column, index, sample, interval, random, samples, startMs);
               if (field.scalar === 'Int') number = Math.round(number);
               if (field.scalar === 'Float') number = Number(number.toFixed(3));
               if (field.scalar === 'Int' || field.scalar === 'Float') row[field.column] = number;
@@ -300,14 +353,15 @@ export function generate(options, model = loadModel()) {
       for (const owner of ['resId', 'parentId']) if (dataset.fields.some(field => field.column === owner)) index(table, [owner, 'ts']);
     }
     db.exec('COMMIT; ANALYZE');
-    const checks = validate(db, model, counts, { anchor });
-    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length || checks.invalidMetricScenarios.length || checks.invalidAlarmTimes.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
+    const checks = validate(db, model, counts, { anchor, start: iso(startMs) });
+    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length || checks.invalidMetricScenarios.length || checks.invalidAlarmTimes.length || checks.missingAlarmDays.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
+    const alarmDays = db.prepare("SELECT date(OCCURUTC / 1000,'unixepoch') day, count(*) alarms, sum(SEVERITY='1') critical, sum(CLEARED=0) uncleared FROM T_CURRENT_ALARM GROUP BY day ORDER BY day").all();
     db.close();
     db = undefined;
     const manifest = {
       format: 'icloud-synthetic-data/v1', revision: model.revision,
-      options: { seed, resources, days, intervalMinutes, anchor, storageGapHours },
-      generation: { revision: 2, profile: 'corpus-inspired', seriesGaps },
+      options: { seed, resources, days, intervalMinutes, anchor: inputAnchor, storageGapHours, alarmsPerResourcePerDay },
+      generation: { revision: 3, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
       window: { start: iso(startMs), endExclusive: anchor, samplesPerSeries: samples },
       catalogSha256: hash(catalogBytes), modelSha256: hash(JSON.stringify(model)),
       database: { file: 'icloud.sqlite', sha256: hash(readFileSync(databasePath)) },
@@ -352,15 +406,22 @@ function relationSQL(key) {
   return `(${parts.map(relationSQL).join(operator === 'And' ? ' AND ' : ' OR ')})`;
 }
 
-export function validate(db, model, counts, { anchor } = {}) {
+export function validate(db, model, counts, { anchor, start } = {}) {
   const checks = { integrity: db.prepare('PRAGMA integrity_check').get().integrity_check,
     emptyTables: [], emptyCarriers: [], invalidTimes: [], invalidEnums: [], relations: [],
     missingCpuSeries: [], alarmsWithoutCpuSamples: [], unsupportedAlarmCpuResources: [],
-    invalidMetricScenarios: [], invalidAlarmTimes: [] };
+    invalidMetricScenarios: [], invalidAlarmTimes: [], missingAlarmDays: [] };
+  if (start && anchor) {
+    const present = new Set(db.prepare("SELECT DISTINCT date(OCCURUTC / 1000,'unixepoch') day FROM T_CURRENT_ALARM").all().map(row => row.day));
+    for (let day = Math.floor(Date.parse(start) / 86400000) * 86400000; day < Date.parse(anchor); day += 86400000) {
+      if (!present.has(iso(day).slice(0, 10))) checks.missingAlarmDays.push(iso(day).slice(0, 10));
+    }
+  }
   for (const [table, predicate] of [
     ['ServerDeviceKPI', 'peakPower < averagePower OR systemPower < 0 OR averagePower < 0'],
     ['StorageHardDriveKPI', 'utility < 0 OR utility > 100 OR avgreadiosize < 0 OR avgwriteiosize < 0'],
     ['StorageDeviceKPI', 'cpuusage < 0 OR cpuusage > 100 OR memoryusage < 0 OR memoryusage > 100'],
+    ['NetworkDeviceKPI', 'portUsedCount < 0 OR portUsedCount > portCount OR operStatusCount > portCount OR cpuUsage < 0 OR cpuUsage > 100'],
   ]) {
     const invalid = db.prepare(`SELECT count(*) n FROM ${quote(table)} WHERE ${predicate}`).get().n;
     if (invalid) checks.invalidMetricScenarios.push({ table, invalid });
@@ -368,8 +429,9 @@ export function validate(db, model, counts, { anchor } = {}) {
   const invalidAlarms = db.prepare(`SELECT CSN FROM T_CURRENT_ALARM WHERE ARRIVEUTC < OCCURUTC
     OR (ACKED=1 AND ACKUTC < OCCURUTC) OR (CLEARED=1 AND CLEARUTC < OCCURUTC)
     OR (ACKED=0 AND ACKUTC != 0) OR (CLEARED=0 AND CLEARUTC != 0)
-    ${anchor ? 'OR max(OCCURUTC, ARRIVEUTC, LATESTOCCURUTC, ACKUTC, CLEARUTC) >= ?' : ''}`)
-    .all(...(anchor ? [Date.parse(anchor)] : []));
+    ${anchor ? 'OR max(OCCURUTC, ARRIVEUTC, LATESTOCCURUTC, ACKUTC, CLEARUTC) >= ?' : ''}
+    ${start ? 'OR OCCURUTC < ?' : ''}`)
+    .all(...(anchor ? [Date.parse(anchor)] : []), ...(start ? [Date.parse(start)] : []));
   checks.invalidAlarmTimes.push(...invalidAlarms.map(row => row.CSN));
   const cpuSources = {
     I_EntNetworkElement: 'NetworkDeviceKPI', PhysicalServer: 'ServerDeviceKPI',
@@ -379,8 +441,8 @@ export function validate(db, model, counts, { anchor } = {}) {
     const missing = db.prepare(`SELECT r.id FROM ${quote(resource)} r WHERE NOT EXISTS (SELECT 1 FROM ${quote(metric)} k WHERE k.resId=r.id)`).all();
     checks.missingCpuSeries.push(...missing.map(row => ({ resource, id: row.id, metric })));
     const missingAlarms = db.prepare(`SELECT a.CSN, a.MEDN FROM T_CURRENT_ALARM a JOIN ${quote(resource)} r ON a.MEDN=r.id
-      WHERE NOT EXISTS (SELECT 1 FROM ${quote(metric)} k WHERE k.resId=r.id AND k.ts >= strftime('%Y-%m-%dT00:00:00Z', a.OCCURUTC / 1000, 'unixepoch')
-        AND k.ts < strftime('%Y-%m-%dT00:00:00Z', a.OCCURUTC / 1000, 'unixepoch', '+1 day'))`).all();
+      WHERE NOT EXISTS (SELECT 1 FROM ${quote(metric)} k WHERE k.resId=r.id AND k.ts >= strftime('%Y-%m-%dT00:00:00.000Z', a.OCCURUTC / 1000, 'unixepoch')
+        AND k.ts < strftime('%Y-%m-%dT00:00:00.000Z', a.OCCURUTC / 1000, 'unixepoch', '+1 day'))`).all();
     checks.alarmsWithoutCpuSamples.push(...missingAlarms.map(row => ({ resource, ...row, metric })));
   }
   checks.unsupportedAlarmCpuResources = db.prepare('SELECT a.CSN, a.MEDN FROM T_CURRENT_ALARM a JOIN I_EntCollaborationElement r ON a.MEDN=r.id').all()
@@ -400,7 +462,7 @@ export function validate(db, model, counts, { anchor } = {}) {
       const column = quote(field.column);
       const test = field.time.encoding === 'EpochMillis' ? `typeof(${column}) != 'integer'`
         : field.time.encoding === 'DateText' ? `length(${column}) != 10 OR date(${column}) IS NULL`
-        : `length(${column}) != 20 OR substr(${column},11,1) != 'T' OR substr(${column},20,1) != 'Z' OR datetime(${column}) IS NULL`;
+        : `length(${column}) != 24 OR substr(${column},11,1) != 'T' OR substr(${column},20,1) != '.' OR substr(${column},21,3) GLOB '*[^0-9]*' OR substr(${column},24,1) != 'Z' OR datetime(${column}) IS NULL`;
       const invalid = db.prepare(`SELECT count(*) AS n FROM ${quote(dataset.table)} WHERE ${column} IS NOT NULL AND (${test})`).get().n;
       if (invalid) checks.invalidTimes.push({ table: dataset.table, column: field.column, invalid });
     }
@@ -441,13 +503,15 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     resources: { type: 'string', default: '12' }, days: { type: 'string', default: '32' },
     'interval-minutes': { type: 'string', default: '60' },
     'storage-gap-hours': { type: 'string', default: '0' },
+    'alarms-per-resource-per-day': { type: 'string', default: '2' },
     'anchor-utc': { type: 'string' }, help: { type: 'boolean' },
   } });
   if (values.help) {
-    console.log('Usage: node scripts/generate-icloud-data.mjs [--output DIR] [--seed N] [--resources N>=6]\n  [--days N] [--interval-minutes N] [--storage-gap-hours N] [--anchor-utc YYYY-MM-DDTHH:MM:SSZ]\nRequires Node.js 22.13+ and bin/telora. Creates icloud.sqlite, manifest.json and model.json.\nExisting output directories are preserved. Default: 12 resources/table, 32 days, hourly samples.');
+    console.log('Usage: node scripts/generate-icloud-data.mjs [--output DIR] [--seed N] [--resources N>=6]\n  [--days N] [--interval-minutes N] [--storage-gap-hours N] [--alarms-per-resource-per-day N]\n  [--anchor-utc YYYY-MM-DDTHH:MM:SSZ]\nRequires Node.js 22.13+; reads the static JSON generation contract. Creates icloud.sqlite, manifest.json and model.json.\nExisting output directories are preserved. Default: 12 resources/table, 32 days, hourly samples, alarms every day.');
   } else {
     const manifest = generate({ output: resolve(values.output), seed: Number(values.seed), resources: Number(values.resources),
       days: Number(values.days), intervalMinutes: Number(values['interval-minutes']), storageGapHours: Number(values['storage-gap-hours']),
+      alarmsPerResourcePerDay: Number(values['alarms-per-resource-per-day']),
       anchor: values['anchor-utc'] ?? iso(Math.floor(Date.now() / 60000) * 60000) });
     console.log(JSON.stringify({ output: resolve(values.output), tables: Object.keys(manifest.tables).length,
       rows: Object.values(manifest.tables).reduce((sum, count) => sum + count, 0),

@@ -1,3 +1,4 @@
+import { normalizeUtcMillis } from './utc-milliseconds.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -8,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 const modelRoot = fileURLToPath(new URL('../ns_model/', import.meta.url));
 const quote = value => `"${value.replaceAll('"', '""')}"`;
 const hash = data => createHash('sha256').update(data).digest('hex');
-const iso = ms => new Date(ms).toISOString().replace('.000Z', 'Z');
+const iso = ms => new Date(ms).toISOString();
 const key = (dataset, field) => `${dataset}/${field}`;
 const sqlTypes = { String: 'TEXT', Int: 'INTEGER', Float: 'REAL', Bool: 'INTEGER' };
 
@@ -78,8 +79,8 @@ function optionsOf(options, model, plan) {
   if (opts.seed > 0xffffffff) throw new Error('seed must fit uint32');
   const minimum = Math.max(12, ...[...plan.references.values()].map(v => v.length));
   if (opts.resources < minimum || opts.resources > 10000) throw new Error(`resources must be between ${minimum} and 10000`);
+  opts.anchor = normalizeUtcMillis(opts.anchor);
   const anchorMs = Date.parse(opts.anchor);
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(opts.anchor) || !Number.isFinite(anchorMs) || iso(anchorMs) !== opts.anchor) throw new Error('anchor must be a valid UTC timestamp: YYYY-MM-DDTHH:MM:SSZ');
   const samples = Math.ceil(opts.days * 1440 / opts.intervalMinutes);
   const startMs = anchorMs - opts.days * 86400000;
   if (!Number.isSafeInteger(startMs) || !Number.isFinite(new Date(startMs).getTime())) throw new Error('Invalid time window');
@@ -137,7 +138,7 @@ function rowFactory(model, plan, opts) {
     }
     if (domain) return domain.members[index % domain.members.length].wires[0];
     if (f.type === 's::DateTimeUtc') return iso(opts.startMs + index % opts.samples * opts.interval);
-    if (f.type === 's::DateTime') return iso(opts.startMs + index % opts.samples * opts.interval).replace('T', ' ').replace('Z', '');
+    if (f.type === 's::DateTime') return iso(opts.startMs + index % opts.samples * opts.interval).replace('T', ' ').replace(/\.\d{3}Z$/, '');
     if (f.type === 's::Date') return iso(opts.startMs + index % opts.samples * opts.interval).slice(0, 10);
     if (f.type === 's::EpochMillis' || f.sourceTimeEncoding === 'EpochMillis') return opts.startMs + index % opts.samples * opts.interval;
     if (f.metric) return metricValue(f, index, sample, opts.samples, time, random(salts.get(k), index, sample));

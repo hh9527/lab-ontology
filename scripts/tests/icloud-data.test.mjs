@@ -22,21 +22,31 @@ try {
   assert.deepEqual(first.checks.invalidEnums, []);
   assert.deepEqual(first.checks.missingCpuSeries, []);
   assert.deepEqual(first.checks.alarmsWithoutCpuSamples, []);
-  assert.equal(first.checks.unsupportedAlarmCpuResources.length, 2);
+  assert.ok(first.checks.unsupportedAlarmCpuResources.length > 2);
+  assert.deepEqual(first.checks.missingAlarmDays, []);
+  assert.equal(first.generation.alarmDays.length, 3, 'Both partial UTC boundary days need alarms');
+  assert.ok(first.generation.alarmDays.every(day => day.alarms >= 6));
+  assert.ok(first.tables.T_CURRENT_ALARM > options.resources * options.days);
   db = new DatabaseSync(join(directory, 'first/icloud.sqlite'));
+  assert.equal(db.prepare("SELECT count(DISTINCT SEVERITY) n FROM T_CURRENT_ALARM").get().n, 4);
+  assert.ok(db.prepare("SELECT count(*) n FROM T_CURRENT_ALARM WHERE ALARMNAME='CPU 利用率过高'").get().n > 0);
+  const traffic = db.prepare(`SELECT avg(CASE WHEN substr(ts,12,2)='06' THEN ifHCInOctetsSpeed END) busy,
+    avg(CASE WHEN substr(ts,12,2)='18' THEN ifHCInOctetsSpeed END) quiet FROM NetworkDeviceInterfaceKPI`).get();
+  assert.ok(traffic.busy > traffic.quiet * 1.5, 'Business-hour traffic should exceed night traffic');
+  assert.equal(db.prepare('SELECT count(*) n FROM NetworkDeviceKPI WHERE portUsedCount>portCount').get().n, 0);
   const catalog = JSON.parse(readFileSync(new URL('../../icloud_model/data/source_catalog.json', import.meta.url)));
   for (const dataset of catalog.datasets) {
     assert.deepEqual(db.prepare(`PRAGMA table_info("${dataset.table}")`).all().map(field => field.name).sort(), dataset.fields.map(field => field.name).sort());
   }
   assert.equal(db.prepare('SELECT count(*) n FROM NetworkDeviceKPI WHERE ts >= ? AND ts < ?').get(first.window.start, first.window.endExclusive).n, 12 * 48);
-  assert.equal(db.prepare('SELECT max(ts) t FROM NetworkDeviceKPI').get().t, '2026-10-03T11:00:00Z');
+  assert.equal(db.prepare('SELECT max(ts) t FROM NetworkDeviceKPI').get().t, '2026-10-03T11:00:00.000Z');
   for (const family of ['HuaweiStorageDevice', 'FCSwitchDevice']) {
     const populations = db.prepare(`SELECT d.id, count(k.ts) n FROM ${family} d LEFT JOIN StorageDeviceKPI k ON k.resId=d.id GROUP BY d.id`).all();
     assert.equal(populations.length, 12);
     assert.ok(populations.every(row => row.n === 48), `${family}: every resource needs a complete series`);
   }
-  assert.ok(db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE resId=? AND ts<?').get('I_EntNetworkElement-0001', '2026-10-02T12:00:00Z').value
-    < db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE resId=? AND ts>=?').get('I_EntNetworkElement-0001', '2026-10-02T12:00:00Z').value);
+  assert.ok(db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE resId=? AND ts<?').get('I_EntNetworkElement-0001', '2026-10-02T12:00:00.000Z').value
+    < db.prepare('SELECT avg(cpuUsage) value FROM NetworkDeviceKPI WHERE resId=? AND ts>=?').get('I_EntNetworkElement-0001', '2026-10-02T12:00:00.000Z').value);
   assert.throws(() => db.exec('INSERT INTO NetworkDeviceKPI SELECT * FROM NetworkDeviceKPI LIMIT 1'), /UNIQUE/);
   assert.throws(() => generate({ ...options, output: join(directory, 'first') }, model), /already exists/);
   assert.throws(() => generate({ ...options, anchor: '2026-02-30T12:00:00Z', output: join(directory, 'bad') }, model), /valid UTC/);
@@ -65,14 +75,23 @@ try {
     assert.deepEqual(gaps.checks.alarmsWithoutCpuSamples, []);
   } finally { gapDb.close(); }
   assert.throws(() => generate({ ...options, storageGapHours: 48, output: join(directory, 'invalid-gap') }, model), /storageGapHours/);
+  assert.throws(() => generate({ ...options, alarmsPerResourcePerDay: 0, output: join(directory, 'invalid-alarm-rate') }, model), /alarmsPerResourcePerDay/);
+  const deletedDay = first.generation.alarmDays[0].day;
+  db.exec('SAVEPOINT alarm_coverage');
+  db.prepare("DELETE FROM T_CURRENT_ALARM WHERE date(OCCURUTC/1000,'unixepoch')=?").run(deletedDay);
+  const dayCounts = {...first.tables, T_CURRENT_ALARM: db.prepare('SELECT count(*) n FROM T_CURRENT_ALARM').get().n};
+  const missingDay = validate(db, model, dayCounts, { anchor: options.anchor, start: first.window.start });
+  assert.deepEqual(missingDay.missingAlarmDays, [deletedDay]);
+  db.exec('ROLLBACK TO alarm_coverage; RELEASE alarm_coverage');
   db.exec("UPDATE NetworkDeviceKPI SET ts='2026-10-01 12:00:00' WHERE rowid=1; UPDATE I_EntNetworkElement SET classification='invalid' WHERE rowid=1");
   const invalid = validate(db, model, first.tables);
   assert.ok(invalid.invalidTimes.length > 0);
   assert.ok(invalid.invalidEnums.length > 0);
-  db.exec("UPDATE StorageDeviceKPI SET resId='missing-owner' WHERE resId='FCSwitchDevice-0005'");
+  const fcAlarm = db.prepare('SELECT a.MEDN id FROM T_CURRENT_ALARM a JOIN FCSwitchDevice d ON a.MEDN=d.id LIMIT 1').get();
+  db.prepare("UPDATE StorageDeviceKPI SET resId='missing-owner' WHERE resId=?").run(fcAlarm.id);
   const missing = validate(db, model, first.tables);
-  assert.ok(missing.missingCpuSeries.some(row => row.id === 'FCSwitchDevice-0005'));
-  assert.ok(missing.alarmsWithoutCpuSamples.some(row => row.MEDN === 'FCSwitchDevice-0005'));
+  assert.ok(missing.missingCpuSeries.some(row => row.id === fcAlarm.id));
+  assert.ok(missing.alarmsWithoutCpuSamples.some(row => row.MEDN === fcAlarm.id));
   db.exec('UPDATE ServerDeviceKPI SET peakPower=0 WHERE rowid=1; UPDATE T_CURRENT_ALARM SET ACKED=1, ACKUTC=OCCURUTC-1 WHERE rowid=1');
   const scenarios = validate(db, model, first.tables, { anchor: options.anchor });
   assert.ok(scenarios.invalidMetricScenarios.some(row => row.table === 'ServerDeviceKPI'));

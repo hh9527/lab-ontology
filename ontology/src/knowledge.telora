@@ -189,13 +189,15 @@ def sample_facts: Fn(t::Declaration, samples::BindingFacts) -> Array(Fact) = fn(
 };
 def dataset_facts: Fn(t::Declaration, edsl::EntityEntry) -> Array(Fact) = fn(declared, dataset) {
     let ds = declared.dataset;
+    let references = edsl::collect_references(ds.row, dataset.fields);
     let roles = array::flat_map(ds.roles, fn(role) {
         [{key: ref("entities", role.entity), value: object([("identity", codec::encode(type_ref(role.identity)))]), references: type_refs(role.identity)}.ty!(Fact),
          {key: member_ref(ds.id, "roles", role.id), value: object([("entity", codec::encode(ref("entities", role.entity))), ("identity", codec::encode(type_ref(role.identity))), ("optional", codec::encode(role.optional)), ("parts", codec::encode(array::map(role.parts, fn(p) { {source: p.source, target: p.target, type: type_ref(p.value), nullable: p.nullable, raw: match p.raw { Some(raw) => Some(type_ref(raw)), None => None }}.ty!(RolePart) })))]),
             references: array::concat([[ref("entities", role.entity)], type_refs(role.identity), array::flat_map(role.parts, fn(p) { array::concat([type_refs(p.value), match p.raw { Some(raw) => type_refs(raw), None => [] }]) })])}.ty!(Fact)]
     });
     let fields = array::map(dataset.fields, fn(f) {
-        {key: member_ref(ds.id, "fields", f.name), value: object([("column", codec::encode(f.column)), ("type", codec::encode(type_ref(f.ty))), ("nullable", codec::encode(f.nullable)), ("key", codec::encode(f.is_key)), ("time", codec::encode(f.time)), ("logical_type", codec::encode(f.logical_type))]), references: type_refs(f.ty)}.ty!(Fact)
+        {key: member_ref(ds.id, "fields", f.name), value: object([("column", codec::encode(f.column)), ("type", codec::encode(type_ref(f.ty))), ("nullable", codec::encode(f.nullable)), ("reference_ids", codec::encode(array::map(array::filter(references, fn(ref) { array::any(ref.fields, fn(name) { name == f.name }) }), fn(ref) { ref.id }))), ("roles", codec::encode(field_business_roles(declared, dataset, f, references))),
+                ("key", codec::encode(f.is_key)), ("time", codec::encode(f.time)), ("logical_type", codec::encode(f.logical_type))]), references: type_refs(f.ty)}.ty!(Fact)
     });
     let time_roles = array::flat_map(dataset.fields, fn(f) {
         match f.time {
@@ -206,7 +208,7 @@ def dataset_facts: Fn(t::Declaration, edsl::EntityEntry) -> Array(Fact) = fn(dec
                 references: [member_ref(ds.id, "fields", f.name)]}.ty!(Fact)],
         }
     });
-    let base: Fact = {key: ref("datasets", ds.id), value: object([("source", codec::encode(ds.source)), ("row", codec::encode(type_ref(ds.row))), ("grain", codec::encode(ds.grain)), ("kind", codec::encode(declared.kind)), ("scope", codec::encode(dataset.scope)), ("clock", codec::encode(declared.clock))]), references: type_refs(ds.row)};
+    let base: Fact = {key: ref("datasets", ds.id), value: object([("references", codec::encode(references)), ("source", codec::encode(ds.source)), ("row", codec::encode(type_ref(ds.row))), ("grain", codec::encode(ds.grain)), ("kind", codec::encode(declared.kind)), ("scope", codec::encode(dataset.scope)), ("clock", codec::encode(declared.clock))]), references: type_refs(ds.row)};
     array::concat([[base], roles, fields, time_roles, array::flat_map(declared.groups, fn(b) { binding_facts(declared, b) }),
         array::flat_map(declared.domains, fn(b) { domain_facts(declared, b) }), array::flat_map(declared.samples, fn(b) { sample_facts(declared, b) })])
 };
@@ -378,11 +380,21 @@ def raw_sample: Fn(samples::BindingFacts) -> Value = fn(b) {
         ("primary", codec::encode(b.primary)), ("summaries", codec::encode(b.summaries)), ("unit", codec::encode(b.unit))])),
         ("field", codec::encode(b.field)), ("nullable", codec::encode(b.nullable)), ("names", codec::encode(b.names))])
 };
+# 业务用途来自显式属性或采样度量声明；不会从存储类型、字段名推断。
+def field_business_roles: Fn(t::Declaration, edsl::EntityEntry, edsl::FieldEntry, Array(edsl::ReferenceSpec)) -> Array(edsl::FieldRole) = fn(d, dataset, field, references) {
+    let roles = edsl::field_roles_for(d.dataset.row, field, references);
+    if array::any(d.samples, fn(sample) { sample.field == field.name })
+        && !array::any(roles, fn(role) { role == edsl::FieldRole::Metric }) {
+        array::push(roles, edsl::FieldRole::Metric)
+    } else { roles }
+};
 def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset) {
+    let references = edsl::collect_references(d.dataset.row, dataset.fields);
     object([
         ("id", codec::encode(d.dataset.id)), ("source", codec::encode(d.dataset.source)),
         ("row", codec::encode(type_id(d.dataset.row))), ("grain", codec::encode(d.dataset.grain)),
         ("kind", codec::encode(d.kind)), ("scope", codec::encode(dataset.scope)), ("clock", codec::encode(d.clock)),
+        ("references", codec::encode(references)),
         ("roles", Value::Array(array::map(d.dataset.roles, fn(r) {
             object([("id", codec::encode(r.id)), ("entity", codec::encode(r.entity)),
                 ("identity", codec::encode(type_id(r.identity))), ("optional", codec::encode(r.optional)),
@@ -394,6 +406,7 @@ def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset)
         ("fields", Value::Array(array::map(dataset.fields, fn(f) {
             object([("name", codec::encode(f.name)), ("column", codec::encode(f.column)),
                 ("type", codec::encode(type_id(f.ty))), ("nullable", codec::encode(f.nullable)),
+                ("reference_ids", codec::encode(array::map(array::filter(references, fn(ref) { array::any(ref.fields, fn(name) { name == f.name }) }), fn(ref) { ref.id }))), ("roles", codec::encode(field_business_roles(d, dataset, f, references))),
                 ("key", codec::encode(f.is_key)), ("time", codec::encode(f.time)), ("logical_type", codec::encode(f.logical_type))])
         }))),
         ("bindings", Value::Array(array::map(d.groups, raw_binding))),
@@ -453,3 +466,5 @@ def raw_relation_sources: Fn(t::Prepared) -> Value = fn(prepared) {
 };
 pub use self::{export, type_id, type_dependencies, expression_types};
 pub use self::{object, type_ref, inline_type, resolved, group_root, raw_capabilities, raw_relation_sources};
+
+pub use self::{field_business_roles};

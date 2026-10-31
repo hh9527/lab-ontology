@@ -6,11 +6,13 @@
 | 逻辑输入 | 声明编码 | 物理绑定 | 接受格式 |
 | --- | --- | --- | --- |
 | `Date` | `DateText` | String | 有效 `YYYY-MM-DD` |
-| `DateTimeUtc` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SSZ` |
+| `DateTimeUtc` | `Rfc3339Text` | String | UTC `YYYY-MM-DDTHH:MM:SS.SSSZ` |
 | `DateTime` | `LocalText` | String | 无时区 `YYYY-MM-DD HH:MM:SS` |
 | `EpochMillis` | `EpochMillis` | Int | Unix 纪元毫秒 |
 
-`DateTimeUtc` 使用规范 UTC 文本，时区身份类型 `DateTimeTz` 与仅偏移量类型 `DateTimeOffset` 尚未实现。
+`DateTimeUtc` 使用固定三位毫秒的规范 UTC 文本。输入接受整秒或 1–3 位小数，绑定和投影统一补齐到三位，保持字符串顺序与时间顺序一致。文本存储使用固定三位毫秒，SQL 直接比较列与规范化绑定，不做列侧时间转换。分桶返回精确的桶起点，不改变边界所属的桶。时区偏移和超过毫秒的精度不属于该输入域。
+
+时区身份类型 `DateTimeTz` 与仅偏移量类型 `DateTimeOffset` 尚未实现。
 `Rfc3339Text` 是物理编码名，不是另一逻辑类型。维度的 `detail.input_docs` 发布规范格式及具体示例。
 
 IC 契约使用 `DateTimeUtc`、`Date` 和 `EpochMillis` 三种逻辑类型。
@@ -18,8 +20,8 @@ PostgreSQL 分别使用 `timestamptz`（UTC 输入输出）、`date`、`bigint`�
 PG timestamptz 保存瞬间，不保存原始时区，宿主必须将返回时间戳序列化为 UTC。
 `Date` 是不含时区与时刻的日历日期，`DateTime` 是不含时区的日期时间。从瞬间提取日期必须显式选择时区；UTC 分桶使用 UTC 规则，结果类型本身不携带时区。
 
-RFC3339 输入目前只接受规范 UTC 秒，偏移和小数秒需在提交 Intent 前处理。
-固定宽度 UTC 文本在原始列字符串比较中保持时间顺序。
+RFC3339 输入接受 UTC 整秒或毫秒，偏移需在提交 Intent 前转换为 UTC。
+固定三位毫秒的 UTC 文本保持时间顺序；SQL 的时间表达式和绑定使用相同精度。
 `EpochMillis` 是从 `1970-01-01T00:00:00Z` 起的绝对毫秒数，编码不依赖时区；UTC／本地业务描述不改变整数表示。
 移位的墙上时钟整数需要另行指定编码。DateTime 是无时区或 UTC 偏移的日期加钟表时间，其值不依赖运行环境，也不同于绝对瞬间。
 将瞬间或相对周期解析为本地墙上时间边界可能需要时区及歧义策略，本接口不会推断二者。

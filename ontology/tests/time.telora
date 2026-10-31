@@ -22,7 +22,7 @@ type Dog = struct {
     @edsl::column("created_at")
     @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::Rfc3339Text)
     @edsl::dimension("created_at", True, True,
-        [edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::DateTimeUtc])
+        [edsl::FilterOp::Eq, edsl::FilterOp::Ge, edsl::FilterOp::Lt], [edsl::FilterInputKind::DateTimeUtc])
     created_at: String,
     @edsl::column("raw_clock")
     @edsl::time_field(edsl::TimeSemantics::Utc, edsl::TimeEncoding::EpochMillis)
@@ -59,7 +59,7 @@ def profile: qb::PlanProfile = {
         qb::Operator::Filter, qb::Operator::Scalar, qb::Operator::Bind, qb::Operator::Group,
         qb::Operator::Aggregate],
     allowed_join_kinds: [], allowed_aggregates: [qb::AggregateFunction::Count],
-    allowed_scalars: [qb::ScalarFunction::Ge, qb::ScalarFunction::Lt, qb::ScalarFunction::And],
+    allowed_scalars: [qb::ScalarFunction::Eq, qb::ScalarFunction::Ge, qb::ScalarFunction::Lt, qb::ScalarFunction::And],
     allow_distinct: False,
 };
 
@@ -120,7 +120,7 @@ pub def end_only_window_omits_lower_predicate_and_binding: test::Test = test::sh
     }"#).unwrap!()));
     if explicit == omitted && string::contains(explicit.sql, "dog.created_at < ?1")
         && !string::contains(explicit.sql, "dog.created_at >=")
-        && explicit.bindings == [qb::Val::String("2024-02-29T00:00:00Z")] { True }
+        && explicit.bindings == [qb::Val::String("2024-02-29T00:00:00.000Z")] { True }
     else { fail!("end-only window must bind only its upper boundary", explicit, omitted) }
 });
 
@@ -184,13 +184,13 @@ pub def rfc3339_field_rejects_noncanonical_text: test::Test = test::should_fail_
         "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
         "filters":[{"node":"dog","dimension":"created_at","op":"Ge","value":"2024-02-29 00:00:00"}]
     }"#).unwrap!())
-}, "invalid canonical RFC3339 UTC second value");
+}, "invalid RFC3339 UTC value (seconds or 1..3 fractional digits)");
 
 pub def offset_rfc3339_requires_normalization_before_binding: test::Test = test::should_fail_with(fn() {
     time::window_filters(payload, "created_at", {
         start: Some(time::TimeValue::DateTimeUtc("2024-03-01T08:00:00+08:00")),
         end: time::TimeValue::DateTimeUtc("2024-03-02T08:00:00+08:00")})
-}, "invalid canonical RFC3339 UTC second value");
+}, "invalid RFC3339 UTC value (seconds or 1..3 fractional digits)");
 
 pub def rfc3339_preserves_four_digit_year_and_december: test::Test = test::should_ok(fn() {
     if edsl::canonical_rfc3339("0001-12-31T23:59:59Z")
@@ -236,3 +236,56 @@ pub def equal_bounds_are_rejected: test::Test = test::should_fail_with(fn() {
 pub def invalid_end_only_is_rejected: test::Test = test::should_fail_with(fn() {
     query_intent_ast_factory(payload)(json::parse(r#"{"op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],"edges":[],"select":[],"count":"dog","time_windows":[{"node":"dog","dimension":"raw_clock","end":"now"}]}"#).unwrap!())
 }, "resolve now to an absolute time boundary");
+
+
+pub def utc_millisecond_precision_and_validation: test::Test = test::should_ok(fn() {
+    edsl::canonical_rfc3339("2024-02-29T23:59:59.001Z")
+        && edsl::canonical_rfc3339("0001-01-01T00:00:00.1Z")
+        && edsl::canonical_rfc3339("9999-12-31T23:59:59.999Z")
+        && !edsl::canonical_rfc3339("2025-02-29T00:00:00.001Z")
+        && !edsl::canonical_rfc3339("2024-01-01T00:00:60.001Z")
+        && !edsl::canonical_rfc3339("2024-01-01T00:00:00.1234Z")
+        && !edsl::canonical_rfc3339("2024-01-01T00:00:00.Z")
+        && !edsl::canonical_rfc3339("2024-01-01T00:00:00.001+00:00")
+});
+
+pub def utc_normalization_preserves_order_and_equivalence: test::Test = test::should_ok(fn() {
+    edsl::rfc3339_key("2024-01-01T00:00:00Z") == "2024-01-01T00:00:00.000Z"
+        && edsl::rfc3339_key("2024-01-01T00:00:00.1Z") == "2024-01-01T00:00:00.100Z"
+        && edsl::rfc3339_key("2024-01-01T00:00:00.12Z") == "2024-01-01T00:00:00.120Z"
+        && edsl::rfc3339_key("2024-01-01T00:00:00.001Z") == "2024-01-01T00:00:00.001Z"
+        && edsl::rfc3339_key("2024-01-01T00:00:00Z") < edsl::rfc3339_key("2024-01-01T00:00:00.001Z")
+});
+
+pub def mixed_precision_window_binds_fixed_milliseconds: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
+        "time_windows":[{"node":"dog","dimension":"created_at",
+            "start":"2024-03-01T00:00:00Z", "end":"2024-03-01T00:00:00.1Z"}]
+    }"#).unwrap!()));
+    query.bindings == [qb::Val::String("2024-03-01T00:00:00.000Z"), qb::Val::String("2024-03-01T00:00:00.100Z")]
+});
+
+pub def millisecond_window_rejects_equivalent_bounds: test::Test = test::should_fail_with(fn() {
+    time::window_filters(payload, "created_at", {
+        start: Some(time::TimeValue::DateTimeUtc("2024-03-01T00:00:00Z")),
+        end: time::TimeValue::DateTimeUtc("2024-03-01T00:00:00.000Z")})
+}, "time window start must precede end");
+
+pub def millisecond_window_rejects_reversed_same_second: test::Test = test::should_fail_with(fn() {
+    time::window_filters(payload, "created_at", {
+        start: Some(time::TimeValue::DateTimeUtc("2024-03-01T00:00:00.001Z")),
+        end: time::TimeValue::DateTimeUtc("2024-03-01T00:00:00Z")})
+}, "time window start must precede end");
+
+
+pub def equivalent_utc_equalities_do_not_conflict: test::Test = test::should_ok(fn() {
+    let query = sqlite::build_query(query_intent_ast_factory(payload)(json::parse(r#"{
+        "op":"Graph","root":"dog","nodes":[{"id":"dog","entity":"dog"}],
+        "edges":[],"select":[{"node":"dog","dimension":"created_at"}],
+        "filters":[{"node":"dog","dimension":"created_at","op":"Eq","value":"2024-03-01T00:00:00Z"},
+            {"node":"dog","dimension":"created_at","op":"Eq","value":"2024-03-01T00:00:00.000Z"}]
+    }"#).unwrap!()));
+    query.bindings == [qb::Val::String("2024-03-01T00:00:00.000Z"), qb::Val::String("2024-03-01T00:00:00.000Z")]
+});

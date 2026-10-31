@@ -1,4 +1,4 @@
-# 字段角色与对象引用
+# 字段用途与对象指代
 
 由议题 #33 跟踪。这些声明向 Agent 和后续报表规划暴露业务用途，不增加查询操作、不自动生成链接、不解析对象，也不选择默认身份展示方式。
 
@@ -25,10 +25,10 @@ type Device = struct {
 
 | 角色 | 含义 | 不表示 |
 | --- | --- | --- |
-| Appellation | 参与身份展示或表达 | 唯一性、默认展示或展示模板 |
-| Reference | 参与已声明的唯一地址 | 复合地址中的单个成员已经足够 |
-| Classification | 描述业务分类 | 闭合值域或筛选能力 |
-| Metric | 描述定量用途 | 单位、聚合规则或可查询度量 |
+| 称谓（Appellation） | 参与身份展示或表达 | 唯一性、默认展示或展示模板 |
+| 指代（Reference） | 参与已声明的唯一地址 | 复合地址中的单个成员已经足够 |
+| 分类（Classification） | 描述业务分类 | 闭合值域或筛选能力 |
+| 指标（Metric） | 描述定量用途 | 单位、聚合规则或可查询度量 |
 
 角色可以重叠：上例 uuid 同时具有 Appellation 和派生的 Reference。不会从属性名猜测角色。
 正式 `sample_measure` 声明也派生 Metric；同一字段再显式标记 Metric 不会重复。
@@ -69,3 +69,13 @@ type Device = struct {
 `tests/field_roles.telora` 覆盖可替代完整引用、重叠角色、公共元数据、私有字段、查询语义不变、Metric 派生和无效声明。
 设备模型将现有唯一 ID 发布为引用，name／alias 标为 Appellation，classification／vendor 标为 Classification。
 已有正式度量自动派生 Metric，不为名称、IP 地址或序列号新增唯一性声明。
+
+## World 发布与 Agent 消费
+
+World 模型可以在 Row 上使用同一套 `field_role` 和 `reference` 属性。构建期知识发布保留 Dataset 的完整 `references` 以及字段的 `roles`，采样度量绑定派生 Metric。属性不会改变 transform 初始化、查询权限或聚合规则。
+
+Entity 的 Role 身份映射独立保留在 Dataset 的 `roles` 中。它表示行中的一组字段指向某个 Entity，不承诺这些字段唯一确定 Dataset 的行，也不自动生成 Dataset 的 `reference` 声明。
+
+插件的结构化领域摘要保留四类用途字段、完整指代组和 Entity 身份映射，局部 card 返回精确事实。全局文本摘要提供 Dataset 入口和能力数量。`field_roles` 是字段用途索引，`references` 保持完整、不随字段分页截断；`section:"fields"` 分页读取字段事实。字段名通过维度／绑定对应查询能力，不能直接替代查询 ID。
+
+Agent 按对象统计时先确定完整指代范围及非空性，再携带称谓展示；分类用于挑选分组和筛选，指标用于定位已有 Measure。样本读取用于解决影响答案的具体疑点，字段角色本身不要求额外验证数据唯一性。
