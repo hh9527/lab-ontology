@@ -13,156 +13,528 @@ use std::type_desc as td;
 use std::build as build;
 use std::value::{Value};
 
-type Entity = struct { id: String, identity: Type };
-def entity: for(I) Fn(m::Entity(I)) -> Entity = fn(value) { {id: value.id, identity: value.identity} };
+type Entity = struct {
+    id: String,
+    identity: Type
+};
+def entity: for(I) Fn(m::Entity(I)) -> Entity = fn(value) {
+    {id: value.id, identity: value.identity}
+};
 type World = struct {
-    revision: String, entities: Array(Entity), datasets: Array(t::Declaration),
-    relations: Array(r::Relation), alternatives: Array(t::Alternative), links: Array(r::Link), profile: qb::PlanProfile,
+    revision: String,
+    entities: Array(Entity),
+    datasets: Array(t::Declaration),
+    relations: Array(r::Relation),
+    alternatives: Array(t::Alternative),
+    links: Array(r::Link),
+    profile: qb::PlanProfile,
 };
 # World 声明 Dataset 和关系；类型从引用自动收集。
-def define: Fn(String, Array(t::Declaration), Array(r::Relation), Array(t::Alternative), Array(r::Link), qb::PlanProfile) -> World = fn(revision, datasets, relations, alternatives, links, profile) {
+def define: Fn(
+    String,
+    Array(t::Declaration),
+    Array(r::Relation),
+    Array(t::Alternative),
+    Array(r::Link),
+    qb::PlanProfile
+) -> World = fn(revision, datasets, relations, alternatives, links, profile) {
     {revision, datasets, relations, alternatives, links, profile, entities: []}
 };
-def with_entities: Fn(World, Array(Entity)) -> World = fn(world, entities) { world <~ {entities} };
+def with_entities: Fn(World, Array(Entity)) -> World = fn(world, entities) {
+    world <~ {entities}
+};
 def resolved_entities: Fn(World) -> Array(Entity) = fn(world) {
-    let roles = array::flat_map(world.datasets, fn(d) { array::concat([d.dataset.roles,
-        array::flat_map(d.groups, g::binding_roles)]) });
-    let entries = array::concat([world.entities, array::map(roles, fn(r) { {id: r.entity, identity: r.identity}.ty!(Entity) })]);
-    pipeline::run(pipeline::from_array(entries) |> pipeline::distinct_by(fn(e) { e.id }) |> pipeline::collect())
+    let roles = array::flat_map(
+        world.datasets,
+        fn(d) {
+            array::concat([d.dataset.roles, array::flat_map(d.groups, g::binding_roles)])
+        }
+    );
+    let entries = array::concat(
+        [
+            world.entities,
+            array::map(
+                roles,
+                fn(r) {
+                    {id: r.entity, identity: r.identity}.ty!(Entity)
+                }
+            )
+        ]
+    );
+    pipeline::run(
+        pipeline::from_array(entries) |> pipeline::distinct_by(
+            fn(e) {
+                e.id
+            }
+        ) |> pipeline::collect()
+    )
 };
 def resolved_types: Fn(World) -> Array(Type) = fn(world) {
-    fk::discover_types(array::concat([fk::declaration_types(world.datasets),
-        array::map(resolved_entities(world), fn(e) { e.identity })]))
+    fk::discover_types(
+        array::concat(
+            [
+                fk::declaration_types(world.datasets),
+                array::map(
+                    resolved_entities(world),
+                    fn(e) {
+                        e.identity
+                    }
+                )
+            ]
+        )
+    )
 };
-type ResolvedWorld = struct { model: World, types: Array(Type), entities: Array(Entity) };
-type Issue = struct { code: String, path: String, message: String };
-def issue: Fn(String, String, String) -> Array(Issue) = fn(code, path, message) { [{code, path, message}] };
+type ResolvedWorld = struct {
+    model: World,
+    types: Array(Type),
+    entities: Array(Entity)
+};
+type Issue = struct {
+    code: String,
+    path: String,
+    message: String
+};
+def issue: Fn(String, String, String) -> Array(Issue) = fn(code, path, message) {
+    [{code, path, message}]
+};
 # 只展开定义内部的结构；到另一个具名类型即停止，不发现或收集模型节点。
 def reference_issues: Fn(ResolvedWorld, Type, String) -> Array(Issue) = fn(world, ty, path) {
     let referenced = fti::generate_field_type_info(fti::memorizer, ty).0;
-    array::flat_map(referenced, fn(required) {
-        if array::any(world.types, fn(provided) { provided == required }) { [] }
-        else { issue("missing_type", path, `type \{k::type_id(required)} is not provided`) }
-    })
+    array::flat_map(
+        referenced,
+        fn(required) {
+            if array::any(
+                world.types,
+                fn(provided) {
+                    provided == required
+                }
+            ) {
+                []
+            } else {
+                issue("missing_type", path, `type \{k::type_id(required)} is not provided`)
+            }
+        }
+    )
 };
 def binding_types: Fn(g::BindingFacts) -> Array(Type) = fn(binding) {
-    array::concat([[binding.row], array::flat_map(binding.members, fn(member) {
-        array::concat([[member.value], k::expression_types(member.node)])
-    }), match binding.contract {
-        g::BindingContract::DeferredDimension(group) => [group.value],
-        g::BindingContract::Numeric(group) => [group.value],
-        g::BindingContract::Identity(role) => [role.identity],
-        _ => [],
-    }])
+    array::concat(
+        [
+            [binding.row],
+            array::flat_map(
+                binding.members,
+                fn(member) {
+                    array::concat([[member.value], k::expression_types(member.node)])
+                }
+            ),
+            match binding.contract {
+                g::BindingContract::DeferredDimension(group) => [group.value],
+                g::BindingContract::Numeric(group) => [group.value],
+                g::BindingContract::Identity(role) => [role.identity],
+                _ => [],
+            }
+        ]
+    )
 };
 def role_issues: Fn(ResolvedWorld, m::PreparedRole, String) -> Array(Issue) = fn(world, role, path) {
-    array::concat([
-        if array::any(world.entities, fn(entity) { entity.id == role.entity && entity.identity == role.identity }) { [] }
-        else { issue("missing_entity", path, `entity \{role.entity} with this identity is not provided`) },
-        reference_issues(world, role.identity, path),
-        array::flat_map(role.parts, fn(part) {
-            array::concat([reference_issues(world, part.value, path), match part.raw {
-                Some(raw) => reference_issues(world, raw, path), None => [],
-            }])
-        })
-    ])
+    array::concat(
+        [
+            if array::any(
+                world.entities,
+                fn(entity) {
+                    entity.id == role.entity && entity.identity == role.identity
+                }
+            ) {
+                []
+            } else {
+                issue(
+                    "missing_entity",
+                    path,
+                    `entity \{role.entity} with this identity is not provided`
+                )
+            },
+            reference_issues(world, role.identity, path),
+            array::flat_map(
+                role.parts,
+                fn(part) {
+                    array::concat(
+                        [
+                            reference_issues(world, part.value, path),
+                            match part.raw {
+                                Some(raw) => reference_issues(world, raw, path),
+                                None => [],
+                            }
+                        ]
+                    )
+                }
+            )
+        ]
+    )
 };
-def endpoint_issues: Fn(ResolvedWorld, r::Endpoint, String) -> Array(Issue) = fn(world, endpoint, path) {
-    match array::find(world.model.datasets, fn(d) { d.dataset.id == endpoint.dataset.id }) {
+def endpoint_issues: Fn(ResolvedWorld, r::Endpoint, String) -> Array(Issue) = fn(
+    world,
+    endpoint,
+    path
+) {
+    match array::find(
+        world.model.datasets,
+        fn(d) {
+            d.dataset.id == endpoint.dataset.id
+        }
+    ) {
         None => issue("missing_dataset", path, `dataset \{endpoint.dataset.id} is not provided`),
         Some(d) => if d.dataset.row != endpoint.dataset.row || d.dataset.source != endpoint.dataset.source || d.dataset.grain != endpoint.dataset.grain {
             issue("conflicting_dataset", path, "endpoint differs from the provided dataset")
-        } else { match array::find(d.dataset.roles, fn(role) { role.id == endpoint.role }) {
-            None => issue("missing_role", path, `role \{endpoint.role} is not provided`),
-            Some(role) => if array::any(endpoint.dataset.roles, fn(other) { other == role }) { [] }
-                else { issue("conflicting_role", path, "endpoint differs from the provided role") },
-        } },
+        } else {
+            match array::find(
+                d.dataset.roles,
+                fn(role) {
+                    role.id == endpoint.role
+                }
+            ) {
+                None => issue("missing_role", path, `role \{endpoint.role} is not provided`),
+                Some(role) => if array::any(
+                    endpoint.dataset.roles,
+                    fn(other) {
+                        other == role
+                    }
+                ) {
+                    []
+                } else {
+                    issue("conflicting_role", path, "endpoint differs from the provided role")
+                },
+            }
+        },
     }
 };
-def relation_reference: Fn(ResolvedWorld, r::Relation, String) -> Array(Issue) = fn(world, relation, path) {
-    if array::any(world.model.relations, fn(provided) { provided == relation }) { [] }
-    else { issue("missing_relation", path, `relation \{relation.id} is not provided with this definition`) }
+def relation_reference: Fn(ResolvedWorld, r::Relation, String) -> Array(Issue) = fn(
+    world,
+    relation,
+    path
+) {
+    if array::any(
+        world.model.relations,
+        fn(provided) {
+            provided == relation
+        }
+    ) {
+        []
+    } else {
+        issue(
+            "missing_relation",
+            path,
+            `relation \{relation.id} is not provided with this definition`
+        )
+    }
 };
 # 数组成员检查仅用于独立自检；后续可用 telora typeid 索引替换。
 def coverage: Fn(World) -> Array(Issue) = fn(world) {
     let declared = world;
-    let world = {model: world, types: resolved_types(world), entities: resolved_entities(world)}.ty!(ResolvedWorld);
-    array::concat([
-        array::flat_map(array::enumerate(declared.entities), fn(pair) {
-            if array::any(array::enumerate(declared.entities), fn(other) { other.0 < pair.0 && other.1.id == pair.1.id }) {
-                issue("duplicate_entity", `entities/\{pair.1.id}`, "entity id is provided more than once")
-            } else { [] }
-        }),
-        array::flat_map(world.types, fn(ty) {
-            array::flat_map(k::type_dependencies(ty), fn(child) { reference_issues(world, child, `types/\{k::type_id(ty)}`) })
-        }),
-        array::flat_map(array::enumerate(world.entities), fn(pair) {
-            let path = `entities/\{pair.1.id}`;
-            array::concat([reference_issues(world, pair.1.identity, path),
-                if array::any(array::enumerate(world.entities), fn(other) { other.0 < pair.0 && other.1.id == pair.1.id }) {
-                    issue("duplicate_entity", path, "entity id is provided more than once")
-                } else { [] }])
-        }),
-        array::flat_map(array::enumerate(world.model.datasets), fn(pair) {
-            let d = pair.1;
-            let path = `datasets/\{d.dataset.id}`;
-            let used = array::concat([[d.dataset.row], array::flat_map(d.groups, binding_types),
-                array::flat_map(d.domains, fn(b) { array::concat([[b.definition.value, b.definition.wire], k::expression_types(b.node)]) }),
-                array::map(d.samples, fn(b) { b.value }), array::map(d.columns, fn(c) { c.value }),
-                array::map(d.scope, fn(s) { s.column.value }), array::map(d.field_counts, fn(c) { c.value }),
-                array::flat_map(d.native_pairs, fn(p) { array::concat([binding_types(p.first), binding_types(p.second)]) })]);
-            array::concat([
-                if array::any(array::enumerate(world.model.datasets), fn(other) { other.0 < pair.0 && other.1.dataset.id == d.dataset.id }) {
-                    issue("duplicate_dataset", path, "dataset id is provided more than once")
-                } else { [] },
-                array::flat_map(used, fn(ty) { reference_issues(world, ty, path) }),
-                array::flat_map(array::concat([d.dataset.roles, array::flat_map(d.groups, g::binding_roles)]), fn(role) {
-                    role_issues(world, role, `\{path}/roles/\{role.id}`)
-                })
-            ])
-        }),
-        array::flat_map(array::enumerate(world.model.relations), fn(pair) {
-            let relation = pair.1;
-            let path = `relations/\{relation.id}`;
-            array::concat([
-                if array::any(array::enumerate(world.model.relations), fn(other) { other.0 < pair.0 && other.1.id == relation.id }) {
-                    issue("duplicate_relation", path, "relation id is provided more than once")
-                } else { [] },
-                endpoint_issues(world, relation.from, `\{path}/from`), endpoint_issues(world, relation.to, `\{path}/to`),
-                match relation.guard { Some(guard) => reference_issues(world, guard.column.value, path), None => [] }
-            ])
-        }),
-        array::flat_map(world.model.alternatives, fn(a) { array::flat_map(a.choices, fn(choice) { relation_reference(world, choice, `alternatives/\{a.id}`) }) }),
-        array::flat_map(world.model.links, fn(link) { array::concat([
-            relation_reference(world, link.a, `links/\{link.id}/a`), relation_reference(world, link.z, `links/\{link.id}/z`),
-            match link.guard { Some(guard) => reference_issues(world, guard.column.value, `links/\{link.id}`), None => [] }
-        ]) })
-    ])
+    let world = {model: world, types: resolved_types(world), entities: resolved_entities(world)}.ty!(
+        ResolvedWorld
+    );
+    array::concat(
+        [
+            array::flat_map(
+                array::enumerate(declared.entities),
+                fn(pair) {
+                    if array::any(
+                        array::enumerate(declared.entities),
+                        fn(other) {
+                            other.0 < pair.0 && other.1.id == pair.1.id
+                        }
+                    ) {
+                        issue(
+                            "duplicate_entity",
+                            `entities/\{pair.1.id}`,
+                            "entity id is provided more than once"
+                        )
+                    } else {
+                        []
+                    }
+                }
+            ),
+            array::flat_map(
+                world.types,
+                fn(ty) {
+                    array::flat_map(
+                        k::type_dependencies(ty),
+                        fn(child) {
+                            reference_issues(world, child, `types/\{k::type_id(ty)}`)
+                        }
+                    )
+                }
+            ),
+            array::flat_map(
+                array::enumerate(world.entities),
+                fn(pair) {
+                    let path = `entities/\{pair.1.id}`;
+                    array::concat(
+                        [
+                            reference_issues(world, pair.1.identity, path),
+                            if array::any(
+                                array::enumerate(world.entities),
+                                fn(other) {
+                                    other.0 < pair.0 && other.1.id == pair.1.id
+                                }
+                            ) {
+                                issue(
+                                    "duplicate_entity",
+                                    path,
+                                    "entity id is provided more than once"
+                                )
+                            } else {
+                                []
+                            }
+                        ]
+                    )
+                }
+            ),
+            array::flat_map(
+                array::enumerate(world.model.datasets),
+                fn(pair) {
+                    let d = pair.1;
+                    let path = `datasets/\{d.dataset.id}`;
+                    let used = array::concat(
+                        [
+                            [d.dataset.row],
+                            array::flat_map(d.groups, binding_types),
+                            array::flat_map(
+                                d.domains,
+                                fn(b) {
+                                    array::concat(
+                                        [
+                                            [b.definition.value, b.definition.wire],
+                                            k::expression_types(b.node)
+                                        ]
+                                    )
+                                }
+                            ),
+                            array::map(
+                                d.samples,
+                                fn(b) {
+                                    b.value
+                                }
+                            ),
+                            array::map(
+                                d.columns,
+                                fn(c) {
+                                    c.value
+                                }
+                            ),
+                            array::map(
+                                d.scope,
+                                fn(s) {
+                                    s.column.value
+                                }
+                            ),
+                            array::map(
+                                d.field_counts,
+                                fn(c) {
+                                    c.value
+                                }
+                            ),
+                            array::flat_map(
+                                d.native_pairs,
+                                fn(p) {
+                                    array::concat([binding_types(p.first), binding_types(p.second)])
+                                }
+                            )
+                        ]
+                    );
+                    array::concat(
+                        [
+                            if array::any(
+                                array::enumerate(world.model.datasets),
+                                fn(other) {
+                                    other.0 < pair.0 && other.1.dataset.id == d.dataset.id
+                                }
+                            ) {
+                                issue(
+                                    "duplicate_dataset",
+                                    path,
+                                    "dataset id is provided more than once"
+                                )
+                            } else {
+                                []
+                            },
+                            array::flat_map(
+                                used,
+                                fn(ty) {
+                                    reference_issues(world, ty, path)
+                                }
+                            ),
+                            array::flat_map(
+                                array::concat(
+                                    [d.dataset.roles, array::flat_map(d.groups, g::binding_roles)]
+                                ),
+                                fn(role) {
+                                    role_issues(world, role, `\{path}/roles/\{role.id}`)
+                                }
+                            )
+                        ]
+                    )
+                }
+            ),
+            array::flat_map(
+                array::enumerate(world.model.relations),
+                fn(pair) {
+                    let relation = pair.1;
+                    let path = `relations/\{relation.id}`;
+                    array::concat(
+                        [
+                            if array::any(
+                                array::enumerate(world.model.relations),
+                                fn(other) {
+                                    other.0 < pair.0 && other.1.id == relation.id
+                                }
+                            ) {
+                                issue(
+                                    "duplicate_relation",
+                                    path,
+                                    "relation id is provided more than once"
+                                )
+                            } else {
+                                []
+                            },
+                            endpoint_issues(world, relation.from, `\{path}/from`),
+                            endpoint_issues(world, relation.to, `\{path}/to`),
+                            match relation.guard {
+                                Some(guard) => reference_issues(world, guard.column.value, path),
+                                None => []
+                            }
+                        ]
+                    )
+                }
+            ),
+            array::flat_map(
+                world.model.alternatives,
+                fn(a) {
+                    array::flat_map(
+                        a.choices,
+                        fn(choice) {
+                            relation_reference(world, choice, `alternatives/\{a.id}`)
+                        }
+                    )
+                }
+            ),
+            array::flat_map(
+                world.model.links,
+                fn(link) {
+                    array::concat(
+                        [
+                            relation_reference(world, link.a, `links/\{link.id}/a`),
+                            relation_reference(world, link.z, `links/\{link.id}/z`),
+                            match link.guard {
+                                Some(guard) => reference_issues(
+                                    world,
+                                    guard.column.value,
+                                    `links/\{link.id}`
+                                ),
+                                None => []
+                            }
+                        ]
+                    )
+                }
+            )
+        ]
+    )
 };
 def self_check: Fn(World) -> Bool = fn(world) {
     let issues = coverage(world);
-    if issues != [] { fail!("world does not cover its definitions", issues) } else { () };
-    array::map(resolved_entities(world), fn(entity) { m::validate_identity(entity.identity) });
-    t::self_check(world.revision, world.datasets, world.relations, world.alternatives, world.links, world.profile)
+    if issues != [] {
+        fail!("world does not cover its definitions", issues)
+    } else {
+        ()
+    };
+    array::map(
+        resolved_entities(world),
+        fn(entity) {
+            m::validate_identity(entity.identity)
+        }
+    );
+    t::self_check(
+        world.revision,
+        world.datasets,
+        world.relations,
+        world.alternatives,
+        world.links,
+        world.profile
+    )
 };
 def prepare: Fn(World) -> t::Prepared = fn(world) {
-    t::build(world.revision, world.datasets, world.relations, world.alternatives, world.links, world.profile)
-        <~ {relations: world.relations}
+    t::build(
+        world.revision,
+        world.datasets,
+        world.relations,
+        world.alternatives,
+        world.links,
+        world.profile
+    ) <~ {relations: world.relations}
 };
 def publication: Fn(World, t::Prepared) -> Value = fn(world, prepared) {
     let entities = resolved_entities(world);
-    let source_types = array::concat([fk::declaration_types(world.datasets), array::map(entities, fn(e) { e.identity })]);
+    let source_types = array::concat(
+        [
+            fk::declaration_types(world.datasets),
+            array::map(
+                entities,
+                fn(e) {
+                    e.identity
+                }
+            )
+        ]
+    );
     let types = fk::discover_types(source_types);
-    fk::publication_from(prepared, types, array::map(entities, fn(entity) { (entity.id, entity.identity) }), source_types)
+    fk::publication_from(
+        prepared,
+        types,
+        array::map(
+            entities,
+            fn(entity) {
+                (entity.id, entity.identity)
+            }
+        ),
+        source_types
+    )
 };
-def stage_prepared: for(B) Fn(World, Fn() -> t::Prepared, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, prepare_model, program) {
-    build::stage(fn() {
-        let prepared = prepare_model();
-        {runtime: prepared.payload, information: {"ontology.knowledge": publication(world, prepared)}}
-    }, program)
+def stage_prepared: for(B) Fn(
+    World,
+    Fn() -> t::Prepared,
+    Fn(crate::ontology::PreparedPayload) -> B
+) -> B = fn(world, prepare_model, program) {
+    build::stage(
+        fn() {
+            let prepared = prepare_model();
+            {
+                runtime: prepared.payload,
+                information: {"ontology.knowledge": publication(world, prepared)}
+            }
+        },
+        program
+    )
 };
 def stage: for(B) Fn(World, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, program) {
-    stage_prepared(world, fn() { prepare(world) }, program)
+    stage_prepared(
+        world,
+        fn() {
+            prepare(world)
+        },
+        program
+    )
 };
-pub use self::{Entity, entity, World, define, with_entities,
-    resolved_types, resolved_entities, Issue, coverage, self_check, prepare, publication, stage, stage_prepared};
+pub use self::{
+    Entity,
+    entity,
+    World,
+    define,
+    with_entities,
+    resolved_types,
+    resolved_entities,
+    Issue,
+    coverage,
+    self_check,
+    prepare,
+    publication,
+    stage,
+    stage_prepared
+};

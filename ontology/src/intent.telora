@@ -7,7 +7,7 @@ use std::codec as codec;
 use std::diagnostics as diagnostics;
 use std::dict as dict;
 use std::string as string;
-use std::value::{ Value };
+use std::value::{Value};
 
 def as_object: Fn(Value) -> Dict(Value) = fn(value) {
     match value {
@@ -50,8 +50,7 @@ def array_opt: Fn(Dict(Value), String) -> Array(Value) = fn(obj, key) {
 def parse_op: Fn(String) -> edsl::FilterOp = fn(op) {
     match codec::decode@[edsl::FilterOp](Value::String(op)) {
         Ok(value) => value,
-        Err(error) => raise!(blame::with_context(error,
-            `unsupported filter operator \{op}`)),
+        Err(error) => raise!(blame::with_context(error, `unsupported filter operator \{op}`)),
     }
 };
 
@@ -97,86 +96,151 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
 
 # 输入推断只读取查询契约，不构造描述、别名、标签等知识发现内容。
 type DimensionInputContract = struct {
-    dataset: String, field: String, computed: Bool, half_open: Bool, input_kinds: Array(edsl::FilterInputKind),
+    dataset: String,
+    field: String,
+    computed: Bool,
+    half_open: Bool,
+    input_kinds: Array(edsl::FilterInputKind),
 };
-def dimension_input_contract: Fn(edsl::PreparedPayload, String) -> DimensionInputContract = fn(payload, id) {
-    let entry = match array::find(payload.dimensions, fn(entry) { entry.id == id }) {
-        Some(entry) => entry, None => fail!(`unknown dimension knowledge point \{id}`, id),
+def dimension_input_contract: Fn(edsl::PreparedPayload, String) -> DimensionInputContract = fn(
+    payload,
+    id
+) {
+    let entry = match array::find(
+        payload.dimensions,
+        fn(entry) {
+            entry.id == id
+        }
+    ) {
+        Some(entry) => entry,
+        None => fail!(`unknown dimension knowledge point \{id}`, id),
     };
-    if !entry.authorized { fail!("dimension is not authorized for discovery", id) }
-    else {
+    if !entry.authorized {
+        fail!("dimension is not authorized for discovery", id)
+    } else {
         let entity = payload.entities[entry.entity];
-        {dataset: entity.id, field: entity.fields[entry.field].name, computed: entry.computed,
-            half_open: entry.half_open, input_kinds: entry.input_kinds}
+        {
+            dataset: entity.id,
+            field: entity.fields[entry.field].name,
+            computed: entry.computed,
+            half_open: entry.half_open,
+            input_kinds: entry.input_kinds
+        }
     }
 };
 
-def inferred_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput =
-    fn(payload, dimension, value) {
-        let detail = dimension_input_contract(payload, dimension);
-        if let Value::Object(obj) = value {
-            if !detail.half_open { fail!("tagged unknown input requires a half-open domain", dimension, value) }
-            else if array::length(dict::keys(obj)) != 1 { fail!("unknown input requires exactly one tag", dimension, value) }
-            else {
-                match dict::get(obj, "unknown") {
-                    Some(Value::String(raw)) => edsl::FilterInput::Unknown(raw),
-                    Some(_) => fail!("unknown raw value must be a string", dimension, value),
-                    None => match dict::get(obj, "unknowns") {
-                        Some(Value::True) => edsl::FilterInput::Unknowns,
-                        _ => fail!("expected unknown string or unknowns true", dimension, value),
-                    },
-                }
-            }
+def inferred_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(
+    payload,
+    dimension,
+    value
+) {
+    let detail = dimension_input_contract(payload, dimension);
+    if let Value::Object(obj) = value {
+        if !detail.half_open {
+            fail!("tagged unknown input requires a half-open domain", dimension, value)
+        } else if array::length(dict::keys(obj)) != 1 {
+            fail!("unknown input requires exactly one tag", dimension, value)
         } else {
-            let candidates = array::filter(detail.input_kinds, fn(kind) {
+            match dict::get(obj, "unknown") {
+                Some(Value::String(raw)) => edsl::FilterInput::Unknown(raw),
+                Some(_) => fail!("unknown raw value must be a string", dimension, value),
+                None => match dict::get(obj, "unknowns") {
+                    Some(Value::True) => edsl::FilterInput::Unknowns,
+                    _ => fail!("expected unknown string or unknowns true", dimension, value),
+                },
+            }
+        }
+    } else {
+        let candidates = array::filter(
+            detail.input_kinds,
+            fn(kind) {
                 match value {
-                    Value::String(_) => kind == edsl::FilterInputKind::Text || kind == edsl::FilterInputKind::Date
-                        || kind == edsl::FilterInputKind::DateTimeUtc
-                        || kind == edsl::FilterInputKind::DateTime || kind == edsl::FilterInputKind::Ipv4,
-                    Value::Int(_) => kind == edsl::FilterInputKind::Int || kind == edsl::FilterInputKind::Number
-                        || kind == edsl::FilterInputKind::EpochMillis,
+                    Value::String(_) => kind == edsl::FilterInputKind::Text || kind == edsl::FilterInputKind::Date || kind == edsl::FilterInputKind::DateTimeUtc || kind == edsl::FilterInputKind::DateTime || kind == edsl::FilterInputKind::Ipv4,
+                    Value::Int(_) => kind == edsl::FilterInputKind::Int || kind == edsl::FilterInputKind::Number || kind == edsl::FilterInputKind::EpochMillis,
                     Value::Float(_) => kind == edsl::FilterInputKind::Number,
                     Value::True => kind == edsl::FilterInputKind::Bool,
                     Value::False => kind == edsl::FilterInputKind::Bool,
                     _ => False,
                 }
-            });
-            if array::length(candidates) == 0 { fail!(`value does not match dimension \{dimension} input type; related knowledge key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Dimension, detail.dataset, dimension)}`, dimension, detail.input_kinds, value) }
-            else {
-                let chosen = if array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Int })
-                    && array::any(candidates, fn(kind) { kind == edsl::FilterInputKind::Number })
-                    && array::length(candidates) == 2 { edsl::FilterInputKind::Int }
-                    else if array::length(candidates) == 1 { candidates[0] }
-                    else { fail!(`dimension \{dimension} has ambiguous declared input types; fix its Model definition`, dimension, candidates, value) };
-                match chosen {
-                    edsl::FilterInputKind::Text => parse_input("text", value),
-                    edsl::FilterInputKind::Ipv4 => match value {
-                        Value::String(text) => edsl::FilterInput::Ipv4(text),
-                        _ => fail!("IPv4 filter requires a string", value),
-                    },
-                    edsl::FilterInputKind::Int => parse_input("int", value),
-                    edsl::FilterInputKind::Number => parse_input("number", value),
-                    edsl::FilterInputKind::Bool => parse_input("bool", value),
-                    edsl::FilterInputKind::DateTimeUtc => parse_input("rfc3339", value),
-                    edsl::FilterInputKind::EpochMillis => parse_input("epoch_millis", value),
-                    edsl::FilterInputKind::Date => parse_input("date", value),
-                    edsl::FilterInputKind::DateTime => parse_input("local_datetime", value),
+            }
+        );
+        if array::length(candidates) == 0 {
+            fail!(
+                `value does not match dimension \{dimension} input type; related knowledge key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Dimension, detail.dataset, dimension)}`,
+                dimension,
+                detail.input_kinds,
+                value
+            )
+        } else {
+            let chosen = if array::any(
+                candidates,
+                fn(kind) {
+                    kind == edsl::FilterInputKind::Int
                 }
+            ) && array::any(
+                candidates,
+                fn(kind) {
+                    kind == edsl::FilterInputKind::Number
+                }
+            ) && array::length(candidates) == 2 {
+                edsl::FilterInputKind::Int
+            } else if array::length(candidates) == 1 {
+                candidates[0]
+            } else {
+                fail!(
+                    `dimension \{dimension} has ambiguous declared input types; fix its Model definition`,
+                    dimension,
+                    candidates,
+                    value
+                )
+            };
+            match chosen {
+                edsl::FilterInputKind::Text => parse_input("text", value),
+                edsl::FilterInputKind::Ipv4 => match value {
+                    Value::String(text) => edsl::FilterInput::Ipv4(text),
+                    _ => fail!("IPv4 filter requires a string", value),
+                },
+                edsl::FilterInputKind::Int => parse_input("int", value),
+                edsl::FilterInputKind::Number => parse_input("number", value),
+                edsl::FilterInputKind::Bool => parse_input("bool", value),
+                edsl::FilterInputKind::DateTimeUtc => parse_input("rfc3339", value),
+                edsl::FilterInputKind::EpochMillis => parse_input("epoch_millis", value),
+                edsl::FilterInputKind::Date => parse_input("date", value),
+                edsl::FilterInputKind::DateTime => parse_input("local_datetime", value),
             }
         }
-    };
-
-def measure_contract: Fn(edsl::PreparedPayload, String) -> edsl::MeasureEntry = fn(payload, id) {
-    match array::find(payload.measures, fn(entry) { entry.id == id }) {
-        Some(entry) => entry, None => fail!(`unknown measure knowledge point \{id}`, id),
     }
 };
-def measure_sampling_contract: Fn(edsl::PreparedPayload, String) -> Option(edsl::SampleMeasureEntry) = fn(payload, id) {
+
+def measure_contract: Fn(edsl::PreparedPayload, String) -> edsl::MeasureEntry = fn(payload, id) {
+    match array::find(
+        payload.measures,
+        fn(entry) {
+            entry.id == id
+        }
+    ) {
+        Some(entry) => entry,
+        None => fail!(`unknown measure knowledge point \{id}`, id),
+    }
+};
+def measure_sampling_contract: Fn(edsl::PreparedPayload, String) -> Option(edsl::SampleMeasureEntry) = fn(
+    payload,
+    id
+) {
     let measure = measure_contract(payload, id);
-    array::find(payload.entities[measure.entity].sample_measures, fn(entry) { entry.id == id })
+    array::find(
+        payload.entities[measure.entity].sample_measures,
+        fn(entry) {
+            entry.id == id
+        }
+    )
 };
 
-def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(payload, measure, value) {
+def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput = fn(
+    payload,
+    measure,
+    value
+) {
     match (edsl::measure_output_type(payload, measure), value) {
         (edsl::OutputType::Text, Value::String(text)) => edsl::FilterInput::Text(text),
         (edsl::OutputType::Integer, Value::Int(number)) => edsl::FilterInput::Int(number),
@@ -186,17 +250,49 @@ def measure_input: Fn(edsl::PreparedPayload, String, Value) -> edsl::FilterInput
         (edsl::OutputType::Boolean, Value::False) => edsl::FilterInput::Bool(False),
         _ => do {
             let entry = measure_contract(payload, measure);
-            fail!(`value does not match measure \{measure} output type; related knowledge key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Measure, payload.entities[entry.entity].id, measure)}`, measure, value)
+            fail!(
+                `value does not match measure \{measure} output type; related knowledge key \{edsl::knowledge_key_hint(edsl::KnowledgeKind::Measure, payload.entities[entry.entity].id, measure)}`,
+                measure,
+                value
+            )
         },
     }
 };
 
-type RawGraphFilter = struct { node: String, dimension: String, op: String, value: Value };
-type RawGraphAnyOf = struct { node: String, dimension: String, values: Array(Value) };
-type RawGraphHaving = struct { node: String, measure: String, op: String, value: Value };
-type RawTimeWindow = struct { node: String, dimension: String, start: Option(Value), end: Value };
-type RawGraphOrder = struct { node: String, dimension: String, direction: String };
-type RawGraphTopMeasure = struct { node: String, measure: String, direction: String, take: Int };
+type RawGraphFilter = struct {
+    node: String,
+    dimension: String,
+    op: String,
+    value: Value
+};
+type RawGraphAnyOf = struct {
+    node: String,
+    dimension: String,
+    values: Array(Value)
+};
+type RawGraphHaving = struct {
+    node: String,
+    measure: String,
+    op: String,
+    value: Value
+};
+type RawTimeWindow = struct {
+    node: String,
+    dimension: String,
+    start: Option(Value),
+    end: Value
+};
+type RawGraphOrder = struct {
+    node: String,
+    dimension: String,
+    direction: String
+};
+type RawGraphTopMeasure = struct {
+    node: String,
+    measure: String,
+    direction: String,
+    take: Int
+};
 # Optional Value fields define the codec key schema; semantic parsing below
 # reads the original object to distinguish omission from explicit null.
 type RawGraphEnvelope = struct {
@@ -237,23 +333,70 @@ type RawGraphExistEnvelope = struct {
     having: Option(Value),
     negated: Option(Value),
 };
-type RawCountThreshold = struct { op: String, value: Value };
-type RawGraphPair = struct { op: String, limit: Option(Value), left: Value, right: Value, align_by: Option(Value), select: Option(Value), count_groups: Option(Value), rank_by: Option(Value) };
-type PairNode = struct { node: String };
-type PairAlignment = struct { left: PairNode, right: PairNode };
-type PairSelection = struct { side: qb::PairSide, node: String, dimension: String };
-type RawPairSubtract = struct { op: String, minuend: qb::PairSide, subtrahend: qb::PairSide, direction: String, take: Int };
-type RawPairRatio = struct { op: String, numerator: qb::PairSide, denominator: qb::PairSide, direction: String, take: Int };
-type RawPairGrowth = struct { op: String, baseline: qb::PairSide, current: qb::PairSide, direction: String, take: Int };
-type RawGraphUnion = struct { op: String, limit: Option(Value), branches: Array(Value) };
-type RawUnionBranch = struct { result_node: String, graph: Value };
-type RawQueryRequest = struct { intents: Array(Value) };
+type RawCountThreshold = struct {
+    op: String,
+    value: Value
+};
+type RawGraphPair = struct {
+    op: String,
+    limit: Option(Value),
+    left: Value,
+    right: Value,
+    align_by: Option(Value),
+    select: Option(Value),
+    count_groups: Option(Value),
+    rank_by: Option(Value)
+};
+type PairNode = struct {
+    node: String
+};
+type PairAlignment = struct {
+    left: PairNode,
+    right: PairNode
+};
+type PairSelection = struct {
+    side: qb::PairSide,
+    node: String,
+    dimension: String
+};
+type RawPairSubtract = struct {
+    op: String,
+    minuend: qb::PairSide,
+    subtrahend: qb::PairSide,
+    direction: String,
+    take: Int
+};
+type RawPairRatio = struct {
+    op: String,
+    numerator: qb::PairSide,
+    denominator: qb::PairSide,
+    direction: String,
+    take: Int
+};
+type RawPairGrowth = struct {
+    op: String,
+    baseline: qb::PairSide,
+    current: qb::PairSide,
+    direction: String,
+    take: Int
+};
+type RawGraphUnion = struct {
+    op: String,
+    limit: Option(Value),
+    branches: Array(Value)
+};
+type RawUnionBranch = struct {
+    result_node: String,
+    graph: Value
+};
+type RawQueryRequest = struct {
+    intents: Array(Value)
+};
 
 def decode_graph_shape: for(A: codec::Decode) Fn(Value, String) -> A = fn(value, topic) {
     match codec::decode@[A](value) {
         Ok(decoded) => decoded,
-        Err(error) => raise!(blame::with_context(error,
-            `invalid \{topic} shape`)),
+        Err(error) => raise!(blame::with_context(error, `invalid \{topic} shape`)),
     }
 };
 
@@ -274,75 +417,113 @@ def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = 
         let detail = dimension_input_contract(payload, dimension);
         if detail.input_kinds != [edsl::FilterInputKind::Ipv4] {
             fail!(`subnet operation requires an IPv4 dimension \{dimension}`, dimension, value)
-        } else { match value {
-            Value::String(text) => edsl::FilterInput::Ipv4Subnet(text),
-            _ => fail!(`IPv4 subnet requires a CIDR string`, value),
-        } }
+        } else {
+            match value {
+                Value::String(text) => edsl::FilterInput::Ipv4Subnet(text),
+                _ => fail!(`IPv4 subnet requires a CIDR string`, value),
+            }
+        }
     } else if value == Value::String("now") {
         let detail = dimension_input_contract(payload, dimension);
-        let temporal = array::any(detail.input_kinds, fn(kind) {
-            kind == edsl::FilterInputKind::EpochMillis || kind == edsl::FilterInputKind::DateTimeUtc
-                || kind == edsl::FilterInputKind::Date
-                || kind == edsl::FilterInputKind::DateTime
-        });
+        let temporal = array::any(
+            detail.input_kinds,
+            fn(kind) {
+                kind == edsl::FilterInputKind::EpochMillis || kind == edsl::FilterInputKind::DateTimeUtc || kind == edsl::FilterInputKind::Date || kind == edsl::FilterInputKind::DateTime
+            }
+        );
         if temporal {
-            fail!(`resolve now to an absolute time value before submitting intent`, dimension, value)
-        } else { inferred_input(payload, dimension, value) }
-    } else { inferred_input(payload, dimension, value) };
-    let request: edsl::FilterRequest = {
-        id: dimension, op, input,
+            fail!(
+                `resolve now to an absolute time value before submitting intent`,
+                dimension,
+                value
+            )
+        } else {
+            inferred_input(payload, dimension, value)
+        }
+    } else {
+        inferred_input(payload, dimension, value)
     };
+    let request: edsl::FilterRequest = {id: dimension, op, input,};
     {node: raw.node, request}
 };
 
-def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue =
-    fn(role, value) {
-        match value {
-            Value::String("now") => fail!(`resolve now to an absolute time boundary before submitting intent`, value),
-            Value::String(text) => match role.encoding {
-                edsl::TimeEncoding::DateText => time::TimeValue::Date(text),
-                edsl::TimeEncoding::Rfc3339Text => time::TimeValue::DateTimeUtc(text),
-                edsl::TimeEncoding::LocalText => time::TimeValue::DateTime(text),
-                _ => fail!("time boundary requires epoch milliseconds", role.encoding, value),
-            },
-            Value::Int(ms) => match role.encoding {
-                edsl::TimeEncoding::EpochMillis => time::TimeValue::EpochMillis(ms),
-                _ => fail!("time boundary requires text in the declared logical format", role.encoding, value),
-            },
-            Value::Object(_) => fail!("resolve relative time to an absolute boundary before submitting intent", value),
-            _ => fail!("time boundary must be a field-compatible absolute value", role.encoding, value),
-        }
-    };
+def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue = fn(role, value) {
+    match value {
+        Value::String("now") => fail!(
+            `resolve now to an absolute time boundary before submitting intent`,
+            value
+        ),
+        Value::String(text) => match role.encoding {
+            edsl::TimeEncoding::DateText => time::TimeValue::Date(text),
+            edsl::TimeEncoding::Rfc3339Text => time::TimeValue::DateTimeUtc(text),
+            edsl::TimeEncoding::LocalText => time::TimeValue::DateTime(text),
+            _ => fail!("time boundary requires epoch milliseconds", role.encoding, value),
+        },
+        Value::Int(ms) => match role.encoding {
+            edsl::TimeEncoding::EpochMillis => time::TimeValue::EpochMillis(ms),
+            _ => fail!(
+                "time boundary requires text in the declared logical format",
+                role.encoding,
+                value
+            ),
+        },
+        Value::Object(_) => fail!(
+            "resolve relative time to an absolute boundary before submitting intent",
+            value
+        ),
+        _ => fail!("time boundary must be a field-compatible absolute value", role.encoding, value),
+    }
+};
 
-def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilter) =
-    fn(payload, value) {
-        match dict::get(as_object(value), "end") {
-            None => fail!("time window end is required and must be non-null"),
-            Some(Value::None) => fail!("time window end is required and must be non-null"),
-            _ => (),
-        };
-        let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
-        let detail = dimension_input_contract(payload, raw.dimension);
-        let role = edsl::time_domain(payload, detail.dataset, detail.field);
-        let window: time::Window = {start: match raw.start {
-                None => None,
-                Some(start) => Some(parse_time_value(role, start)),
-            }, end: parse_time_value(role, raw.end)};
-        array::map(time::window_filters(payload, raw.dimension, window), fn(request) {
-            {node: raw.node, request}
-        })
+def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilter) = fn(
+    payload,
+    value
+) {
+    match dict::get(as_object(value), "end") {
+        None => fail!("time window end is required and must be non-null"),
+        Some(Value::None) => fail!("time window end is required and must be non-null"),
+        _ => (),
     };
+    let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
+    let detail = dimension_input_contract(payload, raw.dimension);
+    let role = edsl::time_domain(payload, detail.dataset, detail.field);
+    let window: time::Window = {
+        start: match raw.start {
+            None => None,
+            Some(start) => Some(parse_time_value(role, start)),
+        },
+        end: parse_time_value(role, raw.end)
+    };
+    array::map(
+        time::window_filters(payload, raw.dimension, window),
+        fn(request) {
+            {node: raw.node, request}
+        }
+    )
+};
 
 def parse_graph_any_of: Fn(edsl::PreparedPayload, Value) -> edsl::GraphAnyOf = fn(payload, item) {
     let raw = decode_graph_shape@[RawGraphAnyOf](item, "syntax/graph/filter");
-    {node: raw.node, dimension: raw.dimension,
-        values: array::map(raw.values, fn(value) { inferred_input(payload, raw.dimension, value) })}
+    {
+        node: raw.node,
+        dimension: raw.dimension,
+        values: array::map(
+            raw.values,
+            fn(value) {
+                inferred_input(payload, raw.dimension, value)
+            }
+        )
+    }
 };
 
 def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
     let raw = decode_graph_shape@[RawGraphHaving](item, "syntax/graph/aggregate");
-    {node: raw.node, measure: raw.measure, op: parse_op(raw.op),
-        threshold: measure_input(payload, raw.measure, raw.value)}
+    {
+        node: raw.node,
+        measure: raw.measure,
+        op: parse_op(raw.op),
+        threshold: measure_input(payload, raw.measure, raw.value)
+    }
 };
 
 def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist = fn(payload, item) {
@@ -354,22 +535,53 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist 
         Some(Value::False) => False,
         Some(value) => fail!(`graph existence negated must be boolean`, value),
     };
-    {anchor: raw.anchor,
+    {
+        anchor: raw.anchor,
         nodes: array::map(as_array(raw.nodes), parse_graph_node),
         edges: array::map(as_array(raw.edges), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
-        filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, value) }),
-            array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, value) })]),
-        any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, value) }),
-        having: array::map(array_opt(obj, "having"), fn(value) { parse_graph_having(payload, value) }),
-        negated}
+        filters: array::concat(
+            [
+                array::map(
+                    array_opt(obj, "filters"),
+                    fn(value) {
+                        parse_graph_filter(payload, value)
+                    }
+                ),
+                array::flat_map(
+                    array_opt(obj, "time_windows"),
+                    fn(value) {
+                        parse_time_window(payload, value)
+                    }
+                )
+            ]
+        ),
+        any_of: array::map(
+            array_opt(obj, "any_of"),
+            fn(value) {
+                parse_graph_any_of(payload, value)
+            }
+        ),
+        having: array::map(
+            array_opt(obj, "having"),
+            fn(value) {
+                parse_graph_having(payload, value)
+            }
+        ),
+        negated
+    }
 };
 
-def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, value) {
+def lower_graph_object: Fn(
+    qb::BuildCtx,
+    edsl::PreparedPayload,
+    Value
+) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan) = fn(ctx, payload, value) {
     let obj = as_object(value);
     let op = as_string(field(obj, "op"));
-    if op != "Graph" { fail!("graph pair and union branches must be Graph intents", op) }
-    else {
+    if op != "Graph" {
+        fail!("graph pair and union branches must be Graph intents", op)
+    } else {
         let raw = decode_graph_shape@[RawGraphEnvelope](value, "syntax/graph");
         let request: edsl::GraphRequest = {
             root: raw.root,
@@ -389,14 +601,46 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
             edges: array::map(as_array(raw.edges), parse_graph_edge),
             constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
             select: decode_graph_shape@[Array(edsl::GraphSelect)](raw.select, "syntax/graph/select"),
-            measures: array::map(array_opt(obj, "measures"), fn(value) {
-                decode_graph_shape@[edsl::GraphMeasureSelect](value, "syntax/graph/select")
-            }),
-            measure_having: array::map(array_opt(obj, "measure_having"), fn(value) { parse_graph_having(payload, value) }),
-            filters: array::concat([array::map(array_opt(obj, "filters"), fn(value) { parse_graph_filter(payload, value) }),
-                array::flat_map(array_opt(obj, "time_windows"), fn(value) { parse_time_window(payload, value) })]),
-            any_of: array::map(array_opt(obj, "any_of"), fn(value) { parse_graph_any_of(payload, value) }),
-            exists: array::map(array_opt(obj, "exists"), fn(value) { parse_graph_existence(payload, value) }),
+            measures: array::map(
+                array_opt(obj, "measures"),
+                fn(value) {
+                    decode_graph_shape@[edsl::GraphMeasureSelect](value, "syntax/graph/select")
+                }
+            ),
+            measure_having: array::map(
+                array_opt(obj, "measure_having"),
+                fn(value) {
+                    parse_graph_having(payload, value)
+                }
+            ),
+            filters: array::concat(
+                [
+                    array::map(
+                        array_opt(obj, "filters"),
+                        fn(value) {
+                            parse_graph_filter(payload, value)
+                        }
+                    ),
+                    array::flat_map(
+                        array_opt(obj, "time_windows"),
+                        fn(value) {
+                            parse_time_window(payload, value)
+                        }
+                    )
+                ]
+            ),
+            any_of: array::map(
+                array_opt(obj, "any_of"),
+                fn(value) {
+                    parse_graph_any_of(payload, value)
+                }
+            ),
+            exists: array::map(
+                array_opt(obj, "exists"),
+                fn(value) {
+                    parse_graph_existence(payload, value)
+                }
+            ),
             count: match dict::get(obj, "count") {
                 None => None,
                 Some(Value::None) => None,
@@ -405,13 +649,18 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
             count_value: match dict::get(obj, "count_value") {
                 None => None,
                 Some(Value::None) => None,
-                Some(value) => Some(decode_graph_shape@[edsl::GraphSelect](value, "syntax/graph/select")),
+                Some(value) => Some(
+                    decode_graph_shape@[edsl::GraphSelect](value, "syntax/graph/select")
+                ),
             },
             count_having: match dict::get(obj, "count_having") {
                 None => None,
                 Some(Value::None) => None,
                 Some(value) => do {
-                    let threshold = decode_graph_shape@[RawCountThreshold](value, "syntax/graph/aggregate");
+                    let threshold = decode_graph_shape@[RawCountThreshold](
+                        value,
+                        "syntax/graph/aggregate"
+                    );
                     let count = match threshold.value {
                         Value::Int(n) => n,
                         other => fail!("graph count threshold must be an integer", other),
@@ -437,19 +686,24 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
                 Some(Value::Int(n)) => Some(n),
                 Some(value) => fail!("graph raw take must be an integer", value),
             },
-            order_by: array::map(array_opt(obj, "order_by"), fn(value) {
-                let order = decode_graph_shape@[RawGraphOrder](value, "syntax/graph/order");
-                let direction = match order.direction {
-                    "Asc" => qb::Ordering::Asc,
-                    "Desc" => qb::Ordering::Desc,
-                    other => fail!(`graph order direction must be Asc or Desc`, other),
-                };
-                {node: order.node, dimension: order.dimension, direction}
-            }),
+            order_by: array::map(
+                array_opt(obj, "order_by"),
+                fn(value) {
+                    let order = decode_graph_shape@[RawGraphOrder](value, "syntax/graph/order");
+                    let direction = match order.direction {
+                        "Asc" => qb::Ordering::Asc,
+                        "Desc" => qb::Ordering::Desc,
+                        other => fail!(`graph order direction must be Asc or Desc`, other),
+                    };
+                    {node: order.node, dimension: order.dimension, direction}
+                }
+            ),
             top_per: match dict::get(obj, "top_per") {
                 None => None,
                 Some(Value::None) => None,
-                Some(value) => Some(decode_graph_shape@[edsl::GraphTopPer](value, "syntax/graph/order")),
+                Some(value) => Some(
+                    decode_graph_shape@[edsl::GraphTopPer](value, "syntax/graph/order")
+                ),
             },
             top_by_measure: match dict::get(obj, "top_by_measure") {
                 None => None,
@@ -471,30 +725,58 @@ def lower_graph_object: Fn(qb::BuildCtx, edsl::PreparedPayload, Value) -> (qb::B
 };
 
 def paired_graph_shape: Fn(edsl::GraphRequest) -> Bool = fn(request) {
-    array::get(request.group_by_identity, 0) == Some(request.root)
-        && array::length(request.measures) == 1 && request.count == None && request.count_value == None
-        && request.count_having == None && !request.count_groups && !request.distinct
-        && !request.include_empty && request.top_per == None && request.top_by_measure == None
-        && array::length(request.order_by) == 0 && request.take == None
+    array::get(request.group_by_identity, 0) == Some(request.root) && array::length(
+        request.measures
+    ) == 1 && request.count == None && request.count_value == None && request.count_having == None && !request.count_groups && !request.distinct && !request.include_empty && request.top_per == None && request.top_by_measure == None && array::length(
+        request.order_by
+    ) == 0 && request.take == None
 };
 
 def paired_group_operand: Fn(qb::Plan, Array(qb::Expr)) -> qb::Plan = fn(plan, identity) {
-    let keys = array::map(array::enumerate(identity), fn(entry) {
-        qb::named_expr_item(entry.1, `__q_key_\{entry.0}`)
-    });
+    let keys = array::map(
+        array::enumerate(identity),
+        fn(entry) {
+            qb::named_expr_item(entry.1, `__q_key_\{entry.0}`)
+        }
+    );
     {...plan, projection: array::concat([plan.projection, keys])}
 };
 
-def pair_operand: Fn(Value, Array(PairSelection), qb::PairSide) -> Value = fn(value, selections, side) {
+def pair_operand: Fn(Value, Array(PairSelection), qb::PairSide) -> Value = fn(
+    value,
+    selections,
+    side
+) {
     let obj = as_object(value);
     if array::length(array_opt(obj, "select")) != 0 {
-        fail!("GraphPair migration: move operand select to outer select with an explicit side", value)
+        fail!(
+            "GraphPair migration: move operand select to outer select with an explicit side",
+            value
+        )
     } else {
-        let selected = array::filter(selections, fn(item) { item.side == side });
-        let unique = array::fold(selected, [], fn(acc, item) {
-            let selection: edsl::GraphSelect = {node: item.node, dimension: item.dimension};
-            if array::any(acc, fn(existing) { existing == selection }) { acc } else { array::push(acc, selection) }
-        });
+        let selected = array::filter(
+            selections,
+            fn(item) {
+                item.side == side
+            }
+        );
+        let unique = array::fold(
+            selected,
+            [],
+            fn(acc, item) {
+                let selection: edsl::GraphSelect = {node: item.node, dimension: item.dimension};
+                if array::any(
+                    acc,
+                    fn(existing) {
+                        existing == selection
+                    }
+                ) {
+                    acc
+                } else {
+                    array::push(acc, selection)
+                }
+            }
+        );
         Value::Object(dict::merge(obj, {select: codec::encode(unique)}))
     }
 };
@@ -502,7 +784,9 @@ def pair_operand: Fn(Value, Array(PairSelection), qb::PairSide) -> Value = fn(va
 def temporal_leq: Fn(edsl::FilterInput, edsl::FilterInput) -> Bool = fn(a, b) {
     match (a, b) {
         (edsl::FilterInput::EpochMillis(x), edsl::FilterInput::EpochMillis(y)) => x <= y,
-        (edsl::FilterInput::DateTimeUtc(x), edsl::FilterInput::DateTimeUtc(y)) => edsl::rfc3339_key(x) <= edsl::rfc3339_key(y),
+        (edsl::FilterInput::DateTimeUtc(x), edsl::FilterInput::DateTimeUtc(y)) => edsl::rfc3339_key(
+            x
+        ) <= edsl::rfc3339_key(y),
         (edsl::FilterInput::Date(x), edsl::FilterInput::Date(y)) => x <= y,
         _ => False,
     }
@@ -510,39 +794,102 @@ def temporal_leq: Fn(edsl::FilterInput, edsl::FilterInput) -> Bool = fn(a, b) {
 
 # A strict upper bound at or below the other population's inclusive lower
 # bound proves that equal temporal identity values cannot exist.
-def pair_time_alignment: Fn(edsl::PreparedPayload, edsl::GraphRequest, edsl::GraphRequest, Array(PairAlignment)) -> Bool = fn(payload, left, right, align) {
-    array::all(align, fn(pair) {
-        let entity_id = edsl::graph_node(left, pair.left.node).entity;
-        let entity = match array::find(payload.entities, fn(entity) { entity.id == entity_id }) {
-            Some(entity) => entity, None => fail!("aligned entity missing", entity_id),
-        };
-        let identity = match entity.dataset {
-            Some(spec) => spec.grain,
-            None => array::map(array::filter(entity.fields, fn(field) { field.is_key }), fn(field) { field.name }),
-        };
-        array::all(array::filter(entity.fields, fn(field) {
-            array::any(identity, fn(name) { name == field.name })
-                && field.time != None
-        }), fn(field) {
-            let bounds = fn(request: edsl::GraphRequest, node: String) {
-                array::filter(request.filters, fn(filter) {
-                    let dimension = dimension_input_contract(payload, filter.request.id);
-                    filter.node == node && !dimension.computed && array::any(entity.fields, fn(candidate) {
-                        candidate.name == dimension.field && candidate.column == field.column
-                    })
-                })
+def pair_time_alignment: Fn(
+    edsl::PreparedPayload,
+    edsl::GraphRequest,
+    edsl::GraphRequest,
+    Array(PairAlignment)
+) -> Bool = fn(payload, left, right, align) {
+    array::all(
+        align,
+        fn(pair) {
+            let entity_id = edsl::graph_node(left, pair.left.node).entity;
+            let entity = match array::find(
+                payload.entities,
+                fn(entity) {
+                    entity.id == entity_id
+                }
+            ) {
+                Some(entity) => entity,
+                None => fail!("aligned entity missing", entity_id),
             };
-            let l = bounds(left, pair.left.node);
-            let r = bounds(right, pair.right.node);
-            let disjoint = array::any(l, fn(a) { array::any(r, fn(b) {
-                (a.request.op == edsl::FilterOp::Lt && b.request.op == edsl::FilterOp::Ge && temporal_leq(a.request.input, b.request.input))
-                    || (b.request.op == edsl::FilterOp::Lt && a.request.op == edsl::FilterOp::Ge && temporal_leq(b.request.input, a.request.input))
-            }) });
-            if disjoint {
-                fail!(`GraphPair align_by nodes \{pair.left.node}/\{pair.right.node} identity contains time field \{field.name} (column \{field.column}); disjoint time windows cannot share an identity. Align owner entities for period comparisons, or use overlapping windows for sample-point pairing.`, pair, field.name)
-            } else { True }
-        })
-    })
+            let identity = match entity.dataset {
+                Some(spec) => spec.grain,
+                None => array::map(
+                    array::filter(
+                        entity.fields,
+                        fn(field) {
+                            field.is_key
+                        }
+                    ),
+                    fn(field) {
+                        field.name
+                    }
+                ),
+            };
+            array::all(
+                array::filter(
+                    entity.fields,
+                    fn(field) {
+                        array::any(
+                            identity,
+                            fn(name) {
+                                name == field.name
+                            }
+                        ) && field.time != None
+                    }
+                ),
+                fn(field) {
+                    let bounds = fn(request: edsl::GraphRequest, node: String) {
+                        array::filter(
+                            request.filters,
+                            fn(filter) {
+                                let dimension = dimension_input_contract(payload, filter.request.id);
+                                filter.node == node && !dimension.computed && array::any(
+                                    entity.fields,
+                                    fn(candidate) {
+                                        candidate.name == dimension.field && candidate.column == field.column
+                                    }
+                                )
+                            }
+                        )
+                    };
+                    let l = bounds(left, pair.left.node);
+                    let r = bounds(right, pair.right.node);
+                    let disjoint = array::any(
+                        l,
+                        fn(a) {
+                            array::any(
+                                r,
+                                fn(b) {
+                                    (
+                                        a.request.op == edsl::FilterOp::Lt && b.request.op == edsl::FilterOp::Ge && temporal_leq(
+                                            a.request.input,
+                                            b.request.input
+                                        )
+                                    ) || (
+                                        b.request.op == edsl::FilterOp::Lt && a.request.op == edsl::FilterOp::Ge && temporal_leq(
+                                            b.request.input,
+                                            a.request.input
+                                        )
+                                    )
+                                }
+                            )
+                        }
+                    );
+                    if disjoint {
+                        fail!(
+                            `GraphPair align_by nodes \{pair.left.node}/\{pair.right.node} identity contains time field \{field.name} (column \{field.column}); disjoint time windows cannot share an identity. Align owner entities for period comparisons, or use overlapping windows for sample-point pairing.`,
+                            pair,
+                            field.name
+                        )
+                    } else {
+                        True
+                    }
+                }
+            )
+        }
+    )
 };
 
 def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
@@ -556,43 +903,135 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
     };
     let align = match raw.align_by {
         Some(value) => decode_graph_shape@[Array(PairAlignment)](value, "syntax/graph_pair"),
-        None => fail!("GraphPair migration: supply explicit align_by and outer select with per-column side", value),
+        None => fail!(
+            "GraphPair migration: supply explicit align_by and outer select with per-column side",
+            value
+        ),
     };
     let selected = match raw.select {
         Some(value) => decode_graph_shape@[Array(PairSelection)](value, "syntax/graph_pair"),
         None => fail!("GraphPair migration: supply outer select (an empty array is allowed)", value),
     };
-    let left_ids = array::map(align, fn(item) { item.left.node });
-    let right_ids = array::map(align, fn(item) { item.right.node });
-    if array::length(align) == 0 || !array::all(array::enumerate(align), fn(entry) {
-        array::length(array::filter(left_ids, fn(id) { id == entry.1.left.node })) == 1
-            && array::length(array::filter(right_ids, fn(id) { id == entry.1.right.node })) == 1
-    }) { fail!("aggregate pair align_by must contain unique nodes on each side", align) }
-    else if !array::all(selected, fn(item) {
-        array::any(if item.side == qb::PairSide::Left { left_ids } else { right_ids }, fn(id) { id == item.node })
-    }) { fail!("aggregate pair output dimensions must belong to aligned identity nodes", selected) }
-    else { () };
-    let left = lower_graph_object(qb::build_context(), payload, pair_operand(raw.left, selected, qb::PairSide::Left));
-    let right = lower_graph_object(qb::independent_query_scope(left.0), payload, pair_operand(raw.right, selected, qb::PairSide::Right));
+    let left_ids = array::map(
+        align,
+        fn(item) {
+            item.left.node
+        }
+    );
+    let right_ids = array::map(
+        align,
+        fn(item) {
+            item.right.node
+        }
+    );
+    if array::length(align) == 0 || !array::all(
+        array::enumerate(align),
+        fn(entry) {
+            array::length(
+                array::filter(
+                    left_ids,
+                    fn(id) {
+                        id == entry.1.left.node
+                    }
+                )
+            ) == 1 && array::length(
+                array::filter(
+                    right_ids,
+                    fn(id) {
+                        id == entry.1.right.node
+                    }
+                )
+            ) == 1
+        }
+    ) {
+        fail!("aggregate pair align_by must contain unique nodes on each side", align)
+    } else if !array::all(
+        selected,
+        fn(item) {
+            array::any(
+                if item.side == qb::PairSide::Left {
+                    left_ids
+                } else {
+                    right_ids
+                },
+                fn(id) {
+                    id == item.node
+                }
+            )
+        }
+    ) {
+        fail!("aggregate pair output dimensions must belong to aligned identity nodes", selected)
+    } else {
+        ()
+    };
+    let left = lower_graph_object(
+        qb::build_context(),
+        payload,
+        pair_operand(raw.left, selected, qb::PairSide::Left)
+    );
+    let right = lower_graph_object(
+        qb::independent_query_scope(left.0),
+        payload,
+        pair_operand(raw.right, selected, qb::PairSide::Right)
+    );
     if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
-        fail!("aggregate pair operands each require one measure, grouping beginning with root identity, and no row ordering or count; qualify each population inside its own graph")
+        fail!(
+            "aggregate pair operands each require one measure, grouping beginning with root identity, and no row ordering or count; qualify each population inside its own graph"
+        )
     } else if left.1.group_by_identity != left_ids || right.1.group_by_identity != right_ids {
-        fail!("aggregate pair group_by_identity must exactly match align_by on each side, beginning with the root", left_ids, right_ids)
-    } else if !array::all(align, fn(item) {
-        edsl::graph_node(left.1, item.left.node).entity == edsl::graph_node(right.1, item.right.node).entity
-    }) {
+        fail!(
+            "aggregate pair group_by_identity must exactly match align_by on each side, beginning with the root",
+            left_ids,
+            right_ids
+        )
+    } else if !array::all(
+        align,
+        fn(item) {
+            edsl::graph_node(left.1, item.left.node).entity == edsl::graph_node(
+                right.1,
+                item.right.node
+            ).entity
+        }
+    ) {
         fail!("aggregate pair aligned nodes must belong to the same entity", align)
     } else {
-        if pair_time_alignment(payload, left.1, right.1, align) { () } else { fail!("invalid temporal alignment") };
+        if pair_time_alignment(payload, left.1, right.1, align) {
+            ()
+        } else {
+            fail!("invalid temporal alignment")
+        };
         let left_identity = edsl::graph_pair_identity(payload, left.1, left.2);
         let right_identity = edsl::graph_pair_identity(payload, right.1, right.2);
-        let keys = array::map(array::enumerate(left_identity), fn(entry) { `__q_key_\{entry.0}` });
-        let visible = array::flat_map(selected, fn(item) {
-            let alias = `\{item.node}_\{item.dimension}`;
-            let prefix = if item.side == qb::PairSide::Left { "left" } else { "right" };
-            let columns = if dimension_input_contract(payload, item.dimension).half_open { [alias, `\{alias}__kind`] } else { [alias] };
-            array::map(columns, fn(column) { {side: item.side, column, alias: `\{prefix}_\{column}`}.ty!(qb::JoinedGroupOutput) })
-        });
+        let keys = array::map(
+            array::enumerate(left_identity),
+            fn(entry) {
+                `__q_key_\{entry.0}`
+            }
+        );
+        let visible = array::flat_map(
+            selected,
+            fn(item) {
+                let alias = `\{item.node}_\{item.dimension}`;
+                let prefix = if item.side == qb::PairSide::Left {
+                    "left"
+                } else {
+                    "right"
+                };
+                let columns = if dimension_input_contract(payload, item.dimension).half_open {
+                    [alias, `\{alias}__kind`]
+                } else {
+                    [alias]
+                };
+                array::map(
+                    columns,
+                    fn(column) {
+                        {side: item.side, column, alias: `\{prefix}_\{column}`}.ty!(
+                            qb::JoinedGroupOutput
+                        )
+                    }
+                )
+            }
+        );
         let left_measure = left.1.measures[0];
         let right_measure = right.1.measures[0];
         let ranked = match raw.rank_by {
@@ -611,56 +1050,150 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                         let r = decode_graph_shape@[RawPairGrowth](value, "syntax/graph_pair");
                         (qb::PairRankOp::GrowthRate, r.current, r.baseline, r.direction, r.take)
                     },
-                    other => fail!("aggregate pair rank supports Subtract, Ratio or GrowthRate with explicit sides", other),
+                    other => fail!(
+                        "aggregate pair rank supports Subtract, Ratio or GrowthRate with explicit sides",
+                        other
+                    ),
                 };
-                if spec.1 == spec.2 { fail!("aggregate pair rank operands must reference different sides", value) }
-                else if count_groups { fail!("aggregate pair rank_by cannot be combined with count_groups", value) }
-                else if spec.4 <= 0 || spec.4 > qb::max_partition_take {
-                    fail!("aggregate pair rank take must be a positive integer within the cap", spec.4)
-                } else { () };
+                if spec.1 == spec.2 {
+                    fail!("aggregate pair rank operands must reference different sides", value)
+                } else if count_groups {
+                    fail!("aggregate pair rank_by cannot be combined with count_groups", value)
+                } else if spec.4 <= 0 || spec.4 > qb::max_partition_take {
+                    fail!(
+                        "aggregate pair rank take must be a positive integer within the cap",
+                        spec.4
+                    )
+                } else {
+                    ()
+                };
                 let direction = match spec.3 {
-                    "Asc" => qb::Ordering::Asc, "Desc" => qb::Ordering::Desc,
+                    "Asc" => qb::Ordering::Asc,
+                    "Desc" => qb::Ordering::Desc,
                     other => fail!("aggregate pair rank direction must be Asc or Desc", other),
                 };
                 let ltype = edsl::measure_output_type(payload, left_measure.measure);
                 let rtype = edsl::measure_output_type(payload, right_measure.measure);
-                if (ltype != edsl::OutputType::Integer && ltype != edsl::OutputType::Number)
-                    || (rtype != edsl::OutputType::Integer && rtype != edsl::OutputType::Number) {
-                    fail!("aggregate pair rank requires numeric measures", left_measure.measure, right_measure.measure)
-                } else { () };
+                if (ltype != edsl::OutputType::Integer && ltype != edsl::OutputType::Number) || (
+                    rtype != edsl::OutputType::Integer && rtype != edsl::OutputType::Number
+                ) {
+                    fail!(
+                        "aggregate pair rank requires numeric measures",
+                        left_measure.measure,
+                        right_measure.measure
+                    )
+                } else {
+                    ()
+                };
                 let lmetric = measure_sampling_contract(payload, left_measure.measure);
                 let rmetric = measure_sampling_contract(payload, right_measure.measure);
                 if left_measure.measure != right_measure.measure && !match (lmetric, rmetric) {
                     (Some(l), Some(r)) => l.unit != None && l.unit == r.unit,
                     _ => False,
-                } { fail!("aggregate pair rank requires the same measure or matching declared units", left_measure.measure, right_measure.measure) }
-                else { () };
-                if !array::all([qb::Operator::Order, qb::Operator::Limit, qb::Operator::Scalar, qb::Operator::Filter], fn(op) {
-                    array::any(payload.profile.allowed_operators, fn(allowed) { allowed == op })
-                }) || !array::all(array::concat([[qb::ScalarFunction::IsNotNull], match spec.0 {
-                    qb::PairRankOp::Subtract => [qb::ScalarFunction::Sub],
-                    qb::PairRankOp::Ratio => [qb::ScalarFunction::Div, qb::ScalarFunction::Ne],
-                    qb::PairRankOp::GrowthRate => [qb::ScalarFunction::Sub, qb::ScalarFunction::Div, qb::ScalarFunction::Gt],
-                }]), fn(op) {
-                    array::any(payload.profile.allowed_scalars, fn(allowed) { allowed == op })
-                }) { fail!("aggregate pair ranking is not authorized by the model query profile", value) }
-                else { () };
+                } {
+                    fail!(
+                        "aggregate pair rank requires the same measure or matching declared units",
+                        left_measure.measure,
+                        right_measure.measure
+                    )
+                } else {
+                    ()
+                };
+                if !array::all(
+                    [
+                        qb::Operator::Order,
+                        qb::Operator::Limit,
+                        qb::Operator::Scalar,
+                        qb::Operator::Filter
+                    ],
+                    fn(op) {
+                        array::any(
+                            payload.profile.allowed_operators,
+                            fn(allowed) {
+                                allowed == op
+                            }
+                        )
+                    }
+                ) || !array::all(
+                    array::concat(
+                        [
+                            [qb::ScalarFunction::IsNotNull],
+                            match spec.0 {
+                                qb::PairRankOp::Subtract => [qb::ScalarFunction::Sub],
+                                qb::PairRankOp::Ratio => [
+                                    qb::ScalarFunction::Div,
+                                    qb::ScalarFunction::Ne
+                                ],
+                                qb::PairRankOp::GrowthRate => [
+                                    qb::ScalarFunction::Sub,
+                                    qb::ScalarFunction::Div,
+                                    qb::ScalarFunction::Gt
+                                ],
+                            }
+                        ]
+                    ),
+                    fn(op) {
+                        array::any(
+                            payload.profile.allowed_scalars,
+                            fn(allowed) {
+                                allowed == op
+                            }
+                        )
+                    }
+                ) {
+                    fail!(
+                        "aggregate pair ranking is not authorized by the model query profile",
+                        value
+                    )
+                } else {
+                    ()
+                };
                 let bound = qb::take_bound(right.0, spec.4);
-                (bound.0, Some({left_measure: `\{left_measure.node}_\{left_measure.measure}`,
-                    right_measure: `\{right_measure.node}_\{right_measure.measure}`, op: spec.0, first: spec.1, direction, take: bound.1}.ty!(qb::JoinedGroupRank)))
+                (
+                    bound.0,
+                    Some(
+                        {
+                            left_measure: `\{left_measure.node}_\{left_measure.measure}`,
+                            right_measure: `\{right_measure.node}_\{right_measure.measure}`,
+                            op: spec.0,
+                            first: spec.1,
+                            direction,
+                            take: bound.1
+                        }.ty!(qb::JoinedGroupRank)
+                    )
+                )
             },
         };
         let joined: qb::JoinedGroups = {
-            left: paired_group_operand(left.2, left_identity), right: paired_group_operand(right.2, right_identity), keys,
-            left_identity, right_identity,
-            outputs: array::concat([visible, [
-                {side: qb::PairSide::Left, column: `\{left_measure.node}_\{left_measure.measure}`, alias: `left_\{left_measure.node}_\{left_measure.measure}`},
-                {side: qb::PairSide::Right, column: `\{right_measure.node}_\{right_measure.measure}`, alias: `right_\{right_measure.node}_\{right_measure.measure}`},
-            ]]),
+            left: paired_group_operand(left.2, left_identity),
+            right: paired_group_operand(right.2, right_identity),
+            keys,
+            left_identity,
+            right_identity,
+            outputs: array::concat(
+                [
+                    visible,
+                    [
+                        {
+                            side: qb::PairSide::Left,
+                            column: `\{left_measure.node}_\{left_measure.measure}`,
+                            alias: `left_\{left_measure.node}_\{left_measure.measure}`
+                        },
+                        {
+                            side: qb::PairSide::Right,
+                            column: `\{right_measure.node}_\{right_measure.measure}`,
+                            alias: `right_\{right_measure.node}_\{right_measure.measure}`
+                        },
+                    ]
+                ]
+            ),
             rank: ranked.1,
         };
-        let plan = if count_groups { qb::QueryPlan::JoinedGroupCount(joined) }
-            else { qb::QueryPlan::JoinedGroups(joined) };
+        let plan = if count_groups {
+            qb::QueryPlan::JoinedGroupCount(joined)
+        } else {
+            qb::QueryPlan::JoinedGroups(joined)
+        };
         qb::finish(ranked.0, qb::validate_query_plan(plan))
     }
 };
@@ -668,50 +1201,113 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
 # A union returns one entity population, not an arbitrary mixture of rows.
 # Requiring its complete visible identity makes SQL's whole-row UNION distinct
 # equivalent to entity deduplication for the selected dimensions.
-def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, Int) -> String = fn(payload, request, result_node, branch) {
+def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, Int) -> String = fn(
+    payload,
+    request,
+    result_node,
+    branch
+) {
     let node = edsl::graph_node(request, result_node);
-    if request.count != None || request.count_value != None || request.count_having != None
-        || request.count_groups || array::length(request.measures) > 0
-        || array::length(request.measure_having) > 0 || array::length(request.group_by_identity) > 0
-        || request.include_empty || request.top_per != None || request.top_by_measure != None
-        || array::length(request.order_by) > 0 || request.take != None {
-        fail!("graph union branch must return unordered raw entity rows without counts, measures or Top-N", branch)
-    } else if array::length(request.select) == 0 || !array::all(request.select, fn(item) { item.node == result_node }) {
-        fail!("graph union branch must select only dimensions of its result node", branch, result_node)
+    if request.count != None || request.count_value != None || request.count_having != None || request.count_groups || array::length(
+        request.measures
+    ) > 0 || array::length(request.measure_having) > 0 || array::length(request.group_by_identity) > 0 || request.include_empty || request.top_per != None || request.top_by_measure != None || array::length(
+        request.order_by
+    ) > 0 || request.take != None {
+        fail!(
+            "graph union branch must return unordered raw entity rows without counts, measures or Top-N",
+            branch
+        )
+    } else if array::length(request.select) == 0 || !array::all(
+        request.select,
+        fn(item) {
+            item.node == result_node
+        }
+    ) {
+        fail!(
+            "graph union branch must select only dimensions of its result node",
+            branch,
+            result_node
+        )
     } else {
-        let entity = match array::find(payload.entities, fn(entry) { entry.id == node.entity }) {
+        let entity = match array::find(
+            payload.entities,
+            fn(entry) {
+                entry.id == node.entity
+            }
+        ) {
             Some(entry) => entry,
             None => fail!("graph union result node has an unknown entity", branch, node.entity),
         };
         let grain = match entity.dataset {
             Some(dataset) => dataset.grain,
-            None => if entity.key_field >= 0 { [entity.fields[entity.key_field].name] }
-                else { fail!("graph union result entity needs a declared identity", branch, node.entity) },
+            None => if entity.key_field >= 0 {
+                [entity.fields[entity.key_field].name]
+            } else {
+                fail!("graph union result entity needs a declared identity", branch, node.entity)
+            },
         };
-        if !array::all(grain, fn(name) {
-            let field = match array::find(array::enumerate(entity.fields), fn(entry) { entry.1.name == name }) {
-                Some(entry) => entry.0,
-                None => fail!("graph union identity field is missing from the entity", branch, name),
-            };
-            array::any(request.select, fn(item) {
-                array::any(payload.dimensions, fn(dimension) {
-                    dimension.id == item.dimension && dimension.entity == entity.index
-                        && dimension.field == field && !dimension.computed
-                })
-            })
-        }) {
-            fail!("graph union branch must project every field of its complete result identity as a plain dimension", branch, node.entity, grain)
-        } else { node.entity }
+        if !array::all(
+            grain,
+            fn(name) {
+                let field = match array::find(
+                    array::enumerate(entity.fields),
+                    fn(entry) {
+                        entry.1.name == name
+                    }
+                ) {
+                    Some(entry) => entry.0,
+                    None => fail!(
+                        "graph union identity field is missing from the entity",
+                        branch,
+                        name
+                    ),
+                };
+                array::any(
+                    request.select,
+                    fn(item) {
+                        array::any(
+                            payload.dimensions,
+                            fn(dimension) {
+                                dimension.id == item.dimension && dimension.entity == entity.index && dimension.field == field && !dimension.computed
+                            }
+                        )
+                    }
+                )
+            }
+        ) {
+            fail!(
+                "graph union branch must project every field of its complete result identity as a plain dimension",
+                branch,
+                node.entity,
+                grain
+            )
+        } else {
+            node.entity
+        }
     }
 };
 
-def lower_union_branch: Fn(qb::BuildCtx, edsl::PreparedPayload, Value, Int) -> (qb::BuildCtx, String, Array(String), qb::Plan) =
-    fn(ctx, payload, value, index) {
-        let branch = decode_graph_shape@[RawUnionBranch](value, "syntax/graph_union");
-        let lowered = lower_graph_object(ctx, payload, branch.graph);
-        let entity = union_graph_result(payload, lowered.1, branch.result_node, index);
-        (lowered.0, entity, array::map(lowered.1.select, fn(item) { item.dimension }), lowered.2)
-    };
+def lower_union_branch: Fn(
+    qb::BuildCtx,
+    edsl::PreparedPayload,
+    Value,
+    Int
+) -> (qb::BuildCtx, String, Array(String), qb::Plan) = fn(ctx, payload, value, index) {
+    let branch = decode_graph_shape@[RawUnionBranch](value, "syntax/graph_union");
+    let lowered = lower_graph_object(ctx, payload, branch.graph);
+    let entity = union_graph_result(payload, lowered.1, branch.result_node, index);
+    (
+        lowered.0,
+        entity,
+        array::map(
+            lowered.1.select,
+            fn(item) {
+                item.dimension
+            }
+        ),
+        lowered.2
+    )
+};
 
 def lower_graph_union: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
     let union = decode_graph_shape@[RawGraphUnion](value, "syntax/graph_union");
@@ -720,38 +1316,75 @@ def lower_graph_union: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(pay
         fail!("graph union requires at least two graph branches", array::length(branches))
     } else {
         let first = lower_union_branch(qb::build_context(), payload, branches[0], 1);
-        let combined = array::fold(array::enumerate(branches),
-            (first.0, first.1, first.2, [first.3]), fn(state, entry) {
-                if entry.0 == 0 { state }
-                else {
-                    let branch = lower_union_branch(qb::independent_query_scope(state.0),
-                        payload, entry.1, entry.0 + 1);
+        let combined = array::fold(
+            array::enumerate(branches),
+            (first.0, first.1, first.2, [first.3]),
+            fn(state, entry) {
+                if entry.0 == 0 {
+                    state
+                } else {
+                    let branch = lower_union_branch(
+                        qb::independent_query_scope(state.0),
+                        payload,
+                        entry.1,
+                        entry.0 + 1
+                    );
                     if branch.1 != state.1 {
-                        fail!(`graph union branch \{entry.0 + 1} must return the same result entity as branch 1: expected \{state.1}, got \{branch.1}`, entry.0 + 1, state.1, branch.1)
+                        fail!(
+                            `graph union branch \{entry.0 + 1} must return the same result entity as branch 1: expected \{state.1}, got \{branch.1}`,
+                            entry.0 + 1,
+                            state.1,
+                            branch.1
+                        )
                     } else if branch.2 != state.2 {
-                        fail!(`graph union branch \{entry.0 + 1} must select the same result dimensions in the same order as branch 1`, entry.0 + 1, state.2, branch.2)
-                    } else { (branch.0, state.1, state.2, array::push(state.3, branch.3)) }
+                        fail!(
+                            `graph union branch \{entry.0 + 1} must select the same result dimensions in the same order as branch 1`,
+                            entry.0 + 1,
+                            state.2,
+                            branch.2
+                        )
+                    } else {
+                        (branch.0, state.1, state.2, array::push(state.3, branch.3))
+                    }
                 }
-            });
-        qb::finish(combined.0, qb::validate_query_plan(qb::QueryPlan::SetRows({
-            kind: qb::SetOpKind::Union, operands: combined.3
-        })))
+            }
+        );
+        qb::finish(
+            combined.0,
+            qb::validate_query_plan(
+                qb::QueryPlan::SetRows({kind: qb::SetOpKind::Union, operands: combined.3})
+            )
+        )
     }
 };
 
-def lower_unlimited_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
+def lower_unlimited_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(
+    payload,
+    intent
+) {
     let obj = as_object(intent);
     let op = as_string(field(obj, "op"));
     if op == "Graph" {
         let lowered = lower_graph_object(qb::build_context(), payload, intent);
         let request = lowered.1;
-        let plan = if request.count_groups { qb::QueryPlan::GroupCount(lowered.2) }
-            else if request.distinct { qb::QueryPlan::DistinctRows(lowered.2) }
-            else { qb::QueryPlan::Rows(lowered.2) };
+        let plan = if request.count_groups {
+            qb::QueryPlan::GroupCount(lowered.2)
+        } else if request.distinct {
+            qb::QueryPlan::DistinctRows(lowered.2)
+        } else {
+            qb::QueryPlan::Rows(lowered.2)
+        };
         qb::finish(lowered.0, qb::validate_query_plan(plan))
-    } else if op == "GraphPair" { lower_graph_pair(payload, intent) }
-    else if op == "GraphUnion" { lower_graph_union(payload, intent) }
-    else { fail!(`unsupported intent op \{op}; use Graph, GraphPair or GraphUnion with named nodes and relations`, op) }
+    } else if op == "GraphPair" {
+        lower_graph_pair(payload, intent)
+    } else if op == "GraphUnion" {
+        lower_graph_union(payload, intent)
+    } else {
+        fail!(
+            `unsupported intent op \{op}; use Graph, GraphPair or GraphUnion with named nodes and relations`,
+            op
+        )
+    }
 };
 
 # Omission or null preserves the existing query; other values are validated before
@@ -761,9 +1394,18 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
     let limit = match dict::get(obj, "limit") {
         None => None,
         Some(Value::None) => None,
-        Some(Value::Int(n)) => if n > 0 { Some(n) }
-            else { fail!("intent limit must be a positive integer (1..9223372036854775807)", field(obj, "limit")) },
-        Some(value) => fail!("intent limit must be a positive integer (1..9223372036854775807)", value),
+        Some(Value::Int(n)) => if n > 0 {
+            Some(n)
+        } else {
+            fail!(
+                "intent limit must be a positive integer (1..9223372036854775807)",
+                field(obj, "limit")
+            )
+        },
+        Some(value) => fail!(
+            "intent limit must be a positive integer (1..9223372036854775807)",
+            value
+        ),
     };
     let ast = lower_unlimited_intent_ast(payload, intent);
     match limit {
@@ -782,9 +1424,26 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
 # Its value does not depend on the runtime environment. Locating it on the
 # instant timeline requires an explicit zone/offset and ambiguity policy.
 # Returning columns classifies values; it never performs that conversion.
-type ResultType = enum { String, Int, Float, Bool, DateTimeUtc, EpochMillis, DateTime };
-type ResultColumn = struct { name: String, type: ResultType, nullable: Bool };
-type PreparedQuery = struct { sql: String, bindings: Array(qb::Val), columns: Array(ResultColumn), limit_slot: Option(Int) };
+type ResultType = enum {
+    String,
+    Int,
+    Float,
+    Bool,
+    DateTimeUtc,
+    EpochMillis,
+    DateTime
+};
+type ResultColumn = struct {
+    name: String,
+    type: ResultType,
+    nullable: Bool
+};
+type PreparedQuery = struct {
+    sql: String,
+    bindings: Array(qb::Val),
+    columns: Array(ResultColumn),
+    limit_slot: Option(Int)
+};
 
 def primitive_result_type: Fn(edsl::OutputType) -> ResultType = fn(ty) {
     match ty {
@@ -800,22 +1459,33 @@ def result_column: Fn(String, edsl::OutputType, Bool) -> ResultColumn = fn(name,
 # Special logical types retain their declared representation. A named value
 # domain projects canonical business IDs (String), not the physical wire type.
 def dimension_result_type: Fn(edsl::DimensionEntry) -> ResultType = fn(dimension) {
-    if dimension.value_type != None || array::length(dimension.canonical_values) > 0 { ResultType::String }
-    else { match (dimension.ty, dimension.output_type) {
-        ("DateTimeUtc", edsl::OutputType::Text) => ResultType::DateTimeUtc,
-        ("DateTime", edsl::OutputType::Text) => ResultType::DateTime,
-        ("EpochMillis", edsl::OutputType::Integer) => ResultType::EpochMillis,
-        _ => primitive_result_type(dimension.output_type),
-    } }
+    if dimension.value_type != None || array::length(dimension.canonical_values) > 0 {
+        ResultType::String
+    } else {
+        match (dimension.ty, dimension.output_type) {
+            ("DateTimeUtc", edsl::OutputType::Text) => ResultType::DateTimeUtc,
+            ("DateTime", edsl::OutputType::Text) => ResultType::DateTime,
+            ("EpochMillis", edsl::OutputType::Integer) => ResultType::EpochMillis,
+            _ => primitive_result_type(dimension.output_type),
+        }
+    }
 };
 def measure_result_type: Fn(edsl::PreparedPayload, String) -> ResultType = fn(payload, id) {
-    let entry = match array::find(payload.measures, fn(entry) { entry.id == id }) {
-        Some(entry) => entry, None => fail!("result column references unknown measure", id),
+    let entry = match array::find(
+        payload.measures,
+        fn(entry) {
+            entry.id == id
+        }
+    ) {
+        Some(entry) => entry,
+        None => fail!("result column references unknown measure", id),
     };
     let primitive = primitive_result_type(edsl::measure_output_type(payload, id));
-    if entry.computed != None || entry.row_expression != None || (entry.aggregate != qb::AggregateFunction::Min
-        && entry.aggregate != qb::AggregateFunction::Max && entry.aggregate != qb::AggregateFunction::Latest) { primitive }
-    else {
+    if entry.computed != None || entry.row_expression != None || (
+        entry.aggregate != qb::AggregateFunction::Min && entry.aggregate != qb::AggregateFunction::Max && entry.aggregate != qb::AggregateFunction::Latest
+    ) {
+        primitive
+    } else {
         let entity = payload.entities[entry.entity];
         let field = entity.fields[entry.field];
         match field.time {
@@ -831,39 +1501,91 @@ def measure_result_type: Fn(edsl::PreparedPayload, String) -> ResultType = fn(pa
 };
 def count_column: ResultColumn = result_column("count", edsl::OutputType::Integer, False);
 
-def expression_nullable: Fn(edsl::PreparedPayload, qb::BuildCtx, qb::Plan, qb::Expr) -> Bool = fn(payload, ctx, plan, expr) {
+def expression_nullable: Fn(edsl::PreparedPayload, qb::BuildCtx, qb::Plan, qb::Expr) -> Bool = fn(
+    payload,
+    ctx,
+    plan,
+    expr
+) {
     match expr {
         qb::Expr::AllocatedBind(binding) => ctx.bindings[binding.index - 1] == qb::Val::None,
         qb::Expr::Column(ref) => {
-            let outer = array::any(plan.joins, fn(join) { join.kind == qb::JoinKind::Left && join.source.alias == ref.source });
-            let source = array::find(plan.sources, fn(source) { source.alias == ref.source });
+            let outer = array::any(
+                plan.joins,
+                fn(join) {
+                    join.kind == qb::JoinKind::Left && join.source.alias == ref.source
+                }
+            );
+            let source = array::find(
+                plan.sources,
+                fn(source) {
+                    source.alias == ref.source
+                }
+            );
             let fields = match source {
                 None => [],
-                Some(source) => array::flat_map(array::filter(payload.entities, fn(entity) { entity.table == source.table }),
-                    fn(entity) { array::filter(entity.fields, fn(field) { field.column == ref.column }) }),
+                Some(source) => array::flat_map(
+                    array::filter(
+                        payload.entities,
+                        fn(entity) {
+                            entity.table == source.table
+                        }
+                    ),
+                    fn(entity) {
+                        array::filter(
+                            entity.fields,
+                            fn(field) {
+                                field.column == ref.column
+                            }
+                        )
+                    }
+                ),
             };
-            outer || array::length(fields) == 0 || array::any(fields, fn(field) { field.nullable })
+            outer || array::length(fields) == 0 || array::any(
+                fields,
+                fn(field) {
+                    field.nullable
+                }
+            )
         },
         qb::Expr::Scalar(call) => match call.function {
             qb::ScalarFunction::IsNotNull => False,
-            qb::ScalarFunction::If => expression_nullable(payload, ctx, plan, call.args[1])
-                || expression_nullable(payload, ctx, plan, call.args[2]),
+            qb::ScalarFunction::If => expression_nullable(payload, ctx, plan, call.args[1]) || expression_nullable(
+                payload,
+                ctx,
+                plan,
+                call.args[2]
+            ),
             # Arithmetic overflow, division by zero and invalid temporal source
             # values may produce NULL even with non-null operands.
             qb::ScalarFunction::Div => True,
             qb::ScalarFunction::UtcDaysAgo => True,
             qb::ScalarFunction::UtcTimeBucket(_) => True,
-            _ => array::any(call.args, fn(arg) { expression_nullable(payload, ctx, plan, arg) }),
+            _ => array::any(
+                call.args,
+                fn(arg) {
+                    expression_nullable(payload, ctx, plan, arg)
+                }
+            ),
         },
     }
 };
 
 def measure_nullable: Fn(edsl::PreparedPayload, String) -> Bool = fn(payload, id) {
-    let entry = match array::find(payload.measures, fn(entry) { entry.id == id }) {
-        Some(entry) => entry, None => fail!("result column references unknown measure", id),
+    let entry = match array::find(
+        payload.measures,
+        fn(entry) {
+            entry.id == id
+        }
+    ) {
+        Some(entry) => entry,
+        None => fail!("result column references unknown measure", id),
     };
     match entry.computed {
-        Some(computed) => measure_nullable(payload, computed.left) || measure_nullable(payload, computed.right),
+        Some(computed) => measure_nullable(payload, computed.left) || measure_nullable(
+            payload,
+            computed.right
+        ),
         None => entry.aggregate != qb::AggregateFunction::Count,
     }
 };
@@ -873,47 +1595,103 @@ def projection_name: Fn(qb::SelectItem) -> String = fn(item) {
         qb::SelectItem::NamedExpr(item) => item.alias,
         qb::SelectItem::Aggregate(item) => item.alias,
         qb::SelectItem::Computed(item) => item.alias,
-        qb::SelectItem::Expr(_) => fail!("semantic result projection requires an explicit alias", item),
+        qb::SelectItem::Expr(_) => fail!(
+            "semantic result projection requires an explicit alias",
+            item
+        ),
     }
 };
 
-def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> Array(ResultColumn) = fn(payload, input, plan, ctx) {
+def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> Array(ResultColumn) = fn(
+    payload,
+    input,
+    plan,
+    ctx
+) {
     let obj = as_object(input);
-    let dimensions = array::flat_map(array_opt(obj, "select"), fn(value) {
-        let item = codec::decode@[edsl::GraphSelect](value).unwrap!();
-        let dimension = match array::find(payload.dimensions, fn(d) { d.id == item.dimension }) {
-            Some(d) => d, None => fail!("result column references unknown dimension", item.dimension),
-        };
-        let name = `\{item.node}_\{item.dimension}`;
-        let column: ResultColumn = {name, type: dimension_result_type(dimension), nullable: True};
-        if dimension.half_open { [column, result_column(`\{name}__kind`, edsl::OutputType::Text, True)] } else { [column] }
-    });
-    let measures = array::map(array_opt(obj, "measures"), fn(value) {
-        let item = codec::decode@[edsl::GraphMeasureSelect](value).unwrap!();
-        {name: `\{item.node}_\{item.measure}`, type: measure_result_type(payload, item.measure), nullable: measure_nullable(payload, item.measure)}.ty!(ResultColumn)
-    });
+    let dimensions = array::flat_map(
+        array_opt(obj, "select"),
+        fn(value) {
+            let item = codec::decode@[edsl::GraphSelect](value).unwrap!();
+            let dimension = match array::find(
+                payload.dimensions,
+                fn(d) {
+                    d.id == item.dimension
+                }
+            ) {
+                Some(d) => d,
+                None => fail!("result column references unknown dimension", item.dimension),
+            };
+            let name = `\{item.node}_\{item.dimension}`;
+            let column: ResultColumn = {
+                name,
+                type: dimension_result_type(dimension),
+                nullable: True
+            };
+            if dimension.half_open {
+                [column, result_column(`\{name}__kind`, edsl::OutputType::Text, True)]
+            } else {
+                [column]
+            }
+        }
+    );
+    let measures = array::map(
+        array_opt(obj, "measures"),
+        fn(value) {
+            let item = codec::decode@[edsl::GraphMeasureSelect](value).unwrap!();
+            {
+                name: `\{item.node}_\{item.measure}`,
+                type: measure_result_type(payload, item.measure),
+                nullable: measure_nullable(payload, item.measure)
+            }.ty!(ResultColumn)
+        }
+    );
     let counts = match dict::get(obj, "count") {
-        Some(Value::String(node)) => [result_column(`\{node}_count`, edsl::OutputType::Integer, False)],
+        Some(Value::String(node)) => [
+            result_column(`\{node}_count`, edsl::OutputType::Integer, False)
+        ],
         _ => [],
     };
     let value_counts = match dict::get(obj, "count_value") {
-        Some(Value::Object(value)) => [result_column(`\{as_string(field(value, "node"))}_\{as_string(field(value, "dimension"))}_count`, edsl::OutputType::Integer, False)],
+        Some(Value::Object(value)) => [
+            result_column(
+                `\{as_string(field(value, "node"))}_\{as_string(field(value, "dimension"))}_count`,
+                edsl::OutputType::Integer,
+                False
+            )
+        ],
         _ => [],
     };
     let declared = array::concat([dimensions, measures, counts, value_counts]);
-    array::map(plan.projection, fn(item) {
-        let name = projection_name(item);
-        let column = match array::find(declared, fn(column) { column.name == name }) {
-            Some(column) => column, None => fail!("result projection is missing a column declaration", name),
-        };
-        match item {
-            qb::SelectItem::NamedExpr(named) => {...column, nullable: expression_nullable(payload, ctx, plan, named.expr)},
-            _ => column,
+    array::map(
+        plan.projection,
+        fn(item) {
+            let name = projection_name(item);
+            let column = match array::find(
+                declared,
+                fn(column) {
+                    column.name == name
+                }
+            ) {
+                Some(column) => column,
+                None => fail!("result projection is missing a column declaration", name),
+            };
+            match item {
+                qb::SelectItem::NamedExpr(named) => {
+                    ...column,
+                    nullable: expression_nullable(payload, ctx, plan, named.expr)
+                },
+                _ => column,
+            }
         }
-    })
+    )
 };
 
-def result_columns: Fn(edsl::PreparedPayload, Value, qb::QueryAst) -> Array(ResultColumn) = fn(payload, input, ast) {
+def result_columns: Fn(edsl::PreparedPayload, Value, qb::QueryAst) -> Array(ResultColumn) = fn(
+    payload,
+    input,
+    ast
+) {
     match ast.plan {
         qb::QueryPlan::Rows(plan) => graph_columns(payload, input, plan, ast.ctx),
         qb::QueryPlan::DistinctRows(plan) => graph_columns(payload, input, plan, ast.ctx),
@@ -922,31 +1700,102 @@ def result_columns: Fn(edsl::PreparedPayload, Value, qb::QueryAst) -> Array(Resu
         qb::QueryPlan::JoinedGroupCount(_) => [count_column],
         qb::QueryPlan::SetRows(set) => {
             let raw = codec::decode@[RawGraphUnion](input).unwrap!();
-            let branches = array::map(array::enumerate(set.operands), fn(entry) {
-                let branch = codec::decode@[RawUnionBranch](raw.branches[entry.0]).unwrap!();
-                graph_columns(payload, branch.graph, entry.1, ast.ctx)
-            });
-            array::map(array::enumerate(branches[0]), fn(entry) {
-                {...entry.1, nullable: array::any(branches, fn(columns) { columns[entry.0].nullable })}
-            })
+            let branches = array::map(
+                array::enumerate(set.operands),
+                fn(entry) {
+                    let branch = codec::decode@[RawUnionBranch](raw.branches[entry.0]).unwrap!();
+                    graph_columns(payload, branch.graph, entry.1, ast.ctx)
+                }
+            );
+            array::map(
+                array::enumerate(branches[0]),
+                fn(entry) {
+                    {
+                        ...entry.1,
+                        nullable: array::any(
+                            branches,
+                            fn(columns) {
+                                columns[entry.0].nullable
+                            }
+                        )
+                    }
+                }
+            )
         },
         qb::QueryPlan::JoinedGroups(joined) => {
             let raw = codec::decode@[RawGraphPair](input).unwrap!();
-            let selected = codec::decode@[Array(PairSelection)](match raw.select { Some(value) => value, None => fail!("validated pair select is missing") }).unwrap!();
-            let left_plan = {...joined.left, projection: array::filter(joined.left.projection, fn(item) { !array::any(joined.keys, fn(key) { key == projection_name(item) }) })};
-            let right_plan = {...joined.right, projection: array::filter(joined.right.projection, fn(item) { !array::any(joined.keys, fn(key) { key == projection_name(item) }) })};
-            let left = graph_columns(payload, pair_operand(raw.left, selected, qb::PairSide::Left), left_plan, ast.ctx);
-            let right = graph_columns(payload, pair_operand(raw.right, selected, qb::PairSide::Right), right_plan, ast.ctx);
-            let visible = array::map(joined.outputs, fn(output) {
-                let columns = if output.side == qb::PairSide::Left { left } else { right };
-                let column = match array::find(columns, fn(column) { column.name == output.column }) {
-                    Some(column) => column, None => fail!("joined result column is missing", output.column),
-                };
-                {...column, name: output.alias}
-            });
+            let selected = codec::decode@[Array(PairSelection)](
+                match raw.select {
+                    Some(value) => value,
+                    None => fail!("validated pair select is missing")
+                }
+            ).unwrap!();
+            let left_plan = {
+                ...joined.left,
+                projection: array::filter(
+                    joined.left.projection,
+                    fn(item) {
+                        !array::any(
+                            joined.keys,
+                            fn(key) {
+                                key == projection_name(item)
+                            }
+                        )
+                    }
+                )
+            };
+            let right_plan = {
+                ...joined.right,
+                projection: array::filter(
+                    joined.right.projection,
+                    fn(item) {
+                        !array::any(
+                            joined.keys,
+                            fn(key) {
+                                key == projection_name(item)
+                            }
+                        )
+                    }
+                )
+            };
+            let left = graph_columns(
+                payload,
+                pair_operand(raw.left, selected, qb::PairSide::Left),
+                left_plan,
+                ast.ctx
+            );
+            let right = graph_columns(
+                payload,
+                pair_operand(raw.right, selected, qb::PairSide::Right),
+                right_plan,
+                ast.ctx
+            );
+            let visible = array::map(
+                joined.outputs,
+                fn(output) {
+                    let columns = if output.side == qb::PairSide::Left {
+                        left
+                    } else {
+                        right
+                    };
+                    let column = match array::find(
+                        columns,
+                        fn(column) {
+                            column.name == output.column
+                        }
+                    ) {
+                        Some(column) => column,
+                        None => fail!("joined result column is missing", output.column),
+                    };
+                    {...column, name: output.alias}
+                }
+            );
             match joined.rank {
                 None => visible,
-                Some(_) => array::push(visible, result_column("comparison_value", edsl::OutputType::Number, True)),
+                Some(_) => array::push(
+                    visible,
+                    result_column("comparison_value", edsl::OutputType::Number, True)
+                ),
             }
         },
     }
@@ -954,12 +1803,19 @@ def result_columns: Fn(edsl::PreparedPayload, Value, qb::QueryAst) -> Array(Resu
 
 type ToQuery = Fn(qb::QueryAst) -> qb::Query;
 
-def query_intent_lower_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> qb::Query = fn(payload, to_query) {
-    fn(intent) { to_query(lower_intent_ast(payload, intent)) }
+def query_intent_lower_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> qb::Query = fn(
+    payload,
+    to_query
+) {
+    fn(intent) {
+        to_query(lower_intent_ast(payload, intent))
+    }
 };
 
 def query_intent_ast_factory: Fn(edsl::PreparedPayload) -> Fn(Value) -> qb::QueryAst = fn(payload) {
-    fn(intent) { lower_intent_ast(payload, intent) }
+    fn(intent) {
+        lower_intent_ast(payload, intent)
+    }
 };
 
 type BatchEvaluation = struct {
@@ -977,49 +1833,103 @@ type BatchResponse = struct {
     queries: Option(Array(PreparedQuery)),
 };
 
-def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> Value =
-    fn(payload, to_query) {
-        fn(request) {
-            let parsed = decode_graph_shape@[RawQueryRequest](request, "syntax/intent");
-            let intents = parsed.intents;
-            if array::length(intents) < 1 || array::length(intents) > 5 {
-                fail!(`query request requires one to five independent intents; got \{array::length(intents)}`, array::length(intents))
-            } else {
-                let assessed: Array(BatchEvaluation) = array::map(array::enumerate(intents), fn(entry) {
-                    let observed = diagnostics::with_diagnostics(fn(intent: Value) {
-                        let ast = lower_intent_ast(payload, intent);
-                        let query = to_query(ast);
-                        {sql: query.sql, bindings: query.bindings, columns: result_columns(payload, intent, ast),
-                            limit_slot: match ast.result_limit {
-                                None => None,
-                                Some(qb::Expr::AllocatedBind(binding)) => Some(binding.index - 1),
-                                Some(_) => fail!("final output limit requires an allocated binding"),
-                            }}.ty!(PreparedQuery)
-                    })(entry.1);
+def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value) -> Value = fn(
+    payload,
+    to_query
+) {
+    fn(request) {
+        let parsed = decode_graph_shape@[RawQueryRequest](request, "syntax/intent");
+        let intents = parsed.intents;
+        if array::length(intents) < 1 || array::length(intents) > 5 {
+            fail!(
+                `query request requires one to five independent intents; got \{array::length(intents)}`,
+                array::length(intents)
+            )
+        } else {
+            let assessed: Array(BatchEvaluation) = array::map(
+                array::enumerate(intents),
+                fn(entry) {
+                    let observed = diagnostics::with_diagnostics(
+                        fn(intent: Value) {
+                            let ast = lower_intent_ast(payload, intent);
+                            let query = to_query(ast);
+                            {
+                                sql: query.sql,
+                                bindings: query.bindings,
+                                columns: result_columns(payload, intent, ast),
+                                limit_slot: match ast.result_limit {
+                                    None => None,
+                                    Some(qb::Expr::AllocatedBind(binding)) => Some(
+                                        binding.index - 1
+                                    ),
+                                    Some(_) => fail!(
+                                        "final output limit requires an allocated binding"
+                                    ),
+                                }
+                            }.ty!(PreparedQuery)
+                        }
+                    )(entry.1);
                     match observed {
-                        Ok((query, reports)) => {index: entry.0, query: Some(query), diagnostics: reports},
+                        Ok((query, reports)) => {
+                            index: entry.0,
+                            query: Some(query),
+                            diagnostics: reports
+                        },
                         Err(reports) => {index: entry.0, query: None, diagnostics: reports},
                     }
-                });
-                let accepted = array::all(assessed, fn(item) { item.query != None });
-                let reports: Array(IndexedDiagnostic) = array::fold(assessed, [], fn(all, item) {
-                    array::concat([all, array::map(item.diagnostics, fn(diagnostic) {
-                        {index: item.index, diagnostic}
-                    })])
-                });
-                let queries = if accepted {
-                    Some(array::map(assessed, fn(item) {
-                        match item.query {
-                            Some(query) => query,
-                            None => fail!("accepted query batch has a failed item", item.index),
+                }
+            );
+            let accepted = array::all(
+                assessed,
+                fn(item) {
+                    item.query != None
+                }
+            );
+            let reports: Array(IndexedDiagnostic) = array::fold(
+                assessed,
+                [],
+                fn(all, item) {
+                    array::concat(
+                        [
+                            all,
+                            array::map(
+                                item.diagnostics,
+                                fn(diagnostic) {
+                                    {index: item.index, diagnostic}
+                                }
+                            )
+                        ]
+                    )
+                }
+            );
+            let queries = if accepted {
+                Some(
+                    array::map(
+                        assessed,
+                        fn(item) {
+                            match item.query {
+                                Some(query) => query,
+                                None => fail!("accepted query batch has a failed item", item.index),
+                            }
                         }
-                    }))
-                } else { None };
-                let response: BatchResponse = {accepted, diagnostics: reports, queries};
-                codec::encode(response)
-            }
+                    )
+                )
+            } else {
+                None
+            };
+            let response: BatchResponse = {accepted, diagnostics: reports, queries};
+            codec::encode(response)
         }
-    };
+    }
+};
 
-pub use self::{ ResultType, ResultColumn, PreparedQuery, result_columns, ToQuery, query_intent_lower_factory, query_intent_ast_factory,
-    query_request_method_factory };
+pub use self::{
+    ResultType,
+    ResultColumn,
+    PreparedQuery,
+    result_columns,
+    ToQuery,
+    query_intent_lower_factory,
+    query_intent_ast_factory,
+    query_request_method_factory
+};

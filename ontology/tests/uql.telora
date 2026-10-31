@@ -4,10 +4,14 @@ use std::array as array;
 use std::codec as codec;
 use std::string as string;
 use std::test as test;
-use std::value::{ Value };
+use std::value::{Value};
 
 # Same context is reused across every renderer clause and nested query.
-def source: (qb::BuildCtx, qb::Source) = qb::source_with_hint(qb::build_context(), "events", "select");
+def source: (qb::BuildCtx, qb::Source) = qb::source_with_hint(
+    qb::build_context(),
+    "events",
+    "select"
+);
 def peer: (qb::BuildCtx, qb::Source) = qb::source_with_hint(source.0, "events", "select");
 def needle: (qb::BuildCtx, qb::Expr) = qb::bind(peer.0, qb::Val::String("active"));
 def take: (qb::BuildCtx, qb::Expr) = qb::bind(needle.0, qb::Val::Int(2));
@@ -16,152 +20,493 @@ def cap: (qb::BuildCtx, qb::Expr) = qb::bind(threshold.0, qb::Val::Int(1));
 def id: qb::Expr = qb::column(source.1, "id");
 def category: qb::Expr = qb::column(source.1, "category");
 def amount: qb::Expr = qb::column(source.1, "amount");
-def predicate: qb::Expr = qb::scalar(qb::ScalarFunction::Eq, [qb::column(source.1, "kind"), needle.1]);
-def count: qb::SelectItem = qb::aggregate_filtered(qb::AggregateFunction::Count, amount, True, Some(predicate), "hits");
-def count_call: qb::AggregateCall = match count { qb::SelectItem::Aggregate(call) => call, _ => fail!("aggregate required") };
-def plan: qb::Plan = {
-    revision: "uql", sources: [source.1], joins: [],
-    projection: [qb::named_expr_item(id, "id")], filter: None,
-    grouping: [], having: [], ordering: [qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Asc)],
-    limit: None, offset: None, exists: [], derived: None, internal_measures: [],
-    partition: None, scalar_comparisons: [], ranked_key_comparisons: [],
+def predicate: qb::Expr = qb::scalar(
+    qb::ScalarFunction::Eq,
+    [qb::column(source.1, "kind"), needle.1]
+);
+def count: qb::SelectItem = qb::aggregate_filtered(
+    qb::AggregateFunction::Count,
+    amount,
+    True,
+    Some(predicate),
+    "hits"
+);
+def count_call: qb::AggregateCall = match count {
+    qb::SelectItem::Aggregate(call) => call,
+    _ => fail!("aggregate required")
 };
-def grouped: qb::Plan = {...plan,
-    projection: [qb::named_expr_item(category, "category"), count,
-        qb::computed_item(qb::ComputedOp::Add, "hits", "hits", "double_hits")],
-    grouping: [category], having: [qb::having_bound(qb::HavingOp::Ge, "hits", threshold.1)],
+def plan: qb::Plan = {
+    revision: "uql",
+    sources: [source.1],
+    joins: [],
+    projection: [qb::named_expr_item(id, "id")],
+    filter: None,
+    grouping: [],
+    having: [],
+    ordering: [qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Asc)],
+    limit: None,
+    offset: None,
+    exists: [],
+    derived: None,
+    internal_measures: [],
+    partition: None,
+    scalar_comparisons: [],
+    ranked_key_comparisons: [],
+};
+def grouped: qb::Plan = {
+    ...plan,
+    projection: [
+        qb::named_expr_item(category, "category"),
+        count,
+        qb::computed_item(qb::ComputedOp::Add, "hits", "hits", "double_hits")
+    ],
+    grouping: [category],
+    having: [qb::having_bound(qb::HavingOp::Ge, "hits", threshold.1)],
     ordering: [qb::order_by(qb::OrderKey::AggregateRef({alias: "double_hits"}), qb::Ordering::Desc)],
 };
-def render: Fn(qb::QueryPlan) -> qb::Query = fn(p) { uql::build_query(qb::finish(cap.0, p)) };
+def render: Fn(qb::QueryPlan) -> qb::Query = fn(p) {
+    uql::build_query(qb::finish(cap.0, p))
+};
 def scalar: Fn(qb::ScalarFunction, Array(qb::Expr)) -> String = fn(f, args) {
     uql::render_expr_with_context(qb::scalar(f, args), cap.0).sql
 };
 
-pub def identifiers_aliases_and_binding_handles: test::Test = test::should_ok(fn() {
-    let query = render(qb::QueryPlan::Rows({...plan,
-        joins: [qb::join(qb::JoinKind::Left, peer.1,
-            qb::source_column_ref(source.1, "id"), qb::source_column_ref(peer.1, "id"))],
-        filter: Some(predicate), limit: Some(take.1), offset: Some(threshold.1),
-    }));
-    query.bindings == cap.0.bindings
-        && string::contains(query.sql, "`events` AS `select`")
-        && string::contains(query.sql, "LEFT JOIN `events` AS `select_2` ON `select`.`id` = `select_2`.`id`")
-        && string::contains(query.sql, "`select`.`kind` = $1")
-        && string::contains(query.sql, "LIMIT $2 OFFSET $3")
-});
-pub def repeated_binding_remains_one_handle: test::Test = test::should_ok(fn() {
-    scalar(qb::ScalarFunction::Eq, [needle.1, needle.1]) == "$1 = $1"
-});
-pub def filtered_distinct_aggregate_preserves_local_scope: test::Test = test::should_ok(fn() {
-    let query = render(qb::QueryPlan::Rows(grouped));
-    string::contains(query.sql, "count(DISTINCT CASE WHEN `select`.`kind` = $1 THEN `select`.`amount` ELSE NULL END)")
-        && !string::contains(query.sql, "FILTER (")
-        && !string::contains(query.sql, " WHERE ")
-        && string::contains(query.sql, "HAVING count(DISTINCT CASE")
-        && string::contains(query.sql, "END) >= $3")
-});
-pub def documented_string_functions_and_ascii_case_folding: test::Test = test::should_ok(fn() {
-    scalar(qb::ScalarFunction::Instr, [id, needle.1]) == "instr(`select`.`id`, $1)"
-        && scalar(qb::ScalarFunction::Substr, [id, take.1]) == "substr(`select`.`id`, $2)"
-        && scalar(qb::ScalarFunction::Length, [id]) == "char_length(`select`.`id`)"
-        && scalar(qb::ScalarFunction::RegexMatch, [id, needle.1]) == "(regexp_count(`select`.`id`, $1) > 0)"
-        && string::contains(scalar(qb::ScalarFunction::Lower, [needle.1]), "replace($1, 'A', 'a')")
-        && !string::contains(scalar(qb::ScalarFunction::Lower, [needle.1]), "translate(")
-});
-pub def binary_collation_is_not_silently_changed: test::Test = test::should_fail_with(fn() {
-    scalar(qb::ScalarFunction::BinaryText, [id])
-}, "UQL spec does not define binary text collation");
-pub def explicit_null_order_is_portable: test::Test = test::should_ok(fn() {
-    let asc = render(qb::QueryPlan::Rows(plan));
-    let desc = render(qb::QueryPlan::Rows({...plan, ordering: [qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Desc)]}));
-    string::contains(asc.sql, "ORDER BY CASE WHEN `select`.`id` IS NULL THEN 0 ELSE 1 END ASC, `select`.`id` ASC")
-        && string::contains(desc.sql, "ORDER BY CASE WHEN `select`.`id` IS NULL THEN 1 ELSE 0 END ASC, `select`.`id` DESC")
-});
-pub def utc_buckets_use_documented_functions: test::Test = test::should_ok(fn() {
-    let datetime = scalar(qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::DateTimeUtc}), [id]);
-    let date = scalar(qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Month, encoding: qb::UtcBucketEncoding::Date}), [id]);
-    let epoch = scalar(qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Month, encoding: qb::UtcBucketEncoding::EpochMillis}), [id]);
-    datetime == "date_trunc('HOUR', CAST(`select`.`id` AS TIMESTAMP))"
-        && date == "CAST(date_trunc('MONTH', CAST(`select`.`id` AS TIMESTAMP)) AS DATE)"
-        && string::contains(epoch, "timestampdiff('SECOND'")
-        && string::contains(epoch, "mod(mod(`select`.`id`, 86400000) + 86400000, 86400000)")
-        && string::contains(epoch, "ELSE NULL END")
-        && string::contains(scalar(qb::ScalarFunction::UtcDaysAgo, [needle.1, take.1]), "timestampadd('DAY', (0 - CAST($2 AS INTEGER))")
-});
-pub def unregistered_binding_is_rejected: test::Test = test::should_fail_with(fn() {
-    uql::render_expr_with_context(qb::Expr::AllocatedBind({index: 5}), cap.0)
-}, "binding handle is not registered");
-pub def invalid_identifier_is_rejected: test::Test = test::should_fail_with(fn() {
-    uql::render_expr_with_context(qb::Expr::Column({source: "select", column: "id` FROM events; --"}), cap.0)
-}, "invalid UQL column identifier");
-pub def invalid_final_cap_is_rejected: test::Test = test::should_fail_with(fn() {
-    uql::build_query({...qb::finish(cap.0, qb::QueryPlan::Rows(plan)), result_limit: Some(needle.1)})
-}, "final output limit must be a positive integer");
+pub def identifiers_aliases_and_binding_handles: test::Test = test::should_ok(
+    fn() {
+        let query = render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    joins: [
+                        qb::join(
+                            qb::JoinKind::Left,
+                            peer.1,
+                            qb::source_column_ref(source.1, "id"),
+                            qb::source_column_ref(peer.1, "id")
+                        )
+                    ],
+                    filter: Some(predicate),
+                    limit: Some(take.1),
+                    offset: Some(threshold.1),
+                }
+            )
+        );
+        query.bindings == cap.0.bindings && string::contains(query.sql, "`events` AS `select`") && string::contains(
+            query.sql,
+            "LEFT JOIN `events` AS `select_2` ON `select`.`id` = `select_2`.`id`"
+        ) && string::contains(query.sql, "`select`.`kind` = $1") && string::contains(
+            query.sql,
+            "LIMIT $2 OFFSET $3"
+        )
+    }
+);
+pub def repeated_binding_remains_one_handle: test::Test = test::should_ok(
+    fn() {
+        scalar(qb::ScalarFunction::Eq, [needle.1, needle.1]) == "$1 = $1"
+    }
+);
+pub def filtered_distinct_aggregate_preserves_local_scope: test::Test = test::should_ok(
+    fn() {
+        let query = render(qb::QueryPlan::Rows(grouped));
+        string::contains(
+            query.sql,
+            "count(DISTINCT CASE WHEN `select`.`kind` = $1 THEN `select`.`amount` ELSE NULL END)"
+        ) && !string::contains(query.sql, "FILTER (") && !string::contains(query.sql, " WHERE ") && string::contains(
+            query.sql,
+            "HAVING count(DISTINCT CASE"
+        ) && string::contains(query.sql, "END) >= $3")
+    }
+);
+pub def documented_string_functions_and_ascii_case_folding: test::Test = test::should_ok(
+    fn() {
+        scalar(qb::ScalarFunction::Instr, [id, needle.1]) == "instr(`select`.`id`, $1)" && scalar(
+            qb::ScalarFunction::Substr,
+            [id, take.1]
+        ) == "substr(`select`.`id`, $2)" && scalar(qb::ScalarFunction::Length, [id]) == "char_length(`select`.`id`)" && scalar(
+            qb::ScalarFunction::RegexMatch,
+            [id, needle.1]
+        ) == "(regexp_count(`select`.`id`, $1) > 0)" && string::contains(
+            scalar(qb::ScalarFunction::Lower, [needle.1]),
+            "replace($1, 'A', 'a')"
+        ) && !string::contains(scalar(qb::ScalarFunction::Lower, [needle.1]), "translate(")
+    }
+);
+pub def binary_collation_is_not_silently_changed: test::Test = test::should_fail_with(
+    fn() {
+        scalar(qb::ScalarFunction::BinaryText, [id])
+    },
+    "UQL spec does not define binary text collation"
+);
+pub def explicit_null_order_is_portable: test::Test = test::should_ok(
+    fn() {
+        let asc = render(qb::QueryPlan::Rows(plan));
+        let desc = render(
+            qb::QueryPlan::Rows(
+                {...plan, ordering: [qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Desc)]}
+            )
+        );
+        string::contains(
+            asc.sql,
+            "ORDER BY CASE WHEN `select`.`id` IS NULL THEN 0 ELSE 1 END ASC, `select`.`id` ASC"
+        ) && string::contains(
+            desc.sql,
+            "ORDER BY CASE WHEN `select`.`id` IS NULL THEN 1 ELSE 0 END ASC, `select`.`id` DESC"
+        )
+    }
+);
+pub def utc_buckets_use_documented_functions: test::Test = test::should_ok(
+    fn() {
+        let datetime = scalar(
+            qb::ScalarFunction::UtcTimeBucket(
+                {unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::DateTimeUtc}
+            ),
+            [id]
+        );
+        let date = scalar(
+            qb::ScalarFunction::UtcTimeBucket(
+                {unit: qb::UtcBucketUnit::Month, encoding: qb::UtcBucketEncoding::Date}
+            ),
+            [id]
+        );
+        let epoch = scalar(
+            qb::ScalarFunction::UtcTimeBucket(
+                {unit: qb::UtcBucketUnit::Month, encoding: qb::UtcBucketEncoding::EpochMillis}
+            ),
+            [id]
+        );
+        datetime == "date_trunc('HOUR', CAST(`select`.`id` AS TIMESTAMP))" && date == "CAST(date_trunc('MONTH', CAST(`select`.`id` AS TIMESTAMP)) AS DATE)" && string::contains(
+            epoch,
+            "timestampdiff('SECOND'"
+        ) && string::contains(epoch, "mod(mod(`select`.`id`, 86400000) + 86400000, 86400000)") && string::contains(
+            epoch,
+            "ELSE NULL END"
+        ) && string::contains(
+            scalar(qb::ScalarFunction::UtcDaysAgo, [needle.1, take.1]),
+            "timestampadd('DAY', (0 - CAST($2 AS INTEGER))"
+        )
+    }
+);
+pub def unregistered_binding_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(qb::Expr::AllocatedBind({index: 5}), cap.0)
+    },
+    "binding handle is not registered"
+);
+pub def invalid_identifier_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::Expr::Column({source: "select", column: "id` FROM events; --"}),
+            cap.0
+        )
+    },
+    "invalid UQL column identifier"
+);
+pub def invalid_final_cap_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::build_query(
+            {...qb::finish(cap.0, qb::QueryPlan::Rows(plan)), result_limit: Some(needle.1)}
+        )
+    },
+    "final output limit must be a positive integer"
+);
 
 # Runtime cases exercise every top-level QueryPlan variant, nested comparisons,
 # scopes, CASE aggregate semantics, latest staging and partitioned Top-N.
 def scoped: qb::Plan = {...plan, sources: [{...source.1, scope: Some(predicate)}]};
-def correlated: qb::Exists = qb::exists(peer.1,
-    [qb::column_eq(qb::source_column_ref(source.1, "category"), qb::source_column_ref(peer.1, "category"))],
-    Some(qb::scalar(qb::ScalarFunction::Eq, [qb::column(peer.1, "kind"), needle.1])));
-def scalar_inner: qb::ScalarSubquery = qb::scalar_subquery_spec(peer.1, [], None, qb::AggregateFunction::Avg, qb::column(peer.1, "amount"), False, None);
-def ranked_inner: qb::RankedKeySubquery = qb::ranked_key_subquery_spec(peer.1, [], None, [qb::column(peer.1, "category")],
-    {function: qb::AggregateFunction::Sum, arg: qb::column(peer.1, "amount"), distinct: False, filter: None, alias: "total", latest: None}, qb::Ordering::Desc);
-def latest_call: qb::SelectItem = qb::SelectItem::Aggregate({function: qb::AggregateFunction::Latest, arg: amount,
-    distinct: False, filter: None, alias: "latest", latest: Some({time: qb::source_column_ref(source.1, "ts"), ties: [qb::source_column_ref(source.1, "id")]})});
-def latest: qb::Plan = {...plan, projection: [qb::named_expr_item(category, "category"), latest_call], grouping: [category], ordering: []};
-def partitioned: qb::Plan = {...plan, projection: [qb::named_expr_item(category, "category"), qb::named_expr_item(id, "id")], ordering: [],
-    partition: Some(qb::partitioned_top_n_bound([category], [qb::order_by(qb::OrderKey::Expr(amount), qb::Ordering::Desc), qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Asc)], take.1))};
-def joined: qb::JoinedGroups = {
-    left: {...grouped, ordering: []}, right: {...grouped, ordering: []}, keys: ["category"], left_identity: [category], right_identity: [category],
-    outputs: [{side: qb::PairSide::Left, column: "hits", alias: "hits"}, {side: qb::PairSide::Right, column: "hits", alias: "right_hits"}], rank: None,
+def correlated: qb::Exists = qb::exists(
+    peer.1,
+    [
+        qb::column_eq(
+            qb::source_column_ref(source.1, "category"),
+            qb::source_column_ref(peer.1, "category")
+        )
+    ],
+    Some(qb::scalar(qb::ScalarFunction::Eq, [qb::column(peer.1, "kind"), needle.1]))
+);
+def scalar_inner: qb::ScalarSubquery = qb::scalar_subquery_spec(
+    peer.1,
+    [],
+    None,
+    qb::AggregateFunction::Avg,
+    qb::column(peer.1, "amount"),
+    False,
+    None
+);
+def ranked_inner: qb::RankedKeySubquery = qb::ranked_key_subquery_spec(
+    peer.1,
+    [],
+    None,
+    [qb::column(peer.1, "category")],
+    {
+        function: qb::AggregateFunction::Sum,
+        arg: qb::column(peer.1, "amount"),
+        distinct: False,
+        filter: None,
+        alias: "total",
+        latest: None
+    },
+    qb::Ordering::Desc
+);
+def latest_call: qb::SelectItem = qb::SelectItem::Aggregate(
+    {
+        function: qb::AggregateFunction::Latest,
+        arg: amount,
+        distinct: False,
+        filter: None,
+        alias: "latest",
+        latest: Some(
+            {
+                time: qb::source_column_ref(source.1, "ts"),
+                ties: [qb::source_column_ref(source.1, "id")]
+            }
+        )
+    }
+);
+def latest: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(category, "category"), latest_call],
+    grouping: [category],
+    ordering: []
 };
-type Case = struct {name: String, query: qb::Query};
+def partitioned: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(category, "category"), qb::named_expr_item(id, "id")],
+    ordering: [],
+    partition: Some(
+        qb::partitioned_top_n_bound(
+            [category],
+            [
+                qb::order_by(qb::OrderKey::Expr(amount), qb::Ordering::Desc),
+                qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Asc)
+            ],
+            take.1
+        )
+    )
+};
+def joined: qb::JoinedGroups = {
+    left: {...grouped, ordering: []},
+    right: {...grouped, ordering: []},
+    keys: ["category"],
+    left_identity: [category],
+    right_identity: [category],
+    outputs: [
+        {side: qb::PairSide::Left, column: "hits", alias: "hits"},
+        {side: qb::PairSide::Right, column: "hits", alias: "right_hits"}
+    ],
+    rank: None,
+};
+type Case = struct {
+    name: String,
+    query: qb::Query
+};
 def cases: Array(Case) = [
     {name: "rows", query: render(qb::QueryPlan::Rows(plan))},
-    {name: "desc", query: render(qb::QueryPlan::Rows({...plan, ordering: [qb::order_by(qb::OrderKey::Expr(amount), qb::Ordering::Desc)]}))},
+    {
+        name: "desc",
+        query: render(
+            qb::QueryPlan::Rows(
+                {...plan, ordering: [qb::order_by(qb::OrderKey::Expr(amount), qb::Ordering::Desc)]}
+            )
+        )
+    },
     {name: "scoped", query: render(qb::QueryPlan::Rows(scoped))},
     {name: "grouped", query: render(qb::QueryPlan::Rows(grouped))},
-    {name: "distinct", query: render(qb::QueryPlan::DistinctRows({...plan, projection: [qb::named_expr_item(category, "category")], ordering: []}))},
+    {
+        name: "distinct",
+        query: render(
+            qb::QueryPlan::DistinctRows(
+                {...plan, projection: [qb::named_expr_item(category, "category")], ordering: []}
+            )
+        )
+    },
     {name: "group_count", query: render(qb::QueryPlan::GroupCount(grouped))},
-    {name: "union", query: render(qb::QueryPlan::SetRows({kind: qb::SetOpKind::Union, operands: [{...plan, ordering: []}, {...plan, ordering: []}]}))},
-    {name: "set_count", query: render(qb::QueryPlan::SetCount({kind: qb::SetOpKind::Union, operands: [{...plan, ordering: []}, {...plan, ordering: []}]}))},
+    {
+        name: "union",
+        query: render(
+            qb::QueryPlan::SetRows(
+                {
+                    kind: qb::SetOpKind::Union,
+                    operands: [{...plan, ordering: []}, {...plan, ordering: []}]
+                }
+            )
+        )
+    },
+    {
+        name: "set_count",
+        query: render(
+            qb::QueryPlan::SetCount(
+                {
+                    kind: qb::SetOpKind::Union,
+                    operands: [{...plan, ordering: []}, {...plan, ordering: []}]
+                }
+            )
+        )
+    },
     {name: "exists", query: render(qb::QueryPlan::Rows({...plan, exists: [correlated]}))},
-    {name: "not_exists", query: render(qb::QueryPlan::Rows({...plan, exists: [qb::exists_not(correlated)]}))},
-    {name: "scalar", query: render(qb::QueryPlan::Rows({...plan, scalar_comparisons: [qb::scalar_aggregate_comparison(qb::source_column_ref(source.1, "amount"), qb::ScalarFunction::Gt, scalar_inner)]}))},
-    {name: "ranked", query: render(qb::QueryPlan::Rows({...plan, ranked_key_comparisons: [qb::ranked_key_comparison(qb::source_column_ref(source.1, "category"), qb::ScalarFunction::Eq, ranked_inner)]}))},
+    {
+        name: "not_exists",
+        query: render(qb::QueryPlan::Rows({...plan, exists: [qb::exists_not(correlated)]}))
+    },
+    {
+        name: "scalar",
+        query: render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    scalar_comparisons: [
+                        qb::scalar_aggregate_comparison(
+                            qb::source_column_ref(source.1, "amount"),
+                            qb::ScalarFunction::Gt,
+                            scalar_inner
+                        )
+                    ]
+                }
+            )
+        )
+    },
+    {
+        name: "ranked",
+        query: render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    ranked_key_comparisons: [
+                        qb::ranked_key_comparison(
+                            qb::source_column_ref(source.1, "category"),
+                            qb::ScalarFunction::Eq,
+                            ranked_inner
+                        )
+                    ]
+                }
+            )
+        )
+    },
     {name: "latest", query: render(qb::QueryPlan::Rows(latest))},
     {name: "partitioned", query: render(qb::QueryPlan::Rows(partitioned))},
     {name: "joined", query: render(qb::QueryPlan::JoinedGroups(joined))},
     {name: "joined_count", query: render(qb::QueryPlan::JoinedGroupCount(joined))},
-    {name: "joined_ratio", query: render(qb::QueryPlan::JoinedGroups({...joined, rank: Some({left_measure: "hits", right_measure: "hits", op: qb::PairRankOp::Ratio, first: qb::PairSide::Right, direction: qb::Ordering::Desc, take: take.1})}))},
-    {name: "capped", query: uql::build_query({...qb::finish(cap.0, qb::QueryPlan::Rows({...plan, limit: Some(take.1)})), result_limit: Some(cap.1)})},
-    {name: "lower", query: render(qb::QueryPlan::Rows({...plan, projection: [qb::named_expr_item(qb::scalar(qb::ScalarFunction::Lower, [qb::column(source.1, "kind")]), "kind")]}))},
+    {
+        name: "joined_ratio",
+        query: render(
+            qb::QueryPlan::JoinedGroups(
+                {
+                    ...joined,
+                    rank: Some(
+                        {
+                            left_measure: "hits",
+                            right_measure: "hits",
+                            op: qb::PairRankOp::Ratio,
+                            first: qb::PairSide::Right,
+                            direction: qb::Ordering::Desc,
+                            take: take.1
+                        }
+                    )
+                }
+            )
+        )
+    },
+    {
+        name: "capped",
+        query: uql::build_query(
+            {
+                ...qb::finish(cap.0, qb::QueryPlan::Rows({...plan, limit: Some(take.1)})),
+                result_limit: Some(cap.1)
+            }
+        )
+    },
+    {
+        name: "lower",
+        query: render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    projection: [
+                        qb::named_expr_item(
+                            qb::scalar(qb::ScalarFunction::Lower, [qb::column(source.1, "kind")]),
+                            "kind"
+                        )
+                    ]
+                }
+            )
+        )
+    },
 ];
-pub def all_plan_shapes_preserve_context: test::Test = test::should_ok(fn() {
-    array::all(cases, fn(item) { item.query.bindings == cap.0.bindings
-        && !string::contains(item.query.sql, "NULLS FIRST") && !string::contains(item.query.sql, "FILTER (")
-        && !string::contains(item.query.sql, "DOUBLE PRECISION") })
-});
-pub def having_requires_group_by: test::Test = test::should_fail_with(fn() {
-    render(qb::QueryPlan::Rows({...grouped, projection: [count], grouping: [], ordering: []}))
-}, "UQL HAVING requires GROUP BY");
-pub def ranked_keys_use_derived_exists_instead_of_grouped_expression_subquery: test::Test = test::should_ok(fn() {
-    let query = render(qb::QueryPlan::Rows({...plan, ranked_key_comparisons: [qb::ranked_key_comparison(qb::source_column_ref(source.1, "category"), qb::ScalarFunction::Eq, ranked_inner)]}));
-    string::contains(query.sql, "EXISTS (SELECT 1 FROM (SELECT `select_2`.`category` AS")
-        && string::contains(query.sql, "GROUP BY `select_2`.`category` ORDER BY")
-        && !string::contains(query.sql, "GROUP BY 1")
-});
-def epoch_cases: Array(Case) = array::flat_map([
-    qb::Val::Int(-1), qb::Val::Int(-3600001), qb::Val::Int(-86400001),
-    qb::Val::Int(-62135596800000), qb::Val::Int(-62135596800001),
-    qb::Val::Int(253402300799999), qb::Val::Int(253402300800000), qb::Val::None,
-], fn(value) {
-    array::map([qb::UtcBucketUnit::Hour, qb::UtcBucketUnit::Day], fn(unit) {
-        let bound = qb::bind(qb::build_context(), value);
-        let rendered = uql::render_expr_with_context(qb::scalar(qb::ScalarFunction::UtcTimeBucket({unit, encoding: qb::UtcBucketEncoding::EpochMillis}), [bound.1]), bound.0);
-        let name = match unit { qb::UtcBucketUnit::Hour => "epoch_hour", _ => "epoch_day" };
-        {name, query: {...rendered, sql: `SELECT \{rendered.sql}`}}.ty!(Case)
-    })
-});
+pub def all_plan_shapes_preserve_context: test::Test = test::should_ok(
+    fn() {
+        array::all(
+            cases,
+            fn(item) {
+                item.query.bindings == cap.0.bindings && !string::contains(
+                    item.query.sql,
+                    "NULLS FIRST"
+                ) && !string::contains(item.query.sql, "FILTER (") && !string::contains(
+                    item.query.sql,
+                    "DOUBLE PRECISION"
+                )
+            }
+        )
+    }
+);
+pub def having_requires_group_by: test::Test = test::should_fail_with(
+    fn() {
+        render(qb::QueryPlan::Rows({...grouped, projection: [count], grouping: [], ordering: []}))
+    },
+    "UQL HAVING requires GROUP BY"
+);
+pub def ranked_keys_use_derived_exists_instead_of_grouped_expression_subquery: test::Test = test::should_ok(
+    fn() {
+        let query = render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    ranked_key_comparisons: [
+                        qb::ranked_key_comparison(
+                            qb::source_column_ref(source.1, "category"),
+                            qb::ScalarFunction::Eq,
+                            ranked_inner
+                        )
+                    ]
+                }
+            )
+        );
+        string::contains(query.sql, "EXISTS (SELECT 1 FROM (SELECT `select_2`.`category` AS") && string::contains(
+            query.sql,
+            "GROUP BY `select_2`.`category` ORDER BY"
+        ) && !string::contains(query.sql, "GROUP BY 1")
+    }
+);
+def epoch_cases: Array(Case) = array::flat_map(
+    [
+        qb::Val::Int(-1),
+        qb::Val::Int(-3600001),
+        qb::Val::Int(-86400001),
+        qb::Val::Int(-62135596800000),
+        qb::Val::Int(-62135596800001),
+        qb::Val::Int(253402300799999),
+        qb::Val::Int(253402300800000),
+        qb::Val::None,
+    ],
+    fn(value) {
+        array::map(
+            [qb::UtcBucketUnit::Hour, qb::UtcBucketUnit::Day],
+            fn(unit) {
+                let bound = qb::bind(qb::build_context(), value);
+                let rendered = uql::render_expr_with_context(
+                    qb::scalar(
+                        qb::ScalarFunction::UtcTimeBucket(
+                            {unit, encoding: qb::UtcBucketEncoding::EpochMillis}
+                        ),
+                        [bound.1]
+                    ),
+                    bound.0
+                );
+                let name = match unit {
+                    qb::UtcBucketUnit::Hour => "epoch_hour",
+                    _ => "epoch_day"
+                };
+                {name, query: {...rendered, sql: `SELECT \{rendered.sql}`}}.ty!(Case)
+            }
+        )
+    }
+);
 pub def execution_queries: Value = codec::encode(array::concat([cases, epoch_cases]));
