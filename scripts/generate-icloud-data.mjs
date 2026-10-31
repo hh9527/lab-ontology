@@ -1,3 +1,5 @@
+import { createKpiWaves } from './kpi-waveforms.mjs';
+import { categoryRandom, categoryValue, enumCategoryValue, tenantLayout, networkDevicePresentation, networkDeviceClass } from './icloud-category-profiles.mjs';
 import { normalizeUtcMillis } from './utc-milliseconds.mjs';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, existsSync } from 'node:fs';
@@ -38,25 +40,27 @@ const resourceNames = {
   I_EnterpriseNetworkLTP: '网络接口', I_EnterpriseSlot: '设备板卡', SYS_StorageDisk: '存储磁盘',
 };
 
-export function metricValue(table, column, index, sample, interval, random, samples = 1, startMs = 0) {
+const defaultWaves = createKpiWaves(20261031);
+export function metricValue(table, column, index, sample, interval, random, samples = 1, startMs = 0, waves = defaultWaves) {
   const elapsed = sample * interval;
   // A synthetic UTC+08 business clock: peaks around afternoon, quiet nights,
   // lower weekends and occasional resource-specific incidents.
   const clock = new Date(startMs + elapsed + 8 * 3600000);
   const hour = clock.getUTCHours() + clock.getUTCMinutes() / 60;
-  const daily = Math.cos((hour - 14 - index % 4 * 0.3) / 24 * 2 * Math.PI);
+  const shape = waves(table,column,index);
+  const {daily,load:dayLoad,jitter} = shape.at(startMs+elapsed);
   const weekday = ![0, 6].includes(clock.getUTCDay());
   const incident = (Math.floor(elapsed / 86400000) + index) % 11 === 3
     ? Math.exp(-Math.pow((hour - 15) / 1.2, 2)) : 0;
   const progress = sample / Math.max(1, samples - 1);
-  const trend = progress * [18, -12, 2][index % 3];
-  const load = (0.28 + 0.6 * (daily + 1) / 2) * (weekday ? 1 : 0.76);
-  const variation = Math.sin(elapsed / 3600000 * 0.73 + index) * 0.7;
+  const trend = progress * [18, -12, 2][index % 3] * shape.trend;
+  const load = dayLoad * (weekday ? 1 : 0.76);
+  const variation = jitter * 8;
   const profile = profiles[table]?.[column]?.[index % 3];
   if (/effcnt$/i.test(column)) return 1;
   const noise = (random() - 0.5) * 1.2;
   if (profile) {
-    const number = Math.max(0, profile[0] + profile[1] * daily + trend * 0.25
+    const number = Math.max(0, profile[0] * shape.baseline + profile[1] * daily + trend * 0.25
       + (index % 7 - 3) * 0.5 + variation + noise + incident * profile[1]);
     return /power|iosize/i.test(column) ? number : Math.min(100, number);
   }
@@ -78,7 +82,7 @@ export function metricValue(table, column, index, sample, interval, random, samp
   }
   if (/power/i.test(column)) return 150 + index * 10 + daily * 20;
   // High/mid/low populations make both sides of CPU/utilization thresholds reachable.
-  return Math.max(0, Math.min(100, [68, 45, 18][index % 3] + daily * 9 + trend
+  return Math.max(0, Math.min(100, [68, 45, 18][index % 3] * shape.baseline + daily * 9 + trend
     + (index % 7 - 3) * 0.8 + variation + noise + incident * 18));
 }
 
@@ -132,15 +136,19 @@ export function generate(options, model = loadModel()) {
     state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
     return state / 4294967296;
   }
+  const waves = createKpiWaves(seed);
   const rows = new Map();
   const enums = new Map();
+  const enumDefinitions = new Map();
   for (const dimension of model.dimensions) {
     const dataset = byId.get(dimension.dataset);
     const key = `${dataset.table}.${dimension.column}`;
     if (dimension.values.length && !dataset.scope.length && !enums.has(key)) {
       enums.set(key, dimension.values.map(value => wire(value.wires[0])));
+      enumDefinitions.set(key, dimension.values);
     }
   }
+  const tenants = tenantLayout(resources, seed);
   const id = (table, index) => `${table}-${String(index + 1).padStart(4, '0')}`;
   function value(dataset, field, index) {
     const column = field.column;
@@ -152,12 +160,15 @@ export function generate(options, model = loadModel()) {
       throw new Error(`Unsupported time encoding ${dataset.table}.${column}`);
     }
     const values = enums.get(`${dataset.table}.${column}`);
-    if (values) return values[index % values.length];
+    if (dataset.table === 'I_EntNetworkElement' && column === 'classification') return networkDeviceClass(index,seed,dataset.table,enumDefinitions.get(`${dataset.table}.${column}`));
+    if (values) return enumCategoryValue(dataset.table, column, index, seed, enumDefinitions.get(`${dataset.table}.${column}`)) ?? values[index % values.length];
+    const category = categoryValue(dataset.table, column, index, seed);
+    if (category !== undefined) return field.scalar === 'String' ? String(category) : category;
     if (field.scalar === 'Int') return index + 1;
     if (field.scalar === 'Float') return Number((10 + random() * 80).toFixed(3));
     if (field.scalar === 'Bool') return index % 2;
     if (field.scalar !== 'String') throw new Error(`Unsupported scalar ${field.scalar}`);
-    if (/tenant_?id/i.test(column)) return id('X_TENANT_VIEW', index);
+    if (/tenant_?id/i.test(column)) return id('X_TENANT_VIEW', dataset.table === 'X_TENANT_VIEW' ? index : tenants.assignments[index]);
     if (/^(projectId|refParentSubnet|siteId|SITE_ID|STREXT13|srcSiteId|destSiteId)$/.test(column)) return id('X_SITE_VIEW', index);
     if (/^(id|resId|CSN|TENANT_ID|oriResId|frameDn)$/i.test(column)) return id(dataset.table, index);
     if (/ipAddress|IPADDRESS/i.test(column)) return `192.0.2.${index % 254 + 1}`;
@@ -170,8 +181,11 @@ export function generate(options, model = loadModel()) {
     if (source.fields.length !== dataset.fields.length || source.fields.some(field => !dataset.fields.some(entry => entry.column === field.name))) {
       throw new Error(`Catalog/model columns differ: ${table}`);
     }
-    rows.set(table, Array.from({ length: resources }, (_, index) => Object.fromEntries(dataset.fields.map(field => [field.column, value(dataset, field, index)]))));
+    rows.set(table, Array.from({ length: table === 'X_TENANT_VIEW' ? tenants.count : resources }, (_, index) => Object.fromEntries(dataset.fields.map(field => [field.column, value(dataset, field, index)]))));
   }
+  const networkClasses = enumDefinitions.get('I_EntNetworkElement.classification');
+  rows.get('I_EntNetworkElement').forEach((row,index) => Object.assign(row,
+    networkDevicePresentation(row.classification,networkClasses,row.manufacturer,index,row.productName)));
   const pon = rows.get('I_EntPonElement');
   for (let i = 0; i < pon.length; i++) {
     pon[i].classification = i % 3 === 0 ? 'ne.category.olt' : i % 3 === 1 ? 'ne.category.pon.onu' : 'ne.category.pon.spl';
@@ -196,7 +210,7 @@ export function generate(options, model = loadModel()) {
         [fromColumn, toColumn] = [toColumn, fromColumn];
         field = targetField;
       }
-      if (identityField(field) || ['tenantId', 'TENANTID', 'projectId', 'refParentSubnet', 'parentOltResId'].includes(fromColumn)) continue;
+      if (identityField(field) || /tenant_?id/i.test(fromColumn) || ['projectId', 'refParentSubnet', 'parentOltResId'].includes(fromColumn)) continue;
       const key = `${fromTable}.${fromColumn}`;
       if (!groups.has(key)) groups.set(key, { table: fromTable, column: fromColumn, targets: [] });
       const targets = groups.get(key).targets;
@@ -208,6 +222,21 @@ export function generate(options, model = loadModel()) {
     rows.get(group.table).forEach((row, index) => {
       const target = group.targets[index % group.targets.length];
       row[group.column] = rows.get(target.table)[index][target.column];
+    });
+  }
+  // Components inherit ownership through their actual parent, including PON
+  // parents whose site/tenant was normalized to the OLT above.
+  const parentColumns = new Set(['parentResId', 'refParentNE', 'neResId', 'cardResId', 'portResId', 'accessDeviceId']);
+  for (let pass = 0; pass < 3; pass++) for (const group of groups.values()) {
+    if (!parentColumns.has(group.column)) continue;
+    rows.get(group.table).forEach((row,index) => {
+      const target = group.targets[index % group.targets.length];
+      const parent = rows.get(target.table)[index];
+      const tenant = parent.tenantId ?? parent.TENANT_ID;
+      if (tenant !== undefined && 'tenantId' in row) row.tenantId = tenant;
+      if (parent.projectId !== undefined) for (const column of ['projectId','refParentSubnet','siteId']) {
+        if (column in row) row[column] = parent.projectId;
+      }
     });
   }
   const ownerTables = {
@@ -232,13 +261,15 @@ export function generate(options, model = loadModel()) {
         row.resId = onu.id;
         row.tenantId = onu.tenantId;
         row.parentId = onu.parentOltResId;
+        if ('projectId' in row) row.projectId = onu.projectId;
       } else {
         row.resId = owner.id ?? owner.resId ?? owner.diskId ?? id(ownerTable, index);
-        if ('tenantId' in row) row.tenantId = owner.tenantId ?? id('X_TENANT_VIEW', index);
+        if ('tenantId' in row) row.tenantId = owner.tenantId ?? id('X_TENANT_VIEW', tenants.assignments[index % resources]);
         if ('parentId' in row) row.parentId = ['NetworkApRadioKPI', 'NetworkApRadioSsidKPI'].includes(table)
           ? rows.get('I_EntNetworkElement')[index].id
           : owner.refParentNE ?? owner.parentResId ?? owner.id ?? row.resId;
       }
+      if ('projectId' in row && table !== 'PonDeviceOnuKPI') row.projectId = owner.projectId ?? row.projectId;
       if ('deviceName' in row) row.deviceName = owner.name;
       if ('classification' in row) row.classification = owner.classification;
     });
@@ -272,9 +303,14 @@ export function generate(options, model = loadModel()) {
       row.TENANTID = owner.tenantId;
       row.STREXT13 = owner.projectId ?? id('X_SITE_VIEW', index);
       row.MENAME = owner.name;
+      row.MANUFACTURER = owner.manufacturer ?? '';
+      row.PRODUCTNAME = owner.productName ?? owner.productmodel ?? '';
+      row.MECATEGORY = owner.classification ?? '';
+      row.TENANT = rows.get('X_TENANT_VIEW').find(tenant => tenant.TENANT_ID === owner.tenantId)?.TENANT_NAME ?? '';
       row.CSN = eventIndex + 1;
-      const severity = (slot * 7 + dayIndex * 11) % 20;
-      row.SEVERITY = severity < 2 ? 1 : severity < 7 ? 2 : severity < 15 ? 3 : 4;
+      // critical / major / minor / warning: 1 / 1.8 / 3.2 / 4.
+      const severity = categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'SEVERITY');
+      row.SEVERITY = severity < 0.10 ? 1 : severity < 0.28 ? 2 : severity < 0.60 ? 3 : 4;
       const recent = dayIndex >= days - 2;
       row.ACKED = (slot + dayIndex) % 5 === 0 ? 0 : 1;
       row.CLEARED = (slot + dayIndex) % (recent ? 3 : 13) === 0 ? 0 : 1;
@@ -320,12 +356,13 @@ export function generate(options, model = loadModel()) {
           if (metric) {
             row.ts = iso(startMs + sample * interval);
             for (const field of dataset.fields) if (metricColumns.has(field.column)) {
-              let number = metricValue(table, field.column, index, sample, interval, random, samples, startMs);
+              let number = metricValue(table, field.column, index, sample, interval, random, samples, startMs, waves);
               if (field.scalar === 'Int') number = Math.round(number);
               if (field.scalar === 'Float') number = Number(number.toFixed(3));
               if (field.scalar === 'Int' || field.scalar === 'Float') row[field.column] = number;
             }
           }
+          if (table === 'ServerDeviceKPI') row.peakPower = Math.max(row.peakPower, Number((Math.max(row.averagePower*1.12,row.systemPower*1.05)).toFixed(3)));
           insert.run(...dataset.fields.map(field => row[field.column]));
           counts[table]++;
         }
@@ -361,7 +398,7 @@ export function generate(options, model = loadModel()) {
     const manifest = {
       format: 'icloud-synthetic-data/v1', revision: model.revision,
       options: { seed, resources, days, intervalMinutes, anchor: inputAnchor, storageGapHours, alarmsPerResourcePerDay },
-      generation: { revision: 3, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
+      generation: { revision: 6, devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
       window: { start: iso(startMs), endExclusive: anchor, samplesPerSeries: samples },
       catalogSha256: hash(catalogBytes), modelSha256: hash(JSON.stringify(model)),
       database: { file: 'icloud.sqlite', sha256: hash(readFileSync(databasePath)) },
@@ -375,6 +412,7 @@ export function generate(options, model = loadModel()) {
         'EpochMillis fields use millisecond values; unresolved source semantics remain subject to model TODOs.',
         'Absent alarm acknowledgement/clear times use zero; Local integer times use the same synthetic clock as UTC.',
         'Relationship cardinality exceptions are reported and are not represented as SQLite foreign keys.',
+        'Server-to-tenant source relations declare reversed cardinalities; shared tenants expose these exceptions without changing the model.',
       ],
     };
     writeFileSync(join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);

@@ -1,3 +1,5 @@
+import { createKpiWaves } from './kpi-waveforms.mjs';
+import { categoryRandom, categoryValue, networkDevicePresentation, networkDeviceClass } from './icloud-category-profiles.mjs';
 import { normalizeUtcMillis } from './utc-milliseconds.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -87,15 +89,16 @@ function optionsOf(options, model, plan) {
   const rows = samples * opts.resources * model.datasets.filter(d => d.kind === 'Metric').length;
   if (!Number.isSafeInteger(rows) || rows > 1000000) throw new Error('Requested data exceeds one million KPI rows');
   if (!opts.output) throw new Error('output is required');
-  return { ...opts, output: resolve(opts.output), anchorMs, samples, startMs, interval: opts.intervalMinutes * 60000 };
+  return { ...opts, output: resolve(opts.output), anchorMs, samples, startMs, alarmRows: opts.resources * opts.days * 2, interval: opts.intervalMinutes * 60000 };
 }
 
-export function metricValue(field, resource, sample, samples, time, noise) {
+const defaultWaves = createKpiWaves(20261031);
+export function metricValue(field, resource, sample, samples, time, noise, shape = defaultWaves('ns',field.name,resource)) {
   if (/effcnt|sample_count/i.test(field.name)) return 1;
-  const daily = Math.sin(time / 86400000 * 2 * Math.PI);
-  const trend = [18, -18, 0][resource % 3] * sample / Math.max(1, samples - 1);
+  const {daily,jitter} = shape.at(time);
+  const trend = [18, -18, 0][resource % 3] * shape.trend * sample / Math.max(1, samples - 1);
   const percentage = /%|percent/i.test(field.unit ?? '') || /cpu|usage|util|busy|ratio|rate_percent/i.test(field.name);
-  let value = Math.max(0, [72, 45, 16][resource % 3] + trend + daily * 6 + noise);
+  let value = Math.max(0, [72, 45, 16][resource % 3] * shape.baseline + trend + daily * 8 + jitter * 8 + (noise-0.5)*1.2);
   if (percentage) value = Math.min(100, value);
   else if (/byte|capacity|size|memory|mem_|bandwidth/i.test(field.name)) value *= 1024 * 1024;
   else if (/power/i.test(field.name)) value *= 10;
@@ -109,6 +112,7 @@ function rowFactory(model, plan, opts) {
     v ^= v >>> 16; v = Math.imul(v, 0x7feb352d); v ^= v >>> 15;
     return (v >>> 0) / 4294967296;
   };
+  const waves = createKpiWaves(opts.seed);
   const cached = new Map();
   function identity(k, index) {
     const cacheKey = `${k}:${index}`;
@@ -128,20 +132,36 @@ function rowFactory(model, plan, opts) {
       // The root has no parent; children reference earlier rows, not themselves.
       if (d.id === 'subnet' && f.name === 'ref_parent_subnet') return index === 0 ? null : identity(key(d.id, 'id'), index - 1);
       if (d.id === 'pon-element' && f.name === 'ref_parent_ne') return index % 3 === 0 ? null : identity(key(d.id, 'id'), index - index % 3);
-      return identity(k, index);
+      return identity(k, d.kind === 'Event' && plan.references.has(k) ? index % opts.resources : index);
     }
     const domain = f.domain && model.domains[f.domain];
+    if (d.id === 'network-element' && f.name === 'classification') return networkDeviceClass(index,opts.seed,d.table,domain.members);
     const guardValues = plan.guards.get(k);
     if (guardValues) {
       const values = [...new Set([...guardValues, ...(domain?.members.flatMap(m => m.wires) ?? [])])];
       return values[index % values.length];
+    }
+    if (d.id === 'alarm-record' && f.name === 'severity') {
+      const draw = categoryRandom(opts.seed, d.table, index, 'SEVERITY');
+      const level = draw < 0.10 ? 'critical' : draw < 0.28 ? 'major' : draw < 0.60 ? 'minor' : 'warning';
+      return domain.members.find(m=>m.id===level).wires[0];
     }
     if (domain) return domain.members[index % domain.members.length].wires[0];
     if (f.type === 's::DateTimeUtc') return iso(opts.startMs + index % opts.samples * opts.interval);
     if (f.type === 's::DateTime') return iso(opts.startMs + index % opts.samples * opts.interval).replace('T', ' ').replace(/\.\d{3}Z$/, '');
     if (f.type === 's::Date') return iso(opts.startMs + index % opts.samples * opts.interval).slice(0, 10);
     if (f.type === 's::EpochMillis' || f.sourceTimeEncoding === 'EpochMillis') return opts.startMs + index % opts.samples * opts.interval;
-    if (f.metric) return metricValue(f, index, sample, opts.samples, time, random(salts.get(k), index, sample));
+    if (f.metric) return metricValue(f, index, sample, opts.samples, time, random(salts.get(k), index, sample), waves(d.id,f.name,index));
+    if (d.id === 'network-element' && ['name','alias','productName','typeId'].includes(f.column)) {
+      const classification = d.fields.find(f=>f.name==='classification');
+      const classes = model.domains[classification.domain].members;
+      const value = scalar(d,classification,index,sample);
+      const manufacturer = categoryValue(d.table,'manufacturer',index,opts.seed);
+      const product = categoryValue(d.table,'productName',index,opts.seed);
+      return networkDevicePresentation(value,classes,manufacturer,index,product)[f.column];
+    }
+    const category = categoryValue(d.id === 'terminal-info' ? 'EntTerminalElement' : d.table, f.column, index, opts.seed);
+    if (category !== undefined) return f.storage === 'String' ? String(category) : category;
     if (f.storage === 'Float') return Math.round((20 + random(salts.get(k), index) * 80) * 1000) / 1000;
     if (f.storage === 'Int') return d.grain.includes(f.name) ? salts.get(k) + index + 1 : index + 1;
     if (f.storage === 'Bool') return index % 2;
@@ -170,11 +190,23 @@ function rowFactory(model, plan, opts) {
     }
     if (d.kind === 'Event') {
       const field = name => d.fields.find(f => f.name === name).column;
-      const occur = opts.startMs + index % opts.samples * opts.interval;
+      const occur = Math.floor(opts.startMs + (index + 0.5) / opts.alarmRows * (opts.anchorMs - opts.startMs));
       row[field('occur_utc')] = occur;
       const cleared = model.domains[d.fields.find(f => f.name === 'cleared').domain].members.find(m => m.id === 'cleared');
       row[field('clear_utc')] = row[field('cleared')] === cleared?.wires[0] ? Math.min(occur + 600000, opts.anchorMs - 1) : 0;
-      row[field('me_name')] = `告警资源-${index + 1}`;
+      let ownerKey = key(d.id,'me_dn'), ownerIndex = index % opts.resources;
+      while (plan.references.has(ownerKey)) {
+        const refs = plan.references.get(ownerKey);
+        ownerKey = refs[ownerIndex % refs.length];
+        ownerIndex = Math.floor(ownerIndex / refs.length);
+      }
+      const owner = plan.fields.get(ownerKey).dataset;
+      const ownerValue = name => {
+        const f = owner.fields.find(f=>f.name===name);
+        return f ? scalar(owner,f,ownerIndex,0) : '';
+      };
+      row[field('me_name')] = ownerValue('name') || `告警资源-${ownerIndex + 1}`;
+      row[field('manufacturer')] = ownerValue('manufacturer');
       row[field('alarm_name')] = ['CPU 利用率过高', '设备离线', '存储响应时间过长', '端口链路异常'][index % 4];
     }
     // Exercise genuine optional values without removing identities or metrics.
@@ -251,7 +283,14 @@ export function validate(db, model, manifest) {
     const upperBoundExceeded = fromExceeded || toExceeded;
     const report = { id: r.id, ...result, maxFrom, maxTo, upperBoundExceeded };
     checks.relations.push(report);
-    if (upperBoundExceeded) checks.cardinalityExceptions.push({ id: r.id, declared: r.cardinality, maxFrom, maxTo, sampledEndpoint: from.kind === 'Metric' || to.kind === 'Metric', explainedBySampling: (!fromExceeded || from.kind === 'Metric') && (!toExceeded || to.kind === 'Metric') });
+    if (upperBoundExceeded) checks.cardinalityExceptions.push({ id: r.id, declared: r.cardinality, maxFrom, maxTo,
+      sampledEndpoint: from.kind === 'Metric' || to.kind === 'Metric',
+      explainedBySampling: (!fromExceeded || from.kind === 'Metric') && (!toExceeded || to.kind === 'Metric'),
+      // These four legacy contracts incorrectly limit a device to one alarm.
+      // Retain the exception; never permit an alarm to acquire multiple owners.
+      explainedByEventHistory: ['ar__pone','ar__fsd_rev','pe__ar_rev','fsd__ar'].includes(r.id)
+        && (!fromExceeded || from.id === 'alarm-record') && (!toExceeded || to.id === 'alarm-record'),
+    });
   }
   const alarm = model.datasets.find(d => d.id === 'alarm-record');
   if (alarm) {
@@ -260,7 +299,7 @@ export function validate(db, model, manifest) {
     const invalid = db.prepare(`SELECT count(*) n FROM ${quote(alarm.table)} WHERE ${col('occur_utc')}<? OR ${col('occur_utc')}>=? OR (${col('cleared')}=? AND (${col('clear_utc')}<${col('occur_utc')} OR ${col('clear_utc')}>=?)) OR (${col('cleared')}<>? AND ${col('clear_utc')}<>0)`).get(start, end, cleared, end, cleared).n;
     if (invalid) checks.invalidScenarios.push('alarm-times');
   }
-  if (checks.integrity !== 'ok' || ['emptyDatasets', 'invalidRows', 'invalidDomains', 'invalidTimes', 'invalidGrains', 'invalidSeries', 'invalidScenarios'].some(k => checks[k].length) || checks.relations.some(r => r.pairs === 0) || checks.cardinalityExceptions.some(r => !r.explainedBySampling)) {
+  if (checks.integrity !== 'ok' || ['emptyDatasets', 'invalidRows', 'invalidDomains', 'invalidTimes', 'invalidGrains', 'invalidSeries', 'invalidScenarios'].some(k => checks[k].length) || checks.relations.some(r => r.pairs === 0) || checks.cardinalityExceptions.some(r => !r.explainedBySampling && !r.explainedByEventHistory)) {
     throw new Error(`NS data validation failed: ${JSON.stringify({ ...checks, relations: checks.relations.filter(r => !r.pairs) })}`);
   }
   return checks;
@@ -283,11 +322,12 @@ export function generate(options, model = loadModel()) {
       db.exec(`CREATE UNIQUE INDEX ${quote('grain_' + d.id)} ON ${quote(d.table)} (${grain.join(',')})`);
       const insert = db.prepare(`INSERT INTO ${quote(d.table)} VALUES (${d.fields.map(() => '?').join(',')})`);
       const samples = d.kind === 'Metric' ? opts.samples : 1;
-      for (let i = 0; i < opts.resources; i++) for (let s = 0; s < samples; s++) {
+      const rowCount = d.kind === 'Event' ? opts.alarmRows : opts.resources;
+      for (let i = 0; i < rowCount; i++) for (let s = 0; s < samples; s++) {
         const row = makeRow(d, i, s);
         insert.run(...d.fields.map(f => row[f.column]));
       }
-      tables[d.table] = { dataset: d.id, columns: d.fields.length, rows: opts.resources * samples };
+      tables[d.table] = { dataset: d.id, columns: d.fields.length, rows: rowCount * samples };
     }
     // Tuple indexes serve relation joins and verification, including composite keys.
     const indexes = new Set();
@@ -299,12 +339,12 @@ export function generate(options, model = loadModel()) {
       db.exec(`CREATE INDEX ${quote('ref_' + indexes.size)} ON ${quote(d.table)} (${names.map(quote).join(',')})`);
     }
     db.exec('COMMIT; ANALYZE');
-    const manifest = { version: 1, generation: { revision: 1, profile: 'ns-typed-demo', seed: opts.seed, resources: opts.resources, days: opts.days, intervalMinutes: opts.intervalMinutes },
+    const manifest = { version: 1, generation: { revision: 4, devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), profile: 'ns-typed-demo', categoryProfile: 'seeded-weighted-categories/v1', alarmSeverityWeights: {critical:1,major:1.8,minor:3.2,warning:4}, alarmsPerResourcePerDay: 2, seed: opts.seed, resources: opts.resources, days: opts.days, intervalMinutes: opts.intervalMinutes },
       sourceCommit: model.sourceCommit, sourceSha256: model.sourceSha256, modelSha256: hash(JSON.stringify(model)), generatorSha256: hash(readFileSync(fileURLToPath(import.meta.url))),
       window: { start: iso(opts.startMs), endExclusive: opts.anchor }, samplesPerSeries: opts.samples, tables,
       columns: model.datasets.reduce((n, d) => n + d.fields.length, 0),
       identityPlan: Object.fromEntries(plan.references),
-      assumptions: ['Synthetic resource identity routing is a fixture scenario, not ontology inference.', 'Raw time fields with unconfirmed units receive synthetic millisecond values without asserting a typed instant.', 'All declared direct relations have witnesses; optional polymorphic references need not match every alternative.', 'Declared cardinality conflicts are reported; data generation does not amend model contracts.'] };
+      assumptions: ['Synthetic resource identity routing is a fixture scenario, not ontology inference.', 'Raw time fields with unconfirmed units receive synthetic millisecond values without asserting a typed instant.', 'All declared direct relations have witnesses; optional polymorphic references need not match every alternative.', 'Declared cardinality conflicts are reported; data generation does not amend model contracts.', 'Four legacy PON/storage owner-alarm relations allow only one alarm per device; repeated alarm history exposes these retained exceptions.'] };
     manifest.checks = validate(db, model, manifest);
     db.close(); db = undefined;
     manifest.databaseSha256 = hash(readFileSync(file));

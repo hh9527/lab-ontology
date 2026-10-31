@@ -3,6 +3,7 @@
 import json
 import hashlib
 import re
+from unit_names import unit_type_name
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 M=json.loads((ROOT/'data/source-model.json').read_text())
@@ -49,7 +50,7 @@ for d in D.values():
             if u!={'symbol':'None'}:unit=u['args'][0]
         if unit is not None:
             key=(unit,f['storage'])
-            unit_types.setdefault(key,'Unit'+str(len(unit_types)))
+            unit_types.setdefault(key,unit_type_name(*key))
             TY[d['id'],f['name']]='units::'+unit_types[key]
 (ROOT/'src/units.telora').write_text('# Nominal source units; see source-model.json for evidence and assumptions.\n'+'\n'.join(f'pub type {name} = struct({storage}); # {unit}' for (unit,storage),name in unit_types.items())+'\n')
 PRE+='use crate::units as units;\n'

@@ -7,6 +7,16 @@ import { generate, loadModel, validate } from '../generate-icloud-data.mjs';
 
 const directory = mkdtempSync(join(process.env.TMPDIR || join(homedir(), '.cache/tmp'), 'icloud-data-test-'));
 const model = loadModel();
+function assertRelationCoverage(manifest) {
+  assert.ok(manifest.checks.relations.every(relation => relation.pairs > 0));
+  for (const relation of manifest.checks.relations.filter(relation=>relation.upperBoundExceeded)) {
+    const spec = model.relations.find(r=>r.id===relation.id);
+    assert.equal(spec.to_table,'X_TENANT_VIEW');
+    assert.ok(spec.from_table.startsWith('PhysicalServer'));
+    assert.equal(spec.cardinality.from,'Optional');
+    assert.equal(relation.maxToPerFrom,1,'Each server/component still belongs to exactly one tenant');
+  }
+}
 const options = { seed: 20260926, resources: 12, days: 2, intervalMinutes: 60, anchor: '2026-10-03T12:00:00Z' };
 let db;
 try {
@@ -17,7 +27,7 @@ try {
   assert.equal(Object.keys(first.tables).length, 48);
   assert.equal(first.columns, 822);
   assert.equal(first.checks.relations.length, model.relations.length);
-  assert.ok(first.checks.relations.every(relation => relation.pairs > 0 && !relation.upperBoundExceeded));
+  assertRelationCoverage(first);
   assert.deepEqual(first.checks.emptyCarriers, []);
   assert.deepEqual(first.checks.invalidEnums, []);
   assert.deepEqual(first.checks.missingCpuSeries, []);
@@ -30,6 +40,20 @@ try {
   db = new DatabaseSync(join(directory, 'first/icloud.sqlite'));
   assert.equal(db.prepare("SELECT count(DISTINCT SEVERITY) n FROM T_CURRENT_ALARM").get().n, 4);
   assert.ok(db.prepare("SELECT count(*) n FROM T_CURRENT_ALARM WHERE ALARMNAME='CPU 利用率过高'").get().n > 0);
+  const classes = model.dimensions.find(d=>d.dataset==='device'&&d.column==='classification').values;
+  const {networkDeviceCategory} = await import('../icloud-category-profiles.mjs');
+  for (const member of classes) for (const wire of member.wires) assert.equal(networkDeviceCategory(Object.values(wire)[0],classes).id,member.id);
+  const devices = db.prepare('SELECT id,name,alias,manufacturer,productName,typeId,classification FROM I_EntNetworkElement').all();
+  for (const device of devices) {
+    const cls=networkDeviceCategory(device.classification,classes);
+    assert.ok(device.name.startsWith(cls.label+'-'));
+    assert.equal(device.alias,device.name);
+    assert.equal(device.typeId,cls.id);
+    assert.ok(device.productName.startsWith(device.manufacturer+'-'+cls.label+'-'));
+  }
+  for (const table of ['NetworkDeviceKPI','NetworkDeviceOnlineKPI']) assert.equal(db.prepare(`SELECT count(*) n FROM "${table}" k JOIN I_EntNetworkElement d ON k.resId=d.id WHERE k.deviceName!=d.name OR k.classification!=d.classification`).get().n,0);
+  assert.equal(db.prepare(`SELECT count(*) n FROM T_CURRENT_ALARM a JOIN I_EntNetworkElement d ON a.MEDN=d.id
+    WHERE a.MENAME!=d.name OR a.MECATEGORY!=d.classification OR a.PRODUCTNAME!=d.productName OR a.MANUFACTURER!=d.manufacturer`).get().n,0);
   const traffic = db.prepare(`SELECT avg(CASE WHEN substr(ts,12,2)='06' THEN ifHCInOctetsSpeed END) busy,
     avg(CASE WHEN substr(ts,12,2)='18' THEN ifHCInOctetsSpeed END) quiet FROM NetworkDeviceInterfaceKPI`).get();
   assert.ok(traffic.busy > traffic.quiet * 1.5, 'Business-hour traffic should exceed night traffic');
@@ -76,6 +100,63 @@ try {
   } finally { gapDb.close(); }
   assert.throws(() => generate({ ...options, storageGapHours: 48, output: join(directory, 'invalid-gap') }, model), /storageGapHours/);
   assert.throws(() => generate({ ...options, alarmsPerResourcePerDay: 0, output: join(directory, 'invalid-alarm-rate') }, model), /alarmsPerResourcePerDay/);
+  // A larger inventory must reuse categories, not invent one category per device.
+  const categorized = generate({ ...options, resources: 36, days: 30, intervalMinutes: 1440, anchor: '2026-10-03T00:00:00Z', output: join(directory, 'categories') }, model);
+  const categoryDb = new DatabaseSync(join(directory, 'categories/icloud.sqlite'));
+  try {
+    for (const [table, column, maximum] of [
+      ['I_EntNetworkElement','manufacturer',4],
+      ['I_EntNetworkElement','version',3], ['I_EntNetworkElement','language',2],
+      ['I_EntNetworkElement','timeZone',1], ['I_EntNetworkElement','location',4],
+      ['PhysicalServer','manufacturer',3], ['PhysicalServer','assetManager',3],
+      ['PhysicalServer','biosVersion',3], ['EntTerminalElement','vendor',4],
+      ['EntTerminalElement','model',12], ['EntTerminalElement','osName',4],
+      ['EntTerminalElement','vlanId',4], ['X_TENANT_VIEW','INDUSTRY',5],
+    ]) {
+      const stats = categoryDb.prepare(`SELECT count(DISTINCT "${column}") n FROM "${table}"`).get();
+      assert.ok(stats.n <= maximum, `${table}.${column}: bounded category population`);
+      assert.equal(categoryDb.prepare(`SELECT count(*) n FROM "${table}" WHERE "${column}" GLOB ?`).get(`${column}-[0-9]*`).n,0);
+    }
+    const tenantRows = categoryDb.prepare('SELECT TENANT_ID FROM X_TENANT_VIEW ORDER BY TENANT_ID').all();
+    assert.equal(tenantRows.length,10);
+    const totals = categorized.generation.tenantDistribution.tiers.map(tier => {
+      const ids = tenantRows.slice(tier.tenantStart,tier.tenantStart+tier.tenants).map(row=>row.TENANT_ID);
+      return categoryDb.prepare(`SELECT count(*) n FROM I_EntNetworkElement WHERE tenantId IN (${ids.map(()=>'?').join(',')})`).get(...ids).n;
+    });
+    assert.deepEqual(totals,[22,11,3]);
+    for (const [table,tenantCol,siteCol] of [
+      ['I_EntNetworkElement','tenantId','projectId'], ['PhysicalServer','tenantId','projectId'],
+      ['I_EntPonElement','tenantId','projectId'], ['EntTerminalElement','tenantId','siteId'],
+    ]) {
+      assert.equal(categoryDb.prepare(`SELECT count(*) n FROM "${table}" d LEFT JOIN X_TENANT_VIEW t ON t.TENANT_ID=d."${tenantCol}" WHERE t.TENANT_ID IS NULL`).get().n,0);
+      assert.equal(categoryDb.prepare(`SELECT count(*) n FROM "${table}" d JOIN X_SITE_VIEW s ON s.SITE_ID=d."${siteCol}" WHERE d."${tenantCol}"!=s.TENANT_ID`).get().n,0);
+    }
+    for (const [child,parent,key] of [['PhysicalServerFan','PhysicalServer','parentResId'],['I_EnterpriseNetworkLTP','I_EntNetworkElement','refParentNE']]) {
+      assert.equal(categoryDb.prepare(`SELECT count(*) n FROM "${child}" c JOIN "${parent}" p ON c."${key}"=p.id WHERE c.tenantId!=p.tenantId`).get().n,0);
+    }
+    assert.equal(categoryDb.prepare(`SELECT count(*) n FROM T_CURRENT_ALARM a JOIN PhysicalServer d ON a.MEDN=d.id WHERE a.TENANTID!=d.tenantId`).get().n,0);
+    assert.equal(categoryDb.prepare(`SELECT count(*) n FROM ServerDeviceKPI k JOIN PhysicalServer d ON k.resId=d.id WHERE k.tenantId!=d.tenantId`).get().n,0);
+    const severityCounts = categoryDb.prepare('SELECT SEVERITY level,count(*) n FROM T_CURRENT_ALARM GROUP BY SEVERITY ORDER BY SEVERITY').all();
+    const totalAlarms = severityCounts.reduce((sum,row)=>sum+row.n,0);
+    assert.equal(severityCounts.length,4);
+    for (const {level,n} of severityCounts) assert.ok(Math.abs(n/totalAlarms-[0.10,0.18,0.32,0.40][level-1])<0.03,
+      `Severity ${level} follows the configured population weight`);
+    assert.equal(categoryDb.prepare('SELECT count(DISTINCT id) n FROM I_EntNetworkElement').get().n,36);
+    assert.equal(categoryDb.prepare('SELECT count(DISTINCT sn) n FROM I_EntNetworkElement').get().n,36);
+    assert.equal(categoryDb.prepare("SELECT count(*) n FROM PhysicalServer WHERE productName NOT LIKE manufacturer || '-%'").get().n,0);
+    assert.equal(categoryDb.prepare(`SELECT count(*) n FROM T_CURRENT_ALARM a JOIN PhysicalServer d ON a.MEDN=d.id
+      WHERE a.MANUFACTURER!=d.manufacturer OR a.PRODUCTNAME!=d.productName`).get().n,0);
+    const vendorCounts = categoryDb.prepare('SELECT count(*) n FROM I_EntNetworkElement GROUP BY manufacturer').all().map(x=>x.n);
+    assert.ok(Math.max(...vendorCounts) > Math.min(...vendorCounts)*2, 'Vendors have a common population and a long tail');
+    assert.ok(categoryDb.prepare("SELECT count(*) n FROM I_EntNetworkElement WHERE commuState='0'").get().n >= 25, 'Most devices are online');
+    assert.ok(categoryDb.prepare('SELECT count(DISTINCT version) n FROM I_EntNetworkElement GROUP BY manufacturer HAVING n>1').all().length>0,
+      'Manufacturers do not determine firmware version one-to-one');
+    assertRelationCoverage(categorized);
+  } finally { categoryDb.close(); }
+  const { categoryValue } = await import('../icloud-category-profiles.mjs');
+  const vendors = seed => Array.from({length:36},(_,i)=>categoryValue('I_EntNetworkElement','manufacturer',i,seed));
+  assert.deepEqual(vendors(100),vendors(100));
+  assert.notDeepEqual(vendors(100),vendors(101),'Changing seed changes category assignments');
   const deletedDay = first.generation.alarmDays[0].day;
   db.exec('SAVEPOINT alarm_coverage');
   db.prepare("DELETE FROM T_CURRENT_ALARM WHERE date(OCCURUTC/1000,'unixepoch')=?").run(deletedDay);

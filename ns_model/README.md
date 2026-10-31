@@ -8,7 +8,7 @@
 - `src/identities.telora`：具名身份类型，以及由源关系明确连接的引用身份空间；身份与 Dataset 分开表达
 - `src/groups.telora`：按类型、过滤能力及统计策略复用 DimensionGroup、采样 MeasureGroup
 - `src/domains.telora`：140 个业务值域及其源编码映射，显式开启类型反向引用，支持业务名词从值追溯到维度和 Dataset
-- `src/units.telora`：按源单位合同复用名义类型；单位证据和待确认假定保留在源声明记录中，不隐含可加性或单位转换
+- `src/units.telora`：按源单位合同复用具名类型，例如 `Percent`、`Watts`、`BytesPerSecond`；同一单位的整数表示使用 `Integer` 前缀（计数默认整数，非整数计数使用 `Fractional` 前缀）。不同源单位拼写仍保留独立类型，不因改名合并；单位证据和待确认假定保留在源声明记录中，不隐含可加性或单位转换
 - `src/model.telora`：World 根声明；从根自动发现关联 Entity 与具名类型，未引用类型不发布
 - `data/generation-contract.json`：与类型化声明同次生成的演示数据合同，包含最终类型和源码哈希
 

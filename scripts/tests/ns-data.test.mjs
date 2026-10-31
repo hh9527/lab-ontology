@@ -18,14 +18,25 @@ try {
   assert.equal(first.columns, 2118);
   assert.equal(first.checks.relations.length, 302);
   assert(first.checks.relations.every(r => r.pairs > 0));
-  assert.equal(first.checks.cardinalityExceptions.length, 16);
-  assert(first.checks.cardinalityExceptions.every(r => r.sampledEndpoint && r.explainedBySampling));
+  assert.equal(first.checks.cardinalityExceptions.filter(r=>r.explainedBySampling).length, 16);
+  assert(first.checks.cardinalityExceptions.every(r => r.explainedBySampling || r.explainedByEventHistory));
   assert(first.checks.domains.some(d => d.absent.length), 'Small profiles report missing domain members');
   db = new DatabaseSync(join(directory, 'first/ns.sqlite'));
   for (const d of model.datasets) {
     assert.deepEqual(db.prepare(`PRAGMA table_info("${d.table}")`).all().map(f => f.name), d.fields.map(f => f.column));
     if (d.kind === 'Metric') assert.equal(first.tables[d.table].rows, options.resources * first.samplesPerSeries);
   }
+  const {networkDeviceCategory}=await import('../icloud-category-profiles.mjs');
+  const classes=model.domains.NeClassificationValueType.members;
+  for (const member of classes) for (const wire of member.wires) assert.equal(networkDeviceCategory(wire,classes).id,member.id);
+  for (const device of db.prepare('SELECT name,manufacturer,productName,typeId,classification FROM EntNetworkElement').all()) {
+    const cls=networkDeviceCategory(device.classification,classes);
+    assert.ok(device.name.startsWith(cls.label+'-'));
+    assert.equal(device.typeId,cls.id);
+    assert.ok(device.productName.startsWith(device.manufacturer+'-'+cls.label+'-'));
+  }
+  assert.equal(db.prepare(`SELECT count(*) n FROM AlarmRecord a JOIN EntNetworkElement d ON a.meDn=d.id
+    WHERE a.meName!=d.name OR a.manufacturer!=d.manufacturer`).get().n,0);
   const populations = db.prepare('SELECT obj_id, count(*) n FROM kpi_network_device_info GROUP BY obj_id').all();
   assert.equal(populations.length, 12);
   assert(populations.every(r => r.n === 16));
@@ -49,6 +60,12 @@ try {
       matches += db.prepare(`SELECT count(*) n FROM "${d.table}" WHERE "${col}"=?`).get(row.value).n;
     }
     assert.equal(matches, 1, `Ambiguous alarm owner ${row.value}`);
+  }
+  assert.equal(db.prepare("SELECT count(DISTINCT date(occurUtc/1000,'unixepoch')) n FROM AlarmRecord").get().n,options.days);
+  assert.equal(db.prepare("SELECT count(*) n FROM AlarmRecord WHERE severity='_default'").get().n,0);
+  assert.equal(first.tables.AlarmRecord.rows,options.resources*options.days*2);
+  for (const [table,column,max] of [['EntNetworkElement','manufacturer',4],['PhysicalServer','manufacturer',3],['PhysicalServer','biosVersion',3]]) {
+    assert.ok(db.prepare(`SELECT count(DISTINCT "${column}") n FROM "${table}"`).get().n<=max);
   }
   function corrupt(sql, expected) {
     db.exec('SAVEPOINT corrupt');
@@ -76,6 +93,6 @@ try {
   const changed = generate({ ...options, seed: options.seed + 1, output: join(directory, 'changed') }, model);
   assert.notEqual(first.databaseSha256, changed.databaseSha256, 'Seed changes metric values');
   const expanded = generate({ ...options, resources: 48, days: 1, intervalMinutes: 360, output: join(directory, 'expanded') }, model);
-  assert(expanded.checks.domains.every(d => d.absent.length === 0), 'Expanded profile covers every canonical domain member');
+  assert(expanded.checks.domains.every(d => d.absent.every(id=>d.domain==='ArSeverityValueType'&&id==='unknown')), 'Expanded profile covers domains except the intentionally omitted unknown severity');
   console.log('NS data: deterministic SQLite, all schema/relations, independent identities, guarded/composite joins, KPI trends, corruption detection and atomic publication passed');
 } finally { db?.close(); rmSync(directory, { recursive: true, force: true }); }
