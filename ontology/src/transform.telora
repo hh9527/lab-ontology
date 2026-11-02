@@ -9,6 +9,7 @@ use crate::ontology as edsl;
 use crate::query as qb;
 use std::array as array;
 use std::type_desc as td;
+use std::type_property as property;
 use std::string as string;
 use std::codec as codec;
 use std::value::{Value};
@@ -134,11 +135,11 @@ def declare: for(Row) Fn(
         kind: edsl::DatasetKind::Entity,
         scope: [],
         dataset: prepared,
-        groups: array::map(groups, g::binding_facts),
+        groups: array::concat([g::field_dimensions(dataset), array::map(groups, g::binding_facts)]),
         record_counts,
         field_counts: [],
         columns: [],
-        domains: [],
+        domains: v::field_bindings(prepared),
         clock: None,
         samples: []
     }
@@ -400,7 +401,11 @@ def with_domains: for(Row) Fn(Declaration, Array(v::Binding(Row))) -> Declaratio
     declared,
     bindings
 ) {
-    declared <~ {domains: array::map(bindings, v::binding_facts)}
+    declared <~ {
+        domains: array::concat(
+            [v::field_bindings(declared.dataset), array::map(bindings, v::binding_facts)]
+        )
+    }
 };
 # Row 字段映射到可信物理列，不接受 SQL 表达式或改变字段类型。
 def column: for(Row, Value) Fn(m::Field(Row, Value), String) -> ColumnMapping(Row) = fn(field, name) {
@@ -525,8 +530,27 @@ def scalar: Fn(Type) -> Scalar = fn(ty) {
         }
     }
 };
+# 字段 property 是声明的源列名；显式映射供程序式构造使用。
+def physical_column: Fn(Declaration, td::FieldDesc) -> String = fn(declared, field) {
+    match array::find(
+        declared.columns,
+        fn(mapping) {
+            mapping.field == field.name
+        }
+    ) {
+        Some(mapping) => mapping.column,
+        None => match property::get_field_prop(
+            declared.dataset.row,
+            field.index,
+            edsl::ColumnMap.type
+        ) {
+            Some(mapping) => mapping.column,
+            None => field.name,
+        },
+    }
+};
 def physical_columns: Fn(Declaration) -> Array(String) = fn(declared) {
-    let fields = td::fields(declared.dataset.row);
+    let fields = m::fields_of(declared.dataset.row);
     array::map(
         declared.columns,
         fn(mapping) {
@@ -559,7 +583,21 @@ def physical_columns: Fn(Declaration) -> Array(String) = fn(declared) {
             } else {
                 field.ty == mapping.value
             };
-            if mapping.row != declared.dataset.row || !actual {
+            let annotation = property::get_field_prop(
+                declared.dataset.row,
+                field.index,
+                edsl::ColumnMap.type
+            );
+            if match annotation {
+                Some(value) => value.column != mapping.column,
+                None => False
+            } {
+                fail!(
+                    "typed column mapping conflicts with field property",
+                    declared.dataset.id,
+                    mapping.field
+                )
+            } else if mapping.row != declared.dataset.row || !actual {
                 fail!(
                     "typed column mapping field witness does not match its row",
                     declared.dataset.id,
@@ -584,15 +622,7 @@ def physical_columns: Fn(Declaration) -> Array(String) = fn(declared) {
     let columns = array::map(
         fields,
         fn(field) {
-            match array::find(
-                declared.columns,
-                fn(mapping) {
-                    mapping.field == field.name
-                }
-            ) {
-                Some(mapping) => mapping.column,
-                None => field.name,
-            }
+            physical_column(declared, field)
         }
     );
     let keys = array::map(columns, identifier_key);
@@ -631,22 +661,14 @@ def entity_entry: Fn(Declaration, Int, Bool) -> edsl::EntityEntry = fn(declared,
         physical_columns(declared)
     } else {
         array::map(
-            td::fields(dataset.row),
+            m::fields_of(dataset.row),
             fn(field) {
-                match array::find(
-                    declared.columns,
-                    fn(mapping) {
-                        mapping.field == field.name
-                    }
-                ) {
-                    Some(mapping) => mapping.column,
-                    None => field.name,
-                }
+                physical_column(declared, field)
             }
         )
     };
     let fields = array::map(
-        td::fields(dataset.row),
+        m::fields_of(dataset.row),
         fn(field) {
             let value = scalar(field.ty);
             if validate && !qb::is_sql_identifier(field.name) {
@@ -937,20 +959,21 @@ def prepare_trusted: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared
     declarations,
     profile
 ) {
-    prepare_impl(revision, declarations, profile, False)
+    prepare_impl(revision, declarations, profile, False, False)
 };
 def prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared = fn(
     revision,
     declarations,
     profile
 ) {
-    prepare_impl(revision, declarations, profile, False)
+    prepare_impl(revision, declarations, profile, False, False)
 };
-def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepared = fn(
+def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool, Bool) -> Prepared = fn(
     revision,
     declarations,
     profile,
-    validate
+    validate,
+    check_profile
 ) {
     if validate {
         let datasets = array::map(
@@ -1023,7 +1046,7 @@ def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepa
             entity_entry(pair.1, pair.0, validate)
         }
     );
-    if validate {
+    if check_profile {
         array::map(
             entities,
             fn(entity) {
@@ -1043,19 +1066,25 @@ def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepa
     } else {
         ()
     };
-    let dimensions = array::flat_map(
-        array::enumerate(declarations),
-        fn(pair) {
-            let members = if validate {
-                g::validate_facts(pair.1.dataset, pair.1.groups)
+    let group_members = array::map(
+        declarations,
+        fn(declared) {
+            if validate {
+                g::validate_facts(declared.dataset, declared.groups)
             } else {
                 array::flat_map(
-                    pair.1.groups,
+                    declared.groups,
                     fn(binding) {
                         binding.members
                     }
                 )
-            };
+            }
+        }
+    );
+    let dimensions = array::flat_map(
+        array::enumerate(declarations),
+        fn(pair) {
+            let members = group_members[pair.0];
             let domains = if validate {
                 v::validate_bindings(pair.1.dataset, pair.1.domains)
             } else {
@@ -1114,16 +1143,7 @@ def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepa
         array::enumerate(declarations),
         fn(pair) {
             let entity = entities[pair.0];
-            let members = if validate {
-                g::validate_facts(pair.1.dataset, pair.1.groups)
-            } else {
-                array::flat_map(
-                    pair.1.groups,
-                    fn(binding) {
-                        binding.members
-                    }
-                )
-            };
+            let members = group_members[pair.0];
             let grouped = array::map(
                 array::filter(
                     members,
@@ -1304,16 +1324,18 @@ def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepa
                             qb::ComputedOp::Add => qb::ScalarFunction::Add,
                             qb::ComputedOp::Sub => qb::ScalarFunction::Sub
                         };
-                        if !array::any(
-                            profile.allowed_operators,
-                            fn(op) {
-                                op == qb::Operator::Scalar
-                            }
-                        ) || !array::any(
-                            profile.allowed_scalars,
-                            fn(op) {
-                                op == operation
-                            }
+                        if check_profile && (
+                            !array::any(
+                                profile.allowed_operators,
+                                fn(op) {
+                                    op == qb::Operator::Scalar
+                                }
+                            ) || !array::any(
+                                profile.allowed_scalars,
+                                fn(op) {
+                                    op == operation
+                                }
+                            )
                         ) {
                             fail!(
                                 "computed count arithmetic is not allowed by the query profile",
@@ -1556,7 +1578,7 @@ def prepare_impl: Fn(String, Array(Declaration), qb::PlanProfile, Bool) -> Prepa
         native_pairs,
         profile
     };
-    let payload = if validate {
+    let payload = if check_profile {
         edsl::validate_transform_contract(payload)
     } else {
         payload
@@ -1632,7 +1654,7 @@ def build_impl: Fn(
     qb::PlanProfile,
     Bool
 ) -> Prepared = fn(revision, declarations, relations, alternatives, links, profile, validate) {
-    let prepared = prepare_impl(revision, declarations, profile, validate);
+    let prepared = prepare_impl(revision, declarations, profile, validate, validate);
     if validate {
         let all_relations = array::concat(
             [
@@ -1834,7 +1856,9 @@ def checked_declare: for(Row) Fn(
     Array(String)
 ) -> Declaration = fn(dataset, roles, groups, record_counts) {
     let declared = m::checked_prepare(dataset, roles);
-    let bindings = array::map(groups, g::binding_facts);
+    let bindings = array::concat(
+        [g::field_dimensions(dataset), array::map(groups, g::binding_facts)]
+    );
     g::validate_facts(declared, bindings);
     {
         native_pairs: [],
@@ -1846,7 +1870,7 @@ def checked_declare: for(Row) Fn(
         record_counts,
         field_counts: [],
         columns: [],
-        domains: [],
+        domains: v::field_bindings(declared),
         clock: None,
         samples: []
     }
@@ -1940,7 +1964,11 @@ def checked_with_domains: for(Row) Fn(Declaration, Array(v::Binding(Row))) -> De
     if declared.dataset.row != Row.type {
         fail!("business dimensions belong to another dataset row", declared.dataset.id)
     } else {
-        declared <~ {domains: array::map(bindings, v::binding_facts)}
+        declared <~ {
+            domains: array::concat(
+                [v::field_bindings(declared.dataset), array::map(bindings, v::binding_facts)]
+            )
+        }
     }
 };
 def checked_field_count: for(Row, Value) Fn(
@@ -2147,6 +2175,66 @@ def checked_prepare: Fn(String, Array(Declaration), qb::PlanProfile) -> Prepared
     declarations,
     profile
 ) {
-    prepare_impl(revision, declarations, profile, True)
+    prepare_impl(revision, declarations, profile, True, True)
 };
 pub use self::{checked_prepare};
+
+# 单个定义的检查和 lowering 独立于 World；Registry 按 Type 缓存此结果。
+type LocalDefinition = struct {
+    declaration: Declaration,
+    payload: edsl::PreparedPayload
+};
+def local_definition: Fn(Declaration) -> LocalDefinition = fn(declared) {
+    let neutral: qb::PlanProfile = {
+        allowed_operators: [],
+        allowed_join_kinds: [],
+        allowed_aggregates: [],
+        allowed_scalars: [],
+        allow_distinct: False
+    };
+    let prepared = prepare_impl("", [declared], neutral, True, False);
+    {declaration: declared, payload: prepared.payload}
+};
+def check_local_profile: Fn(LocalDefinition, qb::PlanProfile) -> () = fn(local, profile) {
+    let entity = local.payload.entities[0];
+    if !array::any(
+        profile.allowed_operators,
+        fn(op) {
+            op == qb::Operator::Source
+        }
+    ) || !qb::source_profile_accepts(entity.source, profile) {
+        fail!("typed dataset source is not allowed by the query profile", entity.id)
+    } else {
+        ()
+    };
+    array::map(
+        local.declaration.computed_counts,
+        fn(count) {
+            let operation = match count.op {
+                qb::ComputedOp::Add => qb::ScalarFunction::Add,
+                qb::ComputedOp::Sub => qb::ScalarFunction::Sub
+            };
+            if !array::any(
+                profile.allowed_operators,
+                fn(op) {
+                    op == qb::Operator::Scalar
+                }
+            ) || !array::any(
+                profile.allowed_scalars,
+                fn(op) {
+                    op == operation
+                }
+            ) {
+                fail!(
+                    "computed count arithmetic is not allowed by the query profile",
+                    count.result.id
+                )
+            } else {
+                ()
+            }
+        }
+    );
+    edsl::validate_transform_contract(local.payload <~ {profile});
+    ()
+};
+pub use self::{LocalDefinition, local_definition, check_local_profile};

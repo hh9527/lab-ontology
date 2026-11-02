@@ -5,6 +5,8 @@ use crate::query as qb;
 use crate::scalars as scalars;
 use crate::ontology as edsl;
 use std::array as array;
+use std::prelude as prelude;
+use std::type_property as property;
 use std::type_desc as td;
 
 type Column = struct {
@@ -44,17 +46,16 @@ type Expr(Row, Value) = struct {
 };
 
 def column_shape: Fn(Type, Column) -> Shape = fn(row, column) {
-    let actual = match array::find(
-        td::fields(row),
-        fn(field) {
-            field.name == column.name
-        }
-    ) {
+    let actual = match model::field_info(row, column.name) {
         Some(field) => field.ty,
         None => fail!("group input field does not exist", column.name),
     };
     let valid = if column.nullable {
-        let variants = td::variants(actual);
+        let variants = if td::kind(actual) == td::TypeDescKind::Enum {
+            td::variants(actual)
+        } else {
+            []
+        };
         array::length(variants) == 2 && array::any(
             variants,
             fn(v) {
@@ -1553,3 +1554,240 @@ def prepare_facts: Fn(model::PreparedDataset, Array(BindingFacts)) -> Array(Memb
     )
 };
 pub use self::{validate_facts};
+
+# 直接字段维度由 Row 上的声明展开；一个字段可以发布多个视图。
+@prelude::property(PropertyTarget::Field)
+type FieldDimensions = struct {
+    dimensions: Array(FieldDimension)
+};
+type FieldDimension = struct {
+    id: String,
+    group: String,
+    value: Option(Type),
+    projectable: Bool,
+    group_projectable: Bool,
+    group_filters: Array(Filter),
+    filters: Array(Filter)
+};
+def field_dimension: Fn(
+    String,
+    String,
+    Array(Filter)
+) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(
+    id,
+    group,
+    filters
+) {
+    fn(ctx, previous) {
+        let before = match previous {
+            Some(p) => p.dimensions,
+            None => []
+        };
+        {
+            dimensions: array::push(
+                before,
+                {
+                    id,
+                    group,
+                    value: None,
+                    projectable: True,
+                    group_projectable: True,
+                    group_filters: filters,
+                    filters
+                }.ty!(FieldDimension)
+            )
+        }
+    }
+};
+def search: Fn(String) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(
+    id
+) {
+    field_dimension(id, "search", text_search_filters)
+};
+def exact: Fn(String) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(
+    id
+) {
+    field_dimension(id, "exact", [Filter::Eq])
+};
+def numeric: Fn(
+    String
+) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(id) {
+    field_dimension(id, "numeric", numeric_filters)
+};
+def epoch_millis: Fn(
+    String
+) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(id) {
+    field_dimension(id, "epoch_millis", time_filters)
+};
+def field_dimensions_for: Fn(model::PreparedDataset) -> Array(BindingFacts) = fn(dataset) {
+    array::flat_map(
+        model::fields_of(dataset.row),
+        fn(field) {
+            match property::get_field_prop(dataset.row, field.index, FieldDimensions.type) {
+                None => [],
+                Some(declared) => {
+                    let variants = if td::kind(field.ty) == td::TypeDescKind::Enum {
+                        td::variants(field.ty)
+                    } else {
+                        []
+                    };
+                    let optional = array::length(variants) == 2 && array::any(
+                        variants,
+                        fn(v) {
+                            v.name == "None" && v.payload == None
+                        }
+                    );
+                    let value = if optional {
+                        match array::find(
+                            variants,
+                            fn(v) {
+                                v.name == "Some"
+                            }
+                        ) {
+                            Some(v) => match v.payload {
+                                Some(ty) => ty,
+                                None => fail!("invalid optional dimension", field.name)
+                            },
+                            None => fail!("invalid optional dimension", field.name)
+                        }
+                    } else {
+                        field.ty
+                    };
+                    array::map(
+                        declared.dimensions,
+                        fn(spec) {
+                            if spec.group == "search" && value != String.type {
+                                fail!("search dimension requires String", field.name)
+                            } else if spec.group == "epoch_millis" && value != scalars::EpochMillis.type {
+                                fail!("epoch_millis dimension requires EpochMillis", field.name)
+                            } else {
+                                ()
+                            };
+                            match spec.value {
+                                Some(expected) => if value != expected {
+                                    fail!("field view does not match group type", field.name)
+                                } else {
+                                    ()
+                                },
+                                None => ()
+                            };
+                            validate_filters(value, spec.filters);
+                            {
+                                row: dataset.row,
+                                dataset: dataset.id,
+                                source: dataset.source,
+                                contract: BindingContract::DeferredDimension(
+                                    {
+                                        id: spec.group,
+                                        value,
+                                        projectable: spec.group_projectable,
+                                        filters: spec.group_filters
+                                    }
+                                ),
+                                members: [
+                                    {
+                                        group: spec.group,
+                                        local: "value",
+                                        id: spec.id,
+                                        node: Node::Column(
+                                            {name: field.name, value, nullable: optional}
+                                        ),
+                                        value,
+                                        nullable: optional,
+                                        aggregate: None,
+                                        projectable: spec.projectable,
+                                        filters: spec.filters,
+                                        kind: MemberKind::Dimension(
+                                            {
+                                                projectable: spec.group_projectable,
+                                                filters: spec.group_filters
+                                            }
+                                        )
+                                    }
+                                ]
+                            }.ty!(BindingFacts)
+                        }
+                    )
+                }
+            }
+        }
+    )
+};
+
+pub use self::{
+    FieldDimensions,
+    FieldDimension,
+    search,
+    exact,
+    numeric,
+    epoch_millis,
+    field_dimensions
+};
+
+# 组合声明通过发布名引用同一字段维度，不重复定义。
+def field_binding: for(Row) Fn(model::Dataset(Row), String) -> Binding(Row) = fn(dataset, id) {
+    let facts = match array::find(
+        field_dimensions(dataset),
+        fn(binding) {
+            array::any(
+                binding.members,
+                fn(member) {
+                    member.id == id
+                }
+            )
+        }
+    ) {
+        Some(binding) => binding,
+        None => fail!("unknown declared field dimension", id)
+    };
+    {
+        row: facts.row,
+        dataset: facts.dataset,
+        source: facts.source,
+        contract: facts.contract,
+        members: facts.members
+    }
+};
+pub use self::{field_binding};
+
+pub use self::{column_shape};
+
+def field_dimensions: for(Row) Fn(model::Dataset(Row)) -> Array(BindingFacts) = fn(dataset) {
+    field_dimensions_for(model::prepare(dataset, []))
+};
+pub use self::{field_dimensions_for};
+
+# 复用显式模板的直接字段视图，保留组能力上限与绑定能力。
+def field_view: for(V) Fn(
+    DimensionGroup(V),
+    String,
+    Bool,
+    Array(Filter)
+) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(
+    group,
+    id,
+    projectable,
+    filters
+) {
+    fn(ctx, previous) {
+        let before = match previous {
+            Some(p) => p.dimensions,
+            None => []
+        };
+        {
+            dimensions: array::push(
+                before,
+                {
+                    id,
+                    group: group.id,
+                    value: Some(group.value),
+                    projectable,
+                    group_projectable: group.projectable,
+                    group_filters: group.filters,
+                    filters
+                }.ty!(FieldDimension)
+            )
+        }
+    }
+};
+pub use self::{field_view};

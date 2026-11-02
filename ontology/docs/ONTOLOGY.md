@@ -15,12 +15,58 @@ IC 与 relation 均采用类型化 Dataset、Entity 角色、Group 绑定及显�
 类型化声明签名见 [`world`](../src/world.telora)；注解式 `edsl::build_transform_root` 仍作为库接口保留。
 完整的小型声明见 [`relation_model`](../../relation_model/src/typed_relations.telora)，服务挂载见[入口](../../relation_model/src/lib.telora)。
 
-实验 API 的 Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
+Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
 维度和聚合度量共用这些表达式；Graph 投影与相关 EXISTS 聚合均检查能力和粒度。
 DimensionGroup 提供文本搜索、数值比较和相等策略，绑定可以收紧能力；筛选专用成员允许声明的过滤，但不允许投影、值计数或样本排名。
 可空身份缺失任一分量时所有分量投影为 NULL，速率只在正时长上计算，Sum／Max／Avg 保留空集 NULL 语义。
-逻辑 Row 字段与物理列名可通过 `transform::column` 和 `transform::map_columns` 显式绑定；未列出的字段使用同名物理列。
-映射保留字段类型、角色和粒度，准备时拒绝错配与列冲突。Group 表达式和角色关系共同使用已校验的物理映射。
+逻辑 Row 字段默认使用同名物理列。异名映射在字段上声明 `@model::column("physicalName")`，初始化从字段类型和 property 派生查询所需的映射。
+
+```telora
+use ontology::model as m;
+
+type Row = struct {
+    id: Int,
+    @m::column("tenantId")
+    tenant_id: String,
+    @m::column("operState")
+    oper_status: String,
+};
+```
+
+直接字段的查询维度在字段上声明。`transform::declare` 从 Row property 展开这些维度，transform 和知识发布共用展开后的声明。
+
+```telora
+use ontology::groups as g;
+
+type FrameRow = struct {
+    @g::exact("frame_id")
+    id: String,
+    @g::search("frame_name")
+    name: String,
+    @g::numeric("frame_temperature")
+    temperature: Option(Float),
+};
+```
+
+- `@g::search(id)` 发布 String 字段的文本搜索维度
+- `@g::exact(id)` 发布字段的等值维度，保留 newtype 身份
+- `@g::numeric(id)` 发布数值比较维度
+- `@g::epoch_millis(id)` 发布 EpochMillis 时间比较维度
+
+维度保留字段可空性；同一字段可以声明多个维度。复用 Row 的 Dataset 继承相同的字段声明，维度发布名在各自 Dataset 内寻址。字段业务角色与查询能力分别声明，称谓或分类本身不授予查询操作。
+枚举分类字段通过值域声明业务成员与源编码的对应关系：
+
+```telora
+@v::classification(FrameOperState_domain, "frame_oper_state")
+oper_state: Option(Int),
+```
+
+`@v::classification(domain, id)` 发布可投影、支持等值筛选的业务维度。需要限制能力时使用 `@v::field_domain(domain, id, projectable, filters)`。源字段必须与值域的源类型一致，或为该类型的 Option；业务枚举、编码映射与排序由值域定义。
+
+组合能力通过 `g::field_binding(dataset, id)` 或 `v::field_binding(dataset, id)` 引用字段已声明的维度。计算表达式、关系和聚合组合使用显式声明；模型自检统一检查属性派生与显式声明间的重复和冲突。显式 `with_domains` 绑定与字段值域声明共同组成 Dataset 的业务维度。
+
+程序式构造可使用 `transform::column` 与 `transform::map_columns`。同一字段的显式映射与 property 必须一致。
+映射保留字段类型、可空性、角色和粒度；模型自检拒绝错配、非法标识符和物理列名冲突，冲突判断不区分 ASCII 大小写。Group 表达式和角色关系共同使用该映射。
 这些表达式直接生成 QueryAst，不接受任意函数或 SQL 字符串映射；API 与范围见 [RFC 0002](../../rfcs/0002-typed-model-composition.md)。
 
 ```telora
@@ -74,3 +120,5 @@ SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
 
 Intent 解析与转换实现见 [`intent.telora`](../src/intent.telora)，模型支持的图校验见
 [`ontology.telora`](../src/ontology.telora)。外部 Intent 形状示例统一维护在[使用说明](../../USAGE.md)，避免产生第二份 JSON 协议。
+
+领域类型的统一注册入口与 IC 自检方法见[类型驱动的领域注册](REGISTRY.md)。

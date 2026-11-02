@@ -34,7 +34,7 @@ await withRunner(process.argv[2],async(_,request)=>{
  const ne=model.datasets.find(d=>d.id==='network-element');
  db.prepare(`INSERT INTO ${quote(ne.table)} (id,name,classification) VALUES (?,?,?)`).run('n1','Alpha','ne.category.switch');
  db.prepare(`INSERT INTO ${quote(ne.table)} (id,name,classification) VALUES (?,?,?)`).run('n2','Beta','ne.category.router');
- const canonical=graph(ne,'ne_id');canonical.filters=[{node:'r',dimension:'ne_classification',op:'Eq',value:'switch'}];
+ const canonical=graph(ne,'ne_id');canonical.filters=[{node:'r',dimension:'ne_classification',op:'Eq',value:'Switch'}];
  const q=await batch([canonical]);assert.deepEqual(execute(q[0]),[{r_ne_id:'n1'}]);
  const sub=model.datasets.find(d=>d.id==='subnet');
  db.prepare(`INSERT INTO ${quote(sub.table)} (id,name) VALUES (?,?)`).run('s1','Subnet');

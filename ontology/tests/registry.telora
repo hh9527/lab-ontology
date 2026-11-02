@@ -1,0 +1,306 @@
+use ontology::registry as registry;
+use ontology::model as m;
+use ontology::relations as r;
+use ontology::transform as t;
+use ontology::ontology as edsl;
+use ontology::groups as g;
+use ontology::world as world;
+use ontology::query as q;
+use std::test as test;
+use std::array as array;
+use std::value::{Value};
+
+@registry::entity("device")
+type Identity = struct {
+    id: Int
+};
+@registry::dataset("devices", "physical_devices", ["id"])
+@registry::roles([subject])
+@registry::record_counts(["count"])
+@registry::alternatives([alternative])
+type Device = struct {
+    @g::exact("id")
+    id: Int,
+    @g::search("name")
+    name: String
+};
+def dataset: m::Dataset(Device) = registry::dataset_of(Device.type);
+def subject: m::Role(Device) = m::role(
+    dataset,
+    registry::entity_of(Identity.type),
+    "subject",
+    False,
+    [
+        m::identity_part(
+            m::field(Device.type, Int.type, "id"),
+            m::field(Identity.type, Int.type, "id")
+        )
+    ]
+);
+pub def registration_is_immutable_and_idempotent: test::Test = test::should_ok(
+    fn() {
+        let once = registry::register_type(registry::empty, Device.type);
+        let twice = registry::register_type(once, Device.type);
+        array::length(registry::empty.datasets) == 0 && array::length(once.datasets) == 1 && once == twice && once.datasets[
+            0
+        ].record_counts == ["count"] && array::length(once.datasets[0].dataset.roles) == 1
+    }
+);
+pub def entity_and_dataset_share_registerable_trait: test::Test = test::should_ok(
+    fn() {
+        let roots = registry::Registerable(Identity).register(
+            registry::Registerable(Device).register(registry::empty)
+        );
+        array::length(roots.datasets) == 1 && array::length(roots.entities) == 1
+    }
+);
+pub def registration_order_does_not_change_definitions: test::Test = test::should_ok(
+    fn() {
+        let a = registry::register_type(
+            registry::register_type(registry::empty, Device.type),
+            Identity.type
+        );
+        let b = registry::register_type(
+            registry::register_type(registry::empty, Identity.type),
+            Device.type
+        );
+        a.datasets == b.datasets && a.entities == b.entities
+    }
+);
+pub def unannotated_root_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        registry::register_type(registry::empty, Int.type);
+        True
+    },
+    "registry root requires dataset or entity property"
+);
+
+def alternative: t::Alternative = {
+    id: "self_choice",
+    choices: [
+        r::relation(
+            "self_edge",
+            dataset,
+            subject,
+            dataset,
+            subject,
+            {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Optional}
+        )
+    ],
+    cardinality: {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Optional}
+};
+def profile: q::PlanProfile = {
+    allowed_operators: [
+        q::Operator::Source,
+        q::Operator::Column,
+        q::Operator::Bind,
+        q::Operator::Scalar,
+        q::Operator::Aggregate,
+        q::Operator::Filter,
+        q::Operator::Project,
+        q::Operator::Group,
+        q::Operator::Join
+    ],
+    allowed_join_kinds: [q::JoinKind::Inner, q::JoinKind::Left],
+    allowed_aggregates: [q::AggregateFunction::Count],
+    allowed_scalars: [
+        q::ScalarFunction::Eq,
+        q::ScalarFunction::Ne,
+        q::ScalarFunction::Lower,
+        q::ScalarFunction::Instr,
+        q::ScalarFunction::Length,
+        q::ScalarFunction::Substr,
+        q::ScalarFunction::Gt,
+        q::ScalarFunction::Ge,
+        q::ScalarFunction::Lt,
+        q::ScalarFunction::Le,
+        q::ScalarFunction::Not,
+        q::ScalarFunction::BinaryText,
+        q::ScalarFunction::And,
+        q::ScalarFunction::Or,
+        q::ScalarFunction::RegexMatch,
+        q::ScalarFunction::Add,
+        q::ScalarFunction::Sub
+    ],
+    allow_distinct: False
+};
+pub def alternative_owns_inline_relations: test::Test = test::should_ok(
+    fn() {
+        let model = registry::define("test", [Device.type, Identity.type], [], profile);
+        array::length(model.relations) == 0 && array::length(model.alternatives) == 1 && world::coverage(
+            model
+        ) == []
+    }
+);
+
+pub def batch_registration_deduplicates_before_expansion: test::Test = test::should_ok(
+    fn() {
+        let batch = registry::register_types(
+            registry::empty,
+            [Device.type, Identity.type, Device.type, Identity.type]
+        );
+        let incremental = registry::register_type(
+            registry::register_type(registry::empty, Device.type),
+            Identity.type
+        );
+        batch == incremental && registry::register_types(batch, [Identity.type, Device.type]) == batch
+    }
+);
+pub def cached_definitions_do_not_leak_registration_state: test::Test = test::should_ok(
+    fn() {
+        let warm = registry::declaration(Device.type);
+        let first = registry::register_types(registry::empty, [Device.type, Identity.type]);
+        let second = registry::register_types(registry::empty, [Device.type, Identity.type]);
+        first == second && first.datasets == [warm] && registry::empty.roots == [] && registry::empty.root_index == {}
+    }
+);
+
+@registry::dataset("devices", "other_devices", [])
+type OtherDevice = struct {
+    id: Int
+};
+pub def root_deduplication_preserves_distinct_nominal_types: test::Test = test::should_ok(
+    fn() {
+        let registered = registry::register_types(
+            registry::empty,
+            [Device.type, OtherDevice.type, Device.type]
+        );
+        array::length(registered.roots) == 2 && array::length(registered.datasets) == 2 && registered.datasets[
+            0
+        ].dataset.source == "physical_devices" && registered.datasets[1].dataset.source == "other_devices"
+    }
+);
+
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use std::json as json;
+use std::codec as codec;
+
+@registry::dataset("texts", "text_rows", ["id"])
+@registry::roles([text_role])
+@registry::record_counts(["count"])
+type TextRow = struct {
+    @g::exact("id")
+    id: Int,
+    @g::exact("value")
+    value: String
+};
+@registry::dataset("numbers", "number_rows", ["id"])
+@registry::roles([number_role])
+@registry::record_counts(["count"])
+type NumberRow = struct {
+    @g::exact("id")
+    id: Int,
+    @g::exact("value")
+    value: Int
+};
+def text_dataset: m::Dataset(TextRow) = registry::dataset_of(TextRow.type);
+def number_dataset: m::Dataset(NumberRow) = registry::dataset_of(NumberRow.type);
+def text_role: m::Role(TextRow) = m::role(
+    text_dataset,
+    registry::entity_of(Identity.type),
+    "subject",
+    False,
+    [
+        m::identity_part(
+            m::field(TextRow.type, Int.type, "id"),
+            m::field(Identity.type, Int.type, "id")
+        )
+    ]
+);
+def number_role: m::Role(NumberRow) = m::role(
+    number_dataset,
+    registry::entity_of(Identity.type),
+    "subject",
+    False,
+    [
+        m::identity_part(
+            m::field(NumberRow.type, Int.type, "id"),
+            m::field(Identity.type, Int.type, "id")
+        )
+    ]
+);
+def text_number: r::Relation = r::relation(
+    "text_number",
+    text_dataset,
+    text_role,
+    number_dataset,
+    number_role,
+    {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Optional}
+);
+
+pub def relation_cannot_expand_the_world: test::Test = test::should_fail_with(
+    fn() {
+        registry::define("missing", [TextRow.type], [text_number], profile);
+        True
+    },
+    "World relation boundary is invalid"
+);
+pub def duplicate_root_names_fail_during_registration: test::Test = test::should_fail_with(
+    fn() {
+        registry::define("duplicate", [Device.type, OtherDevice.type], [], profile);
+        True
+    },
+    "duplicate dataset id"
+);
+@registry::dataset("invalid_columns", "invalid_columns", [])
+type InvalidColumns = struct {
+    @m::column("id")
+    first: Int,
+    id: Int
+};
+pub def local_errors_fail_before_world_assembly: test::Test = test::should_fail_with(
+    fn() {
+        registry::register_type(registry::empty, InvalidColumns.type);
+        True
+    },
+    "typed column mappings collide on a physical column"
+);
+pub def cached_local_definition_does_not_bypass_profile_checks: test::Test = test::should_fail_with(
+    fn() {
+        registry::declaration(TextRow.type);
+        registry::define("narrow", [TextRow.type], [], profile <~ {allowed_aggregates: []});
+        True
+    },
+    "declared measure uses aggregate, filter or scalar capabilities not allowed by the query profile"
+);
+type Response = struct {
+    accepted: Bool,
+    queries: Option(Array(intent::PreparedQuery)),
+    diagnostics: Array(Value)
+};
+pub def member_names_are_scoped_by_dataset_for_input_and_result_types: test::Test = test::should_ok(
+    fn() {
+        let model = registry::define(
+            "scoped",
+            [TextRow.type, NumberRow.type],
+            [text_number],
+            profile
+        );
+        let lower = intent::query_request_method_factory(
+            world::prepare(model).payload,
+            sqlite::build_query
+        );
+        let result = codec::decode@[Response](
+            lower(
+                json::parse(
+                    r#"{"intents":[{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"texts"}],"edges":[],"select":[{"node":"r","dimension":"value"}],"measures":[{"node":"r","measure":"count"}],"filters":[{"node":"r","dimension":"value","op":"Eq","value":"x"}]},{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"numbers"}],"edges":[],"select":[{"node":"r","dimension":"value"}],"measures":[{"node":"r","measure":"count"}],"filters":[{"node":"r","dimension":"value","op":"Eq","value":7}]},{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"texts"},{"id":"b","entity":"numbers"}],"edges":[{"relation":"text_number","from":"a","to":"b"}],"select":[{"node":"a","dimension":"value"},{"node":"b","dimension":"value"}],"filters":[{"node":"a","dimension":"value","op":"Eq","value":"x"},{"node":"b","dimension":"value","op":"Eq","value":7}]}]}"#
+                ).unwrap!()
+            )
+        ).unwrap!();
+        match result.queries {
+            None => fail!(json::stringify(codec::encode(result.diagnostics))),
+            Some(queries) => result.accepted && array::length(queries) == 3 && type_is(
+                queries[0].columns[0],
+                intent::ResultType::String
+            ) && type_is(queries[1].columns[0], intent::ResultType::Int) && type_is(
+                queries[2].columns[0],
+                intent::ResultType::String
+            ) && type_is(queries[2].columns[1], intent::ResultType::Int)
+        }
+    }
+);
+
+def type_is: Fn(intent::ResultColumn, intent::ResultType) -> Bool = fn(column, ty) {
+    column == {name: column.name, type: ty, nullable: column.nullable}.ty!(intent::ResultColumn)
+};

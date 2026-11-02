@@ -21,21 +21,22 @@ const { graph, vocabulary } = buildKnowledge(publication.data);
 
 插件信任模型代码，直接同步执行。静态程序使用 Map／Set 和原地更新，负责规范地址、SHA256 Group 哈希、类型内联、节点展开与事实合并；输入 JSON 保持不变。构图状态只在一次调用中使用，不经跨调用序列化。
 
-最终 graph 使用 `ontology-knowledge-v4` 图结构，含 facts 和 items。vocabulary 每项为 `{key,kind,name,doc,aliases,owner,ownerValue}`，用于 `va_ask`。插件验证词条身份及唯一性，外部展示文件可补充说明和别名。编译、执行或验证错误直接拒绝加载，成功结果按模型及外部展示身份缓存。
+最终 graph 使用 `ontology-knowledge-v5` 图结构，含 facts 和 items。vocabulary 每项为 `{key,kind,name,doc,aliases,owner,ownerValue}`，用于 `va_ask`。插件验证词条身份及唯一性，外部展示文件可补充说明和别名。编译、执行或验证错误直接拒绝加载，成功结果按模型及外部展示身份缓存。
 
 库的 `knowledge::export` 保留完整图等价验收参考实现；默认构建使用 `knowledge::publication`。
 
 ## 最终知识事实
-每条事实为 `{key,value,references}`，key 是规范稳定地址，references 显式指向其他事实。
+每条独立事实为 `{key,value,references,reference_sites}`。独立根为 Dataset、Entity、Type；字段、角色、维度、指标和值域成员作为所属根的内容发布；关系通过顶层描述表交换。references 连接独立根，reference_sites 记录内容中的精确引用位置。
 消费方必须校验契约与引用闭合，再从事实派生成员导航、语义链接和反向链接；展示条目不授予查询权限。
 
-Entity 表达独立业务身份，Dataset 表达行类型、来源、粒度与时钟；Role 以完整身份映射关联 Dataset 与 Entity。
-DimensionGroup／MeasureGroup 表达可复用能力，绑定表达输入映射和发布成员。关系显式引用端点角色。
-这些是不同种类的事实，不能仅按表名或字段同名合并。具体地址以输出 key 为准，不能推测或重写。
+Entity 表达独立业务身份，Dataset 表达来源、粒度与时钟。Role 以完整身份映射关联 Dataset 与 Entity。
+DimensionGroup／MeasureGroup 和绑定用于模型内部复用，发布时将语义展开到 Dataset 的维度和指标内容。关系保留完整端点信息，由插件生成来源 Dataset 的 peers/by 导航。具体地址以输出 key 为准。
 
 Int、Float、Bool、String 及内置 Option、Array、Dict 不生成类型节点，也就没有其反向链接。
 类型字段内联表达，例如 `Array(Option(Dict(types/<业务类型地址>)))`；其中具名业务类型的引用仍保留。
-具名 newtype、具名枚举保留节点，不能因底层为标量或结构类似 Option 而忽略。
+领域 newtype、领域枚举保留节点。Dataset 行记录和 Entity 身份记录内联展开；独立领域记录通过 `@knowledge_policy::independent_type()` 声明。
+仅当领域类型显式允许反向导航，且拥有封闭或半封闭的已知成员时，才生成从类型到使用位置的反向连接。
+源编码取值清单保存在对应维度的 `canonical_values` 中，不产生具名 Type。领域 enum 的成员编码来自 variant property，同一份声明支撑 transform 与知识发布。
 
 P1 支撑运行期程序，P2 支撑上述外部知识；运行期不重跑准备或发现。
 dsh-oks 直接读取 custom section，并可从 `<model>.knowledge-items.json` 补充名称和文档。
@@ -261,3 +262,5 @@ node scripts/benchmark-host-knowledge.mjs \
 设计及边界见 [RFC 0001](../../rfcs/0001-host-knowledge-index.md)。
 
 静态 JS 源码为 `ontology/src/knowledge.js`，通过 `python3 scripts/embed-knowledge-program.py` 生成 Telora 字符串；`--check` 检查漂移。协议设计见 [RFC 0005](../../rfcs/0005-programmed-knowledge-discovery.md)。
+
+关系定义作为顶层 `relations` 描述表交换，由插件派生 `peers/by` 与 cap 的关系路径索引。独立知识节点为 Entity / Dataset / Type；发现入口为 Entity / Dataset / Relation，Type 从类型引用自动发现。关系描述不计入独立知识节点数量。

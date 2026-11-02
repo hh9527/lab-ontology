@@ -1,6 +1,9 @@
 # RFC 0002 阶段 A：独立的对象身份、记录粒度和角色映射。
 # 此入口只准备声明，不连接数据库，不授予查询或图遍历能力。
 use std::array as array;
+use std::dict as dict;
+use std::pipeline as pipeline;
+use std::type_memorizer as memo;
 use std::type_desc as td;
 
 type Entity(Identity) = struct {
@@ -67,15 +70,32 @@ def resolved: Fn(Type) -> Type = fn(ty) {
         ty
     }
 };
+# 类型的字段列表和名称索引只构造一次，局部检查复用同一份元数据。
+def field_lists: memo::TypeMemorizer(Array(td::FieldDesc)) = memo::type_memorizer(td::fields);
+def fields_of: Fn(Type) -> Array(td::FieldDesc) = fn(owner) {
+    memo::computed_with_type(field_lists, owner)
+};
+def field_indexes: memo::TypeMemorizer(Dict(td::FieldDesc)) = memo::type_memorizer(
+    fn(owner) {
+        pipeline::run(
+            pipeline::from_array(fields_of(owner)) |> pipeline::collect_dict(
+                fn(field) {
+                    field.name
+                },
+                fn(field) {
+                    field
+                }
+            )
+        )
+    }
+);
+def field_info: Fn(Type, String) -> Option(td::FieldDesc) = fn(owner, name) {
+    dict::get(memo::computed_with_type(field_indexes, owner), name)
+};
 def field_type: Fn(Type, String) -> Type = fn(owner, name) {
-    match array::find(
-        td::fields(owner),
-        fn(field) {
-            field.name == name
-        }
-    ) {
+    match field_info(owner, name) {
         Some(field) => field.ty,
-        None => fail!("typed model field does not exist", owner, name),
+        None => fail!("typed model field does not exist", owner, name)
     }
 };
 
@@ -90,8 +110,8 @@ def identity_value: Fn(Type) -> Bool = fn(ty) {
     }
 };
 
-def validate_identity: Fn(Type) -> () = fn(identity) {
-    let fields = td::fields(identity);
+def check_identity: Fn(Type) -> Bool = fn(identity) {
+    let fields = fields_of(identity);
     if td::kind(resolved(identity)) != td::TypeDescKind::Struct || array::length(fields) == 0 {
         fail!("entity identity must be a nonempty record", identity)
     } else if !array::all(
@@ -102,8 +122,14 @@ def validate_identity: Fn(Type) -> () = fn(identity) {
     ) {
         fail!("entity identity requires non-null integer or text business values", identity)
     } else {
-        ()
+        True
     }
+};
+
+def identity_checks: memo::TypeMemorizer(Bool) = memo::type_memorizer(check_identity);
+def validate_identity: Fn(Type) -> () = fn(identity) {
+    memo::computed_with_type(identity_checks, identity);
+    ()
 };
 
 def entity: for(Identity) Fn(String, TypeOf(Identity)) -> Entity(Identity) = fn(id, identity) {
@@ -218,7 +244,7 @@ def reference_part: for(Row, Identity, Raw, Nominal) Fn(
 
 def validate_parts: Fn(Type, Type, Bool, Array(Part)) -> () = fn(row, identity, optional, parts) {
     validate_identity(identity);
-    let fields = td::fields(identity);
+    let fields = fields_of(identity);
     if array::length(parts) != array::length(fields) || !array::all(
         fields,
         fn(field) {
@@ -386,7 +412,9 @@ pub use self::{
     identity_part,
     role,
     prepare,
-    validate_prepared
+    validate_prepared,
+    fields_of,
+    field_info
 };
 
 # 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
@@ -541,3 +569,6 @@ pub use self::{
     checked_prepare,
     validate_identity
 };
+
+# 字段声明直接承载异名源列映射；同名列使用字段名。
+pub use crate::ontology::{column};

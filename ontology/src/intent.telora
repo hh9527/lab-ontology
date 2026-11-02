@@ -409,8 +409,52 @@ def parse_graph_edge: Fn(Value) -> edsl::GraphEdge = fn(item) {
     decode_graph_shape@[edsl::GraphEdge](item, "syntax/graph/edge")
 };
 
-def parse_graph_filter: Fn(edsl::PreparedPayload, Value) -> edsl::GraphFilter = fn(payload, item) {
+# 字段与指标名称归属于节点；输入推断和结果列使用同一作用域。
+def graph_node_payload: Fn(
+    edsl::PreparedPayload,
+    Array(edsl::GraphNode),
+    String
+) -> edsl::PreparedPayload = fn(payload, nodes, node) {
+    let dataset = match array::find(
+        nodes,
+        fn(item) {
+            item.id == node
+        }
+    ) {
+        Some(item) => item.entity,
+        None => fail!("unknown graph node", node)
+    };
+    let owner = match array::find(
+        payload.entities,
+        fn(entity) {
+            entity.id == dataset
+        }
+    ) {
+        Some(entity) => entity.index,
+        None => fail!("unknown graph dataset", dataset)
+    };
+    payload <~ {
+        dimensions: array::filter(
+            payload.dimensions,
+            fn(entry) {
+                entry.entity == owner
+            }
+        ),
+        measures: array::filter(
+            payload.measures,
+            fn(entry) {
+                entry.entity == owner
+            }
+        )
+    }
+};
+def parse_graph_filter: Fn(
+    edsl::PreparedPayload,
+    Array(edsl::GraphNode),
+    Value
+) -> edsl::GraphFilter = fn(payload, nodes, item) {
     let raw = decode_graph_shape@[RawGraphFilter](item, "syntax/graph/filter");
+    let payload = graph_node_payload(payload, nodes, raw.node);
     let dimension = raw.dimension;
     let op = parse_op(raw.op);
     let value = raw.value;
@@ -476,16 +520,18 @@ def parse_time_value: Fn(edsl::TimeField, Value) -> time::TimeValue = fn(role, v
     }
 };
 
-def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilter) = fn(
-    payload,
-    value
-) {
+def parse_time_window: Fn(
+    edsl::PreparedPayload,
+    Array(edsl::GraphNode),
+    Value
+) -> Array(edsl::GraphFilter) = fn(payload, nodes, value) {
     match dict::get(as_object(value), "end") {
         None => fail!("time window end is required and must be non-null"),
         Some(Value::None) => fail!("time window end is required and must be non-null"),
         _ => (),
     };
     let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
+    let payload = graph_node_payload(payload, nodes, raw.node);
     let detail = dimension_input_contract(payload, raw.dimension);
     let role = edsl::time_domain(payload, detail.dataset, detail.field);
     let window: time::Window = {
@@ -503,8 +549,13 @@ def parse_time_window: Fn(edsl::PreparedPayload, Value) -> Array(edsl::GraphFilt
     )
 };
 
-def parse_graph_any_of: Fn(edsl::PreparedPayload, Value) -> edsl::GraphAnyOf = fn(payload, item) {
+def parse_graph_any_of: Fn(edsl::PreparedPayload, Array(edsl::GraphNode), Value) -> edsl::GraphAnyOf = fn(
+    payload,
+    nodes,
+    item
+) {
     let raw = decode_graph_shape@[RawGraphAnyOf](item, "syntax/graph/filter");
+    let payload = graph_node_payload(payload, nodes, raw.node);
     {
         node: raw.node,
         dimension: raw.dimension,
@@ -517,8 +568,13 @@ def parse_graph_any_of: Fn(edsl::PreparedPayload, Value) -> edsl::GraphAnyOf = f
     }
 };
 
-def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = fn(payload, item) {
+def parse_graph_having: Fn(
+    edsl::PreparedPayload,
+    Array(edsl::GraphNode),
+    Value
+) -> edsl::GraphHaving = fn(payload, nodes, item) {
     let raw = decode_graph_shape@[RawGraphHaving](item, "syntax/graph/aggregate");
+    let payload = graph_node_payload(payload, nodes, raw.node);
     {
         node: raw.node,
         measure: raw.measure,
@@ -527,8 +583,14 @@ def parse_graph_having: Fn(edsl::PreparedPayload, Value) -> edsl::GraphHaving = 
     }
 };
 
-def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist = fn(payload, item) {
+def parse_graph_existence: Fn(
+    edsl::PreparedPayload,
+    Array(edsl::GraphNode),
+    Value
+) -> edsl::GraphExist = fn(payload, outer, item) {
     let raw = decode_graph_shape@[RawGraphExistEnvelope](item, "syntax/graph/existence");
+    let nodes = array::map(as_array(raw.nodes), parse_graph_node);
+    let scope = array::concat([outer, nodes]);
     let obj = as_object(item);
     let negated = match dict::get(obj, "negated") {
         None => False,
@@ -538,7 +600,7 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist 
     };
     {
         anchor: raw.anchor,
-        nodes: array::map(as_array(raw.nodes), parse_graph_node),
+        nodes,
         edges: array::map(as_array(raw.edges), parse_graph_edge),
         constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
         filters: array::concat(
@@ -546,13 +608,13 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist 
                 array::map(
                     array_opt(obj, "filters"),
                     fn(value) {
-                        parse_graph_filter(payload, value)
+                        parse_graph_filter(payload, scope, value)
                     }
                 ),
                 array::flat_map(
                     array_opt(obj, "time_windows"),
                     fn(value) {
-                        parse_time_window(payload, value)
+                        parse_time_window(payload, scope, value)
                     }
                 )
             ]
@@ -560,13 +622,13 @@ def parse_graph_existence: Fn(edsl::PreparedPayload, Value) -> edsl::GraphExist 
         any_of: array::map(
             array_opt(obj, "any_of"),
             fn(value) {
-                parse_graph_any_of(payload, value)
+                parse_graph_any_of(payload, scope, value)
             }
         ),
         having: array::map(
             array_opt(obj, "having"),
             fn(value) {
-                parse_graph_having(payload, value)
+                parse_graph_having(payload, scope, value)
             }
         ),
         negated
@@ -584,6 +646,7 @@ def lower_graph_object: Fn(
         fail!("graph pair and union branches must be Graph intents", op)
     } else {
         let raw = decode_graph_shape@[RawGraphEnvelope](value, "syntax/graph");
+        let nodes = array::map(as_array(raw.nodes), parse_graph_node);
         let request: edsl::GraphRequest = {
             root: raw.root,
             row_grain: match dict::get(obj, "row_grain") {
@@ -598,7 +661,7 @@ def lower_graph_object: Fn(
                 Some(Value::False) => False,
                 Some(value) => fail!("graph distinct must be boolean", value),
             },
-            nodes: array::map(as_array(raw.nodes), parse_graph_node),
+            nodes,
             edges: array::map(as_array(raw.edges), parse_graph_edge),
             constraints: array::map(array_opt(obj, "constraints"), parse_graph_edge),
             select: decode_graph_shape@[Array(edsl::GraphSelect)](raw.select, "syntax/graph/select"),
@@ -611,7 +674,7 @@ def lower_graph_object: Fn(
             measure_having: array::map(
                 array_opt(obj, "measure_having"),
                 fn(value) {
-                    parse_graph_having(payload, value)
+                    parse_graph_having(payload, nodes, value)
                 }
             ),
             filters: array::concat(
@@ -619,13 +682,13 @@ def lower_graph_object: Fn(
                     array::map(
                         array_opt(obj, "filters"),
                         fn(value) {
-                            parse_graph_filter(payload, value)
+                            parse_graph_filter(payload, nodes, value)
                         }
                     ),
                     array::flat_map(
                         array_opt(obj, "time_windows"),
                         fn(value) {
-                            parse_time_window(payload, value)
+                            parse_time_window(payload, nodes, value)
                         }
                     )
                 ]
@@ -633,13 +696,13 @@ def lower_graph_object: Fn(
             any_of: array::map(
                 array_opt(obj, "any_of"),
                 fn(value) {
-                    parse_graph_any_of(payload, value)
+                    parse_graph_any_of(payload, nodes, value)
                 }
             ),
             exists: array::map(
                 array_opt(obj, "exists"),
                 fn(value) {
-                    parse_graph_existence(payload, value)
+                    parse_graph_existence(payload, nodes, value)
                 }
             ),
             count: match dict::get(obj, "count") {
@@ -847,7 +910,10 @@ def pair_time_alignment: Fn(
                         array::filter(
                             request.filters,
                             fn(filter) {
-                                let dimension = dimension_input_contract(payload, filter.request.id);
+                                let dimension = dimension_input_contract(
+                                    graph_node_payload(payload, request.nodes, filter.node),
+                                    filter.request.id
+                                );
                                 filter.node == node && !dimension.computed && array::any(
                                     entity.fields,
                                     fn(candidate) {
@@ -1020,7 +1086,18 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                 } else {
                     "right"
                 };
-                let columns = if dimension_input_contract(payload, item.dimension).half_open {
+                let columns = if dimension_input_contract(
+                    graph_node_payload(
+                        payload,
+                        if item.side == qb::PairSide::Left {
+                            left.1.nodes
+                        } else {
+                            right.1.nodes
+                        },
+                        item.node
+                    ),
+                    item.dimension
+                ).half_open {
                     [alias, `\{alias}__kind`]
                 } else {
                     [alias]
@@ -1075,8 +1152,14 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                     "Desc" => qb::Ordering::Desc,
                     other => fail!("aggregate pair rank direction must be Asc or Desc", other),
                 };
-                let ltype = edsl::measure_output_type(payload, left_measure.measure);
-                let rtype = edsl::measure_output_type(payload, right_measure.measure);
+                let ltype = edsl::measure_output_type(
+                    graph_node_payload(payload, left.1.nodes, left_measure.node),
+                    left_measure.measure
+                );
+                let rtype = edsl::measure_output_type(
+                    graph_node_payload(payload, right.1.nodes, right_measure.node),
+                    right_measure.measure
+                );
                 if (ltype != edsl::OutputType::Integer && ltype != edsl::OutputType::Number) || (
                     rtype != edsl::OutputType::Integer && rtype != edsl::OutputType::Number
                 ) {
@@ -1612,10 +1695,12 @@ def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> A
     ctx
 ) {
     let obj = as_object(input);
+    let nodes = array::map(array_opt(obj, "nodes"), parse_graph_node);
     let dimensions = array::flat_map(
         array_opt(obj, "select"),
         fn(value) {
             let item = codec::decode@[edsl::GraphSelect](value).unwrap!();
+            let payload = graph_node_payload(payload, nodes, item.node);
             let dimension = match array::find(
                 payload.dimensions,
                 fn(d) {
@@ -1642,6 +1727,7 @@ def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> A
         array_opt(obj, "measures"),
         fn(value) {
             let item = codec::decode@[edsl::GraphMeasureSelect](value).unwrap!();
+            let payload = graph_node_payload(payload, nodes, item.node);
             {
                 name: `\{item.node}_\{item.measure}`,
                 type: measure_result_type(payload, item.measure),

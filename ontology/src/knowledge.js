@@ -71,7 +71,7 @@ function types(s, items) {
 function field_types(s, items) {
   for (const info of items) s.fieldTypes.set(info.id, info);
   for (const t of s.pendingTypes) if (!t.inline) merge(s, address('types', t.id), {
-    name: t.name, kind: t.kind, reverse_references: t.reverse_references === true, representation: t.representation === null ? null : typeref(s, t.representation),
+    name: t.name, kind: t.kind, reverse_references: t.reverse_references === true && t.variants.length > 0 && t.variants.every(v => v.payload === null), representation: t.representation === null ? null : typeref(s, t.representation),
     arguments: t.arguments.map(x => typeref(s, x)), field_types: t.field_types.map(c => column(s, c)),
     variants: t.variants.map(v => v.payload === null ? { ...v } : { ...v, payload: typeref(s, v.payload) }),
   }, t.dependencies.flatMap(x => typerefs(s, x)));
@@ -92,8 +92,9 @@ function domain(s, dataset, b) {
   const definition = { ...b.definition, type: typeref(s, b.definition.type), wire: typeref(s, b.definition.wire) };
   const group = address('dimension_groups', sha256(json(definition))), key = member(dataset, 'bindings', json(['domain', b.id]));
   if (typerefs(s, b.definition.type).includes(typeref(s, b.definition.type))) {
-    for (const v of b.definition.canonical_values) merge(s, `${typeref(s, b.definition.type)}#values/${encode(v.id)}`, { wires: v.wires }, typerefs(s, b.definition.type));
-    merge(s, typeref(s, b.definition.type), { canonical_order: b.definition.order, half_open: b.definition.half_open, wire: typeref(s, b.definition.wire) }, typerefs(s, b.definition.wire));
+    for (const v of b.definition.canonical_values) merge(s, `${typeref(s, b.definition.type)}#values/${encode(v.id)}`, { label: v.label, names: s.types.get(b.definition.type)?.variants.find(variant => variant.name === v.id)?.names || [], wires: v.wires }, typerefs(s, b.definition.type));
+    merge(s, typeref(s, b.definition.type), { canonical_order: b.definition.order, half_open: b.definition.half_open, wire: typeref(s, b.definition.wire),
+      reverse_references: s.types.get(b.definition.type)?.reverse_references === true && b.definition.canonical_values.length > 0 }, typerefs(s, b.definition.wire));
   }
   merge(s, group, definition, [...typerefs(s, b.definition.type), ...typerefs(s, b.definition.wire)]);
   merge(s, key, { group, input: expression(s, b.input), publish: b.id, nullable: b.nullable, projectable: b.projectable, filters: b.filters }, [group]);
@@ -112,7 +113,7 @@ function entity(s, r) {
   merge(s, address('entities', r.entity), { identity: typeref(s, r.identity) }, typerefs(s, r.identity));
 }
 function dataset(s, d) {
-  merge(s, address('datasets', d.id), { source: d.source, row: typeref(s, d.row), grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [] }, typerefs(s, d.row));
+  merge(s, address('datasets', d.id), { source: d.source, grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [] });
   for (const r of d.roles) {
     merge(s, member(d.id, 'roles', r.id), { entity: address('entities', r.entity), identity: typeref(s, r.identity), optional: r.optional,
       parts: r.parts.map(p => ({ ...p, type: typeref(s, p.type), raw: p.raw === null ? null : typeref(s, p.raw) })) },
@@ -164,16 +165,68 @@ function relations(s, r) {
     merge(s, address('relations', a.id), { alternatives: choices }, choices.flatMap(c => [c.from, c.to]));
   }
 }
+// Knowledge nodes and relation descriptors share transport, not graph identity.
+// Member addresses are retrieval locations within their owner, not graph nodes.
+function ownedGraph(s) {
+  const owners = new Map(), folded = new Map(), roots = new Map();
+  const isRoot = key => /^(entities|datasets|relations|types)\/[^#]+$/.test(key);
+  const technical = key => /^(dimension_groups|measure_groups)\//.test(key) || key.includes('#bindings/');
+  const relocate = value => typeof value === 'string' ? owners.get(value) || value
+    : Array.isArray(value) ? value.map(relocate)
+    : value !== null && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k,v]) => [k,relocate(v)])) : value;
+  for (const [key, f] of s.facts) {
+    if (technical(key)) continue;
+    const target = owners.get(key) || key, value = { ...f.value }, refs = new Set(f.references);
+    if (key.includes('#dimensions/') || key.includes('#measures/')) {
+      const b = s.facts.get(value.binding), group = s.facts.get(value.group);
+      const publish = decodeURIComponent(key.slice(key.lastIndexOf('/') + 1));
+      const member = b?.value.members?.find(m => m.publish === publish);
+      const {name, members, ...definition} = group?.value || {};
+      if (typeof definition.type === "string" && definition.type.startsWith("types/")) delete definition.canonical_values;
+      Object.assign(value, definition, member ? Object.fromEntries(Object.entries(member).filter(([k]) => !['local','publish','kind'].includes(k))) : {}, f.value);
+      if (b?.value.input) value.input = b.value.input;
+      if (b?.value.field) value.field = b.value.field;
+      if (typeof b?.value.nullable === 'boolean') value.nullable = b.value.nullable;
+      for (const ref of [...(b?.references || []), ...(group?.references || [])]) refs.add(ref);
+      delete value.binding; delete value.group; delete value.local;
+    }
+    if (key.startsWith('relations/')) value.relation = decodeURIComponent(key.slice('relations/'.length));
+    folded.set(target, { key: target, value: relocate(value), references: [...refs].filter(ref => !technical(ref)).map(ref => owners.get(ref) || ref) });
+  }
+  for (const [key,f] of folded) if (isRoot(key)) roots.set(key, { key, value: { ...f.value }, references: new Set(), reference_sites: [] });
+  for (const [key,f] of folded) {
+    const [root,member] = key.split('#'), owner = roots.get(root);
+    if (!owner) throw new Error(`Unknown knowledge owner: ${key}`);
+    const path = member ? member.split('/').map(decodeURIComponent) : [];
+    if (path.length) {
+      const [category,name] = path;
+      if (!Object.hasOwn(owner.value,category)) owner.value[category] = Object.create(null);
+      Object.defineProperty(owner.value[category],name,{value:f.value,enumerable:true,writable:true,configurable:true});
+    }
+    for (const ref of f.references) {
+      if (!folded.has(ref)) throw new Error(`Unresolved owned knowledge reference: ${key} → ${ref}`);
+      const [target,location] = ref.split('#');
+      if (target !== root) owner.references.add(target);
+      owner.reference_sites.push({path,target,...(location ? {target_path:location.split('/').map(decodeURIComponent)} : {})});
+    }
+  }
+  const facts = [...roots.values()].map(f => ({...f,references:[...f.references],reference_sites:[...new Map(f.reference_sites.map(site => [json(site),site])).values()]}));
+  return { facts: facts.filter(f => !f.key.startsWith('relations/')), relations: facts.filter(f => f.key.startsWith('relations/')), locations: [...folded.keys()] };
+}
 function finish(s) {
   const kinds = { entities: 'Entity', datasets: 'Dataset', dimension_groups: 'DimensionGroup', measure_groups: 'MeasureGroup', types: 'Ty', relations: 'Relation',
     bindings: 'Binding', roles: 'Role', fields: 'Field', dimensions: 'Dimension', measures: 'Measure', values: 'Value', time_roles: 'TimeRole', business_links: 'BusinessLink' };
-  const facts = [...s.facts.values()].map(f => ({ key: f.key, value: f.value, references: [...f.references] }));
-  const vocabulary = facts.map(f => {
-    const [node, suffix] = f.key.split('#'), root = node.split('/'), part = suffix === undefined ? root : suffix.split('/');
-    return { key: f.key, kind: kinds[part[0]], name: decodeURIComponent(part[1]), doc: '', aliases: [],
+  const {facts,relations: relationDescriptors,locations} = ownedGraph(s);
+  const roots = new Map([...facts,...relationDescriptors].map(fact => [fact.key, fact.value]));
+  const vocabulary = locations.map(key => {
+    const [node, suffix] = key.split('#'), root = node.split('/'), part = suffix === undefined ? root : suffix.split('/');
+    const name = decodeURIComponent(part[1]);
+    const value = suffix === undefined ? roots.get(node) : part.reduce((value, key) => value?.[decodeURIComponent(key)], roots.get(node));
+    const aliases = [...new Set([value?.label, ...(Array.isArray(value?.names) ? value.names : [])].filter(item => typeof item === 'string' && item && item !== name))];
+    return { key, kind: kinds[part[0]], name, doc: '', aliases,
       owner: suffix === undefined ? null : root[0] === 'datasets' ? 'dataset' : 'ty', ownerValue: suffix === undefined ? null : decodeURIComponent(root[1]) };
   });
-  return { graph: { knowledge_contract: 'ontology-knowledge-v4', intent_contract: 'ontology-intent-v1', addressing: 'node-member-uri-v1', revision: s.revision, facts, items: [] }, vocabulary };
+  return { graph: { knowledge_contract: 'ontology-knowledge-v5', intent_contract: 'ontology-intent-v1', addressing: 'node-member-uri-v1', discovery_roots: ['entities','datasets','relations'], revision: s.revision, facts, relations: relationDescriptors, items: [] }, vocabulary };
 }
 if (!data || typeof data.revision !== 'string' || !data.revision || !Array.isArray(data.instructions)) {
   throw new Error('Invalid ontology knowledge instructions');

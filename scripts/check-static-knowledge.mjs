@@ -10,8 +10,8 @@ const helpers=new Function(declarations+'\nreturn {sha256,address,json};')();
 for(const value of ['', 'abc', '中文/🙂', 'a'.repeat(10000)]) assert.equal(helpers.sha256(value),createHash('sha256').update(value).digest('hex'));
 assert.equal(helpers.address('datasets',"a!()'*/%中文"),'datasets/a%21%28%29%27%2A%2F%25%E4%B8%AD%E6%96%87');
 assert.equal(helpers.json({z:1,a:{z:2,a:0}}),'{"a":{"a":0,"z":2},"z":1}');
-const build=new Function('data',source), empty={revision:'empty',instructions:[['types',[]]]};
-assert.deepEqual(build(empty),{graph:{knowledge_contract:'ontology-knowledge-v4',intent_contract:'ontology-intent-v1',addressing:'node-member-uri-v1',revision:'empty',facts:[],items:[]},vocabulary:[]});
+const build=new Function('data',source), empty={revision:'empty',instructions:[['types',[]],['field_types',[]]]};
+assert.deepEqual(build(empty),{graph:{knowledge_contract:'ontology-knowledge-v5',intent_contract:'ontology-intent-v1',addressing:'node-member-uri-v1',discovery_roots:['entities','datasets','relations'],revision:'empty',facts:[],relations:[],items:[]},vocabulary:[]});
 for(const value of [null,{}, {revision:'',instructions:[]},{revision:'bad',instructions:[]},
  {revision:'bad',instructions:[['toString',{}]]}, {revision:'bad',instructions:[['dataset',{}]]},
  {revision:'bad',instructions:[['types',[]],['types',[]]]}, {revision:'bad',instructions:[['types',[]],['entity']]},

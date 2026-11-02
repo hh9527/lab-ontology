@@ -1,5 +1,9 @@
 # 可复用业务值域与源编码映射；只准备 transform 所需的离散值语义。
 use crate::model as m;
+use crate::enum_values as ev;
+use std::type_property as property;
+use std::prelude as prelude;
+use std::fmt as fmt;
 use crate::groups as g;
 use crate::ontology as edsl;
 use std::array as array;
@@ -523,3 +527,202 @@ def prepare: Fn(m::PreparedDataset, Array(BindingFacts)) -> Array(BindingFacts) 
     bindings
 };
 pub use self::{validate_bindings};
+
+# 编码来自 variant property；Domain 只是 transform 的准备描述。
+def from_enum: for(Business, Wire) Fn(
+    String,
+    TypeOf(Business),
+    TypeOf(Wire),
+    Bool
+) -> Domain(Business, Wire) = fn(id, business, wire, half_open) {
+    let values = ev::members(business);
+    let order = if property::get_type_prop(business, ev::OrderByITag.type) != None {
+        if wire != Int.type {
+            fail!("order_by_itag requires integer storage", id)
+        } else {
+            ()
+        };
+        let tagged = array::map(
+            values,
+            fn(value) {
+                if array::length(value.wires) != 1 {
+                    fail!("ordered variant requires exactly one integer tag", id, value.id)
+                } else {
+                    ()
+                };
+                match value.wires[0] {
+                    edsl::FilterInput::Int(tag) => (tag, value.id),
+                    _ => fail!("ordered variant requires exactly one integer tag", id, value.id),
+                }
+            }
+        );
+        let sorted = array::fold(
+            tagged,
+            [].ty!(Array((Int, String))),
+            fn(items, item) {
+                array::concat(
+                    [
+                        array::filter(
+                            items,
+                            fn(p) {
+                                p.0 < item.0
+                            }
+                        ),
+                        [item],
+                        array::filter(
+                            items,
+                            fn(p) {
+                                p.0 >= item.0
+                            }
+                        )
+                    ]
+                )
+            }
+        );
+        array::map(
+            sorted,
+            fn(item) {
+                item.1
+            }
+        )
+    } else {
+        []
+    };
+    {definition: {id, value: business, wire, values, half_open, order}}
+};
+pub use self::{from_enum};
+# 源字段的已知原始值是局部约束，不为它们制造领域类型。
+def raw_ints: Fn(String, Array(Int)) -> Domain(String, Int) = fn(id, values) {
+    domain(
+        id,
+        String.type,
+        Int.type,
+        array::map(
+            values,
+            fn(value) {
+                member(fmt::to_string(value), [value])
+            }
+        ),
+        False
+    )
+};
+def raw_texts: Fn(String, Array(String)) -> Domain(String, String) = fn(id, values) {
+    domain(
+        id,
+        String.type,
+        String.type,
+        array::map(
+            values,
+            fn(value) {
+                member(value, [value])
+            }
+        ),
+        False
+    )
+};
+pub use self::{raw_ints, raw_texts};
+
+# 字段上的业务值域声明同时支撑 transform 与知识发布。
+@prelude::property(PropertyTarget::Field)
+type FieldDomains = struct {
+    dimensions: Array(FieldDomain)
+};
+type FieldDomain = struct {
+    definition: Definition,
+    id: String,
+    projectable: Bool,
+    filters: Array(g::Filter)
+};
+def field_domain: for(Business, Wire) Fn(
+    Domain(Business, Wire),
+    String,
+    Bool,
+    Array(g::Filter)
+) -> Fn(property::FieldPropertyCtx, Option(FieldDomains)) -> FieldDomains = fn(
+    domain,
+    id,
+    projectable,
+    filters
+) {
+    fn(ctx, previous) {
+        let before = match previous {
+            Some(p) => p.dimensions,
+            None => []
+        };
+        {
+            dimensions: array::push(
+                before,
+                {definition: domain.definition, id, projectable, filters}.ty!(FieldDomain)
+            )
+        }
+    }
+};
+def classification: for(Business, Wire) Fn(
+    Domain(Business, Wire),
+    String
+) -> Fn(property::FieldPropertyCtx, Option(FieldDomains)) -> FieldDomains = fn(domain, id) {
+    field_domain(domain, id, True, g::equality_filters)
+};
+def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) {
+    array::flat_map(
+        m::fields_of(dataset.row),
+        fn(field) {
+            match property::get_field_prop(dataset.row, field.index, FieldDomains.type) {
+                None => [],
+                Some(declared) => array::map(
+                    declared.dimensions,
+                    fn(spec) {
+                        let nullable = field.ty != spec.definition.wire;
+                        let column: g::Column = {
+                            name: field.name,
+                            value: spec.definition.wire,
+                            nullable
+                        };
+                        # 校验可空包装与实际源类型，不能把错误类型当成 Option。
+                        g::column_shape(dataset.row, column);
+                        {
+                            row: dataset.row,
+                            dataset: dataset.id,
+                            source: dataset.source,
+                            node: g::Node::Column(column),
+                            nullable,
+                            definition: spec.definition,
+                            group_projectable: spec.projectable,
+                            group_filters: spec.filters,
+                            id: spec.id,
+                            projectable: spec.projectable,
+                            filters: spec.filters
+                        }.ty!(BindingFacts)
+                    }
+                )
+            }
+        }
+    )
+};
+pub use self::{FieldDomains, FieldDomain, field_domain, classification, field_bindings};
+
+def field_binding: for(Row) Fn(m::Dataset(Row), String) -> Binding(Row) = fn(dataset, id) {
+    let facts = match array::find(
+        field_bindings(m::prepare(dataset, [])),
+        fn(binding) {
+            binding.id == id
+        }
+    ) {
+        Some(binding) => binding,
+        None => fail!("unknown declared field domain", id)
+    };
+    {
+        row: facts.row,
+        dataset: facts.dataset,
+        source: facts.source,
+        node: facts.node,
+        nullable: facts.nullable,
+        definition: facts.definition,
+        group_projectable: facts.group_projectable,
+        group_filters: facts.group_filters,
+        id: facts.id,
+        projectable: facts.projectable,
+        filters: facts.filters
+    }
+};
+pub use self::{field_binding};

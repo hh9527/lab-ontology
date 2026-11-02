@@ -105,3 +105,43 @@ psql --dbname postgres --set ON_ERROR_STOP=1 --file /tmp/subnets-pg.sql
 
 知识发布 `Ty/{ty}` 和 `Value/{ty}/{value}`。类型文档包含 `storage`、`half_open`、`canonical_order` 和单一 `values` 数组；
 各成员携带 ID、标签、别名、本地化标签及物理编码。维度显式发布 `ty` 和数据集归属，独立 `links` 导出支持发现引用该类型的维度。
+
+
+## 枚举成员编码
+
+领域枚举的 variant 承载整数或字符串源编码；类型承载排序策略。
+
+```telora
+use ontology::enum_values as ev;
+use ontology::values as v;
+
+@ev::order_by_itag
+type AlarmSeverity = enum {
+    @ev::itag(1) Critical,
+    @ev::itag(2) Major,
+    @ev::itag(3) Minor,
+    @ev::itag(4) Warning,
+};
+def severity: v::Domain(AlarmSeverity, Int) = v::from_enum(
+    "AlarmSeverity", AlarmSeverity.type, Int.type, False
+);
+```
+
+variant 使用 PascalCase。`itag` 声明整数编码；`rename` 声明字符串源表示，后续 `alias` 补充同一成员的其他源字符串。`description` 保留英文说明和中文称谓。
+
+```telora
+type StorageRunningStatus = enum {
+    @ev::rename("1") @ev::description("Normal", "正常") Normal,
+    @ev::rename("3") @ev::description("Not Running", "未运行") NotRunning,
+    @ev::rename("12") @ev::description("Powering On", "正在上电") PoweringOn,
+    @ev::rename("47") @ev::description("Powering Off", "正在下电") PoweringOff,
+    @ev::rename("51") @ev::description("Upgrading", "正在升级") Upgrading,
+};
+```
+
+`rename` 对应字符串存储，不隐含数值或排序语义。
+编码用于源字段映射，不决定 enum 的运行时布局。`order_by_itag` 按整数编码升序建立业务排序；未声明排序的枚举不能隐式依赖成员名或声明顺序。
+
+具有业务成员的封闭或半封闭值域使用 enum。variant 使用真实业务名称，编码仅作为 property；原始编码不产生额外的成员身份或包装类型。
+描述属性只用于补充称谓和说明，已有成员名不重复填写为描述，英文不复制为中文称谓。
+仅有源缺省哨兵、没有领域成员含义的标记保存在所属字段的局部约束中，不为其创建领域枚举。
