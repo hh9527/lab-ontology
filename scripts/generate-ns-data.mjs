@@ -18,12 +18,6 @@ const sqlTypes = { String: 'TEXT', Int: 'INTEGER', Float: 'REAL', Bool: 'INTEGER
 export function loadModel() {
   const model = JSON.parse(readFileSync(join(modelRoot, 'data/generation-contract.json')));
   if (model.version !== 1) throw new Error('Unsupported NS generation contract');
-  if (model.sourceSha256 !== hash(readFileSync(join(modelRoot, 'data/source-model.json')))) {
-    throw new Error('Stale NS contract: run python3 ns_model/tools/generate_model.py');
-  }
-  for (const [path, expected] of Object.entries(model.generatedHashes)) {
-    if (hash(readFileSync(join(modelRoot, path))) !== expected) throw new Error(`Stale NS contract: ${path}`);
-  }
   return model;
 }
 

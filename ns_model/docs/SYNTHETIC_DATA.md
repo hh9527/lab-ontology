@@ -27,15 +27,9 @@ node scripts/generate-ns-data.mjs \
 
 ## 模型合同
 
-`ns_model/tools/generate_model.py` 在生成 Telora 声明时，同时输出 `data/generation-contract.json`。此合同直接使用同一次生成得到的最终字段类型、空值约束及实际发布的度量名称，Sum 等未发布能力不进入合同。
+`data/generation-contract.json` 是直接维护的演示数据合同，记录字段类型、空值约束及实际发布的度量名称。模型修改涉及这些内容时，同步更新合同；Sum 等未发布能力不进入合同。
 
-生成器核对源声明清单和全部模型源码的哈希；模型修改后先运行：
-
-```sh
-python3 ns_model/tools/generate_model.py
-```
-
-这一步需要 Python。数据生成本身只读取已提交的合同，不重新解释旧时间注解，也不在初始化阶段执行知识发现或完整模型自检。
+数据生成只读取已提交的合同，不重新解释旧时间注解，也不在初始化阶段执行知识发现或完整模型自检。一次性模型迁移生成器已删除。
 
 ## 合成场景
 
