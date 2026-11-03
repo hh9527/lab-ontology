@@ -1,0 +1,198 @@
+use ontology::registry as registry;
+use ontology::transform as t;
+use ontology::groups as g;
+use ontology::values as v;
+use ontology::enum_values as ev;
+use ontology::ontology as edsl;
+use ontology::query as q;
+use std::array as array;
+use std::diagnostics as diagnostics;
+use std::test as test;
+
+@registry::dataset("collision", "collision_rows", ["id"])
+type Collision = struct {
+    id: Int,
+    @g::exact("same")
+    a: String,
+    @g::exact("same")
+    b: String
+};
+pub def final_renames_must_be_unique: test::Test = test::should_fail_with(
+    fn() {
+        registry::declaration(Collision.type);
+        ()
+    },
+    "duplicate key in unique_by"
+);
+pub def names_fail_at_property_construction: test::Test = test::should_fail_with(
+    fn() {
+        g::search("");
+        ()
+    },
+    "property publish name must be a valid identifier"
+);
+pub def dataset_name_fails_before_application: test::Test = test::should_fail_with(
+    fn() {
+        registry::dataset("", "rows", []);
+        ()
+    },
+    "property name must be nonempty"
+);
+
+type State = enum {
+    @ev::rename("active")
+    Up,
+    @ev::rename("inactive")
+    Down
+};
+def states: v::Domain(State, String) = v::from_enum("State", State.type, String.type, False);
+@registry::dataset("states", "state_rows", ["id"])
+type Row = struct {
+    @g::exact("id")
+    id: Int,
+    @g::search("name")
+    name: Option(String),
+    @v::classification(states, "state")
+    state: Option(String)
+};
+def initialized: t::LocalDefinition = t::initialize_dataset(Row.type);
+def profile: q::PlanProfile = {
+    allowed_operators: [
+        q::Operator::Source,
+        q::Operator::Filter,
+        q::Operator::Column,
+        q::Operator::Bind,
+        q::Operator::Scalar
+    ],
+    allowed_join_kinds: [],
+    allowed_aggregates: [],
+    allow_distinct: False,
+    allowed_scalars: [
+        q::ScalarFunction::If,
+        q::ScalarFunction::Eq,
+        q::ScalarFunction::Ne,
+        q::ScalarFunction::And,
+        q::ScalarFunction::Or,
+        q::ScalarFunction::Gt,
+        q::ScalarFunction::Instr,
+        q::ScalarFunction::Lower,
+        q::ScalarFunction::Substr,
+        q::ScalarFunction::Add,
+        q::ScalarFunction::Sub,
+        q::ScalarFunction::Length
+    ]
+};
+def legacy_accepts: Fn(q::PlanProfile) -> Bool = fn(profile) {
+    match diagnostics::with_diagnostics(
+        fn(value: ()) {
+            edsl::validate_transform_contract(initialized.payload <~ {profile});
+            ()
+        }
+    )(()) {
+        Ok(_) => True,
+        Err(_) => False
+    }
+};
+def initialized_accepts: Fn(q::PlanProfile) -> Bool = fn(profile) {
+    match diagnostics::with_diagnostics(
+        fn(value: ()) {
+            t::check_local_profile(initialized, profile)
+        }
+    )(()) {
+        Ok(_) => True,
+        Err(_) => False
+    }
+};
+pub def completed_local_information_preserves_profile_constraints: test::Test = test::should_ok(
+    fn() {
+        legacy_accepts(profile) && initialized_accepts(profile) && array::all(
+            profile.allowed_scalars,
+            fn(removed) {
+                let narrowed = profile <~ {
+                    allowed_scalars: array::filter(
+                        profile.allowed_scalars,
+                        fn(value) {
+                            value != removed
+                        }
+                    )
+                };
+                legacy_accepts(narrowed) == initialized_accepts(narrowed)
+            }
+        ) && array::all(
+            profile.allowed_operators,
+            fn(removed) {
+                let narrowed = profile <~ {
+                    allowed_operators: array::filter(
+                        profile.allowed_operators,
+                        fn(value) {
+                            value != removed
+                        }
+                    )
+                };
+                legacy_accepts(narrowed) == initialized_accepts(narrowed)
+            }
+        )
+    }
+);
+
+use ontology::samples as samples;
+use ontology::model as m;
+use ontology::quantity as quantity;
+use ontology::scalars as scalars;
+
+pub def sample_template_fails_at_construction: test::Test = test::should_fail_with(
+    fn() {
+        samples::group(
+            "repeated",
+            quantity::Count.type,
+            samples::Statistic::Mean,
+            [samples::Statistic::Mean],
+            None
+        );
+        ()
+    },
+    "sample group statistics must be distinct"
+);
+
+@registry::dataset("samples", "sample_rows", ["id"])
+@registry::metric("at")
+@registry::reported_samples(
+    [
+        samples::bind(
+            registry::dataset_of(SampleRow.type),
+            sample_group,
+            m::field(SampleRow.type, quantity::Count.type, "value"),
+            [{statistic: samples::Statistic::Mean, publish: "average"}]
+        )
+    ]
+)
+type SampleRow = struct {
+    id: Int,
+    at: scalars::DateTimeUtc,
+    value: quantity::Count
+};
+def sample_group: samples::Group(quantity::Count) = samples::group(
+    "sample",
+    quantity::Count.type,
+    samples::Statistic::Mean,
+    [],
+    None
+);
+pub def sample_names_fail_at_binding: test::Test = test::should_fail_with(
+    fn() {
+        samples::bind(
+            registry::dataset_of(SampleRow.type),
+            sample_group,
+            m::field(SampleRow.type, quantity::Count.type, "value"),
+            []
+        );
+        ()
+    },
+    "sample binding must name every statistic exactly once"
+);
+pub def initialized_samples_preserve_the_complete_binding: test::Test = test::should_ok(
+    fn() {
+        let local = t::initialize_dataset(SampleRow.type);
+        array::length(local.payload.entities[0].sample_measures) == 1
+    }
+);

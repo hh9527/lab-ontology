@@ -1,0 +1,590 @@
+# 私有注册实现；局部 property 的完整信息是汇总阶段的信任边界。
+use std::prelude as prelude;
+use std::type_desc as td;
+use std::type_property as props;
+use std::array as array;
+use std::type_memorizer as memo;
+use std::pipeline as pipeline;
+use crate::knowledge as knowledge;
+use crate::model as m;
+use crate::groups as g;
+use crate::values as v;
+use crate::transform as t;
+use crate::relations as r;
+use crate::samples as samples;
+use crate::ontology as edsl;
+use crate::world as world;
+use crate::query as q;
+use crate::property_contract as contract;
+use crate::scalars as scalars;
+
+type DatasetSpec = struct {
+    id: String,
+    source: String,
+    grain: Array(String),
+    grain_fields: Array(Int)
+};
+@prelude::property(PropertyTarget::Type)
+type RootSpec = enum {
+    Dataset(DatasetSpec),
+    Entity(String)
+};
+type Feature = enum {
+    Roles(Array(m::PreparedRole)),
+    Groups(Array(g::BindingFacts)),
+    RecordCounts(Array(String)),
+    Kind((edsl::DatasetKind, t::Clock)),
+    Scope(Array(t::RowScopeFacts)),
+    FieldCounts(Array(t::FieldCountFacts)),
+    ComputedCounts(Array(t::ComputedCountFacts)),
+    NativePairs(Array(t::NativePairFacts)),
+    Samples(Array(samples::BindingFacts))
+};
+@prelude::property(PropertyTarget::Type)
+type Features = struct {
+    items: Array(Feature)
+};
+@prelude::property(PropertyTarget::Type)
+type Connections = struct {
+    relations: Array(r::Relation),
+    alternatives: Array(t::Alternative),
+    links: Array(r::Link)
+};
+
+def dataset: Fn(String, String, Array(String)) -> Fn(td::TypeDesc, Option(RootSpec)) -> RootSpec = fn(
+    id,
+    source,
+    grain
+) {
+    contract::name(id);
+    contract::publish_name(source);
+    contract::unique(grain);
+    fn(ctx, previous) {
+        let grain_fields = m::prepare_dataset_row(ctx, grain);
+        match previous {
+            Some(_) => fail!("duplicate root declaration", id),
+            None => RootSpec::Dataset({id, source, grain, grain_fields})
+        }
+    }
+};
+def entity: Fn(String) -> Fn(td::TypeDesc, Option(RootSpec)) -> RootSpec = fn(id) {
+    contract::name(id);
+    fn(ctx, previous) {
+        m::validate_identity(ctx);
+        match previous {
+            Some(_) => fail!("duplicate root declaration", id),
+            None => RootSpec::Entity(id)
+        }
+    }
+};
+def dataset_spec: Fn(Type) -> DatasetSpec = fn(row) {
+    match props::get_type_prop(row, RootSpec.type) {
+        Some(RootSpec::Dataset(spec)) => spec,
+        _ => fail!("registered dataset requires dataset property", row)
+    }
+};
+def dataset_of: for(Row: Property(RootSpec)) Fn(TypeOf(Row)) -> m::Dataset(Row) = fn(row) {
+    let spec = dataset_spec(row);
+    {id: spec.id, source: spec.source, row, grain: spec.grain}
+};
+def entity_of: for(I: Property(RootSpec)) Fn(TypeOf(I)) -> m::Entity(I) = fn(identity) {
+    match props::required@[RootSpec, I]() {
+        RootSpec::Entity(id) => {id, identity},
+        _ => fail!("registered entity requires entity property", identity)
+    }
+};
+# 类型级 property 保存声明数据；解释阶段不依赖模型提供的闭包。
+def feature: Fn(Feature) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(item) {
+    fn(ctx, previous) {
+        let prepared = prepare_feature(ctx, item);
+        let before = match previous {
+            Some(p) => p.items,
+            None => []
+        };
+        {items: array::push(before, prepared)}
+    }
+};
+def roles: for(Row) Fn(Array(m::Role(Row))) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(
+    values
+) {
+    feature(
+        Feature::Roles(
+            array::map(
+                values,
+                fn(role) {
+                    {
+                        row: role.row,
+                        id: role.id,
+                        entity: role.entity,
+                        identity: role.identity,
+                        optional: role.optional,
+                        parts: role.parts
+                    }.ty!(m::PreparedRole)
+                }
+            )
+        )
+    )
+};
+def groups: for(Row) Fn(Array(g::Binding(Row))) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(
+    values
+) {
+    feature(Feature::Groups(array::map(values, g::binding_facts)))
+};
+def record_counts: Fn(Array(String)) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(values) {
+    array::map(values, contract::publish_name);
+    feature(Feature::RecordCounts(values))
+};
+def temporal: Fn(edsl::DatasetKind, String) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(
+    kind,
+    field
+) {
+    contract::name(field);
+    fn(ctx, previous) {
+        let spec = dataset_spec(ctx);
+        if spec.grain == [] {
+            fail!("temporal dataset requires a complete sample grain", spec.id)
+        } else {
+            ()
+        };
+        let info = match m::field_info(ctx, field) {
+            Some(info) => info,
+            None => fail!("temporal clock field does not exist", spec.id, field)
+        };
+        match scalars::field_time_role(info.ty) {
+            Some(role) => if role.semantics != edsl::TimeSemantics::Utc {
+                fail!("metric clock requires a UTC instant field", spec.id, field)
+            } else {
+                ()
+            },
+            None => fail!("metric clock requires a UTC instant field", spec.id, field)
+        };
+        feature(Feature::Kind((kind, {name: field, index: info.index})))(ctx, previous)
+    }
+};
+def metric: Fn(String) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(field) {
+    temporal(edsl::DatasetKind::Metric, field)
+};
+def event: Fn(String) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(field) {
+    temporal(edsl::DatasetKind::Event, field)
+};
+def scope: for(Row) Fn(Array(t::RowScope(Row))) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(
+    values
+) {
+    feature(
+        Feature::Scope(
+            array::map(
+                values,
+                fn(value) {
+                    {
+                        row: value.row,
+                        dataset: value.dataset,
+                        source: value.source,
+                        column: value.column,
+                        input: value.input
+                    }.ty!(t::RowScopeFacts)
+                }
+            )
+        )
+    )
+};
+def field_counts: for(Row) Fn(
+    Array(t::FieldCount(Row))
+) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(values) {
+    feature(
+        Feature::FieldCounts(
+            array::map(
+                values,
+                fn(value) {
+                    {
+                        condition: value.condition,
+                        index: value.index,
+                        row: value.row,
+                        dataset: value.dataset,
+                        source: value.source,
+                        field: value.field,
+                        value: value.value,
+                        nullable: value.nullable,
+                        id: value.id
+                    }.ty!(t::FieldCountFacts)
+                }
+            )
+        )
+    )
+};
+def computed_counts: for(Row) Fn(
+    Array(t::ComputedCount(Row))
+) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(values) {
+    feature(
+        Feature::ComputedCounts(
+            array::map(
+                values,
+                fn(value) {
+                    let facts: Fn(t::CountRef(Row)) -> t::CountRefFacts = fn(reference) {
+                        {
+                            row: reference.row,
+                            dataset: reference.dataset,
+                            source: reference.source,
+                            id: reference.id
+                        }
+                    };
+                    {
+                        result: facts(value.result),
+                        left: facts(value.left),
+                        right: facts(value.right),
+                        op: value.op
+                    }.ty!(t::ComputedCountFacts)
+                }
+            )
+        )
+    )
+};
+def native_pairs: for(Row) Fn(
+    Array(t::NativePair(Row))
+) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(values) {
+    feature(
+        Feature::NativePairs(
+            array::map(
+                values,
+                fn(pair) {
+                    {
+                        id: pair.id,
+                        first: g::binding_facts(pair.first),
+                        second: g::binding_facts(pair.second)
+                    }.ty!(t::NativePairFacts)
+                }
+            )
+        )
+    )
+};
+def reported_samples: for(Row) Fn(
+    Array(samples::Binding(Row))
+) -> Fn(td::TypeDesc, Option(Features)) -> Features = fn(values) {
+    feature(Feature::Samples(array::map(values, samples::binding_facts)))
+};
+# 参数与目标齐全时完成一次组件准备，之后只传递已验证的描述。
+def prepare_feature: Fn(Type, Feature) -> Feature = fn(row, item) {
+    let spec = dataset_spec(row);
+    let dataset: m::PreparedDataset = {
+        id: spec.id,
+        source: spec.source,
+        row,
+        grain: spec.grain,
+        roles: []
+    };
+    match item {
+        Feature::Roles(roles) => Feature::Roles(m::prepare_roles(row, roles)),
+        Feature::Groups(groups) => {
+            g::prepare_bindings(dataset, groups);
+            item
+        },
+        Feature::Samples(bindings) => {
+            samples::prepare_bindings(dataset, bindings);
+            item
+        },
+        Feature::RecordCounts(names) => {
+            if array::length(names) > 0 && array::length(spec.grain) == 0 {
+                fail!("record count requires a declared dataset grain", spec.id)
+            } else {
+                ()
+            };
+            item
+        },
+        Feature::Scope(values) => {
+            array::map(
+                values,
+                fn(value) {
+                    if value.row != row {
+                        fail!("row scope belongs to another dataset", spec.id)
+                    } else {
+                        ()
+                    }
+                }
+            );
+            item
+        },
+        Feature::FieldCounts(values) => {
+            array::map(
+                values,
+                fn(value) {
+                    if value.row != row {
+                        fail!("field count belongs to another dataset", value.id)
+                    } else {
+                        ()
+                    }
+                }
+            );
+            item
+        },
+        Feature::ComputedCounts(values) => {
+            array::map(
+                values,
+                fn(value) {
+                    if value.result.row != row {
+                        fail!("computed count belongs to another dataset", value.result.id)
+                    } else if array::length(spec.grain) == 0 {
+                        fail!("computed count requires a grain", value.result.id)
+                    } else {
+                        ()
+                    }
+                }
+            );
+            item
+        },
+        _ => item
+    }
+};
+def apply_feature: Fn(t::Declaration, Feature) -> t::Declaration = fn(declared, item) {
+    match item {
+        Feature::Roles(values) => declared <~ {dataset: declared.dataset <~ {roles: values}},
+        Feature::Groups(values) => declared <~ {groups: array::concat([declared.groups, values])},
+        Feature::RecordCounts(values) => declared <~ {record_counts: values},
+        Feature::Kind((kind, clock)) => declared <~ {kind, clock: Some(clock)},
+        Feature::Scope(values) => declared <~ {scope: values},
+        Feature::FieldCounts(values) => declared <~ {field_counts: values},
+        Feature::ComputedCounts(values) => declared <~ {computed_counts: values},
+        Feature::NativePairs(values) => declared <~ {native_pairs: values},
+        Feature::Samples(values) => declared <~ {samples: values}
+    }
+};
+def connections: Fn(Option(Connections)) -> Connections = fn(previous) {
+    match previous {
+        Some(p) => p,
+        None => {relations: [], alternatives: [], links: []}
+    }
+};
+def relations: Fn(Array(r::Relation)) -> Fn(td::TypeDesc, Option(Connections)) -> Connections = fn(
+    values
+) {
+    fn(ctx, previous) {
+        let p = connections(previous);
+        p <~ {relations: array::concat([p.relations, values])}
+    }
+};
+def alternatives: Fn(Array(t::Alternative)) -> Fn(td::TypeDesc, Option(Connections)) -> Connections = fn(
+    values
+) {
+    array::map(
+        values,
+        fn(alternative) {
+            contract::name(alternative.id);
+            if array::length(alternative.choices) == 0 {
+                fail!("alternative relation requires choices", alternative.id)
+            } else {
+                let first = alternative.choices[0];
+                if !array::all(
+                    alternative.choices,
+                    fn(choice) {
+                        choice.from.dataset.row == first.from.dataset.row && choice.to.dataset.row == first.to.dataset.row && choice.guard == first.guard
+                    }
+                ) {
+                    fail!(
+                        "alternative relations must share dataset endpoints and guard",
+                        alternative.id
+                    )
+                } else {
+                    ()
+                }
+            }
+        }
+    );
+    fn(ctx, previous) {
+        let p = connections(previous);
+        p <~ {alternatives: array::concat([p.alternatives, values])}
+    }
+};
+def links: Fn(Array(r::Link)) -> Fn(td::TypeDesc, Option(Connections)) -> Connections = fn(values) {
+    fn(ctx, previous) {
+        let p = connections(previous);
+        p <~ {links: array::concat([p.links, values])}
+    }
+};
+
+def declaration_data: Fn(Type) -> t::Declaration = fn(row) {
+    let spec = dataset_spec(row);
+    let prepared: m::PreparedDataset = {
+        id: spec.id,
+        source: spec.source,
+        row,
+        grain: spec.grain,
+        roles: []
+    };
+    let seed: t::Declaration = {
+        dataset: prepared,
+        grain_fields: spec.grain_fields,
+        groups: [],
+        domains: [],
+        record_counts: [],
+        field_counts: [],
+        computed_counts: [],
+        native_pairs: [],
+        kind: edsl::DatasetKind::Entity,
+        scope: [],
+        clock: None,
+        samples: []
+    };
+    match props::get_type_prop(row, Features.type) {
+        None => seed,
+        Some(features) => array::fold(features.items, seed, apply_feature)
+    }
+};
+# 缓存仅由 Type 决定的纯声明；缓存命中与注册状态无关。
+def declarations: memo::TypeMemorizer(t::LocalDefinition) = memo::type_memorizer(
+    fn(row) {
+        t::initialize_dataset(row)
+    }
+);
+def local_definition: Fn(Type) -> t::LocalDefinition = fn(row) {
+    memo::computed_with_type(declarations, row)
+};
+def declaration: Fn(Type) -> t::Declaration = fn(row) {
+    local_definition(row).declaration
+};
+type RootInfo = struct {
+    dataset: Option(t::LocalDefinition),
+    entity: Option(world::Entity),
+    connections: Connections
+};
+def root_infos: memo::TypeMemorizer(RootInfo) = memo::type_memorizer(
+    fn(ty) {
+        let root = match props::get_type_prop(ty, RootSpec.type) {
+            Some(spec) => spec,
+            None => fail!("registry root requires dataset or entity property", ty)
+        };
+        {
+            dataset: match root {
+                RootSpec::Dataset(_) => Some(local_definition(ty)),
+                _ => None
+            },
+            entity: match root {
+                RootSpec::Entity(id) => Some({id, identity: ty}.ty!(world::Entity)),
+                _ => None
+            },
+            connections: connections(props::get_type_prop(ty, Connections.type))
+        }.ty!(RootInfo)
+    }
+);
+def root_info: Fn(Type) -> RootInfo = fn(ty) {
+    memo::computed_with_type(root_infos, ty)
+};
+type Roots = struct {
+    definitions: Array(t::LocalDefinition),
+    entities: Array(world::Entity),
+    relations: Array(r::Relation),
+    alternatives: Array(t::Alternative),
+    links: Array(r::Link)
+};
+# 根集合一次性收集；不保留旧的增量注册状态或重复 visited 索引。
+def collect_roots: Fn(Array(Type)) -> Roots = fn(types) {
+    let fresh = pipeline::run(
+        pipeline::from_array(types) |> pipeline::distinct_by(knowledge::type_id) |> pipeline::map(
+            root_info
+        ) |> pipeline::collect()
+    );
+    {
+        definitions: array::flat_map(
+            fresh,
+            fn(info) {
+                match info.dataset {
+                    Some(value) => [value],
+                    None => []
+                }
+            }
+        ),
+        entities: array::flat_map(
+            fresh,
+            fn(info) {
+                match info.entity {
+                    Some(value) => [value],
+                    None => []
+                }
+            }
+        ),
+        relations: array::flat_map(
+            fresh,
+            fn(info) {
+                info.connections.relations
+            }
+        ),
+        alternatives: array::flat_map(
+            fresh,
+            fn(info) {
+                info.connections.alternatives
+            }
+        ),
+        links: array::flat_map(
+            fresh,
+            fn(info) {
+                info.connections.links
+            }
+        )
+    }
+};
+# 同一个 RootSpec 支撑 Dataset 与 Entity 的统一 trait 实现。
+def define: Fn(String, Array(Type), q::PlanProfile) -> world::World = fn(revision, roots, profile) {
+    contract::name(revision);
+    let registry = collect_roots(roots);
+    world::from_definitions_with_entities(
+        revision,
+        registry.definitions,
+        registry.entities,
+        registry.relations,
+        registry.alternatives,
+        registry.links,
+        profile
+    )
+};
+pub use self::{
+    declaration_data,
+    dataset,
+    entity,
+    dataset_of,
+    entity_of,
+    roles,
+    groups,
+    record_counts,
+    metric,
+    event,
+    scope,
+    field_counts,
+    computed_counts,
+    native_pairs,
+    reported_samples,
+    relations,
+    alternatives,
+    links,
+    declaration
+};
+
+# 应用只能通过 property roots 建立 World；原始局部声明与汇总器属于私有模块。
+pub use crate::transform::{
+    Alternative,
+    FieldCount,
+    CountRef,
+    ComputedCount,
+    RowScope,
+    NativePair,
+    field_count,
+    filtered_count,
+    count_ref,
+    computed_count_ref,
+    combine_counts,
+    scope_equal,
+    native_pair
+};
+# 公开发布入口只接受带 property 的发现根，不接受手写 World/Declaration/Prepared。
+def payload: Fn(String, Array(Type), q::PlanProfile) -> edsl::PreparedPayload = fn(
+    revision,
+    roots,
+    profile
+) {
+    world::prepare(define(revision, roots, profile)).payload
+};
+def stage: for(B) Fn(String, Array(Type), q::PlanProfile, Fn(edsl::PreparedPayload) -> B) -> B = fn(
+    revision,
+    roots,
+    profile,
+    program
+) {
+    world::stage(define(revision, roots, profile), program)
+};
+pub use self::{payload, stage};

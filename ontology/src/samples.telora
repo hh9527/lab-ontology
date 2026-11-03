@@ -26,6 +26,8 @@ type Name = struct {
     publish: String
 };
 type Binding(Row) = struct {
+    measures: Array(edsl::SampleMeasureEntry),
+    index: Int,
     row: Type,
     dataset: String,
     source: String,
@@ -39,6 +41,8 @@ type Binding(Row) = struct {
     names: Array(Name)
 };
 type BindingFacts = struct {
+    measures: Array(edsl::SampleMeasureEntry),
+    index: Int,
     row: Type,
     dataset: String,
     source: String,
@@ -51,13 +55,12 @@ type BindingFacts = struct {
     unit: Option(String),
     names: Array(Name)
 };
-def validate: Fn(String, Type, Statistic, Array(Statistic), Option(String), Array(Name)) -> () = fn(
+def prepare_group: Fn(String, Type, Statistic, Array(Statistic), Option(String)) -> () = fn(
     id,
     value,
     primary,
     summaries,
-    unit,
-    names
+    unit
 ) {
     let storage = g::representation(value);
     let members = array::concat([[primary], summaries]);
@@ -86,7 +89,18 @@ def validate: Fn(String, Type, Statistic, Array(Statistic), Option(String), Arra
         }
     ) {
         fail!("sample group statistics must be distinct", id)
-    } else if array::length(names) != array::length(members) || !array::all(
+    } else {
+        ()
+    }
+};
+def prepare_names: Fn(String, Statistic, Array(Statistic), Array(Name)) -> () = fn(
+    id,
+    primary,
+    summaries,
+    names
+) {
+    let members = array::concat([[primary], summaries]);
+    if array::length(names) != array::length(members) || !array::all(
         members,
         fn(member) {
             array::length(
@@ -103,17 +117,10 @@ def validate: Fn(String, Type, Statistic, Array(Statistic), Option(String), Arra
     } else if array::any(
         names,
         fn(name) {
-            !qb::is_sql_identifier(name.publish) || array::length(
-                array::filter(
-                    names,
-                    fn(other) {
-                        other.publish == name.publish
-                    }
-                )
-            ) != 1
+            !qb::is_sql_identifier(name.publish)
         }
     ) {
-        fail!("sample binding public names must be distinct SQL identifiers", id)
+        fail!("sample binding public names must be SQL identifiers", id)
     } else {
         ()
     }
@@ -125,6 +132,7 @@ def group: for(Value) Fn(
     Array(Statistic),
     Option(String)
 ) -> Group(Value) = fn(id, value, primary, summaries, unit) {
+    prepare_group(id, value, primary, summaries, unit);
     {id, value, primary, summaries, unit}
 };
 def bind: for(Row, Value) Fn(
@@ -133,10 +141,13 @@ def bind: for(Row, Value) Fn(
     m::Field(Row, Value),
     Array(Name)
 ) -> Binding(Row) = fn(dataset, group, field, names) {
+    prepare_names(group.id, group.primary, group.summaries, names);
     {
+        measures: prepare_measures(field.name, group.primary, group.unit, names),
         row: Row.type,
         dataset: dataset.id,
         source: dataset.source,
+        index: field.index,
         field: field.name,
         value: group.value,
         nullable: field.nullable,
@@ -149,9 +160,11 @@ def bind: for(Row, Value) Fn(
 };
 def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
     {
+        measures: binding.measures,
         row: binding.row,
         dataset: binding.dataset,
         source: binding.source,
+        index: binding.index,
         field: binding.field,
         value: binding.value,
         nullable: binding.nullable,
@@ -162,133 +175,58 @@ def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
         names: binding.names
     }
 };
-def validate_bindings: Fn(
-    m::PreparedDataset,
-    Array(BindingFacts)
-) -> Array(edsl::SampleMeasureEntry) = fn(dataset, bindings) {
-    m::validate_prepared(dataset);
+def prepare_bindings: Fn(m::PreparedDataset, Array(BindingFacts)) -> () = fn(dataset, bindings) {
     array::map(
         bindings,
         fn(binding) {
-            validate(
-                binding.group,
-                binding.value,
-                binding.primary,
-                binding.summaries,
-                binding.unit,
-                binding.names
-            );
-            let shape = g::shape(
-                dataset.row,
-                g::Node::Column(
-                    {name: binding.field, value: binding.value, nullable: binding.nullable}
-                )
-            );
-            if binding.row != dataset.row || binding.dataset != dataset.id || binding.source != dataset.source {
+            if binding.row != dataset.row {
                 fail!("sample binding belongs to another dataset", binding.group)
-            } else if shape.value != binding.value || shape.nullable != binding.nullable {
-                fail!("sample binding field witness is invalid", binding.group)
             } else {
                 ()
-            };
-            ()
+            }
         }
     );
-    lower(bindings)
+    ()
+};
+pub use self::{prepare_bindings};
+def prepare_measures: Fn(
+    String,
+    Statistic,
+    Option(String),
+    Array(Name)
+) -> Array(edsl::SampleMeasureEntry) = fn(field, primary, unit, names) {
+    array::map(
+        names,
+        fn(name) {
+            {
+                id: name.publish,
+                field,
+                unit,
+                aggregate: match name.statistic {
+                    Statistic::Sum => qb::AggregateFunction::Sum,
+                    Statistic::Mean => qb::AggregateFunction::Avg,
+                    Statistic::Min => qb::AggregateFunction::Min,
+                    Statistic::Max => qb::AggregateFunction::Max,
+                    Statistic::Latest => qb::AggregateFunction::Latest
+                },
+                role: if name.statistic == primary {
+                    edsl::SampleMeasureRole::Primary
+                } else {
+                    edsl::SampleMeasureRole::SampleSummary
+                }
+            }
+        }
+    )
 };
 def lower: Fn(Array(BindingFacts)) -> Array(edsl::SampleMeasureEntry) = fn(bindings) {
     array::flat_map(
         bindings,
         fn(binding) {
-            array::map(
-                binding.names,
-                fn(name) {
-                    {
-                        id: name.publish,
-                        field: binding.field,
-                        unit: binding.unit,
-                        aggregate: match name.statistic {
-                            Statistic::Sum => qb::AggregateFunction::Sum,
-                            Statistic::Mean => qb::AggregateFunction::Avg,
-                            Statistic::Min => qb::AggregateFunction::Min,
-                            Statistic::Max => qb::AggregateFunction::Max,
-                            Statistic::Latest => qb::AggregateFunction::Latest
-                        },
-                        role: if name.statistic == binding.primary {
-                            edsl::SampleMeasureRole::Primary
-                        } else {
-                            edsl::SampleMeasureRole::SampleSummary
-                        }
-                    }.ty!(edsl::SampleMeasureEntry)
-                }
-            )
+            binding.measures
         }
     )
 };
-pub use self::{
-    Statistic,
-    Group,
-    Name,
-    Binding,
-    BindingFacts,
-    group,
-    bind,
-    binding_facts,
-    prepare,
-    lower
-};
+
+pub use self::{Statistic, Group, Name, Binding, BindingFacts, group, bind, binding_facts, lower};
 
 # 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
-def checked_group: for(Value) Fn(
-    String,
-    TypeOf(Value),
-    Statistic,
-    Array(Statistic),
-    Option(String)
-) -> Group(Value) = fn(id, value, primary, summaries, unit) {
-    let names = array::map(
-        array::enumerate(array::concat([[primary], summaries])),
-        fn(pair) {
-            {statistic: pair.1, publish: `member_\{pair.0}`}.ty!(Name)
-        }
-    );
-    validate(id, value, primary, summaries, unit, names);
-    {id, value, primary, summaries, unit}
-};
-def checked_bind: for(Row, Value) Fn(
-    m::Dataset(Row),
-    Group(Value),
-    m::Field(Row, Value),
-    Array(Name)
-) -> Binding(Row) = fn(dataset, group, field, names) {
-    m::checked_prepare(dataset, []);
-    let checked = g::checked_input(field);
-    if group.value != Value.type {
-        fail!("sample group type witness does not match its parameter", group.id)
-    } else {
-        ()
-    };
-    validate(group.id, group.value, group.primary, group.summaries, group.unit, names);
-    {
-        row: Row.type,
-        dataset: dataset.id,
-        source: dataset.source,
-        field: field.name,
-        value: Value.type,
-        nullable: checked.nullable,
-        group: group.id,
-        primary: group.primary,
-        summaries: group.summaries,
-        unit: group.unit,
-        names
-    }
-};
-pub use self::{checked_group, checked_bind};
-
-def prepare: Fn(m::PreparedDataset, Array(BindingFacts)) -> Array(edsl::SampleMeasureEntry) = fn(
-    dataset,
-    bindings
-) {
-    lower(bindings)
-};
-pub use self::{validate_bindings};

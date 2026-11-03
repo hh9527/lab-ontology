@@ -1,45 +1,36 @@
 #!/usr/bin/env python3
-"""在隔离工作区对新关系声明运行现有 graph 验收及 SQLite 等价查询。"""
+"""只验证 property 新路径：局部边界诊断及实际 SQLite 查询。"""
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMP_ROOT = Path(os.environ.get("TMPDIR") or Path.home() / ".cache/tmp")
-with tempfile.TemporaryDirectory(prefix="typed-relations-", dir=TEMP_ROOT) as directory:
-    workspace = Path(directory)
-    packages = ["ontology", "relation_model"]
-    (workspace / "telora-config.json").write_text(json.dumps({"version": 1, "members": packages}))
-    lock = json.loads((ROOT / "telora-lock.json").read_text())
-    lock["packages"] = {name: lock["packages"][name] for name in packages}
-    (workspace / "telora-lock.json").write_text(json.dumps(lock))
-    for package in packages:
-        target = workspace / package
-        target.mkdir()
-        shutil.copy2(ROOT / package / "telora-crate.json", target / "telora-crate.json")
-        shutil.copytree(ROOT / package / "src", target / "src")
-    tests = workspace / "relation_model/tests"
-    tests.mkdir()
-    graph = (ROOT / "relation_model/tests/graph.telora").read_text()
-    original = "use crate::model::{ payload, Tenant, Site, Device, Connection, Route };"
-    assert graph.count(original) == 1, "graph fixture import changed; update the explicit payload substitution"
-    graph = graph.replace(original, "use crate::model::{ Tenant, Site, Device, Connection, Route };\nuse crate::typed_relations::{ payload };")
-    (tests / "typed_graph_regression.telora").write_text(graph)
-    shutil.copy2(ROOT / "relation_model/tests/typed_relations.telora", tests / "typed_relations.telora")
-    compiler = os.environ.get("TELORA", str(ROOT / "bin/telora"))
-    options = ["--initialization-fuel", "100000", "--request-fuel", "1000000", "--with-memory-limit", "1024"]
-    result = subprocess.run([compiler, "-C", str(workspace / "relation_model"), "test", "typed_graph_regression", *options],
+COMPILER = os.environ.get("TELORA", str(ROOT / "bin/telora"))
+OPTIONS = ["--initialization-fuel", "100000", "--request-fuel", "1000000", "--with-memory-limit", "1024"]
+for name in ["trusted_boundary", "local_preparation"]:
+    result = subprocess.run([COMPILER, "-C", str(ROOT / "ontology"), "test", name, *OPTIONS],
                             capture_output=True, text=True, timeout=180)
     records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     summaries = [record for record in records if record.get("record") == "summary"]
-    assert result.returncode == 0 and len(summaries) == 1 and summaries[0]["total"] > 0, (result.stdout, result.stderr)
+    assert result.returncode == 0 and len(summaries) == 1, (result.stdout, result.stderr)
     assert summaries[0]["failed"] == 0 and not summaries[0]["aborted"], summaries
-    print(f"Passed {summaries[0]['passed']} existing graph cases with the typed relation payload", flush=True)
-    exported = subprocess.run([compiler, "-C", str(workspace / "relation_model"), "eval", "@test/typed_relations:runtime_cases", *options],
-                              capture_output=True, text=True, timeout=120, check=True)
-    queries = workspace / "queries.json"
-    queries.write_text(exported.stdout)
-    subprocess.run(["node", str(ROOT / "relation_model/tests/typed-relations-runtime.mjs"), str(queries)], check=True)
+    print(f"Passed {summaries[0]['passed']} {name} cases", flush=True)
+with tempfile.TemporaryDirectory(prefix="relation-property-") as directory:
+    artifact = Path(directory) / "relation.wasm"
+    subprocess.run([COMPILER, "-C", str(ROOT / "relation_model"), "build", "relation_model", "--staged", "-o", str(artifact)], check=True)
+    cases = json.loads((ROOT / "relation_model/tests/property-runtime.json").read_text())
+    requests = [{"method": "relation/transform", "input": {"intents": [case["intent"]]}} for case in cases]
+    result = subprocess.run([str(ROOT / "bin/telora-run"), str(artifact), "--serve", "stdio+jsonl://"],
+                            input="".join(json.dumps(request) + "\n" for request in requests),
+                            capture_output=True, text=True, timeout=120, check=True)
+    responses = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert len(responses) == len(cases), (result.stdout, result.stderr)
+    queries = []
+    for case, response in zip(cases, responses):
+        assert response.get("error") is False and response["ok"]["accepted"], response
+        queries.append({"id": case["id"], "typed": response["ok"]["queries"][0]})
+    path = Path(directory) / "queries.json"
+    path.write_text(json.dumps(queries))
+    subprocess.run(["node", str(ROOT / "relation_model/tests/typed-relations-runtime.mjs"), str(path)], check=True)

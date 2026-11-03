@@ -8,7 +8,6 @@ use crate::field_knowledge as fk;
 use crate::query as qb;
 use std::array as array;
 use std::dict as dict;
-use std::type_memorizer as memo;
 use std::pipeline as pipeline;
 use std::build as build;
 use std::value::{Value};
@@ -17,341 +16,108 @@ type Entity = struct {
     id: String,
     identity: Type
 };
-def entity: for(I) Fn(m::Entity(I)) -> Entity = fn(value) {
-    {id: value.id, identity: value.identity}
-};
 type World = struct {
     revision: String,
     entities: Array(Entity),
     datasets: Array(t::Declaration),
+    definitions: Array(t::LocalDefinition),
+    local_knowledge: Array(Value),
+    local_capabilities: k::LocalCapabilities,
     relations: Array(r::Relation),
     alternatives: Array(t::Alternative),
     links: Array(r::Link),
     profile: qb::PlanProfile,
 };
 # 索引构造同时检查名称；发现出的内容无需再证明覆盖。
-def duplicate_name: for(A) Fn(Array(A), Fn(A) -> String) -> Option(String) = fn(items, name) {
-    let unique = pipeline::run(
-        pipeline::from_array(items) |> pipeline::distinct_by(name) |> pipeline::collect()
-    );
-    if array::length(unique) == array::length(items) {
-        None
-    } else {
-        match array::find(
-            array::enumerate(items),
-            fn(pair) {
-                pair.0 >= array::length(unique) || name(pair.1) != name(unique[pair.0])
-            }
-        ) {
-            Some(pair) => Some(name(pair.1)),
-            None => None
-        }
-    }
-};
-def from_definitions: Fn(
+def from_definitions_with_entities: Fn(
     String,
     Array(t::LocalDefinition),
+    Array(Entity),
     Array(r::Relation),
     Array(t::Alternative),
     Array(r::Link),
     qb::PlanProfile
-) -> World = fn(revision, definitions, relations, alternatives, links, profile) {
-    match duplicate_name(
+) -> World = fn(revision, definitions, entities, relations, alternatives, links, profile) {
+    let required = qb::combine_requirements(array::map(definitions, fn(local) { local.contract }));
+    if !qb::requirements_accepted(required, profile) {
+        fail!("model capabilities are not allowed by the query profile", required, profile)
+    } else { () };
+    let datasets = pipeline::run(
+        pipeline::from_array(definitions) |> pipeline::unique_by(fn(local) { local.declaration.dataset.id })
+        |> pipeline::map(fn(local) { local.declaration }) |> pipeline::collect()
+    );
+    let entities = pipeline::run(
+        array::fold(datasets, pipeline::from_array(entities), fn(found, dataset) {
+            pipeline::merge(found, pipeline::from_array(dataset.dataset.roles) |> pipeline::map(
+                fn(role) { {id: role.entity, identity: role.identity}.ty!(Entity) }
+            ))
+        }) |> pipeline::distinct_by(fn(entity) { `\{entity.id}:\{k::type_id(entity.identity)}` })
+        |> pipeline::unique_by(fn(entity) { entity.id }) |> pipeline::collect()
+    );
+    let published = pipeline::run(
+        pipeline::merge(
+            pipeline::from_array(relations) |> pipeline::map(fn(relation) { (relation.id, True) }),
+            pipeline::merge(
+                pipeline::from_array(alternatives) |> pipeline::map(fn(relation) { (relation.id, False) }),
+                pipeline::from_array(links) |> pipeline::map(fn(link) { (link.id, False) })
+            )
+        ) |> pipeline::unique_by(fn(item) { item.0 })
+        |> pipeline::collect_dict(fn(item) { item.0 }, fn(item) { item.1 })
+    );
+    pipeline::run(
+        array::fold(links, pipeline::from_array([].ty!(Array(String))), fn(found, link) {
+            pipeline::merge(found, pipeline::from_array([link.a.id, link.z.id]))
+        }) |> pipeline::distinct_by(fn(id) { id }) |> pipeline::map(fn(id) {
+            if dict::get(published, id) != Some(True) {
+                fail!("business link references an unpublished relation", id)
+            } else { () }
+        }) |> pipeline::collect()
+    );
+    let capabilities = array::map(
         definitions,
         fn(local) {
-            local.declaration.dataset.id
-        }
-    ) {
-        Some(id) => fail!("duplicate dataset id", id),
-        None => ()
-    };
-    array::map(
-        definitions,
-        fn(local) {
-            t::check_local_profile(local, profile)
+            local.capabilities
         }
     );
     let model = {
         revision,
-        entities: [],
-        datasets: array::map(
-            definitions,
-            fn(local) {
-                local.declaration
-            }
-        ),
+        entities,
+        definitions,
+        local_knowledge: [],
+        local_capabilities: {
+            dimensions: array::flat_map(
+                capabilities,
+                fn(local) {
+                    local.dimensions
+                }
+            ),
+            measures: array::flat_map(
+                capabilities,
+                fn(local) {
+                    local.measures
+                }
+            )
+        },
+        datasets,
         relations,
         alternatives,
         links,
         profile
     };
-    self_check(model);
-    model
+    prepare_local_knowledge(model)
 };
-def define: Fn(
-    String,
-    Array(t::Declaration),
-    Array(r::Relation),
-    Array(t::Alternative),
-    Array(r::Link),
-    qb::PlanProfile
-) -> World = fn(revision, datasets, relations, alternatives, links, profile) {
-    from_definitions(
-        revision,
-        array::map(datasets, t::local_definition),
-        relations,
-        alternatives,
-        links,
-        profile
-    )
-};
-def identities: memo::TypeMemorizer(Bool) = memo::type_memorizer(
-    fn(ty) {
-        m::validate_identity(ty);
-        True
-    }
-);
-def with_entities: Fn(World, Array(Entity)) -> World = fn(world, entities) {
-    match duplicate_name(
-        entities,
-        fn(entity) {
-            entity.id
-        }
-    ) {
-        Some(id) => fail!("duplicate entity id", id),
-        None => ()
-    };
-    array::map(
-        entities,
-        fn(entity) {
-            memo::computed_with_type(identities, entity.identity)
-        }
-    );
-    world <~ {entities}
-};
-def resolved_entities: Fn(World) -> Array(Entity) = fn(world) {
-    let roles = array::flat_map(
-        world.datasets,
-        fn(d) {
-            array::concat([d.dataset.roles, array::flat_map(d.groups, g::binding_roles)])
-        }
-    );
-    let entries = array::concat(
-        [
-            world.entities,
-            array::map(
-                roles,
-                fn(r) {
-                    {id: r.entity, identity: r.identity}.ty!(Entity)
-                }
-            )
-        ]
-    );
-    let distinct = pipeline::run(
-        pipeline::from_array(entries) |> pipeline::distinct_by(
-            fn(e) {
-                `\{e.id}:\{k::type_id(e.identity)}`
-            }
-        ) |> pipeline::collect()
-    );
-    match duplicate_name(
-        distinct,
-        fn(e) {
-            e.id
-        }
-    ) {
-        Some(id) => fail!("entity id has conflicting identities", id),
-        None => distinct
-    }
-};
-def resolved_types: Fn(World) -> Array(Type) = fn(world) {
-    fk::discover_types(
-        array::concat(
-            [
-                fk::declaration_types(world.datasets),
-                array::map(
-                    resolved_entities(world),
-                    fn(e) {
-                        e.identity
-                    }
-                )
-            ]
-        )
-    )
-};
-type DatasetIndex = struct {
-    dataset: m::PreparedDataset,
-    roles: Dict(m::PreparedRole)
-};
-type Issue = struct {
-    code: String,
-    path: String,
-    message: String
-};
-def issue: Fn(String, String, String) -> Array(Issue) = fn(code, path, message) {
-    [{code, path, message}]
-};
-def endpoint_issues: Fn(Dict(DatasetIndex), r::Endpoint, String) -> Array(Issue) = fn(
-    datasets,
-    endpoint,
-    path
-) {
-    match dict::get(datasets, endpoint.dataset.id) {
-        None => issue("missing_dataset", path, `dataset \{endpoint.dataset.id} is not in World`),
-        Some(entry) => if entry.dataset.row != endpoint.dataset.row || entry.dataset.source != endpoint.dataset.source || entry.dataset.grain != endpoint.dataset.grain {
-            issue("conflicting_dataset", path, "endpoint differs from the registered dataset")
-        } else {
-            match dict::get(entry.roles, endpoint.role) {
-                None => issue(
-                    "missing_role",
-                    path,
-                    `role \{endpoint.role} is not registered on the dataset`
-                ),
-                Some(registered) => match array::find(
-                    endpoint.dataset.roles,
-                    fn(role) {
-                        role.id == endpoint.role
-                    }
-                ) {
-                    Some(role) => if registered == role {
-                        []
-                    } else {
-                        issue("conflicting_role", path, "endpoint differs from the registered role")
-                    },
-                    None => issue("missing_role", path, "endpoint does not carry its declared role")
-                }
-            }
-        }
-    }
-};
-# World 只检查独立根的索引和 Relation 边界；不遍历自动发现的类型/成员。
-def coverage: Fn(World) -> Array(Issue) = fn(world) {
-    let datasets = pipeline::run(
-        pipeline::from_array(world.datasets) |> pipeline::collect_dict(
-            fn(d) {
-                d.dataset.id
-            },
-            fn(d) {
-                {
-                    dataset: d.dataset,
-                    roles: pipeline::run(
-                        pipeline::from_array(d.dataset.roles) |> pipeline::collect_dict(
-                            fn(role) {
-                                role.id
-                            },
-                            fn(role) {
-                                role
-                            }
-                        )
-                    )
-                }.ty!(DatasetIndex)
-            }
-        )
-    );
-    let relations = array::concat(
-        [
-            world.relations,
-            array::flat_map(
-                world.alternatives,
-                fn(a) {
-                    a.choices
-                }
-            ),
-            array::flat_map(
-                world.links,
-                fn(link) {
-                    [link.a, link.z]
-                }
-            )
-        ]
-    );
-    let published_ids = array::concat(
-        [
-            array::map(
-                world.relations,
-                fn(r) {
-                    r.id
-                }
-            ),
-            array::map(
-                world.alternatives,
-                fn(a) {
-                    a.id
-                }
-            ),
-            array::map(
-                world.links,
-                fn(link) {
-                    link.id
-                }
-            )
-        ]
-    );
-    array::concat(
-        [
-            match duplicate_name(
-                world.datasets,
-                fn(d) {
-                    d.dataset.id
-                }
-            ) {
-                Some(id) => issue(
-                    "duplicate_dataset",
-                    `datasets/\{id}`,
-                    "dataset id is registered more than once"
-                ),
-                None => []
-            },
-            match duplicate_name(
-                published_ids,
-                fn(id) {
-                    id
-                }
-            ) {
-                Some(id) => issue(
-                    "duplicate_relation",
-                    `relations/\{id}`,
-                    "relation id is published more than once"
-                ),
-                None => []
-            },
-            array::flat_map(
-                relations,
-                fn(relation) {
-                    array::concat(
-                        [
-                            endpoint_issues(
-                                datasets,
-                                relation.from,
-                                `relations/\{relation.id}/from`
-                            ),
-                            endpoint_issues(datasets, relation.to, `relations/\{relation.id}/to`)
-                        ]
-                    )
-                }
-            )
-        ]
-    )
-};
-def self_check: Fn(World) -> Bool = fn(world) {
-    let issues = coverage(world);
-    if issues != [] {
-        fail!("World relation boundary is invalid", issues)
-    } else {
-        True
-    }
-};
+def resolved_entities: Fn(World) -> Array(Entity) = fn(world) { world.entities };
 def prepare: Fn(World) -> t::Prepared = fn(world) {
-    t::build(
+    t::build_from_definitions(
         world.revision,
-        world.datasets,
+        world.definitions,
         world.relations,
         world.alternatives,
         world.links,
         world.profile
-    ) <~ {relations: world.relations}
+    )
 };
-def publication: Fn(World, t::Prepared) -> Value = fn(world, prepared) {
+def prepare_local_knowledge: Fn(World) -> World = fn(world) {
     let entities = resolved_entities(world);
     let source_types = array::concat(
         [
@@ -365,8 +131,7 @@ def publication: Fn(World, t::Prepared) -> Value = fn(world, prepared) {
         ]
     );
     let types = fk::discover_types(source_types);
-    fk::publication_from(
-        prepared,
+    let local_knowledge = fk::local_knowledge(
         types,
         array::map(
             entities,
@@ -374,17 +139,29 @@ def publication: Fn(World, t::Prepared) -> Value = fn(world, prepared) {
                 (entity.id, entity.identity)
             }
         ),
-        source_types
-    )
+        source_types,
+        array::map(world.definitions, fk::dataset_definition),
+        array::flat_map(
+            world.definitions,
+            fn(local) {
+                array::map(
+                    local.payload.entities[0].fields,
+                    fn(field) {
+                        field.ty
+                    }
+                )
+            }
+        )
+    );
+    world <~ {local_knowledge}
 };
-def stage_prepared: for(B) Fn(
-    World,
-    Fn() -> t::Prepared,
-    Fn(crate::ontology::PreparedPayload) -> B
-) -> B = fn(world, prepare_model, program) {
+def publication: Fn(World, t::Prepared) -> Value = fn(world, prepared) {
+    fk::publication_with_local(prepared, world.local_knowledge, world.local_capabilities)
+};
+def stage: for(B) Fn(World, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, program) {
     build::stage(
         fn() {
-            let prepared = prepare_model();
+            let prepared = prepare(world);
             {
                 runtime: prepared.payload,
                 information: {"ontology.knowledge": publication(world, prepared)}
@@ -393,29 +170,13 @@ def stage_prepared: for(B) Fn(
         program
     )
 };
-def stage: for(B) Fn(World, Fn(crate::ontology::PreparedPayload) -> B) -> B = fn(world, program) {
-    stage_prepared(
-        world,
-        fn() {
-            prepare(world)
-        },
-        program
-    )
-};
 pub use self::{
     Entity,
-    entity,
     World,
-    define,
-    from_definitions,
-    with_entities,
-    resolved_types,
     resolved_entities,
-    Issue,
-    coverage,
-    self_check,
     prepare,
     publication,
-    stage,
-    stage_prepared
+    stage
 };
+
+pub use self::{from_definitions_with_entities};

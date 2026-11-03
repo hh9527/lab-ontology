@@ -1,0 +1,143 @@
+use ontology::inventory as inventory;
+use ontology::registry as registry;
+use ontology::model as m;
+use ontology::groups as g;
+use ontology::samples as samples;
+use std::array as array;
+use std::type_desc as td;
+use std::test as test;
+
+type Code = enum {
+    First,
+    Second
+};
+@registry::entity("subject")
+type Identity = struct {
+    id: Int
+};
+def shared_group: g::DimensionGroup(Float) = g::dimension_group(
+    "load",
+    Float.type,
+    True,
+    [g::Filter::Eq]
+);
+def shared_sample: samples::Group(Float) = samples::group(
+    "sample",
+    Float.type,
+    samples::Statistic::Mean,
+    [],
+    None
+);
+
+@registry::dataset("a", "a", [])
+@registry::record_counts(["count"])
+@registry::reported_samples(
+    [
+        samples::bind(
+            a,
+            shared_sample,
+            m::field(A.type, Float.type, "load"),
+            [{statistic: samples::Statistic::Mean, publish: "mean_load"}]
+        )
+    ]
+)
+type A = struct {
+    code: Option(Code),
+    @g::search("name")
+    name: String,
+    @g::field_view(shared_group, "load", True, [g::Filter::Eq])
+    load: Float
+};
+@registry::dataset("b", "b", [])
+@registry::record_counts(["count"])
+@registry::reported_samples(
+    [
+        samples::bind(
+            b,
+            shared_sample,
+            m::field(B.type, Float.type, "load"),
+            [{statistic: samples::Statistic::Mean, publish: "mean_load"}]
+        )
+    ]
+)
+type B = struct {
+    @g::search("name")
+    title: String,
+    @g::field_view(shared_group, "load", True, [g::Filter::Eq])
+    load: Float
+};
+def a: m::Dataset(A) = registry::dataset_of(A.type);
+def b: m::Dataset(B) = registry::dataset_of(B.type);
+def collected: inventory::Inventory = inventory::collect(
+    [A.type, B.type, Identity.type, A.type],
+    []
+);
+
+pub def collecting_does_not_call_initializer: test::Test = test::should_ok(
+    fn() {
+        let pending = inventory::defer_with(
+            [1, 1],
+            fn(value) {
+                "one"
+            },
+            fn(value) {
+                fail!("initializer was called")
+            }.ty!(Fn(Int) -> Int)
+        );
+        array::map(pending, fn(entry) { entry.0 }) == ["one"]
+    }
+);
+pub def invoking_thunk_calls_initializer: test::Test = test::should_fail_with(
+    fn() {
+        let pending = inventory::defer_with(
+            [1],
+            fn(value) {
+                "one"
+            },
+            fn(value) {
+                fail!("initializer was called")
+            }.ty!(Fn(Int) -> Int)
+        );
+        let thunk = pending[0].1;
+        thunk();
+        True
+    },
+    "initializer was called"
+);
+pub def same_name_keeps_first_definition: test::Test = test::should_ok(
+    fn() {
+        let pending = inventory::defer_with([1, 2], fn(value) { "same" }, fn(value) { value });
+        let thunk = pending[0].1;
+        array::length(pending) == 1 && thunk() == 1
+    }
+);
+pub def roots_are_closed_and_members_are_scoped: test::Test = test::should_ok(
+    fn() {
+        array::length(collected.datasets) == 2 && array::length(
+            array::map(collected.entities, fn(entry) { entry.0 })
+        ) == 1 && array::length(collected.dimensions) == 4 && array::length(
+            array::map(collected.measures, fn(entry) { entry.0 })
+        ) == 4 && array::length(array::filter(collected.dimensions, fn(entry) {
+            entry.0 == `\{type_name(A.type)}::name` || entry.0 == `\{type_name(B.type)}::name`
+        })) == 2
+    }
+);
+pub def groups_are_shared_across_local_bindings: test::Test = test::should_ok(
+    fn() {
+        array::length(collected.dimension_groups) == 2 && array::length(
+            array::map(collected.measure_groups, fn(entry) { entry.0 })
+        ) == 1
+    }
+);
+pub def wrapped_business_types_are_found_without_builtin_nodes: test::Test = test::should_ok(
+    fn() {
+        array::map(collected.types, fn(entry) { entry.0 }) == [type_name(Code.type)]
+    }
+);
+
+def type_name: Fn(Type) -> String = fn(ty) {
+    match td::name(ty) {
+        Some(name) => name,
+        None => fail!("expected named type")
+    }
+};

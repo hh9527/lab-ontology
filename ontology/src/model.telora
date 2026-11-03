@@ -18,6 +18,7 @@ type Dataset(Row) = struct {
 };
 type Field(Owner, Value) = struct {
     owner: Type,
+    index: Int,
     value: Type,
     name: String,
     nullable: Bool
@@ -27,11 +28,14 @@ type IdentityPart(Row, Identity) = struct {
     identity: Type,
     source: String,
     target: String,
+    source_index: Int,
+    target_index: Int,
     value: Type,
     nullable: Bool,
     raw: Option(Type),
 };
 type Role(Row) = struct {
+    row: Type,
     id: String,
     entity: String,
     identity: Type,
@@ -41,6 +45,8 @@ type Role(Row) = struct {
 type Part = struct {
     source: String,
     target: String,
+    source_index: Int,
+    target_index: Int,
     value: Type,
     nullable: Bool,
     raw: Option(Type)
@@ -53,6 +59,7 @@ type PreparedDataset = struct {
     roles: Array(PreparedRole),
 };
 type PreparedRole = struct {
+    row: Type,
     id: String,
     entity: String,
     identity: Type,
@@ -132,61 +139,61 @@ def validate_identity: Fn(Type) -> () = fn(identity) {
     ()
 };
 
-def entity: for(Identity) Fn(String, TypeOf(Identity)) -> Entity(Identity) = fn(id, identity) {
-    {id, identity}
-};
-
-def validate_dataset: Fn(String, String, Type, Array(String)) -> () = fn(id, source, row, grain) {
-    if id == "" || source == "" {
-        fail!("dataset id and source must be nonempty", id, source)
-    } else if td::kind(resolved(row)) != td::TypeDescKind::Struct {
+# 名称和 grain 去重由 property 参数边界完成；此处仅准备 Row 的类型约束。
+def prepare_dataset_row: Fn(Type, Array(String)) -> Array(Int) = fn(row, grain) {
+    if td::kind(resolved(row)) != td::TypeDescKind::Struct {
         fail!("dataset row must be a record", row)
     } else {
-        array::map(
-            grain,
-            fn(name) {
-                if !identity_value(field_type(row, name)) {
-                    fail!("dataset grain must use non-null identity values", row, name)
-                } else if array::length(
-                    array::filter(
-                        grain,
-                        fn(other) {
-                            other == name
-                        }
-                    )
-                ) != 1 {
-                    fail!("dataset grain repeats a field", name)
-                } else {
-                    ()
-                }
-            }
-        );
         ()
-    }
+    };
+    array::map(
+        grain,
+        fn(name) {
+            let field = match field_info(row, name) {
+                Some(field) => field,
+                None => fail!("dataset grain field does not exist", row, name)
+            };
+            if !identity_value(field.ty) {
+                fail!("dataset grain must use non-null identity values", row, name)
+            } else {
+                field.index
+            }
+        }
+    )
 };
-def dataset: for(Row) Fn(String, String, TypeOf(Row), Array(String)) -> Dataset(Row) = fn(
-    id,
-    source,
-    row,
-    grain
-) {
-    {id, source, row, grain}
-};
+pub use self::{prepare_dataset_row};
 
 def field: for(Owner, Value) Fn(TypeOf(Owner), TypeOf(Value), String) -> Field(Owner, Value) = fn(
     owner,
     value,
     name
 ) {
-    {owner, value, name, nullable: False}
+    let info = match field_info(owner, name) {
+        Some(info) => info,
+        None => fail!("typed model field does not exist", owner, name)
+    };
+    if info.ty != value {
+        fail!("typed model field has a different nominal type", owner, name, value)
+    } else {
+        ()
+    };
+    {owner, index: info.index, value, name, nullable: False}
 };
-
 def optional_field: for(Owner, Value) Fn(
     TypeOf(Owner),
     TypeOf(Value),
     String
 ) -> Field(Owner, Value) = fn(owner, value, name) {
-    {owner, value, name, nullable: True}
+    let info = match field_info(owner, name) {
+        Some(info) => info,
+        None => fail!("typed model field does not exist", owner, name)
+    };
+    if info.ty != Option(Value).type {
+        fail!("typed model optional field has a different nominal type", owner, name, value)
+    } else {
+        ()
+    };
+    {owner, index: info.index, value, name, nullable: True}
 };
 
 # Value 是共享的类型形参，编译期约束映射两侧的名义类型一致。
@@ -199,6 +206,8 @@ def identity_part: for(Row, Identity, Value) Fn(
         identity: target.owner,
         source: source.name,
         target: target.name,
+        source_index: source.index,
+        target_index: target.index,
         value: source.value,
         nullable: source.nullable,
         raw: None
@@ -215,9 +224,7 @@ def identity_storage: Fn(Type) -> Type = fn(ty) {
     }
 };
 def validate_reference: Fn(Type, Type) -> () = fn(raw, target) {
-    if (raw != Int.type && raw != String.type) || !identity_value(target) || identity_storage(
-        target
-    ) != raw {
+    if (raw != Int.type && raw != String.type) || identity_storage(target) != raw {
         fail!(
             "explicit identity reference requires raw integer or text with unchanged storage",
             raw,
@@ -231,81 +238,17 @@ def reference_part: for(Row, Identity, Raw, Nominal) Fn(
     Field(Row, Raw),
     Field(Identity, Nominal)
 ) -> IdentityPart(Row, Identity) = fn(source, target) {
+    validate_reference(Raw.type, Nominal.type);
     {
         row: source.owner,
         identity: target.owner,
         source: source.name,
         target: target.name,
+        source_index: source.index,
+        target_index: target.index,
         value: target.value,
         nullable: source.nullable,
         raw: Some(source.value)
-    }
-};
-
-def validate_parts: Fn(Type, Type, Bool, Array(Part)) -> () = fn(row, identity, optional, parts) {
-    validate_identity(identity);
-    let fields = fields_of(identity);
-    if array::length(parts) != array::length(fields) || !array::all(
-        fields,
-        fn(field) {
-            array::length(
-                array::filter(
-                    parts,
-                    fn(part) {
-                        part.target == field.name
-                    }
-                )
-            ) == 1
-        }
-    ) {
-        fail!("role mapping must cover the complete identity exactly once", identity)
-    } else {
-        array::map(
-            parts,
-            fn(part) {
-                let actual = field_type(row, part.source);
-                let source_type = match part.raw {
-                    None => part.value,
-                    Some(raw) => {
-                        validate_reference(raw, part.value);
-                        raw
-                    }
-                };
-                let valid = if part.nullable {
-                    let variants = td::variants(resolved(actual));
-                    array::length(variants) == 2 && array::any(
-                        variants,
-                        fn(variant) {
-                            variant.name == "None" && variant.payload == None
-                        }
-                    ) && array::any(
-                        variants,
-                        fn(variant) {
-                            variant.name == "Some" && variant.payload == Some(source_type)
-                        }
-                    )
-                } else {
-                    actual == source_type
-                };
-                if !valid || field_type(identity, part.target) != part.value {
-                    fail!("role mapping has incompatible field types", part.source, part.target)
-                } else if part.nullable && !optional {
-                    fail!("nullable identity input requires an optional role", part.source)
-                } else if array::length(
-                    array::filter(
-                        parts,
-                        fn(other) {
-                            other.source == part.source
-                        }
-                    )
-                ) != 1 {
-                    fail!("role mapping repeats a source field", part.source)
-                } else {
-                    ()
-                }
-            }
-        );
-        ()
     }
 };
 
@@ -316,17 +259,65 @@ def role: for(Row, Identity) Fn(
     Bool,
     Array(IdentityPart(Row, Identity))
 ) -> Role(Row) = fn(dataset, entity, id, optional, parts) {
+    if id == "" {
+        fail!("role id must be nonempty", id)
+    } else {
+        ()
+    };
+    let targets = pipeline::run(
+        pipeline::from_array(parts) |> pipeline::unique_by(
+            fn(part) {
+                part.target
+            }
+        ) |> pipeline::collect()
+    );
+    let sources = pipeline::run(
+        pipeline::from_array(targets) |> pipeline::unique_by(
+            fn(part) {
+                part.source
+            }
+        ) |> pipeline::collect()
+    );
+    if array::length(sources) != array::length(fields_of(Identity.type)) {
+        fail!("role mapping must cover the complete identity exactly once", Identity.type)
+    } else {
+        ()
+    };
+    if !optional && array::any(
+        sources,
+        fn(part) {
+            part.nullable
+        }
+    ) {
+        fail!("nullable identity input requires an optional role", id)
+    } else {
+        ()
+    };
+    let ordered = array::flat_map(
+        fields_of(Identity.type),
+        fn(field) {
+            array::filter(
+                sources,
+                fn(part) {
+                    part.target_index == field.index
+                }
+            )
+        }
+    );
     {
+        row: Row.type,
         id,
         entity: entity.id,
-        identity: entity.identity,
+        identity: Identity.type,
         optional,
         parts: array::map(
-            parts,
+            ordered,
             fn(part) {
                 {
                     source: part.source,
                     target: part.target,
+                    source_index: part.source_index,
+                    target_index: part.target_index,
                     value: part.value,
                     nullable: part.nullable,
                     raw: part.raw
@@ -336,65 +327,23 @@ def role: for(Row, Identity) Fn(
     }
 };
 
-def validate_prepared: Fn(PreparedDataset) -> PreparedDataset = fn(declared) {
-    validate_dataset(declared.id, declared.source, declared.row, declared.grain);
-    let roles = declared.roles;
-    let prepared = array::map(
-        roles,
-        fn(role) {
-            if role.id == "" || role.entity == "" {
-                fail!("role and entity ids must be nonempty", role.id, role.entity)
-            } else if array::length(
-                array::filter(
-                    roles,
-                    fn(other) {
-                        other.id == role.id
-                    }
-                )
-            ) != 1 {
-                fail!("dataset repeats an entity role id", role.id)
-            } else if array::any(
-                roles,
-                fn(other) {
-                    other.entity == role.entity && other.identity != role.identity
-                }
-            ) {
-                fail!("entity id has conflicting identity types", role.entity)
-            } else {
-                validate_parts(declared.row, role.identity, role.optional, role.parts);
-                {
-                    id: role.id,
-                    entity: role.entity,
-                    identity: role.identity,
-                    optional: role.optional,
-                    parts: role.parts
-                }.ty!(PreparedRole)
-            }
-        }
-    );
-    declared <~ {roles: prepared}
-};
-def prepare: for(Row) Fn(Dataset(Row), Array(Role(Row))) -> PreparedDataset = fn(dataset, roles) {
-    {
-        id: dataset.id,
-        source: dataset.source,
-        row: dataset.row,
-        grain: dataset.grain,
-        roles: array::map(
-            roles,
+def prepare_roles: Fn(Type, Array(PreparedRole)) -> Array(PreparedRole) = fn(row, roles) {
+    pipeline::run(
+        pipeline::from_array(roles) |> pipeline::unique_by(
             fn(role) {
-                {
-                    id: role.id,
-                    entity: role.entity,
-                    identity: role.identity,
-                    optional: role.optional,
-                    parts: role.parts
-                }.ty!(PreparedRole)
+                role.id
             }
-        )
-    }
+        ) |> pipeline::map(
+            fn(role) {
+                if role.row != row {
+                    fail!("role mapping belongs to another dataset", role.id)
+                } else {
+                    role
+                }
+            }
+        ) |> pipeline::collect()
+    )
 };
-
 pub use self::{
     Entity,
     Dataset,
@@ -404,171 +353,18 @@ pub use self::{
     Part,
     PreparedDataset,
     PreparedRole,
-    entity,
-    dataset,
     field,
     optional_field,
     reference_part,
     identity_part,
     role,
-    prepare,
-    validate_prepared,
     fields_of,
     field_info
 };
 
-# 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
-def checked_entity: for(Identity) Fn(String, TypeOf(Identity)) -> Entity(Identity) = fn(
-    id,
-    identity
-) {
-    validate_identity(identity);
-    if id == "" {
-        fail!("entity id must be nonempty", id)
-    } else {
-        {id, identity}
-    }
-};
-def checked_dataset: for(Row) Fn(String, String, TypeOf(Row), Array(String)) -> Dataset(Row) = fn(
-    id,
-    source,
-    row,
-    grain
-) {
-    validate_dataset(id, source, row, grain);
-    {id, source, row, grain}
-};
-def checked_field: for(Owner, Value) Fn(TypeOf(Owner), TypeOf(Value), String) -> Field(Owner, Value) = fn(
-    owner,
-    value,
-    name
-) {
-    if field_type(owner, name) != value {
-        fail!("typed model field has a different nominal type", owner, name, value)
-    } else {
-        {owner, value, name, nullable: False}
-    }
-};
-def checked_optional_field: for(Owner, Value) Fn(
-    TypeOf(Owner),
-    TypeOf(Value),
-    String
-) -> Field(Owner, Value) = fn(owner, value, name) {
-    if field_type(owner, name) != Option(Value).type {
-        fail!("typed model optional field has a different nominal type", owner, name, value)
-    } else {
-        {owner, value, name, nullable: True}
-    }
-};
-def checked_identity_part: for(Row, Identity, Value) Fn(
-    Field(Row, Value),
-    Field(Identity, Value)
-) -> IdentityPart(Row, Identity) = fn(source, target) {
-    if target.nullable {
-        fail!("identity target cannot be nullable", target.name)
-    } else {
-        {
-            row: source.owner,
-            identity: target.owner,
-            source: source.name,
-            target: target.name,
-            value: source.value,
-            nullable: source.nullable,
-            raw: None
-        }
-    }
-};
-def checked_reference_part: for(Row, Identity, Raw, Nominal) Fn(
-    Field(Row, Raw),
-    Field(Identity, Nominal)
-) -> IdentityPart(Row, Identity) = fn(source, target) {
-    if target.nullable {
-        fail!("identity target cannot be nullable", target.name)
-    } else {
-        ()
-    };
-    validate_reference(Raw.type, Nominal.type);
-    {
-        row: source.owner,
-        identity: target.owner,
-        source: source.name,
-        target: target.name,
-        value: target.value,
-        nullable: source.nullable,
-        raw: Some(source.value)
-    }
-};
-def checked_role: for(Row, Identity) Fn(
-    Dataset(Row),
-    Entity(Identity),
-    String,
-    Bool,
-    Array(IdentityPart(Row, Identity))
-) -> Role(Row) = fn(dataset, entity, id, optional, parts) {
-    if id == "" || entity.id == "" {
-        fail!("role and entity ids must be nonempty", id, entity.id)
-    } else {
-        let mapped = array::map(
-            parts,
-            fn(part) {
-                if part.row != dataset.row || part.identity != entity.identity {
-                    fail!("role mapping belongs to a different row or identity", id)
-                } else {
-                    {
-                        source: part.source,
-                        target: part.target,
-                        value: part.value,
-                        nullable: part.nullable,
-                        raw: part.raw
-                    }.ty!(Part)
-                }
-            }
-        );
-        validate_parts(dataset.row, entity.identity, optional, mapped);
-        {id, entity: entity.id, identity: entity.identity, optional, parts: mapped}
-    }
-};
-def checked_prepare: for(Row) Fn(Dataset(Row), Array(Role(Row))) -> PreparedDataset = fn(
-    declared,
-    roles
-) {
-    # 公开 record 可以手工构造，准备边界重新验证，不把普通 record 当成不可伪造证明。
-    if declared.row != Row.type {
-        fail!("dataset row witness does not match its type", declared.id)
-    } else {
-        validate_prepared(
-            {
-                id: declared.id,
-                source: declared.source,
-                row: Row.type,
-                grain: declared.grain,
-                roles: array::map(
-                    roles,
-                    fn(role) {
-                        {
-                            id: role.id,
-                            entity: role.entity,
-                            identity: role.identity,
-                            optional: role.optional,
-                            parts: role.parts
-                        }.ty!(PreparedRole)
-                    }
-                )
-            }
-        )
-    }
-};
-pub use self::{
-    checked_entity,
-    checked_dataset,
-    checked_field,
-    checked_optional_field,
-    checked_identity_part,
-    checked_reference_part,
-    checked_role,
-    checked_prepare,
-    validate_identity
-};
+pub use self::{validate_identity};
 
 # 字段声明直接承载异名源列映射；同名列使用字段名。
 pub use crate::ontology::{column};
+
+pub use self::{prepare_roles, field_type};

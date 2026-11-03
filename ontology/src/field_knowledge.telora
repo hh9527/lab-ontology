@@ -23,7 +23,6 @@ use crate::knowledge::{
     resolved,
     type_dependencies,
     expression_types,
-    raw_capabilities,
     raw_relation_sources
 };
 
@@ -159,21 +158,7 @@ def raw_group_value: Fn(g::BindingFacts) -> Value = fn(binding) {
                 ("type", codec::encode(field_info(role.identity)))
             ]
         ),
-        g::BindingContract::Dimension => {
-            let member = binding.members[0];
-            let policy = match member.kind {
-                g::MemberKind::Dimension(policy) => policy,
-                _ => fail!("dimension contract has no dimension policy", member.id)
-            };
-            object(
-                [
-                    ("name", codec::encode(member.group)),
-                    ("type", codec::encode(field_info(member.value))),
-                    ("projectable", codec::encode(policy.projectable)),
-                    ("filters", codec::encode(policy.filters))
-                ]
-            )
-        },
+
     }
 };
 # 从同一 Prepared 采集紧凑语义描述；规范地址与完整图由静态 knowledge.js 构造。
@@ -266,7 +251,7 @@ def raw_domain: Fn(v::BindingFacts) -> Value = fn(b) {
     object(
         [
             ("id", codec::encode(b.id)),
-            ("input", raw_expression(b.node)),
+            ("input", raw_expression(g::Node::Column(b.column))),
             ("nullable", codec::encode(b.nullable)),
             ("projectable", codec::encode(b.projectable)),
             ("filters", codec::encode(b.filters)),
@@ -310,7 +295,7 @@ def raw_sample: Fn(samples::BindingFacts) -> Value = fn(b) {
     )
 };
 def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset) {
-    let references = edsl::collect_references(d.dataset.row, dataset.fields);
+    let references = dataset.references;
     object(
         [
             ("id", codec::encode(d.dataset.id)),
@@ -318,7 +303,7 @@ def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset)
             ("grain", codec::encode(d.dataset.grain)),
             ("kind", codec::encode(d.kind)),
             ("scope", codec::encode(dataset.scope)),
-            ("clock", codec::encode(d.clock)),
+            ("clock", codec::encode(match d.clock { Some(clock) => Some(clock.name), None => None })),
             ("references", codec::encode(references)),
             (
                 "roles",
@@ -397,9 +382,8 @@ def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset)
                                             k::field_business_roles(d, dataset, f, references)
                                         )
                                     ),
-                                    ("key", codec::encode(f.is_key)),
-                                    ("time", codec::encode(f.time)),
-                                    ("logical_type", codec::encode(f.logical_type))
+                                    ("key", codec::encode(dataset.grain_fields == [f.index])),
+                                    ("time", codec::encode(f.time))
                                 ]
                             )
                         }
@@ -565,12 +549,6 @@ def declaration_types: Fn(Array(t::Declaration)) -> Array(Type) = fn(declaration
                         }
                     ),
                     array::map(
-                        d.columns,
-                        fn(c) {
-                            c.value
-                        }
-                    ),
-                    array::map(
                         d.samples,
                         fn(b) {
                             b.value
@@ -580,7 +558,7 @@ def declaration_types: Fn(Array(t::Declaration)) -> Array(Type) = fn(declaration
                         d.domains,
                         fn(b) {
                             array::concat(
-                                [[b.definition.value, b.definition.wire], expression_types(b.node)]
+                                [[b.definition.value, b.definition.wire], [b.column.value]]
                             )
                         }
                     ),
@@ -612,12 +590,16 @@ def declaration_types: Fn(Array(t::Declaration)) -> Array(Type) = fn(declaration
         }
     )
 };
-def publication_from: Fn(t::Prepared, Array(Type), Array((String, Type)), Array(Type)) -> Value = fn(
-    prepared,
-    types,
-    entities,
-    source_types
-) {
+def dataset_definition: Fn(t::LocalDefinition) -> Value = fn(local) {
+    raw_dataset(local.declaration, local.payload.entities[0])
+};
+def local_knowledge: Fn(
+    Array(Type),
+    Array((String, Type)),
+    Array(Type),
+    Array(Value),
+    Array(Type)
+) -> Array(Value) = fn(types, entities, source_types, datasets, member_types) {
     let roots = unique_types(
         array::filter(
             types,
@@ -643,17 +625,7 @@ def publication_from: Fn(t::Prepared, Array(Type), Array((String, Type)), Array(
                         e.1
                     }
                 ),
-                array::flat_map(
-                    prepared.payload.entities,
-                    fn(e) {
-                        array::map(
-                            e.fields,
-                            fn(f) {
-                                f.ty
-                            }
-                        )
-                    }
-                )
+                member_types
             ]
         )
     );
@@ -707,18 +679,30 @@ def publication_from: Fn(t::Prepared, Array(Type), Array((String, Type)), Array(
                 }
             ),
             array::map(
-                array::enumerate(prepared.declarations),
-                fn(pair) {
-                    Value::Array(
-                        [
-                            codec::encode("dataset"),
-                            raw_dataset(pair.1, prepared.payload.entities[pair.0])
-                        ]
-                    )
+                datasets,
+                fn(dataset) {
+                    Value::Array([codec::encode("dataset"), dataset])
                 }
-            ),
+            )
+        ]
+    );
+    instructions
+};
+def publication_with_local: Fn(t::Prepared, Array(Value), k::LocalCapabilities) -> Value = fn(
+    prepared,
+    local,
+    capabilities
+) {
+    let instructions = array::concat(
+        [
+            local,
             [
-                Value::Array([codec::encode("capabilities"), raw_capabilities(prepared.payload)]),
+                Value::Array(
+                    [
+                        codec::encode("capabilities"),
+                        k::raw_capabilities_with_local(prepared.payload, capabilities)
+                    ]
+                ),
                 Value::Array([codec::encode("relations"), raw_relation_sources(prepared)])
             ]
         ]
@@ -739,4 +723,6 @@ def publication_from: Fn(t::Prepared, Array(Type), Array((String, Type)), Array(
         ]
     )
 };
-pub use self::{publication_from, discover_types, declaration_types};
+pub use self::{discover_types, declaration_types};
+
+pub use self::{dataset_definition, local_knowledge, publication_with_local};

@@ -5384,3 +5384,137 @@ pub use self::{
     order_by,
     partitioned_top_n_bound,
 };
+
+# 局部准备产出能力摘要；profile 绑定只比较集合，不再构建探测表达式。
+def capability_union: for(A) Fn(Array(A), Array(A)) -> Array(A) = fn(left, right) {
+    array::fold(
+        right,
+        left,
+        fn(values, value) {
+            if array::any(
+                values,
+                fn(other) {
+                    other == value
+                }
+            ) {
+                values
+            } else {
+                array::push(values, value)
+            }
+        }
+    )
+};
+def combine_requirements: Fn(Array(PlanProfile)) -> PlanProfile = fn(profiles) {
+    array::fold(
+        profiles,
+        {
+            allowed_operators: [],
+            allowed_join_kinds: [],
+            allowed_aggregates: [],
+            allowed_scalars: [],
+            allow_distinct: False
+        }.ty!(PlanProfile),
+        fn(left, right) {
+            {
+                allowed_operators: capability_union(left.allowed_operators, right.allowed_operators),
+                allowed_join_kinds: capability_union(
+                    left.allowed_join_kinds,
+                    right.allowed_join_kinds
+                ),
+                allowed_aggregates: capability_union(
+                    left.allowed_aggregates,
+                    right.allowed_aggregates
+                ),
+                allowed_scalars: capability_union(left.allowed_scalars, right.allowed_scalars),
+                allow_distinct: left.allow_distinct || right.allow_distinct
+            }
+        }
+    )
+};
+def expression_scalars: Fn(Expr) -> Array(ScalarFunction) = fn(expr) {
+    match expr {
+        Expr::Scalar(call) => array::fold(
+            call.args,
+            [call.function],
+            fn(values, child) {
+                capability_union(values, expression_scalars(child))
+            }
+        ),
+        _ => []
+    }
+};
+def expression_requirements: Fn(Expr) -> PlanProfile = fn(expr) {
+    {
+        allowed_operators: expr_operators(expr),
+        allowed_join_kinds: [],
+        allowed_aggregates: [],
+        allowed_scalars: expression_scalars(expr),
+        allow_distinct: False
+    }
+};
+def aggregate_requirements: Fn(AggregateCall) -> PlanProfile = fn(call) {
+    {
+        allowed_operators: aggregate_operators(call),
+        allowed_join_kinds: [],
+        allowed_aggregates: [call.function],
+        allowed_scalars: capability_union(
+            expression_scalars(call.arg),
+            match call.filter {
+                Some(value) => expression_scalars(value),
+                None => []
+            }
+        ),
+        allow_distinct: call.distinct
+    }
+};
+def requirements_accepted: Fn(PlanProfile, PlanProfile) -> Bool = fn(required, allowed) {
+    array::all(
+        required.allowed_operators,
+        fn(value) {
+            array::any(
+                allowed.allowed_operators,
+                fn(other) {
+                    other == value
+                }
+            )
+        }
+    ) && array::all(
+        required.allowed_join_kinds,
+        fn(value) {
+            array::any(
+                allowed.allowed_join_kinds,
+                fn(other) {
+                    other == value
+                }
+            )
+        }
+    ) && array::all(
+        required.allowed_aggregates,
+        fn(value) {
+            array::any(
+                allowed.allowed_aggregates,
+                fn(other) {
+                    other == value
+                }
+            )
+        }
+    ) && array::all(
+        required.allowed_scalars,
+        fn(value) {
+            array::any(
+                allowed.allowed_scalars,
+                fn(other) {
+                    other == value
+                }
+            )
+        }
+    ) && (!required.allow_distinct || allowed.allow_distinct)
+};
+pub use self::{
+    combine_requirements,
+    expression_requirements,
+    aggregate_requirements,
+    requirements_accepted
+};
+
+pub use self::{capability_union};

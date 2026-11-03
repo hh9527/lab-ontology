@@ -1,11 +1,16 @@
 # 可复用业务值域与源编码映射；只准备 transform 所需的离散值语义。
 use crate::model as m;
+use crate::property_contract as contract;
 use crate::enum_values as ev;
 use std::type_property as property;
 use std::prelude as prelude;
 use std::fmt as fmt;
 use crate::groups as g;
 use crate::ontology as edsl;
+use crate::query as qb;
+use std::dict as dict;
+use std::pipeline as pipeline;
+use std::json as json;
 use std::array as array;
 use std::codec as codec;
 use std::type_desc as td;
@@ -15,7 +20,16 @@ type Member(Business, Wire) = struct {
     value: Business,
     wires: Array(Wire)
 };
+type DefinitionInput = struct {
+    id: String,
+    value: Type,
+    wire: Type,
+    values: Array(edsl::CanonicalValueSpec),
+    half_open: Bool,
+    order: Array(String)
+};
 type Definition = struct {
+    bindings: Dict(Array(qb::Val)),
     id: String,
     value: Type,
     wire: Type,
@@ -35,7 +49,7 @@ type Binding(Row) = struct {
     row: Type,
     dataset: String,
     source: String,
-    node: g::Node,
+    column: g::Column,
     nullable: Bool,
     definition: Definition,
     group_projectable: Bool,
@@ -48,7 +62,7 @@ type BindingFacts = struct {
     row: Type,
     dataset: String,
     source: String,
-    node: g::Node,
+    column: g::Column,
     nullable: Bool,
     definition: Definition,
     group_projectable: Bool,
@@ -74,9 +88,9 @@ def valid_business_type: Fn(Type) -> Bool = fn(value) {
         )
     )
 };
-def validate_definition: Fn(Definition) -> Definition = fn(definition) {
+def prepare_definition: Fn(DefinitionInput) -> Definition = fn(definition) {
     let storage = g::representation(definition.wire);
-    if definition.id == "" || !valid_business_type(definition.value) {
+    if definition.id == "" {
         fail!("business domain requires a name and text-valued business type", definition.id)
     } else if storage != Int.type && storage != String.type {
         fail!("business domain wire must use integer or text storage", definition.id)
@@ -87,65 +101,37 @@ def validate_definition: Fn(Definition) -> Definition = fn(definition) {
     } else {
         ()
     };
-    array::map(
-        definition.values,
-        fn(value) {
-            if value.id == "" || array::length(value.wires) == 0 || array::length(
-                array::filter(
-                    definition.values,
-                    fn(other) {
-                        other.id == value.id
-                    }
-                )
-            ) != 1 {
-                fail!(
-                    "business domain member ids must be distinct and have wire values",
-                    definition.id,
-                    value.id
-                )
-            } else {
-                ()
-            };
-            array::map(
-                value.wires,
-                fn(wire) {
-                    let compatible = match wire {
-                        edsl::FilterInput::Text(text) => storage == String.type && text != "",
-                        edsl::FilterInput::Int(_) => storage == Int.type,
-                        _ => False,
-                    };
-                    if !compatible {
-                        fail!(
-                            "business domain wire does not match its declared type",
-                            definition.id,
-                            value.id
-                        )
-                    } else if array::length(
-                        array::flat_map(
-                            definition.values,
-                            fn(other) {
-                                array::filter(
-                                    other.wires,
-                                    fn(candidate) {
-                                        candidate == wire
-                                    }
-                                )
-                            }
-                        )
-                    ) != 1 {
-                        fail!(
-                            "business domain wire values must be disjoint",
-                            definition.id,
-                            value.id
-                        )
-                    } else {
-                        ()
-                    }
+    let bindings = pipeline::run(
+        pipeline::from_array(definition.values) |> pipeline::unique_by(fn(value) { value.id })
+        |> pipeline::map(fn(value) {
+            if value.id == "" || value.wires == [] {
+                fail!("business domain member ids must be nonempty and have wire values", definition.id, value.id)
+            } else { () };
+            (value.id, array::map(value.wires, fn(wire) {
+                match wire {
+                    edsl::FilterInput::Text(text) => if storage == String.type && text != "" {
+                        qb::Val::String(text)
+                    } else { fail!("business domain wire does not match its declared type", definition.id, value.id) },
+                    edsl::FilterInput::Int(number) => if storage == Int.type {
+                        qb::Val::Int(number)
+                    } else { fail!("business domain wire does not match its declared type", definition.id, value.id) },
+                    _ => fail!("business domain wire does not match its declared type", definition.id, value.id)
                 }
-            );
-            ()
-        }
+            }))
+        }) |> pipeline::collect_dict(fn(member) { member.0 }, fn(member) { member.1 })
     );
+    # wire 的跨成员唯一性属于 Domain 首次形成完整集合时的约束。
+    let wires = array::flat_map(definition.values, fn(value) { value.wires });
+    pipeline::run(pipeline::from_array(wires) |> pipeline::unique_by(fn(wire) {
+        json::stringify(codec::encode(wire))
+    }) |> pipeline::collect());
+    prepare_order({
+        id: definition.id, value: definition.value, wire: definition.wire,
+        values: definition.values, half_open: definition.half_open, order: definition.order, bindings
+    })
+};
+
+def prepare_order: Fn(Definition) -> Definition = fn(definition) {
     if definition.half_open && definition.order != [] {
         fail!("half-open business domain cannot declare a closed order", definition.id)
     } else if definition.order != [] && (
@@ -175,6 +161,9 @@ def domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(
     Array(Member(Business, Wire)),
     Bool
 ) -> Domain(Business, Wire) = fn(id, business, wire, members, half_open) {
+    if !valid_business_type(business) {
+        fail!("business domain requires a text-valued business type", id)
+    } else { () };
     let values = array::map(
         members,
         fn(member) {
@@ -195,7 +184,7 @@ def domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(
             {id: name, label: name, wires}.ty!(edsl::CanonicalValueSpec)
         }
     );
-    {definition: {id, value: business, wire, values, half_open, order: []}}
+    {definition: prepare_definition({id, value: business, wire, values, half_open, order: []})}
 };
 def ordered: for(Business: codec::Encode, Wire) Fn(
     Domain(Business, Wire),
@@ -210,7 +199,7 @@ def ordered: for(Business: codec::Encode, Wire) Fn(
             }
         }
     );
-    {definition: domain.definition <~ {order: ids}}
+    {definition: prepare_order(domain.definition <~ {order: ids})}
 };
 def validate_filters: Fn(Array(g::Filter)) -> () = fn(filters) {
     if !array::all(
@@ -236,6 +225,7 @@ def dimension_group: for(Business, Wire) Fn(
     Bool,
     Array(g::Filter)
 ) -> DimensionGroup(Business, Wire) = fn(domain, projectable, filters) {
+    validate_filters(filters);
     {definition: domain.definition, projectable, filters}
 };
 def bind: for(Row, Business, Wire) Fn(
@@ -246,11 +236,31 @@ def bind: for(Row, Business, Wire) Fn(
     Bool,
     Array(g::Filter)
 ) -> Binding(Row) = fn(dataset, group, source, id, projectable, filters) {
+    contract::publish_name(id);
+    if (projectable && !group.projectable) || !array::all(
+        filters,
+        fn(op) {
+            array::any(
+                group.filters,
+                fn(allowed) {
+                    allowed == op
+                }
+            )
+        }
+    ) {
+        fail!("business binding cannot expand group capabilities", id)
+    } else {
+        ()
+    };
+    let column = match source.node {
+        g::Node::Column(column) => column,
+        _ => fail!("business binding requires a direct column", id)
+    };
     {
         row: Row.type,
         dataset: dataset.id,
         source: dataset.source,
-        node: source.node,
+        column,
         nullable: source.nullable,
         definition: group.definition,
         group_projectable: group.projectable,
@@ -265,7 +275,7 @@ def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
         row: binding.row,
         dataset: binding.dataset,
         source: binding.source,
-        node: binding.node,
+        column: binding.column,
         nullable: binding.nullable,
         definition: binding.definition,
         group_projectable: binding.group_projectable,
@@ -275,43 +285,10 @@ def binding_facts: for(Row) Fn(Binding(Row)) -> BindingFacts = fn(binding) {
         filters: binding.filters
     }
 };
-def validate_bindings: Fn(m::PreparedDataset, Array(BindingFacts)) -> Array(BindingFacts) = fn(
-    dataset,
-    bindings
-) {
-    m::validate_prepared(dataset);
-    array::map(
-        bindings,
-        fn(binding) {
-            let definition = validate_definition(binding.definition);
-            let shape = g::shape(dataset.row, binding.node);
-            validate_filters(binding.group_filters);
-            validate_filters(binding.filters);
-            if binding.row != dataset.row || binding.dataset != dataset.id || binding.source != dataset.source {
-                fail!("business dimension binding belongs to another dataset", binding.id)
-            } else if shape.value != definition.wire || shape.nullable != binding.nullable {
-                fail!("business dimension source does not match its wire type", binding.id)
-            } else if (binding.projectable && !binding.group_projectable) || !array::all(
-                binding.filters,
-                fn(op) {
-                    array::any(
-                        binding.group_filters,
-                        fn(allowed) {
-                            op == allowed
-                        }
-                    )
-                }
-            ) {
-                fail!("business dimension binding cannot expand group capabilities", binding.id)
-            } else {
-                binding
-            }
-        }
-    )
-};
 # 名义业务成员条件；仅支持直接列，源编码由已声明值域解析。
 type MemberPredicate = struct {
     binding: BindingFacts,
+    wires: Array(qb::Val),
     member: String
 };
 def member_predicate: for(Row, Business: codec::Encode) Fn(
@@ -322,14 +299,19 @@ def member_predicate: for(Row, Business: codec::Encode) Fn(
         Value::String(value) => value,
         _ => fail!("business predicate member must encode to text", binding.id)
     };
-    {binding: binding_facts(binding), member: id}
+    if !array::any(binding.filters, fn(op) { op == g::Filter::Eq }) {
+        fail!("business predicate requires equality filter capability", binding.id)
+    } else { () };
+    match dict::get(binding.definition.bindings, id) {
+        None => fail!("business predicate requires a declared member", binding.id, id),
+        Some(wires) => {binding: binding_facts(binding), member: id, wires}
+    }
 };
 def prepare_predicate: Fn(
     m::PreparedDataset,
     Array(BindingFacts),
     MemberPredicate
-) -> edsl::ScopePredicate = fn(dataset, declared, predicate) {
-    validate_bindings(dataset, [predicate.binding]);
+) -> edsl::PreparedMeasurePredicate = fn(dataset, declared, predicate) {
     if !array::any(
         declared,
         fn(binding) {
@@ -337,29 +319,15 @@ def prepare_predicate: Fn(
         }
     ) {
         fail!("business predicate requires its declared dimension binding", predicate.binding.id)
-    } else if !array::any(
-        predicate.binding.definition.values,
-        fn(value) {
-            value.id == predicate.member
-        }
-    ) {
-        fail!(
-            "business predicate requires a declared member",
-            predicate.binding.id,
-            predicate.member
-        )
     } else {
-        lower_predicate(predicate)
+        {scope: lower_predicate(predicate), wires: predicate.wires, column: predicate.binding.column.name}
     }
 };
 def lower_predicate: Fn(MemberPredicate) -> edsl::ScopePredicate = fn(predicate) {
-    match predicate.binding.node {
-        g::Node::Column(column) => {
-            field: column.name,
-            op: edsl::FilterOp::Eq,
-            input: edsl::FilterInput::Text(predicate.member)
-        },
-        _ => fail!("business predicate requires a direct column binding", predicate.binding.id),
+    {
+        field: predicate.binding.column.name,
+        op: edsl::FilterOp::Eq,
+        input: edsl::FilterInput::Text(predicate.member)
     }
 };
 pub use self::{
@@ -378,156 +346,10 @@ pub use self::{
     ordered,
     dimension_group,
     bind,
-    binding_facts,
-    validate_definition,
-    prepare
+    binding_facts
 };
 
 # 显式严格构造，用于诊断和检查需要立即拒绝的调用方。
-def checked_domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(
-    String,
-    TypeOf(Business),
-    TypeOf(Wire),
-    Array(Member(Business, Wire)),
-    Bool
-) -> Domain(Business, Wire) = fn(id, business, wire, members, half_open) {
-    let values = array::map(
-        members,
-        fn(member) {
-            let name = match codec::encode(member.value) {
-                Value::String(value) => value,
-                _ => fail!("business value must encode to a text id", id)
-            };
-            let wires = array::map(
-                member.wires,
-                fn(value) {
-                    match codec::encode(value) {
-                        Value::String(text) => edsl::FilterInput::Text(text),
-                        Value::Int(number) => edsl::FilterInput::Int(number),
-                        _ => fail!("business wire must encode to integer or text", id),
-                    }
-                }
-            );
-            {id: name, label: name, wires}.ty!(edsl::CanonicalValueSpec)
-        }
-    );
-    {definition: validate_definition({id, value: business, wire, values, half_open, order: []})}
-};
-def checked_ordered: for(Business: codec::Encode, Wire) Fn(
-    Domain(Business, Wire),
-    Array(Business)
-) -> Domain(Business, Wire) = fn(domain, order) {
-    let ids = array::map(
-        order,
-        fn(value) {
-            match codec::encode(value) {
-                Value::String(id) => id,
-                _ => fail!("business order requires text ids", domain.definition.id)
-            }
-        }
-    );
-    {definition: validate_definition(domain.definition <~ {order: ids})}
-};
-def checked_dimension_group: for(Business, Wire) Fn(
-    Domain(Business, Wire),
-    Bool,
-    Array(g::Filter)
-) -> DimensionGroup(Business, Wire) = fn(domain, projectable, filters) {
-    let definition = validate_definition(domain.definition);
-    if definition.value != Business.type || definition.wire != Wire.type {
-        fail!("business domain type witness does not match its parameters", definition.id)
-    } else {
-        ()
-    };
-    validate_filters(filters);
-    {definition, projectable, filters}
-};
-def checked_bind: for(Row, Business, Wire) Fn(
-    m::Dataset(Row),
-    DimensionGroup(Business, Wire),
-    g::Expr(Row, Wire),
-    String,
-    Bool,
-    Array(g::Filter)
-) -> Binding(Row) = fn(dataset, group, input, id, projectable, filters) {
-    m::checked_prepare(dataset, []);
-    let checked = g::checked(input);
-    let definition = validate_definition(group.definition);
-    if definition.value != Business.type || definition.wire != Wire.type {
-        fail!("business domain type witness does not match its parameters", definition.id)
-    } else {
-        ()
-    };
-    validate_filters(group.filters);
-    validate_filters(filters);
-    if (projectable && !group.projectable) || !array::all(
-        filters,
-        fn(op) {
-            array::any(
-                group.filters,
-                fn(allowed) {
-                    op == allowed
-                }
-            )
-        }
-    ) {
-        fail!("business dimension binding cannot expand group capabilities", id)
-    } else {
-        {
-            row: Row.type,
-            dataset: dataset.id,
-            source: dataset.source,
-            node: checked.node,
-            nullable: checked.nullable,
-            definition,
-            group_projectable: group.projectable,
-            group_filters: group.filters,
-            id,
-            projectable,
-            filters
-        }
-    }
-};
-def checked_member_predicate: for(Row, Business: codec::Encode) Fn(
-    Binding(Row),
-    Business
-) -> MemberPredicate = fn(binding, member) {
-    if binding.definition.value != Business.type {
-        fail!("business predicate member has incompatible nominal type", binding.id)
-    } else {
-        ()
-    };
-    let id = match codec::encode(member) {
-        Value::String(value) => value,
-        _ => fail!("business predicate member must encode to text", binding.id)
-    };
-    if !array::any(
-        binding.definition.values,
-        fn(value) {
-            value.id == id
-        }
-    ) {
-        fail!("business predicate requires a declared member", binding.id, id)
-    } else {
-        {binding: binding_facts(binding), member: id}
-    }
-};
-pub use self::{
-    checked_domain,
-    checked_ordered,
-    checked_dimension_group,
-    checked_bind,
-    checked_member_predicate
-};
-
-def prepare: Fn(m::PreparedDataset, Array(BindingFacts)) -> Array(BindingFacts) = fn(
-    dataset,
-    bindings
-) {
-    bindings
-};
-pub use self::{validate_bindings};
-
 # 编码来自 variant property；Domain 只是 transform 的准备描述。
 def from_enum: for(Business, Wire) Fn(
     String,
@@ -588,7 +410,7 @@ def from_enum: for(Business, Wire) Fn(
     } else {
         []
     };
-    {definition: {id, value: business, wire, values, half_open, order}}
+    {definition: prepare_definition({id, value: business, wire, values, half_open, order})}
 };
 pub use self::{from_enum};
 # 源字段的已知原始值是局部约束，不为它们制造领域类型。
@@ -644,7 +466,14 @@ def field_domain: for(Business, Wire) Fn(
     projectable,
     filters
 ) {
+    contract::publish_name(id);
+    validate_filters(filters);
     fn(ctx, previous) {
+        if ctx.ty != Wire.type && ctx.ty != Option(Wire).type {
+            fail!("field domain has incompatible storage type", ctx.name)
+        } else {
+            ()
+        };
         let before = match previous {
             Some(p) => p.dimensions,
             None => []
@@ -674,17 +503,16 @@ def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) 
                     fn(spec) {
                         let nullable = field.ty != spec.definition.wire;
                         let column: g::Column = {
+                            index: field.index,
                             name: field.name,
                             value: spec.definition.wire,
                             nullable
                         };
-                        # 校验可空包装与实际源类型，不能把错误类型当成 Option。
-                        g::column_shape(dataset.row, column);
                         {
                             row: dataset.row,
                             dataset: dataset.id,
                             source: dataset.source,
-                            node: g::Node::Column(column),
+                            column,
                             nullable,
                             definition: spec.definition,
                             group_projectable: spec.projectable,
@@ -700,29 +528,3 @@ def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) 
     )
 };
 pub use self::{FieldDomains, FieldDomain, field_domain, classification, field_bindings};
-
-def field_binding: for(Row) Fn(m::Dataset(Row), String) -> Binding(Row) = fn(dataset, id) {
-    let facts = match array::find(
-        field_bindings(m::prepare(dataset, [])),
-        fn(binding) {
-            binding.id == id
-        }
-    ) {
-        Some(binding) => binding,
-        None => fail!("unknown declared field domain", id)
-    };
-    {
-        row: facts.row,
-        dataset: facts.dataset,
-        source: facts.source,
-        node: facts.node,
-        nullable: facts.nullable,
-        definition: facts.definition,
-        group_projectable: facts.group_projectable,
-        group_filters: facts.group_filters,
-        id: facts.id,
-        projectable: facts.projectable,
-        filters: facts.filters
-    }
-};
-pub use self::{field_binding};

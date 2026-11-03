@@ -1,4 +1,5 @@
 use std::seq as seq;
+use std::pipeline as pipeline;
 use crate::ontology as edsl;
 use crate::query as qb;
 use crate::time as time;
@@ -97,6 +98,7 @@ def parse_input: Fn(String, Value) -> edsl::FilterInput = fn(kind, value) {
 
 # 输入推断只读取查询契约，不构造描述、别名、标签等知识发现内容。
 type DimensionInputContract = struct {
+    time: Option(edsl::TimeField),
     dataset: String,
     field: String,
     computed: Bool,
@@ -121,6 +123,7 @@ def dimension_input_contract: Fn(edsl::PreparedPayload, String) -> DimensionInpu
     } else {
         let entity = payload.entities[entry.entity];
         {
+            time: entity.fields[entry.field].time,
             dataset: entity.id,
             field: entity.fields[entry.field].name,
             computed: entry.computed,
@@ -533,7 +536,10 @@ def parse_time_window: Fn(
     let raw = decode_graph_shape@[RawTimeWindow](value, "syntax/operations/time_window");
     let payload = graph_node_payload(payload, nodes, raw.node);
     let detail = dimension_input_contract(payload, raw.dimension);
-    let role = edsl::time_domain(payload, detail.dataset, detail.field);
+    let role = match detail.time {
+        Some(role) => role,
+        None => fail!("time window requires a time dimension", raw.dimension)
+    };
     let window: time::Window = {
         start: match raw.start {
             None => None,
@@ -877,33 +883,12 @@ def pair_time_alignment: Fn(
                 Some(entity) => entity,
                 None => fail!("aligned entity missing", entity_id),
             };
-            let identity = match entity.dataset {
-                Some(spec) => spec.grain,
-                None => seq::collect(
-                    seq::map(
-                        seq::filter(
-                            seq::from_array(entity.fields),
-                            fn(field) {
-                                field.is_key
-                            }
-                        ),
-                        fn(field) {
-                            field.name
-                        }
-                    )
-                ),
-            };
             array::all(
-                array::filter(
-                    entity.fields,
-                    fn(field) {
-                        array::any(
-                            identity,
-                            fn(name) {
-                                name == field.name
-                            }
-                        ) && field.time != None
-                    }
+                pipeline::run(
+                    pipeline::from_array(entity.grain_fields) |> pipeline::filter_map(fn(index) {
+                        let field = entity.fields[index];
+                        if field.time != None { Some(field) } else { None }
+                    }) |> pipeline::collect()
                 ),
                 fn(field) {
                     let bounds = fn(request: edsl::GraphRequest, node: String) {
@@ -1324,30 +1309,9 @@ def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, In
             Some(entry) => entry,
             None => fail!("graph union result node has an unknown entity", branch, node.entity),
         };
-        let grain = match entity.dataset {
-            Some(dataset) => dataset.grain,
-            None => if entity.key_field >= 0 {
-                [entity.fields[entity.key_field].name]
-            } else {
-                fail!("graph union result entity needs a declared identity", branch, node.entity)
-            },
-        };
-        if !array::all(
-            grain,
-            fn(name) {
-                let field = match array::find(
-                    array::enumerate(entity.fields),
-                    fn(entry) {
-                        entry.1.name == name
-                    }
-                ) {
-                    Some(entry) => entry.0,
-                    None => fail!(
-                        "graph union identity field is missing from the entity",
-                        branch,
-                        name
-                    ),
-                };
+        if entity.grain_fields == [] || !array::all(
+            entity.grain_fields,
+            fn(field) {
                 array::any(
                     request.select,
                     fn(item) {
@@ -1365,7 +1329,7 @@ def union_graph_result: Fn(edsl::PreparedPayload, edsl::GraphRequest, String, In
                 "graph union branch must project every field of its complete result identity as a plain dimension",
                 branch,
                 node.entity,
-                grain
+                array::map(entity.grain_fields, fn(index) { entity.fields[index].name })
             )
         } else {
             node.entity

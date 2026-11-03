@@ -49,12 +49,10 @@ function merge(state, key, value, references = []) {
 }
 function typeref(state, id) {
   const info = state.fieldTypes.get(id);
-  if (!info) throw new Error(`Unknown field type ${id}`);
   return info.text;
 }
 function typerefs(state, id) {
   const info = state.fieldTypes.get(id);
-  if (!info) throw new Error(`Unknown field type ${id}`);
   return info.references;
 }
 const column = (s, c) => ({ ...c, type: typeref(s, c.type) });
@@ -143,8 +141,7 @@ function capabilities(s, c) {
   }
   for (const m of c.measures) {
     const { id, dataset, ...value } = m, field = member(dataset, 'fields', m.anchor_field);
-    const requires = m.requires.map(x => address('datasets', x));
-    merge(s, member(dataset, 'measures', id), { ...value, anchor_field: field, requires }, [field, ...requires,
+    merge(s, member(dataset, 'measures', id), { ...value, anchor_field: field }, [field,
       ...(m.computed === null ? [] : [member(dataset, 'measures', m.computed.left), member(dataset, 'measures', m.computed.right)])]);
   }
   for (const r of c.relations) merge(s, address('relations', r.id), { from_dataset: address('datasets', r.from_dataset), to_dataset: address('datasets', r.to_dataset),
@@ -196,7 +193,6 @@ function ownedGraph(s) {
   for (const [key,f] of folded) if (isRoot(key)) roots.set(key, { key, value: { ...f.value }, references: new Set(), reference_sites: [] });
   for (const [key,f] of folded) {
     const [root,member] = key.split('#'), owner = roots.get(root);
-    if (!owner) throw new Error(`Unknown knowledge owner: ${key}`);
     const path = member ? member.split('/').map(decodeURIComponent) : [];
     if (path.length) {
       const [category,name] = path;
@@ -204,7 +200,6 @@ function ownedGraph(s) {
       Object.defineProperty(owner.value[category],name,{value:f.value,enumerable:true,writable:true,configurable:true});
     }
     for (const ref of f.references) {
-      if (!folded.has(ref)) throw new Error(`Unresolved owned knowledge reference: ${key} → ${ref}`);
       const [target,location] = ref.split('#');
       if (target !== root) owner.references.add(target);
       owner.reference_sites.push({path,target,...(location ? {target_path:location.split('/').map(decodeURIComponent)} : {})});
@@ -228,19 +223,8 @@ function finish(s) {
   });
   return { graph: { knowledge_contract: 'ontology-knowledge-v5', intent_contract: 'ontology-intent-v1', addressing: 'node-member-uri-v1', discovery_roots: ['entities','datasets','relations'], revision: s.revision, facts, relations: relationDescriptors, items: [] }, vocabulary };
 }
-if (!data || typeof data.revision !== 'string' || !data.revision || !Array.isArray(data.instructions)) {
-  throw new Error('Invalid ontology knowledge instructions');
-}
+// Instructions and references come only from the private property publication path.
 const operations = {types, field_types, entity, dataset, capabilities, relations};
 const state = initialize(data.revision);
-for (const [index, instruction] of data.instructions.entries()) {
-  if (!Array.isArray(instruction) || instruction.length !== 2 || typeof instruction[0] !== 'string' || !Object.hasOwn(operations, instruction[0])) {
-    throw new Error('Invalid ontology knowledge instruction');
-  }
-  const [operation, argument] = instruction;
-  if ((index === 0) !== (operation === 'types')) throw new Error('Knowledge types must be declared first and once');
-  if ((index === 1) !== (operation === 'field_types')) throw new Error('Field type information must be declared second and once');
-  operations[operation](state, argument);
-}
-if (data.instructions.length < 2) throw new Error('Missing knowledge type declarations');
+for (const [operation, argument] of data.instructions) operations[operation](state, argument);
 return finish(state);

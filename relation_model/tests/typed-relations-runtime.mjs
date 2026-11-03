@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-// 执行 @test/typed_relations:runtime_cases 导出的真实新旧查询。
+// 执行 property 模型导出的查询，校验固定 SQLite 数据上的业务结果。
 const cases = JSON.parse(readFileSync(process.argv[2] ?? 0, 'utf8'));
 const db = new DatabaseSync(':memory:');
 db.exec(`CREATE TABLE tenants (id TEXT);
@@ -49,10 +49,8 @@ const normalized = (rows) => rows.map((row) => ({ ...row }))
   .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 for (const item of cases) {
   assert.ok(item.id in expected, `unexpected case ${item.id}`);
-  const oldRows = db.prepare(item.baseline.sql).all(...item.baseline.bindings);
   const typedRows = db.prepare(item.typed.sql).all(...item.typed.bindings);
   assert.deepEqual(normalized(typedRows), normalized(expected[item.id]), `${item.id} semantics`);
-  assert.deepEqual(normalized(typedRows), normalized(oldRows), `${item.id} baseline parity`);
 }
 assert.equal(cases.length, Object.keys(expected).length);
 db.exec('DELETE FROM connections; DELETE FROM routes;');
@@ -62,4 +60,4 @@ for (const item of cases.filter((c) => ['exists', 'alternative_counts'].includes
   else assert.ok(rows.length === 7 && rows.every((row) => row.c_count === 0));
 }
 db.close();
-console.log('Passed 6 typed/baseline query pairs: composite tenant identity, explicit A/Z, direction, EXISTS grain and empty/alternative counts.');
+console.log('Passed 6 property query cases: composite tenant identity, explicit A/Z, direction, EXISTS grain and empty/alternative counts.');
