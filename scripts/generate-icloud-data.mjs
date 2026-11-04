@@ -165,7 +165,14 @@ export function generate(options, model = loadModel()) {
     const category = categoryValue(dataset.table, column, index, seed);
     if (category !== undefined) return field.scalar === 'String' ? String(category) : category;
     if (field.scalar === 'Int') return index + 1;
-    if (field.scalar === 'Float') return Number((10 + random() * 80).toFixed(3));
+    if (field.scalar === 'Float') {
+      const number = 10 + random() * 80;
+      // Both source catalogs declare capacity utilization as a 0..1 ratio.
+      if (column === 'usedCapacityRate' && ['HuaweiStorageDevice', 'FCSwitchDevice'].includes(dataset.table)) {
+        return Number((number / 100).toFixed(5));
+      }
+      return Number(number.toFixed(3));
+    }
     if (field.scalar === 'Bool') return index % 2;
     if (field.scalar !== 'String') throw new Error(`Unsupported scalar ${field.scalar}`);
     if (/tenant_?id/i.test(column)) return id('X_TENANT_VIEW', dataset.table === 'X_TENANT_VIEW' ? index : tenants.assignments[index]);
@@ -398,7 +405,7 @@ export function generate(options, model = loadModel()) {
     const manifest = {
       format: 'icloud-synthetic-data/v1', revision: model.revision,
       options: { seed, resources, days, intervalMinutes, anchor: inputAnchor, storageGapHours, alarmsPerResourcePerDay },
-      generation: { revision: 6, devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
+      generation: { revision: 7, capacityUtilizationProfile: 'source-fraction/v1', devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
       window: { start: iso(startMs), endExclusive: anchor, samplesPerSeries: samples },
       catalogSha256: hash(catalogBytes), modelSha256: hash(JSON.stringify(model)),
       database: { file: 'icloud.sqlite', sha256: hash(readFileSync(databasePath)) },
@@ -456,6 +463,8 @@ export function validate(db, model, counts, { anchor, start } = {}) {
     }
   }
   for (const [table, predicate] of [
+    ['HuaweiStorageDevice', 'usedCapacityRate < 0 OR usedCapacityRate > 1'],
+    ['FCSwitchDevice', 'usedCapacityRate < 0 OR usedCapacityRate > 1'],
     ['ServerDeviceKPI', 'peakPower < averagePower OR systemPower < 0 OR averagePower < 0'],
     ['StorageHardDriveKPI', 'utility < 0 OR utility > 100 OR avgreadiosize < 0 OR avgwriteiosize < 0'],
     ['StorageDeviceKPI', 'cpuusage < 0 OR cpuusage > 100 OR memoryusage < 0 OR memoryusage > 100'],

@@ -38,6 +38,21 @@ try {
   assert.ok(first.generation.alarmDays.every(day => day.alarms >= 6));
   assert.ok(first.tables.T_CURRENT_ALARM > options.resources * options.days);
   db = new DatabaseSync(join(directory, 'first/icloud.sqlite'));
+  for (const table of ['HuaweiStorageDevice', 'FCSwitchDevice']) {
+    const range = db.prepare(`SELECT min(usedCapacityRate) lo, max(usedCapacityRate) hi,
+      count(DISTINCT usedCapacityRate) n FROM "${table}"`).get();
+    assert.ok(range.lo >= 0.1 && range.hi <= 0.9, `${table}: capacity utilization is a fraction`);
+    assert.equal(range.n, options.resources);
+    db.exec('SAVEPOINT invalid_capacity_ratio');
+    try {
+      db.exec(`UPDATE "${table}" SET usedCapacityRate=50 WHERE rowid=1`);
+      const checks = validate(db, model, first.tables);
+      assert.ok(checks.invalidMetricScenarios.some(item => item.table === table && item.invalid === 1),
+        `${table}: validator rejects percentage-scale capacity utilization`);
+    } finally {
+      db.exec('ROLLBACK TO invalid_capacity_ratio; RELEASE invalid_capacity_ratio');
+    }
+  }
   assert.equal(db.prepare("SELECT count(DISTINCT SEVERITY) n FROM T_CURRENT_ALARM").get().n, 4);
   assert.ok(db.prepare("SELECT count(*) n FROM T_CURRENT_ALARM WHERE ALARMNAME='CPU 利用率过高'").get().n > 0);
   const classes = model.dimensions.find(d=>d.dataset==='device'&&d.column==='classification').values;
