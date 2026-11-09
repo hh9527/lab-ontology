@@ -47,7 +47,34 @@ const tableCategories = {
   SYS_Controller: {cpuCount: [2, 4], memorySize: [64, 128, 256]},
 };
 
+// Organizations use a mix of city, province and unprefixed names.
+const tenantOrganizations = [
+  ['澄川精密制造有限公司','制造业'], ['云栖数字科技有限公司','信息技术'],
+  ['知澜职业技术学校','教育'], ['汇舟金融信息服务有限公司','金融'], ['和沐康复医院','医疗'],
+  ['星砺智能装备有限公司','制造业'], ['青禾软件技术有限公司','信息技术'],
+  ['明汀实验学校','教育'], ['融溪资产管理有限公司','金融'], ['安澄综合门诊部','医疗'],
+  ['锦棠新材料有限公司','制造业'], ['启帆数据服务有限公司','信息技术'],
+  ['松岚工程技术学院','教育'], ['嘉衡融资租赁有限公司','金融'], ['清源护理院','医疗'],
+  ['远岫电子器件有限公司','制造业'], ['灵沄网络技术有限公司','信息技术'],
+  ['书澄继续教育中心','教育'], ['瑞禾保险代理有限公司','金融'], ['景和健康体检中心','医疗'],
+  ['沐辰医疗器械有限公司','制造业'], ['澜屿信息安全有限公司','信息技术'],
+  ['云杉应用技术研究院','教育'], ['诚澜商业保理有限公司','金融'], ['康汀口腔门诊部','医疗'],
+  ['禾川自动化设备有限公司','制造业'], ['望舒云计算有限公司','信息技术'],
+  ['青麓技能培训中心','教育'], ['致衡投资咨询有限公司','金融'], ['宁禾社区卫生服务中心','医疗'],
+];
+export function tenantPresentation(index) {
+  const [name, industry] = tenantOrganizations[index % tenantOrganizations.length];
+  const batch = Math.floor(index / tenantOrganizations.length);
+  const prefix = ['江州市', '江南', ''][index % 3];
+  return {name: `${prefix}${name}${batch ? `（第${batch + 1}园区）` : ''}`, industry};
+}
+
 export function categoryValue(table, column, index, seed) {
+  if (table === 'X_TENANT_VIEW') {
+    const tenant = tenantPresentation(index);
+    if (column === 'TENANT_NAME') return tenant.name;
+    if (column === 'INDUSTRY') return tenant.industry;
+  }
   const draw = key => categoryRandom(seed, table, index, key);
   const vendor = choose(vendors(table), draw('manufacturer'));
   if (/^(manufacturer|MANUFACTURER|vendor|vendorName|cardManufacturer)$/.test(column)) return vendor;
@@ -74,10 +101,13 @@ export function enumCategoryValue(table, column, index, seed, values) {
     : Object.values(values[Math.floor((random - 0.82) / 0.18 * values.length)]?.wires[0] ?? values.at(-1).wires[0])[0];
 }
 
-export function tenantLayout(resources, seed) {
+export function tenantLayout(resources, seed, requestedCount) {
   // Keep a reusable tenant population smaller than the inventory. Small samples
   // round the 20/30/50 tenant cohorts; the device cohorts remain near 60/30/10.
-  const count = Math.min(10, Math.max(3, Math.floor(resources / 3)));
+  const count = requestedCount ?? Math.max(3, Math.floor(resources / 3));
+  if (!Number.isSafeInteger(count) || count < 3 || count > resources) {
+    throw new Error('tenants must be an integer between 3 and resources');
+  }
   const sizes = [Math.max(1, Math.round(count * 0.2)), Math.max(1, Math.round(count * 0.3))];
   sizes.push(count - sizes[0] - sizes[1]);
   const deviceCounts = [Math.round(resources * 0.6), Math.round(resources * 0.3)];

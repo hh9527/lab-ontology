@@ -18,7 +18,9 @@ try {
     try {
       const values = db.prepare(`SELECT ts AS value FROM "${table}" ORDER BY ts`).all().map(row => row.value);
       assert.ok(values.length > 0);
-      assert.ok(values.every(value => /\.123Z$/.test(value)), name + ': milliseconds must survive generation');
+      assert.ok(values.every(value => /\.\d{3}Z$/.test(value)), name + ': fixed millisecond precision');
+      assert.ok(values.some(value => /\.123Z$/.test(value)), name + ': fractional anchor survives at sampling boundaries');
+      if (name === 'ns') assert.ok(values.every(value => /\.123Z$/.test(value)), 'NS samples retain the anchor offset');
       assert.deepEqual(values, [...values].sort((a,b) => Date.parse(a)-Date.parse(b)));
     } finally { db.close(); }
   }

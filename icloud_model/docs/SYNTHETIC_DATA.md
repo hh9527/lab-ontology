@@ -28,6 +28,10 @@ mise x -- node scripts/generate-icloud-data.mjs \
 同时指定 anchor-utc 和种子可复现相同数据库内容。验证使用选定锚点，因此历史锚点也合法。
 
 resources N 设置基础总体，最少 6；days N 设置 KPI 窗口；interval-minutes N 设置采样间隔，如 5 表示五分钟。
+`--tenants N` 独立设置租户数量（3 至 resources），不再限制为 10；省略时为 resources 的三分之一，至少 3。
+租户按约 20%／30%／50% 分组，分别承载约 60%／30%／10% 的基础资源。
+应同时提供足够资源支撑长尾：例如 `--resources 150 --tenants 30` 可使每组中的每个租户都有资源。
+前 30 个租户采用企业、学校、医疗机构等名称，混合江州市、江南及不带地名三种形式，行业字段与名称一致。
 ONU KPI 遵循限定 ONU 身份，故序列少于基础表。超过一千万 KPI 行的请求被拒绝。
 
 资源覆盖租户、站点、网络设备及组件、服务器及组件、存储、FC 交换机、PON 层级、终端、协作设备和物理连接。
@@ -73,7 +77,7 @@ StorageDeviceKPI 对每个存储设备和 FC 交换机都有完整序列，故�
 
 本工具参考 `icloud-corpus/pack/tables.py` 的服务器、存储和磁盘档位，以及
 `pack/alarms.py` 的快照时间约束。参考包使用独立表结构和场景规模；本工具仍以本仓准备模型与源目录为结构契约。
-生成规则版本记录在 manifest 的 `generation.revision`，当前为 3，`profile` 为 `daily-business-demo`。
+生成规则版本记录在 manifest 的 `generation.revision`，当前为 11，`profile` 为 `daily-business-demo`。
 这些档位是合成场景，不扩展模型能力，也不声明与参考包逐行一致。
 
 - 服务器 CPU／内存按百分比生成，systemPower／averagePower／peakPower 使用功率数值档位，peakPower 始终大于 averagePower
@@ -107,3 +111,31 @@ node scripts/generate-icloud-data.mjs \
 发布前额外检查服务器功率大小关系、存储百分比及磁盘非负值、告警时间顺序及锚点上界。
 检查结果分别记录为 `invalidMetricScenarios` 和 `invalidAlarmTimes`，非空即停止发布。
 固定种子与锚点保证同一生成规则版本可复现；规则版本变化会改变数据哈希。
+
+## 告警的资产派生规则
+
+`generation.alarmProfile` 为 `asset-derived-conditional-events/v2`。
+先生成资产，再统一派生告警的 MEDN、MENAME、TENANTID、STREXT13、MANUFACTURER、PRODUCTNAME、MECATEGORY、METYPE。
+MECATEGORY 表示大类：网络、服务器、华为存储、PON 分别使用源目录示例 NetworkElement、PhysicalServer、HuaweiStorageDevice、EntPonElement。
+FC 和协作设备使用合成约定 FCSwitchDevice、CollaborationElement；这两项不是经过源系统确认的编码。
+网络次级分类从资产规范分类映射为 Switch、Router、Firewall 等演示名称；其他资源保留已有资产 classification 编码。
+这些映射不新增封闭枚举，也不限制真实源数据库的合法编码。
+
+MOI 是定位信息，不是资源 ID。链路和端口告警使用所属设备实际端口的 `Port ID=n`，整机告警为空；没有组件清单的资产只生成整机告警。
+打印机、UPS、协作终端不生成 CPU／内存告警；UPS 可生成供电异常。
+场景目录按资源类型覆盖网络管理、服务器系统、存储容量与性能、FC Fabric、PON、会议质量等多种告警。
+无源分光器只生成光路类告警。目录中的名称是合成场景，不冒充厂商正式告警定义；固定种子抽样决定实际出现的种类。
+CPU／内存告警的抽样权重参考同源 KPI 业务负载，离线告警权重在既有离线窗口内增加。
+这是条件抽样，并不保证每条告警对应某个指标阈值越限，也不构造完整的故障因果仿真。
+严重度继续按 1／1.8／3.2／4 的近似比例生成。
+
+发布时 `invalidAlarmProfiles` 检查资源存在、派生字段一致、定位端口属于该设备；非空即拒绝发布。
+
+## ONU 光功率
+
+`generation.ponOpticsProfile` 为 `hierarchical-path-loss/v1`。
+ONU KPI 的三个光功率字段按实际 resId、parentId 分层生成，固定 seed 保证稳定复现。
+OLT 层模拟覆盖区域的稳定光路损耗差异，ONU 层叠加独立的光路损耗和发射功率差异。
+接收功率使用“对端发射功率减光路损耗”，分别表达 ONU 下行接收与 OLT 上行接收；ONU 发射功率不随光路损耗平移。
+时间变化采用缓慢漂移、小幅抖动以及少量 ONU 的短时衰减，不套用 CPU 昼夜负载曲线。
+这些参数用于演示群体和个体差异，不代表特定设备制式的光预算或告警阈值。

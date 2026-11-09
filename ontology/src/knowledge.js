@@ -69,7 +69,7 @@ function types(s, items) {
 function field_types(s, items) {
   for (const info of items) s.fieldTypes.set(info.id, info);
   for (const t of s.pendingTypes) if (!t.inline) merge(s, address('types', t.id), {
-    name: t.name, kind: t.kind, reverse_references: t.reverse_references === true && t.variants.length > 0 && t.variants.every(v => v.payload === null), representation: t.representation === null ? null : typeref(s, t.representation),
+    name: t.name, kind: t.kind, ...(t.unit == null ? {} : {unit: t.unit}), reverse_references: t.reverse_references === true && t.variants.length > 0 && t.variants.every(v => v.payload === null), representation: t.representation === null ? null : typeref(s, t.representation),
     arguments: t.arguments.map(x => typeref(s, x)), field_types: t.field_types.map(c => column(s, c)),
     variants: t.variants.map(v => v.payload === null ? { ...v } : { ...v, payload: typeref(s, v.payload) }),
   }, t.dependencies.flatMap(x => typerefs(s, x)));

@@ -88,6 +88,11 @@ SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
 
 属性业务角色和具名唯一引用集合见[字段角色](FIELD-ROLES.md)。这些声明丰富发现信息，与查询权限、键、粒度和聚合规则相互独立。
 
+数量类型可以用 `@quantity::unit(symbol, quantity, scale)` 声明单位，知识发布在类型节点的 `unit` 中保留这三个字段。
+`scale` 是相对该量纲基准单位的倍率：比例以 1、数据容量以 byte、功率以 W 为基准。
+共享类型 `Percent`（0..100）、`Fraction`（0..1）、`Megabytes`（十进制 MB）和 `Watts` 已声明单位。
+这些元数据不触发隐式换算；单位未知的来源字段应保留独立类型，不能根据数值分布猜测单位。
+
 - `@entity_id` 和 `@entity_source` 指定数据集及其可信物理来源。`@dataset` 可声明种类和完整身份粒度；未显式声明粒度的模型也可使用 `@key()`。
 - `@dimension`、`@measure` 及相关注解发布可查询能力。物理字段不会自动成为可见或可筛选维度；声明的操作符和输入种类约束 Intent 值。
 - 具名值类型拥有规范成员及其源编码。维度通过 `@dimension_type` 绑定这些类型。标签和别名辅助发现，查询 Intent 仍使用稳定 ID。类型级 `@half_open()` 增加显式 Unknown 分支，保留未识别字符串；带标签输入、结果列和分组规则见[半开放枚举](HALF-OPEN.md)。

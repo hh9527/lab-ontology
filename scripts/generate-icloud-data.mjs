@@ -1,4 +1,6 @@
 import { createKpiWaves } from './kpi-waveforms.mjs';
+import { createPonOptics } from './pon-optics.mjs';
+import { alarmFamilies, alarmProfile, alarmEvent } from './icloud-alarm-profiles.mjs';
 import { categoryRandom, categoryValue, enumCategoryValue, tenantLayout, networkDevicePresentation, networkDeviceClass } from './icloud-category-profiles.mjs';
 import { normalizeUtcMillis } from './utc-milliseconds.mjs';
 import { createHash } from 'node:crypto';
@@ -12,6 +14,8 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const quote = name => `"${name.replaceAll('"', '""')}"`;
 const iso = ms => new Date(ms).toISOString();
 const hash = data => createHash('sha256').update(data).digest('hex');
+// Compress exceptional peaks smoothly instead of clipping many samples to 100.
+const utilization = value => value <= 92 ? Math.max(0, value) : 92 + 8 * (1 - Math.exp(-(value - 92) / 8));
 const wire = value => Object.values(value)[0];
 const leaves = key => key.Eq ? [key.Eq] : Object.values(key).flatMap(parts => parts.flatMap(leaves));
 
@@ -41,6 +45,18 @@ const resourceNames = {
 };
 
 const defaultWaves = createKpiWaves(20261031);
+export function onlineRate(index, time, interval) {
+  // One staggered, finite outage per week. A whole-interval outage is a real
+  // zero; absence of an observation is represented by an absent row.
+  const cycle = 7 * 86400000;
+  const offset = ((index * 37 + 11) % 168) * 3600000;
+  const duration = (12 + index % 7 * 8) * 60000;
+  const downtimeUntil = end => {
+    const cycles = Math.floor((end - offset) / cycle);
+    return cycles * duration + Math.min(duration, end - offset - cycles * cycle);
+  };
+  return 100 * (1 - (downtimeUntil(time + interval) - downtimeUntil(time)) / interval);
+}
 export function metricValue(table, column, index, sample, interval, random, samples = 1, startMs = 0, waves = defaultWaves) {
   const elapsed = sample * interval;
   // A synthetic UTC+08 business clock: peaks around afternoon, quiet nights,
@@ -62,9 +78,12 @@ export function metricValue(table, column, index, sample, interval, random, samp
   if (profile) {
     const number = Math.max(0, profile[0] * shape.baseline + profile[1] * daily + trend * 0.25
       + (index % 7 - 3) * 0.5 + variation + noise + incident * profile[1]);
-    return /power|iosize/i.test(column) ? number : Math.min(100, number);
+    return /power|iosize/i.test(column) ? number : utilization(number);
   }
-  if (/onlineRate/i.test(column)) return index % 6 === 5 && elapsed % 86400000 < 4 * 3600000 || incident > 0.7 ? 0 : 100;
+  if (/onlineRate/i.test(column)) {
+    // A rate is the online fraction of this interval, not a missing sample.
+    return onlineRate(index, startMs + elapsed, interval);
+  }
   if (/optics.*power/i.test(column)) return (/tx/i.test(column) ? -4 : -20) + daily * 1.5 - incident * 3;
   if (/rssi/i.test(column)) return -65 + daily * 7 - incident * 8;
   if (/noise/i.test(column)) return -96 + daily * 3 + incident * 7;
@@ -73,8 +92,8 @@ export function metricValue(table, column, index, sample, interval, random, samp
   if (/errors?|BipError/i.test(column)) return Math.round(load * 2 + incident * (20 + index % 5));
   if (/jitter/i.test(column)) return 0.3 + load * 2 + incident * 12;
   if (/delay|PingRespTime/i.test(column)) return 2 + load * 12 + incident * 80;
-  if (/^(portCount|adminStatusCount)$/i.test(column)) return 48;
-  if (/^(portUsedCount|operStatusCount)$/i.test(column)) return Math.round(48 * load);
+  if (/^(portCount|adminStatusCount)$/i.test(column)) return table === 'NetworkDeviceKPI' ? 4 : 48;
+  if (/^(portUsedCount|operStatusCount)$/i.test(column)) return Math.round((table === 'NetworkDeviceKPI' ? 4 : 48) * load);
   if (/count|Terminals/i.test(column)) return Math.round(8 + (20 + index % 8 * 8) * load + incident * 10);
   if (/speed|traffic|octets|bytes|Ethport.*Rate/i.test(column)) {
     const scale = /bytes|octets(?!speed)/i.test(column) ? 100000000 : 100000;
@@ -82,8 +101,8 @@ export function metricValue(table, column, index, sample, interval, random, samp
   }
   if (/power/i.test(column)) return 150 + index * 10 + daily * 20;
   // High/mid/low populations make both sides of CPU/utilization thresholds reachable.
-  return Math.max(0, Math.min(100, [68, 45, 18][index % 3] * shape.baseline + daily * 9 + trend
-    + (index % 7 - 3) * 0.8 + variation + noise + incident * 18));
+  return utilization([68, 45, 18][index % 3] * shape.baseline + daily * 9 + trend
+    + (index % 7 - 3) * 0.8 + variation + noise + incident * 18);
 }
 
 export function loadModel() {
@@ -148,7 +167,7 @@ export function generate(options, model = loadModel()) {
       enumDefinitions.set(key, dimension.values);
     }
   }
-  const tenants = tenantLayout(resources, seed);
+  const tenants = tenantLayout(resources, seed, options.tenants);
   const id = (table, index) => `${table}-${String(index + 1).padStart(4, '0')}`;
   function value(dataset, field, index) {
     const column = field.column;
@@ -175,8 +194,8 @@ export function generate(options, model = loadModel()) {
     }
     if (field.scalar === 'Bool') return index % 2;
     if (field.scalar !== 'String') throw new Error(`Unsupported scalar ${field.scalar}`);
-    if (/tenant_?id/i.test(column)) return id('X_TENANT_VIEW', dataset.table === 'X_TENANT_VIEW' ? index : tenants.assignments[index]);
-    if (/^(projectId|refParentSubnet|siteId|SITE_ID|STREXT13|srcSiteId|destSiteId)$/.test(column)) return id('X_SITE_VIEW', index);
+    if (/tenant_?id/i.test(column)) return id('X_TENANT_VIEW', dataset.table === 'X_TENANT_VIEW' ? index : tenants.assignments[index % resources]);
+    if (/^(projectId|refParentSubnet|siteId|SITE_ID|STREXT13|srcSiteId|destSiteId)$/.test(column)) return id('X_SITE_VIEW', index % resources);
     if (/^(id|resId|CSN|TENANT_ID|oriResId|frameDn)$/i.test(column)) return id(dataset.table, index);
     if (/ipAddress|IPADDRESS/i.test(column)) return `192.0.2.${index % 254 + 1}`;
     if (/mac/i.test(column)) return `02:00:00:00:${Math.floor(index / 256).toString(16).padStart(2, '0')}:${(index % 256).toString(16).padStart(2, '0')}`;
@@ -188,18 +207,34 @@ export function generate(options, model = loadModel()) {
     if (source.fields.length !== dataset.fields.length || source.fields.some(field => !dataset.fields.some(entry => entry.column === field.name))) {
       throw new Error(`Catalog/model columns differ: ${table}`);
     }
-    rows.set(table, Array.from({ length: table === 'X_TENANT_VIEW' ? tenants.count : resources }, (_, index) => Object.fromEntries(dataset.fields.map(field => [field.column, value(dataset, field, index)]))));
+    const count = table === 'X_TENANT_VIEW' ? tenants.count : table === 'I_EnterpriseNetworkLTP' ? resources * 4 : resources;
+    rows.set(table, Array.from({ length: count }, (_, index) => Object.fromEntries(dataset.fields.map(field => [field.column, value(dataset, field, index)]))));
   }
   const networkClasses = enumDefinitions.get('I_EntNetworkElement.classification');
   rows.get('I_EntNetworkElement').forEach((row,index) => Object.assign(row,
-    networkDevicePresentation(row.classification,networkClasses,row.manufacturer,index,row.productName)));
+    networkDevicePresentation(row.classification,networkClasses,row.manufacturer,index,row.productName),
+    {commuState: onlineRate(index, anchorMs - 1, 1) === 0 ? '1' : '0'}));
   const pon = rows.get('I_EntPonElement');
+  const oltCount = Math.max(1, Math.floor(resources / 8));
+  const splitterCount = Math.max(1, Math.floor(resources / 4));
   for (let i = 0; i < pon.length; i++) {
-    pon[i].classification = i % 3 === 0 ? 'ne.category.olt' : i % 3 === 1 ? 'ne.category.pon.onu' : 'ne.category.pon.spl';
-    pon[i].parentOltResId = i % 3 === 0 ? '' : pon[i - i % 3].id;
+    const parent = i < oltCount ? i : (i - oltCount) % oltCount;
+    pon[i].classification = i < oltCount ? 'ne.category.olt'
+      : i < oltCount + splitterCount ? 'ne.category.pon.spl' : 'ne.category.pon.onu';
+    pon[i].parentOltResId = i < oltCount ? '' : pon[parent].id;
     // OLT and its ONUs share a tenant and site in the synthetic hierarchy.
-    for (const column of ['tenantId', 'projectId', 'refParentSubnet']) pon[i][column] = pon[i - i % 3][column];
+    for (const column of ['tenantId', 'projectId', 'refParentSubnet']) pon[i][column] = pon[parent][column];
   }
+  for (const table of ['HuaweiStorageDevice', 'FCSwitchDevice']) rows.get(table).forEach((row, index) => {
+    // Source catalog: all three capacities are MB, usedCapacityRate is 0..1.
+    const total = Math.round((2 + categoryRandom(seed, table, index, 'capacity-total') * 62) * 1000000);
+    const ratio = 0.1 + categoryRandom(seed, table, index, 'capacity-used') * 0.8;
+    row.totalCapacity = total;
+    row.totalStoragePoolCapacity = total;
+    row.usedCapacity = Math.round(total * ratio);
+    row.unUsedCapacity = total - row.usedCapacity;
+    row.usedCapacityRate = row.usedCapacity / total;
+  });
   // Group alternative owners by source column. Separate physical families keep distinct IDs.
   const groups = new Map();
   const identityField = field => field.is_key || ['oriResId', 'frameDn', 'diskId', 'name'].includes(field.column);
@@ -228,7 +263,9 @@ export function generate(options, model = loadModel()) {
   for (let pass = 0; pass < 3; pass++) for (const group of groups.values()) {
     rows.get(group.table).forEach((row, index) => {
       const target = group.targets[index % group.targets.length];
-      row[group.column] = rows.get(target.table)[index][target.column];
+      const candidates = rows.get(target.table);
+      const parentIndex = group.table === 'I_EnterpriseNetworkLTP' && group.column === 'refParentNE' ? Math.floor(index / 4) : index;
+      row[group.column] = candidates[parentIndex % candidates.length][target.column];
     });
   }
   // Components inherit ownership through their actual parent, including PON
@@ -238,7 +275,9 @@ export function generate(options, model = loadModel()) {
     if (!parentColumns.has(group.column)) continue;
     rows.get(group.table).forEach((row,index) => {
       const target = group.targets[index % group.targets.length];
-      const parent = rows.get(target.table)[index];
+      const candidates = rows.get(target.table);
+      const parentIndex = group.table === 'I_EnterpriseNetworkLTP' && group.column === 'refParentNE' ? Math.floor(index / 4) : index;
+      const parent = candidates[parentIndex % candidates.length];
       const tenant = parent.tenantId ?? parent.TENANT_ID;
       if (tenant !== undefined && 'tenantId' in row) row.tenantId = tenant;
       if (parent.projectId !== undefined) for (const column of ['projectId','refParentSubnet','siteId']) {
@@ -246,6 +285,26 @@ export function generate(options, model = loadModel()) {
       }
     });
   }
+  rows.get('I_EnterpriseNetworkLTP').forEach((row, index) => {
+    const device = rows.get('I_EntNetworkElement')[Math.floor(index / 4)];
+    row.refParentNE = device.id;
+    row.tenantId = device.tenantId;
+    row.name = `GigabitEthernet0/0/${index % 4 + 1}`;
+    row.alias = row.name;
+    row.portIndex = String(index % 4 + 1);
+    row.nativeId = row.name;
+    row.bandwidth = index % 4 === 3 ? 10000000000 : 1000000000;
+    row.ifType = 2;
+    const active = metricValue('NetworkDeviceKPI', 'operStatusCount', Math.floor(index / 4),
+      samples - 1, interval, () => 0.5, samples, anchorMs - days * 86400000, waves);
+    row.operState = index % 4 < active ? 'active' : 'inactive';
+  });
+  rows.get('I_EnterpriseOpticalModule').forEach((row, index) => {
+    const port = rows.get('I_EnterpriseNetworkLTP')[index * 4];
+    row.neResId = port.refParentNE;
+    row.ifName = port.name;
+    row.tenantId = port.tenantId;
+  });
   const ownerTables = {
     NetworkDeviceInterfaceKPI: 'I_EnterpriseNetworkLTP', NetworkDeviceBoardKPI: 'I_EnterpriseSlot',
     ServerDeviceKPI: 'PhysicalServer', StorageDeviceKPI: 'HuaweiStorageDevice',
@@ -254,6 +313,10 @@ export function generate(options, model = loadModel()) {
   for (const [table, dataset] of tables) if (dataset.fields.some(field => field.column === 'ts')) {
     const ownerTable = ownerTables[table] ?? (table.startsWith('Pon') ? 'I_EntPonElement' : 'I_EntNetworkElement');
     const owners = rows.get(ownerTable);
+    if (table === 'NetworkDeviceInterfaceKPI') {
+      const base = rows.get(table);
+      rows.set(table, owners.map((_, index) => ({...base[index % base.length]})));
+    }
     if (table === 'StorageDeviceKPI') {
       const base = rows.get(table);
       rows.set(table, [...owners, ...rows.get('FCSwitchDevice')].map((owner, index) => ({ ...base[index % base.length], resId: owner.id })));
@@ -278,6 +341,7 @@ export function generate(options, model = loadModel()) {
       }
       if ('projectId' in row && table !== 'PonDeviceOnuKPI') row.projectId = owner.projectId ?? row.projectId;
       if ('deviceName' in row) row.deviceName = owner.name;
+      if ('interfaceName' in row) row.interfaceName = owner.name;
       if ('classification' in row) row.classification = owner.classification;
     });
     if (table === 'PonDeviceOnuKPI') rows.set(table, rows.get(table).filter((row, index, all) => all.findIndex(other => other.resId === row.resId) === index));
@@ -291,6 +355,8 @@ export function generate(options, model = loadModel()) {
   });
   const gapEnds = new Map(seriesGaps.map(gap => [gap.resId, Date.parse(gap.endExclusive)]));
   const alarmTemplates = rows.get('T_CURRENT_ALARM');
+  const alarmAssets = new Map(Object.keys(alarmFamilies).map(family => [family,
+    rows.get(family).map(owner => alarmProfile(family, owner, rows.get('I_EnterpriseNetworkLTP')))]));
   const alarms = [];
   const startMs = anchorMs - days * 86400000;
   for (let day = Math.floor(startMs / 86400000) * 86400000, dayIndex = 0; day < anchorMs; day += 86400000, dayIndex++) {
@@ -306,13 +372,12 @@ export function generate(options, model = loadModel()) {
       const eventIndex = alarms.length;
       const family = ['I_EntNetworkElement', 'PhysicalServer', 'HuaweiStorageDevice', 'I_EntPonElement', 'FCSwitchDevice', 'I_EntCollaborationElement'][slot % 6];
       const owner = rows.get(family)[index];
-      row.MEDN = owner.id;
-      row.TENANTID = owner.tenantId;
+      const {ports, ...profile} = alarmAssets.get(family)[index];
+      Object.assign(row, profile);
       row.STREXT13 = owner.projectId ?? id('X_SITE_VIEW', index);
       row.MENAME = owner.name;
       row.MANUFACTURER = owner.manufacturer ?? '';
       row.PRODUCTNAME = owner.productName ?? owner.productmodel ?? '';
-      row.MECATEGORY = owner.classification ?? '';
       row.TENANT = rows.get('X_TENANT_VIEW').find(tenant => tenant.TENANT_ID === owner.tenantId)?.TENANT_NAME ?? '';
       row.CSN = eventIndex + 1;
       // critical / major / minor / warning: 1 / 1.8 / 3.2 / 4.
@@ -321,11 +386,18 @@ export function generate(options, model = loadModel()) {
       const recent = dayIndex >= days - 2;
       row.ACKED = (slot + dayIndex) % 5 === 0 ? 0 : 1;
       row.CLEARED = (slot + dayIndex) % (recent ? 3 : 13) === 0 ? 0 : 1;
-      row.ALARMNAME = ['CPU 利用率过高', '内存使用率过高', '链路质量下降', '设备短时离线', '设备温度过高', '端口错误率升高'][Math.floor(slot / 6) % 6];
       row.LOCATION = owner.projectId ?? owner.name;
       const duration = Math.min(120000, Math.max(0, end - begin - 1));
       const occur = Math.max(startMs, Math.min((gapEnds.get(owner.id) ?? anchorMs) - duration - 1,
         Math.floor(begin + (slot + 0.2 + random() * 0.6) / count * Math.max(1, end - begin - duration))));
+      const metricTable = {PhysicalServer:'ServerDeviceKPI', HuaweiStorageDevice:'StorageDeviceKPI',
+        FCSwitchDevice:'StorageDeviceKPI', I_EntPonElement:'PonDeviceKPI'}[family] ?? 'NetworkDeviceKPI';
+      const load = waves(metricTable, metricTable === 'StorageDeviceKPI' ? 'cpuusage' : 'cpuUsage', index).at(occur).load;
+      row.ALARMNAME = alarmEvent({...profile, ports}, load, onlineRate(index, occur, 60000) < 100,
+        categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'event'),
+        categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'event-variant'));
+      const port = ports[Math.floor(categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'port') * ports.length)];
+      row.MOI = ['链路质量下降', '端口错误率升高'].includes(row.ALARMNAME) ? `Port ID=${port.portIndex}` : '';
       for (const column of ['OCCURUTC', 'OCCURTIME', 'LATESTOCCURUTC', 'LATESTOCCURTIME']) row[column] = occur;
       row.ARRIVEUTC = occur + Math.min(1000, duration);
       row.ACKUTC = row.ACKED ? occur + Math.floor(duration / 2) : 0;
@@ -357,18 +429,28 @@ export function generate(options, model = loadModel()) {
       const sourceFields = catalog.datasets.find(entry => entry.table === table).fields;
       const metricColumns = new Set(sourceFields.filter(field => field.columnType === 'measure').map(field => field.name));
       for (const [index, base] of rows.get(table).entries()) {
+        const optics = table === 'PonDeviceOnuKPI' ? createPonOptics(seed, base.resId, base.parentId) : null;
+        const phase = Math.floor(categoryRandom(seed, table, index, 'sampling-phase') * 101);
+        const missing = 2 + Math.floor(categoryRandom(seed, table, index, 'sampling-missing') * 7);
         for (let sample = 0; sample < (metric ? samples : 1); sample++) {
           if (metric && table === 'StorageDeviceKPI' && startMs + sample * interval >= (gapEnds.get(base.resId) ?? anchorMs)) continue;
+          // Missing observations are absent rows. Retain boundary observations;
+          // coarse (>=6h) scenarios retain daily coverage for alarm examples.
+          if (metric && intervalMinutes < 360 && sample > 0 && sample < samples - 1 && (sample * 37 + phase) % 101 < missing) continue;
           const row = { ...base };
           if (metric) {
-            row.ts = iso(startMs + sample * interval);
+            const jitter = sample === 0 || sample === samples - 1 ? 0
+              : Math.floor(((sample * 7919 + phase * 104729) % 1009) / 1009 * Math.min(180000, interval * 0.04));
+            row.ts = iso(startMs + sample * interval + jitter);
+            const opticalValues = optics?.(Date.parse(row.ts));
             for (const field of dataset.fields) if (metricColumns.has(field.column)) {
-              let number = metricValue(table, field.column, index, sample, interval, random, samples, startMs, waves);
+              let number = opticalValues?.[field.column] ?? metricValue(table, field.column, index, sample, interval, random, samples, startMs, waves);
               if (field.scalar === 'Int') number = Math.round(number);
               if (field.scalar === 'Float') number = Number(number.toFixed(3));
               if (field.scalar === 'Int' || field.scalar === 'Float') row[field.column] = number;
             }
           }
+          if (table === 'NetworkDeviceKPI') row.ifUtilizationRate = 100 * row.operStatusCount / row.portCount;
           if (table === 'ServerDeviceKPI') row.peakPower = Math.max(row.peakPower, Number((Math.max(row.averagePower*1.12,row.systemPower*1.05)).toFixed(3)));
           insert.run(...dataset.fields.map(field => row[field.column]));
           counts[table]++;
@@ -398,14 +480,14 @@ export function generate(options, model = loadModel()) {
     }
     db.exec('COMMIT; ANALYZE');
     const checks = validate(db, model, counts, { anchor, start: iso(startMs) });
-    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length || checks.invalidMetricScenarios.length || checks.invalidAlarmTimes.length || checks.missingAlarmDays.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
+    if (checks.integrity !== 'ok' || checks.emptyTables.length || checks.emptyCarriers.length || checks.invalidTimes.length || checks.invalidEnums.length || checks.missingCpuSeries.length || checks.alarmsWithoutCpuSamples.length || checks.invalidMetricScenarios.length || checks.invalidAlarmTimes.length || checks.invalidAlarmProfiles.length || checks.missingAlarmDays.length) throw new Error(`Validation failed: ${JSON.stringify(checks)}`);
     const alarmDays = db.prepare("SELECT date(OCCURUTC / 1000,'unixepoch') day, count(*) alarms, sum(SEVERITY='1') critical, sum(CLEARED=0) uncleared FROM T_CURRENT_ALARM GROUP BY day ORDER BY day").all();
     db.close();
     db = undefined;
     const manifest = {
       format: 'icloud-synthetic-data/v1', revision: model.revision,
-      options: { seed, resources, days, intervalMinutes, anchor: inputAnchor, storageGapHours, alarmsPerResourcePerDay },
-      generation: { revision: 7, capacityUtilizationProfile: 'source-fraction/v1', devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
+      options: { seed, resources, tenants: tenants.count, days, intervalMinutes, anchor: inputAnchor, storageGapHours, alarmsPerResourcePerDay },
+      generation: { revision: 11, ponOpticsProfile: 'hierarchical-path-loss/v1', alarmProfile: 'asset-derived-conditional-events/v2', capacityUtilizationProfile: 'conserved-capacity-mb/v2', samplingProfile: 'seeded-missing-jitter/v1', topologyProfile: 'multi-port-multi-onu/v1', availabilityProfile: 'interval-downtime/v1', devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v2', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
       window: { start: iso(startMs), endExclusive: anchor, samplesPerSeries: samples },
       catalogSha256: hash(catalogBytes), modelSha256: hash(JSON.stringify(model)),
       database: { file: 'icloud.sqlite', sha256: hash(readFileSync(databasePath)) },
@@ -419,7 +501,6 @@ export function generate(options, model = loadModel()) {
         'EpochMillis fields use millisecond values; unresolved source semantics remain subject to model TODOs.',
         'Absent alarm acknowledgement/clear times use zero; Local integer times use the same synthetic clock as UTC.',
         'Relationship cardinality exceptions are reported and are not represented as SQLite foreign keys.',
-        'Server-to-tenant source relations declare reversed cardinalities; shared tenants expose these exceptions without changing the model.',
       ],
     };
     writeFileSync(join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -455,7 +536,16 @@ export function validate(db, model, counts, { anchor, start } = {}) {
   const checks = { integrity: db.prepare('PRAGMA integrity_check').get().integrity_check,
     emptyTables: [], emptyCarriers: [], invalidTimes: [], invalidEnums: [], relations: [],
     missingCpuSeries: [], alarmsWithoutCpuSamples: [], unsupportedAlarmCpuResources: [],
-    invalidMetricScenarios: [], invalidAlarmTimes: [], missingAlarmDays: [] };
+    invalidMetricScenarios: [], invalidAlarmTimes: [], invalidAlarmProfiles: [], missingAlarmDays: [] };
+  const ports = db.prepare('SELECT * FROM I_EnterpriseNetworkLTP').all();
+  const assets = new Map(Object.keys(alarmFamilies).flatMap(family =>
+    db.prepare(`SELECT * FROM ${quote(family)}`).all().map(owner => [owner.id, alarmProfile(family, owner, ports)])));
+  for (const alarm of db.prepare('SELECT * FROM T_CURRENT_ALARM').all()) {
+    const expected = assets.get(alarm.MEDN);
+    if (!expected || Object.entries(expected).some(([key, value]) => key !== 'ports' && value !== undefined && alarm[key] !== value)
+      || (alarm.MOI && !expected.ports.some(port => alarm.MOI === `Port ID=${port.portIndex}`))
+      || (['链路质量下降', '端口错误率升高'].includes(alarm.ALARMNAME) && !alarm.MOI)) checks.invalidAlarmProfiles.push(alarm.CSN);
+  }
   if (start && anchor) {
     const present = new Set(db.prepare("SELECT DISTINCT date(OCCURUTC / 1000,'unixepoch') day FROM T_CURRENT_ALARM").all().map(row => row.day));
     for (let day = Math.floor(Date.parse(start) / 86400000) * 86400000; day < Date.parse(anchor); day += 86400000) {
@@ -463,8 +553,8 @@ export function validate(db, model, counts, { anchor, start } = {}) {
     }
   }
   for (const [table, predicate] of [
-    ['HuaweiStorageDevice', 'usedCapacityRate < 0 OR usedCapacityRate > 1'],
-    ['FCSwitchDevice', 'usedCapacityRate < 0 OR usedCapacityRate > 1'],
+    ...['HuaweiStorageDevice', 'FCSwitchDevice'].map(table => [table,
+      'totalCapacity <= 0 OR usedCapacity < 0 OR unUsedCapacity < 0 OR abs(totalCapacity-usedCapacity-unUsedCapacity)>0.001 OR abs(usedCapacityRate-usedCapacity/totalCapacity)>0.000001 OR usedCapacityRate < 0 OR usedCapacityRate > 1']),
     ['ServerDeviceKPI', 'peakPower < averagePower OR systemPower < 0 OR averagePower < 0'],
     ['StorageHardDriveKPI', 'utility < 0 OR utility > 100 OR avgreadiosize < 0 OR avgwriteiosize < 0'],
     ['StorageDeviceKPI', 'cpuusage < 0 OR cpuusage > 100 OR memoryusage < 0 OR memoryusage > 100'],
@@ -548,15 +638,17 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const { values } = parseArgs({ options: {
     output: { type: 'string', default: 'bin/icloud-data' }, seed: { type: 'string', default: '20260926' },
     resources: { type: 'string', default: '12' }, days: { type: 'string', default: '32' },
+    tenants: { type: 'string' },
     'interval-minutes': { type: 'string', default: '60' },
     'storage-gap-hours': { type: 'string', default: '0' },
     'alarms-per-resource-per-day': { type: 'string', default: '2' },
     'anchor-utc': { type: 'string' }, help: { type: 'boolean' },
   } });
   if (values.help) {
-    console.log('Usage: node scripts/generate-icloud-data.mjs [--output DIR] [--seed N] [--resources N>=6]\n  [--days N] [--interval-minutes N] [--storage-gap-hours N] [--alarms-per-resource-per-day N]\n  [--anchor-utc YYYY-MM-DDTHH:MM:SSZ]\nRequires Node.js 22.13+; reads the static JSON generation contract. Creates icloud.sqlite, manifest.json and model.json.\nExisting output directories are preserved. Default: 12 resources/table, 32 days, hourly samples, alarms every day.');
+    console.log('Usage: node scripts/generate-icloud-data.mjs [--output DIR] [--seed N] [--resources N>=6]\n  [--tenants N] [--days N] [--interval-minutes N] [--storage-gap-hours N] [--alarms-per-resource-per-day N]\n  [--anchor-utc YYYY-MM-DDTHH:MM:SSZ]\nRequires Node.js 22.13+; reads the static JSON generation contract. Creates icloud.sqlite, manifest.json and model.json.\nExisting output directories are preserved. Default: 12 resources/table, 32 days, hourly samples, alarms every day.');
   } else {
     const manifest = generate({ output: resolve(values.output), seed: Number(values.seed), resources: Number(values.resources),
+      ...(values.tenants === undefined ? {} : {tenants: Number(values.tenants)}),
       days: Number(values.days), intervalMinutes: Number(values['interval-minutes']), storageGapHours: Number(values['storage-gap-hours']),
       alarmsPerResourcePerDay: Number(values['alarms-per-resource-per-day']),
       anchor: values['anchor-utc'] ?? iso(Math.floor(Date.now() / 60000) * 60000) });
