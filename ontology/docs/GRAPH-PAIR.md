@@ -3,7 +3,7 @@
 GraphPair 分别聚合两个总体，按完整身份做内连接，并显式选择每个展示列来自哪一侧。
 
 ```text
-{"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
+{"op":"GraphPair","left":<Graph intent>,"right":<Graph intent>,
  "align_by":[{"left":{"node":"previous_device"},"right":{"node":"current_device"}}],
  "select":[{"side":"Left","node":"previous_device","dimension":"device_name"},
            {"side":"Right","node":"current_device","dimension":"device_name"}],

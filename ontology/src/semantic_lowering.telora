@@ -1,0 +1,824 @@
+# RFC 0006：仅适配模型契约，不提供另一套查询表达式。
+use crate::semantic_model as s;
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::groups as groups;
+use crate::scalars as scalars;
+use crate::property_contract as contract;
+use crate::knowledge as knowledge;
+use crate::transform as transform;
+use crate::model as model;
+use crate::values as values;
+use crate::samples as samples;
+use crate::relations as relations;
+use std::array as array;
+use std::type_property as property;
+use std::dict as dict;
+
+type Mapping = struct {
+    id: String,
+    row: Type,
+    prepared: s::Prepared
+};
+def mapping: Fn(String, Type) -> Mapping = fn(id, row) {
+    contract::publish_name(id);
+    {id, row, prepared: s::prepare(row)}
+};
+def require: for(A) Fn(Option(A)) -> A = fn(value) {
+    match value {
+        Some(value) => value,
+        None => fail!("semantic mapping dependency does not exist")
+    }
+};
+def physical_name: Fn(s::Field, Int) -> String = fn(field, part) {
+    if array::length(field.columns) == 1 {
+        field.name
+    } else {
+        `\{field.name}__\{part}`
+    }
+};
+def component_types: Fn(s::Field) -> Array(Type) = fn(field) {
+    match field.reference {
+        Some(ref) => array::map(
+            s::reference_parts(ref.identity),
+            fn(part) {
+                part.value
+            }
+        ),
+        None => if property::get_type_prop(field.value, s::IdentityInfo.type) != None {
+            array::map(
+                s::identity(field.value).parts,
+                fn(part) {
+                    part.value
+                }
+            )
+        } else {
+            [field.value]
+        }
+    }
+};
+def physical_fields: Fn(s::Prepared) -> Array(edsl::FieldEntry) = fn(prepared) {
+    let fields = array::flat_map(
+        prepared.fields,
+        fn(field) {
+            let parts = component_types(field);
+            array::map(
+                array::enumerate(field.columns),
+                fn(part) {
+                    {
+                        time: scalars::time_role(parts[part.0]),
+                        nullable: field.nullable,
+                        index: 0,
+                        name: physical_name(field, part.0),
+                        column: part.1,
+                        ty: groups::representation(parts[part.0])
+                    }.ty!(edsl::FieldEntry)
+                }
+            )
+        }
+    );
+    contract::unique(
+        array::map(
+            fields,
+            fn(field) {
+                field.name
+            }
+        )
+    );
+    array::map(
+        array::enumerate(fields),
+        fn(pair) {
+            pair.1 <~ {index: pair.0}
+        }
+    )
+};
+def indexes: Fn(edsl::EntityEntry, s::Field) -> Array(Int) = fn(entity, field) {
+    array::map(
+        array::enumerate(field.columns),
+        fn(part) {
+            require(
+                array::find(
+                    entity.fields,
+                    fn(candidate) {
+                        candidate.name == physical_name(field, part.0)
+                    }
+                )
+            ).index
+        }
+    )
+};
+def source_field: Fn(s::Prepared, String) -> s::Field = fn(prepared, name) {
+    require(
+        array::find(
+            prepared.fields,
+            fn(field) {
+                field.name == name
+            }
+        )
+    )
+};
+def entity_entry: Fn(Mapping, Int) -> edsl::EntityEntry = fn(mapping, index) {
+    let p = mapping.prepared;
+    let source: qb::Source = {table: p.source, alias: `semantic_\{index}`, scope: None};
+    let fields = physical_fields(p);
+    let base: edsl::EntityEntry = {
+        index,
+        id: mapping.id,
+        entity_type: mapping.row,
+        table: p.source,
+        alias: source.alias,
+        source,
+        fields,
+        grain_fields: [],
+        references: [],
+        sample_order: None,
+        sample_measures: [],
+        scope: [],
+        source_scope: {
+            alias: source.alias,
+            bindings: [],
+            expression: None,
+            required: {
+                allowed_operators: [],
+                allowed_scalars: [],
+                allowed_aggregates: [],
+                allowed_join_kinds: [],
+                allow_distinct: False
+            }
+        }
+    };
+    let order = match p.clock {
+        None => None,
+        Some(name) => {
+            let clock = source_field(p, name);
+            Some(
+                {
+                    time: {source: source.alias, column: clock.columns[0]},
+                    ties: array::flat_map(
+                        p.grain,
+                        fn(name) {
+                            if name == clock.name {
+                                []
+                            } else {
+                                array::map(
+                                    indexes(base, source_field(p, name)),
+                                    fn(index) {
+                                        {source: source.alias, column: fields[index].column}.ty!(
+                                            qb::ColumnRef
+                                        )
+                                    }
+                                )
+                            }
+                        }
+                    )
+                }.ty!(qb::LatestOrder)
+            )
+        }
+    };
+    base <~ {
+        sample_order: order,
+        grain_fields: array::flat_map(
+            p.grain,
+            fn(name) {
+                indexes(base, source_field(p, name))
+            }
+        ),
+        references: array::concat([
+            array::map(edsl::references_of(mapping.row), fn(reference) {
+                reference <~ {fields: array::flat_map(reference.fields, fn(name) {
+                    array::map(indexes(base, source_field(p, name)), fn(index) { fields[index].name })
+                })}
+            }),
+            match p.binding {
+            None => [],
+            Some(binding) => [
+                {
+                    id: "identity",
+                    fields: array::map(
+                        indexes(base, source_field(p, binding.field)),
+                        fn(index) {
+                            fields[index].name
+                        }
+                    )
+                }
+            ]
+            }
+        ])
+    }
+};
+def dimension_bindings: Fn(Mapping, edsl::EntityEntry) -> Array(groups::BindingFacts) = fn(
+    mapping,
+    entity
+) {
+    array::flat_map(
+        mapping.prepared.fields,
+        fn(field) {
+            let attribute = match field.meaning {
+                Some(meaning) => if meaning.usage == s::Usage::Attribute {
+                    Some(meaning.name)
+                } else {
+                    None
+                },
+                None => None
+            };
+            if array::length(field.columns) != 1 {
+                if attribute != None {
+                    fail!("semantic scalar attribute requires one physical column", field.name)
+                } else {
+                    []
+                }
+            } else if array::length(field.views) == 0 && property::get_field_prop(
+                mapping.row,
+                require(model::field_info(mapping.row, field.name)).index,
+                values::FieldDomains.type
+            ) != None {
+                []
+            } else {
+                let index = indexes(entity, field)[0];
+                let local = match attribute {
+                    Some(name) => name,
+                    None => field.name
+                };
+                let views = if array::length(field.views) == 0 {
+                    [
+                        {
+                            id: local,
+                            group: "physical",
+                            value: component_types(field)[0],
+                            nullable: field.nullable,
+                            projectable: True,
+                            group_projectable: True,
+                            group_filters: [],
+                            filters: []
+                        }.ty!(groups::FieldDimension)
+                    ]
+                } else {
+                    field.views
+                };
+                array::map(
+                    views,
+                    fn(view) {
+                        let member: groups::Member = {
+                            group: view.group,
+                            local: view.id,
+                            id: if array::length(field.views) > 0 && require(
+                                property::get_type_prop(mapping.row, s::TableInfo.type)
+                            ).id != None {
+                                view.id
+                            } else {
+                                `\{mapping.id}__\{view.id}`
+                            },
+                            node: groups::Node::Column(
+                                {
+                                    index,
+                                    name: entity.fields[index].name,
+                                    value: view.value,
+                                    nullable: view.nullable
+                                }
+                            ),
+                            value: view.value,
+                            nullable: view.nullable,
+                            aggregate: None,
+                            projectable: view.projectable,
+                            filters: view.filters,
+                            kind: groups::MemberKind::Dimension(
+                                {projectable: view.group_projectable, filters: view.group_filters}
+                            )
+                        };
+                        {
+                            row: mapping.row,
+                            dataset: mapping.id,
+                            source: mapping.prepared.source,
+                            contract: groups::BindingContract::DeferredDimension(
+                                {
+                                    id: view.group,
+                                    value: view.value,
+                                    projectable: view.group_projectable,
+                                    filters: view.group_filters
+                                }
+                            ),
+                            members: [member]
+                        }.ty!(groups::BindingFacts)
+                    }
+                )
+            }
+        }
+    )
+};
+def remap_node: Fn(groups::Node, Fn(Int) -> Int) -> groups::Node = fn(node, index) {
+    let column: Fn(groups::Column) -> groups::Column = fn(column) {
+        column <~ {index: index(column.index)}
+    };
+    match node {
+        groups::Node::Column(value) => groups::Node::Column(column(value)),
+        groups::Node::Seconds(input) => groups::Node::Seconds(remap_node(input, index)),
+        groups::Node::Ipv4(input) => groups::Node::Ipv4(remap_node(input, index)),
+        groups::Node::UtcBucket(bucket) => groups::Node::UtcBucket(
+            bucket <~ {input: remap_node(bucket.input, index)}
+        ),
+        groups::Node::Rate(inputs) => groups::Node::Rate(
+            {amount: remap_node(inputs.amount, index), duration: remap_node(inputs.duration, index)}
+        ),
+        groups::Node::Identity(input) => groups::Node::Identity(
+            {column: column(input.column), parts: array::map(input.parts, column)}
+        )
+    }
+};
+def statistic_bindings: Fn(Mapping, edsl::EntityEntry) -> Array(groups::BindingFacts) = fn(
+    mapping,
+    entity
+) {
+    array::flat_map(
+        mapping.prepared.fields,
+        fn(field) {
+            match field.meaning {
+                Some(meaning) => array::map(
+                    meaning.statistics,
+                    fn(statistic) {
+                        let pair = match statistic {
+                            s::Statistic::Mean => (
+                                "mean",
+                                qb::AggregateFunction::Avg,
+                                groups::Statistic::Mean
+                            ),
+                            s::Statistic::Min => (
+                                "min",
+                                qb::AggregateFunction::Min,
+                                groups::Statistic::Min
+                            ),
+                            s::Statistic::Max => (
+                                "max",
+                                qb::AggregateFunction::Max,
+                                groups::Statistic::Max
+                            ),
+                            s::Statistic::Sum => (
+                                "sum",
+                                qb::AggregateFunction::Sum,
+                                groups::Statistic::Sum
+                            )
+                        };
+                        let id = `\{mapping.id}__\{meaning.name}_\{pair.0}`;
+                        {
+                            row: mapping.row,
+                            dataset: mapping.id,
+                            source: mapping.prepared.source,
+                            contract: groups::BindingContract::Numeric(
+                                {id: meaning.name, value: field.value, members: [pair.2]}
+                            ),
+                            members: [
+                                {
+                                    group: meaning.name,
+                                    local: pair.0,
+                                    id,
+                                    node: groups::Node::Column(
+                                        {
+                                            index: indexes(entity, field)[0],
+                                            name: field.name,
+                                            value: field.value,
+                                            nullable: field.nullable
+                                        }
+                                    ),
+                                    value: field.value,
+                                    nullable: field.nullable,
+                                    aggregate: Some(pair.1),
+                                    projectable: False,
+                                    filters: [],
+                                    kind: groups::MemberKind::Numeric(pair.2)
+                                }
+                            ]
+                        }.ty!(groups::BindingFacts)
+                    }
+                ),
+                None => []
+            }
+        }
+    )
+};
+# 样本与分类 property 已在字段边界完成名义类型检查；这里只展开物理索引。
+def local_definition: Fn(Mapping) -> transform::LocalDefinition = fn(mapping) {
+    let entity = entity_entry(mapping, 0);
+    let dataset: model::PreparedDataset = {
+        id: mapping.id,
+        source: mapping.prepared.source,
+        row: mapping.row,
+        grain: mapping.prepared.grain,
+        roles: array::flat_map(
+            mapping.prepared.fields,
+            fn(field) {
+                let by = match field.reference {
+                    Some(ref) => if property::get_type_prop(ref.identity, s::IdentityInfo.type) != None {
+                        Some(ref.identity)
+                    } else {
+                        None
+                    },
+                    None => if property::get_type_prop(field.value, s::IdentityInfo.type) != None {
+                        Some(field.value)
+                    } else {
+                        None
+                    }
+                };
+                let targets = if array::length(field.targets) > 0 {
+                    field.targets
+                } else {
+                    match by {
+                        Some(by) => [{name: field.name, identity: by}.ty!(s::ReferenceTarget)],
+                        None => []
+                    }
+                };
+                array::map(
+                    targets,
+                    fn(target) {
+                        let identity = s::identity(target.identity);
+                        let source_indexes = indexes(entity, field);
+                        {
+                            row: mapping.row,
+                            id: target.name,
+                            entity: identity.entity,
+                            identity: target.identity,
+                            optional: field.nullable,
+                            parts: array::map(
+                                array::enumerate(identity.parts),
+                                fn(part) {
+                                    {
+                                        source: entity.fields[source_indexes[part.0]].name,
+                                        target: part.1.path,
+                                        source_index: source_indexes[part.0],
+                                        target_index: part.0,
+                                        value: part.1.value,
+                                        nullable: field.nullable,
+                                        raw: None
+                                    }.ty!(model::Part)
+                                }
+                            )
+                        }.ty!(model::PreparedRole)
+                    }
+                )
+            }
+        )
+    };
+    let physical_index: Fn(Int) -> Int = fn(index) {
+        let field = mapping.prepared.fields[index];
+        if array::length(field.columns) != 1 {
+            fail!("scalar capability cannot bind a composite field", field.name)
+        } else {
+            indexes(entity, field)[0]
+        }
+    };
+    let domains = array::map(
+        values::field_bindings(dataset),
+        fn(binding) {
+            binding <~ {column: binding.column <~ {index: physical_index(binding.column.index)}}
+        }
+    );
+    let reported = array::map(
+        samples::field_bindings(dataset),
+        fn(binding) {
+            binding <~ {index: physical_index(binding.index)}
+        }
+    );
+    let clock = match entity.sample_order {
+        None => None,
+        Some(order) => {
+            let field = require(
+                array::find(
+                    entity.fields,
+                    fn(field) {
+                        field.column == order.time.column
+                    }
+                )
+            );
+            Some({name: field.name, index: field.index}.ty!(transform::Clock))
+        }
+    };
+    if array::length(reported) > 0 && clock == None {
+        fail!("sample field requires a mapping clock", mapping.id)
+    } else {
+        ()
+    };
+    let bindings = array::concat(
+        [
+            dimension_bindings(mapping, entity),
+            statistic_bindings(mapping, entity),
+            array::map(
+                array::concat(
+                    [groups::field_expressions_for(dataset), groups::field_statistics_for(dataset)]
+                ),
+                fn(binding) {
+                    binding <~ {
+                        members: array::map(
+                            binding.members,
+                            fn(member) {
+                                member <~ {node: remap_node(member.node, physical_index)}
+                            }
+                        )
+                    }
+                }
+            )
+        ]
+    );
+    let declared: transform::Declaration = {
+        dataset,
+        grain_fields: entity.grain_fields,
+        groups: bindings,
+        domains,
+        record_counts: mapping.prepared.record_counts,
+        field_counts: array::flat_map(
+            array::enumerate(mapping.prepared.fields),
+            fn(pair) {
+                match property::get_field_prop(mapping.row, pair.0, s::FieldCounts.type) {
+                    None => [],
+                    Some(spec) => array::map(
+                        spec.items,
+                        fn(count) {
+                            {
+                                index: physical_index(pair.0),
+                                row: mapping.row,
+                                dataset: mapping.id,
+                                source: dataset.source,
+                                field: pair.1.name,
+                                value: pair.1.value,
+                                nullable: pair.1.nullable,
+                                id: count.name,
+                                condition: match count.condition {
+                                    None => None,
+                                    Some(condition) => {
+                                        let binding = require(
+                                            array::find(
+                                                domains,
+                                                fn(binding) {
+                                                    binding.id == condition.dimension
+                                                }
+                                            )
+                                        );
+                                        if !array::any(
+                                            binding.filters,
+                                            fn(filter) {
+                                                filter == groups::Filter::Eq
+                                            }
+                                        ) {
+                                            fail!(
+                                                "count condition requires equality capability",
+                                                count.name
+                                            )
+                                        } else {
+                                            ()
+                                        };
+                                        Some(
+                                            {
+                                                binding,
+                                                wires: require(
+                                                    dict::get(
+                                                        binding.definition.bindings,
+                                                        condition.member
+                                                    )
+                                                ),
+                                                member: condition.member
+                                            }.ty!(values::MemberPredicate)
+                                        )
+                                    }
+                                }
+                            }.ty!(transform::FieldCountFacts)
+                        }
+                    )
+                }
+            }
+        ),
+        computed_counts: match property::get_type_prop(mapping.row, s::ComputedCounts.type) {
+            None => [],
+            Some(spec) => array::map(
+                spec.items,
+                fn(count) {
+                    let reference: Fn(String) -> transform::CountRefFacts = fn(id) {
+                        {row: mapping.row, dataset: mapping.id, source: dataset.source, id}
+                    };
+                    {
+                        result: reference(count.name),
+                        op: count.op,
+                        left: reference(count.left),
+                        right: reference(count.right)
+                    }.ty!(transform::ComputedCountFacts)
+                }
+            )
+        },
+        native_pairs: match property::get_type_prop(mapping.row, s::NativePairs.type) {
+            None => [],
+            Some(spec) => array::map(
+                spec.items,
+                fn(pair) {
+                    let binding: Fn(String) -> groups::BindingFacts = fn(id) {
+                        require(
+                            array::find(
+                                bindings,
+                                fn(binding) {
+                                    array::length(binding.members) == 1 && binding.members[0].id == id
+                                }
+                            )
+                        )
+                    };
+                    {id: pair.name, first: binding(pair.left), second: binding(pair.right)}.ty!(
+                        transform::NativePairFacts
+                    )
+                }
+            )
+        },
+        kind: mapping.prepared.kind,
+        scope: array::flat_map(
+            mapping.prepared.fields,
+            fn(field) {
+                match field.scope {
+                    None => [],
+                    Some(input) => [
+                        {
+                            row: mapping.row,
+                            dataset: mapping.id,
+                            source: mapping.prepared.source,
+                            column: {
+                                index: indexes(entity, field)[0],
+                                name: field.name,
+                                value: field.value,
+                                nullable: field.nullable
+                            },
+                            input
+                        }.ty!(transform::RowScopeFacts)
+                    ]
+                }
+            }
+        ),
+        clock,
+        samples: reported
+    };
+    transform::initialize_prepared(
+        declared,
+        entity <~ {
+            sample_measures: samples::lower(reported),
+            scope: array::map(
+                declared.scope,
+                fn(predicate) {
+                    {
+                        index: predicate.column.index,
+                        field: predicate.column.name,
+                        op: edsl::FilterOp::Eq,
+                        input: predicate.input
+                    }.ty!(edsl::PreparedGuard)
+                }
+            )
+        }
+    )
+};
+# 外置 Relation 按新模型字段寻址，不读取旧 registry role 声明。
+def relation_endpoint: Fn(Mapping, String) -> relations::Endpoint = fn(mapping, name) {
+    let dataset = local_definition(mapping).declaration.dataset;
+    let binding = require(
+        array::find(
+            dataset.roles,
+            fn(role) {
+                role.id == name
+            }
+        )
+    );
+    {dataset, role: name, binding}
+};
+def endpoint: Fn(Array(Mapping), Array(edsl::EntityEntry), s::Prepared) -> edsl::EntityEntry = fn(
+    mappings,
+    entities,
+    prepared
+) {
+    let pair = require(
+        array::find(
+            array::enumerate(mappings),
+            fn(pair) {
+                pair.1.row == prepared.row
+            }
+        )
+    );
+    entities[pair.0]
+};
+def relation_entry: Fn(Array(Mapping), Array(edsl::EntityEntry), s::Relation) -> edsl::RelationEntry = fn(
+    mappings,
+    entities,
+    relation
+) {
+    let from = endpoint(mappings, entities, relation.source);
+    let to = endpoint(mappings, entities, relation.target);
+    let left = indexes(from, relation.source_field);
+    let right = indexes(to, relation.target_key);
+    let pairs = array::map(
+        array::enumerate(left),
+        fn(part) {
+            edsl::RelationKey::Eq({from: part.1, to: right[part.0]})
+        }
+    );
+    {
+        id: relation.name,
+        label: relation.name,
+        summary: "",
+        from: from.index,
+        to: to.index,
+        cardinality: {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional},
+        key: if array::length(pairs) == 1 {
+            pairs[0]
+        } else {
+            edsl::RelationKey::And(pairs)
+        },
+        guard: None
+    }
+};
+def payload: Fn(
+    String,
+    Array(Mapping),
+    Array(s::Relation),
+    qb::PlanProfile
+) -> edsl::PreparedPayload = fn(revision, mappings, relations, profile) {
+    contract::unique(
+        array::map(
+            mappings,
+            fn(mapping) {
+                mapping.id
+            }
+        )
+    );
+    contract::unique(
+        array::map(
+            mappings,
+            fn(mapping) {
+                knowledge::type_id(mapping.row)
+            }
+        )
+    );
+    let definitions = array::map(
+        array::enumerate(mappings),
+        fn(pair) {
+            local_definition(pair.1)
+        }
+    );
+    let entities = array::map(
+        array::enumerate(mappings),
+        fn(pair) {
+            entity_entry(pair.1, pair.0) <~ {
+                sample_measures: definitions[pair.0].payload.entities[0].sample_measures,
+                scope: definitions[pair.0].payload.entities[0].scope
+            }
+        }
+    );
+    let result: edsl::PreparedPayload = {
+        revision,
+        entities,
+        profile,
+        dimensions: array::flat_map(
+            array::enumerate(definitions),
+            fn(pair) {
+                array::map(
+                    pair.1.payload.dimensions,
+                    fn(item) {
+                        item <~ {entity: pair.0}
+                    }
+                )
+            }
+        ),
+        measures: array::flat_map(
+            array::enumerate(definitions),
+            fn(pair) {
+                array::map(
+                    pair.1.payload.measures,
+                    fn(item) {
+                        item <~ {entity: pair.0}
+                    }
+                )
+            }
+        ),
+        relations: array::map(
+            relations,
+            fn(relation) {
+                relation_entry(mappings, entities, relation)
+            }
+        ),
+        business_links: [],
+        native_pairs: []
+    };
+    contract::unique(
+        array::map(
+            result.dimensions,
+            fn(dimension) {
+                dimension.id
+            }
+        )
+    );
+    contract::unique(
+        array::map(
+            result.measures,
+            fn(measure) {
+                measure.id
+            }
+        )
+    );
+    contract::unique(
+        array::map(
+            result.relations,
+            fn(relation) {
+                relation.id
+            }
+        )
+    );
+    edsl::prepare_source_scopes(result)
+};
+pub use self::{Mapping, mapping, payload, relation_endpoint, local_definition};

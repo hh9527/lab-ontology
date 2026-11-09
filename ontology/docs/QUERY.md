@@ -44,16 +44,16 @@ def one_row_query: Fn() -> qb::Query = fn() {
 `finish(ctx, plan)` 将分配上下文与已校验计划封装为 `QueryAst`；未完成的 `Ctx` 或 `Plan` 不跨越渲染器边界。
 AST 不能包含原始 SQL、任意函数或字面量片段。
 
-`QueryAst.result_limit` 是可选的已分配正整数绑定，用于最终输出上限。
-公共 Intent 转换仅在 `limit` 是正整数时提供它；省略、null 以及 `finish` 均保持缺省，保留 QueryBuilder 行为。
-它独立于 `Plan.limit`、分区 `take`、连接分组排名 `take` 及业务配置权限。
-两个渲染器均校验其绑定，并仅应用于最终结果 SELECT。若已有最终业务上限，则取较小值且保留原 ORDER BY；PostgreSQL 将 CASE 两侧显式转换为 BIGINT。
-嵌套操作数及 Latest／窗口输入阶段不变。
+`QueryAst.selection` 表达最终结果的业务选择：`order_by:[{column,direction}]` 和 `take`。
+公共 Intent 在 check 时证明最终结果最多 500 行：多行结果须显式排序并取前 N，N 为已知的 1..500 整数；无分组标量计数和普通聚合可证明最多一行。
+排序列必须是最终投影列，选择阶段位于 JOIN、聚合、DISTINCT、UNION 之后，并由各 SQL 渲染器输出最终排序与 LIMIT。
+全局 top_by_measure 和 GraphPair.rank_by 的最终 take 同样可证明上界；分区或分支内的 take 不构成最终上界。
+公共转换响应返回 `max_rows`；执行器按原 SQL 和原绑定执行，不做自动截断。低层 QueryBuilder 的 `finish` 可不带 selection，由其调用方管理结果规模。
 
 `JoinedGroups` 携带独立的 `left_identity`／`right_identity` 表达式、隐藏键别名，以及按序排列且包含侧别、列和结果别名的 `outputs`。
 键投影必须匹配身份表达式并属于操作数分组，不能混入展示分组表达式。模型转换强制要求完整身份和来自已对齐节点的展示属性。
 
-`JoinedGroups.rank` 支持 Subtract、Ratio 和 GrowthRate，显式指定第一侧（第二侧为另一侧）及绑定上限 1..1000。
+`JoinedGroups.rank` 支持 Subtract、Ratio 和 GrowthRate，显式指定第一侧（第二侧为另一侧）及绑定上限；公共查询最终 take 为 1..500。
 GrowthRate 将第一侧作为当前值，第二侧作为基线。渲染器排除 NULL 度量、Ratio 的零分母及 GrowthRate 的非正基线，将操作数转为双精度，并用 NULLIF 保护除法。
 并列时按完整对齐身份升序、NULLS FIRST 决胜。排名结果追加数值列 `comparison_value` 并按该列排序；不排名时不添加该列。
 JoinedGroupCount 拒绝排名。模型转换校验数值类型、单位和配置授权，详见 [GraphPair](GRAPH-PAIR.md)。

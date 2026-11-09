@@ -1,0 +1,213 @@
+pub use crate::knowledge_policy::{subject};
+# 新模型的发现根和发布入口。局部准备只依赖本类型的 property，按 Type 共享缓存。
+pub use crate::transform::{Alternative};
+pub use crate::semantic_model::{
+    Reference,
+    entity_by,
+    dataset,
+    table,
+    bind,
+    grain,
+    numeric,
+    attribute,
+    observation,
+    columns,
+    metric,
+    event,
+    record_counts,
+    scope_equal,
+    targets,
+    ReferenceTarget,
+    Statistic,
+    count,
+    count_when,
+    computed_counts,
+    native_pairs
+};
+use crate::semantic_model as model;
+use crate::semantic_lowering as lowering;
+use crate::ontology as edsl;
+use crate::query as query;
+use crate::relations as relation;
+use crate::transform as transform;
+use crate::world as world;
+use crate::knowledge as knowledge;
+use std::prelude as prelude;
+use std::type_property as property;
+use std::type_memorizer as memo;
+use std::pipeline as pipeline;
+use std::array as array;
+use std::codec as codec;
+use std::value::{Value};
+use crate::groups as groups;
+
+def mapping: Fn(Type) -> lowering::Mapping = fn(row) {
+    let spec = match property::get_type_prop(row, model::TableInfo.type) {
+        Some(spec) => spec,
+        None => fail!("semantic dataset requires dataset property", row)
+    };
+    let id = match spec.id {
+        Some(id) => id,
+        None => fail!("published dataset requires a query address", row)
+    };
+    lowering::mapping(id, row)
+};
+def definitions: memo::TypeMemorizer(transform::LocalDefinition) = memo::type_memorizer(
+    fn(row) {
+        lowering::local_definition(mapping(row))
+    }
+);
+def local: Fn(Type) -> transform::LocalDefinition = fn(row) {
+    memo::computed_with_type(definitions, row)
+};
+def endpoint: Fn(Type, String) -> relation::Endpoint = fn(row, field) {
+    let dataset = local(row).declaration.dataset;
+    match array::find(
+        dataset.roles,
+        fn(role) {
+            role.id == field
+        }
+    ) {
+        Some(binding) => {dataset, role: field, binding},
+        None => fail!(
+            "relation endpoint requires an identity or Reference field",
+            dataset.id,
+            field
+        )
+    }
+};
+# 关系的来源门槛按存储字面量比较，不把 Reference 重新授予普通标量运算。
+def guarded: for(Scalar: codec::Encode) Fn(
+    relation::Relation,
+    String,
+    edsl::FilterOp,
+    Scalar
+) -> relation::Relation = fn(edge, name, op, value) {
+    let row = edge.from.dataset.row;
+    let prepared = local(row);
+    let field = match array::find(
+        prepared.payload.entities[0].fields,
+        fn(field) {
+            field.name == name
+        }
+    ) {
+        Some(field) => field,
+        None => fail!("relation guard field does not exist", name)
+    };
+    if field.ty != groups::representation(Scalar.type) || (
+        op != edsl::FilterOp::Eq && op != edsl::FilterOp::Ne
+    ) {
+        fail!("relation guard requires a compatible equality literal", name)
+    } else {
+        ()
+    };
+    let input = match codec::encode(value) {
+        Value::String(value) => edsl::FilterInput::Text(value),
+        Value::Int(value) => edsl::FilterInput::Int(value),
+        Value::Float(value) => edsl::FilterInput::Number(value),
+        Value::True => edsl::FilterInput::Bool(True),
+        Value::False => edsl::FilterInput::Bool(False),
+        _ => fail!("relation guard requires a scalar literal", name)
+    };
+    edge <~ {
+        guard: Some(
+            {
+                row,
+                dataset: edge.from.dataset.id,
+                source: edge.from.dataset.source,
+                column: {index: field.index, name, value: Scalar.type, nullable: field.nullable},
+                op,
+                input
+            }.ty!(relation::Guard)
+        )
+    }
+};
+@prelude::property(PropertyTarget::Type)
+type Connections = struct {
+    relations: Array(relation::Relation),
+    alternatives: Array(transform::Alternative),
+    links: Array(relation::Link)
+};
+def connections: Fn(Option(Connections)) -> Connections = fn(previous) {
+    match previous {
+        Some(previous) => previous,
+        None => {relations: [], alternatives: [], links: []}
+    }
+};
+def relations: Fn(Array(relation::Relation)) -> Fn(Type, Option(Connections)) -> Connections = fn(
+    items
+) {
+    fn(ctx, previous) {
+        let old = connections(previous);
+        old <~ {relations: array::concat([old.relations, items])}
+    }
+};
+def alternatives: Fn(Array(transform::Alternative)) -> Fn(Type, Option(Connections)) -> Connections = fn(
+    items
+) {
+    fn(ctx, previous) {
+        let old = connections(previous);
+        old <~ {alternatives: array::concat([old.alternatives, items])}
+    }
+};
+def links: Fn(Array(relation::Link)) -> Fn(Type, Option(Connections)) -> Connections = fn(items) {
+    fn(ctx, previous) {
+        let old = connections(previous);
+        old <~ {links: array::concat([old.links, items])}
+    }
+};
+def define: Fn(String, Array(Type), query::PlanProfile) -> world::World = fn(
+    revision,
+    roots,
+    profile
+) {
+    let roots = pipeline::run(
+        pipeline::from_array(roots) |> pipeline::distinct_by(knowledge::type_id) |> pipeline::collect()
+    );
+    let edges = array::map(
+        roots,
+        fn(row) {
+            connections(property::get_type_prop(row, Connections.type))
+        }
+    );
+    world::from_definitions_with_entities(
+        revision,
+        array::map(roots, local),
+        [],
+        array::flat_map(
+            edges,
+            fn(edge) {
+                edge.relations
+            }
+        ),
+        array::flat_map(
+            edges,
+            fn(edge) {
+                edge.alternatives
+            }
+        ),
+        array::flat_map(
+            edges,
+            fn(edge) {
+                edge.links
+            }
+        ),
+        profile
+    )
+};
+def payload: Fn(String, Array(Type), query::PlanProfile) -> edsl::PreparedPayload = fn(
+    revision,
+    roots,
+    profile
+) {
+    world::prepare(define(revision, roots, profile)).payload
+};
+def stage: for(B) Fn(String, Array(Type), query::PlanProfile, Fn(edsl::PreparedPayload) -> B) -> B = fn(
+    revision,
+    roots,
+    profile,
+    program
+) {
+    world::stage(define(revision, roots, profile), program)
+};
+pub use self::{endpoint, guarded, relations, alternatives, links, payload, stage};

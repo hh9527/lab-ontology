@@ -1,0 +1,423 @@
+use ontology::semantic_model as s;
+use ontology::quantity as q;
+use ontology::scalars as scalars;
+use ontology::model as m;
+use ontology::samples as samples;
+use ontology::groups as groups;
+use ontology::field_type_info as field_types;
+use std::test as test;
+use std::array as array;
+use std::string as string;
+
+@s::dataset("limited", "samples", ["id", "ts"])
+@s::metric("ts")
+type ExcessReportedStatistics = struct {
+    id: String,
+    ts: scalars::DateTimeUtc,
+    @samples::field(
+        samples::group(
+            "cpu",
+            Percent.type,
+            samples::Statistic::Mean,
+            [samples::Statistic::Max],
+            None
+        ),
+        [
+            {statistic: samples::Statistic::Mean, publish: "mean_cpu"},
+            {statistic: samples::Statistic::Max, publish: "max_cpu"}
+        ]
+    )
+    cpu: Percent
+};
+pub def sample_field_cannot_bypass_type_statistics: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(ExcessReportedStatistics.type);
+        True
+    },
+    "field statistics exceed type capabilities"
+);
+@s::table("references")
+type AggregatedReference = struct {
+    @groups::statistics(
+        groups::numeric_group("reference", s::Reference(Int).type, [groups::Statistic::Mean]),
+        [{member: groups::Statistic::Mean, publish: "mean_reference"}]
+    )
+    reference: s::Reference(Int)
+};
+pub def opaque_reference_cannot_gain_aggregation_from_its_storage: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(AggregatedReference.type);
+        True
+    },
+    "identity and Reference fields do not inherit scalar aggregation"
+);
+pub def reference_is_an_inline_constructor_in_knowledge: test::Test = verify(
+    fn() {
+        let info = field_types::generate_field_type_info(
+            field_types::memorizer,
+            s::Reference(TenantById).type
+        );
+        string::starts_with(info.1.text, "Reference(") && info.0 == [TenantById.type]
+    }
+);
+
+# should_ok 只检查不抛异常；布尔条件必须显式断言。
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("test assertion failed")
+            }
+        }
+    )
+};
+
+@s::entity_by("Device")
+type DeviceById = struct(String);
+@s::entity_by("Tenant")
+type TenantById = struct(String);
+
+@s::entity_by("Tenant")
+type TenantByNumber = struct(Int);
+
+# 三阶段描述同一张现有物理表，没有因缺少语义标注而拒绝基础表结构。
+@s::table("NetworkDeviceKPI")
+type Raw = struct {
+    resId: String,
+    tenantId: Option(String),
+    ts: String,
+    cpuUsage: Option(Float),
+    online: Bool,
+};
+
+@q::unit("%", "ratio", 0.01)
+@s::numeric([s::Statistic::Mean])
+type Percent = struct(Float);
+
+@s::table("NetworkDeviceKPI")
+type Typed = struct {
+    resId: String,
+    tenantId: Option(s::Reference(TenantById)),
+    ts: scalars::DateTimeUtc,
+    cpuUsage: Option(Percent),
+    online: Bool,
+};
+
+@s::table("NetworkDeviceKPI")
+@s::bind(DeviceById.type, "id")
+@s::grain(["id", "ts"])
+type Observed = struct {
+    @m::column("resId")
+    id: DeviceById,
+
+    @m::column("tenantId")
+    tenant: Option(s::Reference(TenantById)),
+
+    ts: scalars::DateTimeUtc,
+
+    @m::column("cpuUsage")
+    @s::observation("cpu_usage", "ts", [s::Statistic::Mean])
+    cpu: Option(Percent),
+
+    @s::attribute("cpu_limit")
+    cpu_limit: Percent,
+};
+
+@s::table("X_TENANT_VIEW")
+@s::bind(TenantById.type, "id")
+@s::grain(["id"])
+type Tenants = struct {
+    @m::column("TENANT_ID")
+    id: TenantById,
+    @m::column("TENANT_NAME")
+    @s::attribute("name")
+    name: String,
+};
+
+def raw: s::Prepared = s::prepare(Raw.type);
+def typed: s::Prepared = s::prepare(Typed.type);
+def observed: s::Prepared = s::prepare(Observed.type);
+def tenants: s::Prepared = s::prepare(Tenants.type);
+def belongs_to: s::Relation = s::relation("tenant", observed, "tenant", tenants);
+
+pub def primary_table_is_usable_without_business_semantics: test::Test = verify(
+    fn() {
+        let cpu = match array::find(
+            raw.fields,
+            fn(field) {
+                field.name == "cpuUsage"
+            }
+        ) {
+            Some(field) => field,
+            None => fail!("missing cpu field")
+        };
+        array::length(raw.fields) == 5 && cpu.nullable && cpu.value == Float.type && s::discover(
+            raw
+        ) == [] && cpu.columns == ["cpuUsage"]
+    }
+);
+pub def type_enrichment_preserves_physical_storage_and_option: test::Test = verify(
+    fn() {
+        let tenant = match array::find(
+            typed.fields,
+            fn(field) {
+                field.name == "tenantId"
+            }
+        ) {
+            Some(field) => field,
+            None => fail!("missing tenant field")
+        };
+        let cpu = match array::find(
+            typed.fields,
+            fn(field) {
+                field.name == "cpuUsage"
+            }
+        ) {
+            Some(field) => field,
+            None => fail!("missing cpu field")
+        };
+        tenant.nullable && tenant.storage == String.type && tenant.reference != None && cpu.nullable && cpu.storage == Float.type && cpu.value == Percent.type && s::discover(
+            typed
+        ) == []
+    }
+);
+pub def semantic_discovery_uses_prepared_contract: test::Test = verify(
+    fn() {
+        let capabilities = s::discover(observed);
+        array::length(capabilities) == 2 && capabilities[0].name == "cpu_usage" && capabilities[0].columns == [
+            "cpuUsage"
+        ] && capabilities[0].nullable && capabilities[0].unit == Some(
+            {symbol: "%", quantity: "ratio", scale: 0.01}.ty!(q::Unit)
+        ) && capabilities[0].statistics == [s::Statistic::Mean]
+    }
+);
+pub def external_relation_grants_join_and_publishes_target: test::Test = verify(
+    fn() {
+        let info = s::discover_relation(belongs_to);
+        info.source_entity == "Device" && info.target_entity == "Tenant" && info.source_columns == [
+            "tenantId"
+        ] && info.target_columns == ["TENANT_ID"] && info.source_nullable && info.target_optional
+    }
+);
+pub def plain_string_does_not_grant_relation: test::Test = test::should_fail_with(
+    fn() {
+        s::relation("tenant", s::prepare(PlainReference.type), "tenant", tenants);
+        True
+    },
+    "relation requires Reference source"
+);
+@s::table("NetworkDeviceKPI")
+@s::bind(DeviceById.type, "id")
+type PlainReference = struct {
+    id: DeviceById,
+    tenant: String
+};
+
+pub def field_cannot_exceed_type_statistics: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(WrongSum.type);
+        True
+    },
+    "field statistics exceed type capabilities"
+);
+@s::table("NetworkDeviceKPI")
+@s::bind(DeviceById.type, "id")
+@s::grain(["id", "ts"])
+type WrongSum = struct {
+    id: DeviceById,
+    ts: scalars::DateTimeUtc,
+    @s::observation("cpu", "ts", [s::Statistic::Sum])
+    cpu: Percent,
+};
+pub def integer_reference_has_no_primitive_numeric_capability: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(ReferenceAsMeasure.type);
+        True
+    },
+    "field statistics exceed type capabilities"
+);
+@s::table("events")
+@s::bind(DeviceById.type, "id")
+@s::grain(["id", "ts"])
+type ReferenceAsMeasure = struct {
+    id: DeviceById,
+    ts: scalars::DateTimeUtc,
+    @s::observation("owner", "ts", [s::Statistic::Mean])
+    owner: s::Reference(TenantByNumber),
+};
+pub def relation_key_must_match_target_identity: test::Test = test::should_fail_with(
+    fn() {
+        s::relation("tenant", s::prepare(WrongKey.type), "tenant", tenants);
+        True
+    },
+    "relation key types do not match"
+);
+@s::table("events")
+@s::bind(DeviceById.type, "id")
+type WrongKey = struct {
+    id: DeviceById,
+    tenant: s::Reference(TenantByNumber)
+};
+
+pub def relation_target_must_not_multiply_source_rows: test::Test = test::should_fail_with(
+    fn() {
+        s::relation("tenant", observed, "tenant", s::prepare(TenantSamples.type));
+        True
+    },
+    "relation target identity requires unique row grain"
+);
+@s::table("tenant_samples")
+@s::bind(TenantById.type, "id")
+@s::grain(["id", "ts"])
+type TenantSamples = struct {
+    id: TenantById,
+    ts: scalars::DateTimeUtc
+};
+
+pub def unknown_clock_semantics_are_not_assumed: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(PlainClock.type);
+        True
+    },
+    "temporal mapping requires a non-null UTC clock"
+);
+@s::table("NetworkDeviceKPI")
+@s::bind(DeviceById.type, "id")
+type PlainClock = struct {
+    id: DeviceById,
+    ts: String,
+    @s::observation("cpu", "ts", [s::Statistic::Mean])
+    cpu: Percent,
+};
+
+# 同一实体的两种指代不是同一种类型；不能凭底层都是 String 互换。
+@s::entity_by("Tenant")
+type TenantByCode = struct(String);
+@s::table("events")
+@s::bind(DeviceById.type, "id")
+type WrongIdentity = struct {
+    id: DeviceById,
+    tenant: s::Reference(TenantByCode),
+};
+pub def same_entity_different_identity_requires_explicit_mapping: test::Test = test::should_fail_with(
+    fn() {
+        s::relation("tenant", s::prepare(WrongIdentity.type), "tenant", tenants);
+        True
+    },
+    "relation key types do not match"
+);
+
+# 联合指代的每个成员非空；其中可再引用另一个实体的单一指代。
+@s::entity_by("Device")
+type DeviceByTenantAndCode = struct {
+    tenant: s::Reference(TenantById),
+    code: String,
+};
+@s::table("scoped_devices")
+@s::bind(DeviceByTenantAndCode.type, "key")
+@s::grain(["key"])
+type ScopedDevices = struct {
+    @s::columns({tenant: "tenantId", code: "deviceCode"})
+    key: DeviceByTenantAndCode,
+    @s::attribute("name")
+    name: String,
+};
+@s::table("scoped_samples")
+@s::bind(DeviceByTenantAndCode.type, "key")
+@s::grain(["key", "ts"])
+type ScopedSamples = struct {
+    @s::columns({tenant: "ownerTenant", code: "ownerCode"})
+    key: DeviceByTenantAndCode,
+    @s::columns({tenant: "peerTenant", code: "peerCode"})
+    peer: Option(s::Reference(DeviceByTenantAndCode)),
+    ts: scalars::DateTimeUtc,
+};
+pub def composite_reference_retains_identity_and_column_mapping: test::Test = verify(
+    fn() {
+        let source = s::prepare(ScopedSamples.type);
+        let relation = s::relation("peer", source, "peer", s::prepare(ScopedDevices.type));
+        let info = s::discover_relation(relation);
+        let identity = s::identity(DeviceByTenantAndCode.type);
+        identity.entity == "Device" && array::length(identity.parts) == 2 && info.target_identity == DeviceByTenantAndCode.type && info.source_nullable && info.source_columns == [
+            "peerCode",
+            "peerTenant"
+        ] && info.target_columns == ["deviceCode", "tenantId"]
+    }
+);
+
+@s::table("incomplete_mapping")
+type MissingCompositeColumns = struct {
+    peer: s::Reference(DeviceByTenantAndCode),
+};
+pub def composite_identity_requires_complete_column_mapping: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(MissingCompositeColumns.type);
+        True
+    },
+    "physical column count must match identity components"
+);
+
+@s::entity_by("Device")
+type NullableIdentity = struct {
+    tenant: Option(String),
+    code: String
+};
+pub def nullable_identity_component_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        s::identity(NullableIdentity.type);
+        True
+    },
+    "identity components must be non-null"
+);
+
+@s::table("untyped_reference")
+type UntypedReference = struct {
+    peer: s::Reference(String)
+};
+pub def opaque_reference_can_start_with_storage_only: test::Test = verify(
+    fn() {
+        s::prepare(UntypedReference.type).fields[0].reference != None
+    }
+);
+
+@s::table("wrong_member_mapping")
+type WrongMemberMapping = struct {
+    @s::columns({tenant_typo: "tenantId", code: "deviceCode"})
+    peer: s::Reference(DeviceByTenantAndCode),
+};
+pub def composite_mapping_checks_member_paths: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(WrongMemberMapping.type);
+        True
+    },
+    "missing physical mapping for identity component"
+);
+
+use ontology::knowledge_policy as knowledge_policy;
+@knowledge_policy::subject("Device", "missing")
+@s::table("missing_subject")
+type MissingSubject = struct {
+    id: String
+};
+pub def subject_field_must_exist: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(MissingSubject.type);
+        True
+    },
+    "knowledge subject field does not exist"
+);
+
+@knowledge_policy::subject("WrongEntity", "id")
+@s::table("wrong_subject_entity")
+type WrongSubjectEntity = struct {
+    id: DeviceById
+};
+pub def subject_respects_identity_entity: test::Test = test::should_fail_with(
+    fn() {
+        s::prepare(WrongSubjectEntity.type);
+        True
+    },
+    "knowledge subject conflicts with identity entity"
+);

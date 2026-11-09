@@ -1,0 +1,849 @@
+use ontology::semantic_model as s;
+use ontology::semantic_lowering as adapter;
+use ontology::semantic as domain;
+use ontology::ontology as edsl;
+use ontology::query as qb;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::quantity as quantity;
+use ontology::scalars as scalars;
+use ontology::model as m;
+use ontology::registry as registry;
+use ontology::groups as groups;
+use ontology::samples as reported;
+use ontology::values as values;
+use ontology::enum_values as ev;
+use std::test as test;
+use std::array as array;
+use std::string as string;
+use std::json as json;
+use std::codec as codec;
+use std::value::{Value};
+
+# should_ok 只检查不抛异常；布尔条件必须显式断言。
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("test assertion failed")
+            }
+        }
+    )
+};
+
+type SampleSeverity = enum {
+    @ev::rename("1")
+    @ev::alias("critical")
+    Critical,
+    @ev::rename("2")
+    Major
+};
+def severity_domain: values::Domain(SampleSeverity, String) = values::from_enum(
+    "severity",
+    SampleSeverity.type,
+    String.type,
+    False
+);
+def reported_group: reported::Group(Percent) = reported::group(
+    "cpu",
+    Percent.type,
+    reported::Statistic::Mean,
+    [reported::Statistic::Latest, reported::Statistic::Max],
+    Some("%")
+);
+def reported_names: Array(reported::Name) = [
+    {statistic: reported::Statistic::Mean, publish: "cpu_mean"},
+    {statistic: reported::Statistic::Latest, publish: "cpu_latest"},
+    {statistic: reported::Statistic::Max, publish: "cpu_max"}
+];
+@s::dataset("reported", "reported_samples", ["id", "ts"])
+@s::metric("ts")
+@s::record_counts(["sample_count"])
+type ReportedSamples = struct {
+    id: DeviceById,
+    ts: scalars::DateTimeUtc,
+    @reported::field(reported_group, reported_names)
+    cpu: Option(Percent),
+    @values::classification(severity_domain, "severity")
+    severity: String
+};
+@registry::dataset("reported", "reported_samples", ["id", "ts"])
+@registry::metric("ts")
+@registry::record_counts(["sample_count"])
+@registry::reported_samples(
+    [
+        reported::bind(
+            registry::dataset_of(BaselineReportedSamples.type),
+            reported_group,
+            m::optional_field(BaselineReportedSamples.type, Percent.type, "cpu"),
+            reported_names
+        )
+    ]
+)
+type BaselineReportedSamples = struct {
+    id: DeviceById,
+    ts: scalars::DateTimeUtc,
+    cpu: Option(Percent),
+    @values::classification(severity_domain, "severity")
+    severity: String
+};
+def reported_profile: qb::PlanProfile = acceptance_profile <~ {
+    allowed_aggregates: array::concat(
+        [acceptance_profile.allowed_aggregates, [qb::AggregateFunction::Latest]]
+    )
+};
+def reported_new: edsl::PreparedPayload = adapter::payload(
+    "reported",
+    [adapter::mapping("reported", ReportedSamples.type)],
+    [],
+    reported_profile
+);
+def reported_old: edsl::PreparedPayload = registry::payload(
+    "reported",
+    [BaselineReportedSamples.type],
+    reported_profile
+);
+def reported_parity: Fn(String) -> Bool = fn(extra) {
+    let input = parse(
+        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"reported"}],"edges":[],\{extra},"limit":500}`
+    );
+    let old = intent::query_intent_ast_factory(reported_old)(input);
+    let new = intent::query_intent_ast_factory(reported_new)(input);
+    sqlite::build_query(old) == sqlite::build_query(new) && postgres::build_query(old) == postgres::build_query(
+        new
+    ) && intent::result_columns(reported_old, input, old) == intent::result_columns(
+        reported_new,
+        input,
+        new
+    )
+};
+pub def acceptance_reported_primary_latest_and_summary: test::Test = verify(
+    fn() {
+        reported_new.entities[0].sample_measures == reported_old.entities[0].sample_measures && reported_parity(
+            r#""select":[],"measures":[{"node":"s","measure":"cpu_mean"},{"node":"s","measure":"cpu_latest"},{"node":"s","measure":"cpu_max"}]"#
+        )
+    }
+);
+pub def acceptance_named_record_count: test::Test = verify(
+    fn() {
+        reported_parity(r#""select":[],"measures":[{"node":"s","measure":"sample_count"}]"#)
+    }
+);
+pub def acceptance_closed_domain_mapping: test::Test = verify(
+    fn() {
+        let old = match array::find(
+            reported_old.dimensions,
+            fn(d) {
+                d.id == "severity"
+            }
+        ) {
+            Some(value) => value,
+            None => fail!("missing baseline severity")
+        };
+        let new = match array::find(
+            reported_new.dimensions,
+            fn(d) {
+                d.id == "severity"
+            }
+        ) {
+            Some(value) => value,
+            None => fail!("missing new severity")
+        };
+        reported_parity(
+            r#""select":[{"node":"s","dimension":"severity"}],"filters":[{"node":"s","dimension":"severity","op":"Eq","value":"Critical"}]"#
+        ) && new.canonical_values == old.canonical_values && new.canonical_order == old.canonical_order && new.half_open == old.half_open
+    }
+);
+pub def acceptance_new_roots_publish_without_legacy_registry: test::Test = verify(
+    fn() {
+        let published = domain::payload("reported", [ReportedSamples.type], reported_profile);
+        let input = parse(
+            r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"reported"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"cpu_latest"}],"limit":500}"#
+        );
+        let original = intent::query_intent_ast_factory(reported_old)(input);
+        let migrated = intent::query_intent_ast_factory(published)(input);
+        sqlite::build_query(original) == sqlite::build_query(migrated) && postgres::build_query(
+            original
+        ) == postgres::build_query(migrated) && intent::result_columns(
+            reported_old,
+            input,
+            original
+        ) == intent::result_columns(published, input, migrated)
+    }
+);
+pub def same_entity_can_have_multiple_identification_types: test::Test = verify(fn() {
+    let published = domain::payload("multiple-identifications", [Devices.type, ScopedDevices.type], acceptance_profile);
+    array::length(published.entities) == 2
+});
+
+@s::entity_by("Device")
+type DeviceById = struct(String);
+@s::entity_by("Tenant")
+type TenantById = struct(String);
+@s::entity_by("Device")
+type DeviceByTenantAndCode = struct {
+    tenant: s::Reference(TenantById),
+    code: String
+};
+@quantity::unit("%", "ratio", 0.01)
+@s::numeric([s::Statistic::Mean, s::Statistic::Min, s::Statistic::Max])
+type Percent = struct(Float);
+
+@s::dataset("device", "devices", ["id"])
+@s::bind(DeviceById.type, "id")
+@s::grain(["id"])
+type Devices = struct {
+    id: DeviceById,
+    @s::attribute("name")
+    name: String,
+    @m::column("tenant_id")
+    tenant: Option(s::Reference(TenantById)),
+    @s::columns({tenant: "peer_tenant", code: "peer_code"})
+    peer: Option(s::Reference(DeviceByTenantAndCode)),
+};
+@s::table("tenants")
+@s::bind(TenantById.type, "id")
+@s::grain(["id"])
+type Tenants = struct {
+    id: TenantById,
+    @s::attribute("name")
+    name: String,
+};
+@s::dataset("scoped_device", "scoped_devices", ["key"])
+@s::bind(DeviceByTenantAndCode.type, "key")
+@s::grain(["key"])
+type ScopedDevices = struct {
+    @s::columns({tenant: "tenant", code: "code"})
+    key: DeviceByTenantAndCode,
+    @s::attribute("name")
+    name: String,
+};
+@s::table("samples")
+@s::bind(DeviceById.type, "id")
+@s::grain(["id", "ts"])
+type Samples = struct {
+    @m::column("device_id")
+    @groups::exact("id")
+    id: DeviceById,
+    @groups::field_view(baseline_clock, "ts", True, [groups::Filter::Ge, groups::Filter::Lt])
+    ts: scalars::DateTimeUtc,
+    @s::observation("cpu", "ts", [s::Statistic::Mean, s::Statistic::Min, s::Statistic::Max])
+    @groups::numeric("cpu")
+    cpu: Option(Percent),
+    @s::attribute("cpu_threshold")
+    @groups::numeric("cpu_threshold")
+    threshold: Percent,
+};
+def devices: adapter::Mapping = adapter::mapping("device", Devices.type);
+def tenants: adapter::Mapping = adapter::mapping("tenant", Tenants.type);
+def scoped: adapter::Mapping = adapter::mapping("scoped_device", ScopedDevices.type);
+def samples: adapter::Mapping = adapter::mapping("sample", Samples.type);
+def mappings: Array(adapter::Mapping) = [devices, tenants, scoped, samples];
+def relations: Array(s::Relation) = [
+    s::relation("belongs_to", devices.prepared, "tenant", tenants.prepared),
+    s::relation("peer", devices.prepared, "peer", scoped.prepared)
+];
+def profile: qb::PlanProfile = {
+    allowed_operators: [
+        qb::Operator::Source,
+        qb::Operator::Project,
+        qb::Operator::Column,
+        qb::Operator::Bind,
+        qb::Operator::Scalar,
+        qb::Operator::Aggregate,
+        qb::Operator::Group,
+        qb::Operator::Filter,
+        qb::Operator::Exists,
+        qb::Operator::Join,
+        qb::Operator::Order,
+        qb::Operator::Limit
+    ],
+    allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
+    allowed_aggregates: [qb::AggregateFunction::Avg],
+    allowed_scalars: [
+        qb::ScalarFunction::Eq,
+        qb::ScalarFunction::BinaryText,
+        qb::ScalarFunction::And,
+        qb::ScalarFunction::IsNotNull
+    ],
+    allow_distinct: False
+};
+def payload: edsl::PreparedPayload = adapter::payload(
+    "semantic-integration",
+    mappings,
+    relations,
+    profile
+);
+def parse: Fn(String) -> Value = fn(text) {
+    json::parse(text).unwrap!()
+};
+def projection: Value = parse(
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device__name"}],"limit":500}"#
+);
+def aggregate: Value = parse(
+    r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"limit":500}"#
+);
+def joined: Value = parse(
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t","dimension":"tenant__name"}],"limit":500}"#
+);
+def composite: Value = parse(
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"p","entity":"scoped_device"}],"edges":[{"relation":"peer","from":"d","to":"p"}],"select":[{"node":"d","dimension":"device__name"},{"node":"p","dimension":"scoped_device__name"}],"limit":500}"#
+);
+def ast: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
+
+pub def graph_projection_uses_existing_pipeline: test::Test = verify(
+    fn() {
+        let plan = ast(projection);
+        let query = sqlite::build_query(plan);
+        query.bindings == [qb::Val::Int(500)] && string::contains(query.sql, "devices") && intent::result_columns(
+            payload,
+            projection,
+            plan
+        ) == [{name: "d_device__name", type: intent::ResultType::String, nullable: False}]
+    }
+);
+pub def graph_aggregate_retains_result_contract: test::Test = verify(
+    fn() {
+        let plan = ast(aggregate);
+        string::contains(sqlite::build_query(plan).sql, "avg(") && intent::result_columns(
+            payload,
+            aggregate,
+            plan
+        ) == [{name: "s_sample__cpu_mean", type: intent::ResultType::Float, nullable: True}]
+    }
+);
+pub def optional_relation_preserves_root_rows: test::Test = verify(
+    fn() {
+        let plan = ast(joined);
+        let columns = intent::result_columns(payload, joined, plan);
+        string::contains(sqlite::build_query(plan).sql, "LEFT JOIN") && columns[0].nullable == False && columns[
+            1
+        ].nullable
+    }
+);
+pub def graph_composite_relation_contains_every_key: test::Test = verify(
+    fn() {
+        let sql = sqlite::build_query(ast(composite)).sql;
+        string::contains(sql, "peer_tenant") && string::contains(sql, "peer_code") && string::contains(
+            sql,
+            "AND"
+        )
+    }
+);
+pub def same_graph_ast_supports_sqlite_and_postgres: test::Test = verify(
+    fn() {
+        let plan = ast(composite);
+        let left = sqlite::build_query(plan);
+        let right = postgres::build_query(plan);
+        left.bindings == right.bindings && string::contains(right.sql, "LEFT JOIN")
+    }
+);
+pub def undeclared_statistic_is_rejected_by_existing_query_validator: test::Test = test::should_fail_with(
+    fn() {
+        ast(
+            parse(
+                r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"sample__cpu_sum"}]}"#
+            )
+        );
+        True
+    },
+    "unknown declared measure"
+);
+pub def threshold_type_does_not_grant_aggregation: test::Test = test::should_fail_with(
+    fn() {
+        ast(
+            parse(
+                r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"sample__cpu_threshold_mean"}]}"#
+            )
+        );
+        True
+    },
+    "unknown declared measure"
+);
+pub def undeclared_relation_is_not_inferred_from_reference: test::Test = test::should_fail_with(
+    fn() {
+        let no_relations = adapter::payload("no-relations", mappings, [], profile);
+        intent::query_intent_ast_factory(no_relations)(joined);
+        True
+    },
+    "unknown relation"
+);
+
+# 交给 SQLite 运行的就是上述现有 Graph 链路生成的 SQL，而非手写等价 SQL。
+pub def runtime_cases: Value = codec::encode(
+    array::concat(
+        [
+            array::map(
+                [projection, aggregate, joined, composite],
+                fn(input) {
+                    sqlite::build_query(ast(input))
+                }
+            ),
+            [
+                sqlite::build_query(intent::query_intent_ast_factory(chained_payload)(chained)),
+                sqlite::build_query(ast(required)),
+                sqlite::build_query(intent::query_intent_ast_factory(filterable_payload)(filtered))
+            ]
+        ]
+    )
+);
+
+@s::table("devices")
+type RawDeviceTable = struct {
+    id: String,
+    name: Option(String)
+};
+pub def raw_schema_can_project_without_business_declarations: test::Test = verify(
+    fn() {
+        let raw = adapter::payload(
+            "raw",
+            [adapter::mapping("raw_device", RawDeviceTable.type)],
+            [],
+            profile
+        );
+        let input = parse(
+            r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"raw_device"}],"edges":[],"select":[{"node":"r","dimension":"raw_device__name"}],"limit":500}"#
+        );
+        let query = intent::query_intent_ast_factory(raw)(input);
+        raw.measures == [] && raw.relations == [] && intent::result_columns(raw, input, query) == [
+            {name: "r_raw_device__name", type: intent::ResultType::String, nullable: True}
+        ]
+    }
+);
+
+# 查询层要求关联存在，与读取可缺失属性分开表达。
+def required: Value = parse(
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device__name"}],"exists":[{"anchor":"d","nodes":[{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}]}],"limit":500}"#
+);
+pub def explicit_existence_still_filters_roots: test::Test = verify(
+    fn() {
+        string::contains(sqlite::build_query(ast(required)).sql, "EXISTS")
+    }
+);
+
+# 自身身份到自身身份是必有的 One 关系；测试可空性穿过必有关系的传播。
+def chained_payload: edsl::PreparedPayload = payload <~ {
+    relations: array::concat(
+        [
+            payload.relations,
+            [
+                {
+                    id: "tenant_self",
+                    label: "tenant_self",
+                    summary: "",
+                    from: 1,
+                    to: 1,
+                    cardinality: {from: edsl::Cardinality::One, to: edsl::Cardinality::One},
+                    key: edsl::RelationKey::Eq({from: 0, to: 0}),
+                    guard: None
+                }.ty!(edsl::RelationEntry)
+            ]
+        ]
+    )
+};
+def chained: Value = parse(
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"},{"id":"t2","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"},{"relation":"tenant_self","from":"t","to":"t2"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t2","dimension":"tenant__name"}],"limit":500}"#
+);
+pub def nullable_origin_propagates_through_one_relation: test::Test = verify(
+    fn() {
+        let plan = intent::query_intent_ast_factory(chained_payload)(chained);
+        let columns = intent::result_columns(chained_payload, chained, plan);
+        match plan.plan {
+            qb::QueryPlan::Rows(rows) => array::length(rows.joins) == 2 && array::all(
+                rows.joins,
+                fn(join) {
+                    join.kind == qb::JoinKind::Left
+                }
+            ) && !columns[0].nullable && columns[1].nullable,
+            _ => False
+        }
+    }
+);
+pub def one_relation_keeps_inner_join_without_nullable_origin: test::Test = verify(
+    fn() {
+        let one = payload <~ {
+            relations: array::map(
+                payload.relations,
+                fn(relation) {
+                    relation <~ {cardinality: relation.cardinality <~ {to: edsl::Cardinality::One}}
+                }
+            )
+        };
+        let plan = intent::query_intent_ast_factory(one)(joined);
+        string::contains(sqlite::build_query(plan).sql, "INNER JOIN") && !intent::result_columns(
+            one,
+            joined,
+            plan
+        )[
+            1
+        ].nullable
+    }
+);
+pub def reverse_traversal_uses_from_cardinality: test::Test = verify(
+    fn() {
+        let reverse = payload <~ {
+            relations: array::map(
+                payload.relations,
+                fn(relation) {
+                    relation <~ {
+                        cardinality: {from: edsl::Cardinality::Optional, to: edsl::Cardinality::One}
+                    }
+                }
+            )
+        };
+        let input = parse(
+            r#"{"op":"Graph","root":"t","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"t","dimension":"tenant__name"},{"node":"d","dimension":"device__name"}],"limit":500}"#
+        );
+        let plan = intent::query_intent_ast_factory(reverse)(input);
+        string::contains(sqlite::build_query(plan).sql, "LEFT JOIN") && intent::result_columns(
+            reverse,
+            input,
+            plan
+        )[
+            1
+        ].nullable
+    }
+);
+
+# 过滤许可由测试夹具显式授予；WHERE 仍然筛选源行，不移入 LEFT JOIN 的 ON。
+def filterable_payload: edsl::PreparedPayload = payload <~ {
+    dimensions: array::map(
+        payload.dimensions,
+        fn(dimension) {
+            if dimension.id == "tenant__name" {
+                dimension <~ {
+                    filterable: True,
+                    ops: [edsl::FilterOp::Eq],
+                    input_kinds: [edsl::FilterInputKind::Text]
+                }
+            } else {
+                dimension
+            }
+        }
+    )
+};
+def filtered: Value = parse(
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t","dimension":"tenant__name"}],"filters":[{"node":"t","dimension":"tenant__name","op":"Eq","value":"T1"}],"limit":500}"#
+);
+pub def explicit_peer_filter_keeps_where_semantics: test::Test = verify(
+    fn() {
+        let plan = intent::query_intent_ast_factory(filterable_payload)(filtered);
+        let sql = sqlite::build_query(plan).sql;
+        string::contains(sql, "LEFT JOIN") && string::contains(sql, "WHERE")
+    }
+);
+
+# 能力验收：同一物理表、同一 Graph 请求，比较原 transform 与新模型适配。
+# 逐项将原能力缺口转为成对的正向验收；不能用运行时回退旧声明来通过验收。
+@registry::dataset("sample", "samples", ["id", "ts"])
+@registry::metric("ts")
+@registry::groups([baseline_cpu])
+@edsl::reference("identity", ["id"])
+type BaselineSamples = struct {
+    @groups::exact("sample__id")
+    @m::column("device_id")
+    id: String,
+    @groups::field_view(
+        baseline_clock,
+        "sample__ts",
+        True,
+        [groups::Filter::Ge, groups::Filter::Lt]
+    )
+    ts: scalars::DateTimeUtc,
+    @groups::numeric("sample__cpu")
+    cpu: Option(Float),
+    @groups::numeric("sample__cpu_threshold")
+    threshold: Float,
+};
+def baseline_cpu: groups::Binding(BaselineSamples) = groups::numeric_binding(
+    registry::dataset_of(BaselineSamples.type),
+    groups::numeric_group(
+        "cpu_statistics",
+        Float.type,
+        [groups::Statistic::Mean, groups::Statistic::Min, groups::Statistic::Max]
+    ),
+    groups::input(m::optional_field(BaselineSamples.type, Float.type, "cpu")),
+    [
+        {member: groups::Statistic::Mean, publish: "sample__cpu_mean"},
+        {member: groups::Statistic::Min, publish: "sample__cpu_min"},
+        {member: groups::Statistic::Max, publish: "sample__cpu_max"}
+    ]
+);
+def acceptance_profile: qb::PlanProfile = {
+    allowed_operators: [
+        qb::Operator::Source,
+        qb::Operator::Project,
+        qb::Operator::Column,
+        qb::Operator::Bind,
+        qb::Operator::Scalar,
+        qb::Operator::Aggregate,
+        qb::Operator::Group,
+        qb::Operator::Filter,
+        qb::Operator::Join,
+        qb::Operator::Exists,
+        qb::Operator::Having,
+        qb::Operator::Order,
+        qb::Operator::Limit,
+        qb::Operator::Offset,
+        qb::Operator::Partition
+    ],
+    allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
+    allowed_aggregates: [
+        qb::AggregateFunction::Avg,
+        qb::AggregateFunction::Min,
+        qb::AggregateFunction::Max,
+        qb::AggregateFunction::Count
+    ],
+    allowed_scalars: [
+        qb::ScalarFunction::Eq,
+        qb::ScalarFunction::Ne,
+        qb::ScalarFunction::Ge,
+        qb::ScalarFunction::Gt,
+        qb::ScalarFunction::Le,
+        qb::ScalarFunction::Lt,
+        qb::ScalarFunction::And,
+        qb::ScalarFunction::Or,
+        qb::ScalarFunction::IsNotNull,
+        qb::ScalarFunction::BinaryText,
+        qb::ScalarFunction::Sub,
+        qb::ScalarFunction::Div,
+        qb::ScalarFunction::If
+    ],
+    allow_distinct: True
+};
+def baseline_clock: groups::DimensionGroup(scalars::DateTimeUtc) = groups::dimension_group(
+    "clock",
+    scalars::DateTimeUtc.type,
+    True,
+    [groups::Filter::Ge, groups::Filter::Lt]
+);
+def baseline_payload: edsl::PreparedPayload = registry::payload(
+    "baseline-acceptance",
+    [BaselineSamples.type],
+    acceptance_profile
+);
+def new_acceptance_payload: edsl::PreparedPayload = payload <~ {profile: acceptance_profile};
+def sample_input: Fn(String) -> Value = fn(extra) {
+    parse(
+        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],\{extra},"limit":500}`
+    )
+};
+def old_plan: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(baseline_payload);
+def new_plan: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(new_acceptance_payload);
+def same_result: Fn(Value) -> Bool = fn(input) {
+    let old = old_plan(input);
+    let new = new_plan(input);
+    sqlite::build_query(old) == sqlite::build_query(new) && postgres::build_query(old) == postgres::build_query(
+        new
+    ) && intent::result_columns(baseline_payload, input, old) == intent::result_columns(
+        new_acceptance_payload,
+        input,
+        new
+    )
+};
+pub def acceptance_grouping_by_projected_dimension: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(
+                r#""select":[{"node":"s","dimension":"sample__id"}],"measures":[{"node":"s","measure":"sample__cpu_mean"}]"#
+            )
+        )
+    }
+);
+pub def acceptance_grouping_by_identity: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(
+                r#""select":[{"node":"s","dimension":"sample__id"}],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"group_by_identity":["s"]"#
+            )
+        )
+    }
+);
+pub def acceptance_raw_ordering_and_take: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(
+                r#""select":[{"node":"s","dimension":"sample__cpu"}],"order_by":[{"node":"s","dimension":"sample__cpu","direction":"Desc"}],"take":10"#
+            )
+        )
+    }
+);
+pub def acceptance_aggregate_topn: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(
+                r#""select":[{"node":"s","dimension":"sample__id"}],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"top_by_measure":{"node":"s","measure":"sample__cpu_mean","direction":"Desc","take":10}"#
+            )
+        )
+    }
+);
+pub def acceptance_having: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(
+                r#""select":[{"node":"s","dimension":"sample__id"}],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"group_by_identity":["s"],"measure_having":[{"node":"s","measure":"sample__cpu_mean","op":"Gt","value":50}]"#
+            )
+        )
+    }
+);
+pub def acceptance_count_and_count_value: test::Test = verify(
+    fn() {
+        same_result(sample_input(r#""select":[],"count":"s""#)) && same_result(
+            sample_input(r#""select":[],"count_value":{"node":"s","dimension":"sample__cpu"}"#)
+        )
+    }
+);
+pub def acceptance_distinct_and_count_groups: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(r#""select":[{"node":"s","dimension":"sample__id"}],"distinct":true"#)
+        ) && same_result(
+            sample_input(
+                r#""select":[{"node":"s","dimension":"sample__id"}],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"group_by_identity":["s"],"measure_having":[{"node":"s","measure":"sample__cpu_mean","op":"Gt","value":50}],"count_groups":true"#
+            )
+        )
+    }
+);
+
+def filtered_sample: Value = sample_input(
+    r#""select":[{"node":"s","dimension":"sample__id"}],"filters":[{"node":"s","dimension":"sample__cpu","op":"Gt","value":50}]"#
+);
+def windowed_sample: Value = sample_input(
+    r#""select":[{"node":"s","dimension":"sample__id"}],"time_windows":[{"node":"s","dimension":"sample__ts","start":"2026-11-01T00:00:00Z","end":"2026-11-02T00:00:00Z"}]"#
+);
+def any_sample: Value = sample_input(
+    r#""select":[{"node":"s","dimension":"sample__id"}],"any_of":[{"node":"s","dimension":"sample__id","values":["d1","d2"]}]"#
+);
+pub def baseline_filter_time_and_any_of_are_available: test::Test = verify(
+    fn() {
+        array::all(
+            [filtered_sample, windowed_sample, any_sample],
+            fn(input) {
+                string::contains(sqlite::build_query(old_plan(input)).sql, "WHERE")
+            }
+        )
+    }
+);
+pub def acceptance_filter_permissions: test::Test = verify(
+    fn() {
+        same_result(filtered_sample)
+    }
+);
+pub def acceptance_time_window_permissions: test::Test = verify(
+    fn() {
+        same_result(windowed_sample)
+    }
+);
+pub def acceptance_any_of_permissions: test::Test = verify(
+    fn() {
+        same_result(any_sample)
+    }
+);
+pub def acceptance_min_max: test::Test = verify(
+    fn() {
+        same_result(
+            sample_input(
+                r#""select":[],"measures":[{"node":"s","measure":"sample__cpu_min"},{"node":"s","measure":"sample__cpu_max"}]"#
+            )
+        )
+    }
+);
+pub def acceptance_sample_order: test::Test = verify(
+    fn() {
+        match (
+            baseline_payload.entities[0].sample_order,
+            new_acceptance_payload.entities[3].sample_order
+        ) {
+            (Some(old), Some(new)) => old.time.column == new.time.column && array::map(
+                old.ties,
+                fn(column) {
+                    column.column
+                }
+            ) == array::map(
+                new.ties,
+                fn(column) {
+                    column.column
+                }
+            ),
+            _ => False
+        }
+    }
+);
+def aligned_payload: edsl::PreparedPayload = adapter::payload(
+    "aligned",
+    mappings,
+    array::concat([relations, [s::alignment("sample_device", samples.prepared, devices.prepared)]]),
+    acceptance_profile
+);
+pub def acceptance_subject_identity_aligns_to_another_mapping: test::Test = verify(
+    fn() {
+        let input = parse(
+            r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"},{"id":"d","entity":"device"}],"edges":[{"relation":"sample_device","from":"s","to":"d"}],"select":[{"node":"s","dimension":"sample__id"},{"node":"d","dimension":"device__name"}],"limit":500}"#
+        );
+        let plan = intent::query_intent_ast_factory(aligned_payload)(input);
+        string::contains(sqlite::build_query(plan).sql, "LEFT JOIN") && intent::result_columns(
+            aligned_payload,
+            input,
+            plan
+        )[
+            1
+        ].nullable
+    }
+);
+
+def union_identity: Value = sample_input(
+    r#""select":[{"node":"s","dimension":"sample__id"},{"node":"s","dimension":"sample__ts"}]"#
+);
+def union_input: Value = parse(
+    `{"op":"GraphUnion","branches":[{"result_node":"s","graph":\{json::stringify(union_identity)}},{"result_node":"s","graph":\{json::stringify(union_identity)}}],"limit":500}`
+);
+pub def acceptance_graph_union: test::Test = verify(
+    fn() {
+        same_result(union_input)
+    }
+);
+def pair_branch: Fn(String) -> Value = fn(node) {
+    parse(
+        `{"op":"Graph","root":"\{node}","nodes":[{"id":"\{node}","entity":"sample"}],"edges":[],"select":[],"measures":[{"node":"\{node}","measure":"sample__cpu_mean"}],"group_by_identity":["\{node}"]}`
+    )
+};
+def pair_input: Fn(String) -> Value = fn(extra) {
+    parse(
+        `{"op":"GraphPair","left":\{json::stringify(pair_branch("a"))},"right":\{json::stringify(pair_branch("b"))},"align_by":[{"left":{"node":"a"},"right":{"node":"b"}}],"select":[{"side":"Left","node":"a","dimension":"sample__id"}],\{extra}"limit":500}`
+    )
+};
+pub def acceptance_graph_pair: test::Test = verify(
+    fn() {
+        same_result(pair_input(""))
+    }
+);
+pub def acceptance_graph_pair_growth_ranking: test::Test = verify(
+    fn() {
+        same_result(
+            pair_input(
+                r#""rank_by":{"op":"GrowthRate","current":"Right","baseline":"Left","direction":"Desc","take":10},"#
+            )
+        )
+    }
+);
+
+def owner_period: Fn(String, String, String, String) -> Value = fn(owner, sample, start, end) {
+    parse(
+        `{"op":"Graph","root":"\{owner}","nodes":[{"id":"\{owner}","entity":"device"},{"id":"\{sample}","entity":"sample"}],"edges":[{"relation":"sample_device","from":"\{sample}","to":"\{owner}"}],"select":[],"measures":[{"node":"\{sample}","measure":"sample__cpu_mean"}],"group_by_identity":["\{owner}"],"time_windows":[{"node":"\{sample}","dimension":"sample__ts","start":"\{start}","end":"\{end}"}]}`
+    )
+};
+pub def acceptance_disjoint_periods_align_by_business_identity: test::Test = verify(
+    fn() {
+        let left = owner_period("a", "x", "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z");
+        let right = owner_period("b", "y", "2026-11-02T00:00:00Z", "2026-11-03T00:00:00Z");
+        let input = parse(
+            `{"op":"GraphPair","left":\{json::stringify(left)},"right":\{json::stringify(right)},"align_by":[{"left":{"node":"a"},"right":{"node":"b"}}],"select":[{"side":"Left","node":"a","dimension":"device__id"}],"rank_by":{"op":"GrowthRate","current":"Right","baseline":"Left","direction":"Desc","take":10},"limit":500}`
+        );
+        let plan = intent::query_intent_ast_factory(aligned_payload)(input);
+        let sql = sqlite::build_query(plan);
+        string::contains(sql.sql, "ORDER BY") && array::length(sql.bindings) >= 5
+    }
+);

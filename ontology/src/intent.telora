@@ -301,7 +301,6 @@ type RawGraphTopMeasure = struct {
 # reads the original object to distinguish omission from explicit null.
 type RawGraphEnvelope = struct {
     op: String,
-    limit: Option(Value),
     root: String,
     nodes: Value,
     edges: Value,
@@ -343,13 +342,14 @@ type RawCountThreshold = struct {
 };
 type RawGraphPair = struct {
     op: String,
-    limit: Option(Value),
     left: Value,
     right: Value,
     align_by: Option(Value),
     select: Option(Value),
     count_groups: Option(Value),
-    rank_by: Option(Value)
+    rank_by: Option(Value),
+    order_by: Option(Value),
+    take: Option(Value)
 };
 type PairNode = struct {
     node: String
@@ -386,8 +386,9 @@ type RawPairGrowth = struct {
 };
 type RawGraphUnion = struct {
     op: String,
-    limit: Option(Value),
-    branches: Array(Value)
+    branches: Array(Value),
+    order_by: Option(Value),
+    take: Option(Value)
 };
 type RawUnionBranch = struct {
     result_node: String,
@@ -1448,33 +1449,202 @@ def lower_unlimited_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst
     }
 };
 
-# Omission or null preserves the existing query; other values are validated before
-# business lowering to retain their input origin. Int is signed 64-bit.
-def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
-    let obj = as_object(intent);
-    let limit = match dict::get(obj, "limit") {
-        None => None,
-        Some(Value::None) => None,
-        Some(Value::Int(n)) => if n > 0 {
-            Some(n)
-        } else {
-            fail!(
-                "intent limit must be a positive integer (1..9223372036854775807)",
-                field(obj, "limit")
+# Match output columns back to their declared dimension ordering contract.
+def graph_order_dimensions: Fn(
+    edsl::PreparedPayload,
+    Value,
+    String
+) -> Array((String, edsl::DimensionEntry)) = fn(payload, input, prefix) {
+    let obj = as_object(input);
+    let nodes = array::map(array_opt(obj, "nodes"), parse_graph_node);
+    array::map(
+        array_opt(obj, "select"),
+        fn(value) {
+            let item = codec::decode@[edsl::GraphSelect](value).unwrap!();
+            let local = graph_node_payload(payload, nodes, item.node);
+            let dimension = match array::find(
+                local.dimensions,
+                fn(d) {
+                    d.id == item.dimension
+                }
+            ) {
+                Some(d) => d,
+                None => fail!("unknown order dimension", item.dimension)
+            };
+            (`\{prefix}\{item.node}_\{item.dimension}`, dimension)
+        }
+    )
+};
+def result_order_dimensions: Fn(
+    edsl::PreparedPayload,
+    Value
+) -> Array((String, edsl::DimensionEntry)) = fn(payload, input) {
+    let obj = as_object(input);
+    match as_string(field(obj, "op")) {
+        "Graph" => graph_order_dimensions(payload, input, ""),
+        "GraphUnion" => {
+            let branch = as_object(as_array(field(obj, "branches"))[0]);
+            graph_order_dimensions(payload, field(branch, "graph"), "")
+        },
+        "GraphPair" => {
+            let selected = codec::decode@[Array(PairSelection)](
+                Value::Array(array_opt(obj, "select"))
+            ).unwrap!();
+            array::concat(
+                [
+                    graph_order_dimensions(
+                        payload,
+                        pair_operand(field(obj, "left"), selected, qb::PairSide::Left),
+                        "left_"
+                    ),
+                    graph_order_dimensions(
+                        payload,
+                        pair_operand(field(obj, "right"), selected, qb::PairSide::Right),
+                        "right_"
+                    )
+                ]
             )
         },
-        Some(value) => fail!(
-            "intent limit must be a positive integer (1..9223372036854775807)",
-            value
-        ),
-    };
-    let ast = lower_unlimited_intent_ast(payload, intent);
-    match limit {
-        None => ast,
-        Some(value) => {
-            let bound = qb::bind(ast.ctx, qb::Val::Int(value));
-            {...ast, ctx: bound.0, result_limit: Some(bound.1)}
+        _ => [],
+    }
+};
+def final_order_key: Fn(
+    qb::BuildCtx,
+    String,
+    Option(edsl::DimensionEntry)
+) -> (qb::BuildCtx, qb::Expr) = fn(ctx, column, dimension) {
+    let expr = qb::Expr::Column({source: "__q_result", column});
+    match dimension {
+        None => (ctx, expr),
+        Some(d) => if (d.canonical_values != [] && d.canonical_order == []) || d.output_type == edsl::OutputType::Boolean || array::any(
+            d.input_kinds,
+            fn(kind) {
+                kind == edsl::FilterInputKind::Ipv4
+            }
+        ) {
+            fail!(`final order column \{column} has no declared business ordering`, column)
+        } else if d.canonical_order == [] {
+            (ctx, expr)
+        } else {
+            let unknown = qb::bind(ctx, qb::Val::None);
+            array::fold(
+                array::enumerate(d.canonical_order),
+                (unknown.0, unknown.1),
+                fn(state, entry) {
+                    let value = qb::bind(state.0, qb::Val::String(entry.1));
+                    let rank = qb::bind(value.0, qb::Val::Int(entry.0));
+                    (
+                        rank.0,
+                        qb::scalar_if(
+                            qb::scalar(qb::ScalarFunction::Eq, [expr, value.1]),
+                            rank.1,
+                            state.1
+                        )
+                    )
+                }
+            )
         },
+    }
+};
+
+# The public selection is outside every business operation, never an input cap.
+def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
+    let obj = as_object(intent);
+    if dict::get(obj, "limit") != None {
+        fail!(
+            "query limit is not supported; use final order_by and take (1..500)",
+            field(obj, "limit")
+        )
+    } else {
+        let base = Value::Object(
+            dict::from_pairs(
+                array::filter(
+                    dict::pairs(obj),
+                    fn(pair) {
+                        pair.0 != "order_by" && pair.0 != "take"
+                    }
+                )
+            )
+        );
+        let ast = lower_unlimited_intent_ast(payload, base);
+        let columns = result_columns(payload, base, ast);
+        let dimensions = if array_opt(obj, "order_by") == [] {
+            []
+        } else {
+            result_order_dimensions(payload, base)
+        };
+        let ordering = array::fold(
+            array_opt(obj, "order_by"),
+            (ast.ctx, []),
+            fn(state, value) {
+                let item = as_object(value);
+                let column = match dict::get(item, "column") {
+                    Some(value) => as_string(value),
+                    None => `\{as_string(field(item, "node"))}_\{as_string(field(item, "dimension"))}`,
+                };
+                let direction = match as_string(field(item, "direction")) {
+                    "Asc" => qb::Ordering::Asc,
+                    "Desc" => qb::Ordering::Desc,
+                    _ => fail!("final order direction must be Asc or Desc", value),
+                };
+                if !array::any(
+                    columns,
+                    fn(item) {
+                        item.name == column
+                    }
+                ) {
+                    fail!(
+                        `unknown final order column \{column}; use a projected result column`,
+                        value
+                    )
+                } else {
+                    let dimension = match array::find(
+                        dimensions,
+                        fn(entry) {
+                            entry.0 == column
+                        }
+                    ) {
+                        Some(entry) => Some(entry.1),
+                        None => None
+                    };
+                    let key = final_order_key(state.0, column, dimension);
+                    (key.0, array::push(state.1, {key: key.1, direction}.ty!(qb::ResultOrder)))
+                }
+            }
+        );
+        let selected = match dict::get(obj, "take") {
+            Some(Value::Int(n)) => if !array::any(
+                payload.profile.allowed_operators,
+                fn(op) {
+                    op == qb::Operator::Order
+                }
+            ) || !array::any(
+                payload.profile.allowed_operators,
+                fn(op) {
+                    op == qb::Operator::Limit
+                }
+            ) {
+                fail!("query profile must allow Order and Limit for final selection")
+            } else {
+                {
+                    ...ast,
+                    ctx: ordering.0,
+                    selection: Some({order_by: ordering.1, take: qb::public_take(n)})
+                }
+            },
+            Some(value) => fail!("final take must be a known integer in 1..500", value),
+            None => if ordering.1 == [] {
+                ast
+            } else {
+                fail!("final order_by requires take (1..500)")
+            },
+        };
+        let max_rows = qb::result_bound(selected);
+        if max_rows > 0 {
+            selected
+        } else {
+            fail!("query has no proven result bound")
+        }
     }
 };
 
@@ -1503,7 +1673,7 @@ type PreparedQuery = struct {
     sql: String,
     bindings: Array(qb::Val),
     columns: Array(ResultColumn),
-    limit_slot: Option(Int)
+    max_rows: Int
 };
 
 def primitive_result_type: Fn(edsl::OutputType) -> ResultType = fn(ty) {
@@ -1921,15 +2091,7 @@ def query_request_method_factory: Fn(edsl::PreparedPayload, ToQuery) -> Fn(Value
                                 sql: query.sql,
                                 bindings: query.bindings,
                                 columns: result_columns(payload, intent, ast),
-                                limit_slot: match ast.result_limit {
-                                    None => None,
-                                    Some(qb::Expr::AllocatedBind(binding)) => Some(
-                                        binding.index - 1
-                                    ),
-                                    Some(_) => fail!(
-                                        "final output limit requires an allocated binding"
-                                    ),
-                                }
+                                max_rows: qb::result_bound(ast)
                             }.ty!(PreparedQuery)
                         }
                     )(entry.1);

@@ -785,17 +785,8 @@ def render_from_clause: Fn(Plan, BuildCtx) -> String = fn(plan, ctx) {
 };
 
 def render_unpartitioned: Fn(Plan, Bool, BuildCtx) -> String = fn(plan, distinct, ctx) {
-    render_unpartitioned_limited(plan, distinct, ctx, None)
-};
-
-def render_unpartitioned_limited: Fn(Plan, Bool, BuildCtx, Option(Expr)) -> String = fn(
-    plan,
-    distinct,
-    ctx,
-    cap
-) {
     if array::length(qb::latest_calls(plan)) == 0 {
-        render_unpartitioned_from(plan, distinct, ctx, None, cap)
+        render_unpartitioned_from(plan, distinct, ctx, None)
     } else {
         let stage = qb::latest_stage(plan);
         let input = render_unpartitioned(stage.input, False, ctx);
@@ -811,16 +802,15 @@ def render_unpartitioned_limited: Fn(Plan, Bool, BuildCtx, Option(Expr)) -> Stri
             }
         );
         let source = `(SELECT __latest_input.*, row_number() OVER (\{partition}ORDER BY \{string::join(orders, ", ")}) AS __latest_row FROM (\{input}) AS __latest_input) AS __latest_stage`;
-        render_unpartitioned_from(stage.output, distinct, ctx, Some(source), cap)
+        render_unpartitioned_from(stage.output, distinct, ctx, Some(source))
     }
 };
 
-def render_unpartitioned_from: Fn(Plan, Bool, BuildCtx, Option(String), Option(Expr)) -> String = fn(
+def render_unpartitioned_from: Fn(Plan, Bool, BuildCtx, Option(String)) -> String = fn(
     plan,
     distinct,
     ctx,
-    source,
-    cap
+    source
 ) {
     let select_sql = string::join(
         array::map(
@@ -867,15 +857,12 @@ def render_unpartitioned_from: Fn(Plan, Bool, BuildCtx, Option(String), Option(E
         ""
     };
     # SQLite uses LIMIT -1 to express an offset without a row cap.
-    let limit_part = match cap {
-        Some(value) => ` LIMIT \{render_output_limit(plan.limit, value, ctx)}`,
-        None => match plan.limit {
-            Some(value) => ` LIMIT \{render_expr(value, ctx)}`,
-            None => if plan.offset != None {
-                " LIMIT -1"
-            } else {
-                ""
-            },
+    let limit_part = match plan.limit {
+        Some(value) => ` LIMIT \{render_expr(value, ctx)}`,
+        None => if plan.offset != None {
+            " LIMIT -1"
+        } else {
+            ""
         },
     };
     let offset_part = match plan.offset {
@@ -1105,12 +1092,7 @@ def render_plan: Fn(Plan, BuildCtx) -> String = fn(plan, ctx) {
     }
 };
 # Materialize the same validated AST as PostgreSQL, with SQLite syntax.
-def render_joined_groups: Fn(JoinedGroups, Bool, BuildCtx, Option(Expr)) -> String = fn(
-    joined,
-    count,
-    ctx,
-    cap
-) {
+def render_joined_groups: Fn(JoinedGroups, Bool, BuildCtx) -> String = fn(joined, count, ctx) {
     let left = render_plan(joined.left, ctx);
     let right = render_plan(joined.right, ctx);
     let outputs = array::map(
@@ -1173,20 +1155,20 @@ def render_joined_groups: Fn(JoinedGroups, Bool, BuildCtx, Option(Expr)) -> Stri
             );
             (
                 `, \{expression} AS comparison_value`,
-                ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY comparison_value \{direction}, \{string::join(ties, ", ")} LIMIT \{match cap { Some(value) => render_output_limit(Some(rank.take), value, ctx), None => render_expr(rank.take, ctx) }}`
+                ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY comparison_value \{direction}, \{string::join(ties, ", ")} LIMIT \{render_expr(rank.take, ctx)}`
             )
         },
     };
-    `SELECT \{selected}\{ranking.0} FROM (\{left}) AS __q_left INNER JOIN (\{right}) AS __q_right ON \{string::join(keys, " AND ")}\{ranking.1}\{if joined.rank == None { render_output_suffix(cap, ctx) } else { "" }}`
+    `SELECT \{selected}\{ranking.0} FROM (\{left}) AS __q_left INNER JOIN (\{right}) AS __q_right ON \{string::join(keys, " AND ")}\{ranking.1}`
 };
 
-def render_sqlite_plan: Fn(QueryPlan, BuildCtx, Option(Expr)) -> String = fn(query_plan, ctx, cap) {
+def render_sqlite_plan: Fn(QueryPlan, BuildCtx) -> String = fn(query_plan, ctx) {
     match validate_query_plan(query_plan) {
         QueryPlan::Rows(plan) => match plan.partition {
-            None => render_unpartitioned_limited(plan, False, ctx, cap),
-            Some(_) => `\{render_plan(plan, ctx)}\{render_output_suffix(cap, ctx)}`,
+            None => render_unpartitioned(plan, False, ctx),
+            Some(_) => `\{render_plan(plan, ctx)}`,
         },
-        QueryPlan::DistinctRows(plan) => render_unpartitioned_limited(plan, True, ctx, cap),
+        QueryPlan::DistinctRows(plan) => render_unpartitioned(plan, True, ctx),
         QueryPlan::SetRows(set) => {
             let parts = array::map(
                 set.operands,
@@ -1194,7 +1176,7 @@ def render_sqlite_plan: Fn(QueryPlan, BuildCtx, Option(Expr)) -> String = fn(que
                     render_plan(plan, ctx)
                 }
             );
-            `\{string::join(parts, ` \{set_op_sql(set.kind)} `)}\{render_output_suffix(cap, ctx)}`
+            `\{string::join(parts, ` \{set_op_sql(set.kind)} `)}`
         },
         QueryPlan::SetCount(set) => {
             let parts = array::map(
@@ -1204,40 +1186,26 @@ def render_sqlite_plan: Fn(QueryPlan, BuildCtx, Option(Expr)) -> String = fn(que
                 }
             );
             let sql = string::join(parts, ` \{set_op_sql(set.kind)} `);
-            `SELECT count(1) AS count FROM (\{sql}) AS __q_set\{render_output_suffix(cap, ctx)}`
+            `SELECT count(1) AS count FROM (\{sql}) AS __q_set`
         },
         QueryPlan::GroupCount(plan) => {
             let inner = render_plan(plan, ctx);
-            `SELECT count(1) AS count FROM (\{inner}) AS __q_count\{render_output_suffix(cap, ctx)}`
+            `SELECT count(1) AS count FROM (\{inner}) AS __q_count`
         },
-        QueryPlan::JoinedGroups(joined) => render_joined_groups(joined, False, ctx, cap),
-        QueryPlan::JoinedGroupCount(joined) => render_joined_groups(joined, True, ctx, cap),
-    }
-};
-
-# Merge only at the final SELECT, preserving ORDER BY and all business stages.
-def render_output_limit: Fn(Option(Expr), Expr, BuildCtx) -> String = fn(local, cap, ctx) {
-    let output = render_expr(cap, ctx);
-    match local {
-        None => output,
-        Some(value) => {
-            let business = render_expr(value, ctx);
-            `CASE WHEN \{business} < \{output} THEN \{business} ELSE \{output} END`
-        },
-    }
-};
-
-def render_output_suffix: Fn(Option(Expr), BuildCtx) -> String = fn(cap, ctx) {
-    match cap {
-        None => "",
-        Some(value) => ` LIMIT \{render_output_limit(None, value, ctx)}`
+        QueryPlan::JoinedGroups(joined) => render_joined_groups(joined, False, ctx),
+        QueryPlan::JoinedGroupCount(joined) => render_joined_groups(joined, True, ctx),
     }
 };
 
 def build_query: Fn(QueryAst) -> Query = fn(ast) {
     let plan = validate_contextual_pagination(ast.plan, ast.ctx);
-    let cap = qb::validated_output_limit(ast);
-    {sql: render_sqlite_plan(plan, ast.ctx, cap), bindings: ast.ctx.bindings}
+    qb::select_result(
+        {sql: render_sqlite_plan(plan, ast.ctx), bindings: ast.ctx.bindings},
+        ast,
+        fn(expr) {
+            render_sqlite_expr_with_context(expr, ast.ctx).sql
+        }
+    )
 };
 
 pub use self::{build_query, render_sqlite_expr_with_context};

@@ -1,0 +1,213 @@
+# 迁移验收只核对对外契约与查询，不保留第二套运行期模型。
+use crate::typed as model;
+use ontology::ontology as edsl;
+use ontology::intent as intent;
+use ontology::query as query;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use std::array as array;
+use std::codec as codec;
+use std::json as json;
+use std::test as test;
+use std::value::{Value};
+
+type Field = struct {
+    name: String,
+    column: String,
+    nullable: Bool,
+    time: Option(edsl::TimeField)
+};
+type Dataset = struct {
+    id: String,
+    table: String,
+    fields: Array(Field),
+    references: Array(edsl::ReferenceSpec),
+    grain: Array(String),
+    scope: Array(edsl::PreparedGuard),
+    samples: Array(edsl::SampleMeasureEntry)
+};
+type Dimension = struct {
+    id: String,
+    dataset: String,
+    field: String,
+    projectable: Bool,
+    filterable: Bool,
+    ops: Array(edsl::FilterOp),
+    input_kinds: Array(edsl::FilterInputKind),
+    output_type: edsl::OutputType,
+    computed: Bool,
+    utc_bucket: Option(edsl::UtcBucketDimensionSpec),
+    canonical_values: Array(edsl::CanonicalValueSpec),
+    canonical_order: Array(String),
+    half_open: Bool
+};
+type Computed = struct {
+    op: query::ComputedOp,
+    left: String,
+    right: String
+};
+type Measure = struct {
+    id: String,
+    dataset: String,
+    field: String,
+    aggregate: query::AggregateFunction,
+    output_type: edsl::OutputType,
+    computed: Option(Computed),
+    predicate: Option(edsl::ScopePredicate),
+    latest: Bool
+};
+type Relation = struct {
+    id: String,
+    from: String,
+    to: String,
+    cardinality: edsl::RelationCardinality,
+    key: edsl::RelationKey,
+    guard: Option(edsl::PreparedGuard)
+};
+type Contract = struct {
+    datasets: Array(Dataset),
+    dimensions: Array(Dimension),
+    measures: Array(Measure),
+    relations: Array(Relation),
+    native_pairs: Array(edsl::NativePairEntry),
+    business_links: Array(edsl::BusinessLinkEntry)
+};
+type Query = struct {
+    input: Value,
+    sqlite: query::Query,
+    postgres: query::Query,
+    columns: Array(intent::ResultColumn)
+};
+
+def payload: edsl::PreparedPayload = model::payload;
+pub def contract: Value = codec::encode(
+    {
+        datasets: array::map(
+            payload.entities,
+            fn(entity) {
+                {
+                    id: entity.id,
+                    table: entity.table,
+                    fields: array::map(
+                        entity.fields,
+                        fn(field) {
+                            {
+                                name: field.name,
+                                column: field.column,
+                                nullable: field.nullable,
+                                time: field.time
+                            }.ty!(Field)
+                        }
+                    ),
+                    references: entity.references,
+                    grain: array::map(
+                        entity.grain_fields,
+                        fn(index) {
+                            entity.fields[index].name
+                        }
+                    ),
+                    scope: entity.scope,
+                    samples: entity.sample_measures
+                }.ty!(Dataset)
+            }
+        ),
+        dimensions: array::map(
+            payload.dimensions,
+            fn(d) {
+                {
+                    id: d.id,
+                    dataset: payload.entities[d.entity].id,
+                    field: payload.entities[d.entity].fields[d.field].name,
+                    projectable: d.projectable,
+                    filterable: d.filterable,
+                    ops: d.ops,
+                    input_kinds: d.input_kinds,
+                    output_type: d.output_type,
+                    computed: d.computed,
+                    utc_bucket: d.utc_bucket,
+                    canonical_values: d.canonical_values,
+                    canonical_order: d.canonical_order,
+                    half_open: d.half_open
+                }.ty!(Dimension)
+            }
+        ),
+        measures: array::map(
+            payload.measures,
+            fn(m) {
+                {
+                    id: m.id,
+                    dataset: payload.entities[m.entity].id,
+                    field: payload.entities[m.entity].fields[m.field].name,
+                    aggregate: m.aggregate,
+                    output_type: m.output_type,
+                    computed: match m.computed {
+                        Some(c) => Some({op: c.op, left: c.left, right: c.right}.ty!(Computed)),
+                        None => None
+                    },
+                    predicate: match m.predicate {
+                        Some(p) => Some(p.scope),
+                        None => None
+                    },
+                    latest: m.latest != None
+                }.ty!(Measure)
+            }
+        ),
+        relations: array::map(
+            payload.relations,
+            fn(r) {
+                {
+                    id: r.id,
+                    from: payload.entities[r.from].id,
+                    to: payload.entities[r.to].id,
+                    cardinality: r.cardinality,
+                    key: r.key,
+                    guard: r.guard
+                }.ty!(Relation)
+            }
+        ),
+        native_pairs: payload.native_pairs,
+        business_links: payload.business_links
+    }.ty!(Contract)
+);
+
+def inputs: Array(Value) = array::map(
+    [
+        r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device_name"}],"limit":500}"#,
+        r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"device_belongs_to_tenant","from":"d","to":"t"}],"select":[{"node":"t","dimension":"tenant_name"}],"measures":[{"node":"d","measure":"device_count"}],"limit":500}"#,
+        r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"k","entity":"device_kpi"}],"edges":[{"relation":"device_kpi_of_device","from":"k","to":"d"}],"select":[{"node":"d","dimension":"device_name"}],"group_by_identity":["d"],"measures":[{"node":"k","measure":"cpu_usage"},{"node":"k","measure":"device_cpu_latest"}],"time_windows":[{"node":"k","dimension":"device_kpi_ts_raw","start":"2026-10-01T00:00:00Z","end":"2026-10-08T00:00:00Z"}],"limit":500}"#,
+        r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"current_alarm"}],"edges":[],"select":[{"node":"a","dimension":"alarm_severity"}],"measures":[{"node":"a","measure":"alarm_count"},{"node":"a","measure":"critical_or_major_alarm_count"}],"limit":500}"#,
+        r#"{"op":"Graph","root":"p","nodes":[{"id":"p","entity":"pon_onu_role"}],"edges":[],"select":[{"node":"p","dimension":"pon_onu_role__ipAddress_ipv4"}],"limit":500}"#,
+        r#"{"op":"Graph","root":"k","nodes":[{"id":"k","entity":"device_kpi"}],"edges":[],"select":[{"node":"k","dimension":"device_kpi_utc_day"}],"measures":[{"node":"k","measure":"cpu_usage"}],"limit":500}"#,
+        r#"{"op":"Graph","root":"l","nodes":[{"id":"l","entity":"physical_link"}],"edges":[],"select":[{"node":"l","dimension":"physical_link_a_ne_name"},{"node":"l","dimension":"physical_link_z_ne_name"}],"limit":500}"#
+    ],
+    fn(text) {
+        json::parse(text).unwrap!()
+    }
+);
+pub def queries: Value = codec::encode(
+    array::map(
+        inputs,
+        fn(input) {
+            let ast = intent::query_intent_ast_factory(payload)(input);
+            {
+                input,
+                sqlite: sqlite::build_query(ast),
+                postgres: postgres::build_query(ast),
+                columns: intent::result_columns(payload, input, ast)
+            }.ty!(Query)
+        }
+    )
+);
+pub def representative_queries_compile: test::Test = test::should_ok(
+    fn() {
+        # 显式强制求值所有查询，不能把未断言的 Bool 当成功。
+        match queries {
+            Value::Array(items) => if array::length(items) == 7 {
+                ()
+            } else {
+                fail!("missing queries")
+            },
+            _ => fail!("invalid queries")
+        }
+    }
+);

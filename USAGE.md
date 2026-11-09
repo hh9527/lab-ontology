@@ -77,17 +77,13 @@ SQL 与绑定是交给获授权执行层的中间输出，不是澄清依据或�
 {"method":"<domain>/transform","input":{"intents":[<Intent>, ...]}}
 ```
 
-每个顶层 Intent 可声明 `limit`，范围为 1 至 9,223,372,036,854,775,807 的 JSON 整数（有符号 64 位）。
-省略或显式 null 保留既有行为，不增加上限或绑定；布尔、字符串、浮点及非正值被拒绝，并返回针对 limit 的诊断。
-GraphPair 操作数和 GraphUnion 分支不要求此字段。
-模型定义 limit 语义及整数范围；外部插件声明并执行自己的调用要求与行数限制，可以要求 limit、收窄范围或在转发前注入／覆盖。
-通过插件调用时遵守其声明要求。
-
-`limit` 在筛选、聚合、DISTINCT、排名、分区 Top-N、配对及集合操作之后限制最终行数。
-业务 `take` 继续选择总体；二者作用于同一最终有序结果时，SQL 取较小值。分区 Top-N 先于全局输出上限执行。
-上限是 SQL 绑定，不是客户端切片。保留已有排序，无排序时不承诺具体子集或稳定分页。
-transform 返回完整 SQL 和绑定，而非数据库行。执行层必须返回全部结果，包括空结果和恰好到上限的结果；额外截断必须披露。
-不计算总数或 `hasMore`，达到上限不代表覆盖整个总体。
+每个多行查询使用最终 `order_by:[{column,direction}]` 与 `take`，take 是检查时已知的 1..500 整数。
+column 是投影后的完整列名，direction 为 Asc 或 Desc；Graph 的维度排序也可写为 `{node,dimension,direction}`。
+最终排序取前 N 由数据库执行，位于 JOIN、聚合、DISTINCT、UNION 之后。枚举排序遵循模型声明的业务顺序；并列时应显式补充已投影身份列。
+无分组标量计数和普通聚合可证明至多一行；全局 top_by_measure 和 GraphPair.rank_by 也可证明上界，其最终 take 同样为 1..500。
+分区 top_per 或分支内 take 不能证明最终结果上界，缺少证明时 transform/check 返回诊断。
+查询参数 limit 不合法。transform 返回 SQL 和绑定；执行器原样执行，不自动截断，也不修改绑定。
+取前 N 不代表覆盖总体；需要全量统计时先在数据库聚合再选择结果。
 
 响应包含 `accepted`、`diagnostics`、`queries`。每项诊断有标识 Intent 的零基 `index`，以及含 `severity`、`message`、有序 `locs` 的 `diagnostic`。
 由 `fail!` 抛出的转换失败中，`locs[0]` 为规则位置，`locs[1..]` 按参数顺序列来源，含重复来源。
@@ -98,14 +94,14 @@ transform 返回完整 SQL 和绑定，而非数据库行。执行层必须返�
 即使前项失败也检查全部 Intent。仅全部成功时 queries 才按原顺序包含每项 Query，否则为 null。
 成功批次仍可能有警告，使用前应阅读。这是独立计划批次，不是合并结果集。
 
-每个成功 Query 为 `{sql, bindings, columns, limit_slot}`。
+每个成功 Query 为 `{sql, bindings, columns, max_rows}`。
 `columns` 按最终 SQL 结果排序，包含生成的标签和比较列，每项为 `{name, type, nullable}`，例如：
 
 ```json
 {
   "sql": "SELECT ...",
   "bindings": [],
-  "limit_slot": null,
+  "max_rows": 10,
   "columns": [
     {"name": "alarm_severity", "type": "String", "nullable": true},
     {"name": "alarm_count", "type": "Int", "nullable": false}
@@ -113,8 +109,7 @@ transform 返回完整 SQL 和绑定，而非数据库行。执行层必须返�
 }
 ```
 
-`limit_slot` 是最终输出上限在 bindings 中的零基索引，顶层无上限时为 null，不指内部 Top-N／分区上限。
-执行适配器可复制 bindings 并调整该槽以实施自身有界获取策略；模型原样返回请求上限。
+`max_rows` 是检查得到的最终结果行数上界，执行器可据此设置资源保护；它不是额外的截断参数。
 
 列在 transform 时从已校验模型及最终投影推导，无需连接数据库或执行 SQL；空结果和全 NULL 列也有模式。
 类型词汇为 `Int`、`Float`、`Bool`、`String`、`DateTimeUtc`、`EpochMillis`、`DateTime`。

@@ -1,0 +1,1094 @@
+# 业务类型、字段能力与存储映射的局部准备；发布入口见 semantic。
+use std::prelude as prelude;
+use std::type_property as property;
+use std::type_desc as td;
+use std::type_memorizer as memo;
+use std::array as array;
+use std::dict as dict;
+use crate::groups as groups;
+use crate::ontology as edsl;
+use crate::query as query;
+use crate::property_contract as contract;
+use crate::quantity as quantity;
+use crate::scalars as scalars;
+use crate::samples as samples;
+use crate::knowledge_policy as knowledge_policy;
+use std::codec as codec;
+use std::value::{Value};
+
+def require_option: for(A) Fn(Option(A)) -> A = fn(value) {
+    match value {
+        Some(value) => value,
+        None => fail!("missing semantic declaration")
+    }
+};
+def contains: for(A) Fn(Array(A), A) -> Bool = fn(values, target) {
+    array::any(
+        values,
+        fn(value) {
+            value == target
+        }
+    )
+};
+
+type Statistic = enum {
+    Mean,
+    Min,
+    Max,
+    Sum
+};
+@prelude::property(PropertyTarget::Type)
+type IdentityInfo = struct {
+    entity: String
+};
+def entity_by: Fn(String) -> Fn(Type, Option(IdentityInfo)) -> IdentityInfo = fn(entity) {
+    contract::publish_name(entity);
+    fn(ctx, previous) {
+        {entity}
+    }
+};
+@prelude::property(PropertyTarget::Type)
+type ReferenceInfo = struct {
+    identity: Type
+};
+def reference: Fn(Type) -> Fn(Type, Option(ReferenceInfo)) -> ReferenceInfo = fn(identity) {
+    fn(ctx, previous) {
+        {identity}
+    }
+};
+@reference(By.type)
+@knowledge_policy::constructor("Reference")
+type Reference(By) = struct(By);
+def reference_parts: Fn(Type) -> Array(IdentityPart) = fn(by) {
+    if property::get_type_prop(by, IdentityInfo.type) != None {
+        identity(by).parts
+    } else if by == String.type || by == Int.type {
+        [{path: "", value: by}]
+    } else {
+        fail!("Reference requires an identity or opaque String/Int representation", by)
+    }
+};
+# 多态来源标识没有单一目标；字段给出允许的解释，外置 Relation 再选具体连接。
+type ReferenceTarget = struct {
+    name: String,
+    identity: Type
+};
+@prelude::property(PropertyTarget::Field)
+type ReferenceTargets = struct {
+    items: Array(ReferenceTarget)
+};
+def targets: Fn(
+    Array(ReferenceTarget)
+) -> Fn(property::FieldPropertyCtx, Option(ReferenceTargets)) -> ReferenceTargets = fn(items) {
+    contract::unique(
+        array::map(
+            items,
+            fn(item) {
+                item.name
+            }
+        )
+    );
+    array::map(
+        items,
+        fn(item) {
+            contract::publish_name(item.name);
+            identity(item.identity)
+        }
+    );
+    fn(ctx, previous) {
+        let value = value_type(ctx.ty).0;
+        let ref = match property::get_type_prop(value, ReferenceInfo.type) {
+            Some(ref) => ref,
+            None => fail!("reference targets require a Reference field", ctx.name)
+        };
+        let source_parts = reference_parts(ref.identity);
+        array::map(
+            items,
+            fn(item) {
+                let parts = identity(item.identity).parts;
+                if array::length(source_parts) != array::length(parts) || !array::all(
+                    array::enumerate(parts),
+                    fn(part) {
+                        groups::representation(part.1.value) == groups::representation(
+                            source_parts[part.0].value
+                        )
+                    }
+                ) {
+                    fail!("reference target has incompatible representation", ctx.name, item.name)
+                } else {
+                    ()
+                }
+            }
+        );
+        {items}
+    }
+};
+
+@prelude::property(PropertyTarget::Type)
+type NumericInfo = struct {
+    statistics: Array(Statistic)
+};
+def numeric: Fn(Array(Statistic)) -> Fn(Type, Option(NumericInfo)) -> NumericInfo = fn(statistics) {
+    fn(ctx, previous) {
+        let storage = groups::representation(ctx);
+        if storage != Float.type && storage != Int.type {
+            fail!("semantic numeric type has incompatible representation", ctx)
+        } else {
+            ()
+        };
+        {statistics}
+    }
+};
+
+@prelude::property(PropertyTarget::Type)
+type TableInfo = struct {
+    source: String,
+    id: Option(String),
+    grain: Array(String)
+};
+def table: Fn(String) -> Fn(Type, Option(TableInfo)) -> TableInfo = fn(source) {
+    contract::publish_name(source);
+    fn(ctx, previous) {
+        {source, id: None, grain: []}
+    }
+};
+def dataset: Fn(String, String, Array(String)) -> Fn(Type, Option(TableInfo)) -> TableInfo = fn(
+    id,
+    source,
+    grain
+) {
+    contract::name(id);
+    contract::publish_name(source);
+    contract::unique(grain);
+    fn(ctx, previous) {
+        {source, id: Some(id), grain}
+    }
+};
+@prelude::property(PropertyTarget::Type)
+type Binding = struct {
+    identity: Type,
+    field: String
+};
+def bind: Fn(Type, String) -> Fn(Type, Option(Binding)) -> Binding = fn(identity, field) {
+    contract::publish_name(field);
+    fn(ctx, previous) {
+        {identity, field}
+    }
+};
+
+type Usage = enum {
+    Attribute,
+    Observation
+};
+@prelude::property(PropertyTarget::Field)
+type Meaning = struct {
+    name: String,
+    usage: Usage,
+    clock: Option(String),
+    statistics: Array(Statistic)
+};
+def meaning: Fn(
+    String,
+    Usage,
+    Option(String),
+    Array(Statistic)
+) -> Fn(property::FieldPropertyCtx, Option(Meaning)) -> Meaning = fn(name, usage, clock, statistics) {
+    contract::publish_name(name);
+    fn(ctx, previous) {
+        if previous != None {
+            fail!("semantic field meaning must be declared once", ctx.name)
+        } else {
+            ()
+        };
+        {name, usage, clock, statistics}
+    }
+};
+def attribute: Fn(String) -> Fn(property::FieldPropertyCtx, Option(Meaning)) -> Meaning = fn(name) {
+    meaning(name, Usage::Attribute, None, [])
+};
+def observation: Fn(
+    String,
+    String,
+    Array(Statistic)
+) -> Fn(property::FieldPropertyCtx, Option(Meaning)) -> Meaning = fn(name, clock, statistics) {
+    meaning(name, Usage::Observation, Some(clock), statistics)
+};
+
+# 只剥离 Option；普通 newtype 的业务身份必须保留。
+def value_type: Fn(Type) -> (Type, Bool) = fn(ty) {
+    let variants = if td::kind(ty) == td::TypeDescKind::Enum {
+        td::variants(ty)
+    } else {
+        []
+    };
+    if array::length(variants) == 2 && array::any(
+        variants,
+        fn(v) {
+            v.name == "None" && v.payload == None
+        }
+    ) {
+        let some = require_option(
+            array::find(
+                variants,
+                fn(v) {
+                    v.name == "Some"
+                }
+            )
+        );
+        (require_option(some.payload), True)
+    } else {
+        (ty, False)
+    }
+};
+type Identity = struct {
+    entity: String,
+    parts: Array(IdentityPart)
+};
+type IdentityPart = struct {
+    path: String,
+    value: Type
+};
+def identity_part: Fn(Type, String) -> Array(IdentityPart) = fn(value, path) {
+    if value_type(value).1 {
+        fail!("identity components must be non-null", value)
+    } else {
+        ()
+    };
+    match property::get_type_prop(value, ReferenceInfo.type) {
+        Some(ref) => array::map(
+            identity(ref.identity).parts,
+            fn(part) {
+                {
+                    path: if path == "" {
+                        part.path
+                    } else if part.path == "" {
+                        path
+                    } else {
+                        `\{path}.\{part.path}`
+                    },
+                    value: part.value
+                }.ty!(IdentityPart)
+            }
+        ),
+        None => {
+            let storage = groups::representation(value);
+            if storage != String.type && storage != Int.type {
+                fail!("identity components require text or integer representation", value)
+            } else {
+                [{path, value}]
+            }
+        }
+    }
+};
+def compute_identity: Fn(Type) -> Identity = fn(value) {
+    let info = match property::get_type_prop(value, IdentityInfo.type) {
+        Some(info) => info,
+        None => fail!("Reference or binding requires entity_by identity", value)
+    };
+    let shape = resolve_type(value);
+    let parts = if td::kind(shape) == td::TypeDescKind::Newtype {
+        identity_part(td::children(shape)[0], "")
+    } else if td::kind(shape) == td::TypeDescKind::Struct {
+        array::flat_map(
+            td::fields(shape),
+            fn(f) {
+                identity_part(f.ty, f.name)
+            }
+        )
+    } else {
+        fail!("entity_by requires newtype or named struct", value)
+    };
+    if array::length(parts) == 0 {
+        fail!("identity must contain at least one component", value)
+    } else {
+        ()
+    };
+    {entity: info.entity, parts}
+};
+def resolve_type: Fn(Type) -> Type = fn(value) {
+    if td::kind(value) == td::TypeDescKind::Ref {
+        match td::resolve(value) {
+            Ok(resolved) => resolve_type(resolved),
+            Err(error) => fail!(error.message, value)
+        }
+    } else {
+        value
+    }
+};
+def identities: memo::TypeMemorizer(Identity) = memo::type_memorizer(compute_identity);
+def identity: Fn(Type) -> Identity = fn(value) {
+    memo::computed_with_type(identities, value)
+};
+
+# 以逻辑成员路径映射物理列，不依赖反射的字段顺序。
+@prelude::property(PropertyTarget::Field)
+type Columns = struct {
+    names: Dict(String)
+};
+def columns: Fn(Dict(String)) -> Fn(property::FieldPropertyCtx, Option(Columns)) -> Columns = fn(
+    names
+) {
+    let pairs = dict::pairs(names);
+    contract::unique(
+        array::map(
+            pairs,
+            fn(pair) {
+                pair.1
+            }
+        )
+    );
+    array::map(
+        pairs,
+        fn(pair) {
+            contract::publish_name(pair.1)
+        }
+    );
+    fn(ctx, previous) {
+        {names}
+    }
+};
+def allowed_statistics: Fn(Type) -> Array(Statistic) = fn(ty) {
+    match property::get_type_prop(ty, NumericInfo.type) {
+        Some(info) => info.statistics,
+        None => if ty == Float.type || ty == Int.type || ty == quantity::Count.type || ty == quantity::Bytes.type {
+            [Statistic::Mean, Statistic::Min, Statistic::Max, Statistic::Sum]
+        } else {
+            []
+        }
+    }
+};
+
+type Field = struct {
+    name: String,
+    columns: Array(String),
+    value: Type,
+    nullable: Bool,
+    storage: Type,
+    meaning: Option(Meaning),
+    reference: Option(ReferenceInfo),
+    targets: Array(ReferenceTarget),
+    views: Array(groups::FieldDimension),
+    scope: Option(edsl::FilterInput),
+    unit: Option(quantity::Unit)
+};
+@prelude::property(PropertyTarget::Field)
+type SourceScope = struct {
+    input: edsl::FilterInput
+};
+type CountCondition = struct {
+    dimension: String,
+    member: String
+};
+type FieldCount = struct {
+    name: String,
+    condition: Option(CountCondition)
+};
+@prelude::property(PropertyTarget::Field)
+type FieldCounts = struct {
+    items: Array(FieldCount)
+};
+def field_count: Fn(
+    String,
+    Option(CountCondition)
+) -> Fn(property::FieldPropertyCtx, Option(FieldCounts)) -> FieldCounts = fn(name, condition) {
+    contract::publish_name(name);
+    fn(ctx, previous) {
+        let before = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        {items: array::push(before, {name, condition}.ty!(FieldCount))}
+    }
+};
+def count: Fn(String) -> Fn(property::FieldPropertyCtx, Option(FieldCounts)) -> FieldCounts = fn(
+    name
+) {
+    field_count(name, None)
+};
+def count_when: for(Member: codec::Encode) Fn(
+    String,
+    String,
+    Member
+) -> Fn(property::FieldPropertyCtx, Option(FieldCounts)) -> FieldCounts = fn(
+    name,
+    dimension,
+    member
+) {
+    let member = match codec::encode(member) {
+        Value::String(member) => member,
+        _ => fail!("count condition requires a canonical enum member", name)
+    };
+    field_count(name, Some({dimension, member}))
+};
+type ComputedCount = struct {
+    name: String,
+    op: query::ComputedOp,
+    left: String,
+    right: String
+};
+@prelude::property(PropertyTarget::Type)
+type ComputedCounts = struct {
+    items: Array(ComputedCount)
+};
+def computed_counts: Fn(Array(ComputedCount)) -> Fn(Type, Option(ComputedCounts)) -> ComputedCounts = fn(
+    items
+) {
+    array::map(
+        items,
+        fn(item) {
+            contract::publish_name(item.name)
+        }
+    );
+    fn(ctx, previous) {
+        {items}
+    }
+};
+type NativePair = struct {
+    name: String,
+    left: String,
+    right: String
+};
+@prelude::property(PropertyTarget::Type)
+type NativePairs = struct {
+    items: Array(NativePair)
+};
+def native_pairs: Fn(Array(NativePair)) -> Fn(Type, Option(NativePairs)) -> NativePairs = fn(items) {
+    array::map(
+        items,
+        fn(item) {
+            contract::publish_name(item.name)
+        }
+    );
+    fn(ctx, previous) {
+        {items}
+    }
+};
+def scope_equal: for(Scalar: codec::Encode) Fn(
+    Scalar
+) -> Fn(property::FieldPropertyCtx, Option(SourceScope)) -> SourceScope = fn(value) {
+    let input = match codec::encode(value) {
+        Value::String(value) => edsl::FilterInput::Text(value),
+        Value::Int(value) => edsl::FilterInput::Int(value),
+        Value::Float(value) => edsl::FilterInput::Number(value),
+        Value::True => edsl::FilterInput::Bool(True),
+        Value::False => edsl::FilterInput::Bool(False),
+        _ => fail!("source scope requires a scalar literal")
+    };
+    fn(ctx, previous) {
+        if ctx.ty != Scalar.type && ctx.ty != Option(Scalar).type {
+            fail!("source scope has a different nominal type", ctx.name)
+        } else {
+            ()
+        };
+        {input}
+    }
+};
+@prelude::property(PropertyTarget::Type)
+type Grain = struct {
+    fields: Array(String)
+};
+def grain: Fn(Array(String)) -> Fn(Type, Option(Grain)) -> Grain = fn(fields) {
+    contract::unique(fields);
+    fn(ctx, previous) {
+        {fields}
+    }
+};
+type Prepared = struct {
+    row: Type,
+    source: String,
+    binding: Option(Binding),
+    grain: Array(String),
+    fields: Array(Field),
+    kind: edsl::DatasetKind,
+    clock: Option(String),
+    record_counts: Array(String)
+};
+@prelude::property(PropertyTarget::Type)
+type Temporal = struct {
+    kind: edsl::DatasetKind,
+    clock: String
+};
+def temporal: Fn(edsl::DatasetKind, String) -> Fn(Type, Option(Temporal)) -> Temporal = fn(
+    kind,
+    clock
+) {
+    contract::publish_name(clock);
+    fn(ctx, previous) {
+        {kind, clock}
+    }
+};
+def metric: Fn(String) -> Fn(Type, Option(Temporal)) -> Temporal = fn(clock) {
+    temporal(edsl::DatasetKind::Metric, clock)
+};
+def event: Fn(String) -> Fn(Type, Option(Temporal)) -> Temporal = fn(clock) {
+    temporal(edsl::DatasetKind::Event, clock)
+};
+@prelude::property(PropertyTarget::Type)
+type RecordCounts = struct {
+    names: Array(String)
+};
+def record_counts: Fn(Array(String)) -> Fn(Type, Option(RecordCounts)) -> RecordCounts = fn(names) {
+    contract::unique(names);
+    array::map(names, contract::publish_name);
+    fn(ctx, previous) {
+        {names}
+    }
+};
+def field: Fn(Prepared, String) -> Field = fn(prepared, name) {
+    match array::find(
+        prepared.fields,
+        fn(f) {
+            f.name == name
+        }
+    ) {
+        Some(f) => f,
+        None => fail!("semantic source field does not exist", name)
+    }
+};
+def compute: Fn(Type) -> Prepared = fn(row) {
+    let source = match property::get_type_prop(row, TableInfo.type) {
+        Some(info) => info.source,
+        None => fail!("semantic row requires table mapping", row)
+    };
+    let binding = property::get_type_prop(row, Binding.type);
+    let fields = array::map(
+        td::fields(row),
+        fn(f) {
+            let value = value_type(f.ty);
+            let storage = groups::representation(value.0);
+            let reference = property::get_type_prop(value.0, ReferenceInfo.type);
+            let identity_info = property::get_type_prop(value.0, IdentityInfo.type);
+            let sample_fields = property::get_field_prop(row, f.index, samples::FieldSamples.type);
+            let numeric_fields = property::get_field_prop(
+                row,
+                f.index,
+                groups::FieldStatistics.type
+            );
+            if (reference != None || identity_info != None) && (
+                sample_fields != None || numeric_fields != None
+            ) {
+                fail!("identity and Reference fields do not inherit scalar aggregation", f.name)
+            } else {
+                ()
+            };
+            match property::get_type_prop(value.0, NumericInfo.type) {
+                None => (),
+                Some(limit) => {
+                    let requested = array::concat(
+                        [
+                            match sample_fields {
+                                None => [],
+                                Some(spec) => array::flat_map(
+                                    spec.bindings,
+                                    fn(binding) {
+                                        array::flat_map(
+                                            binding.names,
+                                            fn(name) {
+                                                match name.statistic {
+                                                    samples::Statistic::Latest => [],
+                                                    samples::Statistic::Mean => [Statistic::Mean],
+                                                    samples::Statistic::Min => [Statistic::Min],
+                                                    samples::Statistic::Max => [Statistic::Max],
+                                                    samples::Statistic::Sum => [Statistic::Sum]
+                                                }
+                                            }
+                                        )
+                                    }
+                                )
+                            },
+                            match numeric_fields {
+                                None => [],
+                                Some(spec) => array::flat_map(
+                                    spec.items,
+                                    fn(binding) {
+                                        array::map(
+                                            binding.names,
+                                            fn(name) {
+                                                match name.member {
+                                                    groups::Statistic::Mean => Statistic::Mean,
+                                                    groups::Statistic::Min => Statistic::Min,
+                                                    groups::Statistic::Max => Statistic::Max,
+                                                    groups::Statistic::Sum => Statistic::Sum
+                                                }
+                                            }
+                                        )
+                                    }
+                                )
+                            }
+                        ]
+                    );
+                    if !array::all(
+                        requested,
+                        fn(stat) {
+                            contains(limit.statistics, stat)
+                        }
+                    ) {
+                        fail!("field statistics exceed type capabilities", f.name)
+                    } else {
+                        ()
+                    }
+                }
+            };
+            let parts = match reference {
+                Some(ref) => reference_parts(ref.identity),
+                None => if identity_info != None {
+                    identity(value.0).parts
+                } else {
+                    [{path: "", value: value.0}]
+                }
+            };
+            let scalar_types: Array(Type) = [String.type, Int.type, Float.type, Bool.type];
+            if reference == None && identity_info == None && !contains(scalar_types, storage) {
+                fail!("semantic experiment requires scalar fields", f.name)
+            } else {
+                ()
+            };
+            let mapped_column = property::get_field_prop(row, f.index, edsl::ColumnMap.type);
+            let column = match mapped_column {
+                Some(info) => info.column,
+                None => f.name
+            };
+            let columns = match property::get_field_prop(row, f.index, Columns.type) {
+                Some(mapping) => {
+                    if mapped_column != None {
+                        fail!("column and columns mappings cannot be combined", f.name)
+                    } else {
+                        ()
+                    };
+                    if array::length(dict::keys(mapping.names)) != array::length(parts) {
+                        fail!("physical column count must match identity components", f.name)
+                    } else {
+                        ()
+                    };
+                    array::map(
+                        parts,
+                        fn(part) {
+                            match dict::get(mapping.names, part.path) {
+                                Some(column) => column,
+                                None => fail!(
+                                    "missing physical mapping for identity component",
+                                    f.name,
+                                    part.path
+                                )
+                            }
+                        }
+                    )
+                },
+                None => [column]
+            };
+            if array::length(columns) != array::length(parts) {
+                fail!("physical column count must match identity components", f.name)
+            } else {
+                ()
+            };
+            array::map(
+                columns,
+                fn(name) {
+                    contract::publish_name(name)
+                }
+            );
+            {
+                name: f.name,
+                columns,
+                value: value.0,
+                nullable: value.1,
+                storage,
+                meaning: property::get_field_prop(row, f.index, Meaning.type),
+                reference,
+                targets: match property::get_field_prop(row, f.index, ReferenceTargets.type) {
+                    Some(spec) => spec.items,
+                    None => []
+                },
+                views: match property::get_field_prop(row, f.index, groups::FieldDimensions.type) {
+                    Some(spec) => spec.dimensions,
+                    None => []
+                },
+                scope: match property::get_field_prop(row, f.index, SourceScope.type) {
+                    Some(spec) => Some(spec.input),
+                    None => None
+                },
+                unit: property::get_type_prop(value.0, quantity::Unit.type)
+            }.ty!(Field)
+        }
+    );
+    let grain = match property::get_type_prop(row, Grain.type) {
+        Some(g) => g.fields,
+        None => require_option(property::get_type_prop(row, TableInfo.type)).grain
+    };
+    let temporal = property::get_type_prop(row, Temporal.type);
+    let clocks = array::concat(
+        [
+            match temporal {
+                Some(spec) => [spec.clock],
+                None => []
+            },
+            array::flat_map(
+                fields,
+                fn(field) {
+                    match field.meaning {
+                        Some(meaning) => match meaning.clock {
+                            Some(clock) => [clock],
+                            None => []
+                        },
+                        None => []
+                    }
+                }
+            )
+        ]
+    );
+    if !array::all(
+        clocks,
+        fn(clock) {
+            clock == clocks[0]
+        }
+    ) {
+        fail!("sample mapping requires one authoritative clock", row)
+    } else {
+        ()
+    };
+    match property::get_type_prop(row, knowledge_policy::Subjects.type) {
+        None => (),
+        Some(subjects) => {
+            array::map(
+                subjects.items,
+                fn(subject) {
+                    let subject_field = match array::find(
+                        fields,
+                        fn(f) {
+                            f.name == subject.field
+                        }
+                    ) {
+                        Some(f) => f,
+                        None => fail!("knowledge subject field does not exist", subject.field)
+                    };
+                    let by = match subject_field.reference {
+                        Some(ref) => if property::get_type_prop(ref.identity, IdentityInfo.type) == None {
+                            None
+                        } else {
+                            Some(ref.identity)
+                        },
+                        None => if property::get_type_prop(subject_field.value, IdentityInfo.type) != None {
+                            Some(subject_field.value)
+                        } else {
+                            None
+                        }
+                    };
+                    match by {
+                        None => (),
+                        Some(by) => if identity(by).entity != subject.entity {
+                            fail!(
+                                "knowledge subject conflicts with identity entity",
+                                subject.entity,
+                                subject.field
+                            )
+                        } else {
+                            ()
+                        }
+                    }
+                }
+            );
+            ()
+        }
+    };
+    let result: Prepared = {
+        row,
+        source,
+        binding,
+        grain,
+        fields,
+        clock: if array::length(clocks) > 0 {
+            Some(clocks[0])
+        } else {
+            None
+        },
+        kind: match temporal {
+            Some(spec) => spec.kind,
+            None => if array::length(clocks) > 0 {
+                edsl::DatasetKind::Metric
+            } else {
+                edsl::DatasetKind::Entity
+            }
+        },
+        record_counts: match property::get_type_prop(row, RecordCounts.type) {
+            Some(spec) => spec.names,
+            None => []
+        }
+    };
+    if array::length(result.record_counts) > 0 && array::length(grain) == 0 {
+        fail!("record count requires a declared dataset grain", row)
+    } else {
+        ()
+    };
+    match result.clock {
+        None => (),
+        Some(name) => {
+            let clock = field(result, name);
+            let utc = match scalars::time_role(clock.value) {
+                Some(role) => role.semantics == edsl::TimeSemantics::Utc,
+                None => False
+            };
+            if clock.nullable || !utc || array::length(grain) == 0 {
+                fail!("temporal mapping requires a non-null UTC clock and complete grain", name)
+            } else {
+                ()
+            }
+        }
+    };
+    array::map(
+        grain,
+        fn(name) {
+            if field(result, name).nullable {
+                fail!("row grain must be non-null", name)
+            } else {
+                ()
+            }
+        }
+    );
+    match binding {
+        Some(b) => {
+            let key = field(result, b.field);
+            identity(b.identity);
+            if key.nullable || key.value != b.identity {
+                fail!("row identity binding has incompatible type", b.field)
+            } else {
+                ()
+            }
+        },
+        None => ()
+    };
+    contract::unique(
+        array::flat_map(
+            fields,
+            fn(f) {
+                match f.meaning {
+                    Some(m) => [m.name],
+                    None => []
+                }
+            }
+        )
+    );
+    array::map(
+        fields,
+        fn(f) {
+            if f.reference != None && array::any(
+                f.views,
+                fn(view) {
+                    array::any(
+                        view.filters,
+                        fn(filter) {
+                            filter != groups::Filter::Eq && filter != groups::Filter::Ne
+                        }
+                    )
+                }
+            ) {
+                fail!("Reference field does not inherit scalar comparison capabilities", f.name)
+            } else {
+                ()
+            };
+            match f.meaning {
+                None => (),
+                Some(m) => {
+                    if binding == None {
+                        fail!("semantic field requires entity binding", f.name)
+                    } else {
+                        ()
+                    };
+                    match m.usage {
+                        Usage::Attribute => (),
+                        Usage::Observation => {
+                            let clock = field(result, require_option(m.clock));
+                            if clock.nullable || clock.value != scalars::DateTimeUtc.type {
+                                fail!("observation requires non-null UTC clock", f.name)
+                            } else {
+                                ()
+                            };
+                            if f.reference != None || array::length(m.statistics) == 0 || !array::all(
+                                m.statistics,
+                                fn(stat) {
+                                    contains(allowed_statistics(f.value), stat)
+                                }
+                            ) {
+                                fail!("field statistics exceed type capabilities", f.name)
+                            } else {
+                                ()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    );
+    result
+};
+def prepared: memo::TypeMemorizer(Prepared) = memo::type_memorizer(compute);
+def prepare: Fn(Type) -> Prepared = fn(row) {
+    memo::computed_with_type(prepared, row)
+};
+
+# 发现与 lowering 共用 Prepared，不由名称或底层数值类型猜测业务能力。
+type Capability = struct {
+    entity: String,
+    name: String,
+    usage: Usage,
+    source: String,
+    columns: Array(String),
+    value: Type,
+    nullable: Bool,
+    unit: Option(quantity::Unit),
+    reference: Option(ReferenceInfo),
+    clock: Option(String),
+    statistics: Array(Statistic)
+};
+def discover: Fn(Prepared) -> Array(Capability) = fn(p) {
+    array::flat_map(
+        p.fields,
+        fn(f) {
+            match f.meaning {
+                None => [],
+                Some(m) => [
+                    {
+                        entity: identity(require_option(p.binding).identity).entity,
+                        name: m.name,
+                        usage: m.usage,
+                        source: p.source,
+                        columns: f.columns,
+                        value: f.value,
+                        nullable: f.nullable,
+                        unit: f.unit,
+                        reference: f.reference,
+                        clock: m.clock,
+                        statistics: m.statistics
+                    }.ty!(Capability)
+                ]
+            }
+        }
+    )
+};
+# Reference 已给出实体及指代方式；Relation 选择具体目标映射并授予 JOIN。
+type Relation = struct {
+    name: String,
+    source: Prepared,
+    source_field: Field,
+    target: Prepared,
+    target_key: Field
+};
+def relation: Fn(String, Prepared, String, Prepared) -> Relation = fn(
+    name,
+    source,
+    source_name,
+    target
+) {
+    contract::publish_name(name);
+    if source.binding == None || target.binding == None {
+        fail!("relation requires entity bindings")
+    } else {
+        ()
+    };
+    let source_field = field(source, source_name);
+    let ref = match source_field.reference {
+        Some(ref) => ref,
+        None => fail!("relation requires Reference source", source_name)
+    };
+    connect(name, source, source_field, ref.identity, target)
+};
+# 同实体映射对齐不制造外键；来源是该映射自己的绑定身份。
+def alignment: Fn(String, Prepared, Prepared) -> Relation = fn(name, source, target) {
+    let binding = require_option(source.binding);
+    connect(name, source, field(source, binding.field), binding.identity, target)
+};
+def connect: Fn(String, Prepared, Field, Type, Prepared) -> Relation = fn(
+    name,
+    source,
+    source_field,
+    by,
+    target
+) {
+    contract::publish_name(name);
+    let target_key = field(target, require_option(target.binding).field);
+    if require_option(target.binding).identity != by {
+        fail!("relation key types do not match", name)
+    } else {
+        ()
+    };
+    if target.grain != [target_key.name] {
+        fail!("relation target identity requires unique row grain", name)
+    } else {
+        ()
+    };
+    {name, source, source_field, target, target_key}
+};
+type RelationCapability = struct {
+    name: String,
+    source_entity: String,
+    target_entity: String,
+    target_identity: Type,
+    source: String,
+    source_columns: Array(String),
+    target: String,
+    target_columns: Array(String),
+    source_nullable: Bool,
+    target_optional: Bool
+};
+def discover_relation: Fn(Relation) -> RelationCapability = fn(r) {
+    {
+        name: r.name,
+        source_entity: identity(require_option(r.source.binding).identity).entity,
+        target_entity: identity(require_option(r.target.binding).identity).entity,
+        target_identity: require_option(r.target.binding).identity,
+        source: r.source.source,
+        source_columns: r.source_field.columns,
+        target: r.target.source,
+        target_columns: r.target_key.columns,
+        source_nullable: r.source_field.nullable,
+        target_optional: True
+    }
+};
+
+pub use self::{
+    Statistic,
+    Usage,
+    Reference,
+    IdentityInfo,
+    Identity,
+    IdentityPart,
+    ReferenceInfo,
+    ReferenceTarget,
+    targets,
+    reference_parts,
+    NumericInfo,
+    Meaning,
+    entity_by,
+    identity,
+    columns,
+    numeric,
+    table,
+    dataset,
+    TableInfo,
+    bind,
+    grain,
+    Temporal,
+    RecordCounts,
+    metric,
+    event,
+    record_counts,
+    scope_equal,
+    FieldCounts,
+    ComputedCounts,
+    NativePairs,
+    count,
+    count_when,
+    computed_counts,
+    native_pairs,
+    attribute,
+    relation,
+    alignment,
+    observation,
+    Field,
+    Prepared,
+    Capability,
+    Relation,
+    RelationCapability,
+    prepare,
+    discover,
+    discover_relation
+};

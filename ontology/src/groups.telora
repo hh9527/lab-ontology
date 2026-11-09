@@ -1126,3 +1126,252 @@ def field_view: for(V) Fn(
 };
 
 pub use self::{field_view};
+
+# 派生视图也在源字段上声明；局部准备时才绑定实际字段索引。
+type FieldExpressionKind = enum {
+    Ipv4,
+    UtcBucket((qb::UtcBucketUnit, qb::UtcBucketEncoding))
+};
+type FieldExpression = struct {
+    id: String,
+    input: Type,
+    value: Type,
+    input_nullable: Bool,
+    kind: FieldExpressionKind,
+    filters: Array(Filter)
+};
+@prelude::property(PropertyTarget::Field)
+type FieldExpressions = struct {
+    items: Array(FieldExpression)
+};
+def ipv4_view: Fn(
+    String
+) -> Fn(property::FieldPropertyCtx, Option(FieldExpressions)) -> FieldExpressions = fn(id) {
+    property_contract::publish_name(id);
+    fn(ctx, previous) {
+        if ctx.ty != String.type && ctx.ty != Option(String).type {
+            fail!("IPv4 view requires a String field", ctx.name)
+        } else {
+            ()
+        };
+        let before = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        {
+            items: array::push(
+                before,
+                {
+                    id,
+                    input: String.type,
+                    value: scalars::Ipv4.type,
+                    input_nullable: ctx.ty != String.type,
+                    kind: FieldExpressionKind::Ipv4,
+                    filters: ipv4_filters
+                }.ty!(FieldExpression)
+            )
+        }
+    }
+};
+def utc_bucket_view: Fn(
+    String,
+    qb::UtcBucketUnit
+) -> Fn(property::FieldPropertyCtx, Option(FieldExpressions)) -> FieldExpressions = fn(id, unit) {
+    property_contract::publish_name(id);
+    fn(ctx, previous) {
+        let direct = scalars::time_role(ctx.ty) != None;
+        let value = if direct {
+            ctx.ty
+        } else {
+            let variants = td::variants(ctx.ty);
+            match array::find(
+                variants,
+                fn(v) {
+                    v.name == "Some"
+                }
+            ) {
+                Some(v) => match v.payload {
+                    Some(value) => value,
+                    None => fail!("UTC bucket requires a time field", ctx.name)
+                },
+                None => fail!("UTC bucket requires a time field", ctx.name)
+            }
+        };
+        let encoding = bucket_encoding(value, unit);
+        let before = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        {
+            items: array::push(
+                before,
+                {
+                    id,
+                    input: value,
+                    value,
+                    input_nullable: !direct,
+                    kind: FieldExpressionKind::UtcBucket((unit, encoding)),
+                    filters: time_filters
+                }.ty!(FieldExpression)
+            )
+        }
+    }
+};
+def field_expressions_for: Fn(model::PreparedDataset) -> Array(BindingFacts) = fn(dataset) {
+    array::flat_map(
+        model::fields_of(dataset.row),
+        fn(field) {
+            match property::get_field_prop(dataset.row, field.index, FieldExpressions.type) {
+                None => [],
+                Some(spec) => array::map(
+                    spec.items,
+                    fn(view) {
+                        let input = Node::Column(
+                            {
+                                index: field.index,
+                                name: field.name,
+                                value: view.input,
+                                nullable: view.input_nullable
+                            }
+                        );
+                        let node = match view.kind {
+                            FieldExpressionKind::Ipv4 => Node::Ipv4(input),
+                            FieldExpressionKind::UtcBucket(bucket) => Node::UtcBucket(
+                                {input, unit: bucket.0, encoding: bucket.1}
+                            )
+                        };
+                        {
+                            row: dataset.row,
+                            dataset: dataset.id,
+                            source: dataset.source,
+                            contract: BindingContract::DeferredDimension(
+                                {
+                                    id: view.id,
+                                    value: view.value,
+                                    projectable: True,
+                                    filters: view.filters
+                                }
+                            ),
+                            members: [
+                                {
+                                    group: view.id,
+                                    local: "value",
+                                    id: view.id,
+                                    node,
+                                    value: view.value,
+                                    nullable: True,
+                                    aggregate: None,
+                                    projectable: True,
+                                    filters: view.filters,
+                                    kind: MemberKind::Dimension(
+                                        {projectable: True, filters: view.filters}
+                                    )
+                                }
+                            ]
+                        }.ty!(BindingFacts)
+                    }
+                )
+            }
+        }
+    )
+};
+pub use self::{ipv4_view, utc_bucket_view, FieldExpressions, field_expressions_for};
+
+type FieldStatistic = struct {
+    group: NumericGroupFacts,
+    nullable: Bool,
+    names: Array(StatisticName)
+};
+@prelude::property(PropertyTarget::Field)
+type FieldStatistics = struct {
+    items: Array(FieldStatistic)
+};
+def statistics: for(V) Fn(
+    NumericGroup(V),
+    Array(StatisticName)
+) -> Fn(property::FieldPropertyCtx, Option(FieldStatistics)) -> FieldStatistics = fn(group, names) {
+    array::map(
+        names,
+        fn(name) {
+            property_contract::publish_name(name.publish);
+            if !array::any(
+                group.members,
+                fn(member) {
+                    member == name.member
+                }
+            ) {
+                fail!("numeric binding requests an undeclared statistic", group.id)
+            } else {
+                ()
+            }
+        }
+    );
+    fn(ctx, previous) {
+        if ctx.ty != V.type && ctx.ty != Option(V).type {
+            fail!("numeric field has a different nominal type", ctx.name)
+        } else {
+            ()
+        };
+        let before = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        {
+            items: array::push(
+                before,
+                {
+                    group: {id: group.id, value: group.value, members: group.members},
+                    nullable: ctx.ty != V.type,
+                    names
+                }.ty!(FieldStatistic)
+            )
+        }
+    }
+};
+def field_statistics_for: Fn(model::PreparedDataset) -> Array(BindingFacts) = fn(dataset) {
+    array::flat_map(
+        model::fields_of(dataset.row),
+        fn(field) {
+            match property::get_field_prop(dataset.row, field.index, FieldStatistics.type) {
+                None => [],
+                Some(spec) => array::map(
+                    spec.items,
+                    fn(binding) {
+                        {
+                            row: dataset.row,
+                            dataset: dataset.id,
+                            source: dataset.source,
+                            contract: BindingContract::Numeric(binding.group),
+                            members: array::map(
+                                binding.names,
+                                fn(name) {
+                                    let info = statistic_info(name.member);
+                                    {
+                                        group: binding.group.id,
+                                        local: info.0,
+                                        id: name.publish,
+                                        node: Node::Column(
+                                            {
+                                                index: field.index,
+                                                name: field.name,
+                                                value: binding.group.value,
+                                                nullable: binding.nullable
+                                            }
+                                        ),
+                                        value: binding.group.value,
+                                        nullable: True,
+                                        aggregate: Some(info.1),
+                                        projectable: True,
+                                        filters: [],
+                                        kind: MemberKind::Numeric(name.member)
+                                    }.ty!(Member)
+                                }
+                            )
+                        }.ty!(BindingFacts)
+                    }
+                )
+            }
+        }
+    )
+};
+pub use self::{statistics, FieldStatistics, field_statistics_for};

@@ -54,7 +54,7 @@ Intent 不新增 Latest 操作或聚合覆盖。调用方通过已有度量 ID �
 
 ```json
 {
-  "op": "Graph","limit":1000,
+  "op": "Graph",
   "root": "d",
   "nodes": [
     {"id": "d", "entity": "device"},

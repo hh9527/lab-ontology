@@ -621,38 +621,129 @@ type QueryPlan = enum {
     JoinedGroupCount(JoinedGroups),
 };
 
-# Independent final output cap; never limits an operand or aggregate input.
-# Low-level QueryBuilder callers may omit it; public Intents supply it only for a positive integer limit.
+# Final business selection runs after joins, aggregation, DISTINCT and set operations.
+type ResultOrder = struct {
+    key: Expr,
+    direction: Ordering
+};
+type ResultSelection = struct {
+    order_by: Array(ResultOrder),
+    take: Int
+};
 type QueryAst = struct {
     ctx: BuildCtx,
     plan: QueryPlan,
-    result_limit: Option(Expr)
+    selection: Option(ResultSelection)
 };
-
 def finish: Fn(BuildCtx, QueryPlan) -> QueryAst = fn(ctx, plan) {
-    {ctx, plan, result_limit: None}
+    {ctx, plan, selection: None}
 };
 
-# The final cap bypasses business profile/Top-N limits, but not typed binding
-# validation. Renderers must reject forged AST caps as well as public Intents.
-pub def validated_output_limit: Fn(QueryAst) -> Option(Expr) = fn(ast) {
-    match ast.result_limit {
-        None => None,
-        Some(Expr::AllocatedBind(binding)) => if binding.index > 0 && binding.index <= array::length(
-            ast.ctx.bindings
-        ) {
-            match ast.ctx.bindings[binding.index - 1] {
-                Val::Int(n) => if n > 0 {
-                    ast.result_limit
-                } else {
-                    fail!("final output limit must be a positive integer", n)
-                },
-                value => fail!("final output limit must be a positive integer", value),
-            }
-        } else {
-            fail!("final output limit binding is not registered", binding)
+# Only a final global selection or a scalar aggregate proves a public result bound.
+def public_take: Fn(Int) -> Int = fn(n) {
+    if n >= 1 && n <= 500 {
+        n
+    } else {
+        fail!("final take must be an integer in 1..500", n)
+    }
+};
+def bound_value: Fn(BuildCtx, Expr) -> Int = fn(ctx, expr) {
+    match expr {
+        Expr::AllocatedBind(binding) => match ctx.bindings[binding.index - 1] {
+            Val::Int(n) => public_take(n),
+            _ => fail!("final take must be a known integer"),
         },
-        Some(value) => fail!("final output limit must be an allocated integer binding", value),
+        _ => fail!("final take must be a known integer"),
+    }
+};
+def scalar_plan: Fn(Plan) -> Bool = fn(plan) {
+    plan.grouping == [] && plan.partition == None && array::any(
+        array::concat([plan.projection, plan.internal_measures]),
+        fn(item) {
+            match item {
+                SelectItem::Aggregate(call) => call.function != AggregateFunction::Latest,
+                _ => False
+            }
+        }
+    ) && array::all(
+        plan.projection,
+        fn(item) {
+            match item {
+                SelectItem::Aggregate(call) => call.function != AggregateFunction::Latest,
+                SelectItem::Computed(_) => True,
+                _ => False,
+            }
+        }
+    )
+};
+def rows_bound: Fn(BuildCtx, Plan) -> Int = fn(ctx, plan) {
+    if scalar_plan(plan) {
+        1
+    } else {
+        match plan.limit {
+            Some(take) => if plan.ordering != [] && plan.partition == None {
+                bound_value(ctx, take)
+            } else {
+                fail!(
+                    "multirow query requires final order_by and take (1..500); partition take does not bound the result"
+                )
+            },
+            None => fail!("multirow query requires final order_by and take (1..500)"),
+        }
+    }
+};
+def result_bound: Fn(QueryAst) -> Int = fn(ast) {
+    match ast.selection {
+        Some(selection) => if selection.order_by == [] {
+            fail!("final take requires nonempty order_by")
+        } else {
+            public_take(selection.take)
+        },
+        None => match ast.plan {
+            QueryPlan::Rows(plan) => rows_bound(ast.ctx, plan),
+            QueryPlan::DistinctRows(plan) => rows_bound(ast.ctx, plan),
+            QueryPlan::GroupCount(_) => 1,
+            QueryPlan::SetCount(_) => 1,
+            QueryPlan::JoinedGroupCount(_) => 1,
+            QueryPlan::JoinedGroups(joined) => match joined.rank {
+                Some(rank) => bound_value(ast.ctx, rank.take),
+                None => fail!(
+                    "GraphPair requires final order_by and take (1..500), or rank_by with take"
+                ),
+            },
+            QueryPlan::SetRows(_) => fail!("GraphUnion requires final order_by and take (1..500)"),
+        },
+    }
+};
+
+# Column identifiers are resolved against the checked result schema by Intent lowering.
+def select_result: Fn(Query, QueryAst, Fn(Expr) -> String) -> Query = fn(query, ast, render) {
+    match ast.selection {
+        None => query,
+        Some(selection) => {
+            let take = public_take(selection.take);
+            if selection.order_by == [] {
+                fail!("final take requires nonempty order_by")
+            } else {
+                let ordering = string::join(
+                    array::map(
+                        selection.order_by,
+                        fn(item) {
+                            let direction = match item.direction {
+                                Ordering::Asc => "ASC",
+                                Ordering::Desc => "DESC"
+                            };
+                            `CASE WHEN \{render(item.key)} IS NULL THEN 0 ELSE 1 END \{direction}, \{render(item.key)} \{direction}`
+                        }
+                    ),
+                    ", "
+                );
+                {
+                    ...query,
+                    sql: `SELECT * FROM (\{query.sql}) AS __q_result ORDER BY \{ordering} LIMIT \{take}`
+                }
+            }
+        },
     }
 };
 
@@ -5518,3 +5609,5 @@ pub use self::{
 };
 
 pub use self::{capability_union};
+
+pub use self::{ResultOrder, ResultSelection, public_take, result_bound, select_result};

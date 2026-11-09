@@ -108,10 +108,14 @@ function sample(s, dataset, b) {
     { binding: key, group, statistic: n.statistic, type: typeref(s, b.definition.type) }, [key, group, ...typerefs(s, b.definition.type)]);
 }
 function entity(s, r) {
-  merge(s, address('entities', r.entity), { identity: typeref(s, r.identity) }, typerefs(s, r.identity));
+  const key = address('entities', r.entity);
+  const identities = s.facts.get(key)?.value.identities || [];
+  merge(s, key, { identities: [...new Set([...identities, typeref(s, r.identity)])] }, typerefs(s, r.identity));
 }
 function dataset(s, d) {
-  merge(s, address('datasets', d.id), { source: d.source, grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [] });
+  const subjects = (d.subjects ?? []).map(subject => ({ entity: address('entities', subject.entity), field: member(d.id, 'fields', subject.field) }));
+  for (const subject of subjects) if (!s.facts.has(subject.entity)) merge(s, subject.entity, {identities: []});
+  merge(s, address('datasets', d.id), { source: d.source, grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [], ...(subjects.length ? {subjects} : {}) }, subjects.map(subject => subject.entity));
   for (const r of d.roles) {
     merge(s, member(d.id, 'roles', r.id), { entity: address('entities', r.entity), identity: typeref(s, r.identity), optional: r.optional,
       parts: r.parts.map(p => ({ ...p, type: typeref(s, p.type), raw: p.raw === null ? null : typeref(s, p.raw) })) },
@@ -208,7 +212,29 @@ function ownedGraph(s) {
   const facts = [...roots.values()].map(f => ({...f,references:[...f.references],reference_sites:[...new Map(f.reference_sites.map(site => [json(site),site])).values()]}));
   return { facts: facts.filter(f => !f.key.startsWith('relations/')), relations: facts.filter(f => f.key.startsWith('relations/')), locations: [...folded.keys()] };
 }
+// 知识属性按实际可查询能力派生；归属来自显式 subject，不从任意外键猜测。
+function conceptualProperties(s) {
+  for (const [dataset, root] of s.facts) {
+    if (!dataset.startsWith('datasets/') || dataset.includes('#') || !root.value.subjects?.length) continue;
+    const props = new Map();
+    for (const [key, fact] of s.facts) {
+      if (!key.startsWith(dataset + '#dimensions/') && !key.startsWith(dataset + '#measures/')) continue;
+      const dimension = key.startsWith(dataset + '#dimensions/');
+      const field = fact.value.field ?? fact.value.anchor_field;
+      if (!field) continue;
+      const counter = !dimension && ['Count', 'CountDistinct'].includes(fact.value.aggregate);
+      const name = decodeURIComponent((counter ? key : field).split('/').at(-1));
+      const identity = counter ? key : field;
+      let prop = props.get(identity);
+      if (!prop) props.set(identity, prop = {name, field, dimensions: [], measures: [], counters: [], types: []});
+      prop[counter ? 'counters' : dimension ? 'dimensions' : 'measures'].push(key);
+      if (typeof fact.value.type === 'string' && !prop.types.includes(fact.value.type)) prop.types.push(fact.value.type);
+    }
+    root.value.props = [...props.values()];
+  }
+}
 function finish(s) {
+  conceptualProperties(s);
   const kinds = { entities: 'Entity', datasets: 'Dataset', dimension_groups: 'DimensionGroup', measure_groups: 'MeasureGroup', types: 'Ty', relations: 'Relation',
     bindings: 'Binding', roles: 'Role', fields: 'Field', dimensions: 'Dimension', measures: 'Measure', values: 'Value', time_roles: 'TimeRole', business_links: 'BusinessLink' };
   const {facts,relations: relationDescriptors,locations} = ownedGraph(s);

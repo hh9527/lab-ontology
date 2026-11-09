@@ -1,0 +1,406 @@
+use crate::semantic as s;
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use crate::uql as uql;
+use crate::groups as groups;
+use crate::enum_values as ev;
+use crate::values as values;
+use std::array as array;
+use std::dict as dict;
+use std::json as json;
+use std::codec as codec;
+use std::test as test;
+use std::value::{Value};
+@ev::order_by_itag
+type Severity = enum {
+    @ev::itag(1)
+    Zed,
+    @ev::itag(2)
+    Alpha
+};
+def severity_domain: values::Domain(Severity, Int) = values::from_enum(
+    "severity",
+    Severity.type,
+    Int.type,
+    False
+);
+@s::numeric([s::Statistic::Mean])
+type Amount = struct(Float);
+@s::entity_by("Fact")
+type FactId = struct(String);
+@s::dataset("facts", "facts", ["id"])
+@s::bind(FactId.type, "id")
+@s::record_counts(["row_count"])
+type Facts = struct {
+    @s::attribute("id")
+    id: FactId,
+    @s::attribute("category")
+    category: String,
+    @groups::statistics(
+        groups::numeric_group("amount", Amount.type, [groups::Statistic::Mean]),
+        [{member: groups::Statistic::Mean, publish: "amount_mean"}]
+    )
+    amount: Amount,
+    @values::classification(severity_domain, "severity")
+    severity: Int,
+    @s::attribute("flag")
+    flag: Bool
+};
+def profile: qb::PlanProfile = {
+    allowed_operators: [
+        qb::Operator::Source,
+        qb::Operator::Project,
+        qb::Operator::Column,
+        qb::Operator::Bind,
+        qb::Operator::Scalar,
+        qb::Operator::Aggregate,
+        qb::Operator::Group,
+        qb::Operator::Filter,
+        qb::Operator::Join,
+        qb::Operator::Exists,
+        qb::Operator::Having,
+        qb::Operator::Order,
+        qb::Operator::Limit,
+        qb::Operator::Offset,
+        qb::Operator::Partition
+    ],
+    allowed_join_kinds: [qb::JoinKind::Inner, qb::JoinKind::Left],
+    allowed_aggregates: [
+        qb::AggregateFunction::Avg,
+        qb::AggregateFunction::Min,
+        qb::AggregateFunction::Max,
+        qb::AggregateFunction::Count
+    ],
+    allowed_scalars: [
+        qb::ScalarFunction::Eq,
+        qb::ScalarFunction::Ne,
+        qb::ScalarFunction::Ge,
+        qb::ScalarFunction::Gt,
+        qb::ScalarFunction::Le,
+        qb::ScalarFunction::Lt,
+        qb::ScalarFunction::And,
+        qb::ScalarFunction::Or,
+        qb::ScalarFunction::IsNotNull,
+        qb::ScalarFunction::BinaryText,
+        qb::ScalarFunction::Sub,
+        qb::ScalarFunction::Div,
+        qb::ScalarFunction::If
+    ],
+    allow_distinct: True
+};
+
+def payload: edsl::PreparedPayload = s::payload("bounded", [Facts.type], profile);
+def parse: Fn(String) -> Value = fn(text) {
+    json::parse(text).unwrap!()
+};
+def graph: Fn(String) -> Value = fn(extra) {
+    parse(`{"op":"Graph","root":"f","nodes":[{"id":"f","entity":"facts"}],"edges":[],\{extra}}`)
+};
+def raw: String = r#""select":[{"node":"f","dimension":"facts__id"}]"#;
+def grouped: String = r#""select":[{"node":"f","dimension":"facts__category"}],"measures":[{"node":"f","measure":"amount_mean"}]"#;
+def ordered: Fn(Value, String, Int) -> Value = fn(input, column, take) {
+    let obj = match input {
+        Value::Object(obj) => obj,
+        _ => fail!("object expected")
+    };
+    Value::Object(
+        dict::merge(
+            obj,
+            {order_by: parse(`[{"column":"\{column}","direction":"Desc"}]`), take: Value::Int(take)}
+        )
+    )
+};
+def ast: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
+def batch: Fn(Value) -> Value = intent::query_request_method_factory(payload, sqlite::build_query);
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("assertion failed")
+            }
+        }
+    )
+};
+pub def missing_final_selection: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(raw));
+        True
+    },
+    "multirow query requires final order_by and take"
+);
+pub def legacy_limit_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(`\{raw},"limit":5`));
+        True
+    },
+    "query limit is not supported"
+);
+pub def unordered_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(`\{raw},"take":5`));
+        True
+    },
+    "final take requires nonempty order_by"
+);
+pub def order_without_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(`\{raw},"order_by":[{"column":"f_facts__id","direction":"Asc"}]`));
+        True
+    },
+    "final order_by requires take"
+);
+pub def excess_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(ordered(graph(raw), "f_facts__id", 501));
+        True
+    },
+    "final take must be an integer in 1..500"
+);
+pub def zero_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(ordered(graph(raw), "f_facts__id", 0));
+        True
+    },
+    "final take must be an integer in 1..500"
+);
+pub def unknown_column_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(ordered(graph(raw), "missing", 5));
+        True
+    },
+    "unknown final order column missing"
+);
+pub def fractional_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(`\{raw},"take":1.5`));
+        True
+    },
+    "final take must be a known integer"
+);
+pub def null_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(`\{raw},"take":null`));
+        True
+    },
+    "final take must be a known integer"
+);
+pub def raw_bound: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(ordered(graph(raw), "f_facts__id", 500))) == 500
+    }
+);
+pub def grouped_bound: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(ordered(graph(grouped), "f_amount_mean", 2))) == 2
+    }
+);
+pub def grouped_without_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(graph(grouped));
+        True
+    },
+    "multirow query requires final order_by and take"
+);
+pub def scalar_count_exempt: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(graph(r#""select":[],"count":"f""#))) == 1
+    }
+);
+pub def scalar_mean_exempt: test::Test = verify(
+    fn() {
+        qb::result_bound(
+            ast(graph(r#""select":[],"measures":[{"node":"f","measure":"amount_mean"}]"#))
+        ) == 1
+    }
+);
+pub def distinct_bound: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(ordered(graph(`\{raw},"distinct":true`), "f_facts__id", 3))) == 3
+    }
+);
+def union_input: Value = Value::Object(
+    {
+        op: Value::String("GraphUnion"),
+        branches: Value::Array(
+            array::map(
+                [1, 2],
+                fn(index) {
+                    Value::Object({result_node: Value::String("f"), graph: graph(raw)})
+                }
+            )
+        )
+    }
+);
+pub def union_bound: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(ordered(union_input, "f_facts__id", 2))) == 2
+    }
+);
+pub def union_without_final_take_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(union_input);
+        True
+    },
+    "GraphUnion requires final order_by and take"
+);
+pub def batch_reports_check_failure: test::Test = verify(
+    fn() {
+        let response = batch(Value::Object({intents: Value::Array([graph(raw)])}));
+        match response {
+            Value::Object(obj) => dict::get(obj, "accepted") == Some(Value::False),
+            _ => False
+        }
+    }
+);
+pub def batch_publishes_proven_bound: test::Test = verify(
+    fn() {
+        let response = batch(
+            Value::Object({intents: Value::Array([ordered(graph(raw), "f_facts__id", 5)])})
+        );
+        match response {
+            Value::Object(obj) => match dict::get(obj, "queries") {
+                Some(Value::Array(queries)) => match queries[0] {
+                    Value::Object(query) => dict::get(query, "max_rows") == Some(Value::Int(5)) && dict::get(
+                        query,
+                        "limit_slot"
+                    ) == None,
+                    _ => False
+                },
+                _ => False
+            },
+            _ => False
+        }
+    }
+);
+# Executable cases exercise final selection after grouping / DISTINCT / UNION in real SQLite.
+pub def runtime_cases: Value = codec::encode(
+    array::map(
+        [
+            ordered(graph(raw), "f_facts__id", 2),
+            ordered(graph(grouped), "f_amount_mean", 1),
+            ordered(graph(`\{raw},"distinct":true`), "f_facts__id", 2),
+            ordered(union_input, "f_facts__id", 2),
+            graph(r#""select":[],"count":"f""#),
+            graph(r#""select":[],"measures":[{"node":"f","measure":"amount_mean"}]"#),
+            ordered(graph(r#""select":[{"node":"f","dimension":"severity"}]"#), "f_severity", 2)
+        ],
+        fn(input) {
+            sqlite::build_query(ast(input))
+        }
+    )
+);
+pub def dialects_preserve_bindings: test::Test = verify(
+    fn() {
+        let plan = ast(ordered(graph(grouped), "f_amount_mean", 2));
+        sqlite::build_query(plan).bindings == postgres::build_query(plan).bindings && sqlite::build_query(
+            plan
+        ).bindings == uql::build_query(plan).bindings
+    }
+);
+
+def pair_input: Value = Value::Object(
+    {
+        op: Value::String("GraphPair"),
+        left: graph(
+            r#""select":[],"measures":[{"node":"f","measure":"amount_mean"}],"group_by_identity":["f"]"#
+        ),
+        right: graph(
+            r#""select":[],"measures":[{"node":"f","measure":"amount_mean"}],"group_by_identity":["f"]"#
+        ),
+        align_by: parse(r#"[{"left":{"node":"f"},"right":{"node":"f"}}]"#),
+        select: Value::Array([])
+    }
+);
+def ranked_pair: Fn(Int) -> Value = fn(take) {
+    let obj = match pair_input {
+        Value::Object(obj) => obj,
+        _ => fail!("object")
+    };
+    Value::Object(
+        dict::merge(
+            obj,
+            {
+                rank_by: parse(
+                    `{"op":"Subtract","minuend":"Left","subtrahend":"Right","direction":"Desc","take":\{take}}`
+                )
+            }
+        )
+    )
+};
+pub def pair_rank_bounds_final_join: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(ranked_pair(5))) == 5
+    }
+);
+pub def pair_excess_rank_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(ranked_pair(501));
+        True
+    },
+    "final take must be an integer in 1..500"
+);
+pub def pair_unranked_is_unbounded: test::Test = test::should_fail_with(
+    fn() {
+        ast(pair_input);
+        True
+    },
+    "GraphPair requires final order_by and take"
+);
+pub def pair_final_selection_bounds_join: test::Test = verify(
+    fn() {
+        qb::result_bound(ast(ordered(pair_input, "left_f_amount_mean", 5))) == 5
+    }
+);
+pub def local_partition_take_is_not_final_bound: test::Test = test::should_fail_with(
+    fn() {
+        let checked = ast(ordered(graph(raw), "f_facts__id", 2));
+        let plan = match checked.plan {
+            qb::QueryPlan::Rows(plan) => plan,
+            _ => fail!("rows expected")
+        };
+        let take = qb::take_bound(checked.ctx, 1);
+        let partitioned = {...plan, partition: Some({partition_by: [], order_by: [], take: take.1})};
+        qb::result_bound(qb::finish(take.0, qb::QueryPlan::Rows(partitioned)));
+        True
+    },
+    "multirow query requires final order_by and take"
+);
+pub def branch_take_is_not_union_bound: test::Test = test::should_fail_with(
+    fn() {
+        let checked = ast(ordered(graph(raw), "f_facts__id", 2));
+        let plan = match checked.plan {
+            qb::QueryPlan::Rows(plan) => plan,
+            _ => fail!("rows expected")
+        };
+        let take = qb::take_bound(checked.ctx, 1);
+        qb::result_bound(
+            qb::finish(
+                take.0,
+                qb::QueryPlan::SetRows(
+                    {kind: qb::SetOpKind::Union, operands: [{...plan, limit: Some(take.1)}, plan]}
+                )
+            )
+        );
+        True
+    },
+    "GraphUnion requires final order_by and take"
+);
+
+pub def unordered_boolean_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ast(
+            ordered(
+                graph(r#""select":[{"node":"f","dimension":"facts__flag"}]"#),
+                "f_facts__flag",
+                2
+            )
+        );
+        True
+    },
+    "has no declared business ordering"
+);
