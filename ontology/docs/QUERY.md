@@ -46,7 +46,7 @@ AST 不能包含原始 SQL、任意函数或字面量片段。
 
 `QueryAst.selection` 表达最终结果的业务选择：`order_by:[{column,direction}]` 和 `take`。
 公共 Intent 在 check 时证明最终结果最多 500 行：多行结果须显式排序并取前 N，N 为已知的 1..500 整数；无分组标量计数和普通聚合可证明最多一行。
-排序列必须是最终投影列，选择阶段位于 JOIN、聚合、DISTINCT、UNION 之后，并由各 SQL 渲染器输出最终排序与 LIMIT。
+Graph 可用 `{node,dimension,direction}` 或 `{node,measure,direction}` 按未输出键排序；隐藏键不进入结果列。聚合的隐藏维度必须属于原有分组或已分组的节点身份，DISTINCT 的排序键须已输出。选择阶段位于 JOIN、聚合、DISTINCT、UNION 之后，并由各 SQL 渲染器输出最终排序与 LIMIT。
 全局 top_by_measure 和 GraphPair.rank_by 的最终 take 同样可证明上界；分区或分支内的 take 不构成最终上界。
 公共转换响应返回 `max_rows`；执行器按原 SQL 和原绑定执行，不做自动截断。低层 QueryBuilder 的 `finish` 可不带 selection，由其调用方管理结果规模。
 

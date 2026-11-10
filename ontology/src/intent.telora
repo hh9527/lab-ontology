@@ -1547,6 +1547,189 @@ def final_order_key: Fn(
     }
 };
 
+# Sorting keys are computed by the normal semantic lowering and removed only
+# from the final output. Hidden dimensions must not refine an aggregate group.
+def order_column: Fn(Value) -> String = fn(value) {
+    let item = as_object(value);
+    match dict::get(item, "column") {
+        Some(value) => as_string(value),
+        None => {
+            let node = as_string(field(item, "node"));
+            match (dict::get(item, "dimension"), dict::get(item, "measure")) {
+                (Some(dimension), None) => `\{node}_\{as_string(dimension)}`,
+                (None, Some(measure)) => `\{node}_\{as_string(measure)}`,
+                _ => fail!(
+                    "order_by requires column, or node with exactly one dimension or measure",
+                    value
+                ),
+            }
+        },
+    }
+};
+def rows_plan: Fn(qb::QueryAst) -> qb::Plan = fn(ast) {
+    match ast.plan {
+        qb::QueryPlan::Rows(plan) => plan,
+        qb::QueryPlan::DistinctRows(plan) => plan,
+        _ => fail!("hidden sorting keys require a Graph row result"),
+    }
+};
+def prepare_order_query: Fn(edsl::PreparedPayload, Value, Array(Value)) -> (qb::QueryAst, Value) = fn(
+    payload,
+    input,
+    orders
+) {
+    let obj = as_object(input);
+    if as_string(field(obj, "op")) != "Graph" {
+        (lower_unlimited_intent_ast(payload, input), input)
+    } else {
+        let selected = codec::decode@[Array(edsl::GraphSelect)](field(obj, "select")).unwrap!();
+        let measures = codec::decode@[Array(edsl::GraphMeasureSelect)](
+            Value::Array(array_opt(obj, "measures"))
+        ).unwrap!();
+        let extras = array::fold(
+            orders,
+            (selected, measures, [], []),
+            fn(state, value) {
+                let item = as_object(value);
+                if dict::get(item, "column") != None {
+                    state
+                } else {
+                    let node = as_string(field(item, "node"));
+                    let alias = order_column(value);
+                    match (dict::get(item, "dimension"), dict::get(item, "measure")) {
+                        (Some(name), None) => {
+                            let dimension = as_string(name);
+                            if array::any(
+                                state.0,
+                                fn(d) {
+                                    d.node == node && d.dimension == dimension
+                                }
+                            ) {
+                                state
+                            } else {
+                                let key: edsl::GraphSelect = {node, dimension};
+                                (
+                                    array::push(state.0, key),
+                                    state.1,
+                                    array::concat([state.2, [alias, `\{alias}__kind`]]),
+                                    array::push(state.3, key)
+                                )
+                            }
+                        },
+                        (None, Some(name)) => {
+                            let measure = as_string(name);
+                            if array::any(
+                                state.1,
+                                fn(m) {
+                                    m.node == node && m.measure == measure
+                                }
+                            ) {
+                                state
+                            } else {
+                                (
+                                    state.0,
+                                    array::push(
+                                        state.1,
+                                        {node, measure}.ty!(edsl::GraphMeasureSelect)
+                                    ),
+                                    array::push(state.2, alias),
+                                    state.3
+                                )
+                            }
+                        },
+                        _ => fail!("order_by requires exactly one dimension or measure", value),
+                    }
+                }
+            }
+        );
+        if extras.2 == [] {
+            (lower_unlimited_intent_ast(payload, input), input)
+        } else if dict::get(obj, "distinct") == Some(Value::True) {
+            fail!(
+                "DISTINCT sorting keys must be output columns; adding hidden keys would change deduplication",
+                orders
+            )
+        } else {
+            let baseline = Value::Object(dict::merge(obj, {measures: codec::encode(extras.1)}));
+            let baseline_ast = lower_unlimited_intent_ast(payload, baseline);
+            let original = rows_plan(baseline_ast);
+            let expanded = Value::Object(
+                dict::merge(as_object(baseline), {select: codec::encode(extras.0)})
+            );
+            let ast = if extras.3 == [] {
+                baseline_ast
+            } else {
+                lower_unlimited_intent_ast(payload, expanded)
+            };
+            let plan = rows_plan(ast);
+            let aggregate = original.grouping != [] || array::any(
+                array::concat([original.projection, original.internal_measures]),
+                fn(item) {
+                    match item {
+                        qb::SelectItem::Aggregate(_) => True,
+                        qb::SelectItem::Computed(_) => True,
+                        _ => False
+                    }
+                }
+            );
+            let identities = codec::decode@[Array(String)](
+                Value::Array(array_opt(obj, "group_by_identity"))
+            ).unwrap!();
+            let unsafe = array::find(
+                extras.3,
+                fn(key) {
+                    aggregate && !array::any(
+                        identities,
+                        fn(id) {
+                            id == key.node
+                        }
+                    ) && !array::any(
+                        plan.projection,
+                        fn(item) {
+                            match item {
+                                qb::SelectItem::NamedExpr(item) => item.alias == `\{key.node}_\{key.dimension}` && array::any(
+                                    original.grouping,
+                                    fn(expr) {
+                                        expr == item.expr
+                                    }
+                                ),
+                                _ => False,
+                            }
+                        }
+                    )
+                }
+            );
+            match unsafe {
+                Some(key) => fail!(
+                    `cannot order aggregate groups by ungrouped dimension \{key.node}.\{key.dimension}; select a group key, group by this node's identity, or order by an aggregate measure`,
+                    orders
+                ),
+                None => {
+                    let visible = array::filter(
+                        array::map(plan.projection, projection_name),
+                        fn(name) {
+                            !array::any(
+                                extras.2,
+                                fn(hidden) {
+                                    hidden == name
+                                }
+                            )
+                        }
+                    );
+                    if visible == [] {
+                        fail!(
+                            "order_by does not select output; select at least one dimension, measure or count",
+                            orders
+                        )
+                    } else {
+                        ({...ast, output_columns: Some(visible)}, expanded)
+                    }
+                },
+            }
+        }
+    }
+};
+
 # The public selection is outside every business operation, never an input cap.
 def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, intent) {
     let obj = as_object(intent);
@@ -1566,22 +1749,20 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                 )
             )
         );
-        let ast = lower_unlimited_intent_ast(payload, base);
-        let columns = result_columns(payload, base, ast);
+        let prepared = prepare_order_query(payload, base, array_opt(obj, "order_by"));
+        let ast = prepared.0;
+        let columns = result_columns(payload, prepared.1, {...ast, output_columns: None});
         let dimensions = if array_opt(obj, "order_by") == [] {
             []
         } else {
-            result_order_dimensions(payload, base)
+            result_order_dimensions(payload, prepared.1)
         };
         let ordering = array::fold(
             array_opt(obj, "order_by"),
             (ast.ctx, []),
             fn(state, value) {
                 let item = as_object(value);
-                let column = match dict::get(item, "column") {
-                    Some(value) => as_string(value),
-                    None => `\{as_string(field(item, "node"))}_\{as_string(field(item, "dimension"))}`,
-                };
+                let column = order_column(value);
                 let direction = match as_string(field(item, "direction")) {
                     "Asc" => qb::Ordering::Asc,
                     "Desc" => qb::Ordering::Desc,
@@ -1594,7 +1775,7 @@ def lower_intent_ast: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
                     }
                 ) {
                     fail!(
-                        `unknown final order column \{column}; use a projected result column`,
+                        `unknown final order column \{column}; column must name an output column. For a hidden Graph key use {node,dimension,direction} or {node,measure,direction}`,
                         value
                     )
                 } else {
@@ -1921,13 +2102,32 @@ def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> A
     )
 };
 
+def visible_plan: Fn(qb::QueryAst, qb::Plan) -> qb::Plan = fn(ast, plan) {
+    match ast.output_columns {
+        None => plan,
+        Some(columns) => {
+            ...plan,
+            projection: array::filter(
+                plan.projection,
+                fn(item) {
+                    array::any(
+                        columns,
+                        fn(name) {
+                            name == projection_name(item)
+                        }
+                    )
+                }
+            )
+        },
+    }
+};
 def result_columns: Fn(edsl::PreparedPayload, Value, qb::QueryAst) -> Array(ResultColumn) = fn(
     payload,
     input,
     ast
 ) {
     match ast.plan {
-        qb::QueryPlan::Rows(plan) => graph_columns(payload, input, plan, ast.ctx),
+        qb::QueryPlan::Rows(plan) => graph_columns(payload, input, visible_plan(ast, plan), ast.ctx),
         qb::QueryPlan::DistinctRows(plan) => graph_columns(payload, input, plan, ast.ctx),
         qb::QueryPlan::GroupCount(_) => [count_column],
         qb::QueryPlan::SetCount(_) => [count_column],

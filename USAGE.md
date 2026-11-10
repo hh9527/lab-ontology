@@ -78,7 +78,7 @@ SQL 与绑定是交给获授权执行层的中间输出，不是澄清依据或�
 ```
 
 每个多行查询使用最终 `order_by:[{column,direction}]` 与 `take`，take 是检查时已知的 1..500 整数。
-column 是投影后的完整列名，direction 为 Asc 或 Desc；Graph 的维度排序也可写为 `{node,dimension,direction}`。
+column 是投影后的完整列名，direction 为 Asc 或 Desc；Graph 可用 `{node,dimension,direction}` 或 `{node,measure,direction}` 按未输出键排序。隐藏键不出现在结果；聚合的隐藏维度须属于原有分组或已分组节点身份，DISTINCT 须使用已输出键。
 最终排序取前 N 由数据库执行，位于 JOIN、聚合、DISTINCT、UNION 之后。枚举排序遵循模型声明的业务顺序；并列时应显式补充已投影身份列。
 无分组标量计数和普通聚合可证明至多一行；全局 top_by_measure 和 GraphPair.rank_by 也可证明上界，其最终 take 同样为 1..500。
 分区 top_per 或分支内 take 不能证明最终结果上界，缺少证明时 transform/check 返回诊断。
