@@ -1,5 +1,7 @@
 # DARI 类型化数据流语言
 
+注释使用 `#`，从 `#` 到行尾。字符串中的 `#` 是普通字符。
+
 扩展名为 `.dari`，定位是围绕数据获取、处理和展现的流水线定义语言：声明式、强类型、有边界、本地与远程两阶段证明。data 声明可缓存的数据节点，let 命名节点内部的计划片段，不产生新的物化边界。语言核心通过 JSONL 服务接入插件，模型以独立 ABI 提供类型证明和参数化查询计划。主阅读入口为 [device.dari](examples/device.dari)，展示静态模型 query_remote! 与后续 query!；[ic-device.dari](examples/ic-device.dari) 使用真实 IC 模型的符号与类型 ABI。
 
 ## 运行
