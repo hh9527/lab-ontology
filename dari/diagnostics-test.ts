@@ -39,8 +39,13 @@ const set=failure('type A=struct(Float);type B=struct(Float);data left=table([{v
 assert.match(set.message,/value: a = A, b = B/);assert.match(set.message,/保留需要的指标/);
 const {createFixtureModel}=await import('./fixture-model.ts');
 const {model}=createFixtureModel();
+try{check('data q=query_remote! {let alarm=from(ic::DeviceKpi);let selected=alarm |> project({tenant:alarm.tenant_name});selected |> order_by(asc(selected.tenant)) |> take(10)};answer tree! {Answer []};',model);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.equal(e.diagnostics[0].code,'unknown-model-member');assert.match(e.message,/alarm.tenant_name/);assert.match(e.message,/先 connect/);assert(!e.message.includes('r0.'));}
 try{check('data q=query_remote! {let d=from(ic::DeviceKpi);d |> project({name:coalesce(d.name,"unknown")}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer []};',model);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/Computed model expression coalesce/);assert(!e.message.includes('Unknown binding d'));}
 const mismatchModel={...model,check_type(){throw Error('filter parameter type does not match dimension');}};
+const loweredSource='data q=query_remote! {let d=from(ic::DeviceKpi).as!(device);let selected=d |> filter(device.name > 1);let output=selected |> project({name:device.name});output |> order_by(asc(output.name)) |> take(1)};answer tree! {Answer []};';
+try{check(loweredSource,mismatchModel);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/device.name expects String/);assert(!/\br\d+\./.test(e.message));assert(!e.message.includes('@local/'));}
+const aliasModel={...model,check_type(){throw Error('Unsupported predicate on r0.name at node_0');}};
+try{check(loweredSource,aliasModel);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/device.name/);assert(!/\b(?:r\d+|node_\d+)\b/.test(e.message));}
 try{check('data q=query_remote! {let d=from(ic::DeviceKpi);d |> filter(d.name > 1) |> project({name:d.name}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer []};',mismatchModel);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/d.name expects String \(String\), got Int \(Int\)/);assert.equal(e.diagnostics[0].at,'data q=query_remote! {let d=from(ic::DeviceKpi);d |> filter(d.name > '.length);}
 const hostModule=new URL('../../dsh-oks/packages/dsh-oks/src/dari-host.ts',import.meta.url).href;
 const {dariHost}=await import(hostModule);
@@ -54,3 +59,19 @@ for(const operation of ['join','left_join','semi_join','anti_join','union','unio
  assert(!result.message.includes('Unsupported plan operation'));
 }
 console.log('Join and set operations in pipeline positions report supported syntax and repair guidance');
+
+const staticSource='data rows=table([{label:"a",n:1,share:0.5}]);\nanswer tree! {Answer [\nTable(data = rows, spec = {columns:[label,n,share]})\n]};';
+try{check(staticSource,undefined,{host:dariHost});assert.fail('Expected failure');}catch(e){
+ assert(e instanceof DiagnosticFailure);assert.equal(e.diagnostics.length,3);
+ for(const [i,name] of ['label','n','share'].entries()){
+  assert.equal(e.diagnostics[i].code,'static-option');assert.equal(e.diagnostics[i].at,staticSource.indexOf(name,staticSource.indexOf('columns:[')+9));
+  assert.match(e.diagnostics[i].message,new RegExp('Table.spec.columns\\['+i+'\\]'));
+  assert(e.diagnostics[i].suggestion?.includes('project!('+name+')'));
+ }
+ assert(!e.message.includes('L1:1'));
+}
+for(const columns of ['[project!(label),project!(n),project!(share)]','["label","n","share"]'])check(staticSource.replace('[label,n,share]',columns),undefined,{host:dariHost});
+check('data ctx=context! {now:Context::Now,tz:Context::ClientTz};data days=time_windows({epoch_millis:ctx.now,time_zone:ctx.tz},{unit:TimeUnit::Day,count:3,mode:WindowMode::Complete});answer tree! {Answer []};',undefined,{host:dariHost,contextType:{kind:'schema',fields:{epochMillis:{kind:'scalar',name:'EpochMillis'},timeZone:{kind:'scalar',name:'String'}}}});
+const compositeModel={...model,check_type(){throw Error('final order column node_0_name has no declared business ordering');}};
+try{check(loweredSource,compositeModel);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/device.name/);assert(!e.message.includes('node_0_name'));}
+console.log('Static configuration: original locations, option paths, sibling diagnostics and accepted column forms; composite model aliases passed');

@@ -27,6 +27,40 @@ const order=failure('data src=table([{x:1},{x:2}]);data rows=query! {let a=from(
 assert.equal(order.diagnostics[0].code,'ordering-required');assert(!order.message.includes('out.field'));
 assert.equal(failure('data bad=to_datetime_utc(42);answer tree! {Answer []};').diagnostics[0].code,'time-semantics');
 const input=check('data request:Schema({n:Int})=input();answer tree! {Answer [Value(value = request.n)]};');
-assert.throws(()=>resolve(input,db,{request:{n:'bad'}}),(error:Error)=>{assert.match(error.message,/ResolveFailed/);assert.match(error.message,/\[request\]/);assert.match(error.message,/原因：运行期输入/);return true;});
+assert.throws(()=>resolve(input,db,{request:{n:'bad'}}),(error:Error)=>{assert.match(error.message,/SubmitFailed/);assert.match(error.message,/\[request\]/);assert.match(error.message,/原因：运行期输入/);return true;});
 db.close();
+const grouped=(body:string)=>'data src=table([{id:1},{id:2}]);data total=query! {let r=from(src);'+body+'};answer tree! {Answer []};';
+for(const body of ['let g=group_by(r,{});g |> project({n:count()})','group_by(r,{}) |> project({n:count()})']){
+ const error=failure(grouped(body));
+ assert.equal(error.diagnostics[0].code,'group-by-input');
+ assert.match(error.message,/r \|> group_by\(\{key: r.field\}\)/);
+ assert.match(error.message,/r \|> project\(\{n: count\(\)\}\)/);
+ assert(!error.message.includes('@local/'));
+ assert(!error.message.includes('is not an input'));
+}
+for(const args of ['r.id','r,{}','']){
+ const error=failure(grouped('r |> group_by('+args+') |> project({n:count()})'));
+ assert.equal(error.diagnostics[0].code,'group-by-keys');
+ assert.match(error.message,/唯一参数/);
+}
+const countDb=new DatabaseSync(':memory:');
+const unusedGroup=failure(grouped('let g=r |> group_by({id:r.id});r |> project({id:r.id,n:count()})'));
+assert.equal(unusedGroup.diagnostics[0].code,'ungrouped-column');
+assert.match(unusedGroup.message,/Ungrouped column r.id/);
+assert.match(unusedGroup.message,/从 g \|> project/);
+assert(!unusedGroup.message.includes('r0.id'));
+const countSource=grouped('r |> project({n:count()})').replace('Answer []','Answer [UseTable(ref = total)]');
+assert.equal(resolve(check(countSource),countDb).values.total[0].n,2);
+countDb.close();
+const numericText=check('answer tree! {Answer [p ["告警 1094 条", "普通文字", Lit(value = "最近 3 天")]]};');
+assert.equal(numericText.warnings.length,1);
+assert.equal(numericText.warnings[0].code,'numeric-text');
+assert.equal(numericText.warnings[0].at,'answer tree! {Answer [p ['.length);
+assert.match(numericText.warnings[0].suggestion!,/Value/);
+assert.match(numericText.warnings[0].suggestion!,/Lit\(value = "告警 1094 条"\)/);
+assert.equal(check('answer tree! {Answer [Lit(value = "最近 3 天")]};').warnings.length,0);
+for(const text of ['Lit "最近 3 天"','Lit("最近 3 天")','Lit(text = "最近 3 天")']){
+ const error=failure('answer tree! {Answer ['+text+']};');
+ assert.match(error.message,/修复建议：固定文案写 Lit\(value =/);
+}
 console.log('Diagnostic repairs: structured causes, exact original predicate, executable fixes, policy choices and located runtime errors passed');

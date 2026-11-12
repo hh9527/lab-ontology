@@ -12,8 +12,8 @@ data raw: Table(Row) = source("samples");
 data rows = query! {let r = from(raw);r |> project({label:r.label,n:r.n}) |> order_by(desc(out.n)) |> take(10)};
 
 
-report report = tree! { Report [h1 ["设备报告"],BarChart(data = rows, spec = {x:project!(label),value:project!(n),value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}})]};
-answer tree! { Answer [BarChart(data = rows, spec = {x:project!(label),value:project!(n),value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}}),UseReport(ref = report)]};
+report report = tree! { Report [h1 ["设备报告"],BarChart(data = rows, spec = {category:project!(label),value:project!(n),value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}})]};
+answer tree! { Answer [BarChart(data = rows, spec = {category:project!(label),value:project!(n),value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}}),UseReport(ref = report)]};
 `;
 const options={allowTestSources:true,host:dariHost};
 let chartRenders=0;
@@ -28,6 +28,17 @@ assert.match(output.artifacts['chart_1.svg'],/99.8/);
 assert.match(output.artifacts['report.html'],/<svg/);
 assert.match(output.artifacts['report.html'],/<table/);
 assert.match(output.artifacts['report.html'],/id="dari-context"/);
+assert.match(output.artifacts['report.html'],/<title>report<\/title>/);
+const titledOutput=resolve(check(source.replace('Report [','Report(title = "运维 & 健康周报") ['),undefined,options),db);
+const titled=titledOutput.artifacts['report.html'];
+assert.match(titledOutput.answer,/\[运维 & 健康周报\]\(report.html\)/);
+assert.match(output.answer,/\[report\]\(report.html\)/);
+const bracketTitle=resolve(check(source.replace('Report [','Report(title = "周报 [网络]") ['),undefined,options),db);
+assert(bracketTitle.answer.includes('[周报 \\[网络\\]](report.html)'));
+assert.match(titled,/<title>运维 &amp; 健康周报<\/title>/);
+assert(!/<article[^>]*\btitle=/.test(titled));
+assert.match(titled,/<figcaption>[\s\S]*?可用率/);
+assert.match(titled,/data-oks-ref/);
 const extractModule=new URL('../../dsh-oks/packages/dsh-oks/src/report-extract.ts',import.meta.url).href;
 const {extractDariSource}=await import(extractModule);
 const restored=extractDariSource(output.artifacts['report.html']);
@@ -40,7 +51,7 @@ assert.throws(()=>check(source.replace('value:project!(n)','value:project!(label
 db.exec('DELETE FROM samples');
 assert.throws(()=>resolve(check(source,undefined,options),db),/allow_no_data|无数据|empty/i);
 assert.throws(()=>resolve(check(source,undefined,options),db),(error:Error)=>{
- assert.match(error.message,/ResolveFailed\n-------------/);
+ assert.match(error.message,/SubmitFailed\n------------/);
  assert.match(error.message,/L\d+:\d+ \[answer\]: BarChart\(data = rows\)/);
  return true;
 });
@@ -55,14 +66,14 @@ console.log('production presentation: chart, inline table, self-contained report
 // Heterogeneous metrics stay in wide columns; normalization belongs to rendering only.
 const wideFields={period:{kind:'scalar',name:'String'},cpu:{kind:'nominal',name:'Cpu',inner:{kind:'scalar',name:'Float'}},mem:{kind:'nominal',name:'Memory',inner:{kind:'scalar',name:'Float'}}};
 const wideRows=[{period:'上周',cpu:42.1,mem:61.3},{period:'本周',cpu:44.2,mem:59.8}];
-const wideSpec={x:'period',series:[{value:'cpu',label:'CPU',unit:'%'},{value:'mem',label:'内存',unit:'%'}]};
-for(const component of ['GroupedBarChart','GroupedColumnChart']){
+const wideSpec={category:'period',metrics:[{value:'cpu',label:'CPU',unit:'%'},{value:'mem',label:'内存',unit:'%'}]};
+for(const component of ['MultiBarChart']){
  dariHost.checkFigure(component,wideSpec,wideFields);
  const figure=dariHost.renderFigure(component,wideSpec,wideRows,wideFields);
  assert.match(figure.content,/42.1/);assert.match(figure.content,/61.3/);assert.match(figure.content,/CPU/);assert.match(figure.content,/内存/);
  assert.throws(()=>dariHost.checkFigure(component,{...wideSpec,unit:'bytes'},wideFields),/units/);
  assert.throws(()=>dariHost.checkFigure(component,{...wideSpec,stack:{[Symbol.for('dari.enum')]:true,enum:'Stack',variant:'Total'}},wideFields),/parallel/);
- assert.throws(()=>dariHost.checkFigure(component,{...wideSpec,series:[...wideSpec.series,wideSpec.series[0]]},wideFields),/unique/);
+ assert.throws(()=>dariHost.checkFigure(component,{...wideSpec,metrics:[...wideSpec.metrics,wideSpec.metrics[0]]},wideFields),/unique/);
 }
 console.log('Wide grouped charts: distinct nominal columns, labels, embedded source data and unit constraints passed');
 const joinDb=new DatabaseSync(':memory:');
@@ -72,7 +83,7 @@ data left=table([{period:"本周",cpu:Cpu(44.2)},{period:"上周",cpu:Cpu(42.1)}
 data right=table([{period:"上周",memory:Memory(61.3)},{period:"本周",memory:Memory(59.8)}]);
 data weekly=query! {let l=from(left);let r=from(right);join({l,r},l.period==r.period) |> project({period:l.period,cpu:l.cpu,memory:r.memory}) |> order_by(asc(out.period)) |> take(10)};
 
-answer tree! { Answer [GroupedColumnChart(data=weekly,spec={x:project!(period),series:[{value:project!(cpu),label:"CPU",unit:"%"},{value:project!(memory),label:"内存",unit:"%"}]})]};`;
+answer tree! { Answer [MultiBarChart(data=weekly,spec={category:project!(period),metrics:[{value:project!(cpu),label:"CPU",unit:"%"},{value:project!(memory),label:"内存",unit:"%"}]})]};`;
 const keyedOutput=resolve(check(keyed,undefined,{host:dariHost}),joinDb);
 assert.match(keyedOutput.artifacts['chart_1.svg'],/本周,44.2,59.8/);
 assert.match(keyedOutput.artifacts['chart_1.svg'],/上周,42.1,61.3/);
@@ -84,9 +95,9 @@ const rateRows=[{label:'甲',ratio:0.12,percent:12},{label:'乙',ratio:null,perc
 const rateFields={label:{kind:'scalar',name:'String'},ratio:ratioType,percent:percentType};
 const rateTable=dariHost.renderFigure('Table',{},rateRows,rateFields);
 assert.match(rateTable.content,/12%/);assert(!rateTable.content.includes('0.12'));
-const rateChart=dariHost.renderFigure('BarChart',{x:'label',value:'ratio'},rateRows,rateFields);
+const rateChart=dariHost.renderFigure('BarChart',{category:'label',value:'ratio'},rateRows,rateFields);
 assert.match(rateChart.content,/甲,0.12,12/); // embedded CSV keeps original values
 assert.match(rateChart.content,/单位：%/);assert.match(rateChart.content,/>12%</);
 assert.deepEqual(rateRows[0],{label:'甲',ratio:0.12,percent:12});
-assert.throws(()=>dariHost.checkFigure('BarChart',{x:'label',value:'ratio',unit:'bytes'},rateFields),/unit conflicts/);
+assert.throws(()=>dariHost.checkFigure('BarChart',{category:'label',value:'ratio',unit:'bytes'},rateFields),/unit conflicts/);
 console.log('Typed percentage display: scale, suffix, original CSV, nulls and unit conflict passed');

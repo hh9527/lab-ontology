@@ -1,8 +1,9 @@
 import {Fault,type FaultDetails} from './syntax.ts';
 
 export type Diagnostic=FaultDetails&{at:number;message:string;stage:'syntax'|'type'|'model'|'runtime';asset?:string};
+const publicName=(text:string|undefined)=>text?.replace(/@local\/\d+\/([A-Za-z_][A-Za-z_0-9]*)/g,'$1');
 export function faultDiagnostic(error:Fault,stage:Diagnostic['stage'],asset?:string):Diagnostic {
- return {at:error.at,message:error.message.replace(/@local\/\d+\/([A-Za-z_][A-Za-z_0-9]*)/g,'$1'),stage,asset,...error.details};
+ return {at:error.at,message:publicName(error.message)!,stage,asset:publicName(asset),...error.details,reason:publicName(error.details.reason),suggestion:publicName(error.details.suggestion)};
 }
 // Same collection contract as DARI: scoped findings, checkpoints, stable deduplication.
 export class DiagnosticCollector {
@@ -27,7 +28,7 @@ export function repairSuggestion(message:string):string|undefined {
  if(/requires.*order_by|requires an ordering|on multiple rows requires/.test(message))return '先依据业务口径选择排序字段，用当前计划的具名绑定声明 order_by，再 take(n)；不要依赖数据库默认行序';
  if(/proven bound|terminal take/.test(message))return '在交付前通过 order_by(...) |> take(n) 证明上界，n 为 1..500；中间计划可继续在 query! 中处理，不要提前截断参与计算的数据';
  if(/stack requires Stack::/.test(message))return 'stack 使用 Stack::None、Stack::Total 或 Stack::Percent，按需要选择并列、原值堆叠或构成比堆叠';
- if(/Stacking requires an additive|does not allow Sum/.test(message))return '使用允许加总的同类指标；若目标是不同指标并列展示，使用宽表多序列并保持 Stack::None，不转换类型来绕过约束';
+ if(/Stacking requires an additive|does not allow Sum/.test(message))return '堆叠使用允许 Sum 的同类指标；同一指标只需并列时选择 GroupedBarChart，不同指标并列时选择 MultiBarChart，保留业务类型';
  if(/precision requires/.test(message))return 'precision 使用 0..12 的静态整数；它只改变展示，不改变原始数据精度';
  if(/allow_no_data|图表没有数据/.test(message))return '先核对筛选口径；若业务允许无数据，显式设置 spec.allow_no_data: True，否则保留错误，不填造占位数据';
  if(/Use project!/.test(message))return '字段选择写为 project!(field)，不使用字符串或匿名函数';

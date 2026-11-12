@@ -22,6 +22,15 @@ try{
  assert.equal(result.values.rows.length,2);
  assert.equal(result.values.rows.find((r:any)=>r.frame==='无设备').device,null);
  assert.equal(result.values.rows.find((r:any)=>r.frame==='有设备').device,'交换机一');
+ const required=source.replace('device:d.device_name','device:not_none(d.device_name)').replace('take(10)','take(1)');
+ const requiredProgram=check(required,host.model);
+ assert.match(show(requiredProgram.bindings.get('rows')!.type),/device: String/);
+ assert.deepEqual(resolve(requiredProgram,db).values.rows,[{frame:'有设备',device:'交换机一'}]);
+ const classification=source.replace('device:d.device_name','classification:d.device_class').replace('asc(out.frame)','asc(out.classification)');
+ assert.throws(()=>check(classification,host.model),(error:Error)=>{
+  assert.match(error.message,/d.device_class/);assert.match(error.message,/没有声明业务排序/);
+  assert(!error.message.includes('node_1_device_class'));return true;
+ });
  assert.throws(()=>check(source.replace('frame_belongs_to_device,f,d','frame_belongs_to_device,d,f'),host.model),/relation|endpoint|entity/i);
  assert.throws(()=>check(source.replace('connect(ic::relations::frame_belongs_to_device,f,d)\n   |> ',''),host.model),/disconnected|connected|edge|grain/i);
  console.log('multi-node Relation: published symbols, optional LEFT JOIN, nullable Schema, endpoint and connectivity checks passed');

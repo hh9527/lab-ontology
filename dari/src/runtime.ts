@@ -22,8 +22,8 @@ const reportHtml=(text:string)=>text.split('\n\n').map(block=>{
  return '<pre style="white-space:pre-wrap">'+html(block)+'</pre>';
 }).join('\n');
 export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>={},execution:{context?:unknown;contextContractId?:string}={}){
- if(p.model&&(p.model.contractId!==p.modelContractId||p.model.implementationId!==p.modelImplementationId))throw Error(renderDiagnostics(p.source,[{at:0,message:'Model contract changed; check the plan again',stage:'runtime',code:'stale-model-proof',reason:'当前模型身份或实现与检查时不同，已有查询证明不能复用',suggestion:'对同一稿件重新执行检查，再 resolve；不要修改业务口径或放宽类型'}],'ResolveFailed'));
- if(p.contextContractId!==execution.contextContractId)throw Error(renderDiagnostics(p.source,[{at:0,message:'Context contract changed; check the plan again',stage:'runtime',code:'stale-context-proof',reason:'当前 context 的类型契约与检查时不同',suggestion:'确认上下文契约后重新检查同一稿件，再 resolve'}],'ResolveFailed'));
+ if(p.model&&(p.model.contractId!==p.modelContractId||p.model.implementationId!==p.modelImplementationId))throw Error(renderDiagnostics(p.source,[{at:0,message:'Model contract changed; check the plan again',stage:'runtime',code:'stale-model-proof',reason:'当前模型身份或实现与检查时不同，已有查询证明不能复用',suggestion:'对同一稿件重新执行检查，再提交；不要修改业务口径或放宽类型'}],'SubmitFailed'));
+ if(p.contextContractId!==execution.contextContractId)throw Error(renderDiagnostics(p.source,[{at:0,message:'Context contract changed; check the plan again',stage:'runtime',code:'stale-context-proof',reason:'当前 context 的类型契约与检查时不同',suggestion:'确认上下文契约后重新检查同一稿件，再提交'}],'SubmitFailed'));
  registerCalendarSqlite(db);
  db.function('dari_utc_bucket',{deterministic:true},(value:any,unit:any)=>utcBucket(value,unit));
  const patterns=new Map<string,RegExp>();
@@ -243,9 +243,9 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   const saved=scopes;scopes=[];
   try{return globalBinding(name);}catch(error){
    const message=(error as Error).message,b=p.bindings.get(name);
-   if(!b||/^(ResolveFailed|CheckFailed)\n/.test(message))throw error;
+   if(!b||/^(SubmitFailed|CheckFailed)\n/.test(message))throw error;
    const contract=/Model (transform contradicts|result exceeds)|projection does not match|contract changed/i.test(message);
-   throw Error(renderDiagnostics(p.source,[{at:b.ast.at,message,stage:'runtime',asset:b.ast.owner??name,code:contract?'runtime-contract':b.ast.name==='input'?'runtime-input':'runtime-value',...(contract?{reason:'运行实现或结果违背检查期已证明的契约',suggestion:'核对模型及宿主版本并修复实现；不要通过放宽类型或上界掩盖此错误'}:b.ast.name==='input'?{reason:'运行期输入不符合声明的类型或编码',suggestion:'核对输入字段、业务类型编码及可空性；不要修改 Schema 来掩盖错误值'}:{})}],'ResolveFailed'));
+   throw Error(renderDiagnostics(p.source,[{at:b.ast.at,message,stage:'runtime',asset:b.ast.owner??name,code:contract?'runtime-contract':b.ast.name==='input'?'runtime-input':'runtime-value',...(contract?{reason:'运行实现或结果违背检查期已证明的契约',suggestion:'核对模型及宿主版本并修复实现；不要通过放宽类型或上界掩盖此错误'}:b.ast.name==='input'?{reason:'运行期输入不符合声明的类型或编码',suggestion:'核对输入字段、业务类型编码及可空性；不要修改 Schema 来掩盖错误值'}:{})}],'SubmitFailed'));
   }finally{scopes=saved;}
 
  }
@@ -287,7 +287,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   }
   if(n.name==='UseTable'){const text=render(n,numbers);return p.host?.reportHtml?p.host.reportHtml(text,artifacts):reportHtml(text);}
   const tag=n.name==='Report'?'article':n.name;
-  const attributes=Object.entries(attrs).map(([key,node]:[string,any])=>' '+key+'="'+html(node.value)+'"').join('');
+  const attributes=Object.entries(attrs).filter(([key])=>n.name!=='Report'||key!=='title').map(([key,node]:[string,any])=>' '+key+'="'+html(node.value)+'"').join('');
   return '<'+tag+attributes+'>'+n.children.map((c:Node)=>reportNode(c,numbers)).join('')+(['br','hr'].includes(tag)?'':'</'+tag+'>');
  }
  function presented(t:Type|undefined,v:any,digits?:number):any {
@@ -312,7 +312,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
    catch(error){
     const asset=[...p.bindings].filter(([,b])=>b.kind==='tree'&&b.ast.root.at<=n.at).sort((a,b)=>b[1].ast.root.at-a[1].ast.root.at)[0]?.[0];
     const message=n.name+'(data = '+ref('data')+'): '+(error as Error).message;
-    throw Error(renderDiagnostics(p.source,[{at:n.at,message,stage:'runtime',asset}],'ResolveFailed'));
+    throw Error(renderDiagnostics(p.source,[{at:n.at,message,stage:'runtime',asset}],'SubmitFailed'));
    }
   }
   const field=(key:string)=>{const projection=a[key],contract=projection.checkedType,row=p.bindings.get(ref('data'))!.result!.element;if(contract?.kind!=='projection'||!same(contract.input,row)||!same(contract.output,row.fields![projection.field]))throw Error('Field projection does not match its checked row contract');return projection.field;};
@@ -330,7 +330,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   if(n.k==='if')return (value(n.test)?n.yes:n.no).map((c:Node)=>render(c,numbers)).join('\n\n');
   const a=Object.fromEntries(n.attrs.map((f:Node)=>[f.name,f.value]));
   const ref=(key:string)=>a[key].path[0];
-  if(n.name==='Report')return {kind:'report',html:reportNode(n,{charts:0,tables:0})};
+  if(n.name==='Report')return {kind:'report',title:a.title?.value,html:reportNode(n,{charts:0,tables:0})};
   if(n.checkedSpec||n.name==='ColumnChart'){
    const figure=renderChart(n),label=figureLabel(figure.kind,numbers),caption=label+(figure.title?'：'+figure.title:'');
    if(figure.kind==='table')return '**'+md(caption)+'**\n\n'+figure.content;
@@ -356,8 +356,9 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
    const captured=contextLoaded?contextSnapshot:execution.context??null;
    const archive={version:1,context:{run:runId,batch:runId,sourceHash:createHash('sha256').update(p.source).digest('hex'),startedAt,model:p.model?{hash:p.modelImplementationId,domain:p.modelContractId}:null,captures:[{binding:'context',at:{line:1,column:1},value:captured},{binding:'input',at:{line:1,column:1},value:inputs}],acquisitions}};
    const source=p.source.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
-   artifacts[name+'.html']='<!doctype html><meta charset="utf-8"><title>'+html(name)+'</title><style>'+(p.host?.reportStyle??'')+'</style>'+report.html+'\n<script type="text/plain" id="dari-source">'+source+'</script>\n<script type="application/json" id="dari-context">'+json(archive)+'</script>';
-   return '['+name+']('+name+'.html)';
+   artifacts[name+'.html']='<!doctype html><meta charset="utf-8"><title>'+html(report.title??name)+'</title><style>'+(p.host?.reportStyle??'')+'</style>'+report.html+'\n<script type="text/plain" id="dari-source">'+source+'</script>\n<script type="application/json" id="dari-context">'+json(archive)+'</script>';
+   const label=display(report.title??name).replace(/([\\`*_\[\]<>|])/g,'\\$1').replace(/\r?\n/g,' ');
+   return '['+label+']('+name+'.html)';
   }
   const s=children();return /^h[123]$/.test(n.name)?'#'.repeat(Number(n.name[1]))+' '+s:n.name==='strong'?'**'+s+'**':n.name==='em'?'*'+s+'*':s;
  }

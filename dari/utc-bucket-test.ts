@@ -40,4 +40,13 @@ assert.equal(encodedBucket.value.value.kind,'member');
 check(convertedSource.replace('utc_bucket(to_datetime_utc(a.ts),CalendarUnit::Day)','to_datetime_utc(a.ts)'),convertedModel);
 assert.equal(encodedBucket.kind,'to_datetime_utc');
 assert.throws(()=>check(modelSource,convertedModel),/DateTimeUtc dimension or to_datetime_utc/);
+const parameterModel:ModelPort={...model,check_type(intent,encoded){
+ const wire=JSON.parse(encoded.json),predicate=wire.steps.find((s:any)=>s.kind==='filter').body;
+ assert.equal(predicate.right.kind,'parameter');
+ assert.equal(predicate.right.input_type,'DateTimeUtc');
+ const filter=intent.steps.find(s=>s.kind==='filter')!;
+ assert.equal((filter as any).predicate.right.type.name,'DateTimeUtc');
+ return {element:{kind:'schema',fields:{day:{kind:'option',inner:sharedTypes.DateTimeUtc}}},container:'table',maxRows:10,plan:{},receipt:proofTarget(intent,'test',encoded)};
+}};
+check('data boundary=EpochMillis(0);data rows=query_remote! {let a=from(test::Sample);a |> filter(to_datetime_utc(a.ts) >= to_datetime_utc(boundary)) |> project({day:to_datetime_utc(a.ts)}) |> order_by(asc(out.day)) |> take(10)};answer tree! {Answer []};',parameterModel);
 db.close();console.log('UTC bucket: five units, Monday weeks, SQL grouping/aggregation, nullable types and diagnostics passed');

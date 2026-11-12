@@ -5,7 +5,7 @@ import {resolve} from './src/runtime.ts';
 const {dariHost}=await import(new URL('../../dsh-oks/packages/dsh-oks/src/dari-host.ts',import.meta.url).href);
 const db=new DatabaseSync(':memory:');
 try{
- const chart='BarChart(data=rows,spec={x:project!(label),value:project!(value),title:"数量"})';
+ const chart='BarChart(data=rows,spec={category:project!(label),value:project!(value),title:"数量"})';
  const table='Table(data=rows,spec={columns:["label","value"]})';
  const source=`data rows=table([{label:"a",value:1}]);
  report first=tree! {Report [${chart},${table},if False [${chart}] else [],${chart},${table}]};

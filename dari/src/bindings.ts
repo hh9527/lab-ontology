@@ -46,7 +46,7 @@ export function resolvePlanNames(block:Node):Node{
 export function hasPlanBindings(n:Node):boolean{
  return ['query','select'].includes(n.k)&&!n.loweredBindings&&(
   n.bindings.some((b:Node)=>b.name==='out'||b.value.k!=='call'||!['node','from'].includes(b.value.name))||
-  n.start.k==='alias'||n.steps.some((s:Node)=>s.k==='alias')||n.start.k==='call'&&n.start.name==='project'
+  n.start.k==='alias'||n.steps.some((s:Node)=>s.k==='alias')||n.start.k==='call'&&['project','group_by'].includes(n.start.name)
  );
 }
 
@@ -82,6 +82,13 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
   if(n.k==='object')return {...n,fields:n.fields.map((f:Node)=>({...f,value:rewrite(f.value,scope)}))};
   if(n.k==='array')return {...n,items:n.items.map((a:Node)=>rewrite(a,scope))};
   return {...n};
+ }
+ function groupStart(n:Node):never{
+  const input=n.args[0],name=input?.k==='ref'?(input.displayPath??input.path).join('.'):'rows';
+  throw new Fault('group_by requires a pipeline input',n.at,{
+   code:'group-by-input',reason:'group_by 是关系计划算子；输入关系放在 |> 左侧，括号内只放分组键对象',
+   suggestion:'按键分组写为 '+name+' |> group_by({key: '+name+'.field})，随后 |> project({...})；全表计数直接写 '+name+' |> project({n: count()})，无需 group_by({})'
+  });
  }
  function fromTable(name:string,at:number):Relation{
   const a=alias(at);
@@ -173,6 +180,7 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
  function expression(value:Node):Relation{
   const part=parts(value),binding=part.start.k==='alias'?part.start:undefined;
   const start=binding?.value??part.start,steps=part.steps;let relation:Relation;
+  if(start.k==='call'&&start.name==='group_by')groupStart(start);
   if(start.k==='alias')relation=expression(start);
   else if(start.k==='ref'&&start.path.length===1)relation=useRelation(start.path[0],start);
   else if(start.k==='call'&&start.name==='from'&&block.k==='query'){
@@ -198,7 +206,7 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
  for(const binding of block.bindings){
   const {start}=parts(binding.value);
   const plan= binding.value.k==='pipeline'||start.k==='alias'||start.k==='call'&&['from','project','pair',...joins,...sets].includes(start.name)||start.k==='ref'&&locals.get(start.path[0])?.kind==='relation';
-  if(!plan){locals.set(binding.name,{kind:'value',name:emit(rewrite(binding.value,new Map()),binding.name)});continue;}
+  if(!plan){if(start.k==='call'&&start.name==='group_by')groupStart(start);locals.set(binding.name,{kind:'value',name:emit(rewrite(binding.value,new Map()),binding.name)});continue;}
   const relation=expression(binding.value);
   relation.scope.set(binding.name,relation.row);
   locals.set(binding.name,relation);

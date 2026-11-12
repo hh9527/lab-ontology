@@ -66,11 +66,11 @@ Option 表示有没有行，行内字段用可空标量表达。运行时将 tak
 
 Schema 是扁平记录，字段限逻辑标量及其可空形式，嵌套 Schema 不合法。`&` 合并字段并拒绝类型冲突。业务 newtype 保留名义身份，不同 ID 类型不能直接比较。LEFT JOIN 将右侧字段变为可空类型。聚合检查分组字段；count 返回 Int，avg 返回 Option(Float)。封闭 enum 使用模型公开 variant 和 codec；半开放映射保留原始字段，并提供含 Unknown 的计算 enum 字段。
 
-独立关系运算样例见 [source-select.dari](examples/source-select.dari)。展示使用 tree!、Answer、Report、ColumnChart，属性用 `=`。`Value(data = highest, field = project!(cpu))` 读取可选行的字段，缺行或空字段显示无数据。UseTable 输出 Markdown 表格，图表直接内联，UseReport 引用报告产物。条件所有分支都检查类型，执行时只处理选中分支。SVG 内含图表最终输入数据。
+独立关系运算样例见 [source-select.dari](examples/source-select.dari)。展示使用 tree!、Answer、Report，以及展示宿主提供的图表组件，属性用 `=`。`Value(data = highest, field = project!(cpu))` 读取可选行的字段，缺行或空字段显示无数据。UseTable 输出 Markdown 表格，图表直接内联，UseReport 引用报告产物。条件所有分支都检查类型，执行时只处理选中分支。SVG 内含图表最终输入数据。
 
 ## 静态模型取数
 
-组件的字段选择使用 `project!(field)`，例如 `ColumnChart(data = top, x = project!(name), value = project!(cpu))`。这是内置的受限投影宏，只接受一个字段标识，由组件的 data 行 Schema 提供检查上下文，校验字段存在性和所需类型。它生成投影计划，不读取数据，也不消除可选行或字段的空值；不能独立绑定或传入任意表达式。语义相当于选择输入行的一个字段，语言不开放手写函数。
+组件的字段选择使用 `project!(field)`，例如 `BarChart(data = top, spec = {category:project!(name), value:project!(cpu)})`。这是内置的受限投影宏，只接受一个字段标识，由组件的 data 行 Schema 提供检查上下文，校验字段存在性和所需类型。它生成投影计划，不读取数据，也不消除可选行或字段的空值；不能独立绑定或传入任意表达式。语义相当于选择输入行的一个字段，语言不开放手写函数。
 
 ## 前序计算与展现边界
 

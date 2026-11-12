@@ -20,8 +20,8 @@ try{
  assert.throws(()=>check(source.replace('.start.epoch_millis','.start.epochMillis'),undefined,{host:dariHost,contextType}),/Unknown field/);
  assert.throws(()=>check(source.replace('time_zone:"Asia/Shanghai"','timeZone:"Asia/Shanghai"'),undefined,{host:dariHost,contextType}),/time_zone/);
  const fields:any={label:{kind:'scalar',name:'String'},value:{kind:'scalar',name:'Float'}};
- dariHost.checkFigure('BarChart',{x:'label',value:'value',value_min:99,allow_no_data:true,x_label:'设备',value_label:'可用率',layout:{label_font:12,title_font:16,tick_count:5,slant_ticks:false}},fields);
- for(const key of ['valueMin','allowNoData','xLabel','valueLabel','xType','connectNulls','entityColor'])assert.throws(()=>dariHost.checkFigure('BarChart',{x:'label',value:'value',[key]:true},fields),/Use .* instead of/);
- assert.throws(()=>dariHost.checkFigure('BarChart',{x:'label',value:'value',layout:{labelFont:12}},fields),/label_font/);
+ dariHost.checkFigure('BarChart',{category:'label',value:'value',value_min:99,allow_no_data:true,x_label:'设备',value_label:'可用率',layout:{label_font:12,title_font:16,tick_count:5,slant_ticks:false}},fields);
+ for(const key of ['valueMin','allowNoData','xLabel','valueLabel','xType','connectNulls','entityColor'])assert.throws(()=>dariHost.checkFigure('BarChart',{category:'label',value:'value',[key]:true},fields),/Use .* instead of/);
+ assert.throws(()=>dariHost.checkFigure('BarChart',{category:'label',value:'value',layout:{labelFont:12}},fields),/label_font/);
  console.log('Public naming: snake_case time schemas, calendar values, chart options and rejection of legacy names passed');
 }finally{db.close();}

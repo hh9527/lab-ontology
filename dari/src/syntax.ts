@@ -35,10 +35,12 @@ export function parse(source:string,findings?:Fault[]):Node[]{
  }
  function treeNode():Node{
   const t=ts[pos],name=ident(),attrs:Node[]=[];let invalid=false;
+  const litDetails={code:'literal-text',suggestion:'固定文案写 Lit(value = "最近 3 天")；查询结果用 Value(...) 引用；普通文字可直接作为子节点写 "文字"'};
+  if(name==='Lit'&&ts[pos].kind==='string')throw new Fault('Lit requires named attribute value',ts[pos].at,litDetails);
   if(is('(')){
    const open=pos;
    try{take();while(!is(')')){const a=take();if(a.kind!=='id')throw new Fault('Expected attribute name',a.at);if(is(':'))throw new Fault('Node attributes use "=", not ":"; write '+name+'('+a.text+' = ...)',ts[pos].at);need('=');const start=ts[pos].at,value=expr(),end=ts[pos-1];attrs.push({k:'field',name:a.text,value,sourceText:source.slice(start,end.at+end.text.length),at:a.at});if(!eat(','))break;}need(')');}
-   catch(error){if(!findings||!(error instanceof Fault)||!skipAttributes(open))throw error;report(error);attrs.length=0;invalid=true;}
+   catch(error){if(error instanceof Fault&&name==='Lit'&&error.message==='Expected attribute name')error.details=litDetails;if(!findings||!(error instanceof Fault)||!skipAttributes(open))throw error;report(error);attrs.length=0;invalid=true;}
   }
   const nodes=is('[')?children():[];return{k:'element',name,attrs,children:nodes,invalid,at:t.at};
  }
