@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {check} from './src/compiler.ts';
+import {resolve} from './src/runtime.ts';
+import {inSubnet,ipv4} from './src/ipv4.ts';
+assert.equal(ipv4('192.168.1.5'),3232235781);
+for(const bad of ['01.2.3.4','256.1.1.1','1.2.3','1.2.3.4 '])assert.equal(ipv4(bad),null);
+assert.equal(inSubnet('192.168.1.255','192.168.1.0/24'),1);
+assert.equal(inSubnet('192.168.2.0','192.168.1.0/24'),0);
+assert.equal(inSubnet('bad','0.0.0.0/0'),null);
+assert.throws(()=>inSubnet('1.1.1.1','192.168.1.1/24'),/host bits/);
+const db=new DatabaseSync(':memory:');
+const source='data raw=table([{ip:"192.168.1.4"},{ip:"192.168.2.4"},{ip:"bad"}]);data rows=query! {let r=from(raw);r |> filter(coalesce(in_subnet(r.ip,"192.168.1.0/24"),False)) |> project({ip:r.ip})};answer tree! { Answer [UseTable(ref = rows)]};';
+assert.deepEqual(resolve(check(source),db).values.rows,[{ip:'192.168.1.4'}]);
+assert.deepEqual(resolve(check('data empty:Table(Schema({n:Int}))=table([]);answer tree! { Answer [UseTable(ref = empty)]};'),db).values.empty,[]);
+db.close();console.log('finite IPv4 canonical validation, subnet SQL filtering and literal tables passed');

@@ -52,6 +52,9 @@ type ColumnRef = struct {
 # arbitrary function name/operator and no identifier can escape through this
 # vocabulary.  Semantics never change with the profile or the caller.
 type UtcBucketUnit = enum {
+    Year,
+    Quarter,
+    Week,
     Hour,
     Day,
     Month
@@ -84,6 +87,8 @@ type ScalarFunction = enum {
     UtcDaysAgo,
     # Calendar bucket start, preserving the input logical type and NULL.
     UtcTimeBucket(UtcBucketSpec),
+    EpochMillisToUtc,
+    ZonedTimeBucket(UtcBucketUnit),
     Eq,
     Ne,
     Lt,
@@ -113,6 +118,7 @@ type ScalarCall = struct {
 };
 
 type Expr = enum {
+    Parameter(Int),
     Column(ColumnRef),
     AllocatedBind(AllocatedBinding),
     Scalar(ScalarCall),
@@ -906,6 +912,7 @@ def ops_union: Fn(Array(Operator), Array(Operator)) -> Array(Operator) = fn(left
 def expr_operators: Fn(Expr) -> Array(Operator) = fn(expr) {
     match expr {
         Expr::Column(_) => [Operator::Column],
+        Expr::Parameter(_) => [Operator::Bind],
         Expr::AllocatedBind(_) => [Operator::Bind],
         Expr::Scalar(call) => {
             let empty: Array(Operator) = [];
@@ -1400,8 +1407,12 @@ def scalar_arity_ok: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, args
         ScalarFunction::Lower => len == 1,
         ScalarFunction::Length => len == 1,
         ScalarFunction::UtcDaysAgo => len == 2,
+        ScalarFunction::EpochMillisToUtc => len == 1,
+        ScalarFunction::ZonedTimeBucket(unit) => len == 2 && unit != UtcBucketUnit::Hour,
         ScalarFunction::UtcTimeBucket(spec) => len == 1 && !(
-            spec.encoding == UtcBucketEncoding::Date && spec.unit == UtcBucketUnit::Hour
+            spec.encoding == UtcBucketEncoding::Date && spec.unit == UtcBucketUnit::Hour || spec.encoding != UtcBucketEncoding::DateTimeUtc && (
+                spec.unit == UtcBucketUnit::Year || spec.unit == UtcBucketUnit::Quarter || spec.unit == UtcBucketUnit::Week
+            )
         ),
         ScalarFunction::Eq => len == 2,
         ScalarFunction::Ne => len == 2,
@@ -1444,6 +1455,7 @@ def scalar_call_valid: Fn(ScalarFunction, Array(Expr)) -> Bool = fn(function, ar
 def expr_valid: Fn(Expr, Array(String)) -> Bool = fn(expr, aliases) {
     match expr {
         Expr::Column(ref) => is_sql_identifier(ref.column) && known_alias(aliases, ref.source),
+        Expr::Parameter(index) => index >= 0,
         Expr::AllocatedBind(binding) => binding.index > 0,
         Expr::Scalar(call) => array::all(
             call.args,
@@ -1528,6 +1540,7 @@ def latest_calls: Fn(Plan) -> Array(AggregateCall) = fn(plan) {
 def expr_uses_sample: Fn(Expr, String) -> Bool = fn(expr, source) {
     match expr {
         Expr::Column(ref) => ref.source == source,
+        Expr::Parameter(index) => index >= 0,
         Expr::AllocatedBind(_) => True,
         Expr::Scalar(call) => array::all(
             call.args,
@@ -2512,6 +2525,7 @@ def exists_structure_ok: Fn(Exists, Array(String)) -> Bool = fn(ex, main_aliases
                             ),
                         };
                         measure_ok && match h.threshold {
+                            Expr::Parameter(index) => index >= 0,
                             Expr::AllocatedBind(binding) => binding.index > 0,
                             _ => False,
                         }
@@ -2590,6 +2604,7 @@ def having_measure_ok: Fn(Plan, HavingMeasure, Array(String)) -> Bool = fn(plan,
 
 def having_ok: Fn(Plan, Array(String), Having) -> Bool = fn(plan, aliases, h) {
     having_measure_ok(plan, h.measure, aliases) && match h.threshold {
+        Expr::Parameter(index) => index >= 0,
         Expr::AllocatedBind(binding) => binding.index > 0,
         _ => False,
     }
@@ -2725,6 +2740,7 @@ def expr_derived_cols_ok: Fn(Expr, String, Array(String)) -> Bool = fn(expr, ali
         } else {
             True
         },
+        Expr::Parameter(index) => index >= 0,
         Expr::AllocatedBind(_) => True,
         Expr::Scalar(call) => array::all(
             call.args,
@@ -3267,6 +3283,7 @@ def expr_subqueries: Fn(Expr) -> Array(ScalarSubquery) = fn(expr) {
             let empty: Array(ScalarSubquery) = [];
             empty
         },
+        Expr::Parameter(_) => [],
         Expr::AllocatedBind(_) => [],
     }
 };
@@ -3771,6 +3788,7 @@ def operator_allowed: Fn(Operator, Array(Operator)) -> Bool = fn(op, allowed) {
 def expr_scalars_ok: Fn(Expr, Array(ScalarFunction)) -> Bool = fn(expr, allowed) {
     match expr {
         Expr::Column(_) => True,
+        Expr::Parameter(index) => index >= 0,
         Expr::AllocatedBind(_) => True,
         Expr::Scalar(call) => {
             let self_ok = array::any(
@@ -3912,6 +3930,7 @@ def aggregate_profile_accepts: Fn(AggregateCall, PlanProfile) -> Bool = fn(call,
 def expr_profile_accepts: Fn(Expr, PlanProfile) -> Bool = fn(expr, profile) {
     match expr {
         Expr::Column(_) => operator_allowed(Operator::Column, profile.allowed_operators),
+        Expr::Parameter(_) => operator_allowed(Operator::Bind, profile.allowed_operators),
         Expr::AllocatedBind(_) => operator_allowed(Operator::Bind, profile.allowed_operators),
         Expr::Scalar(call) => operator_allowed(Operator::Scalar, profile.allowed_operators) && array::any(
             profile.allowed_scalars,
@@ -5623,4 +5642,33 @@ pub use self::{
 
 pub use self::{capability_union};
 
-pub use self::{ResultOrder, ResultSelection, public_take, result_bound, select_result};
+pub use self::{ResultOrder, ResultSelection, public_take, result_bound, select_result, scalar_plan};
+
+# 等价的同列相等析取在 SQL 后端紧凑表达为 IN；不增加领域或执行能力。
+pub type EqualitySet = struct {
+    input: Expr,
+    values: Array(Expr)
+};
+pub def equality_set: Fn(Expr) -> Option(EqualitySet) = fn(expr) {
+    match expr {
+        Expr::Scalar(call) => if call.function == ScalarFunction::Eq && array::length(call.args) == 2 {
+            Some({input: call.args[0], values: [call.args[1]]}.ty!(EqualitySet))
+        } else if call.function == ScalarFunction::Or && array::length(call.args) == 2 {
+            match (equality_set(call.args[0]), equality_set(call.args[1])) {
+                (Some(left), Some(right)) => if left.input == right.input {
+                    Some(
+                        {input: left.input, values: array::concat([left.values, right.values])}.ty!(
+                            EqualitySet
+                        )
+                    )
+                } else {
+                    None
+                },
+                _ => None
+            }
+        } else {
+            None
+        },
+        _ => None
+    }
+};

@@ -69,7 +69,7 @@ function types(s, items) {
 function field_types(s, items) {
   for (const info of items) s.fieldTypes.set(info.id, info);
   for (const t of s.pendingTypes) if (!t.inline) merge(s, address('types', t.id), {
-    name: t.name, kind: t.kind, ...(t.unit == null ? {} : {unit: t.unit}), reverse_references: t.reverse_references === true && t.variants.length > 0 && t.variants.every(v => v.payload === null), representation: t.representation === null ? null : typeref(s, t.representation),
+    name: t.name, kind: t.kind, ...(t.unit == null ? {} : {unit: t.unit}), ...(t.calculations == null ? {} : {calculations: t.calculations.allowed}), reverse_references: t.reverse_references === true && t.variants.length > 0 && t.variants.every(v => v.payload === null), representation: t.representation === null ? null : typeref(s, t.representation),
     arguments: t.arguments.map(x => typeref(s, x)), field_types: t.field_types.map(c => column(s, c)),
     variants: t.variants.map(v => v.payload === null ? { ...v } : { ...v, payload: typeref(s, v.payload) }),
   }, t.dependencies.flatMap(x => typerefs(s, x)));
@@ -90,9 +90,11 @@ function domain(s, dataset, b) {
   const definition = { ...b.definition, type: typeref(s, b.definition.type), wire: typeref(s, b.definition.wire) };
   const group = address('dimension_groups', sha256(json(definition))), key = member(dataset, 'bindings', json(['domain', b.id]));
   if (typerefs(s, b.definition.type).includes(typeref(s, b.definition.type))) {
-    for (const v of b.definition.canonical_values) merge(s, `${typeref(s, b.definition.type)}#values/${encode(v.id)}`, { label: v.label, names: s.types.get(b.definition.type)?.variants.find(variant => variant.name === v.id)?.names || [], wires: v.wires }, typerefs(s, b.definition.type));
-    merge(s, typeref(s, b.definition.type), { canonical_order: b.definition.order, half_open: b.definition.half_open, wire: typeref(s, b.definition.wire),
-      reverse_references: s.types.get(b.definition.type)?.reverse_references === true && b.definition.canonical_values.length > 0 }, typerefs(s, b.definition.wire));
+    const type = s.types.get(b.definition.type);
+    for (const v of type?.variants || []) if (v.payload === null) merge(s, `${typeref(s, b.definition.type)}#values/${encode(v.name)}`,
+      { label: v.names?.[0] || v.name, names: v.names || [] }, typerefs(s, b.definition.type));
+    merge(s, typeref(s, b.definition.type), { canonical_order: b.definition.order,
+      reverse_references: type?.reverse_references === true && type.variants.length > 0 });
   }
   merge(s, group, definition, [...typerefs(s, b.definition.type), ...typerefs(s, b.definition.wire)]);
   merge(s, key, { group, input: expression(s, b.input), publish: b.id, nullable: b.nullable, projectable: b.projectable, filters: b.filters }, [group]);
@@ -183,7 +185,6 @@ function ownedGraph(s) {
       const publish = decodeURIComponent(key.slice(key.lastIndexOf('/') + 1));
       const member = b?.value.members?.find(m => m.publish === publish);
       const {name, members, ...definition} = group?.value || {};
-      if (typeof definition.type === "string" && definition.type.startsWith("types/")) delete definition.canonical_values;
       Object.assign(value, definition, member ? Object.fromEntries(Object.entries(member).filter(([k]) => !['local','publish','kind'].includes(k))) : {}, f.value);
       if (b?.value.input) value.input = b.value.input;
       if (b?.value.field) value.field = b.value.field;

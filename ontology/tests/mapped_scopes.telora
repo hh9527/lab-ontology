@@ -1,0 +1,208 @@
+use crate::semantic as s;
+use crate::groups as g;
+use crate::values as v;
+use crate::enum_values as ev;
+use crate::query as qb;
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::sqlite as sqlite;
+use crate::postgres as postgres;
+use crate::typed_query as typed;
+use crate::typed_query_protocol as protocol;
+use std::array as array;
+use std::json as json;
+use std::codec as codec;
+use std::test as test;
+use std::value::{Value};
+
+type Kind = enum {
+    Olt,
+    Onu,
+    Unknown
+};
+@ev::order_by_itag
+type Priority = enum {
+    @ev::itag(1)
+    Zed,
+    @ev::itag(2)
+    Alpha
+};
+@s::dataset("rows", "devices", ["id"])
+type Rows = struct {
+    @g::exact("id")
+    id: String,
+    @g::exact("kind_raw")
+    @v::map_or(
+        Kind.type,
+        "kind",
+        [v::member(Kind::Olt, ["olt", "ne.category.olt"]), v::member(Kind::Onu, ["onu"])],
+        Kind::Unknown
+    )
+    classification: Option(String),
+    @v::map(
+        Priority.type,
+        "priority",
+        [v::member(Priority::Zed, [1]), v::member(Priority::Alpha, [2])]
+    )
+    priority: Int
+};
+@s::dataset("olts", "devices", ["id"])
+type Olts = struct {
+    @g::exact("id")
+    id: String,
+    @g::exact("kind_raw")
+    @v::map_or(
+        Kind.type,
+        "kind",
+        [v::member(Kind::Olt, ["olt", "ne.category.olt"]), v::member(Kind::Onu, ["onu"])],
+        Kind::Unknown
+    )
+    @s::scope_equal(Kind::Olt)
+    classification: Option(String),
+};
+@s::dataset("unknowns", "devices", ["id"])
+type Unknowns = struct {
+    @g::exact("id")
+    id: String,
+    @v::map_or(
+        Kind.type,
+        "kind",
+        [v::member(Kind::Olt, ["olt", "ne.category.olt"]), v::member(Kind::Onu, ["onu"])],
+        Kind::Unknown
+    )
+    @s::scope_equal(Kind::Unknown)
+    classification: Option(String),
+};
+def profile: qb::PlanProfile = {
+    allowed_operators: [
+        qb::Operator::Source,
+        qb::Operator::Column,
+        qb::Operator::Project,
+        qb::Operator::Filter,
+        qb::Operator::Scalar,
+        qb::Operator::Bind,
+        qb::Operator::Order,
+        qb::Operator::Limit
+    ],
+    allowed_scalars: [
+        qb::ScalarFunction::Eq,
+        qb::ScalarFunction::Ne,
+        qb::ScalarFunction::IsNotNull,
+        qb::ScalarFunction::And,
+        qb::ScalarFunction::Or,
+        qb::ScalarFunction::Not,
+        qb::ScalarFunction::BinaryText,
+        qb::ScalarFunction::If
+    ],
+    allowed_aggregates: [],
+    allowed_join_kinds: [],
+    allow_distinct: False
+};
+def payload: edsl::PreparedPayload = s::payload(
+    "mapped-scopes",
+    [Rows.type, Olts.type, Unknowns.type],
+    profile
+);
+def request: Fn(String, String) -> Value = fn(dataset, extra) {
+    json::parse(
+        `{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"\{dataset}"}],"edges":[],"select":[{"node":"a","dimension":"id"},{"node":"a","dimension":"kind"}],\{extra}}`
+    ).unwrap!()
+};
+def query: Fn(String, String) -> qb::QueryAst = fn(dataset, extra) {
+    intent::query_intent_ast_factory(payload)(request(dataset, extra))
+};
+def by_id: String = r#""order_by":[{"column":"a_id","direction":"Asc"}],"take":10"#;
+def catalog: Array(typed::Dataset) = typed::collect(payload, "test").datasets;
+type Envelope = struct {
+    intent_json: String
+};
+def membership: Fn(String, String, String) -> Value = fn(logical, member, op) {
+    let wire = `{"root":"a","nodes":[{"id":"a","dataset":"test::rows"}],"steps":[
+      {"id":"filter","kind":"filter","body":{"kind":"mapped_comparison","value":{"kind":"member","node":"a","member":"kind"},"logical":\{json::stringify(codec::encode(logical))},"member":"\{member}","op":"\{op}"}},
+      {"id":"project","kind":"project","body":{"kind":"record","fields":[{"name":"id","value":{"kind":"member","node":"a","member":"id"}},{"name":"kind","value":{"kind":"member","node":"a","member":"kind"}}]}},
+      {"id":"order","kind":"order_by","body":{"terms":[{"direction":"Asc","value":{"kind":"output","name":"id"}}]}},
+      {"id":"take","kind":"take","body":{"count":10}}
+    ]}`;
+    protocol::check_type(
+        payload,
+        catalog,
+        [],
+        "mapped-membership",
+        codec::encode({intent_json: wire}.ty!(Envelope))
+    )
+};
+def kind_logical: String = array::filter(
+    catalog[0].members,
+    fn(m) {
+        m.id == "kind"
+    }
+)[
+    0
+].logical;
+pub def unrelated_business_type_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        membership("unrelated::Kind", "Olt", "Eq")
+    },
+    "requires a dimension of the same business type"
+);
+pub def missing_member_is_rejected: test::Test = test::should_fail(
+    fn() {
+        membership(kind_logical, "Missing", "Eq")
+    }
+);
+pub def semantic_projection_is_not_lexically_orderable: test::Test = test::should_fail_with(
+    fn() {
+        query("rows", r#""order_by":[{"column":"a_kind","direction":"Asc"}],"take":10"#)
+    },
+    "has no declared business ordering"
+);
+pub def node_order_also_requires_business_order: test::Test = test::should_fail_with(
+    fn() {
+        query("rows", r#""order_by":[{"node":"a","dimension":"kind","direction":"Asc"}],"take":10"#)
+    },
+    "has no declared business ordering"
+);
+pub def raw_order_is_independent: test::Test = test::should_ok(
+    fn() {
+        query(
+            "rows",
+            r#""order_by":[{"node":"a","dimension":"kind_raw","direction":"Asc"}],"take":10"#
+        )
+    }
+);
+pub def runtime_cases: Value = match codec::encode(
+    [
+        sqlite::build_query(query("rows", by_id)),
+        sqlite::build_query(query("olts", by_id)),
+        sqlite::build_query(query("unknowns", by_id)),
+        sqlite::build_query(
+            query(
+                "rows",
+                r#""filters":[{"node":"a","dimension":"kind","op":"Eq","value":"Olt"}],"order_by":[{"column":"a_id","direction":"Asc"}],"take":10"#
+            )
+        ),
+        sqlite::build_query(
+            intent::query_intent_ast_factory(payload)(
+                json::parse(
+                    r#"{"op":"Graph","root":"a","nodes":[{"id":"a","entity":"rows"}],"edges":[],"select":[{"node":"a","dimension":"id"},{"node":"a","dimension":"priority"}],"order_by":[{"column":"a_priority","direction":"Asc"},{"column":"a_id","direction":"Asc"}],"take":10}"#
+                ).unwrap!()
+            )
+        ),
+        postgres::build_query(query("olts", by_id))
+    ]
+) {
+    Value::Array(cases) => Value::Array(
+        array::concat(
+            [
+                cases,
+                [
+                    membership(kind_logical, "Olt", "Eq"),
+                    membership(kind_logical, "Unknown", "Eq"),
+                    membership(kind_logical, "Olt", "Ne"),
+                    membership(kind_logical, "Unknown", "Ne")
+                ]
+            ]
+        )
+    ),
+    _ => fail!("query cases must encode as an array")
+};

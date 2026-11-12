@@ -1,0 +1,44 @@
+data ctx = context! { epoch_millis: Context::Now , time_zone: Context::ClientTz };
+data weeks = time_windows(ctx,{unit:TimeUnit::Week,count:2,mode:WindowMode::Complete});
+data rows = query_remote! {
+    let previous = from(ic::device);
+    let current = from(ic::device);
+    let p = from(ic::device_kpi);
+    let c = from(ic::device_kpi);
+    let projected = pair(previous,current)
+      |> connect(ic::relations::device_kpi_of_device,p,previous)
+      |> connect(ic::relations::device_kpi_of_device,c,current)
+      |> group_by_identity(previous)
+      |> group_by_identity(current)
+      |> filter(p.device_kpi_ts_raw >= weeks[0].start.date_time_utc)
+      |> filter(p.device_kpi_ts_raw < weeks[0].end.date_time_utc)
+      |> filter(c.device_kpi_ts_raw >= weeks[1].start.date_time_utc)
+      |> filter(c.device_kpi_ts_raw < weeks[1].end.date_time_utc)
+      |> project({device:current.device_name,before:p.cpu_usage,after:c.cpu_usage});
+    projected
+      |> order_by(desc(growth_rate(projected.after,projected.before)))
+      |> take(10)
+};
+data compared = query! {
+    let r = from(rows);
+    let projected = r |> project({device:r.device,before:r.before,after:r.after,growth:growth_rate(r.after,r.before)});
+    projected
+      |> order_by(desc(projected.growth))
+      |> take(10)
+};
+data previous_values = query! {let r=from(compared);let projected = r |> project({device:r.device,period:"上上周",cpu:r.before});
+    projected};
+data current_values = query! {let r=from(compared);let projected = r |> project({device:r.device,period:"上周",cpu:r.after});
+    projected};
+data plotted = query! {let a=from(previous_values);let b=from(current_values);let combined = union_all({a,b});
+    combined |> order_by(asc(combined.device),asc(combined.period)) |> take(20)};
+
+report report = tree! { Report(title = "设备 CPU 周对比") [
+    h1 ["设备 CPU 周对比"],
+    p ["按客户端日历时区取最近两个完整周，各周使用全部采样计算设备均值，按增长率排名；基期非正的对象不参与增长率排名。"],
+    GroupedBarChart(data = plotted,spec = {
+    x:project!(device),series:project!(period),value:project!(cpu),title:"最近两个完整周 CPU 均值对比",allow_no_data:True
+}),
+    UseTable(ref = compared)
+]};
+answer tree! { Answer [UseReport(ref = report)]};

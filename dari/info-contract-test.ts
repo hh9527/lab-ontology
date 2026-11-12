@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import {infoContracts} from './info-contract.ts';
+import type {ModelPort} from './src/model.ts';
+import type {Type} from './src/compiler.ts';
+const severity:Type={kind:'nominal',name:'AlarmSeverity',inner:{kind:'scalar',name:'Int'},codec:{variants:['Critical','Major'],parse:v=>v,encode:v=>v,decode:v=>v}};
+const model={types:{'ic::Severity':severity},datasets:{'ic::PublishedAlarm':{kind:'dataset',id:'alarm',symbol:'ic::PublishedAlarm',members:{classification:{id:'severity',symbol:'classification',owner:'alarm',kind:'dimension',type:{kind:'option',inner:severity}}}}},relations:{'ic::connections::Owner':{kind:'relation',id:'alarm_owner',symbol:'ic::connections::Owner',from:'alarm',to:'tenant',fromCardinality:'Many0',toCardinality:'Optional'}}} as unknown as ModelPort;
+const result=infoContracts(model,[{id:'dataset',kind:'Dataset',dataset:'alarm'},{id:'member',kind:'Dimension',dataset:'alarm',dimension:'severity'},{id:'relation',kind:'Relation',relation:'alarm_owner'},{id:'type',kind:'Type',type:'AlarmSeverity'},{id:'value',kind:'Value',type:'AlarmSeverity',variant:'Critical'},{id:'field',kind:'Field',dataset:'alarm',members:[{kind:'dimension',id:'severity'}]},{id:'entity',kind:'Entity',datasets:['alarm']},{id:'missing',kind:'Dataset',dataset:'other'}]) as Record<string,any>;
+assert.equal(result.dataset.dataset,'ic::PublishedAlarm');
+assert.equal(result.member.symbol,'classification');
+assert.equal(result.member.type,'Option(ic::Severity)');
+assert.deepEqual(result.member.variants,['ic::Severity::Critical','ic::Severity::Major']);
+assert.equal(result.relation.symbol,'ic::connections::Owner');
+assert.equal(result.type.type,'ic::Severity');
+assert.equal(result.value.symbol,'ic::Severity::Critical');
+assert.equal(result.field.members[0].symbol,'classification');
+assert.equal(result.entity.datasets[0].symbol,'ic::PublishedAlarm');
+assert.deepEqual(result.missing,{available:false});
+console.log('info contracts: exact published identities, optional enum types, field mappings and unavailable points passed');

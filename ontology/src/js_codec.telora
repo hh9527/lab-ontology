@@ -1,0 +1,279 @@
+use crate::shared_types as shared;
+# 模型属性生成运行时 JS codec；源码由模型构建产生。
+use std::prelude as prelude;
+use std::type_property as property;
+use std::codec as codec;
+use std::json as json;
+use std::type_desc as td;
+use std::array as array;
+use std::pipeline as pipeline;
+use std::value::{Value};
+use crate::intent as intent;
+use crate::knowledge as knowledge;
+use crate::enum_values as ev;
+use crate::ontology as edsl;
+use crate::quantity as quantity;
+
+@prelude::property(PropertyTarget::Type)
+type NumberRange = struct {
+    min: Float,
+    max: Float
+};
+def number_range: Fn(Float, Float) -> Fn(Type, Option(NumberRange)) -> NumberRange = fn(min, max) {
+    if min > max {
+        fail!("invalid codec number range", min, max)
+    } else {
+        ()
+    };
+    fn(ctx, previous) {
+        {min, max}
+    }
+};
+def ranges: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
+    let range = match property::get_type_prop(ty, NumberRange.type) {
+        Some(range) => do {
+            if storage != intent::ResultType::Float && storage != intent::ResultType::Int {
+                fail!("number_range requires numeric storage", ty)
+            } else {
+                ()
+            };
+            `if (value < \{json::stringify(codec::encode(range.min))} || value > \{json::stringify(codec::encode(range.max))}) throw new TypeError('value outside model range');`
+        },
+        None => "",
+    };
+    let body = knowledge::resolved(ty);
+    let inherited = if td::kind(body) == td::TypeDescKind::Newtype {
+        ranges(td::children(body)[0], storage)
+    } else {
+        ""
+    };
+    `\{inherited}\{range}`
+};
+type EnumCase = struct {
+    name: String,
+    wires: Array(Value)
+};
+def leaf: Fn(Type) -> Type = fn(ty) {
+    let body = knowledge::resolved(ty);
+    if td::kind(body) == td::TypeDescKind::Newtype {
+        leaf(td::children(body)[0])
+    } else {
+        ty
+    }
+};
+def enum_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
+    let variants = td::variants(knowledge::resolved(ty));
+    if !array::all(
+        variants,
+        fn(v) {
+            v.payload == None
+        }
+    ) {
+        fail!("business enum requires unit variants", ty)
+    } else {
+        ()
+    };
+    if storage != intent::ResultType::String && storage != intent::ResultType::Int {
+        fail!("enum codec requires String or Int storage", ty)
+    } else {
+        ()
+    };
+    let tags = ev::integer_tags(ty);
+    let cases = array::map(
+        variants,
+        fn(v) {
+            let wire = if storage == intent::ResultType::String {
+                codec::encode(v.name)
+            } else {
+                match array::find(
+                    tags,
+                    fn(t) {
+                        t.0 == v.name
+                    }
+                ) {
+                    Some(tag) => codec::encode(tag.1),
+                    None => fail!(
+                        "integer enum codec requires exactly one itag per variant",
+                        ty,
+                        v.name
+                    )
+                }
+            };
+            {name: v.name, wires: [wire]}.ty!(EnumCase)
+        }
+    );
+    let table = json::stringify(codec::encode(cases));
+    let order = json::stringify(codec::encode(ev::business_order(ty)));
+    let integer_tags = json::stringify(codec::encode(tags));
+    let shape = if storage == intent::ResultType::Int {
+        "Number.isSafeInteger(value)"
+    } else {
+        "typeof value === 'string'"
+    };
+    `(() => {
+        const cases = \{table};
+        const byName = new Map(cases.map(c => [c.name, c.wires[0]]));
+        const byWire = new Map(cases.map(c => [c.wires[0], c.name]));
+        const byTag = new Map(\{integer_tags}.map(([name,tag]) => [tag,name]));
+        const parse = value => {
+            if (typeof value === 'string' && byName.has(value)) return Object.freeze({tag:value});
+            if (Number.isSafeInteger(value) && byTag.has(value)) return Object.freeze({tag:byTag.get(value)});
+            if (value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && byName.has(value.tag)) return Object.freeze({tag:value.tag});
+            throw new TypeError('expected closed enum variant');
+        };
+        return Object.freeze({variants:Object.freeze(cases.map(c=>c.name)), order:Object.freeze(\{order}), parse,
+            encode: value => byName.get(parse(value).tag),
+            decode: value => { if (!(\{shape}) || !byWire.has(value)) throw new TypeError('unknown closed enum value'); return Object.freeze({tag:byWire.get(value)}); }
+        });
+    })()`
+};
+def optional_value: Fn(Type) -> Option(Type) = fn(ty) {
+    let body = knowledge::resolved(ty);
+    let variants = if td::kind(body) == td::TypeDescKind::Enum {
+        td::variants(body)
+    } else {
+        []
+    };
+    if array::length(variants) == 2 && array::any(
+        variants,
+        fn(v) {
+            v.name == "None" && v.payload == None
+        }
+    ) {
+        match array::find(
+            variants,
+            fn(v) {
+                v.name == "Some"
+            }
+        ) {
+            Some(v) => v.payload,
+            None => None
+        }
+    } else {
+        None
+    }
+};
+def optional_source: Fn(String) -> String = fn(inner) {
+    `(() => { const inner = \{inner}; return Object.freeze({...inner, parse: value => value === null ? null : inner.parse(value), encode: value => value === null ? null : inner.encode(value), decode: value => value === null ? null : inner.decode(value)}); })()`
+};
+def source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
+    match optional_value(ty) {
+        Some(inner) => optional_source(source(inner, storage)),
+        None => required_source(ty, storage)
+    }
+};
+def required_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
+    let value = leaf(ty);
+    if value != Bool.type && td::kind(knowledge::resolved(value)) == td::TypeDescKind::Enum {
+        enum_source(value, storage)
+    } else {
+        scalar_source(ty, storage)
+    }
+};
+def canonical_source: Fn(Type) -> String = fn(ty) {
+    match optional_value(ty) {
+        Some(inner) => optional_source(canonical_source(inner)),
+        None => required_canonical_source(ty)
+    }
+};
+def required_canonical_source: Fn(Type) -> String = fn(ty) {
+    let value = leaf(ty);
+    if value != Bool.type && td::kind(knowledge::resolved(value)) == td::TypeDescKind::Enum {
+        enum_source(value, intent::ResultType::String)
+    } else {
+        scalar_source(String.type, intent::ResultType::String)
+    }
+};
+# 基础类型 codec 由 DARI 宿主提供；自定义类型只增加自己的约束。
+def scalar_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
+    let key = match shared::semantic(ty) {
+        Some("TimeZone") => if storage == intent::ResultType::String {"\"TimeZone\""} else {fail!("TimeZone requires String storage")},
+        _ => json::stringify(codec::encode(storage)),
+    };
+    let range = ranges(ty, storage);
+    let operations = quantity::calculation_policy(ty);
+    let calculation_metadata = match operations {
+        Some(allowed) => `operations: Object.freeze(\{json::stringify(codec::encode(allowed))}),`,
+        None => "",
+    };
+    let metadata = calculation_metadata;
+    if range == "" && metadata == "" {
+        `primary[\{key}]`
+    } else {
+        `(() => { const base = primary[\{key}]; const parse = value => { value = base.parse(value); \{range} return value; }; return Object.freeze({\{metadata}parse, encode: value => base.encode(parse(value)), decode: value => parse(base.decode(value))}); })()`
+    }
+};
+type Source = struct {
+    storage: intent::ResultType,
+    code: String
+};
+def sources: Fn(Type, intent::ResultType) -> Array(Source) = fn(ty, storage) {
+    let base = {storage, code: source(ty, storage)}.ty!(Source);
+    let value = leaf(ty);
+    let body = knowledge::resolved(value);
+    if value != Bool.type && td::kind(body) == td::TypeDescKind::Enum && storage != intent::ResultType::Int {
+        let tags = ev::integer_tags(value);
+        if tags != [] && array::length(tags) == array::length(td::variants(body)) {
+            [
+                base,
+                {storage: intent::ResultType::Int, code: source(ty, intent::ResultType::Int)}.ty!(
+                    Source
+                )
+            ]
+        } else {
+            [base]
+        }
+    } else {
+        [base]
+    }
+};
+def mapping_source: Fn(edsl::DimensionEntry) -> String = fn(entry) {
+    let cases = array::map(
+        entry.canonical_values,
+        fn(value) {
+            {
+                name: value.id,
+                wires: array::map(
+                    value.wires,
+                    fn(wire) {
+                        match wire {
+                            edsl::FilterInput::Text(value) => codec::encode(value),
+                            edsl::FilterInput::Int(value) => codec::encode(value),
+                            _ => fail!("field mapping requires String or Int source", entry.id)
+                        }
+                    }
+                )
+            }.ty!(EnumCase)
+        }
+    );
+    let table = json::stringify(codec::encode(cases));
+    let fallback = json::stringify(codec::encode(entry.fallback));
+    `(() => { const cases = \{table}, fallback = \{fallback}; const byWire = new Map(cases.flatMap(c => c.wires.map(w => [w,c.name]))); const sample = cases[0].wires[0]; return Object.freeze({cases:Object.freeze(cases.map(c=>Object.freeze({name:c.name,wires:Object.freeze(c.wires)}))), fallback, map: value => { if (value === null) return null; if (typeof value !== typeof sample || (typeof sample === 'number' && !Number.isSafeInteger(value))) throw new TypeError('invalid field mapping source'); if (byWire.has(value)) return Object.freeze({tag:byWire.get(value)}); if (fallback !== null) return Object.freeze({tag:fallback}); throw new TypeError('unmapped strict field value'); }}); })()`
+};
+pub use self::{
+    NumberRange,
+    number_range,
+    source,
+    canonical_source,
+    optional_value,
+    mapping_source,
+    Source,
+    sources
+};
+
+# 展现和共享语义分别发布，不属于 parse/encode/decode 的实现。
+type DisplayPresentation = struct {multiplier:Float,suffix:String,precision:Int};
+def presentation_source: Fn(Type) -> String = fn(ty) {
+    let digits=quantity::display_digits(ty);
+    let policy:Option(DisplayPresentation)=match quantity::display_policy(ty) {
+        Some(scale)=>Some({multiplier:scale.multiplier,suffix:scale.suffix,precision:match digits {Some(value)=>value,None=>2}}),
+        None=>match digits {Some(value)=>Some({multiplier:1.0,suffix:"",precision:value}),None=>None},
+    };
+    json::stringify(codec::encode(policy))
+};
+type SemanticIdentity = struct {identity:Option(String),semantic:Option(String)};
+def semantic_source: Fn(Type) -> String = fn(ty) {
+    let identity: SemanticIdentity = {identity:shared::direct(ty),semantic:shared::semantic(ty)};
+    json::stringify(codec::encode(identity))
+};
+pub use self::{presentation_source,semantic_source};

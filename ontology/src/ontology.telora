@@ -829,6 +829,7 @@ type MeasureEntry = struct {
 };
 
 type DimensionEntry = struct {
+    fallback: Option(String),
     utc_bucket: Option(UtcBucketDimensionSpec),
     value_type: Option(Type),
     ty: String,
@@ -1503,16 +1504,25 @@ def dimension_output_with_context: Fn(
     if array::length(entry.canonical_values) == 0 {
         physical
     } else {
-        let unknown = if entry.half_open {
-            physical
-        } else {
-            qb::bind(physical.0, qb::Val::None)
+        let unknown = match entry.fallback {
+            Some(name) => do {
+                let fallback = qb::bind(physical.0, qb::Val::String(name));
+                let empty = qb::bind(fallback.0, qb::Val::None);
+                (empty.0, qb::scalar_if(qb::is_not_null(physical.1), fallback.1, empty.1))
+            },
+            None => if entry.half_open {
+                physical
+            } else {
+                let invalid = qb::bind(physical.0, qb::Val::String(`!unmapped:\{entry.id}`));
+                let empty = qb::bind(invalid.0, qb::Val::None);
+                (empty.0, qb::scalar_if(qb::is_not_null(physical.1), invalid.1, empty.1))
+            }
         };
         array::fold(
             entry.canonical_values,
             unknown,
             fn(state, value) {
-                let compared = canonical_compare_with_context(
+                let compared = canonical_known_compare_with_context(
                     state.0,
                     entry,
                     physical.1,
@@ -1962,48 +1972,104 @@ def canonical_compare_with_context: Fn(
     FilterOp,
     FilterInput
 ) -> (qb::BuildCtx, qb::Expr) = fn(ctx, entry, base, op, input) {
-    match input {
-        FilterInput::Unknown(raw) => do {
-            if !entry.half_open || known_wire(entry, raw) {
-                fail!("Unknown requires an unrecognized wire in a half-open domain", entry.id, raw)
-            } else if op != FilterOp::Eq && op != FilterOp::Ne {
-                fail!("half-open domain supports only Eq or Ne", entry.id, op)
-            } else {
-                let bound = qb::bind(ctx, qb::Val::String(raw));
-                (
-                    bound.0,
-                    qb::scalar(
-                        if op == FilterOp::Eq {
-                            qb::ScalarFunction::Eq
-                        } else {
-                            qb::ScalarFunction::Ne
-                        },
-                        [base, bound.1]
+    let is_fallback = match (entry.fallback, input) {
+        (Some(name), FilterInput::Text(value)) => name == value,
+        _ => False
+    };
+    if is_fallback {
+        if op != FilterOp::Eq && op != FilterOp::Ne {
+            fail!("canonical dimension supports only Eq or Ne", entry.id, op)
+        } else {
+            ()
+        };
+        let known = canonical_known_with_context(ctx, entry, base);
+        let unknown = qb::scalar(
+            qb::ScalarFunction::And,
+            [qb::is_not_null(base), qb::scalar(qb::ScalarFunction::Not, [known.1])]
+        );
+        let explicit = array::any(
+            entry.canonical_values,
+            fn(value) {
+                match entry.fallback {
+                    Some(name) => value.id == name,
+                    None => False
+                }
+            }
+        );
+        let equal = if explicit {
+            let mapped = canonical_known_compare_with_context(
+                known.0,
+                entry,
+                base,
+                FilterOp::Eq,
+                input
+            );
+            (mapped.0, qb::scalar(qb::ScalarFunction::Or, [unknown, mapped.1]))
+        } else {
+            (known.0, unknown)
+        };
+        if op == FilterOp::Eq {
+            equal
+        } else {
+            (
+                equal.0,
+                qb::scalar(
+                    qb::ScalarFunction::And,
+                    [qb::is_not_null(base), qb::scalar(qb::ScalarFunction::Not, [equal.1])]
+                )
+            )
+        }
+    } else {
+        match input {
+            FilterInput::Unknown(raw) => do {
+                if !entry.half_open || known_wire(entry, raw) {
+                    fail!(
+                        "Unknown requires an unrecognized wire in a half-open domain",
+                        entry.id,
+                        raw
                     )
-                )
-            }
-        },
-        FilterInput::Unknowns => do {
-            if !entry.half_open {
-                fail!("Unknowns requires a half-open domain", entry.id)
-            } else if op != FilterOp::Eq && op != FilterOp::Ne {
-                fail!("half-open domain supports only Eq or Ne", entry.id, op)
-            } else {
-                let known = canonical_known_with_context(ctx, entry, base);
-                (
-                    known.0,
-                    if op == FilterOp::Ne {
-                        known.1
-                    } else {
+                } else if op != FilterOp::Eq && op != FilterOp::Ne {
+                    fail!("half-open domain supports only Eq or Ne", entry.id, op)
+                } else {
+                    let bound = qb::bind(ctx, qb::Val::String(raw));
+                    (
+                        bound.0,
                         qb::scalar(
-                            qb::ScalarFunction::And,
-                            [qb::is_not_null(base), qb::scalar(qb::ScalarFunction::Not, [known.1])]
+                            if op == FilterOp::Eq {
+                                qb::ScalarFunction::Eq
+                            } else {
+                                qb::ScalarFunction::Ne
+                            },
+                            [base, bound.1]
                         )
-                    }
-                )
-            }
-        },
-        _ => canonical_known_compare_with_context(ctx, entry, base, op, input),
+                    )
+                }
+            },
+            FilterInput::Unknowns => do {
+                if !entry.half_open {
+                    fail!("Unknowns requires a half-open domain", entry.id)
+                } else if op != FilterOp::Eq && op != FilterOp::Ne {
+                    fail!("half-open domain supports only Eq or Ne", entry.id, op)
+                } else {
+                    let known = canonical_known_with_context(ctx, entry, base);
+                    (
+                        known.0,
+                        if op == FilterOp::Ne {
+                            known.1
+                        } else {
+                            qb::scalar(
+                                qb::ScalarFunction::And,
+                                [
+                                    qb::is_not_null(base),
+                                    qb::scalar(qb::ScalarFunction::Not, [known.1])
+                                ]
+                            )
+                        }
+                    )
+                }
+            },
+            _ => canonical_known_compare_with_context(ctx, entry, base, op, input),
+        }
     }
 };
 
@@ -2126,7 +2192,7 @@ def canonical_known_compare_with_context: Fn(
             Some(expr) => expr,
             None => fail!("canonical value has no physical wires", entry.id, id),
         };
-        if op == FilterOp::Eq || entry.half_open {
+        if op == FilterOp::Eq || entry.half_open || entry.fallback != None {
             (wires.0, compared)
         } else {
             let known = array::fold(
@@ -2417,6 +2483,7 @@ def instantiate_scope: Fn(qb::Expr, String, String, Int) -> qb::Expr = fn(
     offset
 ) {
     match expr {
+        qb::Expr::Parameter(_) => expr,
         qb::Expr::Column(column) => qb::Expr::Column(
             if column.source == previous {
                 column <~ {source: fresh}
@@ -2913,6 +2980,7 @@ def graph_any_of: Fn(
 
 def retarget_inner_expr: Fn(qb::Expr, String, String) -> qb::Expr = fn(expr, previous, fresh) {
     match expr {
+        qb::Expr::Parameter(_) => expr,
         qb::Expr::Column(column) => qb::Expr::Column(
             if column.source == previous {
                 {...column, source: fresh}
@@ -3394,13 +3462,22 @@ def graph_aggregate_op: Fn(FilterOp) -> qb::HavingOp = fn(op) {
     }
 };
 
+def graph_having_kind_ok: Fn(OutputType, FilterInputKind) -> Bool = fn(output, kind) {
+    match (output, kind) {
+        (OutputType::Integer, FilterInputKind::Int) => True,
+        (OutputType::Number, FilterInputKind::Number) => True,
+        (OutputType::Number, FilterInputKind::Int) => True,
+        (OutputType::Text, FilterInputKind::Text) => True,
+        (OutputType::Boolean, FilterInputKind::Bool) => True,
+        _ => False,
+    }
+};
 def graph_having_input_ok: Fn(OutputType, FilterInput) -> Bool = fn(output, input) {
-    match (output, input) {
-        (OutputType::Integer, FilterInput::Int(_)) => True,
-        (OutputType::Number, FilterInput::Number(_)) => True,
-        (OutputType::Number, FilterInput::Int(_)) => True,
-        (OutputType::Text, FilterInput::Text(_)) => True,
-        (OutputType::Boolean, FilterInput::Bool(_)) => True,
+    match input {
+        FilterInput::Int(_) => graph_having_kind_ok(output, FilterInputKind::Int),
+        FilterInput::Number(_) => graph_having_kind_ok(output, FilterInputKind::Number),
+        FilterInput::Text(_) => graph_having_kind_ok(output, FilterInputKind::Text),
+        FilterInput::Bool(_) => graph_having_kind_ok(output, FilterInputKind::Bool),
         _ => False,
     }
 };
@@ -4620,7 +4697,7 @@ def graph_top_per: Fn(
                     kind == FilterInputKind::Ipv4
                 }
             ) || rank.output_type == OutputType::Boolean || (
-                array::length(rank.canonical_values) > 0 && array::length(rank.canonical_order) == 0
+                rank.canonical_values != [] && rank.canonical_order == []
             ) {
                 fail!(
                     "graph top-per rank has no declared business ordering; choose an ordered dimension or declare canonical_order",
@@ -4978,6 +5055,20 @@ def graph_ordered_edges: Fn(PreparedPayload, String, Array(GraphEdge)) -> Array(
     }
 };
 
+def graph_root_measure_grain_ok: Fn(String, Array(String), Array(GraphSelect)) -> Bool = fn(
+    root,
+    identity,
+    select
+) {
+    identity == [root] && array::all(
+        select,
+        fn(item) {
+            item.node == root
+        }
+    )
+};
+pub use self::{graph_root_measure_grain_ok};
+
 # Each edge adds exactly one new instance. This makes a rooted graph explicit
 # without choosing a shortest path or silently multiplying a join already used.
 def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCtx, qb::Plan) = fn(
@@ -5117,14 +5208,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
     } else if let Some(spec) = array::find(
         request.measure_having,
         fn(spec) {
-            !(
-                request.group_by_identity == [request.root] && array::all(
-                    request.select,
-                    fn(item) {
-                        item.node == request.root
-                    }
-                )
-            ) && !graph_contextual_measure_grain(payload, request, spec.node)
+            !graph_root_measure_grain_ok(request.root, request.group_by_identity, request.select) && !graph_contextual_measure_grain(
+                payload,
+                request,
+                spec.node
+            )
         }
     ) {
         fail!(
@@ -5649,16 +5737,14 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                                     item.dimension
                                 ),
                             };
-                            if (
-                                array::length(dimension.canonical_values) > 0 && array::length(
-                                    dimension.canonical_order
-                                ) == 0
-                            ) || array::any(
+                            if array::any(
                                 dimension.input_kinds,
                                 fn(kind) {
                                     kind == FilterInputKind::Ipv4
                                 }
-                            ) || dimension.output_type == OutputType::Boolean {
+                            ) || dimension.output_type == OutputType::Boolean || (
+                                dimension.canonical_values != [] && dimension.canonical_order == []
+                            ) {
                                 fail!(
                                     "graph order dimension has no declared business ordering; use a plain ordered dimension or extend the Model with an explicit value order",
                                     item.node,
@@ -5676,24 +5762,21 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                                 ) {
                                     Some(qb::SelectItem::NamedExpr(named)) => {
                                         let ranked = if array::length(dimension.canonical_order) > 0 {
-                                            let instance = graph_instance(built.1, item.node);
-                                            let field = payload.entities[instance.entity].fields[
-                                                dimension.field
-                                            ];
                                             let unknown = qb::bind(state.0, qb::Val::None);
                                             array::fold(
                                                 array::enumerate(dimension.canonical_order),
                                                 (unknown.0, unknown.1),
                                                 fn(rank, pair) {
-                                                    let compared = canonical_compare_with_context(
+                                                    let value = qb::bind(
                                                         rank.0,
-                                                        dimension,
-                                                        prepared_column(
-                                                            instance.source,
-                                                            field.column
-                                                        ),
-                                                        FilterOp::Eq,
-                                                        FilterInput::Text(pair.1)
+                                                        qb::Val::String(pair.1)
+                                                    );
+                                                    let compared = (
+                                                        value.0,
+                                                        qb::scalar(
+                                                            qb::ScalarFunction::Eq,
+                                                            [named.expr, value.1]
+                                                        )
                                                     );
                                                     let ordinal = qb::bind(
                                                         compared.0,
@@ -6097,28 +6180,9 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                             item.dimension
                         ),
                     };
-                    if array::length(dimension.canonical_values) > 0 && !dimension.half_open {
-                        let known = graph_any_of(
-                            state.0,
-                            payload,
-                            built.1,
-                            [
-                                {
-                                    node: item.node,
-                                    dimension: item.dimension,
-                                    values: array::map(
-                                        dimension.canonical_values,
-                                        fn(value) {
-                                            FilterInput::Text(value.id)
-                                        }
-                                    )
-                                }
-                            ]
-                        );
-                        (known.0, array::concat([state.1, known.1]))
-                    } else if !dimension.half_open && request.count == Some(request.root) && array::length(
-                        request.group_by_identity
-                    ) == 0 {
+                    if dimension.canonical_values == [] && !dimension.half_open && request.count == Some(
+                        request.root
+                    ) && array::length(request.group_by_identity) == 0 {
                         let instance = graph_instance(built.1, item.node);
                         let field = payload.entities[instance.entity].fields[dimension.field];
                         (
@@ -6382,6 +6446,7 @@ pub use self::{
     graph_node,
     lower_graph,
     dimension_expr,
+    filter_value_with_context,
     dimension_output_type,
     measure_output_type,
     time_logical_type,
@@ -6521,18 +6586,27 @@ def prepare_source_scopes: Fn(PreparedPayload) -> PreparedPayload = fn(payload) 
                     entity.scope,
                     (qb::build_context(), [].ty!(Array(FilterResolution))),
                     fn(state, predicate) {
-                        let dimension = match array::find(
+                        let named = array::find(
                             payload.dimensions,
                             fn(d) {
-                                d.entity == entity.index && d.field == predicate.index
+                                d.entity == entity.index && d.field == predicate.index && d.id == predicate.field
                             }
-                        ) {
+                        );
+                        let dimension = match named {
                             Some(value) => value,
-                            None => fail!(
-                                "entity scope requires a declared dimension",
-                                entity.id,
-                                predicate.field
-                            )
+                            None => match array::find(
+                                payload.dimensions,
+                                fn(d) {
+                                    d.entity == entity.index && d.field == predicate.index
+                                }
+                            ) {
+                                Some(value) => value,
+                                None => fail!(
+                                    "entity scope requires a declared dimension",
+                                    entity.id,
+                                    predicate.field
+                                )
+                            }
                         };
                         let resolved = resolve_scope_on_dimension(
                             state.0,
@@ -6580,3 +6654,7 @@ def prepare_source_scopes: Fn(PreparedPayload) -> PreparedPayload = fn(payload) 
     }
 };
 pub use self::{prepare_source_scopes};
+
+pub use self::{graph_having_kind_ok, graph_aggregate_op, dimension_output_with_context};
+
+pub use self::{open_condition_with_context};

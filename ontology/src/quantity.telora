@@ -1,10 +1,72 @@
+use crate::shared_types as shared;
 # RFC 0002 的单位计算实验；运算签名列举当前支持的可计算关系。
 # 使用 Float 表示物理量，避免整数除法改变速率结果。
 # 开放数量类型可共享，但不参与由领域词汇发起的反向导航。
-# Percent 使用 0..100 尺度；KiB/MiB/GiB 是二进制容量单位，不代表来源未确认的 KB/MB/GB。
+# 百分比尺度属于字段映射；KiB/MiB/GiB 是二进制容量单位，不代表来源未确认的 KB/MB/GB。
 use std::prelude as prelude;
 use std::type_desc as td;
 use std::type_property as property;
+use std::array as array;
+
+type Calculation = enum {
+    Compare, Mean, Min, Max, Round, Difference, Ratio, GrowthRate,
+    Sum, Add, Subtract, Multiply, Divide, Negate,
+};
+@prelude::property(PropertyTarget::Type)
+type Calculations = struct { allowed: Array(Calculation) };
+def calculations: Fn(Array(Calculation)) -> Fn(Type, Option(Calculations)) -> Calculations = fn(allowed) {
+    fn(ctx, previous) {
+        if !numeric_storage(ctx) {fail!("calculations requires numeric storage", ctx)} else { () };
+        if previous != None {fail!("calculations must be declared once", ctx)} else { () };
+        if array::any(allowed, fn(op) {array::length(array::filter(allowed, fn(other) {other == op})) != 1}) {
+            fail!("duplicate calculation capability", ctx)
+        } else { () };
+        {allowed}
+    }
+};
+@prelude::property(PropertyTarget::Type)
+type DisplayScale = struct { multiplier: Float, suffix: String };
+@prelude::property(PropertyTarget::Type)
+type DisplayPrecision = struct { digits: Int };
+def display_precision: Fn(Int) -> Fn(Type, Option(DisplayPrecision)) -> DisplayPrecision = fn(digits) {
+    fn(ctx, previous) {
+        if !numeric_storage(ctx) || digits < 0 || digits > 12 || previous != None {fail!("display_precision requires numeric storage, digits 0..12 and one declaration",ctx)} else { () };
+        {digits}
+    }
+};
+def display_digits: Fn(Type) -> Option(Int) = fn(ty) {
+    match property::get_type_prop(ty,DisplayPrecision.type) {
+        Some(value)=>Some(value.digits),
+        None=>do {
+            let body=if td::kind(ty) == td::TypeDescKind::Ref {match td::resolve(ty){Ok(value)=>value,Err(error)=>fail!(error.message)}} else {ty};
+            if td::kind(body) == td::TypeDescKind::Newtype {display_digits(td::children(body)[0])} else {None}
+        },
+    }
+};
+def display_scale: Fn(Float, String) -> Fn(Type, Option(DisplayScale)) -> DisplayScale = fn(multiplier, suffix) {
+    fn(ctx, previous) {
+        if !numeric_storage(ctx) || multiplier <= 0.0 || previous != None { fail!("display_scale requires numeric storage, positive multiplier and one declaration", ctx) } else { () };
+        {multiplier, suffix}
+    }
+};
+def display_policy: Fn(Type) -> Option(DisplayScale) = fn(ty) {
+    match property::get_type_prop(ty, DisplayScale.type) {
+        Some(policy) => Some(policy),
+        None => do {
+            let body = if td::kind(ty) == td::TypeDescKind::Ref { match td::resolve(ty) {Ok(value) => value, Err(error) => fail!(error.message)} } else {ty};
+            if td::kind(body) == td::TypeDescKind::Newtype { display_policy(td::children(body)[0]) } else { None }
+        },
+    }
+};
+# 比例是不可直接累加的数值：差值/比值/增长率显式返回 Float，不冒充原比例。
+@calculations([Calculation::Compare, Calculation::Mean, Calculation::Min, Calculation::Max, Calculation::Round, Calculation::Difference, Calculation::Ratio, Calculation::GrowthRate])
+@shared::identity("Percent")
+@display_scale(1.0, "%")
+type Percent = struct(Float);
+@calculations([Calculation::Compare, Calculation::Mean, Calculation::Min, Calculation::Max, Calculation::Round, Calculation::Difference, Calculation::Ratio, Calculation::GrowthRate])
+@shared::identity("Ratio")
+@display_scale(100.0, "%")
+type Ratio = struct(Float);
 @prelude::property(PropertyTarget::Type)
 type Unit = struct {
     symbol: String,
@@ -25,10 +87,50 @@ def unit: Fn(String, String, Float) -> Fn(td::TypeDesc, Option(Unit)) -> Unit = 
         }
     }
 };
-@unit("%", "ratio", 0.01)
-type Percent = struct(Float);
-@unit("1", "ratio", 1.0)
-type Fraction = struct(Float);
+@prelude::property(PropertyTarget::Field)
+type FieldUnit = struct {
+    unit: Unit
+};
+# 字段值保留数据库尺度，scale 只描述倍率，不触发隐式转换或授予计算能力。
+def field_unit: Fn(String, String, Float) -> Fn(property::FieldPropertyCtx, Option(FieldUnit)) -> FieldUnit = fn(symbol, quantity, scale) {
+    if symbol == "" || quantity == "" || scale <= 0.0 {
+        fail!("field_unit requires a symbol, quantity and positive scale")
+    } else { () };
+    fn(ctx, previous) {
+        if previous != None { fail!("field unit must be declared once", ctx.name) } else { () };
+        if !numeric_storage(ctx.ty) {
+            fail!("field_unit requires Int or Float, optionally nullable", ctx.name)
+        } else { () };
+        {unit: {symbol, quantity, scale}}
+    }
+};
+def numeric_storage: Fn(Type) -> Bool = fn(ty) {
+    if ty == Float.type || ty == Int.type { True }
+    else if td::kind(ty) == td::TypeDescKind::Ref {
+        match td::resolve(ty) { Ok(value) => numeric_storage(value), Err(_) => False }
+    } else if td::kind(ty) == td::TypeDescKind::Newtype { numeric_storage(td::children(ty)[0]) }
+    else if td::kind(ty) == td::TypeDescKind::Enum {
+        let variants = td::variants(ty);
+        array::length(variants) == 2 && array::any(variants, fn(v) {v.name == "None" && v.payload == None}) && array::any(variants, fn(v) {v.name == "Some" && match v.payload {Some(value) => numeric_storage(value), None => False}})
+    } else { False }
+};
+def calculation_policy: Fn(Type) -> Option(Array(Calculation)) = fn(ty) {
+    let body = if td::kind(ty) == td::TypeDescKind::Ref {
+        match td::resolve(ty) {Ok(value) => value, Err(error) => fail!(error.message)}
+    } else {ty};
+    let inherited = if td::kind(body) == td::TypeDescKind::Newtype {
+        calculation_policy(td::children(body)[0])
+    } else {None};
+    match property::get_type_prop(ty, Calculations.type) {
+        Some(spec) => Some(match inherited {
+            Some(parent) => if array::any(spec.allowed, fn(op) {!array::any(parent, fn(p) {p == op})}) {
+                fail!("newtype calculations cannot exceed inner type capabilities", ty)
+            } else {spec.allowed},
+            None => spec.allowed,
+        }),
+        None => inherited,
+    }
+};
 @unit("MB", "data_size", 1000000.0)
 type Megabytes = struct(Float);
 @unit("W", "power", 1.0)
@@ -65,7 +167,6 @@ type Sample = struct {
     amount: Bytes,
     duration: Seconds
 };
-use std::array as array;
 def mean_rate: Fn(Array(Sample)) -> Option(BytesPerSecond) = fn(samples) {
     let rates = array::fold(
         samples,
@@ -125,8 +226,14 @@ def weighted_rate: Fn(Array(Sample)) -> Option(BytesPerSecond) = fn(samples) {
 pub use self::{
     Unit,
     unit,
+    FieldUnit,
+    field_unit,
+    Calculation,
+    Calculations,
+    calculations,
+    calculation_policy,
     Percent,
-    Fraction,
+    Ratio,
     Megabytes,
     Watts,
     KiB,
@@ -146,3 +253,5 @@ pub use self::{
     mean_rate,
     weighted_rate
 };
+
+pub use self::{DisplayScale, display_scale, display_policy, DisplayPrecision, display_precision, display_digits};

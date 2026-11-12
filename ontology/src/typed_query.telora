@@ -1,0 +1,1045 @@
+# Experimental type/data ABI. Structural Graph lowering and Plan validation are
+# shared with the value-based transform. Runtime thresholds remain symbols.
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use crate::field_type_info as info;
+use crate::groups as groups;
+use crate::model as model;
+use crate::knowledge as knowledge;
+use crate::js_codec as js_codec;
+use std::type_desc as td;
+use std::array as array;
+use std::pipeline as pipeline;
+use std::string as string;
+use std::codec as codec;
+use std::value::{Value};
+use std::dict as dict;
+use std::hash as hash;
+
+type Member = struct {
+    id: String,
+    symbol: String,
+    kind: String,
+    logical: String,
+    storage: intent::ResultType,
+    nullable: Bool,
+};
+type Dataset = struct {
+    id: String,
+    symbol: String,
+    members: Array(Member)
+};
+type Relation = struct {
+    id: String,
+    symbol: String,
+    from: String,
+    to: String,
+    fromCardinality: edsl::Cardinality,
+    toCardinality: edsl::Cardinality
+};
+def relation_symbols: Fn(edsl::PreparedPayload, String) -> Array(Relation) = fn(payload, namespace) {
+    array::map(
+        payload.relations,
+        fn(r) {
+            {
+                id: r.id,
+                symbol: `\{namespace}::relations::\{r.id}`,
+                from: payload.entities[r.from].id,
+                to: payload.entities[r.to].id,
+                fromCardinality: r.cardinality.from,
+                toCardinality: r.cardinality.to
+            }.ty!(Relation)
+        }
+    )
+};
+type Projection = struct {
+    name: String,
+    node: String,
+    kind: String,
+    id: String,
+    not_none: Bool
+};
+type Order = struct {
+    node: String,
+    kind: String,
+    id: String,
+    direction: qb::Ordering
+};
+type Threshold = struct {
+    node: String,
+    measure: String,
+    op: edsl::FilterOp,
+    parameter: Int,
+    input_type: intent::ResultType,
+};
+type RowPredicate = struct {
+    kind: String,
+    node: String,
+    dimension: String,
+    op: edsl::FilterOp,
+    parameter: Int,
+    input_type: intent::ResultType
+};
+type NullPredicate = struct {
+    kind: String,
+    node: String,
+    dimension: String,
+    present: Bool
+};
+type MemberPredicate = struct {
+    kind: String,
+    node: String,
+    dimension: String,
+    member: String,
+    op: edsl::FilterOp
+};
+type BooleanPredicate = struct {
+    kind: String,
+    left: Value,
+    right: Value
+};
+type Request = struct {
+    node: String,
+    nodes: Array(edsl::GraphNode),
+    edges: Array(edsl::GraphEdge),
+    projections: Array(Projection),
+    predicate: Array(Threshold),
+    row_predicates: Array(Value),
+    order_by: Array(Order),
+    take: Option(Int),
+    identity: Array(String),
+};
+type DimensionOrder = struct {
+    node: String,
+    dimension: String,
+    direction: qb::Ordering
+};
+type MeasureOrder = struct {
+    node: String,
+    measure: String,
+    direction: qb::Ordering
+};
+type ResultOrder = struct {
+    column: String,
+    direction: qb::Ordering
+};
+type BaseGraph = struct {
+    op: String,
+    root: String,
+    nodes: Array(edsl::GraphNode),
+    edges: Array(edsl::GraphEdge),
+    select: Array(edsl::GraphSelect),
+    measures: Array(edsl::GraphMeasureSelect),
+    order_by: Array(Value),
+    take: Option(Int),
+    group_by_identity: Array(String),
+};
+type Column = struct {
+    name: String,
+    type: intent::ResultType,
+    nullable: Bool,
+    logical: String,
+};
+type Template = struct {
+    sql: String,
+    bindings: Array(qb::Val),
+    columns: Array(Column),
+    max_rows: Option(Int),
+};
+
+# Prepared SQL fields store physical types; retain the declaration's business type.
+def declared_type: Fn(edsl::EntityEntry, Int) -> Type = fn(entity, index) {
+    let ty = model::fields_of(entity.entity_type)[index].ty;
+    if entity.fields[index].nullable {
+        let variants = td::variants(knowledge::resolved(ty));
+        match array::find(
+            variants,
+            fn(v) {
+                v.name == "Some"
+            }
+        ) {
+            Some(variant) => match variant.payload {
+                Some(value) => value,
+                None => ty,
+            },
+            None => ty,
+        }
+    } else {
+        ty
+    }
+};
+
+# 成员只引用类型；自定义类型先收集去重，再由发布层初始化。
+type TypeRef = struct {
+    logical: String,
+    storage: intent::ResultType,
+    ty: Type
+};
+type Collected = struct {
+    datasets: Array(Dataset),
+    types: Array(TypeRef)
+};
+type MemberRef = struct {
+    owner: Int,
+    member: Member,
+    ty: Type
+};
+def storage_name: Fn(intent::ResultType) -> String = fn(storage) {
+    match storage {
+        intent::ResultType::Int => "Int",
+        intent::ResultType::Float => "Float",
+        intent::ResultType::String => "String",
+        intent::ResultType::Bool => "Bool",
+        intent::ResultType::DateTimeUtc => "DateTimeUtc",
+        intent::ResultType::EpochMillis => "EpochMillis",
+        intent::ResultType::DateTime => "DateTime"
+    }
+};
+def primary: Fn(String) -> Bool = fn(logical) {
+    array::any(
+        ["Int", "Float", "String", "Bool", "DateTimeUtc", "EpochMillis", "DateTime"],
+        fn(name) {
+            name == logical
+        }
+    )
+};
+def type_ref: Fn(Type, intent::ResultType) -> TypeRef = fn(ty, storage) {
+    {logical: info::generate_field_type_info(info::memorizer, ty).1.text, storage, ty}
+};
+def type_key: Fn(TypeRef) -> String = fn(ref) {
+    string::join([ref.logical, "@", storage_name(ref.storage)], "")
+};
+def collect: Fn(edsl::PreparedPayload, String) -> Collected = fn(payload, namespace) {
+    let references = array::concat(
+        [
+            array::map(
+                payload.dimensions,
+                fn(d) {
+                    let declared = match d.value_type {
+                        Some(value) => value,
+                        None => declared_type(payload.entities[d.entity], d.field)
+                    };
+                    let ty = match js_codec::optional_value(declared) {
+                        Some(inner) => inner,
+                        None => declared
+                    };
+                    let storage = intent::dimension_result_type(d);
+                    {
+                        owner: d.entity,
+                        ty,
+                        member: {
+                            id: d.id,
+                            symbol: d.id,
+                            kind: "dimension",
+                            logical: if d.computed || d.utc_bucket != None {
+                                storage_name(storage)
+                            } else {
+                                info::generate_field_type_info(info::memorizer, ty).1.text
+                            },
+                            storage,
+                            nullable: payload.entities[d.entity].fields[d.field].nullable || d.computed || d.utc_bucket != None
+                        }.ty!(Member)
+                    }.ty!(MemberRef)
+                }
+            ),
+            array::map(
+                payload.measures,
+                fn(m) {
+                    let ty = declared_type(payload.entities[m.entity], m.field);
+                    let storage = intent::measure_entry_result_type(payload, m);
+                    {
+                        owner: m.entity,
+                        ty,
+                        member: {
+                            id: m.id,
+                            symbol: m.id,
+                            kind: "measure",
+                            logical: if m.computed != None || m.row_expression != None || m.aggregate == qb::AggregateFunction::Count || (
+                                m.output_type == edsl::OutputType::Number && groups::representation(
+                                    ty
+                                ) != Float.type
+                            ) || (
+                                m.output_type == edsl::OutputType::Integer && groups::representation(
+                                    ty
+                                ) != Int.type
+                            ) {
+                                storage_name(storage)
+                            } else {
+                                info::generate_field_type_info(info::memorizer, ty).1.text
+                            },
+                            storage,
+                            nullable: intent::measure_nullable(payload, m.id)
+                        }.ty!(Member)
+                    }.ty!(MemberRef)
+                }
+            )
+        ]
+    );
+    let grouped = array::fold(
+        references,
+        dict::from_pairs([]).ty!(Dict(Array(Member))),
+        fn(groups, ref) {
+            let owner = payload.entities[ref.owner].id;
+            let before = match dict::get(groups, owner) {
+                Some(members) => members,
+                None => []
+            };
+            dict::merge(groups, dict::from_pairs([(owner, array::push(before, ref.member))]))
+        }
+    );
+    let types = pipeline::run(
+        pipeline::from_array(references) |> pipeline::filter(
+            fn(ref) {
+                !primary(ref.member.logical)
+            }
+        ) |> pipeline::map(
+            fn(ref) {
+                {logical: ref.member.logical, storage: ref.member.storage, ty: ref.ty}.ty!(TypeRef)
+            }
+        ) |> pipeline::distinct_by(type_key) |> pipeline::collect()
+    );
+    {
+        datasets: array::map(
+            payload.entities,
+            fn(entity) {
+                {
+                    id: entity.id,
+                    symbol: string::join([namespace, entity.id], "::"),
+                    members: match dict::get(grouped, entity.id) {
+                        Some(members) => members,
+                        None => []
+                    }
+                }.ty!(Dataset)
+            }
+        ),
+        types
+    }
+};
+
+type PublishedType = struct {
+    name: String,
+    logical: String,
+    storage: intent::ResultType
+};
+# Public names are generated from type declarations on the model side, never
+# decoded from opaque knowledge addresses by the host.
+def symbol_part: Fn(Type, Bool) -> String = fn(ty, full) {
+    let name = match td::name(ty) {
+        Some(name) => if full {
+            string::replace(name, "/", "::")
+        } else {
+            let parts = string::split(name, "::");
+            parts[array::length(parts) - 1]
+        },
+        None => do {
+            let logical = info::generate_field_type_info(info::memorizer, ty).1.text;
+            if qb::is_sql_identifier(logical) {
+                logical
+            } else {
+                string::join(["Anonymous_", hash::sha256(logical)], "")
+            }
+        },
+    };
+    let children = td::children(ty);
+    if children == [] {
+        name
+    } else {
+        string::join(
+            [
+                name,
+                "Of",
+                string::join(
+                    array::map(
+                        children,
+                        fn(child) {
+                            symbol_part(child, full)
+                        }
+                    ),
+                    "::And::"
+                )
+            ],
+            "::"
+        )
+    }
+};
+def type_symbols: Fn(String, Array(TypeRef)) -> Array(PublishedType) = fn(namespace, refs) {
+    let named = pipeline::run(
+        pipeline::from_array(refs) |> pipeline::map(
+            fn(ref) {
+                (symbol_part(ref.ty, True), ref)
+            }
+        ) |> pipeline::distinct_by(
+            fn(item) {
+                item.0
+            }
+        ) |> pipeline::collect()
+    );
+    let canonical = array::map(
+        named,
+        fn(item) {
+            {
+                name: string::join([namespace, item.0], "::"),
+                logical: item.1.logical,
+                storage: item.1.storage
+            }.ty!(PublishedType)
+        }
+    );
+    let short = array::flat_map(
+        named,
+        fn(item) {
+            let name = symbol_part(item.1.ty, False);
+            if item.0 != name && array::length(
+                array::filter(
+                    named,
+                    fn(other) {
+                        symbol_part(other.1.ty, False) == name
+                    }
+                )
+            ) == 1 {
+                [
+                    {
+                        name: string::join([namespace, name], "::"),
+                        logical: item.1.logical,
+                        storage: item.1.storage
+                    }.ty!(PublishedType)
+                ]
+            } else {
+                []
+            }
+        }
+    );
+    array::concat([canonical, short])
+};
+
+def row_predicate: Fn(
+    edsl::PreparedPayload,
+    Array(edsl::GraphNode),
+    Array(Dataset),
+    qb::BuildCtx,
+    Value
+) -> (qb::BuildCtx, qb::Expr) = fn(payload, nodes, catalog, ctx, value) {
+    let kind = match value {
+        Value::Object(fields) => match dict::get(fields, "kind") {
+            Some(Value::String(kind)) => kind,
+            _ => fail!("row predicate requires a kind"),
+        },
+        _ => fail!("row predicate requires an object"),
+    };
+    if kind == "and" || kind == "or" {
+        let expression = codec::decode@[BooleanPredicate](value).unwrap!();
+        let left = row_predicate(payload, nodes, catalog, ctx, expression.left);
+        let right = row_predicate(payload, nodes, catalog, left.0, expression.right);
+        (
+            right.0,
+            qb::scalar(
+                if kind == "and" {
+                    qb::ScalarFunction::And
+                } else {
+                    qb::ScalarFunction::Or
+                },
+                [left.1, right.1]
+            )
+        )
+    } else if kind == "mapped_comparison" {
+        let predicate = codec::decode@[MemberPredicate](value).unwrap!();
+        let node = match array::find(
+            nodes,
+            fn(n) {
+                n.id == predicate.node
+            }
+        ) {
+            Some(n) => n,
+            None => fail!("unknown membership node", predicate.node)
+        };
+        let owner = match array::find(
+            payload.entities,
+            fn(e) {
+                e.id == node.entity
+            }
+        ) {
+            Some(e) => e.index,
+            None => fail!("unknown membership dataset", node.entity)
+        };
+        let dimension = match array::find(
+            payload.dimensions,
+            fn(d) {
+                d.entity == owner && d.id == predicate.dimension
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unknown semantic membership dimension", predicate.dimension)
+        };
+        if !dimension.authorized || !dimension.filterable || dimension.canonical_values == [] || !array::any(
+            dimension.ops,
+            fn(op) {
+                op == predicate.op
+            }
+        ) || (predicate.op != edsl::FilterOp::Eq && predicate.op != edsl::FilterOp::Ne) {
+            fail!(
+                "semantic comparison requires an authorized mapped equality dimension",
+                predicate.dimension
+            )
+        } else {
+            ()
+        };
+        let scoped = payload <~ {
+            entities: array::map(
+                payload.entities,
+                fn(e) {
+                    if e.index == owner {
+                        e <~ {source: e.source <~ {alias: node.id}}
+                    } else {
+                        e
+                    }
+                }
+            )
+        };
+        edsl::filter_value_with_context(
+            ctx,
+            scoped,
+            dimension,
+            predicate.op,
+            edsl::FilterInput::Text(predicate.member)
+        )
+    } else if kind == "null" {
+        let predicate = codec::decode@[NullPredicate](value).unwrap!();
+        let node = match array::find(
+            nodes,
+            fn(n) {
+                n.id == predicate.node
+            }
+        ) {
+            Some(n) => n,
+            None => fail!("unknown filter node", predicate.node)
+        };
+        let dataset = match array::find(
+            catalog,
+            fn(d) {
+                d.id == node.entity
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unpublished filter Dataset", node.entity)
+        };
+        let published = match array::find(
+            dataset.members,
+            fn(m) {
+                m.kind == "dimension" && m.id == predicate.dimension
+            }
+        ) {
+            Some(m) => m,
+            None => fail!("unknown published query dimension", predicate.dimension)
+        };
+        if !published.nullable {
+            fail!("null filter requires an optional dimension member", predicate.dimension)
+        } else {
+            ()
+        };
+        let owner = match array::find(
+            payload.entities,
+            fn(e) {
+                e.id == node.entity
+            }
+        ) {
+            Some(e) => e.index,
+            None => fail!("unknown filter Dataset", node.entity)
+        };
+        let dimension = match array::find(
+            payload.dimensions,
+            fn(d) {
+                d.id == predicate.dimension && d.entity == owner
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unknown query dimension", predicate.dimension)
+        };
+        if !dimension.authorized || !dimension.filterable {
+            fail!("dimension does not support filtering", predicate.dimension)
+        } else {
+            ()
+        };
+        let scoped = payload <~ {
+            entities: array::map(
+                payload.entities,
+                fn(e) {
+                    if e.index == owner {
+                        e <~ {source: e.source <~ {alias: node.id}}
+                    } else {
+                        e
+                    }
+                }
+            )
+        };
+        let output = edsl::dimension_output_with_context(ctx, scoped, dimension);
+        let present = qb::is_not_null(output.1);
+        (
+            output.0,
+            if predicate.present {
+                present
+            } else {
+                qb::scalar(qb::ScalarFunction::Not, [present])
+            }
+        )
+    } else if kind == "comparison" {
+        let predicate = codec::decode@[RowPredicate](value).unwrap!();
+        let node = match array::find(
+            nodes,
+            fn(n) {
+                n.id == predicate.node
+            }
+        ) {
+            Some(n) => n,
+            None => fail!("unknown filter node", predicate.node)
+        };
+        let dataset = match array::find(
+            catalog,
+            fn(d) {
+                d.id == node.entity
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unpublished filter Dataset", node.entity)
+        };
+        let owner = match array::find(
+            payload.entities,
+            fn(e) {
+                e.id == node.entity
+            }
+        ) {
+            Some(e) => e.index,
+            None => fail!("unknown filter Dataset", node.entity)
+        };
+        let available = dataset.members;
+        let published = match array::find(
+            available,
+            fn(m) {
+                m.kind == "dimension" && m.id == predicate.dimension
+            }
+        ) {
+            Some(m) => m,
+            None => fail!("unknown published query dimension", predicate.dimension),
+        };
+        let dimension = match array::find(
+            payload.dimensions,
+            fn(d) {
+                d.id == predicate.dimension && d.entity == owner
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unknown query dimension", predicate.dimension),
+        };
+        if !dimension.authorized || !dimension.filterable || !array::any(
+            dimension.ops,
+            fn(op) {
+                op == predicate.op
+            }
+        ) {
+            fail!(
+                "dimension does not support this filter operation",
+                predicate.dimension,
+                predicate.op
+            )
+        } else {
+            ()
+        };
+        if predicate.parameter < 0 || !(
+            predicate.input_type == published.storage || published.storage == intent::ResultType::Float && predicate.input_type == intent::ResultType::Int
+        ) {
+            fail!(
+                "filter parameter type does not match dimension",
+                predicate.dimension,
+                predicate.input_type
+            )
+        } else {
+            ()
+        };
+        let scoped = payload <~ {
+            entities: array::map(
+                payload.entities,
+                fn(e) {
+                    if e.index == owner {
+                        e <~ {source: e.source <~ {alias: node.id}}
+                    } else {
+                        e
+                    }
+                }
+            )
+        };
+        let output = edsl::dimension_output_with_context(ctx, scoped, dimension);
+        if array::any(
+            [
+                edsl::FilterOp::Contains,
+                edsl::FilterOp::NotContains,
+                edsl::FilterOp::StartsWith,
+                edsl::FilterOp::EndsWith
+            ],
+            fn(op) {
+                op == predicate.op
+            }
+        ) {
+            edsl::open_condition_with_context(
+                output.0,
+                output.1,
+                predicate.op,
+                qb::Expr::Parameter(predicate.parameter)
+            )
+        } else {
+            let op = match predicate.op {
+                edsl::FilterOp::Eq => qb::ScalarFunction::Eq,
+                edsl::FilterOp::Ne => qb::ScalarFunction::Ne,
+                edsl::FilterOp::Gt => qb::ScalarFunction::Gt,
+                edsl::FilterOp::Ge => qb::ScalarFunction::Ge,
+                edsl::FilterOp::Lt => qb::ScalarFunction::Lt,
+                edsl::FilterOp::Le => qb::ScalarFunction::Le,
+                _ => fail!("unsupported symbolic dimension operation", predicate.op),
+            };
+            (output.0, qb::scalar(op, [output.1, qb::Expr::Parameter(predicate.parameter)]))
+        }
+    } else {
+        fail!("unsupported row predicate", kind)
+    }
+};
+
+def check_type: Fn(edsl::PreparedPayload, Array(Dataset), Value) -> Value = fn(
+    payload,
+    catalog,
+    input
+) {
+    let request = codec::decode@[Request](input).unwrap!();
+    let find = fn(node: String, kind: String, id: String) {
+        let source = match array::find(
+            request.nodes,
+            fn(n) {
+                n.id == node
+            }
+        ) {
+            Some(n) => n,
+            None => fail!("unknown member node", node)
+        };
+        let dataset = match array::find(
+            catalog,
+            fn(d) {
+                d.id == source.entity
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unpublished member Dataset", source.entity)
+        };
+        match array::find(
+            dataset.members,
+            fn(m) {
+                m.kind == kind && m.id == id
+            }
+        ) {
+            Some(member) => member,
+            None => fail!("unknown typed query member or role", node, kind, id),
+        }
+    };
+    array::map(
+        request.projections,
+        fn(p) {
+            find(p.node, p.kind, p.id);
+            if !qb::is_sql_identifier(p.name) {
+                fail!("invalid output member name", p.name)
+            } else {
+                ()
+            }
+        }
+    );
+    if array::length(request.projections) == 0 {
+        fail!("typed query requires projections")
+    } else {
+        ()
+    };
+    let measure_ids = array::map(
+        array::filter(
+            request.projections,
+            fn(p) {
+                p.kind == "measure"
+            }
+        ),
+        fn(p) {
+            {node: p.node, measure: p.id}.ty!(edsl::GraphMeasureSelect)
+        }
+    );
+    let measure_ids = array::concat(
+        [
+            measure_ids,
+            array::map(
+                array::filter(
+                    request.order_by,
+                    fn(o) {
+                        o.kind == "measure"
+                    }
+                ),
+                fn(o) {
+                    {node: o.node, measure: o.id}.ty!(edsl::GraphMeasureSelect)
+                }
+            ),
+            array::map(
+                request.predicate,
+                fn(p) {
+                    {node: p.node, measure: p.measure}.ty!(edsl::GraphMeasureSelect)
+                }
+            ),
+        ]
+    );
+    let measure_ids = pipeline::run(
+        pipeline::from_array(measure_ids) |> pipeline::distinct_by(
+            fn(id) {
+                `\{id.node}/\{id.measure}`
+            }
+        ) |> pipeline::collect()
+    );
+    let dimensions = array::map(
+        array::filter(
+            request.projections,
+            fn(p) {
+                p.kind == "dimension"
+            }
+        ),
+        fn(p) {
+            {node: p.node, dimension: p.id}.ty!(edsl::GraphSelect)
+        }
+    );
+    let measures = array::map(
+        measure_ids,
+        fn(id) {
+            find(id.node, "measure", id.measure);
+            id
+        }
+    );
+    let ordering = array::map(
+        request.order_by,
+        fn(o) {
+            find(o.node, o.kind, o.id);
+            if o.kind == "dimension" {
+                codec::encode(
+                    {node: o.node, dimension: o.id, direction: o.direction}.ty!(DimensionOrder)
+                )
+            } else {
+                codec::encode(
+                    {node: o.node, measure: o.id, direction: o.direction}.ty!(MeasureOrder)
+                )
+            }
+        }
+    );
+    # All these values are structural literals carried by the intent type.
+    let graph = codec::encode(
+        {
+            op: "Graph",
+            root: request.node,
+            nodes: request.nodes,
+            edges: request.edges,
+            select: dimensions,
+            measures,
+            order_by: ordering,
+            take: request.take,
+            group_by_identity: request.identity,
+        }.ty!(BaseGraph)
+    );
+    # An unordered selection is legal only when the base model plan proves a
+    # scalar result. Omit the redundant selection so result_bound proves that
+    # property through the shared semantic kernel instead of host heuristics.
+    if request.take == None && request.order_by != [] {
+        fail!("model order_by requires terminal take; order an intermediate table in query!")
+    } else {
+        ()
+    };
+    let graph = if request.order_by == [] || request.take == None {
+        match graph {
+            Value::Object(fields) => Value::Object(
+                dict::from_pairs(
+                    array::filter(
+                        dict::pairs(fields),
+                        fn(pair) {
+                            pair.0 != "take"
+                        }
+                    )
+                )
+            ),
+            _ => fail!("typed query requires an object"),
+        }
+    } else {
+        graph
+    };
+    let ast = if request.take == None {
+        intent::lower_unlimited_intent_ast(payload, graph)
+    } else {
+        intent::query_intent_ast_factory(payload)(graph)
+    };
+    if request.take != None && request.order_by == [] && qb::result_bound(ast) > 1 {
+        fail!("unordered take requires a model result bound of at most one row")
+    } else {
+        ()
+    };
+    let ast = array::fold(
+        request.predicate,
+        ast,
+        fn(ast, predicate) {
+            if !edsl::graph_root_measure_grain_ok(predicate.node, request.identity, dimensions) {
+                fail!(
+                    "graph measure threshold requires complete root identity; use group_by_identity"
+                )
+            } else {
+                ()
+            };
+            find(predicate.node, "measure", predicate.measure);
+            match ast.plan {
+                qb::QueryPlan::Rows(plan) => ast <~ {
+                    plan: qb::QueryPlan::Rows(aggregate_threshold(payload, plan, predicate))
+                },
+                _ => fail!("aggregate filter requires grouped model rows")
+            }
+        }
+    );
+    let ast = array::fold(
+        request.row_predicates,
+        ast,
+        fn(ast, predicate) {
+            let output = row_predicate(payload, request.nodes, catalog, ast.ctx, predicate);
+            match ast.plan {
+                qb::QueryPlan::Rows(plan) => ast <~ {
+                    ctx: output.0,
+                    plan: qb::QueryPlan::Rows(
+                        qb::validate(
+                            plan <~ {
+                                filter: Some(
+                                    match plan.filter {
+                                        Some(previous) => qb::scalar(
+                                            qb::ScalarFunction::And,
+                                            [previous, output.1]
+                                        ),
+                                        None => output.1,
+                                    }
+                                )
+                            },
+                            payload.profile
+                        )
+                    )
+                },
+                _ => fail!("dimension filtering requires a row plan"),
+            }
+        }
+    );
+    let query = sqlite::build_query_not_none(
+        ast,
+        array::map(
+            array::filter(
+                request.projections,
+                fn(p) {
+                    p.not_none
+                }
+            ),
+            fn(p) {
+                `\{p.node}_\{p.id}`
+            }
+        )
+    );
+    let columns = intent::result_columns(payload, graph, ast);
+    let public_columns = array::map(
+        request.projections,
+        fn(p) {
+            let column = match array::find(
+                columns,
+                fn(c) {
+                    c.name == `\{p.node}_\{p.id}`
+                }
+            ) {
+                Some(column) => column,
+                None => fail!("typed projection is absent from validated model result", p.id),
+            };
+            {
+                name: p.name,
+                type: find(p.node, p.kind, p.id).storage,
+                nullable: if p.not_none {
+                    False
+                } else {
+                    column.nullable
+                },
+                logical: find(p.node, p.kind, p.id).logical
+            }.ty!(Column)
+        }
+    );
+    let projection = string::join(
+        array::map(
+            request.projections,
+            fn(p) {
+                `\{p.node}_\{p.id} AS \{p.name}`
+            }
+        ),
+        ", "
+    );
+    codec::encode(
+        {
+            sql: `SELECT \{projection} FROM (\{query.sql}) AS __dari_result`,
+            bindings: query.bindings,
+            columns: public_columns,
+            max_rows: if request.take != None {
+                Some(qb::result_bound(ast))
+            } else {
+                match ast.plan {
+                    qb::QueryPlan::Rows(plan) => if qb::scalar_plan(plan) {
+                        Some(1)
+                    } else {
+                        None
+                    },
+                    _ => None
+                }
+            }
+        }.ty!(Template)
+    )
+};
+pub use self::{
+    Request,
+    row_predicate,
+    Member,
+    Relation,
+    relation_symbols,
+    Dataset,
+    PublishedType,
+    type_symbols,
+    TypeRef,
+    Collected,
+    collect,
+    primary,
+    type_ref,
+    type_key,
+    storage_name,
+    check_type
+};
+
+def aggregate_threshold: Fn(edsl::PreparedPayload, qb::Plan, Threshold) -> qb::Plan = fn(
+    payload,
+    plan,
+    predicate
+) {
+    let kind = match predicate.input_type {
+        intent::ResultType::Int => edsl::FilterInputKind::Int,
+        intent::ResultType::Float => edsl::FilterInputKind::Number,
+        intent::ResultType::String => edsl::FilterInputKind::Text,
+        intent::ResultType::Bool => edsl::FilterInputKind::Bool,
+        _ => fail!("unsupported symbolic aggregate threshold type", predicate.input_type),
+    };
+    if predicate.parameter < 0 || !edsl::graph_having_kind_ok(
+        edsl::measure_output_type(payload, predicate.measure),
+        kind
+    ) {
+        fail!(
+            "symbolic threshold does not match declared measure output",
+            predicate.measure,
+            predicate.input_type
+        )
+    } else {
+        let having = qb::having_bound(
+            edsl::graph_aggregate_op(predicate.op),
+            `\{predicate.node}_\{predicate.measure}`,
+            qb::Expr::Parameter(predicate.parameter)
+        );
+        qb::validate(plan <~ {having: array::push(plan.having, having)}, payload.profile)
+    }
+};
+
+pub use self::{aggregate_threshold};

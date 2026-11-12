@@ -1,0 +1,1182 @@
+# The model owns complete step consumption. The host only serializes IntentType.
+use crate::typed_query as typed;
+use crate::typed_query_pair as pair;
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use std::array as array;
+use std::dict as dict;
+use std::codec as codec;
+use std::json as json;
+use std::hash as hash;
+use std::value::{Value};
+
+type Envelope = struct {
+    intent_json: String
+};
+type Node = struct {
+    id: String,
+    dataset: String
+};
+type Step = struct {
+    id: String,
+    kind: String,
+    body: Value
+};
+type PairRoots = struct {
+    left: String,
+    right: String
+};
+type Intent = struct {
+    root: String,
+    pair: Option(PairRoots),
+    nodes: Array(Node),
+    steps: Array(Step)
+};
+type Member = struct {
+    kind: String,
+    node: String,
+    member: String
+};
+type Output = struct {
+    kind: String,
+    name: String
+};
+type Field = struct {
+    name: String,
+    value: Value
+};
+type Record = struct {
+    kind: String,
+    fields: Array(Field)
+};
+type Binary = struct {
+    kind: String,
+    op: String,
+    left: Value,
+    right: Value
+};
+type Parameter = struct {
+    kind: String,
+    index: Int,
+    input_type: intent::ResultType,
+    nullable: Bool
+};
+type BoundMember = struct {
+    node: String,
+    id: String,
+    symbol: String,
+    kind: String,
+    logical: String,
+    storage: intent::ResultType,
+    nullable: Bool
+};
+type Projection = struct {
+    name: String,
+    node: String,
+    kind: String,
+    id: String,
+    not_none: Bool
+};
+type Order = struct {
+    node: String,
+    kind: String,
+    id: String,
+    direction: qb::Ordering
+};
+type Threshold = struct {
+    node: String,
+    measure: String,
+    op: edsl::FilterOp,
+    parameter: Int,
+    input_type: intent::ResultType
+};
+type RowPredicate = struct {
+    kind: String,
+    node: String,
+    dimension: String,
+    op: edsl::FilterOp,
+    parameter: Int,
+    input_type: intent::ResultType
+};
+type NullPredicate = struct {
+    kind: String,
+    node: String,
+    dimension: String,
+    present: Bool
+};
+type Membership = struct {
+    kind: String,
+    value: Value,
+    logical: String,
+    member: String,
+    op: edsl::FilterOp
+};
+type MemberPredicate = struct {
+    kind: String,
+    node: String,
+    dimension: String,
+    member: String,
+    op: edsl::FilterOp
+};
+type BooleanPredicate = struct {
+    kind: String,
+    left: Value,
+    right: Value
+};
+type Term = struct {
+    direction: qb::Ordering,
+    value: Value
+};
+type Ordering = struct {
+    terms: Array(Term)
+};
+type Group = struct {
+    node: String
+};
+type Take = struct {
+    count: Int
+};
+type Call = struct {
+    kind: String,
+    name: String,
+    args: Array(Value)
+};
+type Connect = struct {
+    relation: String,
+    from: String,
+    to: String
+};
+type State = struct {
+    identity: Array(String),
+    edges: Array(edsl::GraphEdge),
+    projected: Bool,
+    ordered: Bool,
+    take: Option(Int),
+    container: String,
+    projections: Array(Projection),
+    order_by: Array(Order),
+    rank: Option(pair::Rank),
+    predicate: Array(Threshold),
+    row_predicates: Array(Value),
+    consumed: Array(String)
+};
+type Receipt = struct {
+    contractId: String,
+    inputDigest: String,
+    consumedStepIds: Array(String)
+};
+type LoweredRequest = struct {
+    node: String,
+    projections: Array(Projection),
+    nodes: Array(edsl::GraphNode),
+    edges: Array(edsl::GraphEdge),
+    predicate: Array(Threshold),
+    row_predicates: Array(Value),
+    order_by: Array(Order),
+    take: Option(Int),
+    identity: Array(String)
+};
+type PairRequest = struct {
+    request: LoweredRequest,
+    left: String,
+    right: String,
+    rank: Option(pair::Rank)
+};
+
+def wire_kind: Fn(Value) -> String = fn(value) {
+    match value {
+        Value::Object(fields) => match dict::get(fields, "kind") {
+            Some(Value::String(kind)) => kind,
+            _ => fail!("model expression requires a kind"),
+        },
+        _ => fail!("model expression requires an object"),
+    }
+};
+def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, member) {
+    if wire_kind(value) == "mapped_comparison" {
+        let predicate = codec::decode@[Membership](value).unwrap!();
+        let field = member(predicate.value);
+        if field.kind != "dimension" || field.logical != predicate.logical {
+            fail!(
+                "semantic comparison requires a dimension of the same business type",
+                field.id,
+                predicate.logical
+            )
+        } else {
+            ()
+        };
+        if predicate.op != edsl::FilterOp::Eq && predicate.op != edsl::FilterOp::Ne {
+            fail!("semantic member comparison requires Eq or Ne")
+        } else {
+            ()
+        };
+        codec::encode(
+            {
+                kind: "mapped_comparison",
+                node: field.node,
+                dimension: field.id,
+                member: predicate.member,
+                op: predicate.op
+            }.ty!(MemberPredicate)
+        )
+    } else if wire_kind(value) == "call" {
+        let call = codec::decode@[Call](value).unwrap!();
+        if call.name == "is_some" || call.name == "is_none" {
+            if array::length(call.args) != 1 {
+                fail!("null filter requires one optional dimension member")
+            } else {
+                ()
+            };
+            let field = member(call.args[0]);
+            if field.kind != "dimension" || !field.nullable {
+                fail!("null filter requires an optional dimension member", field.id)
+            } else {
+                ()
+            };
+            codec::encode(
+                {
+                    kind: "null",
+                    node: field.node,
+                    dimension: field.id,
+                    present: call.name == "is_some"
+                }.ty!(NullPredicate)
+            )
+        } else {
+            if array::length(call.args) != 2 {
+                fail!("text filter requires a member and a nonnullable String parameter")
+            } else {
+                ()
+            };
+            let field = member(call.args[0]);
+            let parameter = codec::decode@[Parameter](call.args[1]).unwrap!();
+            if field.kind != "dimension" || parameter.nullable || parameter.input_type != intent::ResultType::String {
+                fail!("text filter requires a dimension and a nonnullable String parameter")
+            } else {
+                ()
+            };
+            let op = match call.name {
+                "contains" => edsl::FilterOp::Contains,
+                "not_contains" => edsl::FilterOp::NotContains,
+                "starts_with" => edsl::FilterOp::StartsWith,
+                "ends_with" => edsl::FilterOp::EndsWith,
+                _ => fail!("unsupported row filter function", call.name)
+            };
+            codec::encode(
+                {
+                    kind: "comparison",
+                    node: field.node,
+                    dimension: field.id,
+                    op,
+                    parameter: parameter.index,
+                    input_type: parameter.input_type
+                }.ty!(RowPredicate)
+            )
+        }
+    } else {
+        if wire_kind(value) != "binary" {
+            fail!("compound row filter requires comparisons joined by && or ||")
+        } else {
+            ()
+        };
+        let expr = codec::decode@[Binary](value).unwrap!();
+        if expr.op == "&&" || expr.op == "||" {
+            codec::encode(
+                {
+                    kind: if expr.op == "&&" {
+                        "and"
+                    } else {
+                        "or"
+                    },
+                    left: row_expression(expr.left, member),
+                    right: row_expression(expr.right, member)
+                }.ty!(BooleanPredicate)
+            )
+        } else {
+            let field = member(expr.left);
+            if field.kind != "dimension" {
+                fail!(
+                    "compound model row filters require dimensions; aggregate thresholds use separate filter"
+                )
+            } else {
+                ()
+            };
+            if wire_kind(expr.right) != "parameter" {
+                fail!("dimension comparison requires a parameter on the right")
+            } else {
+                ()
+            };
+            let parameter = codec::decode@[Parameter](expr.right).unwrap!();
+            if parameter.kind != "parameter" || parameter.nullable || parameter.index < 0 {
+                fail!("dimension filter requires a nonnullable typed parameter")
+            } else {
+                ()
+            };
+            let op = match expr.op {
+                "==" => edsl::FilterOp::Eq,
+                "!=" => edsl::FilterOp::Ne,
+                ">" => edsl::FilterOp::Gt,
+                ">=" => edsl::FilterOp::Ge,
+                "<" => edsl::FilterOp::Lt,
+                "<=" => edsl::FilterOp::Le,
+                _ => fail!("unsupported dimension comparison", expr.op),
+            };
+            codec::encode(
+                {
+                    kind: "comparison",
+                    node: field.node,
+                    dimension: field.id,
+                    op,
+                    parameter: parameter.index,
+                    input_type: parameter.input_type
+                }.ty!(RowPredicate)
+            )
+        }
+    }
+};
+
+# UTC conversions and buckets are model-owned derived dimensions. Reuse Graph grouping,
+# authorization and measure aggregation; no raw timestamp is selected as a key.
+type BucketState = struct {
+    payload: edsl::PreparedPayload,
+    catalog: Array(typed::Dataset),
+    steps: Array(Step)
+};
+type BucketFields = struct {
+    payload: edsl::PreparedPayload,
+    catalog: Array(typed::Dataset),
+    fields: Array(Field)
+};
+type UtcBucket = struct {
+    kind: String,
+    value: Value,
+    unit: qb::UtcBucketUnit
+};
+type ZonedUtcBucket = struct {
+    kind: String,
+    value: Value,
+    unit: qb::UtcBucketUnit,
+    timeZone: Value
+};
+type ZoneParameter = struct {
+    kind: String,
+    index: Int,
+    input_type: intent::ResultType,
+    nullable: Bool,
+    logical: String
+};
+type UtcConversion = struct {
+    kind: String,
+    value: Value
+};
+def prepare_time_projections: Fn(
+    edsl::PreparedPayload,
+    Array(typed::Dataset),
+    Intent
+) -> (edsl::PreparedPayload, Array(typed::Dataset), Intent) = fn(payload, catalog, request) {
+    let prepared = array::fold(
+        request.steps,
+        {payload, catalog, steps: []}.ty!(BucketState),
+        fn(state, step) {
+            if step.kind != "project" || wire_kind(step.body) != "record" {
+                state <~ {steps: array::push(state.steps, step)}
+            } else {
+                let record = codec::decode@[Record](step.body).unwrap!();
+                let selected = array::fold(
+                    record.fields,
+                    {payload: state.payload, catalog: state.catalog, fields: []}.ty!(BucketFields),
+                    fn(current, field) {
+                        if wire_kind(field.value) != "utc_bucket" && wire_kind(field.value) != "calendar_bucket" && wire_kind(
+                            field.value
+                        ) != "to_datetime_utc" {
+                            current <~ {fields: array::push(current.fields, field)}
+                        } else {
+                            let zoned = wire_kind(field.value) == "calendar_bucket";
+                            let region = if zoned {
+                                Some(codec::decode@[ZonedUtcBucket](field.value).unwrap!())
+                            } else {
+                                None
+                            };
+                            let zone = match region {
+                                Some(r) => {
+                                    if wire_kind(r.timeZone) != "parameter" {
+                                        fail!("calendar_bucket requires a typed TimeZone parameter")
+                                    } else {
+                                        ()
+                                    };
+                                    let p = codec::decode@[ZoneParameter](r.timeZone).unwrap!();
+                                    if p.index < 0 || p.input_type != intent::ResultType::String || p.nullable || p.logical != "TimeZone" {
+                                        fail!(
+                                            "calendar_bucket requires a nonnullable TimeZone parameter"
+                                        )
+                                    } else {
+                                        ()
+                                    };
+                                    Some(p)
+                                },
+                                None => None
+                            };
+                            let bucket = match region {
+                                Some(r) => Some(
+                                    {kind: "utc_bucket", value: r.value, unit: r.unit}.ty!(
+                                        UtcBucket
+                                    )
+                                ),
+                                None => if wire_kind(field.value) == "utc_bucket" {
+                                    Some(codec::decode@[UtcBucket](field.value).unwrap!())
+                                } else {
+                                    None
+                                }
+                            };
+                            let input = match bucket {
+                                Some(b) => b.value,
+                                None => field.value
+                            };
+                            let converted = wire_kind(input) == "to_datetime_utc";
+                            let original = if converted {
+                                codec::decode@[UtcConversion](input).unwrap!().value
+                            } else {
+                                input
+                            };
+                            if wire_kind(original) != "member" {
+                                fail!(
+                                    "UTC projection requires a direct time dimension; only one explicit to_datetime_utc conversion is supported"
+                                )
+                            } else {
+                                ()
+                            };
+                            let source = codec::decode@[Member](original).unwrap!();
+                            let spec = match bucket {
+                                Some(b) => {
+                                    if b.unit == qb::UtcBucketUnit::Hour {
+                                        fail!("utc_bucket accepts Year/Quarter/Month/Week/Day")
+                                    } else {
+                                        ()
+                                    };
+                                    Some(
+                                        {unit: b.unit, encoding: qb::UtcBucketEncoding::DateTimeUtc}.ty!(
+                                            qb::UtcBucketSpec
+                                        )
+                                    )
+                                },
+                                None => None,
+                            };
+                            let node = match array::find(
+                                request.nodes,
+                                fn(n) {
+                                    n.id == source.node
+                                }
+                            ) {
+                                Some(n) => n,
+                                None => fail!("utc_bucket references an unknown node", source.node)
+                            };
+                            let dataset = match array::find(
+                                current.catalog,
+                                fn(d) {
+                                    d.symbol == node.dataset
+                                }
+                            ) {
+                                Some(d) => d,
+                                None => fail!(
+                                    "utc_bucket references an unpublished Dataset",
+                                    node.dataset
+                                )
+                            };
+                            let member = match array::find(
+                                dataset.members,
+                                fn(m) {
+                                    m.symbol == source.member && m.kind == "dimension"
+                                }
+                            ) {
+                                Some(m) => m,
+                                None => fail!(
+                                    "utc_bucket requires a published DateTimeUtc dimension",
+                                    source.member
+                                )
+                            };
+                            if !(
+                                member.storage == intent::ResultType::DateTimeUtc || converted && member.storage == intent::ResultType::EpochMillis
+                            ) {
+                                fail!(
+                                    "UTC projection requires DateTimeUtc or explicit to_datetime_utc(EpochMillis)",
+                                    source.member
+                                )
+                            } else {
+                                ()
+                            };
+                            let epoch = converted && member.storage == intent::ResultType::EpochMillis;
+                            let owner = match array::find(
+                                current.payload.entities,
+                                fn(e) {
+                                    e.id == dataset.id
+                                }
+                            ) {
+                                Some(e) => e.index,
+                                None => fail!("unknown bucket Dataset", dataset.id)
+                            };
+                            let dimension = match array::find(
+                                current.payload.dimensions,
+                                fn(d) {
+                                    d.entity == owner && d.id == member.id
+                                }
+                            ) {
+                                Some(d) => d,
+                                None => fail!("unknown bucket dimension", member.id)
+                            };
+                            if !dimension.authorized || !dimension.projectable {
+                                fail!("dimension does not support bucket projection", member.id)
+                            } else {
+                                ()
+                            };
+                            let id = `__dari_utc_\{array::length(current.payload.dimensions)}`;
+                            if array::any(
+                                current.payload.dimensions,
+                                fn(d) {
+                                    d.id == id
+                                }
+                            ) {
+                                fail!("internal bucket identifier conflict", id)
+                            } else {
+                                ()
+                            };
+                            let scalars = array::concat(
+                                [
+                                    if epoch {
+                                        [qb::ScalarFunction::EpochMillisToUtc]
+                                    } else {
+                                        []
+                                    },
+                                    match spec {
+                                        Some(s) => [
+                                            if zoned {
+                                                qb::ScalarFunction::ZonedTimeBucket(s.unit)
+                                            } else {
+                                                qb::ScalarFunction::UtcTimeBucket(s)
+                                            }
+                                        ],
+                                        None => []
+                                    }
+                                ]
+                            );
+                            # This closed expression preserves source nullability; it has
+                            # no nullable lookup, canonical mapping or partial conversion.
+                            let derived = dimension <~ {
+                                id,
+                                ty: "DateTimeUtc",
+                                output_type: edsl::OutputType::Text,
+                                utc_bucket: None,
+                                value_type: None,
+                                computed: dimension.computed,
+                                filterable: False,
+                                ops: [],
+                                input_kinds: [],
+                                canonical_values: [],
+                                canonical_order: [],
+                                canonical_aliases: [],
+                                fallback: None,
+                                half_open: False,
+                                build: fn(ctx, source) {
+                                    let value = dimension.build(ctx, source);
+                                    let utc = if epoch {
+                                        qb::scalar(qb::ScalarFunction::EpochMillisToUtc, [value.1])
+                                    } else {
+                                        value.1
+                                    };
+                                    (
+                                        value.0,
+                                        match spec {
+                                            Some(s) => match zone {
+                                                Some(z) => qb::scalar(
+                                                    qb::ScalarFunction::ZonedTimeBucket(s.unit),
+                                                    [utc, qb::Expr::Parameter(z.index)]
+                                                ),
+                                                None => qb::scalar(
+                                                    qb::ScalarFunction::UtcTimeBucket(s),
+                                                    [utc]
+                                                )
+                                            },
+                                            None => utc
+                                        }
+                                    )
+                                }
+                            };
+                            let published = {
+                                id,
+                                symbol: id,
+                                kind: "dimension",
+                                logical: "DateTimeUtc",
+                                storage: intent::ResultType::DateTimeUtc,
+                                nullable: member.nullable
+                            }.ty!(typed::Member);
+                            {
+                                payload: current.payload <~ {
+                                    dimensions: array::push(current.payload.dimensions, derived),
+                                    profile: current.payload.profile <~ {
+                                        allowed_scalars: qb::capability_union(
+                                            current.payload.profile.allowed_scalars,
+                                            scalars
+                                        ),
+                                        allowed_operators: qb::capability_union(
+                                            current.payload.profile.allowed_operators,
+                                            [qb::Operator::Scalar]
+                                        )
+                                    }
+                                },
+                                catalog: array::map(
+                                    current.catalog,
+                                    fn(d) {
+                                        if d.id == dataset.id {
+                                            d <~ {members: array::push(d.members, published)}
+                                        } else {
+                                            d
+                                        }
+                                    }
+                                ),
+                                fields: array::push(
+                                    current.fields,
+                                    field <~ {
+                                        value: codec::encode(
+                                            {kind: "member", node: source.node, member: id}.ty!(
+                                                Member
+                                            )
+                                        )
+                                    }
+                                )
+                            }
+                        }
+                    }
+                );
+                {
+                    payload: selected.payload,
+                    catalog: selected.catalog,
+                    steps: array::push(
+                        state.steps,
+                        step <~ {body: codec::encode(record <~ {fields: selected.fields})}
+                    )
+                }
+            }
+        }
+    );
+    (prepared.payload, prepared.catalog, request <~ {steps: prepared.steps})
+};
+
+def check_type: Fn(
+    edsl::PreparedPayload,
+    Array(typed::Dataset),
+    Array(typed::Relation),
+    String,
+    Value
+) -> Value = fn(payload, catalog, relations, contract_id, input) {
+    let envelope = codec::decode@[Envelope](input).unwrap!();
+    let raw = json::decode@[Intent](envelope.intent_json).unwrap!();
+    let prepared = prepare_time_projections(payload, catalog, raw);
+    let payload = prepared.0;
+    let catalog = prepared.1;
+    let request = prepared.2;
+    let nodes = array::fold(
+        request.nodes,
+        [].ty!(Array(edsl::GraphNode)),
+        fn(nodes, n) {
+            if !qb::is_sql_identifier(n.id) || array::any(
+                nodes,
+                fn(other) {
+                    other.id == n.id
+                }
+            ) {
+                fail!("query node aliases must be unique identifiers", n.id)
+            } else {
+                ()
+            };
+            let dataset = match array::find(
+                catalog,
+                fn(d) {
+                    d.symbol == n.dataset
+                }
+            ) {
+                Some(d) => d,
+                None => fail!("unknown published Dataset symbol", n.dataset)
+            };
+            array::push(nodes, {id: n.id, entity: dataset.id}.ty!(edsl::GraphNode))
+        }
+    );
+    let node = match array::find(
+        nodes,
+        fn(n) {
+            n.id == request.root
+        }
+    ) {
+        Some(n) => n,
+        None => fail!("query root must name a declared node", request.root)
+    };
+    if !qb::is_sql_identifier(node.id) {
+        fail!("typed query root must name the declared node", request.root)
+    } else {
+        ()
+    };
+    let expression_kind = fn(value: Value) {
+        match value {
+            Value::Object(fields) => match dict::get(fields, "kind") {
+                Some(Value::String(kind)) => kind,
+                _ => fail!("typed expression requires a kind"),
+            },
+            _ => fail!("typed expression requires an object"),
+        }
+    };
+    let member = fn(value: Value) {
+        if expression_kind(value) != "member" {
+            fail!(
+                "model expression requires a direct member reference; prepare computed fields in query!"
+            )
+        } else {
+            ()
+        };
+        let expr = codec::decode@[Member](value).unwrap!();
+        let source = match array::find(
+            nodes,
+            fn(n) {
+                n.id == expr.node
+            }
+        ) {
+            Some(n) => n,
+            None => fail!("member must belong to a declared query node", expr.node)
+        };
+        let source_dataset = match array::find(
+            catalog,
+            fn(d) {
+                d.id == source.entity
+            }
+        ) {
+            Some(d) => d,
+            None => fail!("unpublished Dataset", source.entity)
+        };
+        match array::find(
+            source_dataset.members,
+            fn(m) {
+                m.symbol == expr.member
+            }
+        ) {
+            Some(m) => {
+                node: expr.node,
+                id: m.id,
+                symbol: m.symbol,
+                kind: m.kind,
+                logical: m.logical,
+                storage: m.storage,
+                nullable: m.nullable
+            }.ty!(BoundMember),
+            None => fail!("unknown published model member", expr.member),
+        }
+    };
+    let initial = {
+        identity: [],
+        edges: [],
+        projected: False,
+        ordered: False,
+        take: None,
+        container: "table",
+        projections: [],
+        order_by: [],
+        rank: None,
+        predicate: [],
+        row_predicates: [],
+        consumed: []
+    }.ty!(State);
+    let state = array::fold(
+        request.steps,
+        initial,
+        fn(state, step) {
+            if state.take != None {
+                fail!("take is terminal in a model query")
+            } else {
+                ()
+            };
+            if step.id == "" || array::any(
+                state.consumed,
+                fn(id) {
+                    id == step.id
+                }
+            ) {
+                fail!("step identity must be nonempty and unique", step.id)
+            } else {
+                ()
+            };
+            let next = if step.kind == "connect" {
+                if state.projected {
+                    fail!("connect must precede project")
+                } else {
+                    ()
+                };
+                let edge = codec::decode@[Connect](step.body).unwrap!();
+                let relation = match array::find(
+                    relations,
+                    fn(r) {
+                        r.symbol == edge.relation
+                    }
+                ) {
+                    Some(r) => r,
+                    None => fail!("unknown published Relation symbol", edge.relation)
+                };
+                state <~ {
+                    edges: array::push(
+                        state.edges,
+                        {relation: relation.id, from: edge.from, to: edge.to}.ty!(edsl::GraphEdge)
+                    )
+                }
+            } else if step.kind == "group_by_identity" {
+                let group = codec::decode@[Group](step.body).unwrap!();
+                if array::any(
+                    state.identity,
+                    fn(id) {
+                        id == group.node
+                    }
+                ) || state.projected || !array::any(
+                    nodes,
+                    fn(n) {
+                        n.id == group.node
+                    }
+                ) {
+                    fail!("identity grouping requires a unique declared node before projection")
+                } else {
+                    state <~ {identity: array::push(state.identity, group.node)}
+                }
+            } else if step.kind == "filter" {
+                if state.projected {
+                    fail!("model filters must precede projection")
+                } else {
+                    ()
+                };
+                if expression_kind(step.body) == "call" || expression_kind(step.body) == "mapped_comparison" {
+                    state <~ {
+                        row_predicates: array::push(
+                            state.row_predicates,
+                            row_expression(step.body, member)
+                        )
+                    }
+                } else {
+                    if expression_kind(step.body) != "binary" {
+                        fail!(
+                            "model filter requires a single comparison with a member on the left and a parameter on the right"
+                        )
+                    } else {
+                        ()
+                    };
+                    let expr = codec::decode@[Binary](step.body).unwrap!();
+                    if expr.kind != "binary" {
+                        fail!("predicate requires a typed comparison")
+                    } else {
+                        ()
+                    };
+                    if expr.op == "&&" || expr.op == "||" {
+                        state <~ {
+                            row_predicates: array::push(
+                                state.row_predicates,
+                                row_expression(step.body, member)
+                            )
+                        }
+                    } else {
+                        if !array::any(
+                            ["==", "!=", ">", ">=", "<", "<="],
+                            fn(op) {
+                                op == expr.op
+                            }
+                        ) || expression_kind(expr.left) != "member" || expression_kind(expr.right) != "parameter" {
+                            fail!(
+                                "model filter requires a single comparison with a member on the left and a parameter on the right"
+                            )
+                        } else {
+                            ()
+                        };
+                        let field = member(expr.left);
+                        let parameter = codec::decode@[Parameter](expr.right).unwrap!();
+                        if parameter.kind != "parameter" || parameter.nullable || parameter.index < 0 {
+                            fail!("threshold requires a nonnullable typed parameter")
+                        } else {
+                            ()
+                        };
+                        let op = match expr.op {
+                            "==" => edsl::FilterOp::Eq,
+                            "!=" => edsl::FilterOp::Ne,
+                            ">" => edsl::FilterOp::Gt,
+                            ">=" => edsl::FilterOp::Ge,
+                            "<" => edsl::FilterOp::Lt,
+                            "<=" => edsl::FilterOp::Le,
+                            _ => fail!("unsupported model comparison", expr.op),
+                        };
+                        if field.kind == "dimension" {
+                            state <~ {
+                                row_predicates: array::push(
+                                    state.row_predicates,
+                                    codec::encode(
+                                        {
+                                            kind: "comparison",
+                                            node: field.node,
+                                            dimension: field.id,
+                                            op,
+                                            parameter: parameter.index,
+                                            input_type: parameter.input_type
+                                        }.ty!(RowPredicate)
+                                    )
+                                )
+                            }
+                        } else {
+                            state <~ {
+                                predicate: array::push(
+                                    state.predicate,
+                                    {
+                                        node: field.node,
+                                        measure: field.id,
+                                        op,
+                                        parameter: parameter.index,
+                                        input_type: parameter.input_type
+                                    }.ty!(Threshold)
+                                )
+                            }
+                        }
+                    }
+                }
+            } else if step.kind == "project" {
+                if state.projected {
+                    fail!("typed query supports one model projection")
+                } else {
+                    ()
+                };
+                if expression_kind(step.body) != "record" {
+                    fail!("model projection requires a record of direct member references")
+                } else {
+                    ()
+                };
+                let record = codec::decode@[Record](step.body).unwrap!();
+                if record.kind != "record" || record.fields == [] {
+                    fail!("projection requires a nonempty record")
+                } else {
+                    ()
+                };
+                let projections = array::fold(
+                    record.fields,
+                    [].ty!(Array(Projection)),
+                    fn(fields, field) {
+                        if !qb::is_sql_identifier(field.name) || array::any(
+                            fields,
+                            fn(other) {
+                                other.name == field.name
+                            }
+                        ) {
+                            fail!("output field must have a unique identifier", field.name)
+                        } else {
+                            ()
+                        };
+                        let required = wire_kind(field.value) == "call";
+                        let value = if required {
+                            let call = codec::decode@[Call](field.value).unwrap!();
+                            if call.name != "not_none" || array::length(call.args) != 1 {
+                                fail!(
+                                    "model projection accepts direct members or outermost not_none(member)"
+                                )
+                            } else {
+                                ()
+                            };
+                            call.args[0]
+                        } else {
+                            field.value
+                        };
+                        let m = member(value);
+                        if required && !m.nullable {
+                            fail!("not_none requires an optional model member", m.id)
+                        } else {
+                            ()
+                        };
+                        array::push(
+                            fields,
+                            {
+                                name: field.name,
+                                node: m.node,
+                                kind: m.kind,
+                                id: m.id,
+                                not_none: required
+                            }.ty!(Projection)
+                        )
+                    }
+                );
+                state <~ {projected: True, projections}
+            } else if step.kind == "order_by" {
+                if !state.projected || state.ordered {
+                    fail!("ordering requires one preceding projection")
+                } else {
+                    ()
+                };
+                let ordering = codec::decode@[Ordering](step.body).unwrap!();
+                if ordering.terms == [] {
+                    fail!("ordering requires at least one term")
+                } else {
+                    ()
+                };
+                if request.pair != None && array::length(ordering.terms) == 1 && wire_kind(
+                    ordering.terms[0].value
+                ) == "call" {
+                    let term = ordering.terms[0];
+                    let call = codec::decode@[Call](term.value).unwrap!();
+                    if array::length(call.args) != 2 {
+                        fail!("pair ranking requires two projected measure operands")
+                    } else {
+                        ()
+                    };
+                    let measure = fn(value: Value) {
+                        if wire_kind(value) == "output" {
+                            let output = codec::decode@[Output](value).unwrap!();
+                            match array::find(
+                                state.projections,
+                                fn(p) {
+                                    p.name == output.name && p.kind == "measure"
+                                }
+                            ) {
+                                Some(p) => p,
+                                None => fail!(
+                                    "pair ranking requires projected model measures",
+                                    output.name
+                                )
+                            }
+                        } else {
+                            let m = member(value);
+                            match array::find(
+                                state.projections,
+                                fn(p) {
+                                    p.kind == "measure" && p.node == m.node && p.id == m.id
+                                }
+                            ) {
+                                Some(p) => p,
+                                None => fail!("pair ranking member must be projected", m.id)
+                            }
+                        }
+                    };
+                    let op = match call.name {
+                        "difference" => qb::PairRankOp::Subtract,
+                        "ratio" => qb::PairRankOp::Ratio,
+                        "growth_rate" => qb::PairRankOp::GrowthRate,
+                        _ => fail!("unsupported pair ranking function", call.name)
+                    };
+                    state <~ {
+                        ordered: True,
+                        rank: Some(
+                            {
+                                op,
+                                first: measure(call.args[0]).node,
+                                second: measure(call.args[1]).node,
+                                direction: term.direction
+                            }.ty!(pair::Rank)
+                        )
+                    }
+                } else {
+                    let terms = array::map(
+                        ordering.terms,
+                        fn(term) {
+                            let kind = match term.value {
+                                Value::Object(fields) => match dict::get(fields, "kind") {
+                                    Some(Value::String(kind)) => kind,
+                                    _ => fail!("order expression requires a kind"),
+                                },
+                                _ => fail!("order expression requires an object"),
+                            };
+                            let selected = if kind == "output" {
+                                let expr = codec::decode@[Output](term.value).unwrap!();
+                                match array::find(
+                                    state.projections,
+                                    fn(p) {
+                                        p.name == expr.name
+                                    }
+                                ) {
+                                    Some(p) => p,
+                                    None => fail!("unknown projected order member", expr.name),
+                                }
+                            } else {
+                                let m = member(term.value);
+                                {name: "", node: m.node, kind: m.kind, id: m.id, not_none: False}.ty!(
+                                    Projection
+                                )
+                            };
+                            {
+                                node: selected.node,
+                                kind: selected.kind,
+                                id: selected.id,
+                                direction: term.direction
+                            }.ty!(Order)
+                        }
+                    );
+                    state <~ {ordered: True, order_by: terms}
+                }
+            } else if step.kind == "take" || step.kind == "take_opt" {
+                if !state.projected {
+                    fail!("selection requires a projection")
+                } else {
+                    ()
+                };
+                let take = if step.kind == "take_opt" {
+                    1
+                } else {
+                    codec::decode@[Take](step.body).unwrap!().count
+                };
+                if step.kind == "take_opt" {
+                    match step.body {
+                        Value::Object(fields) => if dict::pairs(fields) == [] {
+                            ()
+                        } else {
+                            fail!("take_opt accepts no arguments")
+                        },
+                        _ => fail!("take_opt requires an empty argument record"),
+                    }
+                } else {
+                    ()
+                };
+                state <~ {
+                    take: Some(qb::public_take(take)),
+                    container: if step.kind == "take_opt" {
+                        "option"
+                    } else {
+                        "table"
+                    }
+                }
+            } else {
+                fail!("unsupported model operation", step.kind)
+            };
+            next <~ {consumed: array::push(next.consumed, step.id)}
+        }
+    );
+    let take = state.take;
+    let lowered_request = {
+        node: node.id,
+        projections: state.projections,
+        nodes,
+        edges: state.edges,
+        predicate: state.predicate,
+        row_predicates: state.row_predicates,
+        order_by: state.order_by,
+        take,
+        identity: state.identity
+    }.ty!(LoweredRequest);
+    let lowered = match request.pair {
+        None => typed::check_type(payload, catalog, codec::encode(lowered_request)),
+        Some(roots) => pair::check_type(
+            payload,
+            catalog,
+            codec::encode(
+                {request: lowered_request, left: roots.left, right: roots.right, rank: state.rank}.ty!(
+                    PairRequest
+                )
+            )
+        ),
+    };
+    let receipt = {
+        contractId: contract_id,
+        inputDigest: hash::sha256(envelope.intent_json),
+        consumedStepIds: state.consumed
+    }.ty!(Receipt);
+    match lowered {
+        Value::Object(fields) => Value::Object(
+            dict::merge(
+                fields,
+                {container: codec::encode(state.container), receipt: codec::encode(receipt)}
+            )
+        ),
+        _ => fail!("model lowering must return a result template"),
+    }
+};
+pub use self::{check_type};

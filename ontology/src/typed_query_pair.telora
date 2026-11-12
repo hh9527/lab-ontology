@@ -1,0 +1,130 @@
+use crate::typed_query as typed;
+use crate::ontology as edsl;
+use crate::intent as intent;
+use crate::query as qb;
+use crate::sqlite as sqlite;
+use std::array as array;
+use std::codec as codec;
+use std::dict as dict;
+use std::string as string;
+use std::value::{Value};
+
+type Rank = struct {op:qb::PairRankOp,first:String,second:String,direction:qb::Ordering};
+type Input = struct {request:typed::Request,left:String,right:String,rank:Option(Rank)};
+type Operand = struct {
+    op:String,root:String,nodes:Array(edsl::GraphNode),edges:Array(edsl::GraphEdge),
+    select:Array(edsl::GraphSelect),measures:Array(edsl::GraphMeasureSelect),group_by_identity:Array(String)
+};
+type PairNode = struct {node:String};
+type Alignment = struct {left:PairNode,right:PairNode};
+type Selection = struct {side:qb::PairSide,node:String,dimension:String};
+type Pair = struct {op:String,left:Value,right:Value,align_by:Array(Alignment),select:Array(Selection)};
+type Subtract = struct {op:String,minuend:qb::PairSide,subtrahend:qb::PairSide,direction:qb::Ordering,take:Int};
+type Ratio = struct {op:String,numerator:qb::PairSide,denominator:qb::PairSide,direction:qb::Ordering,take:Int};
+type Growth = struct {op:String,current:qb::PairSide,baseline:qb::PairSide,direction:qb::Ordering,take:Int};
+type Comparison = struct {kind:String,node:String,dimension:String,op:edsl::FilterOp,parameter:Int,input_type:intent::ResultType};
+type Null = struct {kind:String,node:String,dimension:String,present:Bool};
+type Boolean = struct {kind:String,left:Value,right:Value};
+type Column = struct {name:String,type:intent::ResultType,logical:String,nullable:Bool};
+type Template = struct {sql:String,bindings:Array(qb::Val),columns:Array(Column),max_rows:Int};
+
+def filter_nodes: Fn(Value) -> Array(String) = fn(value) {
+    match value {
+        Value::Object(fields) => match dict::get(fields,"kind") {
+            Some(Value::String("comparison")) => [codec::decode@[Comparison](value).unwrap!().node],
+            Some(Value::String("null")) => [codec::decode@[Null](value).unwrap!().node],
+            _ => {let b=codec::decode@[Boolean](value).unwrap!();array::concat([filter_nodes(b.left),filter_nodes(b.right)])},
+        },
+        _ => fail!("invalid model row predicate"),
+    }
+};
+
+def check_type: Fn(edsl::PreparedPayload,Array(typed::Dataset),Value) -> Value = fn(payload,catalog,input) {
+    let spec=codec::decode@[Input](input).unwrap!();
+    let request=spec.request;
+    let take=match request.take {Some(n)=>qb::public_take(n),None=>fail!("pair ranking requires a terminal take")};
+    let component=fn(root:String) {
+        array::fold(request.nodes,[root],fn(found,unused) {
+            array::fold(request.edges,found,fn(found,edge) {
+                let a=array::any(found,fn(id){id == edge.from});
+                let b=array::any(found,fn(id){id == edge.to});
+                if a && !b {array::push(found,edge.to)} else if b && !a {array::push(found,edge.from)} else {found}
+            })
+        })
+    };
+    let left=component(spec.left);
+    let right=component(spec.right);
+    let in_left=fn(node:String){array::any(left,fn(id){id == node})};
+    let in_right=fn(node:String){array::any(right,fn(id){id == node})};
+    if spec.left == spec.right || array::any(left,in_right) || !array::all(request.nodes,fn(n){in_left(n.id)||in_right(n.id)}) {
+        fail!("pair requires two independent connected model populations")
+    } else { () };
+    let side=fn(node:String){if in_left(node){qb::PairSide::Left}else{qb::PairSide::Right}};
+    let prefix=fn(node:String){if in_left(node){"left"}else{"right"}};
+    let operand=fn(root:String,contains:Fn(String)->Bool) {
+        let measures=array::filter(request.projections,fn(p){p.kind == "measure" && contains(p.node)});
+        if array::length(measures) != 1 {fail!("each pair population requires exactly one projected model measure")} else { () };
+        codec::encode({op:"Graph",root,nodes:array::filter(request.nodes,fn(n){contains(n.id)}),edges:array::filter(request.edges,fn(e){contains(e.from)&&contains(e.to)}),
+            select:[],measures:[{node:measures[0].node,measure:measures[0].id}.ty!(edsl::GraphMeasureSelect)],group_by_identity:array::filter(request.identity,contains)}.ty!(Operand))
+    };
+    let left_identity=array::filter(request.identity,in_left);
+    let right_identity=array::filter(request.identity,in_right);
+    if array::length(left_identity) != array::length(right_identity) {fail!("pair identity lists must align one-to-one")} else { () };
+    let graph=codec::encode({op:"GraphPair",left:operand(spec.left,in_left),right:operand(spec.right,in_right),
+        align_by:array::map(array::enumerate(left_identity),fn(e){{left:{node:e.1}.ty!(PairNode),right:{node:right_identity[e.0]}.ty!(PairNode)}.ty!(Alignment)}),
+        select:array::map(array::filter(request.projections,fn(p){p.kind == "dimension"}),fn(p){{side:side(p.node),node:p.node,dimension:p.id}.ty!(Selection)})}.ty!(Pair));
+    let graph=match spec.rank {
+        None=>graph,
+        Some(rank)=>{
+            if side(rank.first) == side(rank.second) {fail!("pair ranking requires measures from opposite populations")} else { () };
+            let first=side(rank.first);
+            let second=side(rank.second);
+            let value=match rank.op {
+                qb::PairRankOp::Subtract=>codec::encode({op:"Subtract",minuend:first,subtrahend:second,direction:rank.direction,take}.ty!(Subtract)),
+                qb::PairRankOp::Ratio=>codec::encode({op:"Ratio",numerator:first,denominator:second,direction:rank.direction,take}.ty!(Ratio)),
+                qb::PairRankOp::GrowthRate=>codec::encode({op:"GrowthRate",current:first,baseline:second,direction:rank.direction,take}.ty!(Growth)),
+            };
+            match graph {Value::Object(fields)=>Value::Object(dict::merge(fields,{rank_by:value})),_=>fail!("invalid pair graph")}
+        },
+    };
+    let ast=intent::lower_graph_pair_with(payload,graph,fn(ctx,graph){
+        let base=intent::lower_graph_object(ctx,payload,graph);
+        let local=fn(node:String){array::any(base.1.nodes,fn(n){n.id == node})};
+        let predicates=array::filter(request.row_predicates,fn(p){
+            let nodes=filter_nodes(p);
+            if array::any(nodes,local) && !array::all(nodes,local) {fail!("row filter cannot cross pair populations; compare aggregated outputs in query!")} else { () };
+            array::all(nodes,local)
+        });
+        let filtered=array::fold(predicates,(base.0,base.2),fn(state,p){
+            let output=typed::row_predicate(payload,base.1.nodes,catalog,state.0,p);
+            (output.0,qb::validate(state.1 <~ {filter:Some(match state.1.filter {Some(previous)=>qb::scalar(qb::ScalarFunction::And,[previous,output.1]),None=>output.1})},payload.profile))
+        });
+        let plan=array::fold(array::filter(request.predicate,fn(p){local(p.node)}),filtered.1,fn(plan,predicate){typed::aggregate_threshold(payload,plan,predicate)});
+        (filtered.0,base.1,plan)
+    });
+    let columns=intent::result_columns(payload,graph,ast);
+    let column_name=fn(node:String,id:String){`\{prefix(node)}_\{node}_\{id}`};
+    let ast=if spec.rank != None {ast} else {
+        if request.order_by == [] {fail!("pair output requires order_by before take")} else { () };
+        let ordering=array::fold(request.order_by,(ast.ctx,[]),fn(state,o){
+            let name=column_name(o.node,o.id);
+            if !array::any(columns,fn(c){c.name == name}) {fail!("pair ordering must reference a projected member",o.id)} else { () };
+            let dimension=if o.kind == "dimension" {array::find(payload.dimensions,fn(d){d.id == o.id})}else{None};
+            let key=intent::final_order_key(state.0,name,dimension);
+            (key.0,array::push(state.1,{key:key.1,direction:o.direction}.ty!(qb::ResultOrder)))
+        });
+        ast <~ {ctx:ordering.0,selection:Some({order_by:ordering.1,take}.ty!(qb::ResultSelection))}
+    };
+    let public_columns=array::map(request.projections,fn(p){
+        let source=match array::find(request.nodes,fn(n){n.id == p.node}) {Some(n)=>n,None=>fail!("unknown pair member node",p.node)};
+        let dataset=match array::find(catalog,fn(d){d.id == source.entity}) {Some(d)=>d,None=>fail!("unknown pair Dataset",source.entity)};
+        let member=match array::find(dataset.members,fn(m){m.kind == p.kind && m.id == p.id}) {Some(m)=>m,None=>fail!("unknown pair member",p.id)};
+        let column=match array::find(columns,fn(c){c.name == column_name(p.node,p.id)}) {Some(c)=>c,None=>fail!("pair projection absent from model result",p.id)};
+        {name:p.name,type:member.storage,logical:member.logical,nullable:if p.not_none {False} else {column.nullable}}.ty!(Column)
+    });
+    if spec.rank != None && array::any(request.projections,fn(p){p.not_none}) {fail!("not_none with pair ranking requires projection in a following query!")} else { () };
+    let query=sqlite::build_query_not_none(ast,array::map(array::filter(request.projections,fn(p){p.not_none}),fn(p){column_name(p.node,p.id)}));
+    let projection=string::join(array::map(request.projections,fn(p){`\{column_name(p.node,p.id)} AS \{p.name}`}),", ");
+    codec::encode({sql:`SELECT \{projection} FROM (\{query.sql}) AS __dari_pair`,bindings:query.bindings,columns:public_columns,max_rows:qb::result_bound(ast)}.ty!(Template))
+};
+pub use self::{Rank,check_type};

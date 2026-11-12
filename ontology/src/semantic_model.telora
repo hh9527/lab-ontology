@@ -13,6 +13,7 @@ use crate::quantity as quantity;
 use crate::scalars as scalars;
 use crate::samples as samples;
 use crate::knowledge_policy as knowledge_policy;
+use crate::values as values;
 use std::codec as codec;
 use std::value::{Value};
 
@@ -368,12 +369,14 @@ type Field = struct {
     reference: Option(ReferenceInfo),
     targets: Array(ReferenceTarget),
     views: Array(groups::FieldDimension),
-    scope: Option(edsl::FilterInput),
+    scope: Option(SourceScope),
     unit: Option(quantity::Unit)
 };
 @prelude::property(PropertyTarget::Field)
 type SourceScope = struct {
-    input: edsl::FilterInput
+    input: edsl::FilterInput,
+    dimension: Option(String),
+    value: Type
 };
 type CountCondition = struct {
     dimension: String,
@@ -475,12 +478,7 @@ def scope_equal: for(Scalar: codec::Encode) Fn(
         _ => fail!("source scope requires a scalar literal")
     };
     fn(ctx, previous) {
-        if ctx.ty != Scalar.type && ctx.ty != Option(Scalar).type {
-            fail!("source scope has a different nominal type", ctx.name)
-        } else {
-            ()
-        };
-        {input}
+        {input, dimension: None, value: Scalar.type}
     }
 };
 @prelude::property(PropertyTarget::Type)
@@ -704,10 +702,71 @@ def compute: Fn(Type) -> Prepared = fn(row) {
                     None => []
                 },
                 scope: match property::get_field_prop(row, f.index, SourceScope.type) {
-                    Some(spec) => Some(spec.input),
+                    Some(spec) => {
+                        let resolved = if value.0 == spec.value {
+                            spec
+                        } else {
+                            let domains = match property::get_field_prop(
+                                row,
+                                f.index,
+                                values::FieldDomains.type
+                            ) {
+                                Some(domains) => domains.dimensions,
+                                None => []
+                            };
+                            let matching = array::filter(
+                                domains,
+                                fn(binding) {
+                                    binding.definition.value == spec.value
+                                }
+                            );
+                            if array::length(matching) != 1 {
+                                fail!(
+                                    "scope requires one semantic mapping of the member type on the same source field",
+                                    f.name
+                                )
+                            } else {
+                                ()
+                            };
+                            let binding = matching[0];
+                            if !contains(binding.filters, groups::Filter::Eq) {
+                                fail!(
+                                    "semantic scope requires equality capability",
+                                    f.name,
+                                    binding.id
+                                )
+                            } else {
+                                ()
+                            };
+                            match spec.input {
+                                edsl::FilterInput::Text(member) => if dict::get(
+                                    binding.definition.bindings,
+                                    member
+                                ) == None && binding.definition.fallback != Some(member) {
+                                    fail!(
+                                        "semantic scope requires a declared member",
+                                        f.name,
+                                        binding.id,
+                                        member
+                                    )
+                                } else {
+                                    ()
+                                },
+                                _ => fail!(
+                                    "semantic scope requires a named business member",
+                                    f.name
+                                )
+                            };
+                            spec <~ {dimension: Some(binding.id)}
+                        };
+                        Some(resolved)
+                    },
                     None => None
                 },
-                unit: property::get_type_prop(value.0, quantity::Unit.type)
+                unit: match property::get_field_prop(row, f.index, quantity::FieldUnit.type) {
+                    Some(spec) => Some(spec.unit),
+                    None => property::get_type_prop(value.0, quantity::Unit.type),
+                }
             }.ty!(Field)
         }
     );

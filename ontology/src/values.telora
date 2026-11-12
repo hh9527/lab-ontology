@@ -29,6 +29,7 @@ type DefinitionInput = struct {
     order: Array(String)
 };
 type Definition = struct {
+    fallback: Option(String),
     bindings: Dict(Array(qb::Val)),
     id: String,
     value: Type,
@@ -94,8 +95,6 @@ def prepare_definition: Fn(DefinitionInput) -> Definition = fn(definition) {
         fail!("business domain requires a name and text-valued business type", definition.id)
     } else if storage != Int.type && storage != String.type {
         fail!("business domain wire must use integer or text storage", definition.id)
-    } else if definition.half_open && storage != String.type {
-        fail!("half-open business domain requires text wire storage", definition.id)
     } else if array::length(definition.values) == 0 {
         fail!("business domain must declare known members", definition.id)
     } else {
@@ -176,6 +175,7 @@ def prepare_definition: Fn(DefinitionInput) -> Definition = fn(definition) {
     );
     prepare_order(
         {
+            fallback: None,
             id: definition.id,
             value: definition.value,
             wire: definition.wire,
@@ -188,17 +188,31 @@ def prepare_definition: Fn(DefinitionInput) -> Definition = fn(definition) {
 };
 
 def prepare_order: Fn(Definition) -> Definition = fn(definition) {
-    if definition.half_open && definition.order != [] {
-        fail!("half-open business domain cannot declare a closed order", definition.id)
-    } else if definition.order != [] && (
-        array::length(definition.order) != array::length(definition.values) || !array::all(
+    let body = g::representation(definition.value);
+    let members = if td::kind(body) == td::TypeDescKind::Enum {
+        array::map(
+            td::variants(body),
+            fn(variant) {
+                variant.name
+            }
+        )
+    } else {
+        array::map(
             definition.values,
+            fn(value) {
+                value.id
+            }
+        )
+    };
+    if definition.order != [] && (
+        array::length(definition.order) != array::length(members) || !array::all(
+            members,
             fn(value) {
                 array::length(
                     array::filter(
                         definition.order,
                         fn(id) {
-                            id == value.id
+                            id == value
                         }
                     )
                 ) == 1
@@ -242,8 +256,26 @@ def domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(
             {id: name, label: name, wires}.ty!(edsl::CanonicalValueSpec)
         }
     );
-    {definition: prepare_definition({id, value: business, wire, values, half_open, order: []})}
+    {
+        definition: prepare_definition(
+            {id, value: business, wire, values, half_open, order: ev::business_order(business)}
+        )
+    }
 };
+def mapping: for(Business: codec::Encode, Wire: codec::Encode) Fn(
+    String,
+    TypeOf(Business),
+    TypeOf(Wire),
+    Array(Member(Business, Wire))
+) -> Domain(Business, Wire) = fn(id, business, wire, members) {
+    if business == Bool.type || td::kind(g::representation(business)) != td::TypeDescKind::Enum {
+        fail!("field mapping requires a closed business enum", id)
+    } else {
+        ()
+    };
+    domain(id, business, wire, members, False)
+};
+pub use self::{mapping};
 def ordered: for(Business: codec::Encode, Wire) Fn(
     Domain(Business, Wire),
     Array(Business)
@@ -597,6 +629,52 @@ def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) 
     )
 };
 pub use self::{FieldDomains, FieldDomain, field_domain, classification, field_bindings};
+
+# 源字段 property 声明映射；模型不需要构造 Domain 或转换函数。
+def map: for(Business: codec::Encode, Wire: codec::Encode) Fn(
+    TypeOf(Business),
+    String,
+    Array(Member(Business, Wire))
+) -> Fn(property::FieldPropertyCtx, Option(FieldDomains)) -> FieldDomains = fn(
+    business,
+    id,
+    members
+) {
+    classification(mapping(id, business, Wire.type, members), id)
+};
+def map_or: for(Business: codec::Encode, Wire: codec::Encode) Fn(
+    TypeOf(Business),
+    String,
+    Array(Member(Business, Wire)),
+    Business
+) -> Fn(property::FieldPropertyCtx, Option(FieldDomains)) -> FieldDomains = fn(
+    business,
+    id,
+    members,
+    fallback
+) {
+    let declared = mapping(id, business, Wire.type, members);
+    let name = match codec::encode(fallback) {
+        Value::String(value) => value,
+        _ => fail!("mapping fallback requires a unit enum variant", id)
+    };
+    classification(
+        {definition: declared.definition <~ {fallback: Some(name)}}.ty!(Domain(Business, Wire)),
+        id
+    )
+};
+def map_filter: for(Business: codec::Encode, Wire: codec::Encode) Fn(
+    TypeOf(Business),
+    String,
+    Array(Member(Business, Wire))
+) -> Fn(property::FieldPropertyCtx, Option(FieldDomains)) -> FieldDomains = fn(
+    business,
+    id,
+    members
+) {
+    field_domain(mapping(id, business, Wire.type, members), id, False, g::equality_filters)
+};
+pub use self::{map, map_or, map_filter};
 
 # 字段 property 是已验证边界；引用只按字段索引与发布名定位。
 def dimension_of: for(Row, Wire) Fn(m::Dataset(Row), m::Field(Row, Wire), String) -> Binding(Row) = fn(

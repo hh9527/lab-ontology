@@ -75,6 +75,8 @@ def scalar_name: Fn(ScalarFunction) -> String = fn(function) {
         ScalarFunction::Length => "length",
         ScalarFunction::UtcDaysAgo => "strftime",
         ScalarFunction::UtcTimeBucket(_) => "strftime",
+        ScalarFunction::EpochMillisToUtc => "strftime",
+        ScalarFunction::ZonedTimeBucket(_) => "dari_calendar_bucket",
         ScalarFunction::Eq => "=",
         ScalarFunction::Ne => "!=",
         ScalarFunction::Lt => "<",
@@ -116,6 +118,9 @@ def direction_sql: Fn(Ordering) -> String = fn(direction) {
 def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
     match spec.encoding {
         qb::UtcBucketEncoding::DateTimeUtc => match spec.unit {
+            qb::UtcBucketUnit::Year => `strftime('%Y-01-01T00:00:00.000Z', \{value})`,
+            qb::UtcBucketUnit::Quarter => `strftime('%Y-%m-01T00:00:00.000Z', \{value}, 'start of month', '-' || ((CAST(strftime('%m', \{value}) AS INTEGER) - 1) % 3) || ' months')`,
+            qb::UtcBucketUnit::Week => `strftime('%Y-%m-%dT00:00:00.000Z', \{value}, '-' || ((CAST(strftime('%w', \{value}) AS INTEGER) + 6) % 7) || ' days')`,
             qb::UtcBucketUnit::Hour => `strftime('%Y-%m-%dT%H:00:00.000Z', \{value})`,
             qb::UtcBucketUnit::Day => `strftime('%Y-%m-%dT00:00:00.000Z', \{value})`,
             qb::UtcBucketUnit::Month => `strftime('%Y-%m-01T00:00:00.000Z', \{value})`,
@@ -123,13 +128,14 @@ def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
         qb::UtcBucketEncoding::Date => match spec.unit {
             qb::UtcBucketUnit::Day => `date(\{value})`,
             qb::UtcBucketUnit::Month => `date(\{value}, 'start of month')`,
-            _ => fail!("Date has no hour bucket"),
+            _ => fail!("this bucket unit requires DateTimeUtc"),
         },
         qb::UtcBucketEncoding::EpochMillis => do {
             let bucket = match spec.unit {
                 qb::UtcBucketUnit::Hour => `(\{value} - ((\{value} % 3600000 + 3600000) % 3600000))`,
                 qb::UtcBucketUnit::Day => `(\{value} - ((\{value} % 86400000 + 86400000) % 86400000))`,
                 qb::UtcBucketUnit::Month => `(CAST(strftime('%s', (\{value} - ((\{value} % 1000 + 1000) % 1000)) / 1000, 'unixepoch', 'start of month') AS INTEGER) * 1000)`,
+                _ => fail!("this bucket unit requires DateTimeUtc"),
             };
             `CASE WHEN \{value} >= -62135596800000 AND \{value} < 253402300800000 THEN \{bucket} ELSE NULL END`
         },
@@ -150,6 +156,22 @@ def render_scalar_sql: Fn(ScalarFunction, Array(String)) -> String = fn(function
         ScalarFunction::Length => `length(\{parts[0]})`,
         ScalarFunction::UtcDaysAgo => `strftime('%Y-%m-%dT%H:%M:%SZ', \{parts[0]}, printf('-%d days', \{parts[1]}))`,
         ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, parts[0]),
+        ScalarFunction::ZonedTimeBucket(unit) => do {
+            let name = match unit {
+                qb::UtcBucketUnit::Year => "Year",
+                qb::UtcBucketUnit::Quarter => "Quarter",
+                qb::UtcBucketUnit::Month => "Month",
+                qb::UtcBucketUnit::Week => "Week",
+                qb::UtcBucketUnit::Day => "Day",
+                _ => fail!("unsupported calendar bucket unit")
+            };
+            `dari_calendar_bucket(\{parts[0]}, '\{name}', \{parts[1]})`
+        },
+        ScalarFunction::EpochMillisToUtc => do {
+            let v = parts[0];
+            let rem = `((\{v} % 1000 + 1000) % 1000)`;
+            `(strftime('%Y-%m-%dT%H:%M:%S', (\{v} - \{rem}) / 1000, 'unixepoch') || printf('.%03dZ', \{rem}))`
+        },
         ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         ScalarFunction::Ne => `\{parts[0]} != \{parts[1]}`,
         ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,
@@ -179,6 +201,11 @@ def render_case_tail: Fn(Expr, BuildCtx) -> String = fn(expr, ctx) {
 # Bindings are allocated by the builder; rendering only resolves their handles.
 def render_expr: Fn(Expr, BuildCtx) -> String = fn(expr, ctx) {
     match expr {
+        Expr::Parameter(index) => if index >= 0 {
+            `:__dari_\{index}`
+        } else {
+            fail!("invalid symbolic parameter", index)
+        },
         Expr::Column(ref) => if is_sql_identifier(ref.source) && is_sql_identifier(ref.column) {
             `\{ref.source}.\{ref.column}`
         } else {
@@ -192,7 +219,14 @@ def render_expr: Fn(Expr, BuildCtx) -> String = fn(expr, ctx) {
             fail!("binding handle is not registered in builder context", binding)
         },
         Expr::Scalar(call) => {
-            if call.function == ScalarFunction::If {
+            let membership = if call.function == ScalarFunction::Or {
+                qb::equality_set(expr)
+            } else {
+                None
+            };
+            if let Some(set) = membership {
+                `\{render_expr(set.input, ctx)} IN (\{string::join(array::map(set.values, fn(value) {render_expr(value, ctx)}), ", ")})`
+            } else if call.function == ScalarFunction::If {
                 `CASE \{render_case_tail(expr, ctx)}`
             } else {
                 render_scalar_sql(
@@ -1209,3 +1243,37 @@ def build_query: Fn(QueryAst) -> Query = fn(ast) {
 };
 
 pub use self::{build_query, render_sqlite_expr_with_context};
+
+# Projection-local non-null guarantees run after aggregation and before global selection.
+def build_query_not_none: Fn(QueryAst, Array(String)) -> Query = fn(ast, columns) {
+    if columns == [] {
+        build_query(ast)
+    } else {
+        if !array::all(columns, qb::is_sql_identifier) {
+            fail!("invalid non-null projection column")
+        } else {
+            ()
+        };
+        let plan = validate_contextual_pagination(ast.plan, ast.ctx);
+        let condition = string::join(
+            array::map(
+                columns,
+                fn(name) {
+                    `__dari_nonnull."\{name}" IS NOT NULL`
+                }
+            ),
+            " AND "
+        );
+        qb::select_result(
+            {
+                sql: `SELECT * FROM (\{render_sqlite_plan(plan,ast.ctx)}) AS __dari_nonnull WHERE \{condition}`,
+                bindings: ast.ctx.bindings
+            },
+            ast,
+            fn(expr) {
+                render_sqlite_expr_with_context(expr, ast.ctx).sql
+            }
+        )
+    }
+};
+pub use self::build_query_not_none;

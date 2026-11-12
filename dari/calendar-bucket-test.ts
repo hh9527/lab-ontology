@@ -1,0 +1,38 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {DatabaseSync} from 'node:sqlite';
+import {calendarBucket} from './src/calendar.ts';
+import {check} from './src/compiler.ts';
+import {resolve} from './src/runtime.ts';
+import {proofTarget,type ModelPort} from './src/model.ts';
+import {sharedTypes} from './src/shared-types.ts';
+const require=createRequire(new URL('../../dsh-oks/packages/dsh-oks/package.json',import.meta.url));
+const {Temporal}=require('@js-temporal/polyfill');
+const expected=(instant:string,unit:string,zone:string)=>{
+ let date=Temporal.Instant.from(instant).toZonedDateTimeISO(zone).toPlainDate();
+ if(unit==='Year')date=date.with({month:1,day:1});
+ if(unit==='Quarter')date=date.with({month:Math.floor((date.month-1)/3)*3+1,day:1});
+ if(unit==='Month')date=date.with({day:1});
+ if(unit==='Week')date=date.subtract({days:date.dayOfWeek-1});
+ return date.toPlainDateTime({hour:0}).toZonedDateTime(zone,{disambiguation:'later'}).toInstant().toString({smallestUnit:'millisecond'});
+};
+const instants=['2026-03-08T06:59:59.999Z','2026-03-08T07:00:00.000Z','2026-11-01T05:30:00.000Z','2026-11-01T06:30:00.000Z','2018-11-04T12:00:00.000Z','2011-12-31T00:00:00.000Z','1969-12-31T23:59:59.999Z'];
+for(const zone of ['Asia/Shanghai','America/New_York','America/Havana','Australia/Lord_Howe','Asia/Kathmandu','Pacific/Apia'])for(const unit of ['Year','Quarter','Month','Week','Day'])for(const instant of instants)assert.equal(calendarBucket(instant,unit,zone),expected(instant,unit,zone),zone+'/'+unit+'/'+instant);
+assert.equal(calendarBucket(null,'Day','Asia/Shanghai'),null);
+assert.throws(()=>calendarBucket(instants[0],'Day','Mars/Olympus'),/time zone|timeZone/i);
+const db=new DatabaseSync(':memory:');
+const source=`data zone=TimeZone("America/New_York");
+data src=table([{ts:EpochMillis(1772953200000),cpu:20.0},{ts:EpochMillis(1772956800000),cpu:40.0}]);
+data rows=query! {let a=from(src);let b=a |> project({day:calendar_bucket(to_datetime_utc(a.ts),CalendarUnit::Day,zone),cpu:a.cpu});let grouped=b |> group_by({day:b.day}) |> project({day:b.day,cpu:avg(b.cpu)});grouped |> order_by(asc(grouped.day)) |> take(10)};
+answer tree! {Answer [UseTable(ref=rows)]};`;
+const result=resolve(check(source),db);
+assert.deepEqual(result.values.rows,[{day:'2026-03-08T05:00:00.000Z',cpu:30}]);
+for(const expr of ['calendar_bucket(DateTimeUtc("2026-01-01T00:00:00Z"),CalendarUnit::Day,"Asia/Shanghai")','calendar_bucket(EpochMillis(0),CalendarUnit::Day,TimeZone("UTC"))'])assert.throws(()=>check(`data x=${expr};answer tree! {Answer []};`),/requires/);
+let wire:any;
+const member={kind:'dimension' as const,id:'ts',symbol:'ts',owner:'sample',type:{kind:'option',inner:sharedTypes.EpochMillis}};
+const model:ModelPort={contractId:'test',implementationId:'test-1',datasets:{'test::Sample':{kind:'dataset',id:'sample',symbol:'test::Sample',members:{ts:member}}},
+ check_type(intent,encoded){wire=JSON.parse(encoded.json);return {element:{kind:'schema',fields:{day:{kind:'option',inner:sharedTypes.DateTimeUtc}}},container:'table',maxRows:10,plan:{},receipt:proofTarget(intent,'test',encoded)};},bind(){throw Error('check-only');}};
+check(`data zone=TimeZone("America/New_York");data rows=query_remote! {let a=from(test::Sample);let p=project({day:calendar_bucket(to_datetime_utc(a.ts),CalendarUnit::Day,zone)});p |> order_by(asc(p.day)) |> take(10)};answer tree! {Answer []};`,model);
+const bucket=wire.steps[0].body.fields[0].value;
+assert.equal(bucket.kind,'calendar_bucket');assert.equal(bucket.value.kind,'to_datetime_utc');assert.deepEqual(bucket.timeZone,{kind:'parameter',index:0,input_type:'String',nullable:false,logical:'TimeZone'});
+db.close();console.log('Region calendar buckets: six zones, five units, DST, midnight disambiguation, SQL grouping and typed model parameters passed');

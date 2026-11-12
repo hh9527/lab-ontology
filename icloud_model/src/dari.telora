@@ -1,0 +1,195 @@
+# DARI model type proof, codecs and parameterized query service.
+use icloud_model::typed;
+use ontology::typed_query as typed_query;
+use ontology::typed_query_protocol as protocol;
+use ontology::intent as intent;
+use ontology::sqlite as sqlite;
+use ontology::js_codec as js_codec;
+use ontology::enum_values as ev;
+use ontology::quantity as quantity;
+use std::transform_service as service;
+use std::value::{Value};
+use std::codec as codec;
+use std::build as build;
+use std::array as array;
+use std::string as string;
+use std::json as json;
+use std::dict as dict;
+use std::pipeline as pipeline;
+use std::hash as hash;
+
+# 实验输入的业务约束只在模型侧定义。
+@js_codec::number_range(0.0, 100.0)
+type BoundedPercent = struct(quantity::Percent);
+type CpuFloor = struct(BoundedPercent);
+type OpenStatus = enum {
+    Up,
+    Down,
+    Unknown,
+};
+@ev::order_by_itag
+type CodecOrder = enum {
+    @ev::itag(20)
+    Alpha,
+    @ev::itag(10)
+    Zeta,
+};
+type InputType = typed_query::PublishedType;
+type Contract = struct {
+    contract_id: String,
+    abi_version: String,
+    datasets: Array(typed_query::Dataset),
+    relations: Array(typed_query::Relation),
+    types: Array(InputType),
+    codec_module: String
+};
+type ContractBody = struct {
+    abi_version: String,
+    datasets: Array(typed_query::Dataset),
+    relations: Array(typed_query::Relation),
+    types: Array(InputType),
+    codec_module: String
+};
+def collected: typed_query::Collected = typed_query::collect(typed::payload, "ic");
+def catalog: Array(typed_query::Dataset) = collected.datasets;
+def relations: Array(typed_query::Relation) = typed_query::relation_symbols(typed::payload,"ic");
+# 测试输入的别名引用同一份类型定义，不复制 codec。
+def input_declarations: Array((String, typed_query::TypeRef)) = [
+    ("ic::CpuFloor", typed_query::type_ref(CpuFloor.type, intent::ResultType::Float)),
+    (
+        "ic::AlarmSeverity",
+        typed_query::type_ref(typed::current_alarm::AlarmSeverity.type, intent::ResultType::String)
+    ),
+    (
+        "ic::DeviceClass",
+        typed_query::type_ref(typed::inventory::DeviceClass.type, intent::ResultType::String)
+    ),
+    ("ic::OpenStatus", typed_query::type_ref(OpenStatus.type, intent::ResultType::String)),
+    ("ic::CodecOrder", typed_query::type_ref(CodecOrder.type, intent::ResultType::String))
+];
+def input_refs: Array(typed_query::TypeRef) = array::map(
+    input_declarations,
+    fn(declared) {
+        declared.1
+    }
+);
+def input_types: Array(InputType) = array::map(
+    array::enumerate(input_declarations),
+    fn(pair) {
+        {name: pair.1.0, logical: input_refs[pair.0].logical, storage: pair.1.1.storage}.ty!(
+            InputType
+        )
+    }
+);
+# 自定义类型先去重；在这一边界之后才生成源码。
+def type_refs: Array(typed_query::TypeRef) = pipeline::run(
+    pipeline::from_array(array::concat([collected.types, input_refs])) |> pipeline::distinct_by(
+        typed_query::type_key
+    ) |> pipeline::collect()
+);
+def public_types: Array(InputType) = array::concat([
+    input_types,
+    array::filter(typed_query::type_symbols("ic", type_refs), fn(item) {
+        !array::any(input_types, fn(declared) { declared.name == item.name })
+    })
+]);
+def codec_entries: String = string::join(
+    array::flat_map(
+        type_refs,
+        fn(ref) {
+            array::map(
+                js_codec::sources(ref.ty, ref.storage),
+                fn(source) {
+                    let key = json::stringify(
+                        codec::encode(typed_query::type_key(ref <~ {storage: source.storage}))
+                    );
+                    string::join([key, ":", source.code], "")
+                }
+            )
+        }
+    ),
+    ",\n"
+);
+def mapping_entries: String = string::join(
+    array::map(
+        array::filter(
+            typed::payload.dimensions,
+            fn(d) {
+                d.canonical_values != []
+            }
+        ),
+        fn(d) {
+            let key = json::stringify(
+                codec::encode(`\{typed::payload.entities[d.entity].id}/\{d.id}`)
+            );
+            `\{key}:\{js_codec::mapping_source(d)}`
+        }
+    ),
+    ",\n"
+);
+def presentation_entries: String = string::join(array::map(type_refs,fn(ref){
+    let key=json::stringify(codec::encode(typed_query::type_key(ref)));
+    `\{key}:\{js_codec::presentation_source(ref.ty)}`
+}),",\n");
+def semantic_entries: String = string::join(array::map(type_refs,fn(ref){
+    let key=json::stringify(codec::encode(typed_query::type_key(ref)));
+    `\{key}:\{js_codec::semantic_source(ref.ty)}`
+}),",\n");
+def codec_module: String = `export function createCodecs(primary) { return Object.freeze({\{codec_entries}}); }\nexport const presentations = Object.freeze({\{presentation_entries}});\nexport const semantics = Object.freeze({\{semantic_entries}});\nexport const mappings = Object.freeze({\{mapping_entries}});\n//# sourceURL=ic-generated-codecs.mjs\n`;
+def contract_id: String = hash::sha256(json::stringify(codec::encode({
+    abi_version: "dari-model/v2", datasets: catalog, relations, types: public_types, codec_module
+}.ty!(ContractBody))));
+
+type Program = struct {
+    contract: Value,
+    check: Fn(Value) -> Value,
+    transform: Fn(Value) -> Value
+};
+def program: Program = build::stage(
+    fn() {
+        {
+            runtime: typed::payload,
+            information: dict::from_pairs([("dari.codecs", codec::encode(codec_module))])
+        }
+    },
+    fn(payload) {
+        {
+            contract: codec::encode(
+                {contract_id, abi_version: "dari-model/v2", datasets: catalog, relations, types: public_types, codec_module}.ty!(Contract)
+            ),
+            check: fn(input) {
+                protocol::check_type(payload, catalog, relations, contract_id, input)
+            },
+            transform: intent::query_request_method_factory(payload, sqlite::build_query)
+        }.ty!(Program)
+    }
+);
+type Request = struct {
+    method: String,
+    input: Value
+};
+type Check = struct {
+    program: Program
+};
+impl service::TransformService for Check {
+    init: fn(ctx) {
+        {program}.ty!(Self)
+    },
+    transform: fn(self, input) {
+        let request = codec::decode@[Request](input).unwrap!();
+        if request.method == "contract" {
+            self.program.contract
+        } else if request.method == "check_type" {
+            self.program.check(request.input)
+        } else if request.method == "transform" {
+            self.program.transform(request.input)
+        } else {
+            fail!("unknown DARI model ABI method", request.method)
+        }
+    },
+};
+@service::collection
+pub type MainService = struct {
+    @service::slot("ontology/dari")
+    check: Check,
+};

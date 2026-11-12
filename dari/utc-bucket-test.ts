@@ -1,0 +1,43 @@
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {check} from './src/compiler.ts';
+import {resolve} from './src/runtime.ts';
+import {utcBucket} from './src/calendar.ts';
+import {proofTarget,type ModelPort} from './src/model.ts';
+import {sharedTypes} from './src/shared-types.ts';
+const db=new DatabaseSync(':memory:');
+for(const [unit,expected]of [['Day','2026-05-17'],['Week','2026-05-11'],['Month','2026-05-01'],['Quarter','2026-04-01'],['Year','2026-01-01']] as const)assert.equal(utcBucket('2026-05-17T23:59:59.999Z',unit),expected+'T00:00:00.000Z');
+assert.equal(utcBucket('2026-01-01T01:00:00Z','Week'),'2025-12-29T00:00:00.000Z');
+assert.equal(utcBucket(null,'Month'),null);
+const source=`data src=table([{ts:DateTimeUtc("2026-05-01T01:00:00Z"),cpu:20.0},{ts:DateTimeUtc("2026-05-01T23:00:00Z"),cpu:40.0},{ts:DateTimeUtc("2026-05-02T00:00:00Z"),cpu:80.0}]);
+data rows=query! {let a=from(src);let b=a |> project({day:utc_bucket(a.ts,CalendarUnit::Day),cpu:a.cpu});let grouped=b |> group_by({day:b.day}) |> project({day:b.day,cpu:avg(b.cpu)});grouped |> order_by(asc(grouped.day)) |> take(10)};
+answer tree! {Answer [UseTable(ref=rows)]};`;
+const program=check(source);const result=resolve(program,db);
+assert.equal(program.bindings.get('rows')!.type.inner!.fields!.day.name,'DateTimeUtc');
+assert.deepEqual(result.values.rows,[{day:'2026-05-01T00:00:00.000Z',cpu:30},{day:'2026-05-02T00:00:00.000Z',cpu:80}]);
+for(const expression of ['utc_bucket(EpochMillis(0),CalendarUnit::Day)','utc_bucket(DateTimeUtc("2026-01-01T00:00:00Z"),"day")'])assert.throws(()=>check(`data x=${expression};answer tree! {Answer []};`),/utc_bucket requires/);
+db.exec('CREATE TABLE nullable_samples(ts TEXT);INSERT INTO nullable_samples VALUES(NULL)');
+const nullable=check(`data src:Table(Schema({ts:Option(DateTimeUtc)}))=source("nullable_samples");data rows=query! {let a=from(src);a |> project({day:utc_bucket(a.ts,CalendarUnit::Day)}) |> order_by(asc(out.day)) |> take(1)};answer tree! {Answer [UseTable(ref=rows)]};`,undefined,{allowTestSources:true});
+assert.equal(nullable.bindings.get('rows')!.type.inner!.fields!.day.kind,'option');
+assert.equal(resolve(nullable,db).values.rows[0].day,null);
+const member={kind:'dimension' as const,id:'ts',symbol:'ts',owner:'sample',type:{kind:'option',inner:sharedTypes.DateTimeUtc}};
+let encodedBucket:any;
+const model:ModelPort={contractId:'test',implementationId:'test-1',datasets:{'test::Sample':{kind:'dataset',id:'sample',symbol:'test::Sample',members:{ts:member}}},
+ check_type(intent,encoded){encodedBucket=JSON.parse(encoded.json).steps[0].body.fields[0].value;assert.equal(encodedBucket.value.node,intent.nodes[0].id);return {element:{kind:'schema',fields:{day:{kind:'option',inner:sharedTypes.DateTimeUtc}}},container:'table',maxRows:10,plan:{},receipt:proofTarget(intent,'test',encoded)};},
+ bind(){throw Error('Check-only model fixture');}};
+const modelSource='data rows=query_remote! {let a=from(test::Sample);let projected=project({day:utc_bucket(a.ts,CalendarUnit::Day)});projected |> order_by(asc(projected.day)) |> take(10)};answer tree! {Answer []};';
+const checked=check(modelSource,model);
+assert.equal(checked.bindings.get('rows')!.type.inner!.fields!.day.kind,'option');
+assert.deepEqual(encodedBucket,{kind:'utc_bucket',value:{kind:'member',node:encodedBucket.value.node,member:'ts'},unit:'Day'});
+assert.throws(()=>check(modelSource,{...model,check_type(intent,encoded){const result=model.check_type(intent,encoded);result.element={kind:'schema',fields:{day:{kind:'scalar',name:'String'}}};return result;}}),/Schema does not match/);
+member.type={kind:'option',inner:sharedTypes.EpochMillis};
+const convertedSource=modelSource.replace('utc_bucket(a.ts,CalendarUnit::Day)','utc_bucket(to_datetime_utc(a.ts),CalendarUnit::Day)');
+// The protocol preserves the conversion instead of silently changing the source encoding.
+const convertedModel:ModelPort={...model,check_type(intent,encoded){encodedBucket=JSON.parse(encoded.json).steps[0].body.fields[0].value;return {element:{kind:'schema',fields:{day:{kind:'option',inner:sharedTypes.DateTimeUtc}}},container:'table',maxRows:10,plan:{},receipt:proofTarget(intent,'test',encoded)};}};
+check(convertedSource,convertedModel);
+assert.equal(encodedBucket.value.kind,'to_datetime_utc');
+assert.equal(encodedBucket.value.value.kind,'member');
+check(convertedSource.replace('utc_bucket(to_datetime_utc(a.ts),CalendarUnit::Day)','to_datetime_utc(a.ts)'),convertedModel);
+assert.equal(encodedBucket.kind,'to_datetime_utc');
+assert.throws(()=>check(modelSource,convertedModel),/DateTimeUtc dimension or to_datetime_utc/);
+db.close();console.log('UTC bucket: five units, Monday weeks, SQL grouping/aggregation, nullable types and diagnostics passed');

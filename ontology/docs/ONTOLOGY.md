@@ -6,6 +6,8 @@
 
 知识发布包含事实和已声明的约束。面向 Agent 的用法与工具示例由消费方负责；版本化契约见[知识契约](KNOWLEDGE.md)。
 
+原始字段、平行语义投射、多 wire 筛选、半封闭分类与独立排序能力见[字段映射](FIELD-MAPPINGS.md)。
+
 ## 查询模型准备
 
 IC 与 relation 均采用类型化 Dataset、Entity 角色、Group 绑定及显式记录计数声明。

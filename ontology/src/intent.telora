@@ -953,7 +953,11 @@ def pair_time_alignment: Fn(
     )
 };
 
-def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
+def lower_graph_pair_with: Fn(
+    edsl::PreparedPayload,
+    Value,
+    Fn(qb::BuildCtx, Value) -> (qb::BuildCtx, edsl::GraphRequest, qb::Plan)
+) -> qb::QueryAst = fn(payload, value, lower) {
     let raw = decode_graph_shape@[RawGraphPair](value, "syntax/graph_pair");
     let obj = as_object(value);
     let count_groups = match dict::get(obj, "count_groups") {
@@ -1025,14 +1029,9 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
     } else {
         ()
     };
-    let left = lower_graph_object(
-        qb::build_context(),
-        payload,
-        pair_operand(raw.left, selected, qb::PairSide::Left)
-    );
-    let right = lower_graph_object(
+    let left = lower(qb::build_context(), pair_operand(raw.left, selected, qb::PairSide::Left));
+    let right = lower(
         qb::independent_query_scope(left.0),
-        payload,
         pair_operand(raw.right, selected, qb::PairSide::Right)
     );
     if !paired_graph_shape(left.1) || !paired_graph_shape(right.1) {
@@ -1274,6 +1273,15 @@ def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payl
         };
         qb::finish(ranked.0, qb::validate_query_plan(plan))
     }
+};
+def lower_graph_pair: Fn(edsl::PreparedPayload, Value) -> qb::QueryAst = fn(payload, value) {
+    lower_graph_pair_with(
+        payload,
+        value,
+        fn(ctx, graph) {
+            lower_graph_object(ctx, payload, graph)
+        }
+    )
 };
 
 # A union returns one entity population, not an arbitrary mixture of rows.
@@ -1892,7 +1900,13 @@ def measure_result_type: Fn(edsl::PreparedPayload, String) -> ResultType = fn(pa
         Some(entry) => entry,
         None => fail!("result column references unknown measure", id),
     };
-    let primitive = primitive_result_type(edsl::measure_output_type(payload, id));
+    measure_entry_result_type(payload, entry)
+};
+def measure_entry_result_type: Fn(edsl::PreparedPayload, edsl::MeasureEntry) -> ResultType = fn(
+    payload,
+    entry
+) {
+    let primitive = primitive_result_type(entry.output_type);
     if entry.computed != None || entry.row_expression != None || (
         entry.aggregate != qb::AggregateFunction::Min && entry.aggregate != qb::AggregateFunction::Max && entry.aggregate != qb::AggregateFunction::Latest
     ) {
@@ -1920,6 +1934,7 @@ def expression_nullable: Fn(edsl::PreparedPayload, qb::BuildCtx, qb::Plan, qb::E
     expr
 ) {
     match expr {
+        qb::Expr::Parameter(_) => False,
         qb::Expr::AllocatedBind(binding) => ctx.bindings[binding.index - 1] == qb::Val::None,
         qb::Expr::Column(ref) => {
             let outer = array::any(
@@ -1962,12 +1977,24 @@ def expression_nullable: Fn(edsl::PreparedPayload, qb::BuildCtx, qb::Plan, qb::E
         },
         qb::Expr::Scalar(call) => match call.function {
             qb::ScalarFunction::IsNotNull => False,
-            qb::ScalarFunction::If => expression_nullable(payload, ctx, plan, call.args[1]) || expression_nullable(
-                payload,
-                ctx,
-                plan,
-                call.args[2]
-            ),
+            qb::ScalarFunction::If => {
+                # 映射兜底 If(IsNotNull(raw), member, NULL) 保留 raw 的可空性。
+                # 仍读取实际计划，LEFT JOIN 引入的空值不会被声明掩盖。
+                let guarded = match (call.args[0], call.args[2]) {
+                    (qb::Expr::Scalar(condition), qb::Expr::AllocatedBind(fallback)) => if condition.function == qb::ScalarFunction::IsNotNull && ctx.bindings[
+                        fallback.index - 1
+                    ] == qb::Val::None {
+                        Some(condition.args[0])
+                    } else {
+                        None
+                    },
+                    _ => None
+                };
+                expression_nullable(payload, ctx, plan, call.args[1]) || match guarded {
+                    Some(raw) => expression_nullable(payload, ctx, plan, raw),
+                    None => expression_nullable(payload, ctx, plan, call.args[2])
+                }
+            },
             # Arithmetic overflow, division by zero and invalid temporal source
             # values may produce NULL even with non-null operands.
             qb::ScalarFunction::Div => True,
@@ -2040,7 +2067,9 @@ def graph_columns: Fn(edsl::PreparedPayload, Value, qb::Plan, qb::BuildCtx) -> A
             let column: ResultColumn = {
                 name,
                 type: dimension_result_type(dimension),
-                nullable: True
+                nullable: payload.entities[dimension.entity].fields[dimension.field].nullable || item.node != as_string(
+                    field(obj, "root")
+                ) || dimension.computed || dimension.utc_bucket != None
             };
             if dimension.half_open {
                 [column, result_column(`\{name}__kind`, edsl::OutputType::Text, True)]
@@ -2358,4 +2387,17 @@ pub use self::{
     query_intent_lower_factory,
     query_intent_ast_factory,
     query_request_method_factory
+};
+
+pub use self::{
+    dimension_result_type,
+    measure_result_type,
+    measure_entry_result_type,
+    measure_nullable
+};
+pub use self::{
+    lower_graph_pair_with,
+    lower_graph_object,
+    final_order_key,
+    lower_unlimited_intent_ast
 };

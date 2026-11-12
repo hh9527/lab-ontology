@@ -34,6 +34,9 @@ pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
 
 def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
     let unit = match spec.unit {
+        qb::UtcBucketUnit::Year => "year",
+        qb::UtcBucketUnit::Quarter => "quarter",
+        qb::UtcBucketUnit::Week => "week",
         qb::UtcBucketUnit::Hour => "hour",
         qb::UtcBucketUnit::Day => "day",
         qb::UtcBucketUnit::Month => "month",
@@ -46,6 +49,7 @@ def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
                 qb::UtcBucketUnit::Hour => `(\{value} - ((\{value} % 3600000 + 3600000) % 3600000))`,
                 qb::UtcBucketUnit::Day => `(\{value} - ((\{value} % 86400000 + 86400000) % 86400000))`,
                 qb::UtcBucketUnit::Month => `(extract(epoch FROM date_trunc('month', to_timestamp((\{value} - ((\{value} % 1000 + 1000) % 1000)) / 1000) AT TIME ZONE 'UTC'))::bigint * 1000)`,
+                _ => fail!("this bucket unit requires DateTimeUtc"),
             };
             `CASE WHEN \{value} >= -62135596800000 AND \{value} < 253402300800000 THEN \{bucket} ELSE NULL END`
         },
@@ -66,6 +70,22 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
         qb::ScalarFunction::Length => `char_length(\{parts[0]})`,
         qb::ScalarFunction::UtcDaysAgo => `to_char((\{parts[0]}::timestamptz - make_interval(days => \{parts[1]}::integer)) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
         qb::ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, parts[0]),
+        qb::ScalarFunction::ZonedTimeBucket(unit) => do {
+            let name = match unit {
+                qb::UtcBucketUnit::Year => "year",
+                qb::UtcBucketUnit::Quarter => "quarter",
+                qb::UtcBucketUnit::Month => "month",
+                qb::UtcBucketUnit::Week => "week",
+                qb::UtcBucketUnit::Day => "day",
+                _ => fail!("unsupported calendar bucket unit")
+            };
+            `date_trunc('\{name}', CAST(\{parts[0]} AS timestamptz), \{parts[1]})`
+        },
+        qb::ScalarFunction::EpochMillisToUtc => do {
+            let v = parts[0];
+            let rem = `((\{v} % 1000 + 1000) % 1000)`;
+            `(to_timestamp((\{v} - \{rem}) / 1000) + \{rem} * INTERVAL '1 millisecond')`
+        },
         qb::ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         qb::ScalarFunction::Ne => `\{parts[0]} != \{parts[1]}`,
         qb::ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,
@@ -87,6 +107,9 @@ type Arguments = struct {
 # The build context owns placeholder assignments; rendering only resolves handles.
 pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
     match expr {
+        qb::Expr::Parameter(_) => fail!(
+            "symbolic query parameters require binding before this dialect"
+        ),
         qb::Expr::Column(ref) => if qb::is_sql_identifier(ref.source) && qb::is_sql_identifier(
             ref.column
         ) {
@@ -102,16 +125,27 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
             fail!("binding handle is not registered in builder context", binding)
         },
         qb::Expr::Scalar(call) => {
-            let initial: Arguments = {sql: [], ctx};
-            let args = array::fold(
-                call.args,
-                initial,
-                fn(state, arg) {
-                    let rendered = emit_expr(arg, state.ctx);
-                    {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
-                }
-            );
-            {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+            let membership = if call.function == qb::ScalarFunction::Or {
+                qb::equality_set(expr)
+            } else {
+                None
+            };
+            if let Some(set) = membership {
+                let input = emit_expr(set.input, ctx);
+                let values = render_exprs(set.values, input.ctx);
+                {sql: `\{input.sql} IN (\{values.sql})`, ctx: values.ctx}
+            } else {
+                let initial: Arguments = {sql: [], ctx};
+                let args = array::fold(
+                    call.args,
+                    initial,
+                    fn(state, arg) {
+                        let rendered = emit_expr(arg, state.ctx);
+                        {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+                    }
+                );
+                {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+            }
         },
     }
 };

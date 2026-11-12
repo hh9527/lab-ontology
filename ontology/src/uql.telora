@@ -37,6 +37,9 @@ pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
 # UQL temporal functions have no timezone argument. Executors must use UTC.
 def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
     let unit = match spec.unit {
+        qb::UtcBucketUnit::Year => "YEAR",
+        qb::UtcBucketUnit::Quarter => "QUARTER",
+        qb::UtcBucketUnit::Week => "WEEK",
         qb::UtcBucketUnit::Hour => "HOUR",
         qb::UtcBucketUnit::Day => "DAY",
         qb::UtcBucketUnit::Month => "MONTH",
@@ -57,6 +60,7 @@ def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
                     let timestamp = `timestampadd('DAY', \{days}, \{origin})`;
                     `CAST(timestampdiff('SECOND', \{origin}, date_trunc('MONTH', \{timestamp})) AS BIGINT) * 1000`
                 },
+                _ => fail!("this bucket unit requires DateTimeUtc"),
             };
             `CASE WHEN \{value} >= -62135596800000 AND \{value} < 253402300800000 THEN \{bucket} ELSE NULL END`
         },
@@ -155,6 +159,11 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
         qb::ScalarFunction::Length => `char_length(\{parts[0]})`,
         qb::ScalarFunction::UtcDaysAgo => `timestamp_format(timestampadd('DAY', (0 - CAST(\{parts[1]} AS INTEGER)), CAST(\{parts[0]} AS TIMESTAMP)), 'yyyy-MM-dd''T''HH:mm:ss''Z''')`,
         qb::ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, parts[0]),
+        qb::ScalarFunction::ZonedTimeBucket(_) => fail!("region timezone buckets require PostgreSQL or the SQLite timezone adapter"),
+        qb::ScalarFunction::EpochMillisToUtc => do {
+            let v=parts[0];let rem=`mod(mod(\{v}, 86400000) + 86400000, 86400000)`;
+            `timestampadd('MILLISECOND', CAST(\{rem} AS INTEGER), timestampadd('DAY', CAST((\{v} - \{rem}) / 86400000 AS INTEGER), CAST('1970-01-01 00:00:00' AS TIMESTAMP)))`
+        },
         qb::ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         qb::ScalarFunction::Ne => `\{parts[0]} <> \{parts[1]}`,
         qb::ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,
@@ -176,6 +185,9 @@ type Arguments = struct {
 # The build context owns placeholder assignments; rendering only resolves handles.
 pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
     match expr {
+        qb::Expr::Parameter(_) => fail!(
+            "symbolic query parameters require binding before this dialect"
+        ),
         qb::Expr::Column(ref) => if qb::is_sql_identifier(ref.source) && qb::is_sql_identifier(
             ref.column
         ) {

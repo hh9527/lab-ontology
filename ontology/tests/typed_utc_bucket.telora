@@ -1,0 +1,54 @@
+use crate::ontology as edsl;
+use crate::query as qb;
+use crate::typed_query as typed;
+use crate::typed_query_protocol as protocol;
+use crate::intent as intent;
+use std::array as array;
+use std::json as json;
+use std::codec as codec;
+use std::value::{Value};
+
+use crate::semantic as domain;
+use crate::scalars as scalars;
+use crate::groups as g;
+use crate::samples as samples;
+
+@domain::metric("ts")
+@domain::dataset("sample","samples",["id"])
+type Sample = struct {
+    @g::exact("sample_id")
+    id:Int,
+    @g::field_view(g::dimension_group("sample_time",scalars::DateTimeUtc.type,True,[g::Filter::Ge,g::Filter::Lt]),"sample_time",True,[g::Filter::Ge,g::Filter::Lt])
+    ts:scalars::DateTimeUtc,
+    @g::field_view(g::dimension_group("sample_epoch",scalars::EpochMillis.type,True,[g::Filter::Ge,g::Filter::Lt]),"sample_epoch",True,[g::Filter::Ge,g::Filter::Lt])
+    epoch:Option(scalars::EpochMillis),
+    @samples::field(samples::group("sample_value",Float.type,samples::Statistic::Mean,[],None),[{statistic:samples::Statistic::Mean,publish:"sample_mean"}])
+    value:Float,
+};
+def profile:qb::PlanProfile={
+    allowed_operators:[qb::Operator::Source,qb::Operator::Column,qb::Operator::Project,qb::Operator::Filter,qb::Operator::Scalar,qb::Operator::Bind,qb::Operator::Group,qb::Operator::Aggregate,qb::Operator::Order,qb::Operator::Limit,qb::Operator::Having],
+    allowed_scalars:[qb::ScalarFunction::Eq,qb::ScalarFunction::Ge,qb::ScalarFunction::Lt,qb::ScalarFunction::IsNotNull,qb::ScalarFunction::And,qb::ScalarFunction::Gt,qb::ScalarFunction::Le,qb::ScalarFunction::Ne],allowed_aggregates:[qb::AggregateFunction::Avg],allowed_join_kinds:[],allow_distinct:False
+};
+def payload:edsl::PreparedPayload=domain::payload("typed-utc-bucket",[Sample.type],profile);
+def catalog:Array(typed::Dataset)=[{id:"sample",symbol:"test::Sample",members:[
+    {id:"sample_time",symbol:"ts",kind:"dimension",logical:"DateTimeUtc",storage:intent::ResultType::DateTimeUtc,nullable:True}.ty!(typed::Member),
+    {id:"sample_epoch",symbol:"epoch",kind:"dimension",logical:"EpochMillis",storage:intent::ResultType::EpochMillis,nullable:True}.ty!(typed::Member),
+    {id:"sample_mean",symbol:"mean",kind:"measure",logical:"Float",storage:intent::ResultType::Float,nullable:True}.ty!(typed::Member)
+]}.ty!(typed::Dataset)];
+type Envelope=struct {intent_json:String};
+type Case=struct {mode:String,encoding:String,unit:String,intent_json:String,result:Value};
+pub def runtime_cases:Value=codec::encode(array::flat_map(["utc","region"],fn(mode){array::flat_map(["datetime","epoch"],fn(encoding){array::map(if mode == "utc" {["Identity","Year","Quarter","Month","Week","Day"]} else {["Year","Quarter","Month","Week","Day"]},fn(unit){
+    let member=if encoding == "datetime" {r#"{"kind":"member","node":"a","member":"ts"}"#} else {r#"{"kind":"to_datetime_utc","value":{"kind":"member","node":"a","member":"epoch"}}"#};
+    let value=if mode == "region" {`{"kind":"calendar_bucket","value":\{member},"unit":"\{unit}","timeZone":{"kind":"parameter","index":0,"input_type":"String","nullable":false,"logical":"TimeZone"}}`} else if unit == "Identity" {if encoding == "datetime" {`{"kind":"to_datetime_utc","value":\{member}}`} else {member}} else {`{"kind":"utc_bucket","value":\{member},"unit":"\{unit}"}`};
+    let wire=`{
+        "root":"a","nodes":[{"id":"a","dataset":"test::Sample"}],"steps":[
+          {"id":"step_0","kind":"project","body":{"kind":"record","fields":[
+            {"name":"bucket","value":\{value}},
+            {"name":"mean","value":{"kind":"member","node":"a","member":"mean"}}
+          ]}},
+          {"id":"step_1","kind":"order_by","body":{"terms":[{"direction":"Asc","value":{"kind":"output","name":"bucket"}}]}},
+          {"id":"step_2","kind":"take","body":{"count":10}}
+        ]
+    }`;
+    {mode,encoding,unit,intent_json:wire,result:protocol::check_type(payload,catalog,[],"test-contract",codec::encode({intent_json:wire}.ty!(Envelope)))}.ty!(Case)
+})})}));
