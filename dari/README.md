@@ -66,21 +66,21 @@ Option 表示有没有行，行内字段用可空标量表达。运行时将 tak
 
 Schema 是扁平记录，字段限逻辑标量及其可空形式，嵌套 Schema 不合法。`&` 合并字段并拒绝类型冲突。业务 newtype 保留名义身份，不同 ID 类型不能直接比较。LEFT JOIN 将右侧字段变为可空类型。聚合检查分组字段；count 返回 Int，avg 返回 Option(Float)。封闭 enum 使用模型公开 variant 和 codec；半开放映射保留原始字段，并提供含 Unknown 的计算 enum 字段。
 
-独立关系运算样例见 [source-select.dari](examples/source-select.dari)。展示使用 tree!、Answer、Report，以及展示宿主提供的图表组件，属性用 `=`。`Value(data = highest, field = project!(cpu))` 读取可选行的字段，缺行或空字段显示无数据。UseTable 输出 Markdown 表格，图表直接内联，UseReport 引用报告产物。条件所有分支都检查类型，执行时只处理选中分支。SVG 内含图表最终输入数据。
+独立关系运算样例见 [source-select.dari](examples/source-select.dari)。展示使用 tree!、Answer、Report，以及展示宿主提供的图表组件，属性用 `=`。先用 `data highest_cpu = map_opt(highest, $.cpu);` 准备可选标量，再用 `UseValue(ref = highest_cpu)` 展示；空值显示无数据。Table 输出 Markdown 表格，图表直接内联，UseReport 引用报告产物。条件所有分支都检查类型，执行时只处理选中分支。SVG 内含图表最终输入数据。
 
 ## 静态模型取数
 
-组件的字段选择使用 `project!(field)`，例如 `BarChart(data = top, spec = {category:project!(name), value:project!(cpu)})`。这是内置的受限投影宏，只接受一个字段标识，由组件的 data 行 Schema 提供检查上下文，校验字段存在性和所需类型。它生成投影计划，不读取数据，也不消除可选行或字段的空值；不能独立绑定或传入任意表达式。语义相当于选择输入行的一个字段，语言不开放手写函数。
+组件的字段选择使用 `$.field`，例如 `BarChart(data = top, spec = {category:$.name, value:$.cpu})`。这是内置的受限投影宏，只接受一个字段标识，由组件的 data 行 Schema 提供检查上下文，校验字段存在性和所需类型。它生成投影计划，不读取数据，也不消除可选行或字段的空值；不能独立绑定或传入任意表达式。语义相当于选择输入行的一个字段，语言不开放手写函数。
 
 ## 前序计算与展现边界
 
-映射由 query! 的 `project({...})` 表达，可组合字段访问、有限算术、lookup 和 coalesce，不需要手写函数。`lookup(value, [{value, label}, ...])` 使用非空静态表，键必须唯一且与输入逻辑类型一致，所有 label 必须是同一逻辑标量类型。未命中或输入为空时返回空值，结果类型为 Option(T)，可通过 coalesce 显式提供默认值。query! 中的 lookup 编译为 SQL CASE，在数据库内完成映射；普通前序绑定也支持相同表达式。
+映射由 query! 的 `project({...})` 表达，可组合字段访问、有限算术、lookup 和 unwrap_or!，不需要手写函数。`lookup(value, [{value, label}, ...])` 使用非空静态表，键必须唯一且与输入逻辑类型一致，所有 label 必须是同一逻辑标量类型。未命中或输入为空时返回空值，结果类型为 Option(T)，可通过 unwrap_or! 显式提供默认值。query! 中的 lookup 编译为 SQL CASE，在数据库内完成映射；普通前序绑定也支持相同表达式。
 
 ```text
 data rows = query! {
     let r = from(alarms);
     let projected = r |> project({
-        label: coalesce(lookup(r.severity, [
+        label: unwrap_or!(lookup(r.severity, [
             {value: ic::AlarmSeverity::Critical, label: "紧急"},
             {value: ic::AlarmSeverity::Major, label: "重要"}
         ]), "其他"),
@@ -91,9 +91,20 @@ data rows = query! {
 
 ```
 
-tree! 组织组件、文本、数据引用和条件分支；字段属性使用直接投影。`Value(value=...)` 接受值引用或字面量，lookup、算术等计算应先绑定或在 query! 中完成。条件仍允许有限布尔表达式及 is_empty，用于选择展示内容。
+tree! 组织组件、文本、数据引用和条件分支；字段属性使用直接投影。`UseValue(ref = a.b.c)` 只接受直接标量引用，lookup、算术等计算应先绑定或在 query! 中完成。条件仍允许有限布尔表达式及 is_empty，用于选择展示内容。
 
 聚焦验证：`node dari/lookup-test.ts`。
+
+## 空值默认值与标量引用
+
+`unwrap_or!(value, default_expr)` 接收 Option(T) 和同一业务类型的 T，结果为 T。后置宏 `value.unwrap_or!(default_expr)` 展开为相同的前置形式；只有值为空时才求值默认表达式。普通计算和 query! 均支持，query! 中 lower 为 SQL COALESCE。query_remote! 仍由模型公开的表达式能力决定。
+
+```text
+data prepared = { cpu: map_opt(highest, $.cpu).unwrap_or!(default_cpu) };
+answer tree! { Answer [UseValue(ref = prepared.cpu)] };
+```
+
+UseValue 的 ref 只接受直接引用，不接受字面量、调用或算术；记录与空值处理提前放在 data 中。precision 为可选展示精度，业务类型、引用标识和高亮保持不变。
 
 ## 模型 query_remote!
 
@@ -161,7 +172,7 @@ context 由宿主传入，不在语言中猜测时间或时区。检查时通过
 - 独立 source 的契约由作者声明，仅用于验证；生产 query_remote! 的契约必须由模型检查产生
 - 单个 query! 支持两源连接、连续筛选和投影、分组、排序截取，可串联多个 query!
 - project 始终产生 Schema 行，单列也需要列名；不支持标量 Table 或嵌套记录字段
-- Option 支持 tree 内的 if let Some 分支；Value 可通过字段投影读取可选行，coalesce 可提供完整行回退
+- Option 支持 tree 内的 if let Some 分支；map_opt 可提前提取可选行字段，unwrap_or! 可提供完整行回退
 - 图表复用全部 16 类生产组件，支持 Markdown 表格、受控 HTML 报告、图内 CSV/spec 和源码/context/执行溯源
 - context 的类型和值由宿主分别提供；宿主通过 dari 配置接入工具、符号查询和提示词，context 契约为 dari-context/v2；日历窗口通过宿主提供；不开放自定义函数或递归类型，尚无 LSP
 

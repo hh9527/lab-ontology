@@ -11,13 +11,13 @@ assert.equal(utcBucket('2026-01-01T01:00:00Z','Week'),'2025-12-29T00:00:00.000Z'
 assert.equal(utcBucket(null,'Month'),null);
 const source=`data src=table([{ts:DateTimeUtc("2026-05-01T01:00:00Z"),cpu:20.0},{ts:DateTimeUtc("2026-05-01T23:00:00Z"),cpu:40.0},{ts:DateTimeUtc("2026-05-02T00:00:00Z"),cpu:80.0}]);
 data rows=query! {let a=from(src);let b=a |> project({day:utc_bucket(a.ts,CalendarUnit::Day),cpu:a.cpu});let grouped=b |> group_by({day:b.day}) |> project({day:b.day,cpu:avg(b.cpu)});grouped |> order_by(asc(grouped.day)) |> take(10)};
-answer tree! {Answer [UseTable(ref=rows)]};`;
+answer tree! {Answer [Table(data =rows)]};`;
 const program=check(source);const result=resolve(program,db);
 assert.equal(program.bindings.get('rows')!.type.inner!.fields!.day.name,'DateTimeUtc');
 assert.deepEqual(result.values.rows,[{day:'2026-05-01T00:00:00.000Z',cpu:30},{day:'2026-05-02T00:00:00.000Z',cpu:80}]);
 for(const expression of ['utc_bucket(EpochMillis(0),CalendarUnit::Day)','utc_bucket(DateTimeUtc("2026-01-01T00:00:00Z"),"day")'])assert.throws(()=>check(`data x=${expression};answer tree! {Answer []};`),/utc_bucket requires/);
 db.exec('CREATE TABLE nullable_samples(ts TEXT);INSERT INTO nullable_samples VALUES(NULL)');
-const nullable=check(`data src:Table(Schema({ts:Option(DateTimeUtc)}))=source("nullable_samples");data rows=query! {let a=from(src);a |> project({day:utc_bucket(a.ts,CalendarUnit::Day)}) |> order_by(asc(out.day)) |> take(1)};answer tree! {Answer [UseTable(ref=rows)]};`,undefined,{allowTestSources:true});
+const nullable=check(`data src:Table(Schema({ts:Option(DateTimeUtc)}))=source("nullable_samples");data rows=query! {let a=from(src);a |> project({day:utc_bucket(a.ts,CalendarUnit::Day)}) |> order_by(asc(out.day)) |> take(1)};answer tree! {Answer [Table(data =rows)]};`,undefined,{allowTestSources:true});
 assert.equal(nullable.bindings.get('rows')!.type.inner!.fields!.day.kind,'option');
 assert.equal(resolve(nullable,db).values.rows[0].day,null);
 const member={kind:'dimension' as const,id:'ts',symbol:'ts',owner:'sample',type:{kind:'option',inner:sharedTypes.DateTimeUtc}};

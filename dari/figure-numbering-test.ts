@@ -5,12 +5,12 @@ import {resolve} from './src/runtime.ts';
 const {dariHost}=await import(new URL('../../dsh-oks/packages/dsh-oks/src/dari-host.ts',import.meta.url).href);
 const db=new DatabaseSync(':memory:');
 try{
- const chart='BarChart(data=rows,spec={category:project!(label),value:project!(value),title:"数量"})';
+ const chart='BarChart(data=rows,spec={category:$.label,value:$.value,title:"数量"})';
  const table='Table(data=rows,spec={columns:["label","value"]})';
  const source=`data rows=table([{label:"a",value:1}]);
  report first=tree! {Report [${chart},${table},if False [${chart}] else [],${chart},${table}]};
  report second=tree! {Report [${chart}]};
- answer tree! {Answer [${chart},UseReport(ref=first),UseReport(ref=second),${table},if False [${chart}] else [],${chart},UseTable(ref=rows)]};`;
+ answer tree! {Answer [${chart},UseReport(ref=first),UseReport(ref=second),${table},if False [${chart}] else [],${chart},Table(data =rows)]};`;
  const result=resolve(check(source,undefined,{host:dariHost}),db);
  assert.match(result.answer,/图 1：数量/);assert.match(result.answer,/图 2：数量/);
  assert.match(result.answer,/表 1/);assert.match(result.answer,/表 2/);

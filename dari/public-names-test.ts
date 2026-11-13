@@ -12,7 +12,7 @@ try{
  data start=windows[0].start.epoch_millis;
  data utc=windows[0].start.date_time_utc;
  data bucket=time_bucket(start,{unit:TimeUnit::Day,time_zone:"Asia/Shanghai"});
- answer tree! {Answer [Value(value=start),Value(value=utc),Value(value=bucket)]};`;
+ answer tree! {Answer [UseValue(ref =start),UseValue(ref =utc),UseValue(ref =bucket)]};`;
  const program=check(source,undefined,{host:dariHost,contextType});
  const result=resolve(program,db,{}, {context:{epochMillis:Date.parse('2026-11-12T00:00:00Z'),timeZone:'Asia/Shanghai'}});
  assert.equal(result.values.utc,'2026-11-10T16:00:00.000Z');

@@ -45,11 +45,11 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
         {id:'b',severity:{tag:'Critical'},category:{tag:'Lsw'},status:{tag:'Unknown'}}
     ]);
     const optional=source.replace('category: ic::DeviceClass});','category: ic::DeviceClass, optional: Option(ic::OpenStatus)});')
-        .replace('status: a.status','status: coalesce(request.optional, ic::OpenStatus::Up)');
+        .replace('status: a.status','status: unwrap_or!(request.optional, ic::OpenStatus::Up)');
     const optionalPlan=check(optional,model);
     assert.deepEqual(resolve(optionalPlan,db,{request:{severity:'Critical',category:'Lsw',optional:null}}).values.rows[0].status,{tag:'Up'});
     assert.deepEqual(resolve(optionalPlan,db,{request:{severity:'Critical',category:'Lsw',optional:'Unknown'}}).values.rows[0].status,{tag:'Unknown'});
-    const labeled=source.replace('status: a.status','status: coalesce(lookup(a.status, [{value: ic::OpenStatus::Up, label: "在线"}]), "其他")');
+    const labeled=source.replace('status: a.status','status: unwrap_or!(lookup(a.status, [{value: ic::OpenStatus::Up, label: "在线"}]), "其他")');
     assert.deepEqual(resolve(check(labeled,model),db,{request:{severity:'Critical',category:'Lsw'}}).values.rows.map((r:any)=>r.status),['在线','其他']);
     assert.throws(()=>check(optional.replace('ic::OpenStatus::Up','ic::OpenStatus::Missing'),model),/Unknown enum variant/);
     assert.throws(()=>check(optional.replace('ic::OpenStatus::Up','ic::OpenStatus("Up")'),model),/static enum variant/);
@@ -67,7 +67,7 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
         a |> project({id: a.device_id, raw: a.device_class_raw, category: a.device_class})
           |> order_by(asc(a.device_id)) |> take(10)
     };
-    answer tree! { Answer [UseTable(ref = rows)] };`,model);
+    answer tree! { Answer [Table(data = rows)] };`,model);
     const classRows=resolve(classes,db).values.rows;
     assert.deepEqual(classRows.map((r:any)=>[r.raw,r.category.tag]),[['LSW','Lsw'],['brand-new','Unknown'],['ne.category.switch','Lsw']]);
     db.exec(`CREATE TABLE I_EnterpriseFrame(frameDn TEXT,operState INTEGER);
@@ -77,7 +77,7 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
         a |> project({id: a.frame__frameDn, raw: a.frame_oper_state_raw, state: a.frame_oper_state})
           |> order_by(asc(a.frame__frameDn)) |> take(10)
     };
-    answer tree! { Answer [UseTable(ref = rows)] };`,model);
+    answer tree! { Answer [Table(data = rows)] };`,model);
     assert.deepEqual(resolve(frame,db).values.rows.map((r:any)=>[r.raw,r.state]),[[null,null],[1,{tag:'Unknown'}],[3,{tag:'Normal'}]]);
     db.exec("CREATE TABLE enum_sort(raw TEXT,logical TEXT); INSERT INTO enum_sort VALUES('Alpha','Alpha'),('Zeta','Zeta')");
     const orderedSource=`type Row = Schema({raw: String, logical: ic::CodecOrder});
@@ -85,7 +85,7 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
     data rows = query! { let a = from(source_rows);
         a |> project({raw: a.raw, logical: a.logical}) |> order_by(asc(out.logical)) |> take(10)
     };
-    answer tree! { Answer [UseTable(ref = rows)] };`;
+    answer tree! { Answer [Table(data = rows)] };`;
     assert.deepEqual(resolve(check(orderedSource,model),db).values.rows.map((r:any)=>r.raw),['Zeta','Alpha']);
     assert.deepEqual(resolve(check(orderedSource.replace('asc(out.logical)','asc(out.raw)'),model),db).values.rows.map((r:any)=>r.raw),['Alpha','Zeta']);
     assert.deepEqual(model.types!['ic::AlarmSeverity'].codec!.parse(1),{tag:'Critical'});

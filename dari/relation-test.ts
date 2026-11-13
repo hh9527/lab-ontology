@@ -15,7 +15,7 @@ try{
  f |> connect(ic::relations::frame_belongs_to_device,f,d)
    |> project({frame:f.frame_name,device:d.device_name})
    |> order_by(asc(out.frame)) |> take(10)
-};answer tree! { Answer [UseTable(ref = rows)]};`;
+};answer tree! { Answer [Table(data = rows)]};`;
  const program=check(source,host.model);
  assert.match(show(program.bindings.get('rows')!.type),/device: Option\(String\)/);
  const result=resolve(program,db);

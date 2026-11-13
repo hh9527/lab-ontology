@@ -8,7 +8,7 @@ const compile=(steps:string)=>check(`
 type Row = Schema({id:Int, score:Float});
 data src: Table(Row) = source("data");
 data rows = query! { let a = from(src); a ${steps} };
-answer tree! { Answer [UseTable(ref = rows)] };
+answer tree! { Answer [Table(data = rows)] };
 `,undefined,{allowTestSources:true});
 const run=(steps:string)=>resolve(compile(steps),db).values.rows;
 assert.deepEqual(run(`|> filter(a.id > 1) |> filter(a.score < 40.0)
@@ -28,7 +28,7 @@ assert.deepEqual(run(`|> project({id:a.id,score:a.score}) |> order_by(desc(out.s
 assert.deepEqual(run(`|> project({id:a.id,score:a.score}) |> order_by(desc(out.score)) |> take(3)
  |> filter(out.score > 20.0) |> order_by(asc(out.id)) |> take(1)`),[{id:2,score:30}]);
 assert.deepEqual(run(`|> project({id:a.id, score:a.score}) |> project({total:sum(out.score)})
- |> filter(coalesce(out.total,0.0) > 0.0)`),[{total:100}]);
+ |> filter(unwrap_or!(out.total,0.0) > 0.0)`),[{total:100}]);
 assert.equal(show(compile('|> project({id:a.id}) |> order_by(asc(out.id)) |> take(2)').bindings.get('rows')!.type),'Table(Schema({id: Int}))');
 assert.throws(()=>compile('|> project({id:a.id}) |> project({score:a.score}) |> order_by(asc(out.score)) |> take(2)'),/Unknown binding a/);
 assert.throws(()=>compile('|> project({id:a.id}) |> filter(out.missing > 1) |> order_by(asc(out.id)) |> take(2)'),/Unknown field/);

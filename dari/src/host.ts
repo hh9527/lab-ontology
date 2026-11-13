@@ -1,5 +1,5 @@
 import type {Type} from './compiler.ts';
-export type FigureOutput={kind:'chart'|'table';content:string;html?:string;title?:string};
+export type FigureOutput={kind:'chart'|'table';content:string;html?:string;title?:string;dataText?:string};
 export type HostPort={
  contractId:string;
  types?:Record<string,Type>;

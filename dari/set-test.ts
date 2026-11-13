@@ -11,17 +11,17 @@ for(let i=600;i<1800;i++)insertB.run(i,'g'+i%3,i);
 const prefix='type R=Schema({id:Int,g:String,n:Int});data a:Table(R)=source("a");data b:Table(R)=source("b");';
 function run(body:string){return resolve(check(prefix+body,undefined,{allowTestSources:true}),db);}
 for(const [op,total]of [['union',1800],['union_all',2400],['intersect',600],['except',600]]as const){
- const result=run(`data combined=query! {let l=from(a);let r=from(b);${op}({l,r})};data total=query! {let x=from(combined);x |> project({n:count()}) |> take_opt()};answer tree! { Answer [Value(data = total,field = project!(n))]};`);
+ const result=run(`data combined=query! {let l=from(a);let r=from(b);${op}({l,r})};data total=query! {let x=from(combined);x |> project({n:count()}) |> take_opt()};answer tree! { Answer [if let Some(value_row) = total [UseValue(ref = value_row.n)] else ["无数据"]]};`);
  assert.equal(result.answer,'*'+total+'*');assert.equal(result.queries,1);
 }
 for(const [op,total]of [['semi_join',600],['anti_join',600]]as const){
- const result=run(`data matched=query! {let l=from(a);let r=from(b);${op}({l,r},l.id == r.id) |> project({id:l.id})};data total=query! {let x=from(matched);x |> project({n:count()}) |> take_opt()};answer tree! { Answer [Value(data = total,field = project!(n))]};`);
+ const result=run(`data matched=query! {let l=from(a);let r=from(b);${op}({l,r},l.id == r.id) |> project({id:l.id})};data total=query! {let x=from(matched);x |> project({n:count()}) |> take_opt()};answer tree! { Answer [if let Some(value_row) = total [UseValue(ref = value_row.n)] else ["无数据"]]};`);
  assert.equal(result.answer,'*'+total+'*');
 }
-const top=run('data rows=query! {let r=from(a);r |> top_per({g:r.g},desc(r.n),1) |> project({g:r.g,n:r.n}) |> order_by(asc(out.g)) |> take(10)};answer tree! { Answer [UseTable(ref = rows)]};');
+const top=run('data rows=query! {let r=from(a);r |> top_per({g:r.g},desc(r.n),1) |> project({g:r.g,n:r.n}) |> order_by(asc(out.g)) |> take(10)};answer tree! { Answer [Table(data = rows)]};');
 assert.deepEqual(top.values.rows.map((r:any)=>r.n),[1197,1198,1199]);
-const dedup=run('data rows=query! {let r=from(a);r |> project({g:r.g}) |> distinct() |> order_by(asc(out.g)) |> take(10)};answer tree! { Answer [UseTable(ref = rows)]};');
+const dedup=run('data rows=query! {let r=from(a);r |> project({g:r.g}) |> distinct() |> order_by(asc(out.g)) |> take(10)};answer tree! { Answer [Table(data = rows)]};');
 assert.equal(dedup.values.rows.length,3);
-assert.throws(()=>check(prefix+'answer tree! { Answer [UseTable(ref = a)]};',undefined,{allowTestSources:true}),/proven bound/);
-assert.equal(run('data empty=is_empty(a);answer tree! { Answer [Value(value = empty)]};').answer,'*false*');
+assert.throws(()=>check(prefix+'answer tree! { Answer [Table(data = a)]};',undefined,{allowTestSources:true}),/proven bound/);
+assert.equal(run('data empty=is_empty(a);answer tree! { Answer [UseValue(ref = empty)]};').answer,'*false*');
 db.close();console.log('unmaterialized SQL DAG: union/all/intersect/except, semi/anti joins, distinct, partition Top-N and delivery bounds passed');

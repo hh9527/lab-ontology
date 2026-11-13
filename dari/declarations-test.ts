@@ -6,7 +6,7 @@ const db=new DatabaseSync(':memory:');
 const source=`
 data rows=table([{name:"A",value:1}]);
 
-report summary=tree! {Report [ColumnChart(data = rows,x = project!(name),value = project!(value))]};
+report summary=tree! {Report [ColumnChart(data = rows,x = $.name,value = $.value)]};
 answer tree! {Answer [UseReport(ref = summary)]};
 `;
 const p=check(source),result=resolve(p,db);
@@ -19,6 +19,7 @@ for(const [text,error]of [
  ['data x=tree! {Answer []};',/data requires a data value/],
  ['figure x=42;',/Use type, data, report or answer/],
  ['answer tree! {Answer [UseFigure(ref = x)]};',/Unknown component UseFigure/],
+ ['answer tree! {Answer [UseTable(ref = x)]};',/Unknown component UseTable/],
  ['report x=tree! {Answer []};',/report requires tree!/],
  ['answer tree! {Report []};',/answer requires tree!/],
  ['answer = tree! {Answer []};',/without =/],

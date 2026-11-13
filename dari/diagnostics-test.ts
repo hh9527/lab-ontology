@@ -3,9 +3,9 @@ import {check} from './src/compiler.ts';
 import {DiagnosticFailure,modelErrorText} from './src/diagnostics.ts';
 function failure(source:string){try{check(source);assert.fail('Expected diagnostics');}catch(error){assert(error instanceof DiagnosticFailure);return error;}}
 const syntax=failure(`answer tree! { Answer [
- Value(value: concat("x)","y")),
- Value(value: 2),
- Value(value: 3)
+ UseValue(value: concat("x)","y")),
+ UseValue(value: 2),
+ UseValue(value: 3)
 ]};`);
 assert.equal(syntax.diagnostics.length,3);
 assert.match(syntax.message,/CheckFailed\n-----------/);
@@ -15,11 +15,11 @@ assert(!syntax.message.includes('Missing attribute'));
 const semantic=failure(`data bad=missing;
 data dependent=bad + 1;
 data fields={a:firstMissing,b:secondMissing};
-answer tree! { Answer [p [Value(value = thirdMissing),Value(value = fourthMissing)]]};`);
+answer tree! { Answer [p [UseValue(ref = thirdMissing),UseValue(ref = fourthMissing)]]};`);
 assert.equal(semantic.diagnostics.length,5);
 assert(!semantic.message.includes('Unknown binding bad'));
 assert(!semantic.message.includes('One data answer'));
-const mixed=failure('data bad = ;\ndata valid = 42;\ndata other = notDefined;\nanswer tree! {Answer [Value(value = valid)]};');
+const mixed=failure('data bad = ;\ndata valid = 42;\ndata other = notDefined;\nanswer tree! {Answer [UseValue(ref = valid)]};');
 assert.equal(mixed.diagnostics.length,2);
 assert(!mixed.message.includes('Unknown binding valid'));
 const types=failure('type Bad=Schema({a:Missing,b:OtherMissing});data input:Bad=input();answer tree! { Answer []};');
@@ -40,7 +40,7 @@ assert.match(set.message,/value: a = A, b = B/);assert.match(set.message,/保留
 const {createFixtureModel}=await import('./fixture-model.ts');
 const {model}=createFixtureModel();
 try{check('data q=query_remote! {let alarm=from(ic::DeviceKpi);let selected=alarm |> project({tenant:alarm.tenant_name});selected |> order_by(asc(selected.tenant)) |> take(10)};answer tree! {Answer []};',model);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.equal(e.diagnostics[0].code,'unknown-model-member');assert.match(e.message,/alarm.tenant_name/);assert.match(e.message,/先 connect/);assert(!e.message.includes('r0.'));}
-try{check('data q=query_remote! {let d=from(ic::DeviceKpi);d |> project({name:coalesce(d.name,"unknown")}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer []};',model);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/Computed model expression coalesce/);assert(!e.message.includes('Unknown binding d'));}
+try{check('data q=query_remote! {let d=from(ic::DeviceKpi);d |> project({name:unwrap_or!(d.name,"unknown")}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer []};',model);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/Computed model expression unwrap_or!/);assert(!e.message.includes('Unknown binding d'));}
 const mismatchModel={...model,check_type(){throw Error('filter parameter type does not match dimension');}};
 const loweredSource='data q=query_remote! {let d=from(ic::DeviceKpi).as!(device);let selected=d |> filter(device.name > 1);let output=selected |> project({name:device.name});output |> order_by(asc(output.name)) |> take(1)};answer tree! {Answer []};';
 try{check(loweredSource,mismatchModel);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/device.name expects String/);assert(!/\br\d+\./.test(e.message));assert(!e.message.includes('@local/'));}
@@ -66,11 +66,11 @@ try{check(staticSource,undefined,{host:dariHost});assert.fail('Expected failure'
  for(const [i,name] of ['label','n','share'].entries()){
   assert.equal(e.diagnostics[i].code,'static-option');assert.equal(e.diagnostics[i].at,staticSource.indexOf(name,staticSource.indexOf('columns:[')+9));
   assert.match(e.diagnostics[i].message,new RegExp('Table.spec.columns\\['+i+'\\]'));
-  assert(e.diagnostics[i].suggestion?.includes('project!('+name+')'));
+  assert(e.diagnostics[i].suggestion?.includes('$.'+name+''));
  }
  assert(!e.message.includes('L1:1'));
 }
-for(const columns of ['[project!(label),project!(n),project!(share)]','["label","n","share"]'])check(staticSource.replace('[label,n,share]',columns),undefined,{host:dariHost});
+for(const columns of ['[$.label,$.n,$.share]','["label","n","share"]'])check(staticSource.replace('[label,n,share]',columns),undefined,{host:dariHost});
 check('data ctx=context! {now:Context::Now,tz:Context::ClientTz};data days=time_windows({epoch_millis:ctx.now,time_zone:ctx.tz},{unit:TimeUnit::Day,count:3,mode:WindowMode::Complete});answer tree! {Answer []};',undefined,{host:dariHost,contextType:{kind:'schema',fields:{epochMillis:{kind:'scalar',name:'EpochMillis'},timeZone:{kind:'scalar',name:'String'}}}});
 const compositeModel={...model,check_type(){throw Error('final order column node_0_name has no declared business ordering');}};
 try{check(loweredSource,compositeModel);assert.fail('Expected failure');}catch(e){assert(e instanceof DiagnosticFailure);assert.match(e.message,/device.name/);assert(!e.message.includes('node_0_name'));}

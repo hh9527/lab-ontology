@@ -19,7 +19,7 @@ try{
  |> filter(kr.device_kpi_ts_raw >= request.split) |> filter(kr.device_kpi_ts_raw < request.end)
  |> project({device:l.device_id,before:kl.cpu_usage,after:kr.cpu_usage})
  |> order_by(desc(growth_rate(out.after,out.before))) |> take(10)
- };answer tree! { Answer [UseTable(ref = rows)]};`;
+ };answer tree! { Answer [Table(data = rows)]};`;
  const inputs={request:{start:'2026-11-01T00:00:00Z',split:'2026-11-02T00:00:00Z',end:'2026-11-03T00:00:00Z'}};
  const result=resolve(check(source,host.model),db,inputs);
  assert.deepEqual(result.values.rows.map((r:any)=>r.device),['one','two']);

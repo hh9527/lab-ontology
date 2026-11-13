@@ -8,7 +8,7 @@ const host=await openModel(process.argv[2]);
 const db=new DatabaseSync(':memory:');
 try{
  db.exec("CREATE TABLE T_CURRENT_ALARM(CSN INTEGER,OCCURUTC INTEGER,ALARMNAME TEXT);INSERT INTO T_CURRENT_ALARM VALUES(1,1000,'A'),(2,2000,'A'),(3,3000,'B'),(4,9000,'A'),(5,1500,'C')");
- const query=(body:string)=>check('data bounds:Schema({start:EpochMillis,end:EpochMillis})=input();data rows=query_remote! {'+body+'};answer tree! { Answer [UseTable(ref = rows)]};',host.model);
+ const query=(body:string)=>check('data bounds:Schema({start:EpochMillis,end:EpochMillis})=input();data rows=query_remote! {'+body+'};answer tree! { Answer [Table(data = rows)]};',host.model);
  const body='let a=from(ic::current_alarm);let windowed=a |> filter(a.alarm_occur_utc_raw >= bounds.start && a.alarm_occur_utc_raw < bounds.end);let totals=project({name:windowed.alarm_name,cnt:windowed.alarm_count});totals |> order_by(desc(totals.cnt),asc(totals.name)) |> take(10)';
  assert.deepEqual(resolve(query(body),db,{bounds:{start:1000,end:4000}}).values.rows,[{name:'A',cnt:2},{name:'B',cnt:1},{name:'C',cnt:1}]);
  const after=body.replace('totals |> order_by','totals |> filter(totals.name != "C") |> order_by');

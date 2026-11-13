@@ -33,7 +33,7 @@ try{
     if(request.method==='check')result={types:[...p.bindings].filter(([,b])=>!b.internal).map(([name,b])=>({name,type:show(b.type)})),warnings:p.warnings.length?renderDiagnostics(p.source,p.warnings,'Warnings'):undefined};
     else{
      const db=new DatabaseSync(database,{readOnly:true});
-     try{const run=resolve(p,db,request.inputs??{},{context:request.context,contextContractId:request.contextContractId});result={answer:run.answer,artifacts:run.artifacts,queries:run.queries};}finally{db.close();}
+     try{const run=resolve(p,db,request.inputs??{},{context:request.context,contextContractId:request.contextContractId});result={answer:run.answer,artifacts:run.artifacts,queries:run.queries,dataDocument:run.dataDocument,deliveryId:run.deliveryId};}finally{db.close();}
     }
    }else throw Error('Unknown DARI service method');
    process.stdout.write(JSON.stringify({id,result})+'\n');

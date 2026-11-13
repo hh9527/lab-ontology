@@ -12,7 +12,7 @@ try{
             a |> project({value: a.${dimension.id}})
               |> order_by(asc(a.${dimension.id})) |> take(5)
         };
-        answer tree! { Answer [UseTable(ref = rows)] };`;
+        answer tree! { Answer [Table(data = rows)] };`;
         try {assert.equal(check(source,host.model).bindings.get('rows')!.type.kind,'table');}
         catch(error){throw Error(dataset.id+': '+(error as Error).message);}
         datasets++;

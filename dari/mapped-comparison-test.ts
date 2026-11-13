@@ -8,7 +8,7 @@ const dataset=model.datasets['ic::DeviceKpi'];
 dataset.members.class={kind:'dimension',id:'class',symbol:'class',owner:dataset.id,type:kind};
 let calls=0,captured:any;
 model.check_type=(_intent,encoded)=>{calls++;captured=JSON.parse(encoded.json);throw Error('model-boundary');};
-const source=(predicate:string)=>`data rows=query_remote! {let a=from(ic::DeviceKpi);a |> filter(${predicate}) |> project({name:a.name}) |> order_by(asc(out.name)) |> take(10)};answer tree! {Answer [UseTable(ref = rows)]};`;
+const source=(predicate:string)=>`data rows=query_remote! {let a=from(ic::DeviceKpi);a |> filter(${predicate}) |> project({name:a.name}) |> order_by(asc(out.name)) |> take(10)};answer tree! {Answer [Table(data = rows)]};`;
 for(const [predicate,op]of [['a.class == ic::Kind::Olt','Eq'],['ic::Kind::Olt != a.class','Ne']]){
  assert.throws(()=>check(source(predicate),model),/model-boundary/);
  assert.deepEqual(captured.steps[0].body,{kind:'mapped_comparison',value:{kind:'member',node:captured.nodes[0].id,member:'class'},logical:'test::Kind',member:'Olt',op});

@@ -1,9 +1,14 @@
+function readProjection(row:any,path:readonly string[]):any {
+ let value=row;
+ for(const segment of path){const unwrap=segment.endsWith('?'),key=unwrap?segment.slice(0,-1):segment;value=value[key];if(unwrap){if(value===null||value?.tag==='None')return null;if(value?.tag==='Some')value=value.value;}}
+ return value;
+}
 import {calendarFunctions,utcBucket,calendarBucket,registerCalendarSqlite} from './calendar.ts';
 import {formatValue} from './format.ts';
 import {timeFunctions,epochMillis} from './time-values.ts';
 import {timeType,sharedTypes} from './shared-types.ts';
 import {inSubnet} from './ipv4.ts';
-import {same,type Program,type Type,type Plan} from './compiler.ts';
+import {same,projectionType,type Program,type Type,type Plan} from './compiler.ts';
 import type {Node} from './syntax.ts';
 import {renderDiagnostics} from './diagnostics.ts';
 import type {DatabaseSync} from 'node:sqlite';
@@ -37,6 +42,12 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
  for(const [name,fn]of Object.entries(p.host?.functions??{}))if(fn.sql)db.function('dari_host_'+name,{deterministic:true,varargs:true},(...args:any[])=>fn.run(args.map((value,i)=>fn.sql!.jsonArgs?.includes(i)&&value!==null?JSON.parse(value):value)) as any);
  for(const [name,type]of Object.entries(sharedTypes))if(timeType(type)||['LocalDate','TimeZone'].includes(name))db.function('dari_parse_'+name,{deterministic:true},(v:any)=>type.codec!.parse(v) as any);
  let chartSerial=0;
+ let dataScope='answer';
+ const dataSections=new Map<string,string[]>(),includedReports=new Set<string>();
+ const recordData=(key:string,text:string)=>{const parts=dataSections.get(dataScope)??[];parts.push('## '+dataScope+'/'+key+'\n\n'+text);dataSections.set(dataScope,parts);};
+ const valueKeys=new Set<string>(),valueSections=new Map<string,string[]>();
+ function recordValue(n:Node,text:unknown){const a=Object.fromEntries(n.attrs.map((f:Node)=>[f.name,f.value]));const key=a.ref.path.join('.');const full=dataScope+'/'+key;if(!valueKeys.has(full)){valueKeys.add(full);const lines=valueSections.get(dataScope)??[];lines.push('- '+key+': '+md(text));valueSections.set(dataScope,lines);}}
+
  const cache=new Map<string,any>();const artifacts:Record<string,string>={};let queries=0;
  const runId=randomUUID(),startedAt=new Date().toISOString();
  let scopes:Record<string,any>[]=[];
@@ -96,8 +107,8 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   }
   if(n.k==='call'&&n.name==='map_opt'){
    const row=value(n.args[0]),projection=n.args[1],contract=projection.checkedType;
-   if(contract?.kind!=='projection'||!contract.input.fields?.[projection.field]||!same(contract.output,contract.input.fields[projection.field]))throw Error('Optional projection does not match its checked contract');
-   return row===null||row?.tag==='None'?null:(row?.tag==='Some'?row.value:row)[projection.field];
+   if(contract?.kind!=='projection'||!same(contract.output,projectionType(contract.input,projection.path)))throw Error('Optional projection does not match its checked contract');
+   if(row===null||row?.tag==='None')return null;return readProjection(row?.tag==='Some'?row.value:row,projection.path);
   }
   if(n.k==='call'&&Object.hasOwn(timeFunctions,n.name)){const args=n.args.map(value);return args.some((v:any)=>v===null)?null:(timeFunctions[n.name as keyof typeof timeFunctions] as (...args:any[])=>any)(...args);}
   if(n.k==='call'&&p.types.get(n.name)?.kind==='scalar'&&['EpochMillis','DateTimeUtc','DateTimeTz','LocalDate','TimeZone'].includes(p.types.get(n.name)!.name!))return convert(p.types.get(n.name)!,value(n.args[0]),'parse');
@@ -122,7 +133,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   }
   return plainValue(n);
  }
- function plainValue(n:Node):any {if(n.k==='array')return n.items.map(value);if(n.k==="unary"){const v=value(n.value);return v===null?null:-v;}if(n.k==="binary"){const a=operand(n.left),b=operand(n.right);if(a===null||b===null)return null;switch(n.op){case "+":return a+b;case "-":return a-b;case "*":return a*b;case "/":return b===0?null:a/b;case "%":return b===0?null:a%b;case "==":return a===b;case "!=":return a!==b;case "<":return a<b;case ">":return a>b;case "<=":return a<=b;case ">=":return a>=b;case "&&":return a&&b;case "||":return a||b;}}if(n.k==="call"&&n.name==="coalesce"){const v=value(n.args[0]);return v?.tag==='Some'?v.value:v?.tag==='None'||v===null?value(n.args[1]):v;}if(n.k==='literal')return n.value;if(n.k==='ref'){const scope=scopes.findLast(s=>Object.hasOwn(s,n.path[0]));let v=scope?scope[n.path[0]]:binding(n.path[0]);for(const k of n.path.slice(1))v=v[k];return v;}if(n.k==='object')return Object.fromEntries(n.fields.map((f:Node)=>[f.name,value(f.value)]));if(n.k==='call'&&n.name==='is_empty')return value(n.args[0]).length===0;if(n.k==='call'&&p.types.get(n.name)?.kind==='nominal')return convert(p.types.get(n.name)!,value(n.args[0]),'parse');throw Error('Unsupported runtime expression '+n.k);}
+ function plainValue(n:Node):any {if(n.k==='array')return n.items.map(value);if(n.k==="unary"){const v=value(n.value);return v===null?null:-v;}if(n.k==="binary"){const a=operand(n.left),b=operand(n.right);if(a===null||b===null)return null;switch(n.op){case "+":return a+b;case "-":return a-b;case "*":return a*b;case "/":return b===0?null:a/b;case "%":return b===0?null:a%b;case "==":return a===b;case "!=":return a!==b;case "<":return a<b;case ">":return a>b;case "<=":return a<=b;case ">=":return a>=b;case "&&":return a&&b;case "||":return a||b;}}if(n.k==="call"&&n.name==="unwrap_or"){const v=value(n.args[0]);return v?.tag==='Some'?v.value:v?.tag==='None'||v===null?value(n.args[1]):v;}if(n.k==='literal')return n.value;if(n.k==='ref'){const scope=scopes.findLast(s=>Object.hasOwn(s,n.path[0]));let v=scope?scope[n.path[0]]:binding(n.path[0]);for(const k of n.path.slice(1))v=v[k];return v;}if(n.k==='object')return Object.fromEntries(n.fields.map((f:Node)=>[f.name,value(f.value)]));if(n.k==='call'&&n.name==='is_empty')return value(n.args[0]).length===0;if(n.k==='call'&&p.types.get(n.name)?.kind==='nominal')return convert(p.types.get(n.name)!,value(n.args[0]),'parse');throw Error('Unsupported runtime expression '+n.k);}
  function sql(name:string,args:any[]):string {
   const b=p.bindings.get(name)!;
   if(b.kind==='literal_table'){
@@ -184,7 +195,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
     if(['is_some','is_none'].includes(n.name))return '('+expr(n.args[0],input,qualifier)+(n.name==='is_some'?' IS NOT NULL)':' IS NULL)');
     if(n.name==='lookup')return '(CASE '+expr(n.args[0],input,qualifier)+n.args[1].items.map((entry:Node)=>' WHEN '+expr(entry.fields.find((f:Node)=>f.name==='value').value,input,qualifier)+' THEN '+expr(entry.fields.find((f:Node)=>f.name==='label').value,input,qualifier)).join('')+' ELSE NULL END)';
     if(p.types.get(n.name)?.kind==='nominal'){const t=p.types.get(n.name)!;if(t.codec){args.push(t.codec.encode(value(n)));return '?';}return expr(n.args[0],input,qualifier);}
-    const fn=({count:'COUNT',sum:'SUM',avg:'AVG',min:'MIN',max:'MAX',coalesce:'COALESCE',round:'ROUND'} as Record<string,string>)[n.name];
+    const fn=({count:'COUNT',sum:'SUM',avg:'AVG',min:'MIN',max:'MAX',unwrap_or:'COALESCE',round:'ROUND'} as Record<string,string>)[n.name];
     if(!fn)throw Error('Unsupported SQL function '+n.name);return fn+'('+(n.name==='count'&&!n.args.length?'*':n.args.map((a:Node)=>expr(a,input,qualifier)).join(', '))+')';
    }
    throw Error('Unsupported SQL expression '+n.k);
@@ -258,7 +269,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
    if(b.type.kind==='option')v=v.length?{tag:'Some',value:v[0]}:{tag:'None'};
   }
   else if(b.ast.k==='call'&&b.ast.name==='input'){try{v=convert(b.type,inputs[name],'parse');}catch(e){throw Error('Invalid input '+name+': '+(e as Error).message);}}
-  else if(b.kind==='tree')v=render(b.ast.root);
+  else if(b.kind==='tree'){const previous=dataScope;dataScope=name===p.answer?'answer':'reports/'+name;try{v=render(b.ast.root);}finally{dataScope=previous;}}
   else if(b.kind==='literal_table'){
    if(b.result!.maxRows!>500)throw Error('Materialization requires a proven bound <= 500');
    v=b.ast.args[0].items.map((row:Node)=>convert(b.type.inner!,value(row),'parse'));
@@ -275,17 +286,17 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   if(n.k==='iflet'){const v=value(n.test),yes=v!==null&&v!==undefined&&v?.tag!=='None';if(!yes)return n.no.map((c:Node)=>reportNode(c,numbers)).join('');scopes.push({[n.name]:v?.tag==='Some'?v.value:v});try{return n.yes.map((c:Node)=>reportNode(c,numbers)).join('');}finally{scopes.pop();}}
   const attrs=Object.fromEntries(n.attrs.map((a:Node)=>[a.name,a.value]));
   if(n.name==='Lit')return html(attrs.value.value);
-  if(n.name==='Value'){
-   const reference=attrs.data?attrs.data.path.join('.')+'.'+attrs.field.field:attrs.value.k==='ref'?attrs.value.path.join('.'):'value@'+n.at;
-   const title=n.attrs.find((a:Node)=>a.name===(attrs.data?'data':'value')).sourceText??reference;
-   return '<span data-oks-ref="'+html(reference)+'" title="'+html(title)+'">'+html(componentValue(n))+'</span>';
+  if(n.name==='UseValue'){
+   const reference=attrs.ref.path.join('.');
+   const shown=componentValue(n);recordValue(n,shown);
+   const title=n.attrs.find((a:Node)=>a.name==='ref').sourceText??reference;
+   return '<span data-oks-ref="'+html(reference)+'" title="'+html(title)+'">'+html(shown)+'</span>';
   }
   if(n.checkedSpec||n.name==='ColumnChart'){
    const figure=renderChart(n);
-   const label=figureLabel(figure.kind,numbers);
+   const label=figureLabel(figure.kind,numbers);recordData((figure.kind==='table'?'tables/':'figures/')+(figure.kind==='table'?numbers.tables:numbers.charts),figure.dataText??(figure.kind==='table'?figure.content:''));
    return '<figure>'+(figure.kind==='table'?figure.html:figure.content)+'<figcaption><span class="item-no">'+label+'</span>'+html(figure.title??'')+'</figcaption></figure>';
   }
-  if(n.name==='UseTable'){const text=render(n,numbers);return p.host?.reportHtml?p.host.reportHtml(text,artifacts):reportHtml(text);}
   const tag=n.name==='Report'?'article':n.name;
   const attributes=Object.entries(attrs).filter(([key])=>n.name!=='Report'||key!=='title').map(([key,node]:[string,any])=>' '+key+'="'+html(node.value)+'"').join('');
   return '<'+tag+attributes+'>'+n.children.map((c:Node)=>reportNode(c,numbers)).join('')+(['br','hr'].includes(tag)?'':'</'+tag+'>');
@@ -296,18 +307,14 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
  }
  function componentValue(n:Node):any {
   const attrs=Object.fromEntries(n.attrs.map((a:Node)=>[a.name,a.value]));
-  if(attrs.value)return presented(expressionType(attrs.value),value(attrs.value),n.checkedPrecision);
-  const name=attrs.data.path[0],projection=attrs.field,contract=projection.checkedType,row=p.bindings.get(name)!.result!.element;
-  if(contract?.kind!=='projection'||!same(contract.input,row)||!row.fields![projection.field]||!same(contract.output,row.fields![projection.field]))throw Error('Field projection does not match its checked row contract');
-  const rows=binding(name),item=rows?.tag==='Some'?rows.value:rows?.tag==='None'?undefined:rows[0];
-  return presented(contract.output,item?.[projection.field],n.checkedPrecision);
+  return presented(expressionType(attrs.ref),value(attrs.ref),n.checkedPrecision);
  }
  function renderChart(n:Node):import('./host.ts').FigureOutput {
   const a=Object.fromEntries(n.attrs.map((f:Node)=>[f.name,f.value]));const ref=(key:string)=>a[key].path[0];
   if(n.checkedSpec&&p.host){
    const rows=(name:string)=>binding(name).map((row:any)=>Object.fromEntries(Object.entries(row).map(([k,v]:[string,any])=>[k,v&&typeof v==='object'&&typeof v.tag==='string'?display(v):v])));
    // Resolve inputs outside the rendering catch: an upstream failure keeps its own location.
-   const data=rows(ref('data')),nodes=a.nodes?rows(ref('nodes')):undefined;
+   const data=rows(ref('data')).map((row:any)=>({...row,...Object.fromEntries((n.checkedPaths??[]).map((path:string[])=>[path.join('.'),readProjection(row,path)]))})),nodes=a.nodes?rows(ref('nodes')):undefined;
    try{return p.host.renderFigure(n.name,n.checkedSpec,data,n.checkedFields,nodes);}
    catch(error){
     const asset=[...p.bindings].filter(([,b])=>b.kind==='tree'&&b.ast.root.at<=n.at).sort((a,b)=>b[1].ast.root.at-a[1].ast.root.at)[0]?.[0];
@@ -315,9 +322,16 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
     throw Error(renderDiagnostics(p.source,[{at:n.at,message,stage:'runtime',asset}],'SubmitFailed'));
    }
   }
-  const field=(key:string)=>{const projection=a[key],contract=projection.checkedType,row=p.bindings.get(ref('data'))!.result!.element;if(contract?.kind!=='projection'||!same(contract.input,row)||!same(contract.output,row.fields![projection.field]))throw Error('Field projection does not match its checked row contract');return projection.field;};
+  const field=(key:string)=>{const projection=a[key],contract=projection.checkedType,row=p.bindings.get(ref('data'))!.result!.element;if(contract?.kind!=='projection'||!same(contract.input,row)||!same(contract.output,projectionType(row,projection.path)))throw Error('Field projection does not match its checked row contract');return projection.path.join('.');};
+  if(n.name==='Table'){
+   const spec=n.checkedSpec??{},fields=n.checkedFields,rows=binding(ref('data')),columns=spec.columns??Object.keys(fields),labels=spec.labels??{};
+   if(!rows.length&&!spec.allow_no_data)throw Error('Table has no data; set allow_no_data:True when an empty result is acceptable');
+   const content='| '+columns.map((key:string)=>md(labels[key]??key)).join(' | ')+' |\n| '+columns.map(()=>'---').join(' | ')+' |\n'+rows.map((row:any)=>'| '+columns.map((key:string)=>md(presented(fields[key],row[key],spec.precision))).join(' | ')+' |').join('\n');
+   const tableHtml='<table><thead><tr>'+columns.map((key:string)=>'<th>'+html(labels[key]??key)+'</th>').join('')+'</tr></thead><tbody>'+rows.map((row:any)=>'<tr>'+columns.map((key:string)=>'<td>'+html(presented(fields[key],row[key],spec.precision))+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+   return {kind:'table',content,html:tableHtml,title:spec.title};
+  }
   if(n.name==='ColumnChart'){
-   const rows=binding(ref('data')),x=field('x'),y=field('value'),width=Math.max(320,rows.length*80),height=240,max=Math.max(1,...rows.map((r:any)=>Number(r[y]??0)));
+   const rows=binding(ref('data')).map((row:any)=>({...row,...Object.fromEntries(['x','value'].map(key=>[a[key].path.join('.'),readProjection(row,a[key].path)]))})),x=field('x'),y=field('value'),width=Math.max(320,rows.length*80),height=240,max=Math.max(1,...rows.map((r:any)=>Number(r[y]??0)));
    const bars=rows.map((r:any,i:number)=>{const h=Math.max(0,Number(r[y]??0))/max*170;return `<rect x="${i*80+20}" y="${190-h}" width="45" height="${h}" fill="#3977b8"/><text x="${i*80+20}" y="210">${html(r[x])}</text>`;}).join('');
    return {kind:'chart' as const,content:`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><metadata>${html(JSON.stringify({spec:{x,y},data:rows}))}</metadata>${bars}</svg>`};
   }
@@ -332,7 +346,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   const ref=(key:string)=>a[key].path[0];
   if(n.name==='Report')return {kind:'report',title:a.title?.value,html:reportNode(n,{charts:0,tables:0})};
   if(n.checkedSpec||n.name==='ColumnChart'){
-   const figure=renderChart(n),label=figureLabel(figure.kind,numbers),caption=label+(figure.title?'：'+figure.title:'');
+   const figure=renderChart(n),label=figureLabel(figure.kind,numbers),caption=label+(figure.title?'：'+figure.title:'');recordData((figure.kind==='table'?'tables/':'figures/')+(figure.kind==='table'?numbers.tables:numbers.charts),figure.dataText??(figure.kind==='table'?figure.content:''));
    if(figure.kind==='table')return '**'+md(caption)+'**\n\n'+figure.content;
    const name='chart_'+(++chartSerial);artifacts[name+'.svg']=figure.content;return '!['+md(caption)+']('+name+'.svg)\n\n'+md(caption);
   }
@@ -346,13 +360,14 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   if(n.name==='pre'){const text=children(),fence='`'.repeat(Math.max(3,...(text.match(/`+/g)??[]).map((s:string)=>s.length+1)));return fence+'\n'+text+'\n'+fence;}
   if(n.name==='code'){const text=children(),fence='`'.repeat(Math.max(1,...(text.match(/`+/g)??[]).map((s:string)=>s.length+1)));return fence+' '+text+' '+fence;}
   if(n.name==='a')return '['+children()+']('+a.href.value.replaceAll(' ','%20').replaceAll('(','%28').replaceAll(')','%29')+')';
-  if(n.name==='Value'){
-   const text=display(componentValue(n)).replace(/([\\`*_\[\]<>|])/g,'\\$1').replace(/\r?\n/g,' ');
+  if(n.name==='UseValue'){
+   const shown=componentValue(n);recordValue(n,shown);
+   const text=display(shown).replace(/([\\`*_\[\]<>|])/g,'\\$1').replace(/\r?\n/g,' ');
    return text?'*'+text+'*':'';
   }
-  if(n.name==='UseTable'){const label='**'+figureLabel('table',numbers)+'**\n\n';const rows=binding(ref('ref')),schema=p.bindings.get(ref('ref'))!.type.inner!.fields!,fields=Object.keys(schema);if(p.host)return label+p.host.renderFigure('Table',{},rows,schema).content;return label+'| '+fields.map(md).join(' | ')+' |\n| '+fields.map(()=>'---').join(' | ')+' |\n'+rows.map((r:any)=>'| '+fields.map(k=>md(presented(schema[k],r[k]))).join(' | ')+' |').join('\n');}
   if(n.name==='UseReport'){
    const name=ref('ref'),report=binding(name),json=(v:unknown)=>JSON.stringify(v).replaceAll('<','\\u003c');
+   includedReports.add('reports/'+name);
    const captured=contextLoaded?contextSnapshot:execution.context??null;
    const archive={version:1,context:{run:runId,batch:runId,sourceHash:createHash('sha256').update(p.source).digest('hex'),startedAt,model:p.model?{hash:p.modelImplementationId,domain:p.modelContractId}:null,captures:[{binding:'context',at:{line:1,column:1},value:captured},{binding:'input',at:{line:1,column:1},value:inputs}],acquisitions}};
    const source=p.source.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
@@ -362,5 +377,5 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   }
   const s=children();return /^h[123]$/.test(n.name)?'#'.repeat(Number(n.name[1]))+' '+s:n.name==='strong'?'**'+s+'**':n.name==='em'?'*'+s+'*':s;
  }
- const answer=binding(p.answer);return {answer,artifacts,queries,values:Object.fromEntries([...cache].filter(([name])=>!p.bindings.get(name)?.internal))};
+ const answer=binding(p.answer);const dataDocument=['answer',...includedReports].flatMap(scope=>{const values=valueSections.get(scope);return [...(dataSections.get(scope)??[]),...(values?.length?['## '+scope.replace(/^reports\//,'report/')+'/values\n\n'+values.join('\n')]:[])];}).join('\n\n');return {answer,artifacts,queries,dataDocument,deliveryId:runId,values:Object.fromEntries([...cache].filter(([name])=>!p.bindings.get(name)?.internal))};
 }

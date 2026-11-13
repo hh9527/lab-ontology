@@ -43,12 +43,12 @@ data topname = query_remote! {
 
 ## 计算与展现
 
-有限算术、lookup、coalesce、round、concat、case_when、is_some/is_none 和记录映射放在前序表达式或 query!。语言不开放手写函数、递归、循环和任意代码执行。tree! 组织组件、文本、引用和展示条件，Value 的直接值只接受引用或字面量。
+有限算术、lookup、unwrap_or!、round、concat、case_when、is_some/is_none 和记录映射放在前序表达式或 query!。语言不开放手写函数、递归、循环和任意代码执行。tree! 组织组件、文本、引用和展示条件，UseValue 只接受 a.b.c 形式的直接标量引用。
 
-等值标签映射优先使用 `lookup(value, [{value, label}, ...])`；范围判断或复合条件使用 case_when。查找表必须是非空静态数组，键唯一且与输入的非空业务类型一致，所有 label 的类型一致。未命中或输入为空时返回 None，可按展示口径用 coalesce 提供兜底文案。例如在 query! 的 project 中为设备分类添加标签：
+等值标签映射优先使用 `lookup(value, [{value, label}, ...])`；范围判断或复合条件使用 case_when。查找表必须是非空静态数组，键唯一且与输入的非空业务类型一致，所有 label 的类型一致。未命中或输入为空时返回 None，可按展示口径用 unwrap_or! 提供兜底文案。例如在 query! 的 project 中为设备分类添加标签：
 
 ```telora
-category: coalesce(lookup(r.cls, [
+category: unwrap_or!(lookup(r.cls, [
     {value: ic::DeviceClass::Lsw, label: "交换机"},
     {value: ic::DeviceClass::Router, label: "路由器"},
     {value: ic::DeviceClass::Ap, label: "无线接入点"}
@@ -57,15 +57,27 @@ category: coalesce(lookup(r.cls, [
 
 枚举键使用模型发布的精确符号。标签用于展示，筛选和计算保留原业务字段；lookup 不要求作者展开嵌套 case_when。
 
-`case_when(condition, then_value, else_value)` 恰好接收三个参数，条件必须为非空 Bool，两支结果类型须兼容。多个条件嵌套于 else_value，例如 `case_when(a, "甲", case_when(b, "乙", "其他"))`。可空比较产生 Option(Bool)，空值表示不命中时用 `coalesce(原条件, False)`；空值语义由业务决定。
+`case_when(condition, then_value, else_value)` 恰好接收三个参数，条件必须为非空 Bool，两支结果类型须兼容。多个条件嵌套于 else_value，例如 `case_when(a, "甲", case_when(b, "乙", "其他"))`。可空比较产生 Option(Bool)，空值表示不命中时用 `unwrap_or!(原条件, False)`；空值语义由业务决定。
 
-本地 `ratio(a,b)` 与 `growth_rate(a,b)` 返回 Option(Ratio)，保留比例类型、受限算子及百分比展示语义；输入为空时返回 None，ratio 分母为零、growth_rate 基线非正时也返回 None。非空 Float 可显式构造 `Ratio(value)`，例如 Ratio(0.12) 展示为 12%；构造器不直接接受 Option(Float)，需要先按业务处理空值，不擅自补零。投影、round、avg/min/max 保留 Ratio；difference 在兼容的名义类型之间计算并保留该类型，包括 Percent 与 Ratio。计算结果的空值不因展示而补零。普通记录字段先在 data/do 中绑定，再用 Value(value = prepared_value) 展示，无需构造占位表。
+本地 `ratio(a,b)` 与 `growth_rate(a,b)` 返回 Option(Ratio)，保留比例类型、受限算子及百分比展示语义；输入为空时返回 None，ratio 分母为零、growth_rate 基线非正时也返回 None。非空 Float 可显式构造 `Ratio(value)`，例如 Ratio(0.12) 展示为 12%；构造器不直接接受 Option(Float)，需要先按业务处理空值，不擅自补零。投影、round、avg/min/max 保留 Ratio；difference 在兼容的名义类型之间计算并保留该类型，包括 Percent 与 Ratio。计算结果的空值不因展示而补零。普通记录字段先在 data/do 中绑定，再用 UseValue(ref = prepared_value) 展示，无需构造占位表。
 
-project!(field) 是组件中的受限字段投影语法。检查器记录输入 Schema 和字段类型，渲染器消费该检查期契约以核对字段访问。当前它不是可独立绑定、组合或复用的通用投影类型构造器，不消除空值，也不作为任意函数开放。
+$.field 是组件中的受限字段投影语法。检查器记录输入 Schema 和字段类型，渲染器消费该检查期契约以核对字段访问。当前它不是可独立绑定、组合或复用的通用投影类型构造器，不消除空值，也不作为任意函数开放。
 
 模型 property 的字段映射表达稳定的领域含义，例如数据库编码到业务 enum；lookup 表达本次任务的标签、分组或显示映射。跨任务共享的业务映射应进入模型，不在各分析稿里重复定义。lookup 编译为 SQL CASE 是执行位置选择，不把其结果变成模型的领域定义；tree! 只消费已经准备好的值。
 
 `query_remote!` 中的计算字段与具名成员比较，例如 `a.class == Kind::Olt`，只接受同一业务类型；模型利用该字段的映射将条件下推为 raw 的 IN 集合判断。投影仍生成 CASE，半封闭映射保留 Unknown 和 NULL 的区别。raw 与语义类型不能直接比较。分类映射不授予排序能力：远端和本地语义分类均需独立声明业务顺序，raw 按自身类型排序。契约见[字段映射](../../ontology/docs/FIELD-MAPPINGS.md)。
+
+
+## 空值默认值与标量引用
+
+`unwrap_or!(value, default_expr)` 接收 Option(T) 和同一业务类型的 T，结果为 T。后置宏 `value.unwrap_or!(default_expr)` 展开为相同的前置形式；只有值为空时才求值默认表达式。普通计算和 query! 均支持，query! 中 lower 为 SQL COALESCE。query_remote! 仍由模型公开的表达式能力决定。
+
+```text
+data prepared = { cpu: map_opt(highest, $.cpu).unwrap_or!(default_cpu) };
+answer tree! { Answer [UseValue(ref = prepared.cpu)] };
+```
+
+UseValue 的 ref 只接受直接引用，不接受字面量、调用或算术；记录与空值处理提前放在 data 中。precision 为可选展示精度，业务类型、引用标识和高亮保持不变。
 
 ## 行与空值
 
@@ -141,7 +153,7 @@ semi_join 按存在性保留左侧行，不因右侧多次命中而复制左侧�
 
 ### 比例的显示尺度
 
-模型以类型 property 发布 presentation 元数据，包含 multiplier 和 suffix，业务 newtype 继承内层的显示约定。Percent(12) 与 Ratio(0.12) 均显示为 12%；正文 Value、表格和图表消费同一类型契约。计算、比较、排序及编码继续使用原数值。空值保持无数据语义。
+模型以类型 property 发布 presentation 元数据，包含 multiplier 和 suffix，业务 newtype 继承内层的显示约定。Percent(12) 与 Ratio(0.12) 均显示为 12%；正文 UseValue、表格和图表消费同一类型契约。计算、比较、排序及编码继续使用原数值。空值保持无数据语义。
 
 图表的 value_min 等显示轴参数使用显示尺度，例如百分比坐标轴从 99% 开始时写 value_min:99。显式 unit 必须与类型声明的显示单位一致。图表内嵌 CSV 保留原数值，读取时结合类型显示尺度与 spec 理解。
 
@@ -189,7 +201,7 @@ EpochMillis 支持加减整数毫秒偏移；两个 EpochMillis 相减得到整�
 | order_by | 字段具有比较能力 | 保留 Schema 和上界，建立排序契约 |
 | take(n) | 已有排序或至多一行，n 为 1..500 | Table(S)，上界为原上界与 n 的较小值 |
 | take_opt() | 已有排序或至多一行 | Option(S)，至多一行 |
-| map_opt | Option(S)，有效的 project!(field) | Option(T)，嵌套可空性归一化 |
+| map_opt | Option(S)，有效的 $.field | Option(T)，嵌套可空性归一化 |
 
 filter 中的 is_some 只产生谓词，不隐式改变字段类型。需要非空字段时在 project 中使用 not_none，确保类型收窄对应明确的行过滤。时间转换保留可空性；业务 newtype 的计算规则独立于物理存储类型。排序和上界可随 data 结果继续传递，节点结果按需求值并在一次 resolve 内缓存。
 
@@ -207,15 +219,15 @@ query_remote! { ... } 与 context! { ... } 是具有专门语义的宏入口。c
 
 展示宿主发布封闭枚举 Stack，spec.stack 使用 Stack::None、Stack::Total、Stack::Percent，默认 None。Total 表达原值堆叠，Percent 表达类别内加总后归一为百分比。分组柱状图、分组条形图和面积图支持堆叠；业务指标须允许 Sum。宽表不同指标只支持并列展示，Stack::None 合法。展示单位相同不代表具备加总能力。
 
-数值展示默认最多两位小数并去掉末尾零，Int 保留完整整数。Percent(12) 与 Ratio(0.12) 显示为 12%。模型可通过 @quantity::display_precision(n) 发布可继承的默认精度；显式配置优先于模型默认，模型默认优先于系统默认。图表和 Table 使用 spec.precision，正文使用 Value(value = prepared, precision = 3)，n 为 0..12 的静态整数。精度只影响轴刻度、标签、提示框、正文与表格显示，不改查询、排序、几何值和 SVG 内嵌原始输入。
+数值展示默认最多两位小数并去掉末尾零，Int 保留完整整数。Percent(12) 与 Ratio(0.12) 显示为 12%。模型可通过 @quantity::display_precision(n) 发布可继承的默认精度；显式配置优先于模型默认，模型默认优先于系统默认。图表和 Table 使用 spec.precision，正文使用 UseValue(ref = prepared, precision = 3)，n 为 0..12 的静态整数。精度只影响轴刻度、标签、提示框、正文与表格显示，不改查询、排序、几何值和 SVG 内嵌原始输入。
 
-query! { ... } 使用关系计划专用语法。query_remote!、query!、tree!、context!、project! 的 ! 均标记专门的语法或语义边界，不等同于副作用或立即执行；具体求值阶段由各自契约确定。filter、project、order_by、take 等普通管道算子保持函数调用形式。
+query! { ... } 使用关系计划专用语法。query_remote!、query!、tree!、context! 的 ! 均标记专门的语法或语义边界，不等同于副作用或立即执行；具体求值阶段由各自契约确定。filter、project、order_by、take 等普通管道算子保持函数调用形式。
 
 ## 诊断反馈契约
 
 每条反馈定位到行列和数据/展示节点，描述实际与期望的类型或能力。关键类型与计划检查直接产生稳定的错误类别、原因和修复建议；文本统一渲染，保留多个独立错误并抑制上游失败引发的重复错误。其余错误保留原始描述，只有能确定修复方式时才补建议。
 
-可空条件必须显式决定空值含义：若空值表示不满足，可用 coalesce(原条件, False)；若需保留相应行，则按业务选择 True 或独立表达空值条件。反馈尽可能引用作者原始表达式，不泄露内部计划别名。建议不会替作者选择排序字段、默认值或统计口径，不通过删条件、剥离业务类型、扩大上界来绕过检查。
+可空条件必须显式决定空值含义：若空值表示不满足，可用 unwrap_or!(原条件, False)；若需保留相应行，则按业务选择 True 或独立表达空值条件。反馈尽可能引用作者原始表达式，不泄露内部计划别名。建议不会替作者选择排序字段、默认值或统计口径，不通过删条件、剥离业务类型、扩大上界来绕过检查。
 
 运行期错误沿用同一文本格式，并定位到负责的数据或展示节点。输入编码错误提示核对输入；版本变化要求重新检查同一稿件；已证明契约与模型输出矛盾则明确属于实现问题。展示缺少数据时先核对口径，仅在业务允许时建议 allow_no_data，不伪造占位行。
 
@@ -308,3 +320,5 @@ EpochMillis 来源写成 `calendar_bucket(to_datetime_utc(a.epoch), CalendarUnit
 query! 中使用同一表达式，先投影桶再分组。query_remote! 第一版的 zone 是类型化参数，来自顶层 data；模型成员中的普通 String 时区字段尚未自动提升为 TimeZone。检查期由模型证明时间类型、单位和时区参数契约，执行期绑定实际地区 ID。SQLite 适配固定注册 dari_calendar_bucket，PostgreSQL 使用原生三参数 date_trunc；UQL 不支持此算子。执行侧不另行选择语义或回退固定偏移。
 
 桶键的本地午夜解释与 PostgreSQL 对齐：重复午夜选择较后的瞬时值，不存在的午夜按跳变前偏移解释。它是日历分组的规范键；判断日期区间的覆盖边界仍使用 DateRange/at_zone 的区间契约，不能把特殊跳变日的桶键直接视为最早事件边界。无效地区 ID 报错，不回退服务器时区或 UTC。SQLite 使用宿主 Intl/IANA 数据，规则版本随运行环境固定；升级时区数据后应重新检查并计算结果。
+
+字段选择器 `$.field` 由组件 data 或 map_opt 的输入行提供类型上下文；`$.x.y` 逐级检查记录字段；`$.x?.y` 的 `?` 要求 x 为 Option，遇到 None 则在选择器边界返回 None，否则继续取字段。含 `?` 的选择器返回 Option(最终字段类型)，不叠加 Option；普通 `.` 不隐式穿透 Option。选择器不是任意表达式或匿名函数，UseValue(ref = prepared.value) 仍使用具名数据引用。

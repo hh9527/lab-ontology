@@ -12,7 +12,7 @@ data result = do {
  let shifted = do { let n = offset + 3; n * 2 };
  {first: ctx.now, second: again.instant, zone: ctx.tz, count: shifted}
 };
-answer tree! { Answer [Value(value = result.first), Value(value = result.second), Value(value = result.zone), Value(value = result.count)] };`;
+answer tree! { Answer [UseValue(ref = result.first), UseValue(ref = result.second), UseValue(ref = result.zone), UseValue(ref = result.count)] };`;
 const program=check(source,undefined,{contextType});
 assert.equal(program.bindings.get('ctx')!.type.fields!.tz.name,'TimeZone');
 assert.equal(program.bindings.get('result')!.type.fields!.count.name,'Int');
@@ -22,7 +22,7 @@ assert.equal(resolve(program,db,{},execution).answer,'*1000*\n\n*1000*\n\n*Asia/
 assert.equal(captures,1);
 assert.equal(resolve(program,db,{},execution).answer,'*2000*\n\n*2000*\n\n*Asia/Shanghai*\n\n*10*');
 assert.equal(captures,2);
-const onlyNow=check('data c=context! { t: Context::Now }; answer tree! {Answer [Value(value=c.t)]};',undefined,{contextType});
+const onlyNow=check('data c=context! { t: Context::Now }; answer tree! {Answer [UseValue(ref =c.t)]};',undefined,{contextType});
 assert.equal(resolve(onlyNow,db,{}, {context:{epochMillis:1,timeZone:null}}).answer,'*1*');
 assert.throws(()=>resolve(program,db,{}, {context:{epochMillis:1,timeZone:null}}),/invalid model scalar/);
 assert.throws(()=>resolve(program,db,{}, {context:{epochMillis:1,timeZone:'Mars/Olympus'}}),/invalid model scalar/);

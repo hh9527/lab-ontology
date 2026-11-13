@@ -45,9 +45,8 @@ try{
     assert.equal(resolve(program,db,{request:{floor:100}}).answer,'最高 CPU：*无数据*');
     const singleton=`data row = query_remote! {
         let a = from(ic::device_kpi); a |> project({cpu:a.cpu_usage}) |> take_opt()
-    }; answer tree! { Answer [Value(data = row, field = project!(cpu))] };`;
+    }; answer tree! { Answer [if let Some(value_row) = row [UseValue(ref = value_row.cpu)] else ["无数据"]] };`;
     assert.equal(resolve(check(singleton,host.model),db).answer,'*60%*');
-    assert.equal(resolve(check(singleton.replace('take_opt()','take(1)'),host.model),db).answer,'*60%*');
     assert.throws(()=>check(singleton.replace('cpu:a.cpu_usage','cpu:a.device_kpi_res_id'),host.model),/multirow|order|bound/);
     const requestsBefore=host.stats.requests;
     resolve(program,db,{request:{floor:40}});

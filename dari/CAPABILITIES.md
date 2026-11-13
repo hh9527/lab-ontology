@@ -18,7 +18,7 @@
 | 全量分组、组内排名、去重 | group_by、聚合、top_per、distinct | set-test、composition-test |
 | 完整输入后处理 | 无上界中间 SQL DAG，交付处证明至多 500 行 | model-composition-test |
 | 单行和可选行 | take_opt、if let、map_opt 投影 | pipeline-test、scalar-test |
-| 有限计算与映射 | 算术、余数、lookup、case_when、coalesce、round、concat | scalar-test、lookup-test |
+| 有限计算与映射 | 算术、余数、lookup、case_when、unwrap_or!、round、concat | scalar-test、lookup-test |
 | 量纲与名义类型 | 兼容类型的算术保留量纲，标识类型不参与数值运算 | compiler 类型规则、ic-test |
 | IPv4 视图与子网 | 模型视图、query! 中 in_subnet/not_in_subnet | ipv4-test |
 | 小型任务常量表 | table([...])，空表显式 Schema | ipv4-test |

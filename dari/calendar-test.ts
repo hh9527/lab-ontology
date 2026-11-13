@@ -9,7 +9,7 @@ const evaluate=(expression:string)=>{
  // Force the data node through a scalar consumer, keeping range internals private.
  const t=p.bindings.get('result')!.type;
  const suffix=t.kind==='range'?'.start':'';
- return resolve(check(`data result=${expression};answer tree! {Answer [Value(value=result${suffix})]};`),db).answer.replaceAll('*','');
+ return resolve(check(`data result=${expression};answer tree! {Answer [UseValue(ref =result${suffix})]};`),db).answer.replaceAll('*','');
 };
 assert.equal(evaluate('calendar_period(LocalDate("2026-02-15"), CalendarUnit::Month)'),'2026-02-01');
 assert.equal(evaluate('calendar_floor(LocalDate("2026-02-01"), CalendarUnit::Week)'),'2026-01-26');
@@ -25,10 +25,10 @@ assert.equal(evaluate('contains(date_range(LocalDate("2026-02-01"),LocalDate("20
 const periods=check(`data february=calendar_period(LocalDate("2026-02-01"),CalendarUnit::Month);
 data first=do {let week=calendar_period(february.start,CalendarUnit::Week);at_zone(intersection(week,february),TimeZone("Asia/Shanghai"))};
 data second=do {let week=calendar_period(february.start,CalendarUnit::Week);at_zone(intersection(shift_dates(week,CalendarUnit::Week,1),february),TimeZone("Asia/Shanghai"))};
-answer tree! {Answer [Value(value=first.start),Value(value=first.end),Value(value=second.start),Value(value=second.end)]};`);
+answer tree! {Answer [UseValue(ref =first.start),UseValue(ref =first.end),UseValue(ref =second.start),UseValue(ref =second.end)]};`);
 assert.equal(resolve(periods,db).answer.replaceAll('*',''),[Date.parse('2026-02-01T00:00:00+08:00'),Date.parse('2026-02-02T00:00:00+08:00'),Date.parse('2026-02-02T00:00:00+08:00'),Date.parse('2026-02-09T00:00:00+08:00')].join('\n\n'));
 for(const [date,hours]of [['2026-03-08',23],['2026-11-01',25]] as const){
- const p=check(`data window=at_zone(calendar_period(LocalDate("${date}"),CalendarUnit::Day),TimeZone("America/New_York"));answer tree! {Answer [Value(value=window.start),Value(value=window.end)]};`);
+ const p=check(`data window=at_zone(calendar_period(LocalDate("${date}"),CalendarUnit::Day),TimeZone("America/New_York"));answer tree! {Answer [UseValue(ref =window.start),UseValue(ref =window.end)]};`);
  const values=resolve(p,db).answer.replaceAll('*','').split('\n\n').map(Number);assert.equal(values[1]-values[0],hours*3600000);
 }
 assert.equal(evaluate('at_zone(calendar_period(LocalDate("2018-11-04"),CalendarUnit::Day),TimeZone("America/Sao_Paulo"))'),String(Date.parse('2018-11-04T03:00:00Z')));
@@ -42,7 +42,7 @@ assert.match(resolve(example,db,{}, {context:{epochMillis:Date.parse('2026-11-12
 const bounded=check(`data w=at_zone(calendar_period(LocalDate("2026-02-01"),CalendarUnit::Month),TimeZone("UTC"));
 data t=table([{ts:EpochMillis(1769904000000)},{ts:EpochMillis(1772323200000)}]);
 data rows=query! {let a=from(t);let selected=a |> filter(a.ts>=w.start && a.ts<w.end) |> project({ts:a.ts});selected |> order_by(asc(selected.ts)) |> take(5)};
-answer tree! {Answer [UseTable(ref=rows)]};`);
+answer tree! {Answer [Table(data =rows)]};`);
 assert.equal(resolve(bounded,db).values.rows.length,1);
 db.close();
 console.log('Calendar periods, February weeks, leap dates, range algebra, timezone boundaries and diagnostics passed');

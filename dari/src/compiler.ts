@@ -21,6 +21,19 @@ const numeric=(type:Type):boolean=>{let t=present(type);if(t.codec?.variants||t.
 export function show(t:Type):string{if(t.kind==='schema')return 'Schema({'+Object.entries(t.fields!).map(([n,t])=>n+': '+show(t)).join(', ')+'})';if(['option','table'].includes(t.kind))return (t.kind==='option'?'Option':'Table')+'('+show(t.inner!)+')';return t.displayName??t.name??t.kind;}
 export const same=(a:Type,b:Type):boolean=>a.kind===b.kind&&(a.kind==='schema'?Object.keys(a.fields!).length===Object.keys(b.fields!).length&&Object.entries(a.fields!).every(([k,t])=>!!b.fields![k]&&same(t,b.fields![k])):a.kind==='option'||a.kind==='table'?same(a.inner!,b.inner!):a.name===b.name);
 const err=(n:Node,message:string,details:FaultDetails={}):never=>{throw new Fault(message,n.at,details);};
+export function projectionType(input:Type,path:readonly string[]):Type {
+ let current=input,shortCircuit=false;
+ for(const segment of path){
+  const unwrap=segment.endsWith('?'),key=unwrap?segment.slice(0,-1):segment;
+  if(!['schema','range'].includes(current.kind))throw Error('Cannot project '+key+' on '+show(current)+'; prepare optional or computed values before selecting a field');
+  if(!Object.hasOwn(current.fields!,key))throw Error('Unknown field '+key+' in $.'+path.join('.')+'; examples: '+Object.keys(current.fields!).slice(0,8).join(', '));
+  current=current.fields![key];
+  if(unwrap){if(current.kind!=='option')throw Error('? requires Option(T) at $.'+path.join('.'));current=current.inner!;shortCircuit=true;}
+ }
+ return shortCircuit?optional(current):current;
+}
+function checkedProjection(n:Node,input:Type):Type {try{const output=projectionType(input,n.path);n.checkedType={kind:'projection',input,output};return output;}catch(error){return err(n,(error as Error).message);}}
+
 function expressionHint(n:Node):string|undefined {
  if(n.k==='ref')return (n.displayPath??n.path).map((key:string|number,i:number)=>typeof key==='number'?'['+key+']':(i?'.':'')+key).join('');
  if(n.k==='literal')return n.value===null?'None':typeof n.value==='boolean'?n.value?'True':'False':JSON.stringify(n.value);
@@ -31,7 +44,7 @@ function expressionHint(n:Node):string|undefined {
 const bool=(n:Node,t:Type)=>{
  if(t.kind==='scalar'&&t.name==='Bool')return;
  const nullable=t.kind==='option'&&t.inner?.name==='Bool',hint=expressionHint(n);
- err(n,'Predicate requires Bool; got '+show(t),nullable?{code:'nullable-predicate',reason:'可空比较或计算可能返回空值，条件需要明确的 True 或 False',suggestion:'仅当空值应表示不满足时，使用 '+(hint?'coalesce('+hint+', False)':'coalesce 为该条件指定 False 默认值')+'；若空值应让条件成立，可选择 True 或单独表达空值条件'}:{code:'predicate-type',reason:'条件必须是 Bool；数值、文本和可选行没有隐式真假转换',suggestion:'数值或文本请显式比较；可空值使用 is_some/is_none；可选行在 tree! 中使用 if let Some 解构'});
+ err(n,'Predicate requires Bool; got '+show(t),nullable?{code:'nullable-predicate',reason:'可空比较或计算可能返回空值，条件需要明确的 True 或 False',suggestion:'仅当空值应表示不满足时，使用 '+(hint?'unwrap_or!('+hint+', False)':'unwrap_or! 为该条件指定 False 默认值')+'；若空值应让条件成立，可选择 True 或单独表达空值条件'}:{code:'predicate-type',reason:'条件必须是 Bool；数值、文本和可选行没有隐式真假转换',suggestion:'数值或文本请显式比较；可空值使用 is_some/is_none；可选行在 tree! 中使用 if let Some 解构'});
 };
 const compatible=(a:Type,b:Type):boolean=>same(a,b)||a.kind==='option'&&(b.name==='None'||compatible(a.inner!,b))||a.name==='Float'&&b.name==='Int';
 function modelPresence(root:number,pair:IntentType['pair'],steps:QueryOperation[],nodeCount:number):Map<number,boolean>{
@@ -44,7 +57,7 @@ function modelPresence(root:number,pair:IntentType['pair'],steps:QueryOperation[
  }
  return presence;
 }
-function mismatchDetails(wanted:Type,got:Type):FaultDetails {return got.kind==='option'&&same(wanted,got.inner!)?{code:'nullable-value',reason:'需要非空值，但表达式可能为空',suggestion:'若有业务默认值，用 coalesce；若来自表字段且允许丢弃空值行，在 project 的字段最外层使用 not_none'}:{code:'type-mismatch',reason:'期望类型与表达式的业务类型或容器形态不一致',suggestion:'保留业务类型约束，核对输入契约和投影；不要只按底层存储类型强行转换'};}
+function mismatchDetails(wanted:Type,got:Type):FaultDetails {return got.kind==='option'&&same(wanted,got.inner!)?{code:'nullable-value',reason:'需要非空值，但表达式可能为空',suggestion:'若有业务默认值，用 unwrap_or!；若来自表字段且允许丢弃空值行，在 project 的字段最外层使用 not_none'}:{code:'type-mismatch',reason:'期望类型与表达式的业务类型或容器形态不一致',suggestion:'保留业务类型约束，核对输入契约和投影；不要只按底层存储类型强行转换'};}
 export function check(source:string,model?:ModelPort,options:{allowTestSources?:boolean;contextType?:Type;contextContractId?:string;host?:HostPort}={}):Program{
  const diagnostics=new DiagnosticCollector();
  try{return checkProgram(source,model,options,diagnostics);}catch(e){if(e instanceof DiagnosticFailure)throw e;if(e instanceof Fault){diagnostics.report(faultDiagnostic(e,'syntax'));throw new DiagnosticFailure(source,diagnostics.list());}throw e;}
@@ -109,6 +122,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
  }
  function assign(n:Node,wanted:Type,env:Record<string,Type>={}){const got=infer(n,env);if(!compatible(wanted,got))err(n,'Expected '+show(wanted)+'; got '+show(got),mismatchDetails(wanted,got));}
  function infer(n:Node,env:Record<string,Type>={},aggregate=false,groupKeys=new Set<string>()):Type{
+  if(n.k==='projection')err(n,'$.field requires an input row context; use it in figure settings or map_opt');
   if(n.k==='context')err(n,'context! must directly initialize a top-level data declaration');
   if(n.k==='do'){
    const local={...env},names=new Set<string>();
@@ -206,11 +220,10 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     return n.resolvedType=n.name!=='difference'||a.kind==='option'||b.kind==='option'?optional(result):result;
    }
    if(n.name==='map_opt'){
-    if(n.args.length!==2||n.args[1].k!=='projection')err(n,'map_opt requires an optional row and project!(field)');
+    if(n.args.length!==2||n.args[1].k!=='projection')err(n,'map_opt requires an optional row and $.field');
     const input=infer(n.args[0],env,aggregate,groupKeys),projection=n.args[1];
-    if(input.kind!=='option'||input.inner?.kind!=='schema')err(n,'map_opt requires Option(Schema); got '+show(input),{code:'optional-row',reason:'map_opt 消费可选的单行结果，不消费表或普通标量',suggestion:'多行处理用 query!；若业务确实只需要一行，先按业务顺序 take_opt()，再用 project!(field) 选择字段'});
-    const field=input.inner!.fields![projection.field];if(!field)err(projection,'Unknown field '+projection.field+'; examples: '+Object.keys(input.inner!.fields!).slice(0,8).join(', '));
-    projection.checkedType={kind:'projection',input:input.inner!,output:field};
+    if(input.kind!=='option'||input.inner?.kind!=='schema')err(n,'map_opt requires Option(Schema); got '+show(input),{code:'optional-row',reason:'map_opt 消费可选的单行结果，不消费表或普通标量',suggestion:'多行处理用 query!；若业务确实只需要一行，先按业务顺序 take_opt()，再用 $.field 选择字段'});
+    const field=checkedProjection(projection,input.inner!);
     return n.resolvedType=optional(field);
    }
    if(['is_some','is_none'].includes(n.name)){if(n.args.length!==1||infer(n.args[0],env,aggregate,groupKeys).kind!=='option')err(n,n.name+' requires Option(T)');return scalar('Bool');}
@@ -223,7 +236,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     if(!aggregate)err(n,'Aggregate only allowed in grouped projection');if(n.name==='count'){if(n.args.length>1)err(n,'count accepts zero or one column');if(n.args.length)infer(n.args[0],env);return scalar('Int');}
     if(n.args.length!==1)err(n,'Aggregate requires one column');const t=present(infer(n.args[0],env));if(!numeric(t))err(n,'Aggregate requires numeric column');calculation(n,t,({sum:'Sum',avg:'Mean',min:'Min',max:'Max'} as Record<string,string>)[n.name]);return optional(n.name==='avg'&&t.kind!=='nominal'?scalar('Float'):t);
    }
-   if(n.name==='coalesce'){if(n.args.length!==2)err(n,'coalesce requires value and fallback');const a=infer(n.args[0],env,aggregate,groupKeys),b=infer(n.args[1],env,aggregate,groupKeys);if(a.kind!=='option'||!compatible(a.inner!,b))err(n,'coalesce requires Option(T) and T; got '+show(a)+' and '+show(b),{code:'coalesce-types',reason:a.kind!=='option'?'第一个参数已经是非空值':'默认值必须是与可空值兼容的非空类型',suggestion:a.kind!=='option'?'直接使用第一个参数；coalesce 仅用于填补空值':'提供同一业务类型的非空默认值；若需要丢弃空值行，改在投影字段最外层使用 not_none'});return a.inner!;}
+   if(n.name==='unwrap_or'){if(n.args.length!==2)err(n,'unwrap_or! requires value and fallback');const a=infer(n.args[0],env,aggregate,groupKeys),b=infer(n.args[1],env,aggregate,groupKeys);if(a.kind!=='option'||!compatible(a.inner!,b))err(n,'unwrap_or requires Option(T) and T; got '+show(a)+' and '+show(b),{code:'unwrap_or-types',reason:a.kind!=='option'?'第一个参数已经是非空值':'默认值必须是与可空值兼容的非空类型',suggestion:a.kind!=='option'?'直接使用第一个参数；unwrap_or! 仅用于填补空值':'提供同一业务类型的非空默认值；若需要丢弃空值行，改在投影字段最外层使用 not_none'});return a.inner!;}
    if(n.name==='is_empty'){if(n.args.length!==1||infer(n.args[0],env).kind!=='table')err(n,'is_empty requires a table');return scalar('Bool');}
    const t=p.types.get(n.name);
    if(t?.kind==='scalar'&&['EpochMillis','DateTimeUtc','DateTimeTz','LocalDate','TimeZone'].includes(semantic(t)??'')){if(n.args.length!==1)err(n,'Time constructor requires one encoded value');const input=infer(n.args[0],env,aggregate,groupKeys);if(input.kind!=='scalar'||input.name!==(semantic(t)==='EpochMillis'?'Int':'String'))err(n,'Time constructor requires its encoded Int/String representation; use to_* for time conversions');return n.resolvedType=t;}
@@ -444,7 +457,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
    if(value.k==='unary')return {kind:'unary',op:value.op,value:expression(value.value)};
    if(value.k==='call'&&['difference','ratio','growth_rate','contains','not_contains','starts_with','ends_with','is_some','is_none'].includes(value.name))return {kind:'call',name:value.name,args:value.args.map(expression)};
    function usesNode(v:Node):boolean{return v.k==='ref'&&aliases.has(v.path[0])||v.k==='call'&&v.args.some(usesNode)||v.k==='binary'&&(usesNode(v.left)||usesNode(v.right))||v.k==='unary'&&usesNode(v.value);}
-   if(usesNode(value))err(value,'Computed model expression '+(value.name??value.k)+' cannot be a query parameter; project supported members in query_remote!, then compute this expression in query!');
+   if(usesNode(value))err(value,'Computed model expression '+(value.name==='unwrap_or'?'unwrap_or!':value.name??value.k)+' cannot be a query parameter; project supported members in query_remote!, then compute this expression in query!');
    const t=infer(value);if(!['scalar','nominal'].includes(present(t).kind))err(value,'Query parameters must be logical scalars');
    return {kind:'parameter',index:parameters.push(value)-1,type:t};
   }
@@ -488,12 +501,12 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   // Builtins may probe staticness of dynamic arguments; only presentation options publish findings.
   if(n.k==='object'){const evaluate=(f:Node)=>[f.name,constant(f.value,fields,path+'.'+f.name)];return Object.fromEntries(fields?settle(n.fields,evaluate):n.fields.map(evaluate));}
   if(n.k==='array'){const evaluate=({item,index}:{item:Node;index:number})=>constant(item,fields,path+'['+index+']'),items=n.items.map((item:Node,index:number)=>({item,index}));return fields?settle(items,evaluate):items.map(evaluate);}
-  if(n.k==='projection'){if(!fields?.[n.field])return err(n,'Unknown figure field '+n.field+'; examples: '+Object.keys(fields??{}).slice(0,8).join(', '));return n.field;}
+  if(n.k==='projection'){if(!fields)return err(n,'$.field requires an input row context');const type=checkedProjection(n,{kind:'schema',fields});if(n.path.length>1)fields[n.path.join('.')]=type;return n.path.join('.');}
   if(n.k==='ref'){
    const v=variant(n);if(v)return Object.freeze({[Symbol.for('dari.enum')]:true,enum:v.type.name,variant:v.name});
    if(failed.has(n.path[0]))throw new UpstreamTypeUnavailable();
    const binding=p.bindings.get(n.path[0]);
-   if(!binding)err(n,'Unknown static option '+expressionHint(n)+' in '+path,{code:'static-option',reason:'配置中的裸标识被解释为已声明的静态绑定，不是数据列名',suggestion:fields&&n.path.length===1&&Object.hasOwn(fields,n.path[0])?'字段选择写 project!('+n.path[0]+')；列名配置也可写 '+JSON.stringify(n.path[0]):'文本配置加双引号；字段选择写 project!(字段名)；静态绑定需先声明'});
+   if(!binding)err(n,'Unknown static option '+expressionHint(n)+' in '+path,{code:'static-option',reason:'配置中的裸标识被解释为已声明的静态绑定，不是数据列名',suggestion:fields&&n.path.length===1&&Object.hasOwn(fields,n.path[0])?'字段选择写 $.'+n.path[0]+'；列名配置也可写 '+JSON.stringify(n.path[0]):'文本配置加双引号；字段选择写 $.字段名；静态绑定需先声明'});
    let value=constant(binding!.ast,fields,path);for(const key of n.path.slice(1)){if(value==null||!Object.hasOwn(value,key))err(n,'Unknown static option '+expressionHint(n)+' in '+path);value=value[key];}return value;
   }
   return err(n,'Expected a static presentation or builtin option');
@@ -508,32 +521,48 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
    const checkpoint=diagnostics.checkpoint();
    const allowed=['data','nodes','spec',...(attrs.spec?[]:['x','value','series','x_type','title','style','layout','allow_no_data','value_min','unit','x_label','value_label'])];
    for(const key of Object.keys(attrs))if(!allowed.includes(key))finding(new Fault('Unknown figure attribute '+key+' on '+n.name+'; chart configuration belongs in spec = {...}',attrs[key].at));
-   const data=binding('data'),nodes=attrs.nodes?binding('nodes'):undefined,fields=data.type.inner!.fields!;
+   const data=binding('data'),nodes=attrs.nodes?binding('nodes'):undefined,fields={...data.type.inner!.fields!};
    for(const b of [data,...(nodes?[nodes]:[])])if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)finding(new Fault('Figure input '+(b===data?'data':'nodes')+' requires a proven bound <= 500; order_by and take before presentation',n.at));
    const spec=attrs.spec?constant(attrs.spec,fields,n.name+'.spec'):Object.fromEntries(Object.entries(attrs).filter(([key])=>!['data','nodes'].includes(key)).map(([key,value])=>[key,constant(value,fields,n.name+'.'+key)]));
    try{p.host.checkFigure(n.name,spec,fields,nodes?.type.inner!.fields);}catch(e){finding(new Fault((e as Error).message,attrs.spec?.at??n.at));}
    if(diagnostics.hasErrors(checkpoint))throw new UpstreamTypeUnavailable();
-   n.checkedSpec=spec;n.checkedFields=fields;return {kind:'figure'};
+   n.checkedSpec=spec;n.checkedFields=fields;n.checkedPaths=Object.keys(fields).filter(key=>!Object.hasOwn(data.type.inner!.fields!,key)).map(key=>key.split('.'));return {kind:'figure'};
   }
-  const signature:Record<string,string[]>={Answer:[],Report:[],section:[],h1:[],h2:[],h3:[],p:[],div:[],span:[],ul:[],ol:[],li:[],blockquote:[],pre:[],code:[],strong:[],em:[],a:['href'],br:[],hr:[],Lit:['value'],Value:['data','field'],UseTable:['ref'],ColumnChart:['data','x','value'],UseReport:['ref']};
+  const signature:Record<string,string[]>={Answer:[],Report:[],section:[],h1:[],h2:[],h3:[],p:[],div:[],span:[],ul:[],ol:[],li:[],blockquote:[],pre:[],code:[],strong:[],em:[],a:['href'],br:[],hr:[],Lit:['value'],UseValue:['ref','precision'],Table:['data','spec'],ColumnChart:['data','x','value'],UseReport:['ref']};
   const optionalAttrs=['id','class','title','lang','data-oks-shrink'];
   for(const key of optionalAttrs)if(attrs[key]){if(attrs[key].k!=='literal'||typeof attrs[key].value!=='string')err(attrs[key],key+' requires static text');}
   if(n.name==='a'){if(attrs.href?.k!=='literal'||typeof attrs.href.value!=='string'||! /^(https?:|mailto:|#|\/)/.test(attrs.href.value))err(n,'Link href requires a static http, mailto, fragment or absolute path');}
-  if(n.name==='Lit'&&(attrs.value?.k!=='literal'||typeof attrs.value.value!=='string'))err(n,'Lit requires value = "static text"',{code:'literal-text',reason:'Lit 使用具名属性 value 接收静态字符串，表示作者确认这是固定文案',suggestion:'固定文案写 Lit(value = "最近 3 天")；查询结果用 Value(...) 引用；普通文字也可以直接写 "文字"'});
-  if(n.name==='Value'&&attrs.precision){try{n.checkedPrecision=precision(constant(attrs.precision));}catch(e){err(attrs.precision,(e as Error).message);}}
-  if(n.name==='Value')signature.Value.push('precision');
-  if(n.name==='Value'&&attrs.value){signature.Value=['value','precision'];if(!['ref','literal'].includes(attrs.value.k))err(attrs.value,'Prepare computed values before tree!; Value accepts a value reference or literal');const t=infer(attrs.value,env);let base=t;while(base.kind==='option')base=base.inner!;if(!['scalar','nominal'].includes(base.kind))err(n,'Value(value=...) requires a logical scalar');}
-  if(!Object.hasOwn(signature,n.name))err(n,'Unknown component '+n.name);for(const a of Object.keys(attrs))if(!signature[n.name].includes(a)&&!optionalAttrs.includes(a))err(n,'Unknown attribute '+a+' on '+n.name);for(const a of signature[n.name])if(a!=='precision'&&!attrs[a])err(n,'Missing attribute '+a+' on '+n.name);
+  if(n.name==='Lit'&&(attrs.value?.k!=='literal'||typeof attrs.value.value!=='string'))err(n,'Lit requires value = "static text"',{code:'literal-text',reason:'Lit 使用具名属性 value 接收静态字符串，表示作者确认这是固定文案',suggestion:'固定文案写 Lit(value = "最近 3 天")；查询结果用 UseValue(ref = ...) 引用；普通文字也可以直接写 "文字"'});
+  if(n.name==='UseValue'){
+   if(attrs.precision){try{n.checkedPrecision=precision(constant(attrs.precision));}catch(e){err(attrs.precision,(e as Error).message);}}
+   if(attrs.ref){
+    if(attrs.ref.k!=='ref'||attrs.ref.path.some((key:unknown)=>typeof key!=='string'))err(attrs.ref,'UseValue requires a direct scalar reference',{code:'value-reference',reason:'tree! 只引用已准备好的标量，不执行计算或默认值处理',suggestion:'先用 data prepared = ... 准备结果，再写 UseValue(ref = prepared) 或 UseValue(ref = prepared.field)'});
+    const t=infer(attrs.ref,env);let base=t;while(base.kind==='option')base=base.inner!;
+    if(!['scalar','nominal'].includes(base.kind))err(attrs.ref,'UseValue requires a logical scalar reference; got '+show(t));
+   }
+  }
+  if(!Object.hasOwn(signature,n.name))err(n,'Unknown component '+n.name);for(const a of Object.keys(attrs))if(!signature[n.name].includes(a)&&!optionalAttrs.includes(a))err(n,'Unknown attribute '+a+' on '+n.name);for(const a of signature[n.name])if(a!=='precision'&&!(n.name==='Table'&&a==='spec')&&!attrs[a])err(n,'Missing attribute '+a+' on '+n.name);
   const lookup=(a:string)=>{const v=attrs[a];if(v?.k!=='ref'||v.path.length!==1)err(n,a+' requires a declaration reference');const b=p.bindings.get(v.path[0]);if(!b&&failed.has(v.path[0]))throw new UpstreamTypeUnavailable();if(!b)err(v,'Unknown declaration '+v.path[0]);return b!;};
-  if(['UseTable','ColumnChart'].includes(n.name)){const b=lookup(n.name==='UseTable'?'ref':'data');if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)err(n,'Presentation requires a proven bound <= 500; use order_by and take');}
-  if(['UseTable','ColumnChart','Value'].includes(n.name)&&!(n.name==='Value'&&attrs.value)){const b=lookup(n.name==='UseTable'?'ref':'data');const row=n.name==='Value'&&b.type.kind==='option';if(!(b.type.kind==='table'||row)||b.type.inner!.kind!=='schema')err(n,'Expected Schema rows');for(const a of n.name==='ColumnChart'?['x','value']:n.name==='Value'?['field']:[]){if(attrs[a].k!=='projection')err(attrs[a],'Use project!(field) to select a row field');const t=b.type.inner!.fields![attrs[a].field];attrs[a].checkedType={kind:'projection',input:b.type.inner!,output:t};if(!t)err(attrs[a],'Unknown field '+attrs[a].field+'; examples: '+Object.keys(b.type.inner!.fields!).slice(0,8).join(', '));let numeric=present(t);while(numeric.kind==='nominal')numeric=numeric.inner!;if(a==='value'&&!['Int','Float'].includes(numeric.name??''))err(attrs[a],'Chart value must be numeric or a newtype with numeric representation');}if(n.name==='Value'&&!row&&(b.result?.maxRows===undefined||b.result.maxRows>1))err(n,'Value requires a statically single-row result');}
+  if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)err(n,'Presentation requires a proven bound <= 500; use order_by and take');}
+  if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.type.kind!=='table'||b.type.inner!.kind!=='schema')err(n,'Expected Schema rows');for(const a of n.name==='ColumnChart'?['x','value']:[]){if(attrs[a].k!=='projection')err(attrs[a],'Use $.field to select a row field');const t=checkedProjection(attrs[a],b.type.inner!);let numeric=present(t);while(numeric.kind==='nominal')numeric=numeric.inner!;if(a==='value'&&!['Int','Float'].includes(numeric.name??''))err(attrs[a],'Chart value must be numeric or a newtype with numeric representation');}}
+  if(n.name==='Table'){
+   const fields=lookup('data').type.inner!.fields!,spec=attrs.spec?constant(attrs.spec,fields,'Table.spec'):{};
+   for(const key of Object.keys(spec))if(!['columns','labels','title','precision','allow_no_data'].includes(key))err(n,'Unknown Table option '+key);
+   const columns=spec.columns??Object.keys(fields);
+   if(!Array.isArray(columns)||columns.some((key:unknown)=>typeof key!=='string'||!Object.hasOwn(fields,key as string)))err(n,'Table columns must reference existing fields');
+   if(spec.labels!==undefined&&(!spec.labels||typeof spec.labels!=='object'||Array.isArray(spec.labels)||Object.entries(spec.labels).some(([key,label])=>!Object.hasOwn(fields,key)||typeof label!=='string')))err(n,'Table labels require existing field names and text labels');
+   if(spec.allow_no_data!==undefined&&typeof spec.allow_no_data!=='boolean')err(n,'Table allow_no_data requires Bool');
+   if(spec.title!==undefined&&typeof spec.title!=='string')err(n,'Table title requires static text');
+   if(spec.precision!==undefined)try{precision(spec.precision);}catch(e){err(n,(e as Error).message);}
+   n.checkedSpec=spec;n.checkedFields=fields;
+  }
   if(n.name==='UseReport'&&lookup('ref').type.kind!=='report')err(n,'UseReport requires report');
-  if(['Value','Lit','UseTable','ColumnChart','UseReport','br','hr'].includes(n.name)&&n.children.length)err(n,'Leaf component cannot have children');
+  if(['UseValue','Lit','Table','ColumnChart','UseReport','br','hr'].includes(n.name)&&n.children.length)err(n,'Leaf component cannot have children');
   let invalidChild=false;
   function checkChild(c:Node,scope:Record<string,Type>){try{checkChildValue(c,scope);}catch(error){finding(error);invalidChild=true;}}
   function checkChildValue(c:Node,scope:Record<string,Type>){
    if(c.k==='literal'){
-    if(typeof c.value==='string'&&/\p{N}/u.test(c.value))p.warnings.push({at:c.at,asset,stage:'type',code:'numeric-text',message:'文本包含数字，请确认是否为查询结果',suggestion:'数据值使用 Value(...) 引用；固定文案使用 Lit(value = '+JSON.stringify(c.value)+') 显式声明'});
+    if(typeof c.value==='string'&&/\p{N}/u.test(c.value))p.warnings.push({at:c.at,asset,stage:'type',code:'numeric-text',message:'文本包含数字，请确认是否为查询结果',suggestion:'数据值使用 UseValue(ref = ...) 引用；固定文案使用 Lit(value = '+JSON.stringify(c.value)+') 显式声明'});
     return;
    }
    if(c.k==='iflet'){const t=infer(c.test,scope);if(t.kind!=='option')err(c.test,'if let Some requires Option(T)');const nested={...scope,[c.name]:t.inner!};c.yes.forEach((child:Node)=>checkChild(child,nested));c.no.forEach((child:Node)=>checkChild(child,scope));return;}

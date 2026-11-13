@@ -18,7 +18,7 @@ data rows = query_remote! {
    |> project({severity:a.alarm_severity,total:a.alarm_count})
    |> order_by(asc(out.severity)) |> take(10)
 };
-answer tree! { Answer [UseTable(ref = rows)]};`;
+answer tree! { Answer [Table(data = rows)]};`;
  const program=check(source,host.model);
  const output=resolve(program,db,{request:{start:1500,end:3000}});
  assert.deepEqual(output.values.rows.map((r:any)=>r.total),[1,1]);
@@ -29,7 +29,7 @@ answer tree! { Answer [UseTable(ref = rows)]};`;
  const compound=source.replace('filter(a.alarm_occur_utc_raw >= request.start)\n   |> filter(a.alarm_occur_utc_raw < request.end)','filter((a.alarm_occur_utc_raw >= request.start && a.alarm_occur_utc_raw < request.end) || a.alarm_severity == ic::AlarmSeverity::Major)');
  assert.deepEqual(resolve(check(compound,host.model),db,{request:{start:1500,end:3000}}).values.rows.map((r:any)=>r.total),[1,2]);
  db.exec("CREATE TABLE I_EnterpriseFrame(name TEXT,manufacturer TEXT); INSERT INTO I_EnterpriseFrame VALUES('null',NULL),('empty',''),('named','Acme')");
- const nullable=(predicate:string)=>'data rows=query_remote! {let f=from(ic::frame);f |> filter('+predicate+') |> project({name:f.frame_name}) |> order_by(asc(out.name)) |> take(10)};answer tree! { Answer [UseTable(ref = rows)]};';
+ const nullable=(predicate:string)=>'data rows=query_remote! {let f=from(ic::frame);f |> filter('+predicate+') |> project({name:f.frame_name}) |> order_by(asc(out.name)) |> take(10)};answer tree! { Answer [Table(data = rows)]};';
  const selected=(predicate:string)=>resolve(check(nullable(predicate),host.model),db).values.rows.map((row:any)=>row.name);
  assert.deepEqual(selected('is_some(f.frame__manufacturer)'),['empty','named']);
  assert.deepEqual(selected('is_none(f.frame__manufacturer)'),['null']);
@@ -37,16 +37,16 @@ answer tree! { Answer [UseTable(ref = rows)]};`;
  assert.deepEqual(selected('is_none(f.frame__manufacturer) || f.frame_name == "named"'),['named','null']);
  assert.throws(()=>check(nullable('is_some(f.frame_name)'),host.model),/optional dimension/);
  assert.throws(()=>check(nullable('is_some()'),host.model),/one optional dimension/);
- const projected='data rows=query_remote! {let f=from(ic::frame);f |> project({name:f.frame_name,manufacturer:not_none(f.frame__manufacturer)}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer [UseTable(ref = rows)]};';
+ const projected='data rows=query_remote! {let f=from(ic::frame);f |> project({name:f.frame_name,manufacturer:not_none(f.frame__manufacturer)}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer [Table(data = rows)]};';
  const projectedProgram=check(projected,host.model);
  assert.equal(show(projectedProgram.bindings.get('rows')!.type),'Table(Schema({name: String, manufacturer: String}))');
  assert.deepEqual(resolve(projectedProgram,db).values.rows,[{name:'empty',manufacturer:''}]);
  const firstNull=projected.replace('asc(out.name)','desc(out.name)');
  assert.deepEqual(resolve(check(firstNull,host.model),db).values.rows,[{name:'named',manufacturer:'Acme'}]);
  assert.throws(()=>check(projected.replace('not_none(f.frame__manufacturer)','not_none(f.frame_name)'),host.model),/optional direct model member/);
- assert.throws(()=>check(projected.replace('not_none(f.frame__manufacturer)','coalesce(not_none(f.frame__manufacturer),"x")'),host.model),/Computed model expression|outermost/);
+ assert.throws(()=>check(projected.replace('not_none(f.frame__manufacturer)','unwrap_or!(not_none(f.frame__manufacturer),"x")'),host.model),/Computed model expression|outermost/);
  db.exec('CREATE TABLE NetworkDeviceKPI(cpuUsage REAL)');
- const aggregate='data rows=query_remote! {let a=from(ic::device_kpi);a |> project({cpu:not_none(a.cpu_usage)})};answer tree! { Answer [UseTable(ref = rows)]};';
+ const aggregate='data rows=query_remote! {let a=from(ic::device_kpi);a |> project({cpu:not_none(a.cpu_usage)})};answer tree! { Answer [Table(data = rows)]};';
  const aggregateProgram=check(aggregate,host.model);
  assert(!show(aggregateProgram.bindings.get('rows')!.type).includes('Option('));
  assert.deepEqual(resolve(aggregateProgram,db).values.rows,[]);

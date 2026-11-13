@@ -13,8 +13,8 @@ try{
      |> connect(ic::relations::frame_belongs_to_device).as!(d);
    let output = linked |> project({frame:f.frame_name,device:d.device_name});
    output |> order_by(asc(output.frame)) |> take(10)
- }; answer tree! { Answer [UseTable(ref = rows)] };`;
- const local=check('data input=table([{n:1}]);data rows=query! {from(input).as!(a) |> project({n:a.n})};answer tree! {Answer [UseTable(ref=rows)]};');
+ }; answer tree! { Answer [Table(data = rows)] };`;
+ const local=check('data input=table([{n:1}]);data rows=query! {from(input).as!(a) |> project({n:a.n})};answer tree! {Answer [Table(data =rows)]};');
  assert.deepEqual(resolve(local,db).values.rows,[{n:1}]);
  const program=check(source,host.model);
  assert.match(show(program.bindings.get('rows')!.type),/device: Option\(String\)/);
@@ -35,7 +35,7 @@ try{
  const shadow=check(`data rows=query_remote! {
   from(ic::frame).as!(r) |> connect(ic::relations::frame_belongs_to_device).as!(r)
   |> project({device:r.device_name}).as!(r) |> order_by(asc(r.device)) |> take(10)
- };answer tree! {Answer [UseTable(ref=rows)]};`,host.model);
+ };answer tree! {Answer [Table(data =rows)]};`,host.model);
  assert.deepEqual(resolve(shadow,db).values.rows,[{device:null},{device:'device one'}]);
  console.log('Postfix node bindings: inferred peers, named plans, reverse traversal, optional LEFT JOIN and diagnostics passed');
 }finally{db.close();await host.close();}

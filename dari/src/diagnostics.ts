@@ -15,10 +15,10 @@ export class DiagnosticCollector {
 }
 export class UpstreamTypeUnavailable extends Error {}
 export function repairSuggestion(message:string):string|undefined {
- if(/Node attributes use|Expected =, got :/.test(message))return 'tree! 节点属性使用 =，例如 Value(value = prepared)，对象字段才使用冒号';
+ if(/Node attributes use|Expected =, got :/.test(message))return 'tree! 节点属性使用 =，例如 UseValue(ref = prepared)，对象字段才使用冒号';
  if(/Unknown (?:field|model member)/.test(message))return '使用该输入 Schema 中列出的字段；模型成员的精确符号可从 oks_info 获取';
  if(/Unknown binding out/.test(message))return '首次 project 使用输入别名；结果显式绑定，例如 let output = project({value:a.value}); output |> order_by(asc(output.value))';
- if(/Predicate requires Bool; got Option\(Bool\)/.test(message))return '条件可能为空；若空值按不满足处理，使用 coalesce(condition, False)';
+ if(/Predicate requires Bool; got Option\(Bool\)/.test(message))return '条件可能为空；若空值按不满足处理，使用 unwrap_or!(condition, False)';
  if(/case_when requires/.test(message))return 'case_when(condition, thenValue, elseValue) 恰好接受三个参数；多个分支嵌套在 elseValue 中，标签查表也可用 lookup';
  if(/Unknown built-in from|Expected ;, got \|>/.test(message))return '数据流水线写在 query! { let r = from(rows); r |> project({...}) } 中';
  if(/supported as a query! starting expression/.test(message))return '在 query! 中先 let a = from(left); let b = from(right); 然后以 join({a,b}, a.key == b.key) 或 semi_join({a,b}, a.key == b.key) 起手，再 |> project({...})；集合运算以 intersect({a,b}) 等起手，不放在 |> 后';
@@ -31,7 +31,7 @@ export function repairSuggestion(message:string):string|undefined {
  if(/Stacking requires an additive|does not allow Sum/.test(message))return '堆叠使用允许 Sum 的同类指标；同一指标只需并列时选择 GroupedBarChart，不同指标并列时选择 MultiBarChart，保留业务类型';
  if(/precision requires/.test(message))return 'precision 使用 0..12 的静态整数；它只改变展示，不改变原始数据精度';
  if(/allow_no_data|图表没有数据/.test(message))return '先核对筛选口径；若业务允许无数据，显式设置 spec.allow_no_data: True，否则保留错误，不填造占位数据';
- if(/Use project!/.test(message))return '字段选择写为 project!(field)，不使用字符串或匿名函数';
+ if(/Use \$\.field/.test(message))return '字段选择写为 $.field，不使用字符串或匿名函数';
  if(/Unknown component/.test(message))return '核对组件名称与大小写；扩展组件使用 PascalCase，普通标签使用小写';
  return undefined;
 }

@@ -14,7 +14,7 @@ model.types!['ic::Ordered']=enumeration('ic::Ordered',['Zed','Alpha']);
 const program=(kind:string,term:string)=>`type Row = Schema({raw:String,kind:ic::${kind}});
 data src:Table(Row)=source("devices");
 data rows=query! {let a=from(src);a |> project({raw:a.raw,kind:a.kind}) |> order_by(asc(out.${term})) |> take(10)};
-answer tree! {Answer [UseTable(ref = rows)]};`;
+answer tree! {Answer [Table(data = rows)]};`;
 assert.throws(()=>check(program('Unordered','kind'),model,{allowTestSources:true}),/has no declared business ordering/);
 const db=new DatabaseSync(':memory:');db.exec("CREATE TABLE devices(raw TEXT,kind TEXT);INSERT INTO devices VALUES ('b','Zed'),('a','Alpha')");
 const ordered=resolve(check(program('Ordered','kind'),model,{allowTestSources:true}),db).values.rows;

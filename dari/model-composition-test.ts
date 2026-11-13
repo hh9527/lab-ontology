@@ -11,7 +11,7 @@ try {
  const insert=db.prepare('INSERT INTO I_EnterpriseFrame VALUES(?)');
  for(let i=0;i<1200;i++)insert.run((i%2?'Edge':'Core')+'-'+i);
  const prefix='data population=query_remote! {let f=from(ic::frame);f |> project({name:f.frame_name})};';
- const answer='answer tree! { Answer [Value(data = total,field = project!(n))]};';
+ const answer='answer tree! { Answer [if let Some(value_row) = total [UseValue(ref = value_row.n)] else ["无数据"]]};';
  const aggregate='data total=query! {let r=from(population);r |> project({n:count()}) |> take_opt()};';
  const all=resolve(check(prefix+aggregate+answer,host.model),db);
  assert.equal(all.answer,'*1200*');assert.equal(all.queries,1);
@@ -22,7 +22,7 @@ try {
  }
  const doubled=prefix+'data doubled=query! {let a=from(population);let b=from(population);union_all({a,b})};'+aggregate.replace('from(population)','from(doubled)')+answer;
  assert.equal(resolve(check(doubled,host.model),db).answer,'*2400*');
- assert.throws(()=>check(prefix+'answer tree! { Answer [UseTable(ref = population)]};',host.model),/proven bound/);
+ assert.throws(()=>check(prefix+'answer tree! { Answer [Table(data = population)]};',host.model),/proven bound/);
  assert.throws(()=>check(prefix.replace('project({name:f.frame_name})','project({name:f.frame_name}) |> order_by(asc(out.name))')+aggregate+answer,host.model),/terminal take/);
  console.log('real IC: unbounded query composition, 1200-row aggregation, 2400-row union, model text filters and presentation bound passed');
 } finally {db.close();await host.close();}

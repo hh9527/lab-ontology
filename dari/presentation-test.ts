@@ -12,8 +12,8 @@ data raw: Table(Row) = source("samples");
 data rows = query! {let r = from(raw);r |> project({label:r.label,n:r.n}) |> order_by(desc(out.n)) |> take(10)};
 
 
-report report = tree! { Report [h1 ["设备报告"],BarChart(data = rows, spec = {category:project!(label),value:project!(n),value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}})]};
-answer tree! { Answer [BarChart(data = rows, spec = {category:project!(label),value:project!(n),value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}}),UseReport(ref = report)]};
+report report = tree! { Report [h1 ["设备报告"],BarChart(data = rows, spec = {category:$.label,value:$.n,value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}})]};
+answer tree! { Answer [BarChart(data = rows, spec = {category:$.label,value:$.n,value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}}),UseReport(ref = report)]};
 `;
 const options={allowTestSources:true,host:dariHost};
 let chartRenders=0;
@@ -46,8 +46,8 @@ assert(restored.endsWith(source));
 assert.match(restored,/Report execution metadata/);
 assert.equal(resolve(check(restored,undefined,options),db).answer,output.answer);
 assert.equal(Object.keys(output.artifacts).length,2);
-assert.throws(()=>check(source.replace('project!(n),value_min','project!(missing),value_min'),undefined,options),/Unknown figure field/);
-assert.throws(()=>check(source.replace('value:project!(n)','value:project!(label)'),undefined,options),/numeric mapping/);
+assert.throws(()=>check(source.replace('$.n,value_min','$.missing,value_min'),undefined,options),/Unknown field missing/);
+assert.throws(()=>check(source.replace('value:$.n','value:$.label'),undefined,options),/numeric mapping/);
 db.exec('DELETE FROM samples');
 assert.throws(()=>resolve(check(source,undefined,options),db),/allow_no_data|无数据|empty/i);
 assert.throws(()=>resolve(check(source,undefined,options),db),(error:Error)=>{
@@ -58,7 +58,7 @@ assert.throws(()=>resolve(check(source,undefined,options),db),(error:Error)=>{
 const empty=source.replaceAll('value_min:99.0','allow_no_data:True,value_min:99.0').replaceAll('columns:[','allow_no_data:True,columns:[');
 assert.match(resolve(check(empty,undefined,options),db).artifacts['chart_1.svg'],/无数据/);
 const contextType={kind:'schema',fields:{epochMillis:{kind:'scalar',name:'EpochMillis'},timeZone:{kind:'scalar',name:'String'}}};
-const calendar=check(`data ctx = context! { epoch_millis: Context::Now , time_zone: Context::ClientTz };data weeks = time_windows(ctx,{unit:TimeUnit::Week,count:2,mode:WindowMode::Complete});data start = weeks[0].start.epoch_millis;answer tree! { Answer [p [Value(value = start)]]};`,undefined,{host:dariHost,contextType});
+const calendar=check(`data ctx = context! { epoch_millis: Context::Now , time_zone: Context::ClientTz };data weeks = time_windows(ctx,{unit:TimeUnit::Week,count:2,mode:WindowMode::Complete});data start = weeks[0].start.epoch_millis;answer tree! { Answer [p [UseValue(ref = start)]]};`,undefined,{host:dariHost,contextType});
 assert.match(resolve(calendar,db,{}, {context:{epochMillis:Date.parse('2026-11-11T06:00:00Z'),timeZone:'Asia/Shanghai'}}).answer,/179/);
 db.close();
 console.log('production presentation: chart, inline table, self-contained report, empty data and calendar passed');
@@ -83,7 +83,7 @@ data left=table([{period:"本周",cpu:Cpu(44.2)},{period:"上周",cpu:Cpu(42.1)}
 data right=table([{period:"上周",memory:Memory(61.3)},{period:"本周",memory:Memory(59.8)}]);
 data weekly=query! {let l=from(left);let r=from(right);join({l,r},l.period==r.period) |> project({period:l.period,cpu:l.cpu,memory:r.memory}) |> order_by(asc(out.period)) |> take(10)};
 
-answer tree! { Answer [MultiBarChart(data=weekly,spec={category:project!(period),metrics:[{value:project!(cpu),label:"CPU",unit:"%"},{value:project!(memory),label:"内存",unit:"%"}]})]};`;
+answer tree! { Answer [MultiBarChart(data=weekly,spec={category:$.period,metrics:[{value:$.cpu,label:"CPU",unit:"%"},{value:$.memory,label:"内存",unit:"%"}]})]};`;
 const keyedOutput=resolve(check(keyed,undefined,{host:dariHost}),joinDb);
 assert.match(keyedOutput.artifacts['chart_1.svg'],/本周,44.2,59.8/);
 assert.match(keyedOutput.artifacts['chart_1.svg'],/上周,42.1,61.3/);

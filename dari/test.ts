@@ -7,23 +7,23 @@ import {resolve} from './src/runtime.ts';
 const source=readFileSync(new URL('./examples/source-select.dari',import.meta.url),'utf8');
 const program=check(source);
 for(const [from,to,error]of [
- ['project!(cpu)', '"cpu"', /Use project!\(field\)/],
- ['project!(cpu)', 'project!(missing)', /Unknown field missing/],
- ['project!(cpu)', 'project!(name)', /Chart value must be numeric/],
- ['project!(cpu)', 'project!(cpu + 1)', /Expected \)/],
- ['project!(cpu)', 'project!("cpu")', /Expected identifier/],
- ['project!(cpu)', 'fn(x) { x.cpu }', /Expected/],
+ ['$.cpu', '"cpu"', /Use \$\.field/],
+ ['$.cpu', '$.missing', /Unknown field missing/],
+ ['$.cpu', '$.name', /Chart value must be numeric/],
+ ['$.cpu', '$.cpu + 1', /Use \$\.field/],
+ ['$.cpu', '$."cpu"', /Expected identifier/],
+ ['$.cpu', 'fn(x) { x.cpu }', /Expected/],
 ] as const)assert.throws(()=>check(source.replace(from,to)),error);
-assert.throws(()=>check(source.replace('data top = query! {','data selector = project!(cpu);\ndata top = query! {')),/Unsupported expression projection/);
+assert.throws(()=>check(source.replace('data top = query! {','data selector = $.cpu;\ndata top = query! {')),/requires an input row context/);
 assert.equal(show(program.bindings.get('request')!.type),'Schema({floor: Float})');
 for(const [declaration,error]of [
  ['data request = input(Params);',/accepts no arguments/],
  ['data request: Params = input(Params);',/accepts no arguments/],
  ['data request = input();',/explicit Schema type annotation/],
  ['data request: Float = input();',/annotation must be Schema/],
- ['data request: Params = coalesce(input(), {floor: 0.0});',/explicitly typed declaration/],
+ ['data request: Params = unwrap_or!(input(), {floor: 0.0});',/explicitly typed declaration/],
 ] as const)assert.throws(()=>check(source.replace('data request: Params = input();',declaration)),error);
-assert.equal(show(program.bindings.get('summary')!.type),'Table(Schema({n: Int, average: Option(Float)}))');
+assert.equal(show(program.bindings.get('summary')!.type),'Option(Schema({n: Int, average: Option(Float)}))');
 const db=new DatabaseSync(':memory:');
 db.exec('CREATE TABLE devices(id TEXT,name TEXT,cpu REAL,tenant TEXT)');
 const insert=db.prepare('INSERT INTO devices VALUES(?,?,?,?)');
@@ -50,7 +50,7 @@ type A = Schema({id: Id}); type B = Schema({id: Id, score: Float});
 data a: Table(A) = source("a"); data b: Table(B) = source("b");
 data rows = query! { let l = from(a); let r = from(b);
 left_join({l,r}, l.id == r.id) |> project({id:l.id, score:r.score}) |> order_by(asc(out.id)) |> take(10) };
-answer tree! { Answer [UseTable(ref = rows)] };`;
+answer tree! { Answer [Table(data = rows)] };`;
 const jp=check(joined);assert.equal(show(jp.bindings.get('rows')!.type),'Table(Schema({id: Id, score: Option(Float)}))');
 db.exec("CREATE TABLE a(id TEXT); CREATE TABLE b(id TEXT, score REAL); INSERT INTO a VALUES('one'),('two'); INSERT INTO b VALUES('one',7)");
 assert.match(resolve(jp,db).answer,/two \| 无数据/);
@@ -73,7 +73,7 @@ assert.equal(resolve(check(shadowed),db,{request:{floor:50}}).answer,output.answ
 assert.equal(show(program.bindings.get('highest')!.type),'Option(Schema({cpu: Float}))');
 assert.equal(show(program.bindings.get('best_device')!.type),'Option(Schema({id: DeviceId, cpu: Float}))');
 assert.equal(show(program.bindings.get('average')!.type),'Option(Schema({cpu: Option(Float)}))');
-const inspect=source.replace('Value(data = summary, field = project!(n))','Value(data = highest, field = project!(cpu)), Value(data = average, field = project!(cpu))');
+const inspect=source.replace('UseValue(ref = summary_n)','if let Some(value_row) = highest [UseValue(ref = value_row.cpu)] else ["无数据"], if let Some(value_row) = average [UseValue(ref = value_row.cpu)] else ["无数据"]');
 const options=resolve(check(inspect),db,{request:{floor:50}});
 assert.deepEqual(options.values.highest,{tag:'Some',value:{cpu:99}});
 assert.deepEqual(options.values.average,{tag:'Some',value:{cpu:99}});
@@ -87,8 +87,8 @@ assert.throws(()=>check(source.replace('cpu: Float, tenant: String','cpu: Schema
 assert.throws(()=>check(source.replace('cpu: Float, tenant: String','cpu: Option(Option(Float)), tenant: String')),/Option requires/);
 
 // Optional record values preserve their schema and support an explicit fallback.
-const recordValue=source.replace('answer', 'data winner = coalesce(best_device, {id: DeviceId("none"), cpu: 0.0});\nanswer')
- .replace('Value(data = summary, field = project!(n))','Value(value = winner.cpu)');
+const recordValue=source.replace('answer', 'data winner = unwrap_or!(best_device, {id: DeviceId("none"), cpu: 0.0});\nanswer')
+ .replace('UseValue(ref = summary_n)','UseValue(ref = winner.cpu)');
 const winner=resolve(check(recordValue),db,{request:{floor:50}});
 assert.equal(winner.values.best_device.tag,'Some');assert.equal(winner.values.winner.cpu,99);
 const noWinner=resolve(check(recordValue),db,{request:{floor:200}});
@@ -101,7 +101,7 @@ const chained=source.replace('answer',`data cpu_values = query! {
 data scalar_peak = query! {
     let a = from(cpu_values); a |> project(a) |> order_by(desc(out.cpu)) |> take_opt()
 };
-answer`).replace('Value(data = summary, field = project!(n))','Value(data = scalar_peak, field = project!(cpu))');
+answer`).replace('UseValue(ref = summary_n)','if let Some(value_row) = scalar_peak [UseValue(ref = value_row.cpu)] else ["无数据"]');
 assert.equal(show(check(chained).bindings.get('cpu_values')!.type),'Table(Schema({cpu: Float}))');
 assert.deepEqual(resolve(check(chained),db,{request:{floor:50}}).values.scalar_peak,{tag:'Some',value:{cpu:99}});
 const wholeRecord=source.replace('project({id: a.id, name: a.name, cpu: a.cpu})','project(a)');

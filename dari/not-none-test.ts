@@ -4,7 +4,7 @@ import {check,show} from './src/compiler.ts';
 import {resolve} from './src/runtime.ts';
 const db=new DatabaseSync(':memory:');
 db.exec("CREATE TABLE samples(id INTEGER,v REAL,label TEXT);INSERT INTO samples VALUES(1,NULL,'missing'),(2,0.12,''),(3,0.34,'ok'),(4,0.56,NULL)");
-const program=(steps:string)=>check(`type R=Schema({id:Int,v:Option(Float),label:Option(String)});data src:Table(R)=source("samples");data rows=query! {let r=from(src);r ${steps}};answer tree! { Answer [UseTable(ref = rows)]};`,undefined,{allowTestSources:true});
+const program=(steps:string)=>check(`type R=Schema({id:Int,v:Option(Float),label:Option(String)});data src:Table(R)=source("samples");data rows=query! {let r=from(src);r ${steps}};answer tree! { Answer [Table(data = rows)]};`,undefined,{allowTestSources:true});
 const run=(steps:string)=>resolve(program(steps),db).values.rows;
 const steps='|> project({id:r.id,v:not_none(r.v),label:r.label}) |> order_by(asc(out.id)) |> take(2)';
 assert.equal(show(program(steps).bindings.get('rows')!.type),'Table(Schema({id: Int, v: Float, label: Option(String)}))');
@@ -14,7 +14,7 @@ assert.deepEqual(run('|> project({id:r.id,v:not_none(r.v + 1.0)}) |> order_by(as
 assert.deepEqual(run('|> filter(r.id == 1) |> project({v:not_none(avg(r.v))})'),[]);
 assert.deepEqual(run('|> project({v:not_none(avg(r.v))})'),[{v:0.34}]);
 assert.throws(()=>program('|> project({id:not_none(r.id)}) |> order_by(asc(out.id)) |> take(10)'),/requires Option/);
-assert.throws(()=>program('|> project({v:coalesce(not_none(r.v),0.0)}) |> order_by(asc(out.v)) |> take(10)'),/outermost/);
+assert.throws(()=>program('|> project({v:unwrap_or!(not_none(r.v),0.0)}) |> order_by(asc(out.v)) |> take(10)'),/outermost/);
 assert.throws(()=>program('|> filter(is_some(not_none(r.v))) |> project({id:r.id}) |> order_by(asc(out.id)) |> take(10)'),/outermost/);
 assert.throws(()=>program('|> project({v:not_none()}) |> order_by(asc(out.v)) |> take(10)'),/requires one/);
 db.close();

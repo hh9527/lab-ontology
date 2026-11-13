@@ -21,7 +21,7 @@ try{
  assert.deepEqual(percent.presentation,{multiplier:1,suffix:'%'});
  assert.deepEqual(ratio.presentation,{multiplier:100,suffix:'%'});
  assert.deepEqual(host.model.types![metricNames[0]].presentation,{multiplier:1,suffix:'%',precision:2});
- const displayed=resolve(check('data r=ic::Ratio(0.12);data p=ic::Percent(12.0);data rows=table([{r:r}]);data single=query! {let a=from(rows);a |> project({r:avg(a.r)})};answer tree! { Answer [Value(value = r),Value(value = p),Value(data = single,field = project!(r))]};',host.model),db);
+ const displayed=resolve(check('data r=ic::Ratio(0.12);data p=ic::Percent(12.0);data rows=table([{r:r}]);data single=query! {let a=from(rows);a |> project({r:avg(a.r)}) |> take_opt()};answer tree! { Answer [UseValue(ref = r),UseValue(ref = p),if let Some(value_row) = single [UseValue(ref = value_row.r)] else ["无数据"]]};',host.model),db);
  assert.equal((displayed.answer.match(/12%/g)??[]).length,3);
  assert.equal(ratio.codec!.encode(0.12),0.12);
  const prefix='data a=ic::Percent(20.0);data b=ic::Percent(10.0);';
@@ -31,13 +31,13 @@ try{
  assert.throws(()=>check(prefix+'data rows=table([{v:a},{v:b}]);data bad=query! {let r=from(rows);r |> project({v:sum(r.v)})};answer tree! { Answer []};',host.model),/does not allow Sum/);
  const program=check(prefix+`
  data rows=table([{v:a},{v:b}]);
- data stats=query! {let r=from(rows);r |> project({mean:avg(r.v),lo:min(r.v),hi:max(r.v)})};
+ data stats=query! {let r=from(rows);r |> project({mean:avg(r.v),lo:min(r.v),hi:max(r.v)}) |> take_opt()};
  data delta=difference(a,b);
  data relative=ratio(a,b);
  data growth=growth_rate(a,b);
  data rounded=round(a,1);
  data compared=a>b;
- answer tree! { Answer [Value(value = delta),Value(data = stats,field = project!(mean))]};`,host.model);
+ answer tree! { Answer [UseValue(ref = delta),if let Some(value_row) = stats [UseValue(ref = value_row.mean)] else ["无数据"]]};`,host.model);
  assert.equal(show(program.bindings.get('delta')!.type),'Percent');
  assert.equal(show(program.bindings.get('relative')!.type),'Option(Ratio)');
  assert.equal(show(program.bindings.get('rounded')!.type),'Percent');

@@ -24,7 +24,7 @@ const db=new DatabaseSync(':memory:');
 const source=`data zone=TimeZone("America/New_York");
 data src=table([{ts:EpochMillis(1772953200000),cpu:20.0},{ts:EpochMillis(1772956800000),cpu:40.0}]);
 data rows=query! {let a=from(src);let b=a |> project({day:calendar_bucket(to_datetime_utc(a.ts),CalendarUnit::Day,zone),cpu:a.cpu});let grouped=b |> group_by({day:b.day}) |> project({day:b.day,cpu:avg(b.cpu)});grouped |> order_by(asc(grouped.day)) |> take(10)};
-answer tree! {Answer [UseTable(ref=rows)]};`;
+answer tree! {Answer [Table(data =rows)]};`;
 const result=resolve(check(source),db);
 assert.deepEqual(result.values.rows,[{day:'2026-03-08T05:00:00.000Z',cpu:30}]);
 for(const expr of ['calendar_bucket(DateTimeUtc("2026-01-01T00:00:00Z"),CalendarUnit::Day,"Asia/Shanghai")','calendar_bucket(EpochMillis(0),CalendarUnit::Day,TimeZone("UTC"))'])assert.throws(()=>check(`data x=${expr};answer tree! {Answer []};`),/requires/);

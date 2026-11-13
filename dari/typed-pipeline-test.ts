@@ -23,8 +23,8 @@ data named=query! {
  result |> take(1)
 };
 data first=query! {let a=from(named);a |> take_opt()};
-data title=map_opt(first,project!(name));
-answer tree! { Answer [UseTable(ref = rows),UseTable(ref = named),Value(value = title)]};
+data title=map_opt(first,$.name);
+answer tree! { Answer [Table(data = rows),Table(data = named),UseValue(ref = title)]};
 `;
 // An inherited order and bound remain usable across named data boundaries.
 const program=check(source);
@@ -35,7 +35,7 @@ assert.equal(program.bindings.get('first')!.type.kind,'option');
 const output=resolve(program,db);
 assert.deepEqual(output.values.named,[{name:'B',seen:'1970-01-01T00:00:01.000Z',cpu:80}]);
 assert.match(output.answer,/80%/);
-assert.throws(()=>check(prefix+'data bad=query! {let a=from(devices);let result=project({cpu:a.cpu+1.0});result |> order_by(desc(result.cpu)) |> take(1)};answer tree! { Answer [UseTable(ref = bad)]};'),/does not allow Add/);
+assert.throws(()=>check(prefix+'data bad=query! {let a=from(devices);let result=project({cpu:a.cpu+1.0});result |> order_by(desc(result.cpu)) |> take(1)};answer tree! { Answer [Table(data = bad)]};'),/does not allow Add/);
 assert.equal(show(check(source.replace('name:not_none(a.name)','name:a.name')).bindings.get('title')!.type),'Option(String)');
 db.close();
 console.log('Typed pipeline: lexical plans, nullable join, narrowing projection, time conversion, nominal policy, inherited order/bound and optional row passed');
