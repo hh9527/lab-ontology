@@ -179,3 +179,5 @@ context 由宿主传入，不在语言中猜测时间或时区。检查时通过
 ## 关系组合与完整输入验收
 
 relation-test.ts 验证 Relation 的可选关联与模型检查；pair-test.ts 验证两期完整聚合、身份对齐和增长排名；model-composition-test.ts 验证未物化模型查询的 1,200 行聚合与 2,400 行集合合并；set-test.ts 验证集合、半连接、去重和分组 TopN。所有交付上界在 check 阶段证明，中间无上界计划只作为 SQL 子查询消费。
+
+时间类型、format/formats 与类型化横轴见 [LANGUAGE.md](LANGUAGE.md#时间展示)，可运行示例见 [time-display.dari](examples/time-display.dari)。

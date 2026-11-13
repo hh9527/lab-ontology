@@ -9,7 +9,7 @@ const db=new DatabaseSync(':memory:');
 const run=(source:string)=>{const name=[...source.matchAll(/data (\w+)=/g)].at(-1)![1];return resolve(check(source+'answer tree! { Answer ['+(name==='rows'?'Table(data = rows)':'UseValue(ref = '+name+')')+']};',undefined,{host:dariHost}),db).values;};
 assert.equal(run('data t=EpochMillis(0);data later=t+1000;data delta=later-t;').delta,1000);
 assert.equal(run('data t=to_datetime_utc(EpochMillis(0));').t,'1970-01-01T00:00:00.000Z');
-assert.equal(run('data t=to_datetime_tz(EpochMillis(0),"Asia/Shanghai");').t,'1970-01-01T08:00:00.000+08:00[Asia/Shanghai]');
+assert.equal(run('data t=to_datetime_tz(EpochMillis(0),TimeZone("Asia/Shanghai"));').t,'1970-01-01T08:00:00.000+08:00[Asia/Shanghai]');
 assert.equal(run('data t=time_bucket(DateTimeUtc("2026-03-08T20:00:00Z"),{unit:TimeUnit::Day,time_zone:"America/New_York"});').t,'2026-03-08T05:00:00.000Z');
 assert.throws(()=>primaryCodecs.EpochMillis.parse('0'),/requires Int/);
 assert.throws(()=>primaryCodecs.DateTimeUtc.parse(0),/requires ISO String/);

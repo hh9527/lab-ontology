@@ -26,12 +26,12 @@ const periods=check(`data february=calendar_period(LocalDate("2026-02-01"),Calen
 data first=do {let week=calendar_period(february.start,CalendarUnit::Week);at_zone(intersection(week,february),TimeZone("Asia/Shanghai"))};
 data second=do {let week=calendar_period(february.start,CalendarUnit::Week);at_zone(intersection(shift_dates(week,CalendarUnit::Week,1),february),TimeZone("Asia/Shanghai"))};
 answer tree! {Answer [UseValue(ref =first.start),UseValue(ref =first.end),UseValue(ref =second.start),UseValue(ref =second.end)]};`);
-assert.equal(resolve(periods,db).answer.replaceAll('*',''),[Date.parse('2026-02-01T00:00:00+08:00'),Date.parse('2026-02-02T00:00:00+08:00'),Date.parse('2026-02-02T00:00:00+08:00'),Date.parse('2026-02-09T00:00:00+08:00')].join('\n\n'));
+assert.deepEqual(['first','second'].flatMap(key=>{const r=resolve(periods,db).values[key];return [r.start,r.end];}),[Date.parse('2026-02-01T00:00:00+08:00'),Date.parse('2026-02-02T00:00:00+08:00'),Date.parse('2026-02-02T00:00:00+08:00'),Date.parse('2026-02-09T00:00:00+08:00')]);
 for(const [date,hours]of [['2026-03-08',23],['2026-11-01',25]] as const){
  const p=check(`data window=at_zone(calendar_period(LocalDate("${date}"),CalendarUnit::Day),TimeZone("America/New_York"));answer tree! {Answer [UseValue(ref =window.start),UseValue(ref =window.end)]};`);
- const values=resolve(p,db).answer.replaceAll('*','').split('\n\n').map(Number);assert.equal(values[1]-values[0],hours*3600000);
+ const window=resolve(p,db).values.window;assert.equal(window.end-window.start,hours*3600000);
 }
-assert.equal(evaluate('at_zone(calendar_period(LocalDate("2018-11-04"),CalendarUnit::Day),TimeZone("America/Sao_Paulo"))'),String(Date.parse('2018-11-04T03:00:00Z')));
+assert.equal(evaluate('at_zone(calendar_period(LocalDate("2018-11-04"),CalendarUnit::Day),TimeZone("America/Sao_Paulo"))'),'2018-11-04 03:00:00 +00:00 \\[UTC\\]');
 assert.throws(()=>evaluate('at_zone(calendar_period(LocalDate("2011-12-30"),CalendarUnit::Day),TimeZone("Pacific/Apia"))'),/does not exist/);
 for(const expr of ['date_of(42,TimeZone("UTC"))','date_of(EpochMillis(0),"UTC")','calendar_period(LocalDate("2026-01-01"),"month")','at_zone({start:LocalDate("2026-01-01"),end:LocalDate("2026-01-02")},TimeZone("UTC"))'])assert.throws(()=>check(`data x=${expr};answer tree! {Answer []};`),/requires/);
 // Existing text containment and table emptiness retain their separate typed contracts.

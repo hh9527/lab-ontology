@@ -1,6 +1,6 @@
 export type Node = {k:string;at:number;[key:string]:any};
 export type Token = {text:string;at:number;kind:string};
-export type FaultDetails={code?:string;reason?:string;suggestion?:string;stage?:'syntax'|'type'|'model'|'runtime'};
+export type FaultDetails={code?:string;expression?:string;reason?:string;suggestion?:string;stage?:'syntax'|'type'|'model'|'runtime'};
 export class Fault extends Error {
  at:number;line?:number;column?:number;details:FaultDetails;
  constructor(message:string,at:number,details:FaultDetails={}){super(message);this.at=at;this.details=details;}

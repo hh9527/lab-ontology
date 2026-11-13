@@ -1,5 +1,5 @@
 import type {Type} from './compiler.ts';
-import {dateTimeUtc,epochMillis,timeZone} from './time-values.ts';
+import {dateTimeUtc,epochMillis,timeZone,parseDateTimeTz} from './time-values.ts';
 import type {ValueCodec} from './model.ts';
 const DAY=86400000;
 export function localDate(value:unknown):string{
@@ -17,6 +17,7 @@ function closed(name:string,variants:string[]):Type{
  return{kind:'nominal',name,inner:scalar('String'),codec};
 }
 export const calendarTypes:Record<string,Type>={
+ DateStyle:closed('DateStyle',['Date','DateTime','Time']),
  CalendarUnit:closed('CalendarUnit',['Year','Quarter','Month','Week','Day']),
  Weekday:closed('Weekday',['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']),
  DateOverflow:closed('DateOverflow',['Reject','Clamp']),
@@ -77,7 +78,14 @@ function define(name:string,required:string[],optional:string[],output:Type,run:
  calendarFunctions[name]={check(args){if(args.length<required.length||args.length>required.length+optional.length)throw Error(name+' requires '+required.join(', ')+(optional.length?' [, '+optional.join(', ')+']':''));
   args.forEach((t,i)=>{const expected=[...required,...optional][i];if(t.kind==='option'||!(expected==='Instant'?['EpochMillis','DateTimeUtc','DateTimeTz'].includes(t.semantic??t.name??''):t.name===expected))throw Error(name+' argument '+(i+1)+' requires '+expected+'; got '+(t.name??t.kind));});return output;},run};
 }
-define('date_of',['Instant','TimeZone'],[],scalar('LocalDate'),([instant,zone])=>dateOf(instant,zone));
+calendarFunctions.date_of={
+ check(args){
+  if(args.length===1&&args[0].kind!=='option'&&(args[0].semantic??args[0].name)==='DateTimeTz')return scalar('LocalDate');
+  if(args.length===2&&args[0].kind!=='option'&&['EpochMillis','DateTimeUtc','DateTimeTz'].includes(args[0].semantic??args[0].name??'')&&args[1].kind!=='option'&&(args[1].semantic??args[1].name)==='TimeZone')return scalar('LocalDate');
+  throw Error('date_of requires a nonnullable instant and TimeZone, or one nonnullable DateTimeTz using its own zone');
+ },
+ run([instant,zone]){return dateOf(instant,zone??/\[([^\]]+)\]$/.exec(parseDateTimeTz(instant))![1]);}
+};
 define('calendar_floor',['LocalDate','CalendarUnit'],['Weekday'],scalar('LocalDate'),([date,unit,weekday])=>floor(date,unit,weekday));
 define('calendar_ceil',['LocalDate','CalendarUnit'],['Weekday'],scalar('LocalDate'),([date,unit,weekday])=>{const start=floor(date,unit,weekday);return start===date?start:shift(start,unit,1);});
 define('calendar_period',['LocalDate','CalendarUnit'],['Weekday'],dateRangeType,([date,unit,weekday])=>{const start=floor(date,unit,weekday);return range(start,shift(start,unit,1),'DateRange');});

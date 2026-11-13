@@ -177,15 +177,43 @@ r |> project({name:r.name,manufacturer:not_none(r.manufacturer)})
   |> order_by(asc(out.name)) |> take(10)
 ```
 
-公共源码中的绑定、字段、函数、参数及图表配置采用 snake_case；类型、枚举成员和扩展组件采用 PascalCase，HTML 元素保留标签名称。时间窗口边界使用 epoch_millis/date_time_utc，时区选项使用 time_zone；图表使用 allow_no_data、value_min、x_type、x_label、value_label、connect_nulls、entity_color，layout 使用 label_font、title_font、slant_ticks、tick_count。底层 JS 库的名称通过宿主适配，不构成源码别名。
+公共源码中的绑定、字段、函数、参数及图表配置采用 snake_case；类型、枚举成员和扩展组件采用 PascalCase，HTML 元素保留标签名称。时间窗口边界使用 epoch_millis/date_time_utc，时区选项使用 time_zone；图表使用 allow_no_data、value_min、x_axis、formats、x_label、value_label、connect_nulls、entity_color，layout 使用 label_font、title_font、slant_ticks、tick_count。底层 JS 库的名称通过宿主适配，不构成源码别名。
 
 ## 共享标量与时间
 
 ontology 与 DARI 共享 Percent、Ratio、EpochMillis、DateTimeUtc、DateTimeTz、TimeZone 的语义身份。业务模型通过 property 声明共享身份或继承关系；语言按发布契约识别，不依赖 IC/NS 名称。语义身份、parse/encode/decode 与 presentation 分别发布。Percent 与 Ratio 保留受限的计算能力，展示策略不赋予额外算术能力。
 
-顶层 `data ctx = context! { now: Context::Now, tz: Context::ClientTz };` 按静态选择项推导 Schema：now 为 EpochMillis，tz 为 TimeZone。客户端时区缺失或无效时报错；只选择 Now 时不要求时区。EpochMillis 使用整数毫秒编码，DateTimeUtc 使用 ISO 时间字符串编码，DateTimeTz 使用带偏移与 IANA 时区的字符串编码。构造器接收各自的非空编码值。to_epoch_millis(t)、to_datetime_utc(t)、to_datetime_tz(t,"Asia/Shanghai") 表达显式转换，并保留输入可空性。DateTimeTz 保留瞬时值、偏移和时区，检查偏移与时区的一致性；比较及排序按瞬时值进行。
+顶层 `data ctx = context! { now: Context::Now, tz: Context::ClientTz };` 按静态选择项推导 Schema：now 为 EpochMillis，tz 为 TimeZone。客户端时区缺失或无效时报错；只选择 Now 时不要求时区。EpochMillis 使用整数毫秒编码，DateTimeUtc 使用 ISO 时间字符串编码，DateTimeTz 使用带偏移与 IANA 时区的字符串编码。构造器接收各自的非空编码值。to_epoch_millis(t)、to_datetime_utc(t)、to_datetime_tz(t,TimeZone("Asia/Shanghai")) 表达显式转换，并保留输入可空性。DateTimeTz 保留瞬时值、偏移和时区，检查偏移与时区的一致性；比较及排序按瞬时值进行。
 
-EpochMillis 支持加减整数毫秒偏移；两个 EpochMillis 相减得到整数毫秒时长。time_bucket(t,{unit:TimeUnit::Day,time_zone:"Asia/Shanghai"}) 按明确的日历时区分桶并返回 DateTimeUtc，支持 minute/hour/day/week/month/quarter/year。周从星期一开始，日历边界按时区及夏令时规则确定。上述算子可用于标量节点及 query! 的字段表达式。
+EpochMillis 支持加减整数毫秒偏移；两个 EpochMillis 相减得到整数毫秒时长。日历分桶使用 calendar_bucket，UTC 分桶使用 utc_bucket，见后文；日期区间按 LocalDate/DateRange 组合，不能假定每天固定 24 小时。
+
+## 时间展示
+
+计算值与展示解耦：EpochMillis / DateTimeUtc 表达确定时刻，DateTimeTz 为同一时刻附带地区时区；LocalDate 只有日历日期，不参与时区转换。显示格式不改变原值、类型、分组或排序。不要截取 UTC 字符串来获得本地日期。
+
+```dari
+data ctx = context! { now: Context::Now, tz: Context::ClientTz };
+data date_format = { time_zone: ctx.tz, date_style: DateStyle::Date };
+data local_now = to_datetime_tz(ctx.now, ctx.tz);
+data today = date_of(local_now);
+answer tree! { Answer [
+    UseValue(ref = ctx.now, format = date_format),
+    UseValue(ref = local_now),
+    Table(data = daily, spec = { formats: { day: date_format } }),
+    LineChart(data = daily, spec = {
+        x: $.day, value: $.cpu,
+        formats: { day: date_format }
+    })
+] };
+```
+
+示例中的 daily 是先前取得的有界表，day 为 EpochMillis / DateTimeUtc / DateTimeTz，cpu 为数值指标。`formats` 的键为输入字段名，UseValue 的 `format` 使用同一配置。time_zone 接受非空 TimeZone（如 ctx.tz 或预先构造的 TimeZone），date_style 使用 DateStyle::Date / DateTime / Time。配置结构和枚举在检查期确定；time_zone 的类型在检查期校验，实际地区值来自本次执行的缓存数据节点。
+
+未指定格式时，EpochMillis / DateTimeUtc 明确按 UTC 展示；DateTimeTz 按自身地区展示。默认 DateTime 显示日期、时分秒、实际 UTC 偏移和地区名，以区分夏令时回拨的重复时刻。Date 只显示 YYYY-MM-DD；Time 只显示 HH:mm:ss。LocalDate 原样显示 YYYY-MM-DD，不接受 time_zone 或非 Date 的 date_style。空值保留为空，不伪造日期，不采用服务器默认时区。
+
+LineChart / AreaChart 从字段类型推导横轴：三种时刻类型为连续时间轴，LocalDate / String 为类别轴，普通数值为数值轴。需要显式选择时使用 x_axis: Axis::Time / Category / Value；Time 要求时刻类型，Value 要求数值。轴标签、axis pointer、tooltip 与交付数据采用同一时间格式；原始输入仍保留在 SVG 元数据。DateTimeTz 连续轴包含不同地区时必须显式指定统一 time_zone。类别轴的格式若把不同瞬时值压成同一标签会报错，避免图表悄悄合并数据。
+
+`date_of(instant, zone)` 计算 LocalDate；单参数 `date_of(zoned)` 要求 DateTimeTz，使用其自带地区。date_of 与日期区间运算用于前序 data/do；行级日历聚合在 query! / query_remote! 使用 calendar_bucket。地区分桶键保持 DateTimeUtc，表格或图表通过 formats 显示对应地区的日期；无需把分组键降成 String。地区日可能为 23 / 25 小时，不能用固定 86400000 毫秒代替日历日期推进。
 
 ## 类型化查询组合
 
@@ -253,7 +281,7 @@ data window = do {
 
 | 函数 | 参数与结果 |
 | --- | --- |
-| date_of | instant, TimeZone → LocalDate |
+| date_of | instant, TimeZone → LocalDate；或 DateTimeTz → LocalDate（自带地区） |
 | calendar_floor / calendar_ceil | LocalDate, CalendarUnit, 可选 Weekday → LocalDate |
 | calendar_period | LocalDate, CalendarUnit, 可选 Weekday → DateRange |
 | shift_date | LocalDate, CalendarUnit, Int, 可选 DateOverflow → LocalDate |
@@ -265,7 +293,7 @@ data window = do {
 | contains | 区间, 同类端点 → Bool |
 | is_empty | 区间 → Bool；表为空的既有重载也保留 |
 
-instant 接受 EpochMillis / DateTimeUtc / DateTimeTz。这些日历准备函数当前要求非空输入，不自动吞掉 None。calendar_ceil 在已对齐时保持原日。intersection 不相交时返回位于较晚起点的空区间。at_zone 按时区日历求当天最早存在的瞬时值，整个日期不存在时报错。输出端点使用 `.start` / `.end`；UTC 或带时区展示使用显式 to_datetime_utc / to_datetime_tz 转换。
+instant 接受 EpochMillis / DateTimeUtc / DateTimeTz。这些日历准备函数当前要求非空输入，不自动吞掉 None。calendar_ceil 在已对齐时保持原日。intersection 不相交时返回位于较晚起点的空区间。at_zone 按时区日历求当天最早存在的瞬时值，整个日期不存在时报错。输出端点使用 `.start` / `.end`；时间展示通过 format/formats 配置，不必为显示修改分组键。
 
 完整组合见 [calendar.dari](examples/calendar.dari)。input! 暂未实现。
 
@@ -297,7 +325,7 @@ data rows = query_remote! {
 
 query_remote! 在投影中接受直接 DateTimeUtc 维度，或 `utc_bucket(to_datetime_utc(a.epoch), CalendarUnit::Day)` 这样的显式 EpochMillis 转换后分桶；也支持单独投影 `to_datetime_utc(a.epoch)`。转换的源必须为直接 EpochMillis/DateTimeUtc 维度，结果保持 DateTimeUtc 及来源可空性。通过已投影字段排序。模型检查权限、类型与聚合语义，再生成原生 SQL 分组；不在宿主取回原始行后分组。接口与 IC/NS 无绑定，示例仅使用 IC 已发布符号说明调用。
 
-utc_bucket 不补齐没有记录的桶，不改变业务度量的聚合能力；本地 UDF 与模型 SQL 使用相同 UTC 周期定义。带时区分桶和固定时长分桶属于后续范围。
+utc_bucket 不补齐没有记录的桶，不改变业务度量的聚合能力；本地 UDF 与模型 SQL 使用相同 UTC 周期定义。地区日历分桶见下节；固定时长分桶尚未提供。
 
 ## 地区时区分桶
 
@@ -315,7 +343,7 @@ data daily = query_remote! {
 };
 ```
 
-EpochMillis 来源写成 `calendar_bucket(to_datetime_utc(a.epoch), CalendarUnit::Day, ctx.tz)`。固定地区也使用地区身份，如 `data zone = TimeZone("America/New_York");`，不接受裸 String 或隐式 UtcOffset。地区桶与 UTC 桶都返回桶键的 UTC 表达，展示用 to_datetime_tz。
+EpochMillis 来源写成 `calendar_bucket(to_datetime_utc(a.epoch), CalendarUnit::Day, ctx.tz)`。固定地区也使用地区身份，如 `data zone = TimeZone("America/New_York");`，不接受裸 String 或隐式 UtcOffset。地区桶与 UTC 桶都返回桶键的 UTC 表达；展示时用 formats 指定地区与日期样式，无需变更桶键类型。
 
 query! 中使用同一表达式，先投影桶再分组。query_remote! 第一版的 zone 是类型化参数，来自顶层 data；模型成员中的普通 String 时区字段尚未自动提升为 TimeZone。检查期由模型证明时间类型、单位和时区参数契约，执行期绑定实际地区 ID。SQLite 适配固定注册 dari_calendar_bucket，PostgreSQL 使用原生三参数 date_trunc；UQL 不支持此算子。执行侧不另行选择语义或回退固定偏移。
 

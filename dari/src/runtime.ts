@@ -5,6 +5,7 @@ function readProjection(row:any,path:readonly string[]):any {
 }
 import {calendarFunctions,utcBucket,calendarBucket,registerCalendarSqlite} from './calendar.ts';
 import {formatValue} from './format.ts';
+import type {TimeFormat} from './time-display.ts';
 import {timeFunctions,epochMillis} from './time-values.ts';
 import {timeType,sharedTypes} from './shared-types.ts';
 import {inSubnet} from './ipv4.ts';
@@ -46,7 +47,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
  const dataSections=new Map<string,string[]>(),includedReports=new Set<string>();
  const recordData=(key:string,text:string)=>{const parts=dataSections.get(dataScope)??[];parts.push('## '+dataScope+'/'+key+'\n\n'+text);dataSections.set(dataScope,parts);};
  const valueKeys=new Set<string>(),valueSections=new Map<string,string[]>();
- function recordValue(n:Node,text:unknown){const a=Object.fromEntries(n.attrs.map((f:Node)=>[f.name,f.value]));const key=a.ref.path.join('.');const full=dataScope+'/'+key;if(!valueKeys.has(full)){valueKeys.add(full);const lines=valueSections.get(dataScope)??[];lines.push('- '+key+': '+md(text));valueSections.set(dataScope,lines);}}
+ function recordValue(n:Node,text:unknown){const a=Object.fromEntries(n.attrs.map((f:Node)=>[f.name,f.value]));const key=a.ref.path.join('.');const full=dataScope+'/'+key+'/'+String(text);if(!valueKeys.has(full)){valueKeys.add(full);const lines=valueSections.get(dataScope)??[];lines.push('- '+key+': '+md(text));valueSections.set(dataScope,lines);}}
 
  const cache=new Map<string,any>();const artifacts:Record<string,string>={};let queries=0;
  const runId=randomUUID(),startedAt=new Date().toISOString();
@@ -301,13 +302,15 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   const attributes=Object.entries(attrs).filter(([key])=>n.name!=='Report'||key!=='title').map(([key,node]:[string,any])=>' '+key+'="'+html(node.value)+'"').join('');
   return '<'+tag+attributes+'>'+n.children.map((c:Node)=>reportNode(c,numbers)).join('')+(['br','hr'].includes(tag)?'':'</'+tag+'>');
  }
- function presented(t:Type|undefined,v:any,digits?:number):any {
-  if(t?.kind==='option')return presented(t.inner,v?.tag==='Some'?v.value:v?.tag==='None'?null:v,digits);
-  return p.host?.formatValue?p.host.formatValue(t,v,digits):formatValue(t,v,digits);
+ function presented(t:Type|undefined,v:any,digits?:number,format?:TimeFormat):any {
+  if(t?.kind==='option')return presented(t.inner,v?.tag==='Some'?v.value:v?.tag==='None'?null:v,digits,format);
+  return p.host?.formatValue?p.host.formatValue(t,v,digits,format):formatValue(t,v,digits,format);
  }
+ function resolvedTimeFormat(format:any):TimeFormat|undefined {return format?{...(format.date_style?{date_style:format.date_style}:{}),...(format.time_zone?{time_zone:value(format.time_zone)}:{})}:undefined;}
+ function presentationSpec(n:Node):any {return {...n.checkedSpec,...(n.checkedTimeFormats?{formats:Object.fromEntries(Object.entries(n.checkedTimeFormats).map(([key,format])=>[key,resolvedTimeFormat(format)]))}:{})};}
  function componentValue(n:Node):any {
   const attrs=Object.fromEntries(n.attrs.map((a:Node)=>[a.name,a.value]));
-  return presented(expressionType(attrs.ref),value(attrs.ref),n.checkedPrecision);
+  return presented(expressionType(attrs.ref),value(attrs.ref),n.checkedPrecision,resolvedTimeFormat(n.checkedTimeFormat));
  }
  function renderChart(n:Node):import('./host.ts').FigureOutput {
   const a=Object.fromEntries(n.attrs.map((f:Node)=>[f.name,f.value]));const ref=(key:string)=>a[key].path[0];
@@ -315,7 +318,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
    const rows=(name:string)=>binding(name).map((row:any)=>Object.fromEntries(Object.entries(row).map(([k,v]:[string,any])=>[k,v&&typeof v==='object'&&typeof v.tag==='string'?display(v):v])));
    // Resolve inputs outside the rendering catch: an upstream failure keeps its own location.
    const data=rows(ref('data')).map((row:any)=>({...row,...Object.fromEntries((n.checkedPaths??[]).map((path:string[])=>[path.join('.'),readProjection(row,path)]))})),nodes=a.nodes?rows(ref('nodes')):undefined;
-   try{return p.host.renderFigure(n.name,n.checkedSpec,data,n.checkedFields,nodes);}
+   try{return p.host.renderFigure(n.name,presentationSpec(n),data,n.checkedFields,nodes);}
    catch(error){
     const asset=[...p.bindings].filter(([,b])=>b.kind==='tree'&&b.ast.root.at<=n.at).sort((a,b)=>b[1].ast.root.at-a[1].ast.root.at)[0]?.[0];
     const message=n.name+'(data = '+ref('data')+'): '+(error as Error).message;
@@ -324,10 +327,10 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
   }
   const field=(key:string)=>{const projection=a[key],contract=projection.checkedType,row=p.bindings.get(ref('data'))!.result!.element;if(contract?.kind!=='projection'||!same(contract.input,row)||!same(contract.output,projectionType(row,projection.path)))throw Error('Field projection does not match its checked row contract');return projection.path.join('.');};
   if(n.name==='Table'){
-   const spec=n.checkedSpec??{},fields=n.checkedFields,rows=binding(ref('data')),columns=spec.columns??Object.keys(fields),labels=spec.labels??{};
+   const spec=presentationSpec(n),fields=n.checkedFields,rows=binding(ref('data')),columns=spec.columns??Object.keys(fields),labels=spec.labels??{};
    if(!rows.length&&!spec.allow_no_data)throw Error('Table has no data; set allow_no_data:True when an empty result is acceptable');
-   const content='| '+columns.map((key:string)=>md(labels[key]??key)).join(' | ')+' |\n| '+columns.map(()=>'---').join(' | ')+' |\n'+rows.map((row:any)=>'| '+columns.map((key:string)=>md(presented(fields[key],row[key],spec.precision))).join(' | ')+' |').join('\n');
-   const tableHtml='<table><thead><tr>'+columns.map((key:string)=>'<th>'+html(labels[key]??key)+'</th>').join('')+'</tr></thead><tbody>'+rows.map((row:any)=>'<tr>'+columns.map((key:string)=>'<td>'+html(presented(fields[key],row[key],spec.precision))+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+   const content='| '+columns.map((key:string)=>md(labels[key]??key)).join(' | ')+' |\n| '+columns.map(()=>'---').join(' | ')+' |\n'+rows.map((row:any)=>'| '+columns.map((key:string)=>md(presented(fields[key],row[key],spec.precision,spec.formats?.[key]))).join(' | ')+' |').join('\n');
+   const tableHtml='<table><thead><tr>'+columns.map((key:string)=>'<th>'+html(labels[key]??key)+'</th>').join('')+'</tr></thead><tbody>'+rows.map((row:any)=>'<tr>'+columns.map((key:string)=>'<td>'+html(presented(fields[key],row[key],spec.precision,spec.formats?.[key]))+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
    return {kind:'table',content,html:tableHtml,title:spec.title};
   }
   if(n.name==='ColumnChart'){

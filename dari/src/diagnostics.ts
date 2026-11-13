@@ -3,7 +3,7 @@ import {Fault,type FaultDetails} from './syntax.ts';
 export type Diagnostic=FaultDetails&{at:number;message:string;stage:'syntax'|'type'|'model'|'runtime';asset?:string};
 const publicName=(text:string|undefined)=>text?.replace(/@local\/\d+\/([A-Za-z_][A-Za-z_0-9]*)/g,'$1');
 export function faultDiagnostic(error:Fault,stage:Diagnostic['stage'],asset?:string):Diagnostic {
- return {at:error.at,message:publicName(error.message)!,stage,asset:publicName(asset),...error.details,reason:publicName(error.details.reason),suggestion:publicName(error.details.suggestion)};
+ return {at:error.at,message:publicName(error.message)!,stage,asset:publicName(asset),...error.details,expression:publicName(error.details.expression),reason:publicName(error.details.reason),suggestion:publicName(error.details.suggestion)};
 }
 // Same collection contract as DARI: scoped findings, checkpoints, stable deduplication.
 export class DiagnosticCollector {
@@ -40,6 +40,7 @@ export function renderDiagnostics(source:string,diagnostics:Diagnostic[],status=
  for(const d of diagnostics.slice(0,20)){
   const prefix=source.slice(0,d.at),line=prefix.split('\n').length,column=d.at-prefix.lastIndexOf('\n');
   lines.push('- L'+line+':'+column+(d.asset?' ['+d.asset+']':'')+': '+d.message.replace(/[\r\n]+/g,' '));
+  if(d.expression)lines.push('  表达式：'+d.expression.replace(/[\r\n]+/g,' '));
   if(d.reason)lines.push('  原因：'+d.reason.replace(/[\r\n]+/g,' '));
   const suggestion=d.suggestion??repairSuggestion(d.message);if(suggestion)lines.push('  修复建议：'+suggestion);
  }

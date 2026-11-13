@@ -3,7 +3,7 @@ export type FigureOutput={kind:'chart'|'table';content:string;html?:string;title
 export type HostPort={
  contractId:string;
  types?:Record<string,Type>;
- formatValue?(type:Type|undefined,value:unknown,precision?:number):unknown;
+ formatValue?(type:Type|undefined,value:unknown,precision?:number,format?:import('./time-display.ts').TimeFormat):unknown;
  components:readonly string[];
  checkFigure(name:string,spec:Record<string,unknown>,fields:Record<string,Type>,nodes?:Record<string,Type>):void;
  renderFigure(name:string,spec:Record<string,unknown>,rows:Record<string,unknown>[],fields:Record<string,Type>,nodes?:Record<string,unknown>[]):FigureOutput;

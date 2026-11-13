@@ -1,5 +1,6 @@
 import {calendarTypes,calendarFunctions} from './calendar.ts';
 import {precision} from './format.ts';
+import {validateTimeFormat,type TimeFormat} from './time-display.ts';
 import {sharedTypes,semantic,timeType} from './shared-types.ts';
 import {hasPlanBindings,lowerPlanBindings,resolvePlanNames} from './bindings.ts';
 import {lowerNodeBindings} from './node-bindings.ts';
@@ -20,7 +21,7 @@ export const present=(t:Type):Type=>t.kind==='option'?t.inner!:t;
 const numeric=(type:Type):boolean=>{let t=present(type);if(t.codec?.variants||t.name?.startsWith('Reference('))return false;while(t.kind==='nominal')t=t.inner!;return t.name==='Int'||t.name==='Float';};
 export function show(t:Type):string{if(t.kind==='schema')return 'Schema({'+Object.entries(t.fields!).map(([n,t])=>n+': '+show(t)).join(', ')+'})';if(['option','table'].includes(t.kind))return (t.kind==='option'?'Option':'Table')+'('+show(t.inner!)+')';return t.displayName??t.name??t.kind;}
 export const same=(a:Type,b:Type):boolean=>a.kind===b.kind&&(a.kind==='schema'?Object.keys(a.fields!).length===Object.keys(b.fields!).length&&Object.entries(a.fields!).every(([k,t])=>!!b.fields![k]&&same(t,b.fields![k])):a.kind==='option'||a.kind==='table'?same(a.inner!,b.inner!):a.name===b.name);
-const err=(n:Node,message:string,details:FaultDetails={}):never=>{throw new Fault(message,n.at,details);};
+const err=(n:Node,message:string,details:FaultDetails={}):never=>{throw new Fault(message,n.at,{...(n.k==='call'?{expression:expressionHint(n)}:{}),...details});};
 export function projectionType(input:Type,path:readonly string[]):Type {
  let current=input,shortCircuit=false;
  for(const segment of path){
@@ -38,7 +39,7 @@ function expressionHint(n:Node):string|undefined {
  if(n.k==='ref')return (n.displayPath??n.path).map((key:string|number,i:number)=>typeof key==='number'?'['+key+']':(i?'.':'')+key).join('');
  if(n.k==='literal')return n.value===null?'None':typeof n.value==='boolean'?n.value?'True':'False':JSON.stringify(n.value);
  if(n.k==='binary'){const a=expressionHint(n.left),b=expressionHint(n.right);return a&&b?'('+a+' '+n.op+' '+b+')':undefined;}
- if(n.k==='call'){const args=n.args.map(expressionHint);return args.every((a:unknown)=>a!==undefined)?n.name+'('+args.join(', ')+')':undefined;}
+ if(n.k==='call'){const args=n.args.map(expressionHint);return args.every((a:unknown)=>a!==undefined)?n.name+(n.name==='unwrap_or'?'!':'')+'('+args.join(', ')+')':undefined;}
  return undefined;
 }
 const bool=(n:Node,t:Type)=>{
@@ -177,7 +178,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     const source=infer(n.args[0],env,aggregate,groupKeys);
     if(!timeType(source))err(n,'Time conversion requires EpochMillis, DateTimeUtc or DateTimeTz; got '+show(source),{code:'time-semantics',reason:'Int 或 String 的存储表示没有自动赋予时间语义',suggestion:'先核对来源的时间编码和单位；确为毫秒整数时用 EpochMillis 构造，确为 ISO 时间字符串时用 DateTimeUtc 构造，再显式转换；不要猜测秒与毫秒'});
     let nullable=source.kind==='option';
-    if(arity===2){const zone=infer(n.args[1],env,aggregate,groupKeys);if(!['String','TimeZone'].includes(present(zone).name??''))err(n,'Time zone requires String');nullable ||= zone.kind==='option';}
+    if(arity===2){const zone=infer(n.args[1],env,aggregate,groupKeys);if(semantic(present(zone))!=='TimeZone')err(n,'Time zone requires TimeZone; use ctx.tz from context! or TimeZone("Asia/Shanghai")');nullable ||= zone.kind==='option';}
     const output=scalar(n.name==='to_epoch_millis'?'EpochMillis':n.name==='to_datetime_utc'?'DateTimeUtc':'DateTimeTz');return n.resolvedType=nullable?optional(output):output;
    }
    if(p.host?.functions[n.name]){
@@ -236,7 +237,16 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     if(!aggregate)err(n,'Aggregate only allowed in grouped projection');if(n.name==='count'){if(n.args.length>1)err(n,'count accepts zero or one column');if(n.args.length)infer(n.args[0],env);return scalar('Int');}
     if(n.args.length!==1)err(n,'Aggregate requires one column');const t=present(infer(n.args[0],env));if(!numeric(t))err(n,'Aggregate requires numeric column');calculation(n,t,({sum:'Sum',avg:'Mean',min:'Min',max:'Max'} as Record<string,string>)[n.name]);return optional(n.name==='avg'&&t.kind!=='nominal'?scalar('Float'):t);
    }
-   if(n.name==='unwrap_or'){if(n.args.length!==2)err(n,'unwrap_or! requires value and fallback');const a=infer(n.args[0],env,aggregate,groupKeys),b=infer(n.args[1],env,aggregate,groupKeys);if(a.kind!=='option'||!compatible(a.inner!,b))err(n,'unwrap_or requires Option(T) and T; got '+show(a)+' and '+show(b),{code:'unwrap_or-types',reason:a.kind!=='option'?'第一个参数已经是非空值':'默认值必须是与可空值兼容的非空类型',suggestion:a.kind!=='option'?'直接使用第一个参数；unwrap_or! 仅用于填补空值':'提供同一业务类型的非空默认值；若需要丢弃空值行，改在投影字段最外层使用 not_none'});return a.inner!;}
+   if(n.name==='unwrap_or'){
+    if(n.args.length!==2)err(n,'unwrap_or! requires value and fallback');
+    const a=infer(n.args[0],env,aggregate,groupKeys),b=infer(n.args[1],env,aggregate,groupKeys);
+    if(a.kind!=='option'||!compatible(a.inner!,b)){
+     const value=expressionHint(n.args[0]),fallback=expressionHint(n.args[1]);
+     const types='第一个参数 '+(value??'（表达式）')+': '+show(a)+'；默认值 '+(fallback??'（表达式）')+': '+show(b);
+     err(n,'unwrap_or requires Option(T) and T; got '+show(a)+' and '+show(b),{code:'unwrap_or-types',reason:types+'。'+(a.kind!=='option'?'第一个参数已经是非空值':'默认值必须是与可空值兼容的非空类型'),suggestion:a.kind!=='option'?'仅将此调用替换为 '+(value??'第一个参数')+'；其他 Option 参数的 unwrap_or! 保留':'提供同一业务类型的非空默认值；若需要丢弃空值行，改在投影字段最外层使用 not_none'});
+    }
+    return a.inner!;
+   }
    if(n.name==='is_empty'){if(n.args.length!==1||infer(n.args[0],env).kind!=='table')err(n,'is_empty requires a table');return scalar('Bool');}
    const t=p.types.get(n.name);
    if(t?.kind==='scalar'&&['EpochMillis','DateTimeUtc','DateTimeTz','LocalDate','TimeZone'].includes(semantic(t)??'')){if(n.args.length!==1)err(n,'Time constructor requires one encoded value');const input=infer(n.args[0],env,aggregate,groupKeys);if(input.kind!=='scalar'||input.name!==(semantic(t)==='EpochMillis'?'Int':'String'))err(n,'Time constructor requires its encoded Int/String representation; use to_* for time conversions');return n.resolvedType=t;}
@@ -511,6 +521,48 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   }
   return err(n,'Expected a static presentation or builtin option');
  }
+ function configObject(n:Node):Node {
+  if(n.k==='ref'&&n.path.length===1){const b=p.bindings.get(n.path[0]);if(b)return configObject(b.ast);}
+  return n;
+ }
+ function timeFormat(n:Node,type:Type,env:Record<string,Type>):{sample:TimeFormat;checked:{date_style?:TimeFormat['date_style'];time_zone?:Node}} {
+  n=configObject(n);
+  if(n.k!=='object')err(n,'Time format requires {time_zone: TimeZone, date_style: DateStyle::Date}');
+  const sample:TimeFormat={},checked:{date_style?:TimeFormat['date_style'];time_zone?:Node}={};
+  const seen=new Set<string>();
+  for(const f of n.fields){
+   if(seen.has(f.name))err(f,'Duplicate time format option '+f.name);seen.add(f.name);
+   if(f.name==='time_zone'){
+    const zoneType=infer(f.value,env);
+    if(semantic(zoneType)!=='TimeZone'||zoneType.kind==='option')err(f.value,'time_zone requires a nonnullable TimeZone; use ctx.tz from context! or a prepared TimeZone value');
+    checked.time_zone=f.value;sample.time_zone='UTC';
+   }else if(f.name==='date_style'){
+    const v=variant(f.value);
+    if(v?.type.name!=='DateStyle')err(f.value,'date_style requires DateStyle::Date, DateStyle::DateTime or DateStyle::Time');
+    checked.date_style=sample.date_style=v!.name as TimeFormat['date_style'];
+   }else err(f,'Unknown time format option '+f.name);
+  }
+  try{validateTimeFormat(type,sample);}catch(e){err(n,(e as Error).message);}
+  return {sample,checked};
+ }
+ function figureSpec(n:Node,fields:Record<string,Type>,owner:Node,env:Record<string,Type>):Record<string,unknown>{
+  const object=configObject(n);
+  if(object.k!=='object')return constant(n,fields,owner.name+'.spec');
+  const formatFields=object.fields.filter((f:Node)=>f.name==='formats');
+  if(formatFields.length>1)err(formatFields[1],'Duplicate presentation option formats');
+  const spec=constant({...object,fields:object.fields.filter((f:Node)=>f.name!=='formats')},fields,owner.name+'.spec');
+  if(formatFields.length){
+   const formats=configObject(formatFields[0].value);if(formats.k!=='object')err(formats,'formats requires field names mapped to time formats');
+   const checked:Record<string,unknown>={},samples:Record<string,TimeFormat>={};
+   settle(formats.fields,(f:Node)=>{
+    if(!Object.hasOwn(fields,f.name))err(f,'Unknown format field '+f.name);
+    if(Object.hasOwn(checked,f.name))err(f,'Duplicate format field '+f.name);
+    const value=timeFormat(f.value,fields[f.name],env);checked[f.name]=value.checked;samples[f.name]=value.sample;
+   });
+   owner.checkedTimeFormats=checked;spec.formats=samples;
+  }
+  return spec;
+ }
  function tree(n:Node,env:Record<string,Type>={}):Type{
   if(n.invalid)throw new UpstreamTypeUnavailable();
   if(p.host&&n.name==='ColumnChart')err(n,'Unknown component '+n.name+'; available figure components: '+p.host.components.join(', '));
@@ -519,16 +571,16 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
    if(n.children.length)err(n,'Figure component cannot have children');
    const binding=(key:string)=>{const ref=attrs[key];if(ref?.k!=='ref'||ref.path.length!==1)err(n,key+' requires a Table declaration reference');const b=p.bindings.get(ref.path[0]);if(!b&&failed.has(ref.path[0]))throw new UpstreamTypeUnavailable();if(b?.type.kind!=='table'||b.type.inner?.kind!=='schema')err(n,key+' requires Table(Schema)');return b!;};
    const checkpoint=diagnostics.checkpoint();
-   const allowed=['data','nodes','spec',...(attrs.spec?[]:['x','value','series','x_type','title','style','layout','allow_no_data','value_min','unit','x_label','value_label'])];
+   const allowed=['data','nodes','spec',...(attrs.spec?[]:['x','value','series','title','style','layout','allow_no_data','value_min','unit','x_label','value_label','formats','x_axis'])];
    for(const key of Object.keys(attrs))if(!allowed.includes(key))finding(new Fault('Unknown figure attribute '+key+' on '+n.name+'; chart configuration belongs in spec = {...}',attrs[key].at));
    const data=binding('data'),nodes=attrs.nodes?binding('nodes'):undefined,fields={...data.type.inner!.fields!};
    for(const b of [data,...(nodes?[nodes]:[])])if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)finding(new Fault('Figure input '+(b===data?'data':'nodes')+' requires a proven bound <= 500; order_by and take before presentation',n.at));
-   const spec=attrs.spec?constant(attrs.spec,fields,n.name+'.spec'):Object.fromEntries(Object.entries(attrs).filter(([key])=>!['data','nodes'].includes(key)).map(([key,value])=>[key,constant(value,fields,n.name+'.'+key)]));
+   const spec=attrs.spec?figureSpec(attrs.spec,fields,n,env):figureSpec({k:'object',at:n.at,fields:Object.entries(attrs).filter(([key])=>!['data','nodes'].includes(key)).map(([name,value])=>({k:'field',name,value,at:value.at}))},fields,n,env);
    try{p.host.checkFigure(n.name,spec,fields,nodes?.type.inner!.fields);}catch(e){finding(new Fault((e as Error).message,attrs.spec?.at??n.at));}
    if(diagnostics.hasErrors(checkpoint))throw new UpstreamTypeUnavailable();
    n.checkedSpec=spec;n.checkedFields=fields;n.checkedPaths=Object.keys(fields).filter(key=>!Object.hasOwn(data.type.inner!.fields!,key)).map(key=>key.split('.'));return {kind:'figure'};
   }
-  const signature:Record<string,string[]>={Answer:[],Report:[],section:[],h1:[],h2:[],h3:[],p:[],div:[],span:[],ul:[],ol:[],li:[],blockquote:[],pre:[],code:[],strong:[],em:[],a:['href'],br:[],hr:[],Lit:['value'],UseValue:['ref','precision'],Table:['data','spec'],ColumnChart:['data','x','value'],UseReport:['ref']};
+  const signature:Record<string,string[]>={Answer:[],Report:[],section:[],h1:[],h2:[],h3:[],p:[],div:[],span:[],ul:[],ol:[],li:[],blockquote:[],pre:[],code:[],strong:[],em:[],a:['href'],br:[],hr:[],Lit:['value'],UseValue:['ref','precision','format'],Table:['data','spec'],ColumnChart:['data','x','value'],UseReport:['ref']};
   const optionalAttrs=['id','class','title','lang','data-oks-shrink'];
   for(const key of optionalAttrs)if(attrs[key]){if(attrs[key].k!=='literal'||typeof attrs[key].value!=='string')err(attrs[key],key+' requires static text');}
   if(n.name==='a'){if(attrs.href?.k!=='literal'||typeof attrs.href.value!=='string'||! /^(https?:|mailto:|#|\/)/.test(attrs.href.value))err(n,'Link href requires a static http, mailto, fragment or absolute path');}
@@ -539,15 +591,16 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     if(attrs.ref.k!=='ref'||attrs.ref.path.some((key:unknown)=>typeof key!=='string'))err(attrs.ref,'UseValue requires a direct scalar reference',{code:'value-reference',reason:'tree! 只引用已准备好的标量，不执行计算或默认值处理',suggestion:'先用 data prepared = ... 准备结果，再写 UseValue(ref = prepared) 或 UseValue(ref = prepared.field)'});
     const t=infer(attrs.ref,env);let base=t;while(base.kind==='option')base=base.inner!;
     if(!['scalar','nominal'].includes(base.kind))err(attrs.ref,'UseValue requires a logical scalar reference; got '+show(t));
+    if(attrs.format)n.checkedTimeFormat=timeFormat(attrs.format,t,env).checked;
    }
   }
-  if(!Object.hasOwn(signature,n.name))err(n,'Unknown component '+n.name);for(const a of Object.keys(attrs))if(!signature[n.name].includes(a)&&!optionalAttrs.includes(a))err(n,'Unknown attribute '+a+' on '+n.name);for(const a of signature[n.name])if(a!=='precision'&&!(n.name==='Table'&&a==='spec')&&!attrs[a])err(n,'Missing attribute '+a+' on '+n.name);
+  if(!Object.hasOwn(signature,n.name))err(n,'Unknown component '+n.name);for(const a of Object.keys(attrs))if(!signature[n.name].includes(a)&&!optionalAttrs.includes(a))err(n,'Unknown attribute '+a+' on '+n.name);for(const a of signature[n.name])if(!['precision','format'].includes(a)&&!(n.name==='Table'&&a==='spec')&&!attrs[a])err(n,'Missing attribute '+a+' on '+n.name);
   const lookup=(a:string)=>{const v=attrs[a];if(v?.k!=='ref'||v.path.length!==1)err(n,a+' requires a declaration reference');const b=p.bindings.get(v.path[0]);if(!b&&failed.has(v.path[0]))throw new UpstreamTypeUnavailable();if(!b)err(v,'Unknown declaration '+v.path[0]);return b!;};
   if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)err(n,'Presentation requires a proven bound <= 500; use order_by and take');}
   if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.type.kind!=='table'||b.type.inner!.kind!=='schema')err(n,'Expected Schema rows');for(const a of n.name==='ColumnChart'?['x','value']:[]){if(attrs[a].k!=='projection')err(attrs[a],'Use $.field to select a row field');const t=checkedProjection(attrs[a],b.type.inner!);let numeric=present(t);while(numeric.kind==='nominal')numeric=numeric.inner!;if(a==='value'&&!['Int','Float'].includes(numeric.name??''))err(attrs[a],'Chart value must be numeric or a newtype with numeric representation');}}
   if(n.name==='Table'){
-   const fields=lookup('data').type.inner!.fields!,spec=attrs.spec?constant(attrs.spec,fields,'Table.spec'):{};
-   for(const key of Object.keys(spec))if(!['columns','labels','title','precision','allow_no_data'].includes(key))err(n,'Unknown Table option '+key);
+   const fields=lookup('data').type.inner!.fields!,spec=attrs.spec?figureSpec(attrs.spec,fields,n,env):{};
+   for(const key of Object.keys(spec))if(!['columns','labels','title','precision','allow_no_data','formats'].includes(key))err(n,'Unknown Table option '+key);
    const columns=spec.columns??Object.keys(fields);
    if(!Array.isArray(columns)||columns.some((key:unknown)=>typeof key!=='string'||!Object.hasOwn(fields,key as string)))err(n,'Table columns must reference existing fields');
    if(spec.labels!==undefined&&(!spec.labels||typeof spec.labels!=='object'||Array.isArray(spec.labels)||Object.entries(spec.labels).some(([key,label])=>!Object.hasOwn(fields,key)||typeof label!=='string')))err(n,'Table labels require existing field names and text labels');

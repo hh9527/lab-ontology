@@ -34,3 +34,5 @@ Graph 的领域约束由原模型内核证明；集合、半连接、组内排�
 `.dari` 不开放手写函数、递归、循环、任意执行代码或物理数据库 source。测试中的 source 由独立 API 开关授权。声明按依赖顺序书写。表格显示标签使用任务内 lookup；稳定业务编码由模型 property 和生成的 codec 决定。
 
 Stack 枚举、非加总指标限制和类型化数值展示由 chart-types-test 验证；默认最多两位小数，支持模型精度及显式展示精度覆盖。
+
+时间展示：UseValue(format)、Table/图表 formats 共用 DateStyle 与 TimeZone 契约；时间轴由字段类型推导，DateTimeTz 支持地区展示。验证见 time-presentation-test。

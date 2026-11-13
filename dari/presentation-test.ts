@@ -59,7 +59,7 @@ const empty=source.replaceAll('value_min:99.0','allow_no_data:True,value_min:99.
 assert.match(resolve(check(empty,undefined,options),db).artifacts['chart_1.svg'],/无数据/);
 const contextType={kind:'schema',fields:{epochMillis:{kind:'scalar',name:'EpochMillis'},timeZone:{kind:'scalar',name:'String'}}};
 const calendar=check(`data ctx = context! { epoch_millis: Context::Now , time_zone: Context::ClientTz };data weeks = time_windows(ctx,{unit:TimeUnit::Week,count:2,mode:WindowMode::Complete});data start = weeks[0].start.epoch_millis;answer tree! { Answer [p [UseValue(ref = start)]]};`,undefined,{host:dariHost,contextType});
-assert.match(resolve(calendar,db,{}, {context:{epochMillis:Date.parse('2026-11-11T06:00:00Z'),timeZone:'Asia/Shanghai'}}).answer,/179/);
+assert.match(resolve(calendar,db,{}, {context:{epochMillis:Date.parse('2026-11-11T06:00:00Z'),timeZone:'Asia/Shanghai'}}).answer,/2026-10-25 16:00:00/);
 db.close();
 console.log('production presentation: chart, inline table, self-contained report, empty data and calendar passed');
 
