@@ -8,11 +8,11 @@ import {faultDiagnostic,DiagnosticCollector,DiagnosticFailure,UpstreamTypeUnavai
 import {encodeIntent,proofTarget,verifyReceipt,storage} from './model.ts';
 import type {ModelPort,CheckedIntent,IntentType,QueryExprType,QueryOperation} from './model.ts';
 import {parse,Fault,type FaultDetails,type Node} from './syntax.ts';
-import {MAX_RESULT_ROWS,type Plan,type ResultContract,type Ordering} from './plan.ts';
+import {MAX_RESULT_ROWS,MAX_PRESENTATION_ROWS,type Plan,type ResultContract,type Ordering} from './plan.ts';
 export type {Plan} from './plan.ts';
 import {primaryCodecs} from './primary-codecs.ts';
 import type {HostPort} from './host.ts';
-export type Type={kind:string;name?:string;displayName?:string;semantic?:string;presentation?:{multiplier:number;suffix:string;precision?:number};inner?:Type;fields?:Record<string,Type>;input?:Type;output?:Type;codec?:import('./model.ts').ValueCodec};
+export type Type={kind:string;name?:string;modelLogical?:string;displayName?:string;semantic?:string;presentation?:{multiplier:number;suffix:string;precision?:number};inner?:Type;fields?:Record<string,Type>;input?:Type;output?:Type;codec?:import('./model.ts').ValueCodec};
 export type Binding={internal?:boolean;type:Type;ast:Node;kind:string;plan?:Plan;modelPlan?:unknown;parameters?:Node[];result?:ResultContract};
 export type Program={types:Map<string,Type>;bindings:Map<string,Binding>;answer:string;source:string;warnings:import('./diagnostics.ts').Diagnostic[];model?:ModelPort;modelContractId?:string;modelImplementationId?:string;contextType?:Type;contextContractId?:string;host?:HostPort};
 const scalar=(name:string):Type=>sharedTypes[name==='Rfc3339'?'DateTimeUtc':name]??{kind:'scalar',name,codec:primaryCodecs[name]};
@@ -134,7 +134,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   }
   if(n.k==='literal')return scalar(n.literal);
   if(n.k==='object'){const fields:Record<string,Type>=Object.create(null);settle(n.fields,(f:Node)=>{if(Object.hasOwn(fields,f.name))err(f,'Duplicate field '+f.name);fields[f.name]=infer(f.value,env,aggregate,groupKeys);});return{kind:'schema',fields};}
-  if(n.k==='ref'){const v=variant(n);if(v){n.enumVariant=v;n.resolvedType=v.type;return v.type;}const [name,...path]=n.path;let t=env[name]??p.bindings.get(name)?.type;if(!t&&failed.has(name))throw new UpstreamTypeUnavailable();if(!t)err(n,name==='out'?'Unknown binding out; out is available only for projected or set results. In this scope use source fields: '+Object.entries(env).flatMap(([alias,t])=>Object.keys(t.fields??{}).map(field=>alias+'.'+field)).slice(0,8).join(', '):'Unknown binding '+name+'; available bindings: '+[...Object.keys(env),...[...p.bindings].filter(([,b])=>!b.internal).map(([name])=>name)].slice(0,8).join(', '));for(const key of path){if(t!.kind==='array'&&typeof key==='number'){t=t!.inner!;continue;}if(!['schema','range'].includes(t!.kind))err(n,'Cannot access '+key+' on '+show(t!));const next=t!.fields![key];if(!next)err(n,'Unknown field '+(n.displayPath??n.path).join('.')+'; examples: '+Object.keys(t!.fields!).slice(0,8).join(', '));t=next;}n.resolvedType=t;return t!;}
+  if(n.k==='ref'){const v=variant(n);if(v){n.enumVariant=v;n.resolvedType=v.type;return v.type;}const [name,...path]=n.path;let t=env[name]??p.bindings.get(name)?.type;if(!t&&failed.has(name))throw new UpstreamTypeUnavailable();if(!t&&path.length&&env.out)err(n,'Unknown binding '+(n.displayPath??n.path)[0]+' after projection',{code:'projected-scope',reason:'project 后的字段属于新的结果；distinct 后也应通过当前结果名称访问',suggestion:'写 let output = rows |> project({...}) |> distinct(); output |> order_by(asc(output.field))；查询源字段用原节点，投影后的列用结果绑定'});if(!t)err(n,'Unknown binding '+name+'; available bindings: '+[...Object.keys(env),...[...p.bindings].filter(([,b])=>!b.internal).map(([name])=>name)].slice(0,8).join(', '));for(const key of path){if(t!.kind==='array'&&typeof key==='number'){t=t!.inner!;continue;}if(!['schema','range'].includes(t!.kind))err(n,'Cannot access '+key+' on '+show(t!));const next=t!.fields![key];if(!next)err(n,'Unknown field '+(n.displayPath??n.path).join('.')+'; examples: '+Object.keys(t!.fields!).slice(0,8).join(', '));t=next;}n.resolvedType=t;return t!;}
   if(n.k==='unary'){const t=infer(n.value,env,aggregate,groupKeys);if(!numeric(t))err(n,'Unary minus requires numeric type');calculation(n,t,'Negate');return t;}
   if(n.k==='binary'){
    const [a,b]=settle([n.left,n.right],(v:Node)=>infer(v,env,aggregate,groupKeys)),nullable=a.kind==='option'||b.kind==='option';const x=present(a),y=present(b);
@@ -265,7 +265,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   const aliases=new Map<string,{binding:string;type:Type}>();
   for(const b of n.bindings){
    if(b.name==='out'||aliases.has(b.name))err(b,'Duplicate or reserved source alias '+b.name);
-   if(b.value.k!=='call'||b.value.name!=='from'||b.value.args.length!==1||b.value.args[0].k!=='ref'||b.value.args[0].path.length!==1)err(b,'let only binds from(table); start join({a,b}, a.key == b.key) directly, then project({left:a.field,right:b.field})');
+   if(b.value.k!=='call'||b.value.name!=='from'||b.value.args.length!==1||b.value.args[0].k!=='ref'||b.value.args[0].path.length!==1)err(b,'Internal plan input must be from(table)');
    const name=b.value.args[0].path[0],t=p.bindings.get(name)?.type;
    if(!t&&failed.has(name))throw new UpstreamTypeUnavailable();
    if(t?.kind!=='table')err(b,'from requires Table(Schema)');
@@ -273,33 +273,41 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   }
   const setKinds:Record<string,NonNullable<Plan['setOp']>>={union:'UNION',union_all:'UNION ALL',intersect:'INTERSECT',except:'EXCEPT'};
   const existenceKinds:Record<string,NonNullable<Plan['existsMode']>>={semi_join:'semi',anti_join:'anti'};
-  const setOp=n.start.k==='call'?setKinds[n.start.name]:undefined;
-  const existsMode=n.start.k==='call'?existenceKinds[n.start.name]:undefined;
-  const joined=n.start.k==='call'&&['join','left_join','semi_join','anti_join'].includes(n.start.name);
-  const names:string[]=n.start.k==='ref'?n.start.path:(joined&&n.start.args.length===2||setOp&&n.start.args.length===1)?fieldsOf(n.start.args[0]).map(f=>{
-   if(f.value.k!=='ref'||f.value.path.join('.')!==f.name)err(f,'join uses {a,b} source aliases');return f.name;
-  }):err(n.start,'Start with source alias or join({a,b}, condition)');
+  const setOp=n.start.k==='combine'?setKinds[n.start.name]:undefined;
+  const existsMode=n.start.k==='combine'?existenceKinds[n.start.name]:undefined;
+  const joined=n.start.k==='combine'&&['join','left_join','semi_join','anti_join'].includes(n.start.name);
+  const names:string[]=n.start.k==='ref'?n.start.path:n.start.k==='combine'?n.start.inputs.map((v:Node)=>v.path[0]):err(n.start,'Internal plan requires a source or a binary relation node');
   if(new Set(names).size!==names.length||(setOp?names.length<2:names.length!==(joined?2:1)))err(n.start,'Use distinct source aliases; joins require two sources and set operations at least two');
   if(setOp){const first=aliases.get(names[0]);if(!first)err(n.start,'Unknown set source '+names[0]);settle(names.slice(1),name=>{const other=aliases.get(name);if(!other)err(n.start,'Unknown set source '+name);const left=first!.type.fields!,right=other!.type.fields!;const differences=[...new Set([...Object.keys(left),...Object.keys(right)])].filter(key=>!left[key]||!right[key]||!same(left[key],right[key]));if(differences.length)err(n.start,'Set inputs must have the same named Schema and business types; '+differences.slice(0,8).map(key=>key+': '+names[0]+' = '+(left[key]?show(left[key]):'missing')+', '+name+' = '+(right[key]?show(right[key]):'missing')).join('; '));});}
-  const scope:Record<string,Type>={},refs:Record<string,string>={},fields:Record<string,Type>={};
+  const nullableFields=(t:Type):Type=>t.kind==='schema'?{...t,fields:Object.fromEntries(Object.entries(t.fields!).map(([key,value])=>[key,nullableFields(value)]))}:optional(t);
+  const scope:Record<string,Type>={},predicateScope:Record<string,Type>={},refs:Record<string,string>={},fields:Record<string,Type>={};
   const sources=names.map((alias,i)=>{
    const a=aliases.get(alias);if(!a)err(n.start,'Unknown source alias '+alias);
    const nullable=i===1&&n.start.name==='left_join';
+   predicateScope[alias]=a!.type;
    scope[alias]=nullable?{kind:'schema',fields:Object.fromEntries(Object.entries(a!.type.fields!).map(([k,t])=>[k,optional(t)]))}:a!.type;
-   const columns:Record<string,string>={};
+   const columns:Record<string,string>={},references:Record<string,string>={};
    for(const [name,t]of Object.entries(scope[alias].fields!)){
     const column=joined?'s'+i+'_'+Object.keys(columns).length:name;
-    columns[name]=column;if(!existsMode||i===0){refs[alias+'.'+name]=column;fields[column]=t;}
+    columns[name]=column;references[name]=name;if(!existsMode||i===0){refs[alias+'.'+name]=column;fields[column]=t;}
    }
    const binding=p.bindings.get(a!.binding)!;
-   return {alias,binding:a!.binding,nullable,fields:columns,ordering:binding.result?.ordering??[]};
+   if(binding.plan){
+    predicateScope[alias]={...a!.type,fields:{...binding.plan.scope,...a!.type.fields}};
+    const nested=nullable?Object.fromEntries(Object.entries(binding.plan.scope).map(([key,t])=>[key,nullableFields(t)])):binding.plan.scope;
+    scope[alias]={...scope[alias],fields:{...nested,...scope[alias].fields}};
+    for(const [path,column]of Object.entries(binding.plan.refs)){
+     references[path]=column;if(!existsMode||i===0)refs[alias+'.'+path]=columns[column];
+    }
+   }
+   return {alias,binding:a!.binding,nullable,fields:columns,references,ordering:binding.result?.ordering??[]};
   });
-  if(joined)bool(n.start.args[1],infer(n.start.args[1],Object.fromEntries(names.map(name=>[name,aliases.get(name)!.type]))));
+  if(joined)bool(n.start.condition,infer(n.start.condition,predicateScope));
   if(existsMode)delete scope[names[1]];
   const bounds=sources.map(s=>p.bindings.get(s.binding)!.result?.maxRows);
   const maxRows=existsMode||setOp==='EXCEPT'||setOp==='INTERSECT'?bounds[0]:bounds.every(b=>b!==undefined)?setOp?bounds.reduce<number>((v,b)=>v+b!,0):bounds.reduce<number>((v,b,i)=>v*(sources[i].nullable?Math.max(1,b!):b!),1):undefined;
   const element:Type={kind:'schema',fields};
-  let plan:Plan={id:id++,kind:setOp?'set':'source',result:{element,container:'table',maxRows,ordering:joined||setOp?[]:sources[0].ordering},scope:setOp?{out:element}:scope,refs:setOp?Object.fromEntries(Object.keys(fields).map(k=>['out.'+k,k])):refs,sources,join:joined?n.start.args[1]:undefined,setOp,existsMode};
+  let plan:Plan={id:id++,kind:setOp?'set':'source',result:{element,container:'table',maxRows,ordering:joined||setOp?[]:sources[0].ordering},scope:setOp?{out:element}:scope,refs:setOp?Object.fromEntries(Object.keys(fields).map(k=>['out.'+k,k])):refs,sources,join:joined?n.start.condition:undefined,setOp,existsMode};
   function orderKeys(ordering:Ordering[],schema:Type,stage:number):Ordering[]{
    return ordering.map((o,i)=>{let key='_dari_'+stage+'_order_'+i;while(Object.hasOwn(schema.fields!,key))key+='_';return {key,direction:o.direction};});
   }
@@ -372,9 +380,8 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
    if(!input.result.ordering.length&&(input.result.maxRows===undefined||input.result.maxRows>1))err(step,(opt?'take_opt':'take')+' on multiple rows requires order_by',{code:'ordering-required',reason:'多行输入没有已证明的顺序，直接取前 N 行不能确定业务口径',suggestion:'按任务口径为当前具名计划选择排序字段，先 order_by 再 '+(opt?'take_opt()':'take(n)')+'；已有至多一行证明的输入无需排序'});
    return node('take',input,{...input.result,container:opt?'option':'table',maxRows:Math.min(input.result.maxRows??count,count)},{count});
   }
-  for(const step of n.steps){const rule=rules[step.name];if(!rule){if(['join','left_join','semi_join','anti_join','union','union_all','intersect','except'].includes(step.name))err(step,step.name+' is supported as a query! starting expression, not after |>');err(step,'Unsupported plan operation '+step.name);}plan=rule(plan,step);}
+  for(const step of n.steps){const rule=rules[step.name];if(!rule){err(step,'Unsupported plan operation '+step.name);}plan=rule(plan,step);}
   if(plan.result.container==='grouped')err(n,'group_by requires project to define grouped output');
-  if(joined&&!n.steps.some((step:Node)=>step.name==='project'))err(n,'join requires project to name its output fields');
   const localCalendar=(value:Node):void=>{if(value.calendarFunction)err(value,'Calendar range preparation belongs in a top-level data/do node; pass its scalar endpoints into query!/query_remote!');for(const item of Object.values(value)){if(Array.isArray(item)){for(const child of item)if(child&&typeof child==='object'&&'k'in child)localCalendar(child);}else if(item&&typeof item==='object'&&'k'in item)localCalendar(item as Node);}};
   localCalendar(n);
   return plan;
@@ -398,7 +405,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
    if(n.start.args.length!==2||n.start.args.some((a:Node)=>a.k!=='ref'||a.path.length!==1||!aliases.has(a.path[0])))err(n.start,'pair requires two bound model nodes');
    pair={left:aliases.get(n.start.args[0].path[0])!,right:aliases.get(n.start.args[1].path[0])!};
    if(pair.left===pair.right)err(n.start,'pair requires two independent model populations');
-  }else if(n.start.k!=='ref'||n.start.path.length!==1||!aliases.has(n.start.path[0]))err(n.start,'query must start with a bound model node or pair(left,right)');
+  }else if(n.start.k!=='ref'||n.start.path.length!==1||!aliases.has(n.start.path[0]))err(n.start,'Model plan requires a bound model node or a lowered pair input');
   function expression(value:Node,allowNotNone=false):QueryExprType {const result=expressionValue(value,allowNotNone);modelLocations.set(result,value);return result;}
   function expressionValue(value:Node,allowNotNone=false):QueryExprType {
    // Expressions independent of model rows are evaluated locally and sent as typed parameters.
@@ -418,7 +425,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     if(index!==undefined){
      if(path.length!==1)err(value,'Use node.member for model dimensions and measures');
      const dataset=nodes[index].dataset,member=Object.hasOwn(dataset.members,path[0])?dataset.members[path[0]]:undefined;
-     if(!member)return err(value,'Unknown model member '+expressionHint(value),{code:'unknown-model-member',reason:'该字段不属于当前输入 '+dataset.symbol,suggestion:'使用 oks_info 查看该数据集的成员；若字段属于其他实体，先 connect 已发布的 Relation，再通过目标节点别名引用，不能直接从当前节点读取'});
+     if(!member)return err(value,'Unknown model member '+expressionHint(value),{code:'unknown-model-member',reason:'该绑定当前指向模型节点 '+dataset.symbol+'，关系计划绑定不代表所有节点成员的合并',suggestion:'投影前通过成员所属节点引用，例如 a.alarm_count、t.tenant_name；分组不会合并节点名称。project 后通过具名结果引用新列；精确成员用 oks_info 查看'});
      if(member.owner!==dataset.id)err(value,'Model member does not belong to its Dataset');
      return {kind:'member',node:index,member};
     }
@@ -465,7 +472,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
     return {kind:'binary',op:value.op,left,right};
    }
    if(value.k==='unary')return {kind:'unary',op:value.op,value:expression(value.value)};
-   if(value.k==='call'&&['difference','ratio','growth_rate','contains','not_contains','starts_with','ends_with','is_some','is_none'].includes(value.name))return {kind:'call',name:value.name,args:value.args.map(expression)};
+   if(value.k==='call'&&['difference','ratio','growth_rate','contains','not_contains','starts_with','ends_with','is_some','is_none','unwrap_or'].includes(value.name))return {kind:'call',name:value.name,args:value.args.map(expression)};
    function usesNode(v:Node):boolean{return v.k==='ref'&&aliases.has(v.path[0])||v.k==='call'&&v.args.some(usesNode)||v.k==='binary'&&(usesNode(v.left)||usesNode(v.right))||v.k==='unary'&&usesNode(v.value);}
    if(usesNode(value))err(value,'Computed model expression '+(value.name==='unwrap_or'?'unwrap_or!':value.name??value.k)+' cannot be a query parameter; project supported members in query_remote!, then compute this expression in query!');
    const t=infer(value);if(!['scalar','nominal'].includes(present(t).kind))err(value,'Query parameters must be logical scalars');
@@ -574,7 +581,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
    const allowed=['data','nodes','spec',...(attrs.spec?[]:['x','value','series','title','style','layout','allow_no_data','value_min','unit','x_label','value_label','formats','x_axis'])];
    for(const key of Object.keys(attrs))if(!allowed.includes(key))finding(new Fault('Unknown figure attribute '+key+' on '+n.name+'; chart configuration belongs in spec = {...}',attrs[key].at));
    const data=binding('data'),nodes=attrs.nodes?binding('nodes'):undefined,fields={...data.type.inner!.fields!};
-   for(const b of [data,...(nodes?[nodes]:[])])if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)finding(new Fault('Figure input '+(b===data?'data':'nodes')+' requires a proven bound <= 500; order_by and take before presentation',n.at));
+   for(const b of [data,...(nodes?[nodes]:[])])if(b.result?.maxRows===undefined||b.result.maxRows>MAX_PRESENTATION_ROWS)finding(new Fault('Figure input '+(b===data?'data':'nodes')+' requires a proven bound <= '+MAX_PRESENTATION_ROWS,n.at,{code:'presentation-bound',reason:'每个图表输入独立受展现行数上限约束，取数上界不等于展现上界',suggestion:'先按业务聚合，或 order_by(...) |> take(110) 后再交给组件；不自动截断'}));
    const spec=attrs.spec?figureSpec(attrs.spec,fields,n,env):figureSpec({k:'object',at:n.at,fields:Object.entries(attrs).filter(([key])=>!['data','nodes'].includes(key)).map(([name,value])=>({k:'field',name,value,at:value.at}))},fields,n,env);
    try{p.host.checkFigure(n.name,spec,fields,nodes?.type.inner!.fields);}catch(e){finding(new Fault((e as Error).message,attrs.spec?.at??n.at));}
    if(diagnostics.hasErrors(checkpoint))throw new UpstreamTypeUnavailable();
@@ -596,7 +603,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   }
   if(!Object.hasOwn(signature,n.name))err(n,'Unknown component '+n.name);for(const a of Object.keys(attrs))if(!signature[n.name].includes(a)&&!optionalAttrs.includes(a))err(n,'Unknown attribute '+a+' on '+n.name);for(const a of signature[n.name])if(!['precision','format'].includes(a)&&!(n.name==='Table'&&a==='spec')&&!attrs[a])err(n,'Missing attribute '+a+' on '+n.name);
   const lookup=(a:string)=>{const v=attrs[a];if(v?.k!=='ref'||v.path.length!==1)err(n,a+' requires a declaration reference');const b=p.bindings.get(v.path[0]);if(!b&&failed.has(v.path[0]))throw new UpstreamTypeUnavailable();if(!b)err(v,'Unknown declaration '+v.path[0]);return b!;};
-  if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.result?.maxRows===undefined||b.result.maxRows>MAX_RESULT_ROWS)err(n,'Presentation requires a proven bound <= 500; use order_by and take');}
+  if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.result?.maxRows===undefined||b.result.maxRows>MAX_PRESENTATION_ROWS)err(n,'Presentation requires a proven bound <= '+MAX_PRESENTATION_ROWS,{code:'presentation-bound',reason:'表格输入必须证明不超过展现上限；最多取数 500 行不代表可全部展现',suggestion:'先聚合或按业务 order_by(...) |> take(110)，不自动截断'});}
   if(['Table','ColumnChart'].includes(n.name)){const b=lookup('data');if(b.type.kind!=='table'||b.type.inner!.kind!=='schema')err(n,'Expected Schema rows');for(const a of n.name==='ColumnChart'?['x','value']:[]){if(attrs[a].k!=='projection')err(attrs[a],'Use $.field to select a row field');const t=checkedProjection(attrs[a],b.type.inner!);let numeric=present(t);while(numeric.kind==='nominal')numeric=numeric.inner!;if(a==='value'&&!['Int','Float'].includes(numeric.name??''))err(attrs[a],'Chart value must be numeric or a newtype with numeric representation');}}
   if(n.name==='Table'){
    const fields=lookup('data').type.inner!.fields!,spec=attrs.spec?figureSpec(attrs.spec,fields,n,env):{};
@@ -632,7 +639,7 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
  for(let declarationIndex=0;declarationIndex<declarations.length;declarationIndex++){
   const d=declarations[declarationIndex];
   asset=d.owner?d.owner+(d.label?' / '+d.label:''):d.name;
-  if(d.k==='declaration')d.value=resolvePlanNames(d.value);
+  if(d.k==='declaration'){if(d.value.k==='query')d.remoteBoundary=true;d.value=resolvePlanNames(d.value);}
   if(d.k==='declaration'&&d.value.k==='query'){
    try{d.value=lowerNodeBindings(d.value,model);}catch(error){finding(error);failed.add(d.name);continue;}
   }
@@ -701,6 +708,10 @@ function checkProgram(source:string,model?:ModelPort,options:{allowTestSources?:
   else if(d.value.k==='tree'){t=tree(d.value.root);kind='tree';}
   else t=infer(d.value);
   if(!d.internal){
+   if(kind==='model'||d.remoteBoundary){
+    const bound=plan?.result.maxRows??modelShape?.maxRows;
+    if(bound===undefined||bound>MAX_RESULT_ROWS)err(d,'Remote query data node requires a proven result bound <= '+MAX_RESULT_ROWS,{code:'query-bound',reason:'query_remote! 是远端取数边界，不能将无上界结果交给本地查询再截断',suggestion:'在本查询返回前按业务口径 order_by(...) |> take(n)，n <= 500；全表单行聚合或已有有限输入的推导上界也可成立。本地 query! 可以组合无界 SQL 计划，但物化与展现前必须证明有界'});
+   }
    const role=d.declarationKind;
    if(role==='data'&&['answer','figure','report','content'].includes(t!.kind))err(d,'data requires a data value; put charts inline in report or answer');
    if(['report','answer'].includes(role)&&(d.value.k!=='tree'||t!.kind!==role))err(d,role+' requires tree! with a '+(role==='answer'?'Answer':role==='report'?'Report':'chart or Table')+' root');

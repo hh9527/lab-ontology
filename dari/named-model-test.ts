@@ -18,7 +18,7 @@ try{
  const required=query('let f=from(ic::frame);let output=project({name:f.frame_name,manufacturer:not_none(f.frame__manufacturer)});output |> order_by(asc(output.name)) |> take(1)');
  assert.equal(show(required.bindings.get('rows')!.type),'Table(Schema({name: String, manufacturer: String}))');
  assert.deepEqual(resolve(required,db).values.rows,[{name:'b',manufacturer:''}]);
- const related=query('let f=from(ic::frame);let d=from(ic::device);let linked=f |> connect(ic::relations::frame_belongs_to_device,f,d);let output=linked |> project({frame:f.frame_name,device:d.device_name});output |> order_by(asc(output.frame)) |> take(10)');
+ const related=query('let f=from(ic::frame);let d=from(ic::device);let linked=f |> connect(ic::relations::frame_belongs_to_device,f,d);let output=linked |> project({frame:f.frame_name,device:d.device_name}).as!(out);output |> order_by(asc(output.frame)) |> take(10)');
  assert.match(show(related.bindings.get('rows')!.type),/device: Option\(String\)/);
  const {dariHost}=await import(new URL('../../dsh-oks/packages/dsh-oks/src/dari-host.ts',import.meta.url).href);
  const scalar=(name:string)=>({kind:'scalar',name});

@@ -15,7 +15,7 @@ data rows = query_remote! {
  let a = from(ic::current_alarm);
  a |> filter(a.alarm_occur_utc_raw >= request.start)
    |> filter(a.alarm_occur_utc_raw < request.end)
-   |> project({severity:a.alarm_severity,total:a.alarm_count})
+   |> project({severity:a.alarm_severity,total:a.alarm_count}).as!(out)
    |> order_by(asc(out.severity)) |> take(10)
 };
 answer tree! { Answer [Table(data = rows)]};`;
@@ -29,7 +29,7 @@ answer tree! { Answer [Table(data = rows)]};`;
  const compound=source.replace('filter(a.alarm_occur_utc_raw >= request.start)\n   |> filter(a.alarm_occur_utc_raw < request.end)','filter((a.alarm_occur_utc_raw >= request.start && a.alarm_occur_utc_raw < request.end) || a.alarm_severity == ic::AlarmSeverity::Major)');
  assert.deepEqual(resolve(check(compound,host.model),db,{request:{start:1500,end:3000}}).values.rows.map((r:any)=>r.total),[1,2]);
  db.exec("CREATE TABLE I_EnterpriseFrame(name TEXT,manufacturer TEXT); INSERT INTO I_EnterpriseFrame VALUES('null',NULL),('empty',''),('named','Acme')");
- const nullable=(predicate:string)=>'data rows=query_remote! {let f=from(ic::frame);f |> filter('+predicate+') |> project({name:f.frame_name}) |> order_by(asc(out.name)) |> take(10)};answer tree! { Answer [Table(data = rows)]};';
+ const nullable=(predicate:string)=>'data rows=query_remote! {let f=from(ic::frame);f |> filter('+predicate+') |> project({name:f.frame_name}).as!(out) |> order_by(asc(out.name)) |> take(10)};answer tree! { Answer [Table(data = rows)]};';
  const selected=(predicate:string)=>resolve(check(nullable(predicate),host.model),db).values.rows.map((row:any)=>row.name);
  assert.deepEqual(selected('is_some(f.frame__manufacturer)'),['empty','named']);
  assert.deepEqual(selected('is_none(f.frame__manufacturer)'),['null']);
@@ -37,7 +37,29 @@ answer tree! { Answer [Table(data = rows)]};`;
  assert.deepEqual(selected('is_none(f.frame__manufacturer) || f.frame_name == "named"'),['named','null']);
  assert.throws(()=>check(nullable('is_some(f.frame_name)'),host.model),/optional dimension/);
  assert.throws(()=>check(nullable('is_some()'),host.model),/one optional dimension/);
- const projected='data rows=query_remote! {let f=from(ic::frame);f |> project({name:f.frame_name,manufacturer:not_none(f.frame__manufacturer)}) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer [Table(data = rows)]};';
+
+ const optionalSource=(predicate:string)=>'type Params=Schema({name:Option(String)});data request:Params=input();data rows=query_remote! {let f=from(ic::frame);f |> filter('+predicate+') |> project({name:f.frame_name}).as!(out) |> order_by(asc(out.name)) |> take(10)};answer tree! {Answer [Table(data=rows,spec={allow_no_data:True})]};';
+ const optionalProgram=check(optionalSource('(f.frame_name == request.name).unwrap_or!(False)'),host.model);
+ assert.deepEqual(resolve(optionalProgram,db,{request:{name:'named'}}).values.rows,[{name:'named'}]);
+ assert.deepEqual(resolve(optionalProgram,db,{request:{name:null}}).values.rows,[]);
+ const acceptUnknown=check(optionalSource('(f.frame_name == request.name).unwrap_or!(True)'),host.model);
+ assert.equal(resolve(acceptUnknown,db,{request:{name:null}}).values.rows.length,3);
+ assert.throws(()=>check(optionalSource('f.frame_name == request.name'),host.model),/nonnullable|unwrap_or/);
+ assert.throws(()=>check(optionalSource('(f.frame_name == request.name).unwrap_or!(1)'),host.model),/Bool/);
+ assert.throws(()=>check(optionalSource('(f.frame_name == "named").unwrap_or!(False)'),host.model),/already Bool/);
+ const nested=check(optionalSource('((f.frame_name == request.name).unwrap_or!(False)) || f.frame_name == "empty"'),host.model);
+ assert.deepEqual(resolve(nested,db,{request:{name:null}}).values.rows,[{name:'empty'}]);
+ console.log('model optional parameters: Some/None, explicit Bool defaults and boolean composition passed');
+
+ const enumSource='type Params=Schema({severity:Option(ic::AlarmSeverity)});data request:Params=input();data rows=query_remote! {let a=from(ic::current_alarm);a |> filter((a.alarm_severity == request.severity).unwrap_or!(False)) |> project({total:a.alarm_count}).as!(out) |> take(1)};answer tree! {Answer [Table(data=rows)]};';
+ let enumWire='';
+ const enumProgram=check(enumSource,{...host.model,check_type(intent,encoded){enumWire=encoded.json;return host.model.check_type(intent,encoded);}});
+ const wrongBusiness=JSON.parse(enumWire);
+ wrongBusiness.steps.find((step:any)=>step.kind==='filter').body.args[0].right.logical='AnotherIdentity';
+ assert.throws(()=>host.checkWire(JSON.stringify(wrongBusiness)),/business type does not match/);
+ assert.deepEqual(resolve(enumProgram,db,{request:{severity:'Critical'}}).values.rows,[{total:2}]);
+ assert.deepEqual(resolve(enumProgram,db,{request:{severity:null}}).values.rows,[{total:0}]);
+ const projected='data rows=query_remote! {let f=from(ic::frame);f |> project({name:f.frame_name,manufacturer:not_none(f.frame__manufacturer)}).as!(out) |> order_by(asc(out.name)) |> take(1)};answer tree! { Answer [Table(data = rows)]};';
  const projectedProgram=check(projected,host.model);
  assert.equal(show(projectedProgram.bindings.get('rows')!.type),'Table(Schema({name: String, manufacturer: String}))');
  assert.deepEqual(resolve(projectedProgram,db).values.rows,[{name:'empty',manufacturer:''}]);
@@ -46,7 +68,7 @@ answer tree! { Answer [Table(data = rows)]};`;
  assert.throws(()=>check(projected.replace('not_none(f.frame__manufacturer)','not_none(f.frame_name)'),host.model),/optional direct model member/);
  assert.throws(()=>check(projected.replace('not_none(f.frame__manufacturer)','unwrap_or!(not_none(f.frame__manufacturer),"x")'),host.model),/Computed model expression|outermost/);
  db.exec('CREATE TABLE NetworkDeviceKPI(cpuUsage REAL)');
- const aggregate='data rows=query_remote! {let a=from(ic::device_kpi);a |> project({cpu:not_none(a.cpu_usage)})};answer tree! { Answer [Table(data = rows)]};';
+ const aggregate='data rows=query_remote! {let a=from(ic::device_kpi);a |> project({cpu:not_none(a.cpu_usage)}).as!(out)};answer tree! { Answer [Table(data = rows,spec={allow_no_data:True})]};';
  const aggregateProgram=check(aggregate,host.model);
  assert(!show(aggregateProgram.bindings.get('rows')!.type).includes('Option('));
  assert.deepEqual(resolve(aggregateProgram,db).values.rows,[]);

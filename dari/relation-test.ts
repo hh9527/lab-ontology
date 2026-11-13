@@ -13,7 +13,7 @@ try{
  const source=`data rows = query_remote! {
  let f = from(ic::frame);let d = from(ic::device);
  f |> connect(ic::relations::frame_belongs_to_device,f,d)
-   |> project({frame:f.frame_name,device:d.device_name})
+   |> project({frame:f.frame_name,device:d.device_name}).as!(out)
    |> order_by(asc(out.frame)) |> take(10)
 };answer tree! { Answer [Table(data = rows)]};`;
  const program=check(source,host.model);

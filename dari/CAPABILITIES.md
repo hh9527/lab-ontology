@@ -16,7 +16,7 @@
 | 存在性条件与反存在性条件 | semi_join/anti_join | set-test |
 | 任务内连接与左连接 | join/left_join，显式 project 命名输出 | composition-test、test |
 | 全量分组、组内排名、去重 | group_by、聚合、top_per、distinct | set-test、composition-test |
-| 完整输入后处理 | 无上界中间 SQL DAG，交付处证明至多 500 行 | model-composition-test |
+| 有界取数与展现 | 远端节点至多 500 行；本地组合 SQL 计划；单个表或图输入至多 110 行 | relation-usability-test |
 | 单行和可选行 | take_opt、if let、map_opt 投影 | pipeline-test、scalar-test |
 | 有限计算与映射 | 算术、余数、lookup、case_when、unwrap_or!、round、concat | scalar-test、lookup-test |
 | 量纲与名义类型 | 兼容类型的算术保留量纲，标识类型不参与数值运算 | compiler 类型规则、ic-test |

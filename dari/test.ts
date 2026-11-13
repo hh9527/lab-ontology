@@ -49,7 +49,7 @@ type Id = struct(String); type OtherId = struct(String);
 type A = Schema({id: Id}); type B = Schema({id: Id, score: Float});
 data a: Table(A) = source("a"); data b: Table(B) = source("b");
 data rows = query! { let l = from(a); let r = from(b);
-left_join({l,r}, l.id == r.id) |> project({id:l.id, score:r.score}) |> order_by(asc(out.id)) |> take(10) };
+l |> left_join(r, l.id == r.id) |> project({id:l.id, score:r.score}).as!(out) |> order_by(asc(out.id)) |> take(10) };
 answer tree! { Answer [Table(data = rows)] };`;
 const jp=check(joined);assert.equal(show(jp.bindings.get('rows')!.type),'Table(Schema({id: Id, score: Option(Float)}))');
 db.exec("CREATE TABLE a(id TEXT); CREATE TABLE b(id TEXT, score REAL); INSERT INTO a VALUES('one'),('two'); INSERT INTO b VALUES('one',7)");
@@ -96,10 +96,10 @@ assert.deepEqual(noWinner.values.best_device,{tag:'None'});assert.equal(noWinner
 
 // Every relation carries named Schema rows.
 const chained=source.replace('answer',`data cpu_values = query! {
-    let a = from(top); a |> project({cpu: a.cpu}) |> order_by(desc(out.cpu)) |> take(3)
+    let a = from(top); a |> project({cpu: a.cpu}).as!(out) |> order_by(desc(out.cpu)) |> take(3)
 };
 data scalar_peak = query! {
-    let a = from(cpu_values); a |> project(a) |> order_by(desc(out.cpu)) |> take_opt()
+    let a = from(cpu_values); a |> project(a).as!(out) |> order_by(desc(out.cpu)) |> take_opt()
 };
 answer`).replace('UseValue(ref = summary_n)','if let Some(value_row) = scalar_peak [UseValue(ref = value_row.cpu)] else ["无数据"]');
 assert.equal(show(check(chained).bindings.get('cpu_values')!.type),'Table(Schema({cpu: Float}))');
@@ -132,7 +132,7 @@ assert.equal(resolve(check(renamed,model),db,{request:{floor:50}}).answer,'最�
 const projectedOrder=modelSource.replace('desc(a.cpu_usage)','desc(projected.cpu)');
 assert.equal(resolve(check(projectedOrder,model),db,{request:{floor:50}}).answer,'最高 CPU：*99*');
 const omitMeasure=modelSource.replace('project({device: a.device_id, cpu: a.cpu_usage})','project({device: a.device_id})')
- .replace('a |> project({cpu: a.cpu})','a |> project({cpu: a.device})')
+ .replace('a |> project({cpu: a.cpu}).as!(out)','a |> project({cpu: a.device}).as!(out)')
  .replace('order_by(desc(projected.cpu))','order_by(asc(projected.cpu))');
 assert.equal(show(check(omitMeasure,model).bindings.get('readings')!.type),'Table(Schema({device: ic::DeviceId}))');
 const annotated=modelSource.replace('data readings =','type Expected = Schema({device: ic::DeviceId, cpu: Option(Float)});\ndata readings: Table(Expected) =');
@@ -146,7 +146,7 @@ assert.equal(resolve(check(modelSource,model),samples,{request:{floor:60}}).answ
 const renamedFields=modelSource.replace('device: a.device_id, cpu: a.cpu_usage','resource: a.device_id, usage: a.cpu_usage').replace('project({cpu: a.cpu})','project({cpu: a.usage})');
 assert.equal(resolve(check(renamedFields,model),samples,{request:{floor:60}}).answer,'最高 CPU：*70*');
 // Published AVG remains nullable for grouped and ungrouped results.
-const globalMetric=modelSource.replace('a |> filter(a.cpu_usage > request.floor)\n      |> project({device: a.device_id, cpu: a.cpu_usage})','a |> project({cpu: a.cpu_usage})');
+const globalMetric=modelSource.replace('a |> filter(a.cpu_usage > request.floor)\n      |> project({device: a.device_id, cpu: a.cpu_usage}).as!(out)','a |> project({cpu: a.cpu_usage}).as!(out)');
 assert.equal(show(check(globalMetric,model).bindings.get('readings')!.type),'Table(Schema({cpu: Option(Float)}))');
 samples.exec('DELETE FROM devices');
 const noSamples=resolve(check(globalMetric,model),samples);

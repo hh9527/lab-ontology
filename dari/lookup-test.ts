@@ -12,7 +12,7 @@ data rows = query! {
     r |> project({id: r.id, label: unwrap_or!(lookup(r.code, [
         {value: "switch", label: "交换机"},
         {value: "router", label: "路由器"}
-    ]), "其他"), doubled: r.id * 2})
+    ]), "其他"), doubled: r.id * 2}).as!(out)
       |> order_by(asc(out.id)) |> take(10)
 };
 answer tree! { Answer [p [UseValue(ref = caption)], Table(data = rows)] };
@@ -35,7 +35,7 @@ for(const [from,to,error]of [
 ] as const)assert.throws(()=>check(source.replace(from,to)),error);
 // SQL placeholder order remains correct with lookup in an outer projection.
 const nested=source.replace('answer',`data nested = query! {
- let r = from(rows); r |> project({id:r.id, label:unwrap_or!(lookup(r.label,[{value:"交换机",label:"SW"}]),"other")})
+ let r = from(rows); r |> project({id:r.id, label:unwrap_or!(lookup(r.label,[{value:"交换机",label:"SW"}]),"other")}).as!(out)
  |> order_by(asc(out.id)) |> take(10)
 }; answer`).replace('Table(data = rows)','Table(data = nested)');
 assert.equal(resolve(check(nested),db).values.nested[0].label,'SW');

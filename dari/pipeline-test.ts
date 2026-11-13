@@ -10,7 +10,7 @@ data request: Params = input();
 data row = query_remote! {
     let a = from(ic::DeviceKpi);
     a |> filter(a.cpu_usage > request.floor)
-      |> project({cpu: a.cpu_usage})
+      |> project({cpu: a.cpu_usage}).as!(out)
       |> order_by(desc(out.cpu)) |> take_opt()
 };
 answer tree! { Answer [
@@ -39,9 +39,9 @@ const shadowed=source.replace('answer','data cpu = 42; data derived = cpu + 1; a
  .replace('if cpu > 50.0 [p ["偏高"]]','if cpu > 50.0 [p [UseValue(ref = derived)]]');
 assert.equal(resolve(check(shadowed,model),db,{request:{floor:0}}).answer,'CPU：*80*\n\n*43*');
 const bounded=source.replace('answer',`data rows = query_remote! {
- let a = from(ic::DeviceKpi); a |> project({cpu:a.cpu_usage}) |> order_by(desc(out.cpu)) |> take(5)
+ let a = from(ic::DeviceKpi); a |> project({cpu:a.cpu_usage}).as!(out) |> order_by(desc(out.cpu)) |> take(5)
 };
-data copied = query! { let r = from(rows); r |> project({cpu:r.cpu}) };
+data copied = query! { let r = from(rows); r |> project({cpu:r.cpu}).as!(out) };
 answer`).replace('p ["CPU：", UseValue(ref = found.cpu)]','Table(data = copied)');
 assert.match(resolve(check(bounded,model),db,{request:{floor:0}}).answer,/80/);
 const contextSource=`data ctx = context! { time_zone: Context::ClientTz }; answer tree! { Answer [p [UseValue(ref = ctx.time_zone)]] };`;
@@ -59,7 +59,7 @@ model.implementationId='new-build';
 assert.throws(()=>resolve(program,db,{request:{floor:0}}),/Model contract changed/);
 model.implementationId=implementation;
 const scalarQuery=`data row = query_remote! {
- let a = from(ic::DeviceKpi); a |> project({cpu:a.cpu_usage}) |> take_opt()
+ let a = from(ic::DeviceKpi); a |> project({cpu:a.cpu_usage}).as!(out) |> take_opt()
 }; answer tree! { Answer [if let Some(value_row) = row [UseValue(ref = value_row.cpu)] else ["无数据"]] };`;
 assert.equal(resolve(check(scalarQuery,model),db).answer,'*80*');
 const singleton=scalarQuery.replace('take_opt()','take(1)').replace('if let Some(value_row) = row [UseValue(ref = value_row.cpu)] else ["无数据"]','Table(data = row)');

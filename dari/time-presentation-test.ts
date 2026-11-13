@@ -16,7 +16,7 @@ data zoned=to_datetime_tz(moment,ctx.tz);
 data day=date_of(zoned);
 data epoch=to_epoch_millis(moment);
 data raw:Table(Schema({at:DateTimeUtc,v:Float}))=source("samples");
-data rows=query! {let r=from(raw);let result=r |> project({at:r.at,zoned:to_datetime_tz(r.at,ctx.tz),v:r.v});result |> order_by(asc(result.at)) |> take(10)};
+data rows=query! {let r=from(raw);let result=r |> project({at:r.at,zoned:to_datetime_tz(r.at,ctx.tz),v:r.v}).as!(out);result |> order_by(asc(result.at)) |> take(10)};
 report full=tree! {Report [Table(data=rows,spec={formats:{at:fmt,zoned:{date_style:DateStyle::Date}}}),LineChart(data=rows,spec={x:$.zoned,value:$.v,formats:{zoned:fmt}})]};
 answer tree! {Answer [UseValue(ref=moment,format=fmt),UseValue(ref=zoned),UseValue(ref=day),UseValue(ref=epoch,format=fmt),UseReport(ref=full)]};`;
 const options={host:dariHost,contextType,allowTestSources:true};

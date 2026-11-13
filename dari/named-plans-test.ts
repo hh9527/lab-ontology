@@ -10,12 +10,12 @@ const compile=(body:string)=>check(prefix+'data rows=query! {'+body+'};answer tr
 const run=(body:string)=>resolve(compile(body),db).values.rows;
 assert.deepEqual(run('let a=from(src);let out=project({name:a.name,value:a.cpu});out |> order_by(desc(out.value)) |> take(2)'),[{name:'B',value:30},{name:'C',value:20}]);
 assert.deepEqual(run('let a=from(src);let chosen=a |> filter(a.cpu > 10.0);let result=project({name:chosen.name,value:chosen.cpu});result |> filter(result.value < 30.0) |> order_by(asc(result.name)) |> take(10)'),[{name:'C',value:20}]);
-assert.deepEqual(run('let a=from(src);let first=project({value:a.cpu});let second=first |> project({doubled:first.value * 2.0});second |> order_by(desc(second.doubled)) |> take(2)'),[{doubled:60},{doubled:40}]);
-assert.deepEqual(run('let a=from(src);let b=from(src);let related=join({a,b},a.id==b.id);let output=related |> project({name:a.name,value:b.cpu});output |> order_by(desc(output.value)) |> take(1)'),[{name:'B',value:30}]);
+assert.deepEqual(run('let a=from(src);let first=project({value:a.cpu});let second=first |> project({doubled:first.value * 2.0}).as!(out);second |> order_by(desc(second.doubled)) |> take(2)'),[{doubled:60},{doubled:40}]);
+assert.deepEqual(run('let a=from(src);let b=from(src);let related=a |> join(b, a.id==b.id);let output=related |> project({name:a.name,value:b.cpu}).as!(out);output |> order_by(desc(output.value)) |> take(1)'),[{name:'B',value:30}]);
 assert.throws(()=>compile('let a=from(src);let b=from(src);let output=project({name:a.name,value:b.cpu});output |> order_by(asc(output.name)) |> take(1)'),/multiple input relations/);
 assert.throws(()=>compile('let a=from(src);let x=project({value:a.cpu});x |> order_by(asc(out.value)) |> take(1)'),/Unknown binding out/);
 assert.throws(()=>compile('let a=from(src);let x=project({value:a.cpu});x |> filter(a.cpu > 1.0) |> order_by(asc(x.value)) |> take(1)'),/not an input/);
-assert.deepEqual(run('let a=from(src);let a=from(src);a |> project({id:a.id}) |> order_by(asc(out.id)) |> take(1)'),[{id:'a'}]);
+assert.deepEqual(run('let a=from(src);let a=from(src);a |> project({id:a.id}).as!(out) |> order_by(asc(out.id)) |> take(1)'),[{id:'a'}]);
 const {model}=createFixtureModel();
 const query=(body:string)=>check('data rows=query_remote! {'+body+'};answer tree! { Answer [Table(data = rows)]};',model);
 const q=query('let a=from(ic::DeviceKpi);let out=project({name:a.name,value:a.cpu_usage});out |> order_by(desc(out.value)) |> take(2)');
@@ -28,7 +28,7 @@ assert(Object.keys(resolve(after,db).values).every(name=>!name.startsWith('@')))
 assert([...after.bindings].filter(([name])=>name.startsWith('@')).every(([,b])=>b.internal));
 assert.deepEqual(resolve(query('let a=from(ic::DeviceKpi);let output=project({name:a.name,value:a.cpu_usage});let limited=output |> order_by(desc(output.value)) |> take(2);limited |> filter(unwrap_or!(limited.value,0.0) < 30.0)'),db).values.rows,[{name:'C',value:20}]);
 assert.deepEqual(resolve(query('let a=from(ic::DeviceKpi);let output=project({name:a.name,value:a.cpu_usage});let limited=output |> order_by(desc(output.value)) |> take(3);limited |> take(2)'),db).values.rows,[{name:'B',value:30},{name:'C',value:20}]);
-const branched=compile('let a=from(src);let base=project({id:a.id,value:a.cpu});let low=base |> filter(base.value < 20.0);let high=base |> filter(base.value > 20.0);let all=union({low,high});all |> order_by(asc(all.id)) |> take(10)');
+const branched=compile('let a=from(src);let base=project({id:a.id,value:a.cpu});let low=base |> filter(base.value < 20.0);let high=base |> filter(base.value > 20.0);let all=low |> union(high);all |> order_by(asc(all.id)) |> take(10)');
 assert.deepEqual(resolve(branched,db).values.rows,[{id:'a',value:10},{id:'b',value:30}]);
 assert.throws(()=>compile('let a=from(src);let result=project({value:a.cpu});result |> order_by(desc(result.missing)) |> take(1)'),/Unknown field/);
 assert.throws(()=>compile('let a=from(src);let result=project({value:later.cpu});let later=from(src);result |> order_by(desc(result.value)) |> take(1)'),/unambiguous input/);

@@ -64,7 +64,7 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
         INSERT INTO I_EntNetworkElement VALUES ('one','LSW'),('two','ne.category.switch'),('three','brand-new');`);
     const classes=check(`data rows = query_remote! {
         let a = from(ic::device);
-        a |> project({id: a.device_id, raw: a.device_class_raw, category: a.device_class})
+        a |> project({id: a.device_id, raw: a.device_class_raw, category: a.device_class}).as!(out)
           |> order_by(asc(a.device_id)) |> take(10)
     };
     answer tree! { Answer [Table(data = rows)] };`,model);
@@ -74,7 +74,7 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
         INSERT INTO I_EnterpriseFrame VALUES ('a',NULL),('b',1),('c',3);`);
     const frame=check(`data rows = query_remote! {
         let a = from(ic::frame);
-        a |> project({id: a.frame__frameDn, raw: a.frame_oper_state_raw, state: a.frame_oper_state})
+        a |> project({id: a.frame__frameDn, raw: a.frame_oper_state_raw, state: a.frame_oper_state}).as!(out)
           |> order_by(asc(a.frame__frameDn)) |> take(10)
     };
     answer tree! { Answer [Table(data = rows)] };`,model);
@@ -83,7 +83,7 @@ export function testEnums(model:ModelPort,codecs:Record<string,ValueCodec>,mappi
     const orderedSource=`type Row = Schema({raw: String, logical: ic::CodecOrder});
     data source_rows: Table(Row) = source("enum_sort");
     data rows = query! { let a = from(source_rows);
-        a |> project({raw: a.raw, logical: a.logical}) |> order_by(asc(out.logical)) |> take(10)
+        a |> project({raw: a.raw, logical: a.logical}).as!(out) |> order_by(asc(out.logical)) |> take(10)
     };
     answer tree! { Answer [Table(data = rows)] };`;
     assert.deepEqual(resolve(check(orderedSource,model),db).values.rows.map((r:any)=>r.raw),['Zeta','Alpha']);

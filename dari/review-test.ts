@@ -21,10 +21,10 @@ try{
  const source=`type Row = Schema({id:Int,tenant:Option(String)});
  data aa: Table(Row) = source("a"); data bb: Table(Row) = source("b");
  data rows = query! {let l = from(aa);let r = from(bb);
- join({l,r}, unwrap_or!(l.tenant, "") == unwrap_or!(r.tenant, ""))
- |> project({id:l.id,peer:r.id}) |> order_by(asc(out.id)) |> take(10)};
+ l |> join(r, unwrap_or!(l.tenant, "") == unwrap_or!(r.tenant, ""))
+ |> project({id:l.id,peer:r.id}).as!(out) |> order_by(asc(out.id)) |> take(10)};
  answer tree! { Answer [Table(data = rows)]};`;
  assert.deepEqual(resolve(check(source,undefined,{allowTestSources:true}),db).values.rows,[{id:1,peer:10},{id:2,peer:20}]);
- assert.throws(()=>check(source.replace('|> project({id:l.id,peer:r.id}) |> order_by(asc(out.id))','|> order_by(asc(l.id))'),undefined,{allowTestSources:true}),/join requires project/);
+ assert.throws(()=>check(source.replace('|> project({id:l.id,peer:r.id}).as!(out) |> order_by(asc(out.id))','|> order_by(asc(l.id))'),undefined,{allowTestSources:true}),/join requires project/);
 }finally{db.close();}
 console.log('review contracts and joins: passed');

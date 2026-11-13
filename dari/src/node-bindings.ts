@@ -41,12 +41,18 @@ export function lowerNodeBindings(block:Node,model?:ModelPort):Node {
     if(binding&&current)currents.set(binding.name,current);
     continue;
    }
-   if(step.args.length!==1)fail(step,'Use connect(Relation).as!(peer) when traversing from the current node');
+   if(step.args.length===3){
+    if(step.args.slice(1).some((n:Node)=>n.k!=='ref'||n.path.length!==1||!datasets.has(currents.get(n.path[0])??n.path[0])))fail(step,'connect(Relation, from_node, to_node) requires two declared model nodes');
+    const endpoints=step.args.slice(1).map((n:Node)=>currents.get(n.path[0])??n.path[0]);
+    result.push(wrapped);current=endpoints[0]===current?endpoints[1]:endpoints[0];
+    if(binding)currents.set(binding.name,current);continue;
+   }
+   if(step.args.length!==1)fail(step,'Use connect(Relation).as!(peer), or connect(Relation, from_node, to_node) with declared endpoints');
    const symbol=step.args[0],relation=symbol.k==='ref'&&symbol.path.length===1?model?.relations?.[symbol.path[0]]:undefined;
    if(!relation)fail(step,'connect requires a published Relation symbol');
    const source=datasets.get(current);
    if(!source)fail(step,'connect requires a current model node before projection');
-   if(relation!.from===relation!.to)fail(step,'Self Relation requires explicit endpoint nodes and direction');
+   if(relation!.from===relation!.to)fail(step,'Self Relation requires connect(Relation, from_node, to_node); declare each endpoint with from(Dataset), in the Relation’s published from/to order');
    const forward=relation!.from===source!.id;
    if(!forward&&relation!.to!==source!.id)fail(step,'Relation does not connect the current Dataset '+source!.symbol);
    const peerId=forward?relation!.to:relation!.from;

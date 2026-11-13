@@ -21,7 +21,6 @@ export function repairSuggestion(message:string):string|undefined {
  if(/Predicate requires Bool; got Option\(Bool\)/.test(message))return '条件可能为空；若空值按不满足处理，使用 unwrap_or!(condition, False)';
  if(/case_when requires/.test(message))return 'case_when(condition, thenValue, elseValue) 恰好接受三个参数；多个分支嵌套在 elseValue 中，标签查表也可用 lookup';
  if(/Unknown built-in from|Expected ;, got \|>/.test(message))return '数据流水线写在 query! { let r = from(rows); r |> project({...}) } 中';
- if(/supported as a query! starting expression/.test(message))return '在 query! 中先 let a = from(left); let b = from(right); 然后以 join({a,b}, a.key == b.key) 或 semi_join({a,b}, a.key == b.key) 起手，再 |> project({...})；集合运算以 intersect({a,b}) 等起手，不放在 |> 后';
  if(/Set inputs must/.test(message))return '按列出的输入、字段和类型差异修正；统一字段业务类型及可空性，保留需要的指标，不靠删除输入来绕过错误';
  if(/Unknown (?:binding|declaration|type)/.test(message))return '核对名称与大小写，并将定义放在使用它的声明之前';
  if(/Unknown (?:figure )?attribute/.test(message))return '核对组件支持的属性；图表配置写在 spec = {...} 中';

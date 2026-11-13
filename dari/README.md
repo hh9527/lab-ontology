@@ -2,7 +2,7 @@
 
 注释使用 `#`，从 `#` 到行尾。字符串中的 `#` 是普通字符。
 
-扩展名为 `.dari`，定位是围绕数据获取、处理和展现的流水线定义语言：声明式、强类型、有边界、本地与远程两阶段证明。data 声明可缓存的数据节点，let 命名节点内部的计划片段，不产生新的物化边界。语言核心通过 JSONL 服务接入插件，模型以独立 ABI 提供类型证明和参数化查询计划。主阅读入口为 [device.dari](examples/device.dari)，展示静态模型 query_remote! 与后续 query!；[ic-device.dari](examples/ic-device.dari) 使用真实 IC 模型的符号与类型 ABI。
+扩展名为 `.dari`，定位是围绕数据获取、处理和展现的流水线定义语言：声明式、强类型、有边界、本地与远程两阶段证明。data 声明可缓存的数据节点，let 命名节点内部的计划片段，不产生新的物化边界。每个顶层 query_remote! 数据节点在 check 时必须证明结果至多 500 行，不能依赖下游再截断；query! 可保留无界 SQL 计划，但物化前必须证明至多 500 行，单个 Table 或图表输入须证明至多 110 行。语言核心通过 JSONL 服务接入插件，模型以独立 ABI 提供类型证明和参数化查询计划。主阅读入口为 [device.dari](examples/device.dari)，展示静态模型 query_remote! 与后续 query!；[ic-device.dari](examples/ic-device.dari) 使用真实 IC 模型的符号与类型 ABI。
 
 ## 运行
 
@@ -52,7 +52,7 @@ data highest = query! {
 };
 ```
 
-query! 直接引用外部绑定，check 只读取绑定类型，resolve 才使用参数值。局部源别名优先于同名外部绑定。投影结果通过 let 显式命名，后续使用该名称访问字段；紧随投影的排序也可引用当前阶段未输出的源字段。连续 filter/project 形成新的有类型阶段；连接使用 `join({a,b}, condition)` 或 `left_join(...)`。
+query! 直接引用外部绑定，check 只读取绑定类型，resolve 才使用参数值。局部源别名优先于同名外部绑定。投影结果通过 let 显式命名，后续使用该名称访问字段；紧随投影的排序也可引用当前阶段未输出的源字段。连续 filter/project 形成新的有类型阶段；连接使用 `a |> join(b, condition)` 或 `left_join(...)`。
 
 `project(expr)` 根据记录对象或记录引用推导 Schema 行。单列也显式命名。末端算子决定容器：
 
@@ -178,6 +178,6 @@ context 由宿主传入，不在语言中猜测时间或时区。检查时通过
 
 ## 关系组合与完整输入验收
 
-relation-test.ts 验证 Relation 的可选关联与模型检查；pair-test.ts 验证两期完整聚合、身份对齐和增长排名；model-composition-test.ts 验证未物化模型查询的 1,200 行聚合与 2,400 行集合合并；set-test.ts 验证集合、半连接、去重和分组 TopN。所有交付上界在 check 阶段证明，中间无上界计划只作为 SQL 子查询消费。
+relation-test.ts 验证 Relation 的可选关联与模型检查；pair-test.ts 验证两期完整聚合、身份对齐和增长排名；relation-usability-test.ts 验证远端取数上界、本地计划与展现边界；set-test.ts 验证集合、半连接、去重和分组 TopN。远端节点及展现上界在 check 阶段证明，本地无界计划只作为 SQL 子查询消费。
 
 时间类型、format/formats 与类型化横轴见 [LANGUAGE.md](LANGUAGE.md#时间展示)，可运行示例见 [time-display.dari](examples/time-display.dari)。

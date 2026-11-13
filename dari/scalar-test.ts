@@ -8,7 +8,7 @@ db.exec("CREATE TABLE samples(name TEXT,n REAL); INSERT INTO samples VALUES('甲
 const source=`
 type Row = Schema({name:String,n:Option(Float)});
 data raw: Table(Row) = source("samples");
-data rows = query! {let r = from(raw);r |> project({label:concat(r.name,"设备"),value:round(unwrap_or!(r.n,0.0),2),missing:is_none(r.n),state:case_when(is_some(r.n),"已测","缺测")}) |> order_by(asc(out.label)) |> take(5)};
+data rows = query! {let r = from(raw);r |> project({label:concat(r.name,"设备"),value:round(unwrap_or!(r.n,0.0),2),missing:is_none(r.n),state:case_when(is_some(r.n),"已测","缺测")}).as!(out) |> order_by(asc(out.label)) |> take(5)};
 report report = tree! { Report(title = "报告") [section(id = "summary") [h3 ["摘要"],ul [li ["第一项"],li [a(href = "https://example.com") ["详情"]]],blockquote [p ["口径"]],pre ["select * from samples;"],Table(data = rows)]]};
 answer tree! { Answer [UseReport(ref = report)]};`;
 const output=resolve(check(source,undefined,{allowTestSources:true}),db);
@@ -19,7 +19,7 @@ assert.match(output.artifacts['report.html'],/<a href="https:\/\/example.com">�
 assert.match(output.artifacts['report.html'],/<blockquote><p>口径<\/p><\/blockquote>/);
 const scalar=check('data label = concat("甲","设备");data n = round(1.234,2);data text = case_when(True,label,"乙");answer tree! { Answer [p [UseValue(ref = text),UseValue(ref = n)]]};');
 assert.equal(resolve(scalar,db).answer,'*甲设备**1.23*');
-const optional=check(source.replace('report report =',`data first = query! {let r=from(rows);r |> project({n:r.value}) |> order_by(desc(out.n)) |> take_opt()};
+const optional=check(source.replace('report report =',`data first = query! {let r=from(rows);r |> project({n:r.value}).as!(out) |> order_by(desc(out.n)) |> take_opt()};
 data firstNumber = map_opt(first,$.n);
 data rounded = round(firstNumber,1);
 report report =`).replace('UseReport(ref = report)','UseValue(ref = rounded)'),undefined,{allowTestSources:true});

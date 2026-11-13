@@ -2,6 +2,7 @@ import type {Type} from './compiler.ts';
 import type {Node} from './syntax.ts';
 
 export const MAX_RESULT_ROWS=500;
+export const MAX_PRESENTATION_ROWS=110;
 export type Ordering={key:string;direction:'asc'|'desc'};
 export type ResultContract={element:Type;container:'table'|'option'|'grouped';maxRows?:number;ordering:Ordering[]};
 export type Plan={
@@ -11,7 +12,7 @@ export type Plan={
  result:ResultContract;
  scope:Record<string,Type>;
  refs:Record<string,string>;
- sources?:{alias:string;binding:string;nullable:boolean;fields:Record<string,string>;ordering:Ordering[]}[];
+ sources?:{alias:string;binding:string;nullable:boolean;fields:Record<string,string>;references:Record<string,string>;ordering:Ordering[]}[];
  join?:Node;
  setOp?:'UNION'|'UNION ALL'|'INTERSECT'|'EXCEPT';
  existsMode?:'semi'|'anti';

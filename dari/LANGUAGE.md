@@ -8,7 +8,7 @@ DARI 是围绕数据获取、处理和展现的流水线定义语言，具有声
 
 关系处理遵循有类型约束的 SQL 语义。query! / query_remote! 内 let 使用不可变、按声明顺序的词法作用域，支持同名 shadow：先在旧作用域中求右侧的类型与计划，再发布新绑定。新绑定可以有不同 Schema，已绑定的分支仍引用原来的计划。project 从输入成员推导输出 Schema，以绑定的名称引用结果列，没有凭空出现的行变量。单输入 project 可根据成员引用确定输入，多输入必须显式声明 join 或模型 Relation。先筛选源行再聚合与先聚合再筛选结果是不同计划，编译器保留作者表达的顺序。
 
-后置宏 `.as!(name)` 是表达式位置的绑定语法糖，遵循与 let 相同的顺序 shadow 规则，绑定后仍返回原计划。query! 和 query_remote! 的筛选、投影等计划都可用它命名，后续步骤使用新绑定。模型关系遍历中，`connect(Relation)` 从当前节点推导对端 Dataset，后置绑定命名新对端；连续 connect 从最新节点继续，表达式仍携带整个关系计划。let 绑定整个计划，成员投影可使用各节点名称。关系方向、可空性与行粒度由模型证明，自关联需显式端点以消除方向歧义。
+后置宏 `.as!(name)` 是表达式位置的绑定语法糖，遵循与 let 相同的顺序 shadow 规则，绑定后仍返回原计划。query! 和 query_remote! 的筛选、投影等计划都可用它命名，后续步骤使用新绑定。模型关系遍历中，`connect(Relation)` 从当前节点推导对端 Dataset，后置绑定命名新对端；连续 connect 从最新节点继续，表达式仍携带整个关系计划。let 绑定整个计划，成员投影可使用各节点名称。关系方向、可空性与行粒度由模型证明，自关联使用 `connect(Relation, from_node, to_node)`，两个节点分别用 from(Dataset) 声明，参数顺序对应 Relation 发布的 from/to；管道输入可以是任一端，方向不由节点变量名推测。
 
 ```telora
 data rows = query_remote! {
@@ -70,7 +70,7 @@ $.field 是组件中的受限字段投影语法。检查器记录输入 Schema �
 
 ## 空值默认值与标量引用
 
-`unwrap_or!(value, default_expr)` 接收 Option(T) 和同一业务类型的 T，结果为 T。后置宏 `value.unwrap_or!(default_expr)` 展开为相同的前置形式；只有值为空时才求值默认表达式。普通计算和 query! 均支持，query! 中 lower 为 SQL COALESCE。query_remote! 仍由模型公开的表达式能力决定。
+`unwrap_or!(value, default_expr)` 接收 Option(T) 和同一业务类型的 T，结果为 T。后置宏 `value.unwrap_or!(default_expr)` 展开为相同的前置形式；只有值为空时才求值默认表达式。普通计算和 query! 均支持，query! 中 lower 为 SQL COALESCE。query_remote! 的行级维度条件支持显式默认值：`filter((a.tenant_id == selected_tenant).unwrap_or!(False))`。可空参数为 None 时比较结果为空，由 False 默认值排除该行；True 默认值则接受未知条件。None 不会取消筛选。参数保留业务类型与内部 codec，模型负责检查；聚合度量阈值仍要求非空参数。
 
 ```text
 data prepared = { cpu: map_opt(highest, $.cpu).unwrap_or!(default_cpu) };
@@ -87,9 +87,9 @@ query! 可连续 filter、project，也可在 take 后继续处理有界表。�
 
 每个算子对应显式计划节点，记录 inputType 与 result。ResultContract 统一包含元素 Schema、容器、有序键和行数上界；组件与后处理从绑定上的同一份结果契约读取性质。
 
-行数上界沿计划传播：映射与筛选不扩大输入上界，连接采用乘积上界，左连接计入缺行保留，无分组聚合至多一行，take 取输入上界与参数的较小值。映射、筛选和 take 保留内部排序键；分组与聚合使旧顺序失效。连续两次 order_by 明确报错，多个排序条件应放在同一次调用；take 后的 order_by 是独立重排。SQL 的内部排序列不会交付给作者，子查询别名使用阶段编号。
+行数上界沿计划传播：映射与筛选不扩大输入上界，连接采用乘积上界，左连接计入缺行保留，无分组聚合至多一行，take 取输入上界与参数的较小值。映射、筛选和 take 保留内部排序键；分组与聚合使旧顺序失效。连续两次 order_by 明确报错，多个排序条件放在同一次调用，例如 `order_by(desc(output.rank), asc(output.name))`，按参数顺序依次破除并列；take 后的 order_by 是独立重排。SQL 的内部排序列不会交付给作者，子查询别名使用阶段编号。
 
-交付 Table 必须证明不超过 500 行；已知输入上界时不强制重复 take。take_opt 改变容器类型，不能继续应用表算子。group_by 产生待投影的分组契约，只接受 project 消费；重复分组会给出分组诊断，不伪装成投影位置错误。
+每个顶层 query_remote! 数据节点必须证明不超过 500 行；每个 Table 或图表输入必须证明不超过 110 行。已知输入上界时不强制重复 take。take_opt 改变容器类型，不能继续应用表算子。group_by 产生待投影的分组契约，只接受 project 消费；重复分组会给出分组诊断，不伪装成投影位置错误。
 
 query_remote!/query! 共享算子的结果含义，但外部模型仍可拒绝尚未实现的组合；当前 IC 模型支持 Relation 多节点、维度谓词、聚合阈值和两期比较，不能将 query! 的新组合能力等同于模型 query_remote! 已支持全部组合。
 
@@ -127,19 +127,21 @@ if let Some(name) = value 在 tree! 分支中收窄 Option(T) 为 T。name 只�
 
 ## 完整输入上的关系组合
 
-中间 query_remote!/query! 不要求交付上界，保持 SQL DAG；只有交付 Table 和图表输入要求证明至多 500 行。query_remote! 无 take 时不接受 order_by，后续 query! 可排序和 take。union/union_all/intersect/except 合并一致 Schema，semi_join/anti_join 使用存在性保留左行，top_per 在分组内排名，distinct 去重。各操作均在数据库执行，is_empty 使用 EXISTS 而非拉取数据。
+每个顶层 query_remote! 数据节点在 check 时必须证明结果至多 500 行，包括未使用的远端查询；下游本地 take 不能补救远端无界节点。query! 可保持无界 SQL 计划供后续组合，但不得将无界结果物化到 JS。展现输入必须证明至多 110 行，并满足组件类型与空数据规则。union/union_all/intersect/except 合并一致 Schema，semi_join/anti_join 使用存在性保留左行，top_per 在分组内排名，distinct 去重。各操作均在数据库执行，is_empty 使用 EXISTS 而非拉取数据。
 
 有限标量包含文本 contains/not_contains/starts_with/ends_with、IPv4 in_subnet/not_in_subnet、整数余数和可选行 map_opt 投影。表常量通过 table([...]) 构造；空表需 Table(Schema) 注解。模型参数仍由模型生成 codec 解析；IPv4 子网是 query! 的有限算子，其值在执行时验证。
 
-### 联接与集合运算的位置
+### 关系绑定与管道组合
 
-join、left_join、semi_join、anti_join 与 union、union_all、intersect、except 是 query! 的起始表达式。先使用 let 绑定 from 输入，再以联接或集合运算起手，后接 project 等流水线算子。把这些起始表达式放在 |> 后会得到位置诊断，并给出正确写法。
+let 和后置 .as! 声明关系名称，算子参数引用已有绑定，不用对象键模拟别名。join、left_join、semi_join、anti_join 写为 left |> join(right, condition)；union、union_all、intersect、except 写为 left |> intersect(right)。可以继续串接关系算子；最终通过 project 为联接输出命名。对象只表达字段结构，例如 project({...}) 和 group_by({...})。
+
+query_remote! 的两期对齐写为 left |> pair(right)。普通关联使用 input |> connect(Relation).as!(peer)，显式端点使用 input |> connect(Relation, from_node, to_node)，后者也可用 .as! 命名当前端点。Relation 的 from/to 顺序决定显式端点顺序。没有隐式 out；投影结果用 let result = ... 或 .as!(result) 命名，后续引用 result.field。显式 let out 是普通绑定。
 
 ```text
 data overlap = query! {
   let a = from(top_port);
   let b = from(top_bandwidth);
-  semi_join({a,b}, a.device_id == b.device_id)
+  a |> semi_join(b, a.device_id == b.device_id)
     |> project({device_id:a.device_id})
     |> distinct()
 };
@@ -173,8 +175,8 @@ project({field:not_none(expr)}) 在声明输出列时同时声明非空约束：
 query! 接受可推导的投影表达式，包含聚合结果；query_remote! 接受已发布的可空成员投影，由模型完成校验及 SQL lowering。筛除发生在计算投影结果之后、后续排序及 take 之前，不把聚合结果的非空约束提前到源数据上。空字符串仍是非空值。带内置 pair 排名的 query_remote! 暂不接受该投影，需在后续 query! 中使用。
 
 ```text
-r |> project({name:r.name,manufacturer:not_none(r.manufacturer)})
-  |> order_by(asc(out.name)) |> take(10)
+let result = r |> project({name:r.name,manufacturer:not_none(r.manufacturer)});
+result |> order_by(asc(result.name)) |> take(10)
 ```
 
 公共源码中的绑定、字段、函数、参数及图表配置采用 snake_case；类型、枚举成员和扩展组件采用 PascalCase，HTML 元素保留标签名称。时间窗口边界使用 epoch_millis/date_time_utc，时区选项使用 time_zone；图表使用 allow_no_data、value_min、x_axis、formats、x_label、value_label、connect_nulls、entity_color，layout 使用 label_font、title_font、slant_ticks、tick_count。底层 JS 库的名称通过宿主适配，不构成源码别名。

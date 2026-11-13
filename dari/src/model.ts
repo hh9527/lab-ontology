@@ -80,7 +80,9 @@ export function encodeIntent(intent:IntentType){
                 const index=e.kind==='literal'?next++:e.index;
                 if(e.kind==='literal')constants.set(index,e.value);
                 parameterTypes.set(index,e.type);
-                return {kind:'parameter',index,input_type:storage(e.type).type,nullable:e.type.kind==='option',...(e.type.name==='TimeZone'?{logical:'TimeZone'}:{})};
+                const base=e.type.kind==='option'?e.type.inner!:e.type;
+                const logical=base.modelLogical??(base.kind==='nominal'||base.name==='TimeZone'?base.name:undefined);
+                return {kind:'parameter',index,input_type:storage(e.type).type,nullable:e.type.kind==='option',...(logical?{logical}:{})};
             }
             default:throw Error('Unsupported intent expression '+(e as {kind:string}).kind);
         }

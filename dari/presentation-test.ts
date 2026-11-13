@@ -9,7 +9,7 @@ db.exec("CREATE TABLE samples(label TEXT,n REAL); INSERT INTO samples VALUES('�
 const source=`
 type Row = Schema({label:String,n:Float});
 data raw: Table(Row) = source("samples");
-data rows = query! {let r = from(raw);r |> project({label:r.label,n:r.n}) |> order_by(desc(out.n)) |> take(10)};
+data rows = query! {let r = from(raw);r |> project({label:r.label,n:r.n}).as!(out) |> order_by(desc(out.n)) |> take(10)};
 
 
 report report = tree! { Report [h1 ["设备报告"],BarChart(data = rows, spec = {category:$.label,value:$.n,value_min:99.0,title:"可用率"}),Table(data = rows, spec = {columns:["label","n"],labels:{label:"设备",n:"可用率"}})]};
@@ -81,7 +81,7 @@ const keyed=`
 type Cpu=struct(Float);type Memory=struct(Float);
 data left=table([{period:"本周",cpu:Cpu(44.2)},{period:"上周",cpu:Cpu(42.1)}]);
 data right=table([{period:"上周",memory:Memory(61.3)},{period:"本周",memory:Memory(59.8)}]);
-data weekly=query! {let l=from(left);let r=from(right);join({l,r},l.period==r.period) |> project({period:l.period,cpu:l.cpu,memory:r.memory}) |> order_by(asc(out.period)) |> take(10)};
+data weekly=query! {let l=from(left);let r=from(right);l |> join(r, l.period==r.period) |> project({period:l.period,cpu:l.cpu,memory:r.memory}).as!(out) |> order_by(asc(out.period)) |> take(10)};
 
 answer tree! { Answer [MultiBarChart(data=weekly,spec={category:$.period,metrics:[{value:$.cpu,label:"CPU",unit:"%"},{value:$.memory,label:"内存",unit:"%"}]})]};`;
 const keyedOutput=resolve(check(keyed,undefined,{host:dariHost}),joinDb);

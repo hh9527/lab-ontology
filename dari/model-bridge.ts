@@ -40,7 +40,8 @@ export async function openModel(artifact:string,runner=pathResolve('bin/telora-r
         if(metadata?.identity&&!shared)throw Error('Unknown shared ontology type '+metadata.identity);
         if(shared&&JSON.stringify(shared.codec?.operations)!==JSON.stringify(codec.operations))throw Error('Shared type calculation contract mismatch '+metadata!.identity);
         const type:Type=shared??(primary?{...base,codec}:{kind:'nominal',name:logical,inner:base,codec,semantic:metadata?.semantic??undefined,presentation:presentations?.[key]??undefined});
-        businessTypes.set(key,type);return type;
+        const published={...type,modelLogical:logical};
+        businessTypes.set(key,published);return published;
     }
     const started=performance.now();
     let contract:{contract_id:string;abi_version:string;datasets:WireDataset[];relations:Omit<RelationSymbol,'kind'>[];types:{name:string;logical:string;storage:string}[];codec_module:string};
@@ -53,7 +54,7 @@ export async function openModel(artifact:string,runner=pathResolve('bin/telora-r
         if(!presentations||!semantics)throw Error('Model must publish independent semantic and presentation contracts');
         for(const t of contract.types){
             types[t.name]=business(t.logical,t.storage);
-            if(types[t.name].kind==='nominal'&&!Object.values(sharedTypes).includes(types[t.name]))types[t.name].displayName=t.name;
+            if(types[t.name].kind==='nominal'&&!Object.hasOwn(sharedTypes,types[t.name].name??''))types[t.name].displayName=t.name;
         }
     }catch(e){worker.postMessage({close:true});throw e;}
     stats.contractMs=performance.now()-started;
@@ -89,7 +90,10 @@ export async function openModel(artifact:string,runner=pathResolve('bin/telora-r
                 const index=Number(parameter);
                 const value=constant!==undefined?checked.bindings[Number(constant)-1]:constants.has(index)?constants.get(index):parameters[index];
                 if(value===undefined)throw Error('Missing model binding');
-                bindings.push(parameter!==undefined&&parameterTypes.get(index)?.codec?parameterTypes.get(index)!.codec!.encode(value):value);return '?';
+                let type=parameterTypes.get(index);
+                if(type?.kind==='option')type=type.inner;
+                const unwrapped=value?.tag==='None'?null:value?.tag==='Some'?value.value:value;
+                bindings.push(parameter!==undefined&&unwrapped!==null&&type?.codec?type.codec.encode(unwrapped):unwrapped);return '?';
             });
             return {sql,bindings,columns:checked.columns.map(({logical,...column})=>column),max_rows:checked.max_rows??undefined};
         }

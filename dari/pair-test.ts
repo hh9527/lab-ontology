@@ -13,11 +13,11 @@ try{
  const source=`type Params = Schema({start:Rfc3339,split:Rfc3339,end:Rfc3339});data request:Params = input();
  data rows = query_remote! {
  let l = from(ic::device);let r = from(ic::device);let kl = from(ic::device_kpi);let kr = from(ic::device_kpi);
- pair(l,r) |> connect(ic::relations::device_kpi_of_device,kl,l) |> connect(ic::relations::device_kpi_of_device,kr,r)
+ l |> pair(r) |> connect(ic::relations::device_kpi_of_device,kl,l) |> connect(ic::relations::device_kpi_of_device,kr,r)
  |> group_by_identity(l) |> group_by_identity(r)
  |> filter(kl.device_kpi_ts_raw >= request.start) |> filter(kl.device_kpi_ts_raw < request.split)
  |> filter(kr.device_kpi_ts_raw >= request.split) |> filter(kr.device_kpi_ts_raw < request.end)
- |> project({device:l.device_id,before:kl.cpu_usage,after:kr.cpu_usage})
+ |> project({device:l.device_id,before:kl.cpu_usage,after:kr.cpu_usage}).as!(out)
  |> order_by(desc(growth_rate(out.after,out.before))) |> take(10)
  };answer tree! { Answer [Table(data = rows)]};`;
  const inputs={request:{start:'2026-11-01T00:00:00Z',split:'2026-11-02T00:00:00Z',end:'2026-11-03T00:00:00Z'}};

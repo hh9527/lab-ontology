@@ -13,8 +13,8 @@ const source=prefix+`
 data rows=query! {
  let a=from(devices);
  let b=from(labels);
- let related=left_join({a,b},a.id==b.id);
- let result=related |> project({id:a.id,name:b.name,seen:to_datetime_utc(a.seen),cpu:a.cpu});
+ let related=a |> left_join(b, a.id==b.id);
+ let result=related |> project({id:a.id,name:b.name,seen:to_datetime_utc(a.seen),cpu:a.cpu}).as!(out);
  result |> order_by(desc(result.cpu)) |> take(2)
 };
 data named=query! {

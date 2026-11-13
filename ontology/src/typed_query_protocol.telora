@@ -60,7 +60,8 @@ type Parameter = struct {
     kind: String,
     index: Int,
     input_type: intent::ResultType,
-    nullable: Bool
+    nullable: Bool,
+    logical: Option(String)
 };
 type BoundMember = struct {
     node: String,
@@ -118,6 +119,11 @@ type MemberPredicate = struct {
     dimension: String,
     member: String,
     op: edsl::FilterOp
+};
+type DefaultPredicate = struct {
+    kind: String,
+    value: Value,
+    parameter: Int
 };
 type BooleanPredicate = struct {
     kind: String,
@@ -193,8 +199,56 @@ def wire_kind: Fn(Value) -> String = fn(value) {
         _ => fail!("model expression requires an object"),
     }
 };
-def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, member) {
-    if wire_kind(value) == "mapped_comparison" {
+def check_parameter: Fn(BoundMember, Parameter) -> () = fn(field, parameter) {
+    match parameter.logical {
+        Some(logical) => if logical != field.logical {
+            fail!(
+                "filter parameter business type does not match member",
+                field.id,
+                field.logical,
+                logical
+            )
+        } else {
+            ()
+        },
+        None => ()
+    }
+};
+
+def predicate_nullable: Fn(Value, Fn(Value) -> BoundMember) -> Bool = fn(value, member) {
+    let kind = wire_kind(value);
+    if kind == "parameter" {
+        codec::decode@[Parameter](value).unwrap!().nullable
+    } else if kind == "member" {
+        member(value).nullable
+    } else if kind == "binary" {
+        let expr = codec::decode@[Binary](value).unwrap!();
+        predicate_nullable(expr.left, member) || predicate_nullable(expr.right, member)
+    } else if kind == "mapped_comparison" {
+        member(codec::decode@[Membership](value).unwrap!().value).nullable
+    } else if kind == "call" {
+        let call = codec::decode@[Call](value).unwrap!();
+        if call.name == "unwrap_or" || call.name == "is_some" || call.name == "is_none" {
+            False
+        } else {
+            array::any(
+                call.args,
+                fn(arg) {
+                    predicate_nullable(arg, member)
+                }
+            )
+        }
+    } else {
+        fail!("unsupported predicate expression", kind)
+    }
+};
+
+def row_expression: Fn(Value, Fn(Value) -> BoundMember, Bool) -> Value = fn(
+    value,
+    member,
+    accepts_null
+) {
+    let result = if wire_kind(value) == "mapped_comparison" {
         let predicate = codec::decode@[Membership](value).unwrap!();
         let field = member(predicate.value);
         if field.kind != "dimension" || field.logical != predicate.logical {
@@ -222,7 +276,31 @@ def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, mem
         )
     } else if wire_kind(value) == "call" {
         let call = codec::decode@[Call](value).unwrap!();
-        if call.name == "is_some" || call.name == "is_none" {
+        if call.name == "unwrap_or" {
+            if array::length(call.args) != 2 || wire_kind(call.args[1]) != "parameter" {
+                fail!("unwrap_or! requires a nullable predicate and a nonnullable Bool fallback")
+            } else {
+                ()
+            };
+            if !predicate_nullable(call.args[0], member) {
+                fail!("unwrap_or! requires Option(Bool); this predicate is already Bool")
+            } else {
+                ()
+            };
+            let fallback = codec::decode@[Parameter](call.args[1]).unwrap!();
+            if fallback.nullable || fallback.input_type != intent::ResultType::Bool || fallback.index < 0 {
+                fail!("unwrap_or! predicate fallback must be a nonnullable Bool")
+            } else {
+                ()
+            };
+            codec::encode(
+                {
+                    kind: "default",
+                    value: row_expression(call.args[0], member, True),
+                    parameter: fallback.index
+                }.ty!(DefaultPredicate)
+            )
+        } else if call.name == "is_some" || call.name == "is_none" {
             if array::length(call.args) != 1 {
                 fail!("null filter requires one optional dimension member")
             } else {
@@ -250,7 +328,8 @@ def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, mem
             };
             let field = member(call.args[0]);
             let parameter = codec::decode@[Parameter](call.args[1]).unwrap!();
-            if field.kind != "dimension" || parameter.nullable || parameter.input_type != intent::ResultType::String {
+            check_parameter(field, parameter);
+            if field.kind != "dimension" || (parameter.nullable && !accepts_null) || parameter.input_type != intent::ResultType::String {
                 fail!("text filter requires a dimension and a nonnullable String parameter")
             } else {
                 ()
@@ -288,8 +367,8 @@ def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, mem
                     } else {
                         "or"
                     },
-                    left: row_expression(expr.left, member),
-                    right: row_expression(expr.right, member)
+                    left: row_expression(expr.left, member, accepts_null),
+                    right: row_expression(expr.right, member, accepts_null)
                 }.ty!(BooleanPredicate)
             )
         } else {
@@ -307,8 +386,11 @@ def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, mem
                 ()
             };
             let parameter = codec::decode@[Parameter](expr.right).unwrap!();
-            if parameter.kind != "parameter" || parameter.nullable || parameter.index < 0 {
-                fail!("dimension filter requires a nonnullable typed parameter")
+            check_parameter(field, parameter);
+            if parameter.kind != "parameter" || (parameter.nullable && !accepts_null) || parameter.index < 0 {
+                fail!(
+                    "nullable filter parameter requires explicit unwrap_or!(comparison, False) or True"
+                )
             } else {
                 ()
             };
@@ -332,7 +414,15 @@ def row_expression: Fn(Value, Fn(Value) -> BoundMember) -> Value = fn(value, mem
                 }.ty!(RowPredicate)
             )
         }
-    }
+    };
+    if !accepts_null && predicate_nullable(value, member) {
+        fail!(
+            "Predicate requires Bool; got Option(Bool). Use unwrap_or!(condition, False) when null means no match, or True when unknown is accepted"
+        )
+    } else {
+        ()
+    };
+    result
 };
 
 # UTC conversions and buckets are model-owned derived dimensions. Reuse Graph grouping,
@@ -722,6 +812,76 @@ def check_type: Fn(
             _ => fail!("typed expression requires an object"),
         }
     };
+    # Compute the contextual type of each node in the query forest. Field
+    # declarations remain unchanged; optional traversal changes the reference type.
+    let connections = array::map(
+        array::filter(
+            request.steps,
+            fn(step) {
+                step.kind == "connect"
+            }
+        ),
+        fn(step) {
+            let edge = codec::decode@[Connect](step.body).unwrap!();
+            let relation = match array::find(
+                relations,
+                fn(r) {
+                    r.symbol == edge.relation
+                }
+            ) {
+                Some(r) => r,
+                None => fail!("unknown published Relation symbol", edge.relation)
+            };
+            (edge, relation)
+        }
+    );
+    let roots = match request.pair {
+        Some(pair) => [(pair.left, False), (pair.right, False)],
+        None => [(request.root, False)]
+    };
+    let presence = array::fold(
+        request.nodes,
+        roots,
+        fn(known, unused) {
+            array::fold(
+                connections,
+                known,
+                fn(known, connection) {
+                    let edge = connection.0;
+                    let relation = connection.1;
+                    let from = array::find(
+                        known,
+                        fn(item) {
+                            item.0 == edge.from
+                        }
+                    );
+                    let to = array::find(
+                        known,
+                        fn(item) {
+                            item.0 == edge.to
+                        }
+                    );
+                    match (from, to) {
+                        (Some(origin), None) => array::push(
+                            known,
+                            (
+                                edge.to,
+                                relation.toCardinality == edsl::Cardinality::Optional || origin.1 && relation.toCardinality == edsl::Cardinality::One
+                            )
+                        ),
+                        (None, Some(origin)) => array::push(
+                            known,
+                            (
+                                edge.from,
+                                relation.fromCardinality == edsl::Cardinality::Optional || origin.1 && relation.fromCardinality == edsl::Cardinality::One
+                            )
+                        ),
+                        _ => known
+                    }
+                }
+            )
+        }
+    );
     let member = fn(value: Value) {
         if expression_kind(value) != "member" {
             fail!(
@@ -762,7 +922,12 @@ def check_type: Fn(
                 kind: m.kind,
                 logical: m.logical,
                 storage: m.storage,
-                nullable: m.nullable
+                nullable: m.nullable || array::any(
+                    presence,
+                    fn(item) {
+                        item.0 == expr.node && item.1
+                    }
+                )
             }.ty!(BoundMember),
             None => fail!("unknown published model member", expr.member),
         }
@@ -849,7 +1014,7 @@ def check_type: Fn(
                     state <~ {
                         row_predicates: array::push(
                             state.row_predicates,
-                            row_expression(step.body, member)
+                            row_expression(step.body, member, False)
                         )
                     }
                 } else {
@@ -870,7 +1035,7 @@ def check_type: Fn(
                         state <~ {
                             row_predicates: array::push(
                                 state.row_predicates,
-                                row_expression(step.body, member)
+                                row_expression(step.body, member, False)
                             )
                         }
                     } else {
@@ -889,7 +1054,9 @@ def check_type: Fn(
                         let field = member(expr.left);
                         let parameter = codec::decode@[Parameter](expr.right).unwrap!();
                         if parameter.kind != "parameter" || parameter.nullable || parameter.index < 0 {
-                            fail!("threshold requires a nonnullable typed parameter")
+                            fail!(
+                                "Nullable filter parameter requires explicit unwrap_or!(comparison, False) or True; aggregate thresholds require a nonnullable typed parameter"
+                            )
                         } else {
                             ()
                         };
@@ -906,16 +1073,7 @@ def check_type: Fn(
                             state <~ {
                                 row_predicates: array::push(
                                     state.row_predicates,
-                                    codec::encode(
-                                        {
-                                            kind: "comparison",
-                                            node: field.node,
-                                            dimension: field.id,
-                                            op,
-                                            parameter: parameter.index,
-                                            input_type: parameter.input_type
-                                        }.ty!(RowPredicate)
-                                    )
+                                    row_expression(step.body, member, False)
                                 )
                             }
                         } else {

@@ -10,7 +10,8 @@ type Relation={
 type Local=Relation|{kind:'value';name:string};
 const ref=(name:string,at:number):Node=>({k:'ref',path:[name],at});
 const call=(name:string,args:Node[],at:number):Node=>({k:'call',name,args,at});
-function fail(n:Node,message:string):never{throw new Fault(message,n.at);}
+function fail(n:Node,message:string,details:import('./syntax.ts').FaultDetails={}):never{throw new Fault(message,n.at,details);}
+const display=(n:Node)=>String((n.displayPath??n.path)[0]);
 const parts=(n:Node)=>n.k==='pipeline'?n:{start:n,steps:[],at:n.at};
 const sets=new Set(['union','union_all','intersect','except']);
 const joins=new Set(['join','left_join','semi_join','anti_join']);
@@ -27,9 +28,6 @@ export function resolvePlanNames(block:Node):Node{
   if(n.k==='pipeline'){const start=expression(n.start),steps=n.steps.map(expression);return {...n,start,steps};}
   if(n.k==='call'){
    const args=n.args.map(expression);
-   if((joins.has(n.name)||sets.has(n.name))&&n.args[0]?.k==='object')args[0]={...args[0],fields:args[0].fields.map((f:Node,i:number)=>{
-    const original=n.args[0].fields[i];return original.value.k==='ref'&&original.value.path.length===1&&original.name===original.value.path[0]?{...f,name:f.value.path[0]}:f;
-   })};
    return {...n,args};
   }
   if(n.k==='binary')return {...n,left:expression(n.left),right:expression(n.right)};
@@ -44,15 +42,12 @@ export function resolvePlanNames(block:Node):Node{
 }
 
 export function hasPlanBindings(n:Node):boolean{
- return ['query','select'].includes(n.k)&&!n.loweredBindings&&(
-  n.bindings.some((b:Node)=>b.name==='out'||b.value.k!=='call'||!['node','from'].includes(b.value.name))||
-  n.start.k==='alias'||n.steps.some((s:Node)=>s.k==='alias')||n.start.k==='call'&&['project','group_by'].includes(n.start.name)
- );
+ return ['query','select'].includes(n.k)&&!n.loweredBindings;
 }
 
 export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:ReadonlySet<string>=new Set()):Node[]{
  const block=declaration.value,locals=new Map<string,Local>(),definitions:Node[]=[];
- let aliasIndex=0;const captures=new Map<string,string>(),materialized=new Map<object,string>();
+ let aliasIndex=0;const materialized=new Map<object,string>(),captures=new Map<string,string>();
  const alias=(at:number)=>ref('r'+aliasIndex++,at);
  function emit(value:Node,label:string):string{
   const name=fresh();definitions.push({k:'internal_plan',name,value,at:value.at,internal:true,owner:declaration.owner??declaration.name,label});return name;
@@ -68,12 +63,12 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
    if(replacement)return {...n,path:[...replacement.path,...n.path.slice(1)],displayPath:n.displayPath??n.path};
    const local=locals.get(n.path[0]);
    if(local?.kind==='value')return {...n,path:[local.name,...n.path.slice(1)]};
-   if(local?.kind==='relation')fail(n,'Relation '+n.path[0]+' is not an input of this plan; use its bound name as the input or declare an explicit join/Relation');
-   if(n.path[0]==='out'){
-    if(!globals.has('out'))fail(n,'Unknown binding out; bind a project result with let and use that name');
-    let name=captures.get('out');if(!name){name=emit(ref('out',n.at),'out');captures.set('out',name);}
+   if(local?.kind==='relation')fail(n,'Relation '+display(n)+' is not an input of this plan',{code:'relation-scope',reason:'投影后的字段属于新的结果；远端投影前的字段仍属于具体模型节点',suggestion:'为当前结果绑定名称：let output = input |> project({...}) |> distinct(); output |> order_by(asc(output.field))；多源字段先用 join 或 connect 建立输入'});
+   if(globals.has(n.path[0])){
+    let name=captures.get(n.path[0]);if(!name){name=emit(ref(n.path[0],n.at),n.path[0]);captures.set(n.path[0],name);}
     return {...n,path:[name,...n.path.slice(1)]};
    }
+   if(n.path[0]==='out')fail(n,'Unknown binding out; bind a project result with let and use that name');
    return n;
   }
   if(n.k==='call')return {...n,args:n.args.map((a:Node)=>rewrite(a,scope))};
@@ -96,7 +91,7 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
  }
  function useRelation(name:string,n:Node):Relation{
   const local=locals.get(name);
-  if(!local||local.kind!=='relation')fail(n,'Unknown relation binding '+name);
+  if(!local||local.kind!=='relation')fail(n,'Unknown relation binding '+display(n),{code:'relation-input',reason:'join/set 的输入必须是当前计划中已引入的关系，顶层 data 不是局部关系绑定',suggestion:'先写 let a = from(data_a); let b = from(data_b); 再写 a |> semi_join(b, a.id == b.id) 或 a |> intersect(b)；已有局部关系则核对名称和声明顺序'});
   // Bindings are immutable: composing a plan never alters its sibling branches.
   return {...local,scope:new Map(local.scope),steps:[...local.steps],bindings:[...local.bindings]};
  }
@@ -112,34 +107,34 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
   if(found.size!==1)fail(n,found.size?'project references multiple input relations; bind their join/Relation explicitly, then use joined |> project({...})':'project has no unambiguous input relation; use input |> project({...})');
   const name=[...found][0];return useRelation(name,n);
  }
- function combine(n:Node):Relation{
-  const pair=n.name==='pair';
-  const names:Node[]=pair?n.args:n.args[0]?.k==='object'?n.args[0].fields.map((f:Node)=>{
-   if(f.value.k!=='ref'||f.value.path.length!==1||f.name!==f.value.path[0])fail(f,'Use distinct bound relation names in {left,right}');return f.value;
-  }):fail(n,'Join/set operations require {left,right} relation inputs');
-  if(names.some(v=>v.k!=='ref'||v.path.length!==1)||new Set(names.map(v=>v.path[0])).size!==names.length)fail(n,'Use distinct bound relation names');
-  if((pair||joins.has(n.name))&&names.length!==2||sets.has(n.name)&&names.length<2)fail(n,'Joins require two inputs; set operations require at least two');
-  const inputs=names.map(v=>useRelation(v.path[0],v));
+ function combine(left:Relation,n:Node):Relation{
+  const pair=n.name==='pair',joined=joins.has(n.name),right=n.args[0];
+  if(n.args.length!==(joined?2:1)||right?.k!=='ref'||right.path.length!==1)fail(n,n.name+' requires a pipeline input and a bound right relation'+(joined?', followed by a condition':''),{code:'relation-input',suggestion:'先 let a = from(data_a); let b = from(data_b); 再 a |> '+n.name+'(b'+(joined?', a.id == b.id':'')+')'});
+  const inputs=[left,useRelation(right.path[0],right)];
+  if(inputs[0].key===inputs[1].key)fail(n,'Use distinct bound relation inputs; introduce a separate from(...) binding for a self join');
   if(pair){
    if(block.k!=='query'||inputs.some(r=>r.language!=='query'||r.projected||r.steps.length))fail(n,'pair requires two independent bound model nodes');
    const scope=new Map<string,Node>(),bindings=inputs.flatMap(r=>r.bindings);
-   inputs.forEach((r,i)=>{for(const [key,value]of r.scope)scope.set(key,value);scope.set(names[i].path[0],r.row);});
+   inputs.forEach(r=>{for(const [key,value]of r.scope)scope.set(key,value);});
    return {kind:'relation',language:'query',bindings,start:call('pair',inputs.map(r=>r.row),n.at),steps:[],scope,row:inputs[0].row,projected:false,key:{}};
   }
   if(block.k==='query'&&inputs.some(r=>r.language==='query'&&!r.projected))fail(n,'Model nodes join through an explicit published Relation using connect; query results join in query!');
   const scope=new Map<string,Node>(),bindings:Node[]=[],members:Node[]=[];
   inputs.forEach((r,i)=>{
-   const a=alias(n.at),name=names[i].path[0],source=materialize(r,name);
+   const a=alias(n.at),source=materialize(r,i?'right input':'left input');
    bindings.push({k:'let',name:a.path[0],value:call('from',[ref(source,n.at)],n.at),at:n.at});
-   scope.set(name,a);members.push({k:'field',name:a.path[0],value:a,at:n.at});
+   for(const [name,value]of r.scope){
+    if(joined&&scope.has(name))fail(n,'Join inputs share a relation binding; introduce independent from(...) bindings');
+    scope.set(name,value.path[0]==='out'||value.path[0]===r.row.path[0]&&r.start.k==='ref'?a:{...a,path:[...a.path,...value.path]});
+   }
+   members.push(a);
   });
-  const args:Node[]=[{k:'object',fields:members,at:n.at}];
-  if(joins.has(n.name)){
-   if(n.args.length!==2)fail(n,'join requires {left,right} and a condition');args.push(rewrite(n.args[1],scope));
-  }else if(n.args.length!==1)fail(n,'Set operations require one input record');
-  return {kind:'relation',language:'select',bindings,start:call(n.name,args,n.at),steps:[],scope,row:ref('out',n.at),projected:false,key:{}};
+  const start:Node={k:'combine',name:n.name,inputs:members,condition:joined?rewrite(n.args[1],scope):undefined,at:n.at};
+  const resultScope=joined?scope:new Map([...left.scope.keys()].map(name=>[name,ref('out',n.at)]));
+  return {kind:'relation',language:'select',bindings,start,steps:[],scope:resultScope,row:ref('out',n.at),projected:!joined,key:{}};
  }
  function apply(input:Relation,operation:Node):Relation{
+  if(joins.has(operation.name)||sets.has(operation.name)||operation.name==='pair')return combine(input,operation);
   let r={...input,steps:[...input.steps],scope:new Map(input.scope)};
   if(operation.name==='connect'&&r.language==='query'&&!r.projected){
    const args=operation.args;
@@ -167,6 +162,11 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
   }
   const operationScope=operation.name==='order_by'?new Map([...r.orderingScope??[],...r.scope]):r.scope;
   const step=rewrite(operation,operationScope);
+  if(operation.name==='connect'&&r.language==='query'){
+   const endpoints=step.args.slice(1);
+   const peer=endpoints.find((v:Node)=>v.path[0]!==r.row.path[0]);
+   if(peer)r.row=peer;
+  }
   r.steps.push(step);
   if(operation.name==='project'){
    r.orderingScope=r.scope;r.projected=true;r.row=ref('out',operation.at);
@@ -190,8 +190,8 @@ export function lowerPlanBindings(declaration:Node,fresh:()=>string,globals:Read
    const arg=start.args[0],local=locals.get(arg.path[0]);
    relation=local?.kind==='relation'?fromTable(materialize(local,arg.path[0]),start.at):fromTable(arg.path[0],start.at);
   }else if(start.k==='call'&&start.name==='project')relation=apply(inputForProjection(start),start);
-  else if(start.k==='call'&&(joins.has(start.name)||sets.has(start.name)||start.name==='pair'))relation=combine(start);
-  else fail(start,'A relation plan starts with a bound relation, node, from, project, join or set operation');
+  else if(start.k==='call'&&(joins.has(start.name)||sets.has(start.name)||start.name==='pair'))fail(start,start.name+' requires a pipeline input; use left |> '+start.name+'(right'+(joins.has(start.name)?', condition':'')+')');
+  else fail(start,'A relation plan starts with a bound relation, from(...) or an unambiguous project({...})');
   if(binding){
    relation.scope.set(binding.name,relation.row);locals.set(binding.name,relation);
   }

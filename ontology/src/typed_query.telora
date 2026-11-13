@@ -95,6 +95,11 @@ type MemberPredicate = struct {
     member: String,
     op: edsl::FilterOp
 };
+type DefaultPredicate = struct {
+    kind: String,
+    value: Value,
+    parameter: Int
+};
 type BooleanPredicate = struct {
     kind: String,
     left: Value,
@@ -418,8 +423,9 @@ def row_predicate: Fn(
     Array(edsl::GraphNode),
     Array(Dataset),
     qb::BuildCtx,
+    qb::Plan,
     Value
-) -> (qb::BuildCtx, qb::Expr) = fn(payload, nodes, catalog, ctx, value) {
+) -> (qb::BuildCtx, qb::Expr) = fn(payload, nodes, catalog, ctx, plan, value) {
     let kind = match value {
         Value::Object(fields) => match dict::get(fields, "kind") {
             Some(Value::String(kind)) => kind,
@@ -427,10 +433,24 @@ def row_predicate: Fn(
         },
         _ => fail!("row predicate requires an object"),
     };
-    if kind == "and" || kind == "or" {
+    if kind == "default" {
+        let expression = codec::decode@[DefaultPredicate](value).unwrap!();
+        let inner = row_predicate(payload, nodes, catalog, ctx, plan, expression.value);
+        (
+            inner.0,
+            qb::scalar(
+                qb::ScalarFunction::If,
+                [
+                    qb::scalar(qb::ScalarFunction::IsNotNull, [inner.1]),
+                    inner.1,
+                    qb::Expr::Parameter(expression.parameter)
+                ]
+            )
+        )
+    } else if kind == "and" || kind == "or" {
         let expression = codec::decode@[BooleanPredicate](value).unwrap!();
-        let left = row_predicate(payload, nodes, catalog, ctx, expression.left);
-        let right = row_predicate(payload, nodes, catalog, left.0, expression.right);
+        let left = row_predicate(payload, nodes, catalog, ctx, plan, expression.left);
+        let right = row_predicate(payload, nodes, catalog, left.0, plan, expression.right);
         (
             right.0,
             qb::scalar(
@@ -532,11 +552,6 @@ def row_predicate: Fn(
             Some(m) => m,
             None => fail!("unknown published query dimension", predicate.dimension)
         };
-        if !published.nullable {
-            fail!("null filter requires an optional dimension member", predicate.dimension)
-        } else {
-            ()
-        };
         let owner = match array::find(
             payload.entities,
             fn(e) {
@@ -573,6 +588,14 @@ def row_predicate: Fn(
             )
         };
         let output = edsl::dimension_output_with_context(ctx, scoped, dimension);
+        if !intent::expression_nullable(payload, output.0, plan, output.1) {
+            fail!(
+                "null filter requires an optional dimension member in this relation context",
+                predicate.dimension
+            )
+        } else {
+            ()
+        };
         let present = qb::is_not_null(output.1);
         (
             output.0,
@@ -899,26 +922,35 @@ def check_type: Fn(edsl::PreparedPayload, Array(Dataset), Value) -> Value = fn(
         request.row_predicates,
         ast,
         fn(ast, predicate) {
-            let output = row_predicate(payload, request.nodes, catalog, ast.ctx, predicate);
             match ast.plan {
-                qb::QueryPlan::Rows(plan) => ast <~ {
-                    ctx: output.0,
-                    plan: qb::QueryPlan::Rows(
-                        qb::validate(
-                            plan <~ {
-                                filter: Some(
-                                    match plan.filter {
-                                        Some(previous) => qb::scalar(
-                                            qb::ScalarFunction::And,
-                                            [previous, output.1]
-                                        ),
-                                        None => output.1,
-                                    }
-                                )
-                            },
-                            payload.profile
+                qb::QueryPlan::Rows(plan) => do {
+                    let output = row_predicate(
+                        payload,
+                        request.nodes,
+                        catalog,
+                        ast.ctx,
+                        plan,
+                        predicate
+                    );
+                    ast <~ {
+                        ctx: output.0,
+                        plan: qb::QueryPlan::Rows(
+                            qb::validate(
+                                plan <~ {
+                                    filter: Some(
+                                        match plan.filter {
+                                            Some(previous) => qb::scalar(
+                                                qb::ScalarFunction::And,
+                                                [previous, output.1]
+                                            ),
+                                            None => output.1,
+                                        }
+                                    )
+                                },
+                                payload.profile
+                            )
                         )
-                    )
+                    }
                 },
                 _ => fail!("dimension filtering requires a row plan"),
             }

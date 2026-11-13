@@ -225,7 +225,7 @@ export function resolve(p:Program,db:DatabaseSync,inputs:Record<string,unknown>=
    if(plan.result.ordering.length){const s=plan.sources![0];columns.push(...s.ordering.map((o,i)=>quote(s.alias)+'.'+quote(o.key)+' AS '+quote(plan.result.ordering[i].key)));}
    const sources=plan.sources!.map(s=>'('+sql(s.binding,args)+') AS '+quote(s.alias));
    let text='SELECT '+columns.join(', ')+' FROM '+sources[0];
-   if(sources.length===2){const refs=Object.fromEntries(plan.sources!.flatMap(s=>Object.keys(s.fields).map(name=>[s.alias+'.'+name,quote(s.alias)+'.'+quote(name)])));text+=plan.existsMode?' WHERE '+(plan.existsMode==='anti'?'NOT ':'')+'EXISTS (SELECT 1 FROM '+sources[1]+' WHERE '+expr(plan.join!,plan,refs)+')':(plan.sources![1].nullable?' LEFT JOIN ':' INNER JOIN ')+sources[1]+' ON '+expr(plan.join!,plan,refs);}
+   if(sources.length===2){const refs=Object.fromEntries(plan.sources!.flatMap(s=>Object.entries(s.references).map(([path,column])=>[s.alias+'.'+path,quote(s.alias)+'.'+quote(column)])));text+=plan.existsMode?' WHERE '+(plan.existsMode==='anti'?'NOT ':'')+'EXISTS (SELECT 1 FROM '+sources[1]+' WHERE '+expr(plan.join!,plan,refs)+')':(plan.sources![1].nullable?' LEFT JOIN ':' INNER JOIN ')+sources[1]+' ON '+expr(plan.join!,plan,refs);}
    return text+order();
   }
   if(plan.kind==='group')throw Error('Grouped rows must be consumed by project');

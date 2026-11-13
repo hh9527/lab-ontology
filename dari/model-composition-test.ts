@@ -3,26 +3,23 @@ import {DatabaseSync} from 'node:sqlite';
 import {openModel} from './model-bridge.ts';
 import {check} from './src/compiler.ts';
 import {resolve} from './src/runtime.ts';
-
 const host=await openModel(process.argv[2]);
 const db=new DatabaseSync(':memory:');
 try {
- db.exec('CREATE TABLE I_EnterpriseFrame(name TEXT)');
- const insert=db.prepare('INSERT INTO I_EnterpriseFrame VALUES(?)');
- for(let i=0;i<1200;i++)insert.run((i%2?'Edge':'Core')+'-'+i);
- const prefix='data population=query_remote! {let f=from(ic::frame);f |> project({name:f.frame_name})};';
- const answer='answer tree! { Answer [if let Some(value_row) = total [UseValue(ref = value_row.n)] else ["无数据"]]};';
- const aggregate='data total=query! {let r=from(population);r |> project({n:count()}) |> take_opt()};';
- const all=resolve(check(prefix+aggregate+answer,host.model),db);
+ db.exec('CREATE TABLE T_CURRENT_ALARM(CSN INTEGER,ALARMNAME TEXT)');
+ const insert=db.prepare('INSERT INTO T_CURRENT_ALARM VALUES(?,?)');
+ for(let i=0;i<1200;i++)insert.run(i,(i%2?'Edge':'Core')+'-'+i);
+ const answer='answer tree! {Answer [if let Some(row)=total [UseValue(ref=row.n)] else ["无数据"]]};';
+ const aggregate=(filter='')=>'data total=query_remote! {let f=from(ic::current_alarm);let rows=f '+filter+' |> project({n:f.alarm_count});rows |> take_opt()};';
+ const all=resolve(check(aggregate()+answer,host.model),db);
  assert.equal(all.answer,'*1200*');assert.equal(all.queries,1);
- for(const [predicate,n] of [['contains(f.frame_name,"CORE")',600],['not_contains(f.frame_name,"core")',600],['starts_with(f.frame_name,"edge")',600],['ends_with(f.frame_name,"19")',12]] as const){
-  const text=prefix.replace('f |> project','f |> filter('+predicate+') |> project');
-  const output=resolve(check(text+aggregate+answer,host.model),db);
-  assert.equal(output.answer,'*'+n+'*');assert.equal(output.queries,1);
+ for(const [predicate,n]of [['contains(f.alarm_name,"CORE")',600],['not_contains(f.alarm_name,"core")',600],['starts_with(f.alarm_name,"edge")',600],['ends_with(f.alarm_name,"19")',12]]as const){
+  assert.equal(resolve(check(aggregate('|> filter('+predicate+')')+answer,host.model),db).answer,'*'+n+'*');
  }
- const doubled=prefix+'data doubled=query! {let a=from(population);let b=from(population);union_all({a,b})};'+aggregate.replace('from(population)','from(doubled)')+answer;
- assert.equal(resolve(check(doubled,host.model),db).answer,'*2400*');
- assert.throws(()=>check(prefix+'answer tree! { Answer [Table(data = population)]};',host.model),/proven bound/);
- assert.throws(()=>check(prefix.replace('project({name:f.frame_name})','project({name:f.frame_name}) |> order_by(asc(out.name))')+aggregate+answer,host.model),/terminal take/);
- console.log('real IC: unbounded query composition, 1200-row aggregation, 2400-row union, model text filters and presentation bound passed');
+ const unbounded='data population=query_remote! {let f=from(ic::current_alarm);f |> project({name:f.alarm_name})};';
+ assert.throws(()=>check(unbounded+answer,host.model),/Remote query data node requires a proven result bound/);
+ const bounded='data population=query_remote! {let f=from(ic::current_alarm);let rows=f |> project({name:f.alarm_name});rows |> order_by(asc(rows.name)) |> take(20)};';
+ const doubled=bounded+'data doubled=query! {let a=from(population);let b=from(population);a |> union_all(b)};data total=query! {let r=from(doubled);r |> project({n:count()}) |> take_opt()};'+answer;
+ assert.equal(resolve(check(doubled,host.model),db).answer,'*40*');
+ console.log('Real IC: full-population aggregate/filter, strict remote boundary and bounded remote/local union composition passed');
 } finally {db.close();await host.close();}
