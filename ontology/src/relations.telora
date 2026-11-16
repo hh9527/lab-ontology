@@ -15,7 +15,8 @@ type Endpoint = struct {
     role: String,
     binding: model::PreparedRole
 };
-type Guard = struct {
+type GuardPredicate = struct {
+    target: Bool,
     row: Type,
     dataset: String,
     source: String,
@@ -23,6 +24,7 @@ type Guard = struct {
     op: edsl::FilterOp,
     input: edsl::FilterInput
 };
+type Guard = enum { Predicate(GuardPredicate), All(Array(Guard)), Any(Array(Guard)) };
 type Relation = struct {
     key: edsl::RelationKey,
     guard: Option(Guard),
@@ -82,6 +84,10 @@ def relation: Fn(String, Endpoint, Endpoint, edsl::RelationCardinality) -> Relat
         {guard: None, id, from, to, cardinality, key}
     }
 };
+# 多次附加条件取合取，不能覆盖已有的业务约束。
+def with_guard: Fn(Relation, Guard) -> Relation = fn(edge, predicate) {
+    edge <~ {guard: Some(match edge.guard {None => predicate, Some(previous) => Guard::All([previous, predicate])})}
+};
 def guarded: for(Row, Scalar: codec::Encode) Fn(
     Relation,
     model::Field(Row, Scalar),
@@ -93,23 +99,7 @@ def guarded: for(Row, Scalar: codec::Encode) Fn(
     } else if op != edsl::FilterOp::Eq && op != edsl::FilterOp::Ne {
         fail!("relation guard supports only Eq or Ne", relation.id)
     } else {
-        relation <~ {
-            guard: Some(
-                {
-                    row: Row.type,
-                    dataset: relation.from.dataset.id,
-                    source: relation.from.dataset.source,
-                    column: {
-                        index: field.index,
-                        name: field.name,
-                        value: Scalar.type,
-                        nullable: field.nullable
-                    },
-                    op,
-                    input: scalar_input(value)
-                }
-            )
-        }
+        with_guard(relation, Guard::Predicate({target: False, row: Row.type, dataset: relation.from.dataset.id, source: relation.from.dataset.source, column: {index: field.index, name: field.name, value: Scalar.type, nullable: field.nullable}, op, input: scalar_input(value)}.ty!(GuardPredicate)))
     }
 };
 def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
@@ -125,7 +115,7 @@ def guarded_link: for(Row, Scalar: codec::Encode) Fn(
     edsl::FilterOp,
     Scalar
 ) -> Link = fn(declared, field, op, value) {
-    declared <~ {guard: guarded(declared.a, field, op, value).guard}
+    declared <~ {guard: guarded(declared.a <~ {guard: declared.guard}, field, op, value).guard}
 };
 # World 的端点登记约束只在此首次解析；同一 Dataset 的所有关系复用结果。
 type Owners = memo::TypeMemorizer(edsl::EntityEntry);
@@ -147,13 +137,15 @@ def owners: Fn(edsl::PreparedPayload) -> Owners = fn(payload) {
 def owner: Fn(Owners, Endpoint) -> edsl::EntityEntry = fn(owners, endpoint) {
     memo::computed_with_type(owners, endpoint.dataset.row)
 };
-def guard: Fn(Option(Guard)) -> Option(edsl::PreparedGuard) = fn(value) {
+def lower_guard: Fn(Guard) -> edsl::PreparedRelationGuard = fn(value) {
     match value {
-        None => None,
-        Some(value) => Some(
-            {field: value.column.name, index: value.column.index, op: value.op, input: value.input}
-        )
+        Guard::Predicate(value) => edsl::PreparedRelationGuard::Predicate({target:value.target,predicate:{field: value.column.name, index: value.column.index, op: value.op, input: value.input}}),
+        Guard::All(values) => edsl::PreparedRelationGuard::All(array::map(values,lower_guard)),
+        Guard::Any(values) => edsl::PreparedRelationGuard::Any(array::map(values,lower_guard))
     }
+};
+def guard: Fn(Option(Guard)) -> Option(edsl::PreparedRelationGuard) = fn(value) {
+    match value {None => None, Some(value) => Some(lower_guard(value))}
 };
 def lower: Fn(Owners, Relation) -> edsl::RelationEntry = fn(owners, declared) {
     let from = owner(owners, declared.from);
@@ -215,6 +207,8 @@ pub use self::{
     Owners,
     owners,
     Guard,
+    GuardPredicate,
+    with_guard,
     guarded_link,
     guarded,
     Endpoint,

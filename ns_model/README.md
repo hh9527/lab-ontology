@@ -1,72 +1,61 @@
-# NeoSight 类型化模型
+# NeoSight 类型模型
 
-模型以具名类型和 property 声明 Dataset / Entity，Registry 汇总根类型，各 Dataset 通过 property 声明其出向 Relation，自动发现被引用的具名类型，发布 `ns/transform`，生成 SQLite 查询。构建采用 A/B 两阶段；A 准备 transform 数据和知识发布信息，运行期 B 消费已准备的数据。
+NS 使用 `ontology::semantic`，从已有表结构出发，以类型和字段 Property 表达业务可解空间。模型通过一个 Wasm 同时发布全量知识、公开类型、codec 与通用 transform 契约。
 
 ## 模型组织
 
-- `src/datasets/`：151 个 Dataset、2,118 个字段，保留源表与列映射、行粒度和内部 KPI 桥接表
-- `src/identities.telora`：具名身份类型，以及由源关系明确连接的引用身份空间；身份与 Dataset 分开表达
-- `src/groups.telora`：按类型、过滤能力及统计策略复用 DimensionGroup、采样 MeasureGroup
-- `src/domains.telora`：140 个业务值域及其源编码映射，显式开启类型反向引用，支持业务名词从值追溯到维度和 Dataset
-- `src/units.telora`：按源单位合同复用具名类型，例如 `Percent`、`Watts`、`BytesPerSecond`；同一单位的整数表示使用 `Integer` 前缀（计数默认整数，非整数计数使用 `Fractional` 前缀）。不同源单位拼写仍保留独立类型，不因改名合并；单位证据和待确认假定保留在源声明记录中，不隐含可加性或单位转换
-- `src/model.telora`：Registry 根清单及查询配置；Dataset / Entity 显式注册，业务 Type 按引用自动发现，未引用类型不发布
-- `data/generation-contract.json`：直接维护的演示数据合同，记录字段类型、空值约束和发布名称；模型变更涉及这些内容时同步更新
+- `src/datasets/`：151 个数据集、2,118 个物理字段，保留表列映射、粒度、可空性、字段能力、分类映射及外置关系
+- `src/identities.telora`：业务实体的具名指代，单字段使用 newtype，联合指代使用 struct；字段通过 Reference 指向完整身份
+- `src/domains.telora`：141 个具名业务枚举；wire 映射由原始字段的 Property 声明，半开放值域提供 Unknown，NULL 仍保持可空
+- `src/metric_values.telora`：每个业务指标独立的 newtype，保留指标身份，不因单位相同而允许相互运算
+- `src/units.telora`：可复用的物理单位合同，不隐含可加性或单位转换
+- `src/model.telora`：根类型、revision 与查询能力 profile
+- `src/lib.telora`：统一模型服务入口，一次构建期准备知识和转换能力
+- `data/source-model.json`：来源目录与声明快照，保留来源提交及文件散列
+- `data/generation-contract.json`：演示数据的物理字段、wire、约束与关系条件合同
+- `data/migration-decisions.json`：尚待确认的来源假定、未发布的路径和已核实的修正
 
-同一身份空间可以在一个 Dataset 中承担多个角色。例如子网身份分别用于自身主键和父子网引用。关系只连接显式声明的身份角色，不因为两个字段都使用 String 就推断可连接。
+身份与数据集分开表达。同一身份可在多个数据集中承担不同角色；联合角色通过 `@domain::role` 复用现有字段。关系只连接显式声明的完整身份，不因字段都使用 String 就推断连接。
 
-## 时间约定
+分类的原始字段保留存储类型，平行计算维度发布业务枚举；既能检查原始数据，也能按具名业务分类筛选、投影。业务指标的统计能力由 samples Property 声明，物理数字类型不自动许可 Sum。
 
-| 类型 | 含义 |
-|---|---|
-| `Date` | 不含时区的日历日期 |
-| `DateTime` | 不含时区的日期时间 |
-| `DateTimeUtc` | UTC 绝对时刻，当前使用规范 UTC 文本编码 |
-| `EpochMillis` | 毫秒编码的绝对时刻 |
+## 发布与查询
 
-`DateTimeTz` 和 `DateTimeOffset` 尚未实现。UTC 日历分桶是转换规则，不赋予 Date 时区。源字段仅声明整数而没有毫秒证据时保留原始类型，不能把旧模型的单位假定当成源事实。
+统一服务槽为 `ontology/model`，contract 发布目录、类型和 codec，transform 将类型化意图转换为经过校验的结果类型、参数化 SQLite 计划及证明凭据。执行期只绑定参数并执行计划。知识随同一制品的 ontology.knowledge 元数据发布，详见 [模型发布契约](../ontology/MODEL-PUBLICATION.md)。
 
-## 维护与验收
+公开数据集符号使用 snake_case，例如 `ns::network_element`；知识地址和数据集 ID 保留 `datasets/network-element` 与 `network-element`。成员沿用已有的维度、统计 ID，关系使用 `ns::relations::<name>`。
+
+## 来源与约束
+
+当前发布 302 条直接关系，包含联合键和两端的条件限制。存储前端端口关系同时要求 `logicType = "0"` 和 `portType` 属于 FC/FCoE/ETH/RoCE；正反向关系使用相同的限制。多个 guard 取合取，候选值集合取析取，且条件绑定到明确的一端。
+
+样本关系的基数以完整的时间序列粒度判断，资源到多时点样本以及资源到多条告警历史允许多值；不能用主体身份冒充单条样本或告警记录身份。合成数据逐条检查基数上界，不豁免采样或告警历史。
+
+来源目录中的三条关系缺少连接条件，保持待确认：OpticalModuleBondPort、BondPortBondEthPort、SubnetLocatedInSubnet。201 条具有连接条件的来源关系已由直接关系覆盖。92 条 Via 路径保留在迁移记录中，调用方可显式提供底层连接链。
+
+`ar__fsd_rev`、`fsd__ar`、`fs__sh` 是多对多关系。知识目录保留其真实基数；当前类型化查询契约拒绝直接投影两端并展开关系行，不能将其当成单值关系。运行验收对其检查明确拒绝，其余 299 条关系从保留行粒度的一端执行 SQL。
+
+来源目录有 152 个 Dataset，当前保留 151 个，未引入重复便利表 T_DEVICE_ALL。粒度字段的必填假定和来源 nullable 冲突保留在迁移记录中；这些假定不作为新增来源证据。缺少可加物理量合同的 118 个 Sum 声明保持待确认，既有可发布统计共 3,038 项。
+
+## 时间
+
+通用时间类型由 ontology 提供。告警的 occur_utc、clear_utc 按已确认约定使用 Option(EpochMillis)，保留原有可空性；可空发生时间不声明为要求非空的权威事件时钟。KPI 使用已有 DateTimeUtc 采样时钟及完整粒度。其他未确认单位的原始时间字段保持原始类型，待确认项有独立记录。
+
+## 验收
+
+临时制品使用 `$TMPDIR`，未设置时使用 `~/.cache/tmp`；编译器使用 release 版本。
 
 ```sh
-# 使用支持 std::pipeline、build::stage 和独立 buildtime 配额的 Telora CLI
-$TELORA -C ns_model check @src/lib --only-types
-$TELORA -C ns_model build @src/lib --staged -o "$TMPDIR/ns.wasm"
-node ns_model/tools/check_transform.mjs "$TMPDIR/ns.wasm"
+ns_tmp="${TMPDIR:-$HOME/.cache/tmp}"
+mkdir -p "$ns_tmp"
+node scripts/export-ns-audit.mjs "$ns_tmp/ns-audit.json" --test
+node scripts/check-ns-source.mjs "$ns_tmp/ns-audit.json"
+bin/telora -C ns_model build @src/lib --staged \
+  --buildtime-fuel 800000 --buildtime-memory-limit 2048 \
+  --initialization-fuel 400000 --request-fuel 100000 --with-memory-limit 2048 \
+  -o "$ns_tmp/ns-model.wasm"
+node ns_model/tools/check_transform.mjs "$ns_tmp/ns-model.wasm" \
+  /path/to/dsh-oks/packages/dsh-oks/src/telora-model.ts "$ns_tmp/ns-audit.json"
 ```
 
-`data/source-model.json` 记录来源提交、文件散列、原始元数据和声明。模型源码直接维护，不再提供一次性迁移生成器。`data/migration-decisions.json` 记录待确认时间单位、源 nullable 与声明粒度冲突，以及未迁移路径。
-
-## 首版边界
-
-旧声明中的 Sum 样本缺少当前类型系统要求的明确可加物理量合同；这些 Sum 名称暂未发布，Max/Min 仍保留。待确认项逐字段记录为 `unconfirmed_additive_sample`，不把未知单位的 Float 冒充 Bytes，也不绕过可加性校验。
-
-
-当前声明 302 条直接关系，其中包括复合键和源侧等值条件。92 条 Via 路径声明保留在迁移记录中，尚未发布为快捷关系；调用方可显式提供底层桥接链。
-
-这些关系来自旧声明，不等价于全部源关系已审计通过。源目录中的三条关系缺少连接条件；企业前端端口关系中的 IN 条件未由旧声明完整表达，不能据此宣布语义等价。源端口条件需要进一步核对后才能作为正式合同验收。
-
-源目录有 152 个 Dataset；当前按既有模型保留 151 个，重复便利表 `T_DEVICE_ALL` 暂未引入。粒度字段沿用旧声明的必填合同，与源 nullable 冲突的部分有明确记录。
-
-`python3 ns_model/tools/check_model.py --telora "$TELORA"` 在隔离工作区使用定义入口，执行注册时局部检查和 World 关系边界检查。局部定义及字段元数据按 Type 缓存；Relation 端点要求在显式根中。自动发现的内容不重复进行全图覆盖检查。隔离测试使用独立 fuel 和构建内存配额，不改变部署模型的运行配额。
-
-SQL 验收覆盖 Dataset 投影、直接关系、样本、枚举映射及错误输入。知识发布由插件的 owned-knowledge 验收检查独立节点、精确读取和反向引用策略。
-
-## 构建配额
-
-根目录 `telora-config.json` 统一设置配额；fuel 单位为百万，内存单位为 MiB。构建阶段为 `buildtimeFuel: 150000`、`buildtimeMemoryLimit: 256`；初始化为 `initializationFuel: 5000`，请求为 `requestFuel: 10000`，两者共享 `memoryLimit: 64`。这些字段需要支持阶段配额的 Telora 版本。
-
-在 `explore/registry-inventory` 分支上，同机、同编译器、同配额且开启 GC 的单次对照：
-
-| 指标 | 旧路径（`a1c6ddd`） | property 信任边界路径 |
-|---|---:|---:|
-| 初始化准备 | 63.04 秒 | 36.26 秒 |
-| 完整构建 | 81.91 秒 | 54.02 秒 |
-| 构建 fuel | 140,085,056,806 | 80,841,869,502 |
-| 构建期线性内存 | 92.25 MiB | 124.69 MiB |
-| 制品 | 21.58 MiB | 21.83 MiB |
-
-准备耗时减少约 42%，但构建期线性内存增加约 35%；当前优化没有降低内存峰值。知识保持 595 个节点和 302 条关系，词汇表一致。代表性 transform 对照覆盖投影、直接关联、带条件关联、枚举、KPI 样本及错误输入；知识差异仅为空默认属性省略和复合键输入顺序。
-
-## 演示数据
-
-使用 `node scripts/generate-ns-data.mjs --output bin/ns-data` 生成 SQLite 数据和覆盖清单。固定种子、窗口及实际模型 SQL 验收方式见[演示数据说明](docs/SYNTHETIC_DATA.md)。
+来源验收核对物理字段、维度、分类名称与 wire 集合、统计和关系条件；运行验收使用插件适配器及 Node 原生 WebAssembly，执行全部数据集投影、关系 SQL、统计，并用违反端口条件的行验证拒绝效果。演示数据说明见 [合成数据](docs/SYNTHETIC_DATA.md)。

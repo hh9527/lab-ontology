@@ -52,13 +52,15 @@ def endpoint: Fn(Type, String) -> relation::Endpoint = fn(row, field) {
     }
 };
 # 关系的来源门槛按存储字面量比较，不把 Reference 重新授予普通标量运算。
-def guarded: for(Scalar: codec::Encode) Fn(
+def guarded_on: for(Scalar: codec::Encode) Fn(
     relation::Relation,
     String,
     edsl::FilterOp,
-    Scalar
-) -> relation::Relation = fn(edge, name, op, value) {
-    let row = edge.from.dataset.row;
+    Scalar,
+    Bool
+) -> relation::Relation = fn(edge, name, op, value, target) {
+    let endpoint=if target {edge.to} else {edge.from};
+    let row = endpoint.dataset.row;
     let prepared = local(row);
     let field = match array::find(
         prepared.payload.entities[0].fields,
@@ -84,19 +86,22 @@ def guarded: for(Scalar: codec::Encode) Fn(
         Value::False => edsl::FilterInput::Bool(False),
         _ => fail!("relation guard requires a scalar literal", name)
     };
-    edge <~ {
-        guard: Some(
-            {
-                row,
-                dataset: edge.from.dataset.id,
-                source: edge.from.dataset.source,
-                column: {index: field.index, name, value: Scalar.type, nullable: field.nullable},
-                op,
-                input
-            }.ty!(relation::Guard)
-        )
-    }
+    relation::with_guard(edge, relation::Guard::Predicate({target, row, dataset: endpoint.dataset.id, source: endpoint.dataset.source, column: {index: field.index, name, value: Scalar.type, nullable: field.nullable}, op, input}.ty!(relation::GuardPredicate)))
 };
+def guarded: for(Scalar:codec::Encode) Fn(relation::Relation,String,edsl::FilterOp,Scalar) -> relation::Relation = fn(edge,name,op,value) {guarded_on(edge,name,op,value,False)};
+def guarded_to: for(Scalar:codec::Encode) Fn(relation::Relation,String,edsl::FilterOp,Scalar) -> relation::Relation = fn(edge,name,op,value) {guarded_on(edge,name,op,value,True)};
+# 同一字段的有限候选值取析取，与已有关系条件取合取。
+def guarded_in_on: for(Scalar: codec::Encode) Fn(relation::Relation, String, Array(Scalar),Bool) -> relation::Relation = fn(edge, name, values,target) {
+    if values == [] { fail!("relation membership guard requires at least one value", name) } else { () };
+    let predicates = array::map(values, fn(value) {
+        match guarded_on(edge <~ {guard: None}, name, edsl::FilterOp::Eq, value,target).guard {
+            Some(predicate) => predicate, None => fail!("missing prepared relation guard")
+        }
+    });
+    relation::with_guard(edge, relation::Guard::Any(predicates))
+};
+def guarded_in: for(Scalar:codec::Encode) Fn(relation::Relation,String,Array(Scalar)) -> relation::Relation = fn(edge,name,values) {guarded_in_on(edge,name,values,False)};
+def guarded_in_to: for(Scalar:codec::Encode) Fn(relation::Relation,String,Array(Scalar)) -> relation::Relation = fn(edge,name,values) {guarded_in_on(edge,name,values,True)};
 @prelude::property(PropertyTarget::Type)
 type Connections = struct {
     relations: Array(relation::Relation),
@@ -185,4 +190,4 @@ def stage: for(B) Fn(String, Array(Type), query::PlanProfile, Fn(edsl::PreparedP
 ) {
     world::stage(define(revision, roots, profile), program)
 };
-pub use self::{endpoint, guarded, relations, alternatives, links, payload, stage, define};
+pub use self::{endpoint, guarded, guarded_in, guarded_to, guarded_in_to, relations, alternatives, links, payload, stage, define};

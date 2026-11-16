@@ -856,6 +856,8 @@ type PreparedGuard = struct {
     op: FilterOp,
     input: FilterInput
 };
+type PreparedRelationPredicate = struct {target:Bool,predicate:PreparedGuard};
+type PreparedRelationGuard = enum { Predicate(PreparedRelationPredicate), All(Array(PreparedRelationGuard)), Any(Array(PreparedRelationGuard)) };
 type RelationEntry = struct {
     id: String,
     label: String,
@@ -864,7 +866,7 @@ type RelationEntry = struct {
     to: Int,
     cardinality: RelationCardinality,
     key: RelationKey,
-    guard: Option(PreparedGuard),
+    guard: Option(PreparedRelationGuard),
 };
 
 type BusinessLinkEntry = struct {
@@ -874,7 +876,7 @@ type BusinessLinkEntry = struct {
     a_relation: String,
     z_relation: String,
     direction: LinkDirection,
-    guard: Option(PreparedGuard),
+    guard: Option(PreparedRelationGuard),
 };
 
 type PreparedPayload = struct {
@@ -2648,46 +2650,51 @@ def graph_key_condition: Fn(
     }
 };
 
-def guard_information: Fn(Option(PreparedGuard)) -> Option(ScopePredicate) = fn(guard) {
+def relation_guard_information: Fn(PreparedRelationGuard) -> Value = fn(guard) {
     match guard {
-        None => None,
-        Some(value) => Some({field: value.field, op: value.op, input: value.input})
+        PreparedRelationGuard::Predicate(value) => {
+            let leaf=codec::encode({field:value.predicate.field,op:value.predicate.op,input:value.predicate.input}.ty!(ScopePredicate));
+            if value.target {Value::Object({"to":leaf})} else {leaf}
+        },
+        PreparedRelationGuard::All(values) => Value::Object({"all":Value::Array(array::map(values,relation_guard_information))}),
+        PreparedRelationGuard::Any(values) => Value::Object({"any":Value::Array(array::map(values,relation_guard_information))})
     }
 };
-def bind_indexed_guard: Fn(
-    qb::BuildCtx,
-    EntityEntry,
-    Option(PreparedGuard),
-    qb::Source
-) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, entity, guard, source) {
+def guard_information: Fn(Option(PreparedRelationGuard)) -> Option(Value) = fn(guard) {
+    match guard { None => None, Some(value) => Some(relation_guard_information(value)) }
+};
+def bind_guard_expression: Fn(qb::BuildCtx, Array((EntityEntry,qb::Source)), PreparedRelationGuard) -> (qb::BuildCtx, qb::Expr) = fn(ctx,sources,guard) {
+    let combine = fn(values:Array(PreparedRelationGuard),operation:qb::ScalarFunction) {
+        if values == [] { fail!("relation guard group must not be empty") } else { () };
+        let result=array::fold(values,(ctx,None.ty!(Option(qb::Expr))),fn(state,value) {
+            let bound=bind_guard_expression(state.0,sources,value);
+            (bound.0,Some(match state.1 {None => bound.1,Some(previous) => qb::scalar(operation,[previous,bound.1])}))
+        });
+        (result.0,match result.1 {Some(value) => value,None => fail!("relation guard group must not be empty")})
+    };
     match guard {
-        None => (ctx, None),
-        Some(value) => {
-            let bound = qb::bind(ctx, to_val(value.input));
-            let operation = if value.op == FilterOp::Ne {
-                qb::ScalarFunction::Ne
-            } else {
-                qb::ScalarFunction::Eq
-            };
-            (
-                bound.0,
-                Some(
-                    qb::scalar(
-                        operation,
-                        [prepared_column(source, entity.fields[value.index].column), bound.1]
-                    )
-                )
-            )
-        }
+        PreparedRelationGuard::Predicate(entry) => {
+            let selected=sources[if entry.target {1} else {0}];
+            let entity=selected.0;let source=selected.1;let value=entry.predicate;
+            let bound=qb::bind(ctx,to_val(value.input));
+            let operation=if value.op == FilterOp::Ne {qb::ScalarFunction::Ne} else {qb::ScalarFunction::Eq};
+            (bound.0,qb::scalar(operation,[prepared_column(source,entity.fields[value.index].column),bound.1]))
+        },
+        PreparedRelationGuard::All(values) => combine(values,qb::ScalarFunction::And),
+        PreparedRelationGuard::Any(values) => combine(values,qb::ScalarFunction::Or)
     }
+};
+def bind_indexed_guard: Fn(qb::BuildCtx,Array((EntityEntry,qb::Source)),Option(PreparedRelationGuard)) -> (qb::BuildCtx,Option(qb::Expr)) = fn(ctx,sources,guard) {
+    match guard {None => (ctx,None), Some(value) => {let result=bind_guard_expression(ctx,sources,value);(result.0,Some(result.1))}}
 };
 def bind_relation_guard: Fn(
     qb::BuildCtx,
     PreparedPayload,
     RelationEntry,
+    qb::Source,
     qb::Source
-) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, relation, source) {
-    bind_indexed_guard(ctx, payload.entities[relation.from], relation.guard, source)
+) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, relation, source, target) {
+    bind_indexed_guard(ctx, [(payload.entities[relation.from],source),(payload.entities[relation.to],target)], relation.guard)
 };
 def bind_link_guard: Fn(
     qb::BuildCtx,
@@ -2695,7 +2702,7 @@ def bind_link_guard: Fn(
     BusinessLinkEntry,
     qb::Source
 ) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, link, source) {
-    bind_indexed_guard(ctx, payload.entities[link.hub], link.guard, source)
+    bind_indexed_guard(ctx, [(payload.entities[link.hub],source)], link.guard)
 };
 def graph_guarded_join: Fn(
     qb::BuildCtx,
@@ -2705,7 +2712,7 @@ def graph_guarded_join: Fn(
     qb::Source
 ) -> (qb::BuildCtx, qb::JoinCondition) = fn(ctx, payload, relation, from_source, to_source) {
     let key = graph_key_condition(payload, relation, from_source, to_source, relation.key);
-    let guard = bind_relation_guard(ctx, payload, relation, from_source);
+    let guard = bind_relation_guard(ctx, payload, relation, from_source, to_source);
     (
         guard.0,
         match guard.1 {
@@ -2859,7 +2866,7 @@ def graph_constraints: Fn(
                         to.source,
                         relation.key
                     );
-                    let guard = bind_relation_guard(state.0, payload, relation, from.source);
+                    let guard = bind_relation_guard(state.0, payload, relation, from.source, to.source);
                     let expr = match guard.1 {
                         None => key,
                         Some(value) => qb::scalar(qb::ScalarFunction::And, [key, value]),
@@ -3837,7 +3844,8 @@ def graph_existence: Fn(
                                                 source.0,
                                                 payload,
                                                 relation,
-                                                from_source
+                                                from_source,
+                                                to_source
                                             );
                                             (
                                                 guard.0,
@@ -6422,6 +6430,7 @@ pub use self::{
     DimensionEntry,
     RelationEntry,
     PreparedGuard,
+    PreparedRelationGuard,
     guard_information,
     NativePairEntry,
     PreparedPayload,

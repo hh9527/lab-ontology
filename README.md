@@ -6,7 +6,7 @@
 |---|---|
 | `ontology` | 业务类型、能力与关系声明，模型准备，查询证明，SQL 方言及服务发布 |
 | `icloud_model` | IC 领域模型与服务配置，使用 semantic 建模入口 |
-| `ns_model` | NS 领域模型，使用 registry 建模入口 |
+| `ns_model` | NS 领域模型与统一发布，使用 semantic 建模入口 |
 | `relation_model` | 关系模型与等价性验收基线 |
 | `scripts` | 数据合成、审计与验收工具 |
 | `benchmarks`、`evaluations` | 性能实验及评估记录 |

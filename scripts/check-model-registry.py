@@ -9,7 +9,7 @@ import tempfile
 import argparse
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("model", nargs="?", default="icloud_model", choices=("icloud_model", "ns_model"))
+parser.add_argument("model", nargs="?", default="icloud_model", choices=("icloud_model",))
 parser.add_argument("--telora", type=Path)
 parser.add_argument("--fuel", type=int, help="Isolated initialization/request fuel budget, in millions")
 args = parser.parse_args()
@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix=model + "-registry-check-", dir=base) as
         shutil.copytree(repo / name / "src", crate / "src")
         shutil.copy2(repo / name / "telora-crate.json", crate / "telora-crate.json")
     # The test needs definitions, not MainService's closed build-time stage.
-    (root / model / "src/lib.telora").write_text("pub mod typed;\n" if model == "icloud_model" else "pub mod model; pub mod units; pub mod identities; pub mod groups; pub mod domains; pub mod datasets; mod profile;\n")
+    (root / model / "src/lib.telora").write_text("pub mod typed;\n")
     tests = root / model / "tests"
     tests.mkdir()
     shutil.copy2(repo / model / "tests/registry_model.telora", tests)

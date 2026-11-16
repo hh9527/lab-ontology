@@ -54,17 +54,4 @@ IC 使用 semantic 建模入口，模型准备和服务验收见 [IC 类型模�
 
 ## NS 模型
 
-NS 的生成器将来源契约转换为 Dataset / Entity 根类型及字段 property。Dataset 类型以物理来源表命名；`model.telora` 汇总根清单和完整关系描述表。关系集中定义，避免 Dataset 模块之间的循环导入。
-
-`@g::field_view(group, id, projectable, filters)` 将字段发布为共享维度组的视图。组保留类型及能力上限，字段声明本地发布名称、投影和过滤能力；字段基础类型必须与组类型一致。`@v::field_domain(...)` 声明带枚举映射的分类维度。跨字段、时间分桶及样本统计使用类型级能力标注。
-
-生成器先格式化源码，再计算 `generation-contract.json` 的源码哈希。连续生成结果一致。
-
-```sh
-python3 ns_model/tools/generate_model.py
-python3 scripts/check-model-registry.py ns_model
-```
-
-NS 的隔离检查使用定义入口，触发注册时局部检查及 World 关系边界检查。`world::self_check` 提供边界诊断，不重复准备完整 transform 或遍历自动发现内容。
-
-诊断时可用 `--fuel` 显式设置隔离检查的初始化和请求 fuel，单位为百万；内存沿用构建配额，项目配置和部署制品保持原有配额。
+NS 使用 semantic 建模入口，以具名身份、Reference、联合角色及外置关系约束业务可解空间。字段 Property 声明分类映射、统计及共享维度能力。模型组织、统一发布及隔离验收见 [NS 类型模型](../../ns_model/README.md)。

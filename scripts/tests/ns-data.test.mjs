@@ -18,8 +18,7 @@ try {
   assert.equal(first.columns, 2118);
   assert.equal(first.checks.relations.length, 302);
   assert(first.checks.relations.every(r => r.pairs > 0));
-  assert.equal(first.checks.cardinalityExceptions.filter(r=>r.explainedBySampling).length, 16);
-  assert(first.checks.cardinalityExceptions.every(r => r.explainedBySampling || r.explainedByEventHistory));
+  assert.deepEqual(first.checks.cardinalityExceptions, [], 'Sampling and alarm history must respect declared cardinality');
   assert(first.checks.domains.some(d => d.absent.length), 'Small profiles report missing domain members');
   db = new DatabaseSync(join(directory, 'first/ns.sqlite'));
   for (const d of model.datasets) {
@@ -85,6 +84,9 @@ try {
     assert.throws(() => generate({ ...options, ...bad, output: join(directory, 'invalid') }, model));
     assert.equal(existsSync(join(directory, 'invalid')), false);
   }
+  const invalidBound = structuredClone(model);
+  invalidBound.relations.find(r => r.id === 's2__sede').cardinality.to = 'Optional';
+  assert.throws(() => validate(db, invalidBound, first), /cardinalityExceptions/, 'Sampling cannot bypass an incorrect upper bound');
   const broken = structuredClone(model);
   broken.datasets.find(d => d.kind === 'Metric').grain = ['ts'];
   assert.throws(() => generate({ ...options, output: join(directory, 'failed') }, broken), /UNIQUE/);

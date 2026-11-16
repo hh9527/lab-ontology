@@ -1,3 +1,4 @@
+import { guardLeaves, guardSql } from './ns-guards.mjs';
 import { createKpiWaves } from './kpi-waveforms.mjs';
 import { categoryRandom, categoryValue, networkDevicePresentation, networkDeviceClass } from './icloud-category-profiles.mjs';
 import { normalizeUtcMillis } from './utc-milliseconds.mjs';
@@ -60,10 +61,12 @@ export function prepare(model) {
   const identityFields = new Set([...references.keys(), ...donors]);
   const guards = new Map();
   for (const r of model.relations.filter(r => r.guard)) {
-    if (!r.guard.op.symbol.endsWith('::Eq')) throw new Error(`Unsupported fixture guard ${r.id}`);
-    const k = key(r.from, r.guard.field);
-    if (!guards.has(k)) guards.set(k, []);
-    if (!guards.get(k).includes(r.guard.input.args[0])) guards.get(k).push(r.guard.input.args[0]);
+    for (const leaf of guardLeaves(r.guard)) {
+      if (leaf.op !== 'Eq') throw new Error('Unsupported fixture guard ' + r.id);
+      const k = key(r[leaf.side], leaf.field);
+      if (!guards.has(k)) guards.set(k, []);
+      if (!guards.get(k).includes(leaf.value)) guards.get(k).push(leaf.value);
+    }
   }
   return { datasets, fields, references, identityFields, guards };
 }
@@ -173,9 +176,11 @@ function rowFactory(model, plan, opts) {
         return row[from.column] === scalar(target, to, i, 0);
       }));
       if (!matches) continue;
-      const f = d.fields.find(f => f.name === r.guard.field), value = r.guard.input.args[0];
-      if (!appliedGuards.has(f.column)) appliedGuards.set(f.column, []);
-      if (!appliedGuards.get(f.column).includes(value)) appliedGuards.get(f.column).push(value);
+      for (const leaf of guardLeaves(r.guard).filter(g => g.side === 'from')) {
+        const f = d.fields.find(f => f.name === leaf.field), value = leaf.value;
+        if (!appliedGuards.has(f.column)) appliedGuards.set(f.column, []);
+        if (!appliedGuards.get(f.column).includes(value)) appliedGuards.get(f.column).push(value);
+      }
     }
     for (const [column, matched] of appliedGuards) {
       const f = d.fields.find(f => f.column === column);
@@ -214,8 +219,9 @@ function relationSql(model, relation) {
   const from = model.datasets.find(d => d.id === relation.from), to = model.datasets.find(d => d.id === relation.to);
   const column = (d, field) => quote(d.fields.find(f => f.name === field).column);
   const equal = relation.pairs.map(p => `a.${column(from, p.from)}=b.${column(to, p.to)}`).join(' AND ');
-  const guard = relation.guard ? ` AND a.${column(from, relation.guard.field)}=?` : '';
-  const values = relation.guard ? [relation.guard.input.args[0]] : [];
+  const rendered = guardSql(model, relation, quote);
+  const guard = rendered.sql ? ' AND ' + rendered.sql : '';
+  const values = rendered.values;
   return { from, to, equal, guard, values };
 }
 
@@ -277,14 +283,7 @@ export function validate(db, model, manifest) {
     const upperBoundExceeded = fromExceeded || toExceeded;
     const report = { id: r.id, ...result, maxFrom, maxTo, upperBoundExceeded };
     checks.relations.push(report);
-    if (upperBoundExceeded) checks.cardinalityExceptions.push({ id: r.id, declared: r.cardinality, maxFrom, maxTo,
-      sampledEndpoint: from.kind === 'Metric' || to.kind === 'Metric',
-      explainedBySampling: (!fromExceeded || from.kind === 'Metric') && (!toExceeded || to.kind === 'Metric'),
-      // These four legacy contracts incorrectly limit a device to one alarm.
-      // Retain the exception; never permit an alarm to acquire multiple owners.
-      explainedByEventHistory: ['ar__pone','ar__fsd_rev','pe__ar_rev','fsd__ar'].includes(r.id)
-        && (!fromExceeded || from.id === 'alarm-record') && (!toExceeded || to.id === 'alarm-record'),
-    });
+    if (upperBoundExceeded) checks.cardinalityExceptions.push({id:r.id,declared:r.cardinality,maxFrom,maxTo});
   }
   const alarm = model.datasets.find(d => d.id === 'alarm-record');
   if (alarm) {
@@ -293,7 +292,7 @@ export function validate(db, model, manifest) {
     const invalid = db.prepare(`SELECT count(*) n FROM ${quote(alarm.table)} WHERE ${col('occur_utc')}<? OR ${col('occur_utc')}>=? OR (${col('cleared')}=? AND (${col('clear_utc')}<${col('occur_utc')} OR ${col('clear_utc')}>=?)) OR (${col('cleared')}<>? AND ${col('clear_utc')}<>0)`).get(start, end, cleared, end, cleared).n;
     if (invalid) checks.invalidScenarios.push('alarm-times');
   }
-  if (checks.integrity !== 'ok' || ['emptyDatasets', 'invalidRows', 'invalidDomains', 'invalidTimes', 'invalidGrains', 'invalidSeries', 'invalidScenarios'].some(k => checks[k].length) || checks.relations.some(r => r.pairs === 0) || checks.cardinalityExceptions.some(r => !r.explainedBySampling && !r.explainedByEventHistory)) {
+  if (checks.integrity !== 'ok' || ['emptyDatasets', 'invalidRows', 'invalidDomains', 'invalidTimes', 'invalidGrains', 'invalidSeries', 'invalidScenarios'].some(k => checks[k].length) || checks.relations.some(r => r.pairs === 0) || checks.cardinalityExceptions.length > 0) {
     throw new Error(`NS data validation failed: ${JSON.stringify({ ...checks, relations: checks.relations.filter(r => !r.pairs) })}`);
   }
   return checks;
@@ -333,12 +332,12 @@ export function generate(options, model = loadModel()) {
       db.exec(`CREATE INDEX ${quote('ref_' + indexes.size)} ON ${quote(d.table)} (${names.map(quote).join(',')})`);
     }
     db.exec('COMMIT; ANALYZE');
-    const manifest = { version: 1, generation: { revision: 4, devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), profile: 'ns-typed-demo', categoryProfile: 'seeded-weighted-categories/v1', alarmSeverityWeights: {critical:1,major:1.8,minor:3.2,warning:4}, alarmsPerResourcePerDay: 2, seed: opts.seed, resources: opts.resources, days: opts.days, intervalMinutes: opts.intervalMinutes },
+    const manifest = { version: 1, generation: { revision: 5, devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v1', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), profile: 'ns-typed-demo', categoryProfile: 'seeded-weighted-categories/v1', alarmSeverityWeights: {critical:1,major:1.8,minor:3.2,warning:4}, alarmsPerResourcePerDay: 2, seed: opts.seed, resources: opts.resources, days: opts.days, intervalMinutes: opts.intervalMinutes },
       sourceCommit: model.sourceCommit, sourceSha256: model.sourceSha256, modelSha256: hash(JSON.stringify(model)), generatorSha256: hash(readFileSync(fileURLToPath(import.meta.url))),
       window: { start: iso(opts.startMs), endExclusive: opts.anchor }, samplesPerSeries: opts.samples, tables,
       columns: model.datasets.reduce((n, d) => n + d.fields.length, 0),
       identityPlan: Object.fromEntries(plan.references),
-      assumptions: ['Synthetic resource identity routing is a fixture scenario, not ontology inference.', 'Raw time fields with unconfirmed units receive synthetic millisecond values without asserting a typed instant.', 'All declared direct relations have witnesses; optional polymorphic references need not match every alternative.', 'Declared cardinality conflicts are reported; data generation does not amend model contracts.', 'Four legacy PON/storage owner-alarm relations allow only one alarm per device; repeated alarm history exposes these retained exceptions.'] };
+      assumptions: ['Synthetic resource identity routing is a fixture scenario, not ontology inference.', 'Raw time fields with unconfirmed units receive synthetic millisecond values without asserting a typed instant.', 'All declared direct relations have witnesses; optional polymorphic references need not match every alternative.', 'Declared cardinality conflicts are reported; data generation does not amend model contracts.', 'Every declared cardinality bound is checked against generated relation witnesses.'] };
     manifest.checks = validate(db, model, manifest);
     db.close(); db = undefined;
     manifest.databaseSha256 = hash(readFileSync(file));
