@@ -69,7 +69,8 @@ node scripts/check-staged-model-self-check.mjs /path/to/generated-workspace
 ```sh
 python3 scripts/build-model-preparation-sample.py icloud_model
 python3 scripts/build-model-preparation-sample.py icloud_model --self-check
-node scripts/check-typed-icloud-service.mjs /path/to/icloud_model.wasm
+node scripts/export-icloud-audit.mjs "$TMPDIR/ic-source-audit.json"
+node scripts/check-icloud-service.mjs /path/to/icloud_model.wasm bin/telora-run "$TMPDIR/ic-source-audit.json"
 ```
 
 脚本将 ontology 与模型复制到隔离临时工作区，保持模型源码不变，并核对源码 SHA256。

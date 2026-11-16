@@ -155,15 +155,11 @@ SQLite 与 PG 执行相同场景：
 `ontology/tests/latest.telora` 检查准备、授权、伪造 AST 排序、输出类型和计算依赖。
 导出查询由 `ontology/tests/latest-runtime.mjs` 执行，覆盖 EpochMillis、负时间、NULL 时钟和值、Avg／Count 不变、计算度量及超出 JavaScript Number 精度的精确 BIGINT。
 
-`icloud_model/tests/latest.telora` 为 `scripts/check-icloud-latest.mjs` 导出真实产品查询：
-Latest／Avg 混合、选择前后阈值、Top-N、GraphPair Subtract／Ratio／GrowthRate、半开窗口、未来样本及服务器 CPU／内存。
-检查器在 UTC 和 Asia/Shanghai 下执行 PG 原生 timestamptz，并在 SQLite 使用规范 UTC 文本。
+IC 的整行 Latest、Avg、NULL 保留与跨期间排名由当前模型服务的独立 SQLite 场景验收，执行入口见 [IC 模型验收](../../icloud_model/docs/TYPED_MIGRATION.md#验收)。
 
-导出并运行：
+通用查询引擎的跨方言验收：
 
 ```sh
-bin/telora -C ontology eval @test/latest:runtime_queries --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048 > /tmp/latest-core.json
-node ontology/tests/latest-runtime.mjs /tmp/latest-core.json /path/to/pglite/dist/index.js
-bin/telora -C icloud_model eval @test/latest:runtime_queries --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048 > /tmp/icloud-latest.json
-node scripts/check-icloud-latest.mjs /tmp/icloud-latest.json /path/to/pglite/dist/index.js
+bin/telora -C ontology eval @test/latest:runtime_queries --initialization-fuel 100000 --request-fuel 100000 --with-memory-limit 2048 > "$TMPDIR/latest-core.json"
+node ontology/tests/latest-runtime.mjs "$TMPDIR/latest-core.json" /path/to/pglite/dist/index.js
 ```

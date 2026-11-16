@@ -46,21 +46,11 @@ trait Registerable {
 
 能力标注由 ontology 转换为纯函数步骤，折叠到 Dataset 定义中。闭包由 ontology 内部创建；领域层使用标注和定义表达式。关系不要求目标先注册，且不会自动扩展独立根清单。
 
-`registry::declaration(T.type)` 提供单个类型的派生声明，供显式模型检查及现有引用使用。最终 World 通过根清单统一生成。
+`registry::payload` 与 `registry::stage` 通过根清单统一准备模型。
 
-## 验收 IC
+## IC 模型
 
-```sh
-bin/telora -C ontology test registry
-bin/telora -C ontology test result_columns
-bin/telora -C ontology test graph_pair --initialization-fuel 20000 --request-fuel 20000
-bin/telora -C ontology test ontology/intent --initialization-fuel 30000 --request-fuel 30000
-python3 scripts/check-ic-registry.py
-```
-
-Graph 配对和 Intent 回归套件使用独立的测试 fuel 配额，覆盖较大的测试夹具和多次查询；这些参数只作用于当前测试命令。
-
-IC 模型自检脚本复制源码到临时工作区，以定义入口代替 MainService 入口，避免测试初始化触发服务的 build-time stage。完整模型定义在该隔离检查中使用构建阶段四倍的 fuel 上限和相同的内存配额；运行配置和部署制品不受影响。
+IC 使用 semantic 建模入口，模型准备和服务验收见 [IC 类型模型](../../icloud_model/docs/TYPED_MIGRATION.md)。
 
 ## NS 模型
 

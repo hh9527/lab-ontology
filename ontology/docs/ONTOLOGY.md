@@ -8,9 +8,15 @@
 
 原始字段、平行语义投射、多 wire 筛选、半封闭分类与独立排序能力见[字段映射](FIELD-MAPPINGS.md)。
 
+## 联合定位角色
+
+`@semantic::role(name, Identity.type, {part: "field"})` 把同一行已有的标量字段映射到一个完整业务身份。外置 Relation 通过 `semantic::endpoint(Row.type, name)` 使用该角色。声明必须覆盖身份的全部成员，源字段必须存在、存储表示相容且互不重复；任一源字段可空时整个角色可空。角色名不能与同一行的自动身份或 Reference 角色重名。
+
+联合角色只授予显式连接的定位方式，不声明数据集唯一性，不增加物理列，也不授予原始字段额外计算能力。例如设备内端口名可定位光模块，光模块仍可没有唯一 grain。嵌套存储结构使用字段级 `semantic::columns`；跨现有字段的定位使用类型级 `semantic::role`。
+
 ## 查询模型准备
 
-IC 与 relation 均采用类型化 Dataset、Entity 角色、Group 绑定及显式记录计数声明。
+IC 使用 `ontology::semantic`，从业务身份、Reference 字段与外置关系准备模型，具体入口见 [IC 类型模型](../../icloud_model/docs/TYPED_MIGRATION.md)。relation 使用 registry 的类型化 Dataset、Entity 角色、Group 绑定及显式记录计数声明。
 `transform::prepare/build` 默认信任模型，准备查询所需的 `PreparedPayload`；
 发布前用独立 `transform::self_check` 完整检查同一组声明。运行期始终校验输入。
 `world::stage` 在封闭构建期从同一准备结果产出查询状态与静态知识；服务仅挂载 transform。

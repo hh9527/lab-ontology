@@ -1,4 +1,4 @@
-"""Source-policy and refresh regression checks; compiled coverage is audited separately."""
+"""Source policy and time coverage checks; model contracts are audited from prepared declarations."""
 
 import importlib.util
 import json
@@ -11,9 +11,6 @@ ROOT = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
 from icloud_capabilities import address_view, category
 
-spec = importlib.util.spec_from_file_location("reconcile", SCRIPTS / "reconcile-icloud-capabilities.py")
-reconcile = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(reconcile)
 spec = importlib.util.spec_from_file_location("time_audit", SCRIPTS / "audit-icloud-time.py")
 time_audit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(time_audit)
@@ -42,78 +39,6 @@ class SourceCapabilities(unittest.TestCase):
         self.assertTrue(address_view(field("mgmtIp")))
         self.assertFalse(address_view(field("ipv4Mask")))
         self.assertFalse(address_view(field("ipv6")))
-
-    def test_refresh_generates_family_and_partial_view(self):
-        version = reconcile.refresh.new_field("device", field("version"), "version")
-        self.assertIn("search_text_ops, text_inputs", version)
-        address = reconcile.refresh.new_field("device", field("ipAddress", "ip"), "address")
-        self.assertIn('computed_dimension("device__ipAddress_ipv4"', address)
-        self.assertIn("edsl::canonical_ipv4_view", address)
-        self.assertNotIn("@edsl::logical_type", address)
-        unknown = reconcile.refresh.new_field("device", field("unknown"), "unknown")
-        self.assertIn("text_ops, text_inputs", unknown)
-
-    def test_reconciliation_is_idempotent_on_complete_model(self):
-        model = (ROOT / "icloud_model/src/model.telora").read_text()
-        catalog = json.loads((ROOT / "icloud_model/data/source_catalog.json").read_text())
-        self.assertEqual(reconcile.reconcile(model, catalog), model)
-
-    def test_source_refresh_preserves_existing_capability_declarations(self):
-        model = (ROOT / "icloud_model/src/model.telora").read_text()
-        data = ROOT / "icloud_model/data"
-        refreshed = reconcile.refresh.refresh(model, json.loads((data / "source_catalog.json").read_text()),
-                                              json.loads((data / "source_exceptions.json").read_text()))
-        # Source refresh may reorder type-level relation decorators; field bodies must not change.
-        before = [(m["id"], m["body"]) for m in reconcile.refresh.ENTITY.finditer(model)]
-        after = [(m["id"], m["body"]) for m in reconcile.refresh.ENTITY.finditer(refreshed)]
-        self.assertEqual(after, before)
-
-    def test_source_declarations_allow_intervening_knowledge_annotations(self):
-        model = '''@edsl::entity_id("orphan")
-type Orphan = struct {
-    id: String,
-};
-@edsl::entity_id("samples")
-@edsl::related_to({kind: edsl::KnowledgeKind::Measure, owner: "samples", id: "avg"},
-    {kind: edsl::KnowledgeKind::Dimension, owner: "samples", id: "value"})
-@edsl::entity_source("Samples", "samples")
-type Samples = struct {
-    @edsl::column("value")
-    value: Float,
-};
-'''
-        declarations = list(reconcile.refresh.ENTITY.finditer(model))
-        self.assertEqual([(item["id"], item["table"], item["type"]) for item in declarations],
-                         [("samples", "Samples", "Samples")])
-        self.assertIn("@edsl::related_to", declarations[0]["header"])
-
-    def test_time_declarations_use_metadata_and_reviewed_conventions(self):
-        sample = reconcile.refresh.new_field("foo", field("ts", "datetime"), "sample_time")
-        self.assertIn("Rfc3339Text", sample)
-        self.assertIn("FilterInputKind::DateTimeUtc", sample)
-        date = reconcile.refresh.new_field("foo", field("date", properties={"dte.time.format.pattern": "YYYY-MM-DD"}), "date")
-        self.assertIn("TimeEncoding::DateText", date)
-        self.assertIn("FilterInputKind::Date", date)
-        clock = reconcile.refresh.new_field("foo", field("timestamp", "long", columnType="timestamp"), "timestamp")
-        self.assertIn("TODO: Confirm source integer clock unit", clock)
-        self.assertIn("FilterInputKind::EpochMillis", clock)
-        ordinary = reconcile.refresh.new_field("foo", field("time_like_name"), "text")
-        self.assertNotIn("time_field", ordinary)
-
-    def test_integer_time_assumptions_have_source_todos(self):
-        model = (ROOT / "icloud_model/src/model.telora").read_text()
-        catalog = json.loads((ROOT / "icloud_model/data/source_catalog.json").read_text())
-        sources = {dataset["table"]: {field["name"]: field for field in dataset["fields"]} for dataset in catalog["datasets"]}
-        count = 0
-        for entity in reconcile.refresh.ENTITY.finditer(model):
-            for field in reconcile.FIELD.finditer(entity["body"]):
-                if "TimeEncoding::EpochMillis" not in field["block"]:
-                    continue
-                raw = sources[entity["table"]][field["column"]]
-                if time_audit.basis(raw, "EpochMillis")["requires_confirmation"]:
-                    self.assertIn("TODO:", field["block"], f"{entity['id']}.{field['name']}")
-                    count += 1
-        self.assertGreater(count, 0)
 
     def test_datetime_utc_audit_contract_and_legacy_rejection(self):
         raw = field("ts", "datetime")

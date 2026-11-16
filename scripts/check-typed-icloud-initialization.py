@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在不含旧 IC 模型的临时工作区验证 typed 入口独立初始化。"""
+"""在隔离工作区验证 IC 模型声明的独立初始化。"""
 import json
 import os
 from pathlib import Path
@@ -35,4 +35,4 @@ with tempfile.TemporaryDirectory(prefix="typed-icloud-init-", dir=TEMP_ROOT) as 
     assert result.returncode == 0 and len(summaries) == 1, (result.stdout, result.stderr)
     assert summaries[0]["status"] == "ok" and not summaries[0]["types_only"], summaries
     assert not any(record.get("severity") == "error" for record in records), records
-    print("Passed independent typed IC initialization with the legacy model and service absent")
+    print("Passed IC model initialization in an isolated declaration-only workspace")

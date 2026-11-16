@@ -20,6 +20,7 @@ use std::array as array;
 use std::string as string;
 use std::json as json;
 use std::codec as codec;
+use std::dict as dict;
 use std::value::{Value};
 
 # should_ok 只检查不抛异常；布尔条件必须显式断言。
@@ -109,10 +110,10 @@ def reported_old: edsl::PreparedPayload = registry::payload(
 );
 def reported_parity: Fn(String) -> Bool = fn(extra) {
     let input = parse(
-        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"reported"}],"edges":[],\{extra},"limit":500}`
+        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"reported"}],"edges":[],\{extra}}`
     );
-    let old = intent::query_intent_ast_factory(reported_old)(input);
-    let new = intent::query_intent_ast_factory(reported_new)(input);
+    let old = query_ast(reported_old)(input);
+    let new = query_ast(reported_new)(input);
     sqlite::build_query(old) == sqlite::build_query(new) && postgres::build_query(old) == postgres::build_query(
         new
     ) && intent::result_columns(reported_old, input, old) == intent::result_columns(
@@ -154,7 +155,7 @@ pub def acceptance_closed_domain_mapping: test::Test = verify(
             None => fail!("missing new severity")
         };
         reported_parity(
-            r#""select":[{"node":"s","dimension":"severity"}],"filters":[{"node":"s","dimension":"severity","op":"Eq","value":"Critical"}]"#
+            r#""select":[{"node":"s","dimension":"severity"}],"measures":[{"node":"s","measure":"cpu_mean"}],"filters":[{"node":"s","dimension":"severity","op":"Eq","value":"Critical"}]"#
         ) && new.canonical_values == old.canonical_values && new.canonical_order == old.canonical_order && new.half_open == old.half_open
     }
 );
@@ -162,10 +163,10 @@ pub def acceptance_new_roots_publish_without_legacy_registry: test::Test = verif
     fn() {
         let published = domain::payload("reported", [ReportedSamples.type], reported_profile);
         let input = parse(
-            r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"reported"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"cpu_latest"}],"limit":500}"#
+            r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"reported"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"cpu_latest"}],"take":500}"#
         );
-        let original = intent::query_intent_ast_factory(reported_old)(input);
-        let migrated = intent::query_intent_ast_factory(published)(input);
+        let original = query_ast(reported_old)(input);
+        let migrated = query_ast(published)(input);
         sqlite::build_query(original) == sqlite::build_query(migrated) && postgres::build_query(
             original
         ) == postgres::build_query(migrated) && intent::result_columns(
@@ -278,28 +279,63 @@ def payload: edsl::PreparedPayload = adapter::payload(
     relations,
     profile
 );
+
+# 每个独立验收请求明确使用当前公共结果选择契约。
+def items: Fn(Dict(Value), String) -> Array(Value) = fn(obj, name) {
+    match dict::get(obj, name) { Some(Value::Array(values)) => values, _ => [] }
+};
+def text: Fn(Dict(Value), String) -> String = fn(obj, name) {
+    match dict::get(obj, name) { Some(Value::String(value)) => value, _ => "" }
+};
+def object: Fn(Value) -> Dict(Value) = fn(value) {
+    match value { Value::Object(fields) => fields, _ => fail!("expected test intent object") }
+};
+def bounded: Fn(Value) -> Value = fn(input) {
+    let obj = object(input);
+    let selects = items(obj, "select");
+    let measures = items(obj, "measures");
+    if items(obj, "order_by") != [] { input }
+    else if dict::get(obj,"count_groups") == Some(Value::True) { Value::Object(dict::from_pairs(array::filter(dict::pairs(obj),fn(pair){pair.0 != "take"}))) }
+    else if selects == [] && measures == [] { Value::Object(dict::from_pairs(array::filter(dict::pairs(obj),fn(pair){pair.0 != "take"}))) }
+    else {
+        let order = if measures != [] {
+            let member = object(measures[0]);
+            Value::Object({node: Value::String(text(member,"node")), measure: Value::String(text(member,"measure")), direction: Value::String("Asc")})
+        } else {
+            let member = object(selects[0]);
+            let prefix = if text(member,"side") == "Left" { "left_" } else if text(member,"side") == "Right" { "right_" } else { "" };
+            Value::Object({column: Value::String(string::join([prefix,text(member,"node"),"_",text(member,"dimension")],"")), direction: Value::String("Asc")})
+        };
+        let take = match dict::get(obj, "take") { Some(value) => value, None => Value::Int(500) };
+        Value::Object(dict::merge(obj, {order_by: Value::Array([order]), take}))
+    }
+};
+def query_ast: Fn(edsl::PreparedPayload) -> Fn(Value) -> qb::QueryAst = fn(model) {
+    fn(input) { intent::query_intent_ast_factory(model)(bounded(input)) }
+};
+
 def parse: Fn(String) -> Value = fn(text) {
     json::parse(text).unwrap!()
 };
 def projection: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device__name"}],"limit":500}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device__name"}],"take":500}"#
 );
 def aggregate: Value = parse(
-    r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"limit":500}"#
+    r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],"select":[],"measures":[{"node":"s","measure":"sample__cpu_mean"}],"take":500}"#
 );
 def joined: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t","dimension":"tenant__name"}],"limit":500}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t","dimension":"tenant__name"}],"take":500}"#
 );
 def composite: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"p","entity":"scoped_device"}],"edges":[{"relation":"peer","from":"d","to":"p"}],"select":[{"node":"d","dimension":"device__name"},{"node":"p","dimension":"scoped_device__name"}],"limit":500}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"p","entity":"scoped_device"}],"edges":[{"relation":"peer","from":"d","to":"p"}],"select":[{"node":"d","dimension":"device__name"},{"node":"p","dimension":"scoped_device__name"}],"take":500}"#
 );
-def ast: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(payload);
+def ast: Fn(Value) -> qb::QueryAst = query_ast(payload);
 
 pub def graph_projection_uses_existing_pipeline: test::Test = verify(
     fn() {
         let plan = ast(projection);
         let query = sqlite::build_query(plan);
-        query.bindings == [qb::Val::Int(500)] && string::contains(query.sql, "devices") && intent::result_columns(
+        qb::result_bound(plan) == 500 && string::contains(query.sql, "devices") && intent::result_columns(
             payload,
             projection,
             plan
@@ -367,7 +403,7 @@ pub def threshold_type_does_not_grant_aggregation: test::Test = test::should_fai
 pub def undeclared_relation_is_not_inferred_from_reference: test::Test = test::should_fail_with(
     fn() {
         let no_relations = adapter::payload("no-relations", mappings, [], profile);
-        intent::query_intent_ast_factory(no_relations)(joined);
+        query_ast(no_relations)(joined);
         True
     },
     "unknown relation"
@@ -384,9 +420,9 @@ pub def runtime_cases: Value = codec::encode(
                 }
             ),
             [
-                sqlite::build_query(intent::query_intent_ast_factory(chained_payload)(chained)),
+                sqlite::build_query(query_ast(chained_payload)(chained)),
                 sqlite::build_query(ast(required)),
-                sqlite::build_query(intent::query_intent_ast_factory(filterable_payload)(filtered))
+                sqlite::build_query(query_ast(filterable_payload)(filtered))
             ]
         ]
     )
@@ -406,9 +442,9 @@ pub def raw_schema_can_project_without_business_declarations: test::Test = verif
             profile
         );
         let input = parse(
-            r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"raw_device"}],"edges":[],"select":[{"node":"r","dimension":"raw_device__name"}],"limit":500}"#
+            r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"raw_device"}],"edges":[],"select":[{"node":"r","dimension":"raw_device__name"}],"take":500}"#
         );
-        let query = intent::query_intent_ast_factory(raw)(input);
+        let query = query_ast(raw)(input);
         raw.measures == [] && raw.relations == [] && intent::result_columns(raw, input, query) == [
             {name: "r_raw_device__name", type: intent::ResultType::String, nullable: True}
         ]
@@ -417,7 +453,7 @@ pub def raw_schema_can_project_without_business_declarations: test::Test = verif
 
 # 查询层要求关联存在，与读取可缺失属性分开表达。
 def required: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device__name"}],"exists":[{"anchor":"d","nodes":[{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}]}],"limit":500}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device__name"}],"exists":[{"anchor":"d","nodes":[{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}]}],"take":500}"#
 );
 pub def explicit_existence_still_filters_roots: test::Test = verify(
     fn() {
@@ -446,11 +482,11 @@ def chained_payload: edsl::PreparedPayload = payload <~ {
     )
 };
 def chained: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"},{"id":"t2","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"},{"relation":"tenant_self","from":"t","to":"t2"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t2","dimension":"tenant__name"}],"limit":500}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"},{"id":"t2","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"},{"relation":"tenant_self","from":"t","to":"t2"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t2","dimension":"tenant__name"}],"take":500}"#
 );
 pub def nullable_origin_propagates_through_one_relation: test::Test = verify(
     fn() {
-        let plan = intent::query_intent_ast_factory(chained_payload)(chained);
+        let plan = query_ast(chained_payload)(chained);
         let columns = intent::result_columns(chained_payload, chained, plan);
         match plan.plan {
             qb::QueryPlan::Rows(rows) => array::length(rows.joins) == 2 && array::all(
@@ -473,7 +509,7 @@ pub def one_relation_keeps_inner_join_without_nullable_origin: test::Test = veri
                 }
             )
         };
-        let plan = intent::query_intent_ast_factory(one)(joined);
+        let plan = query_ast(one)(joined);
         string::contains(sqlite::build_query(plan).sql, "INNER JOIN") && !intent::result_columns(
             one,
             joined,
@@ -496,9 +532,9 @@ pub def reverse_traversal_uses_from_cardinality: test::Test = verify(
             )
         };
         let input = parse(
-            r#"{"op":"Graph","root":"t","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"t","dimension":"tenant__name"},{"node":"d","dimension":"device__name"}],"limit":500}"#
+            r#"{"op":"Graph","root":"t","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"t","dimension":"tenant__name"},{"node":"d","dimension":"device__name"}],"take":500}"#
         );
-        let plan = intent::query_intent_ast_factory(reverse)(input);
+        let plan = query_ast(reverse)(input);
         string::contains(sqlite::build_query(plan).sql, "LEFT JOIN") && intent::result_columns(
             reverse,
             input,
@@ -527,11 +563,11 @@ def filterable_payload: edsl::PreparedPayload = payload <~ {
     )
 };
 def filtered: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t","dimension":"tenant__name"}],"filters":[{"node":"t","dimension":"tenant__name","op":"Eq","value":"T1"}],"limit":500}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"},{"id":"t","entity":"tenant"}],"edges":[{"relation":"belongs_to","from":"d","to":"t"}],"select":[{"node":"d","dimension":"device__name"},{"node":"t","dimension":"tenant__name"}],"filters":[{"node":"t","dimension":"tenant__name","op":"Eq","value":"T1"}],"take":500}"#
 );
 pub def explicit_peer_filter_keeps_where_semantics: test::Test = verify(
     fn() {
-        let plan = intent::query_intent_ast_factory(filterable_payload)(filtered);
+        let plan = query_ast(filterable_payload)(filtered);
         let sql = sqlite::build_query(plan).sql;
         string::contains(sql, "LEFT JOIN") && string::contains(sql, "WHERE")
     }
@@ -629,11 +665,11 @@ def baseline_payload: edsl::PreparedPayload = registry::payload(
 def new_acceptance_payload: edsl::PreparedPayload = payload <~ {profile: acceptance_profile};
 def sample_input: Fn(String) -> Value = fn(extra) {
     parse(
-        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],\{extra},"limit":500}`
+        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"}],"edges":[],\{extra}}`
     )
 };
-def old_plan: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(baseline_payload);
-def new_plan: Fn(Value) -> qb::QueryAst = intent::query_intent_ast_factory(new_acceptance_payload);
+def old_plan: Fn(Value) -> qb::QueryAst = query_ast(baseline_payload);
+def new_plan: Fn(Value) -> qb::QueryAst = query_ast(new_acceptance_payload);
 def same_result: Fn(Value) -> Bool = fn(input) {
     let old = old_plan(input);
     let new = new_plan(input);
@@ -782,9 +818,9 @@ def aligned_payload: edsl::PreparedPayload = adapter::payload(
 pub def acceptance_subject_identity_aligns_to_another_mapping: test::Test = verify(
     fn() {
         let input = parse(
-            r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"},{"id":"d","entity":"device"}],"edges":[{"relation":"sample_device","from":"s","to":"d"}],"select":[{"node":"s","dimension":"sample__id"},{"node":"d","dimension":"device__name"}],"limit":500}"#
+            r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"sample"},{"id":"d","entity":"device"}],"edges":[{"relation":"sample_device","from":"s","to":"d"}],"select":[{"node":"s","dimension":"sample__id"},{"node":"d","dimension":"device__name"}],"take":500}"#
         );
-        let plan = intent::query_intent_ast_factory(aligned_payload)(input);
+        let plan = query_ast(aligned_payload)(input);
         string::contains(sqlite::build_query(plan).sql, "LEFT JOIN") && intent::result_columns(
             aligned_payload,
             input,
@@ -799,7 +835,7 @@ def union_identity: Value = sample_input(
     r#""select":[{"node":"s","dimension":"sample__id"},{"node":"s","dimension":"sample__ts"}]"#
 );
 def union_input: Value = parse(
-    `{"op":"GraphUnion","branches":[{"result_node":"s","graph":\{json::stringify(union_identity)}},{"result_node":"s","graph":\{json::stringify(union_identity)}}],"limit":500}`
+    `{"op":"GraphUnion","order_by":[{"column":"s_sample__id","direction":"Asc"}],"branches":[{"result_node":"s","graph":\{json::stringify(union_identity)}},{"result_node":"s","graph":\{json::stringify(union_identity)}}],"take":500}`
 );
 pub def acceptance_graph_union: test::Test = verify(
     fn() {
@@ -813,7 +849,7 @@ def pair_branch: Fn(String) -> Value = fn(node) {
 };
 def pair_input: Fn(String) -> Value = fn(extra) {
     parse(
-        `{"op":"GraphPair","left":\{json::stringify(pair_branch("a"))},"right":\{json::stringify(pair_branch("b"))},"align_by":[{"left":{"node":"a"},"right":{"node":"b"}}],"select":[{"side":"Left","node":"a","dimension":"sample__id"}],\{extra}"limit":500}`
+        `{"op":"GraphPair","left":\{json::stringify(pair_branch("a"))},"right":\{json::stringify(pair_branch("b"))},"align_by":[{"left":{"node":"a"},"right":{"node":"b"}}],"select":[{"side":"Left","node":"a","dimension":"sample__id"}],\{extra}"take":500}`
     )
 };
 pub def acceptance_graph_pair: test::Test = verify(
@@ -841,9 +877,9 @@ pub def acceptance_disjoint_periods_align_by_business_identity: test::Test = ver
         let left = owner_period("a", "x", "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z");
         let right = owner_period("b", "y", "2026-11-02T00:00:00Z", "2026-11-03T00:00:00Z");
         let input = parse(
-            `{"op":"GraphPair","left":\{json::stringify(left)},"right":\{json::stringify(right)},"align_by":[{"left":{"node":"a"},"right":{"node":"b"}}],"select":[{"side":"Left","node":"a","dimension":"device__id"}],"rank_by":{"op":"GrowthRate","current":"Right","baseline":"Left","direction":"Desc","take":10},"limit":500}`
+            `{"op":"GraphPair","left":\{json::stringify(left)},"right":\{json::stringify(right)},"align_by":[{"left":{"node":"a"},"right":{"node":"b"}}],"select":[{"side":"Left","node":"a","dimension":"device__id"}],"rank_by":{"op":"GrowthRate","current":"Right","baseline":"Left","direction":"Desc","take":10},"take":500}`
         );
-        let plan = intent::query_intent_ast_factory(aligned_payload)(input);
+        let plan = query_ast(aligned_payload)(input);
         let sql = sqlite::build_query(plan);
         string::contains(sql.sql, "ORDER BY") && array::length(sql.bindings) >= 5
     }

@@ -412,12 +412,37 @@ def statistic_bindings: Fn(Mapping, edsl::EntityEntry) -> Array(groups::BindingF
 # 样本与分类 property 已在字段边界完成名义类型检查；这里只展开物理索引。
 def local_definition: Fn(Mapping) -> transform::LocalDefinition = fn(mapping) {
     let entity = entity_entry(mapping, 0);
+    let declared_roles = match property::get_type_prop(mapping.row, s::RoleMappings.type) {
+        None => [],
+        Some(spec) => array::map(spec.items, fn(role) {
+            let identity = s::identity(role.identity);
+            let parts = array::map(array::enumerate(identity.parts), fn(part) {
+                let name = require(dict::get(role.fields, part.1.path));
+                let field = match array::find(mapping.prepared.fields, fn(field) { field.name == name }) {
+                    Some(field) => field,
+                    None => fail!("role source field does not exist", role.name, name)
+                };
+                let physical = indexes(entity, field);
+                if array::length(physical) != 1 || groups::representation(field.value) != groups::representation(part.1.value) {
+                    fail!("role field has incompatible representation", role.name, field.name)
+                } else { () };
+                {source: entity.fields[physical[0]].name, target: part.1.path,
+                 source_index: physical[0], target_index: part.0, value: part.1.value,
+                 nullable: field.nullable, raw: None}.ty!(model::Part)
+            });
+            if array::any(parts, fn(part) { array::length(array::filter(parts, fn(other) { other.source == part.source })) != 1 }) {
+                fail!("role mapping must use distinct source fields", role.name)
+            } else { () };
+            {row: mapping.row, id: role.name, entity: identity.entity, identity: role.identity,
+             optional: array::any(parts, fn(part) { part.nullable }), parts}.ty!(model::PreparedRole)
+        })
+    };
     let dataset: model::PreparedDataset = {
         id: mapping.id,
         source: mapping.prepared.source,
         row: mapping.row,
         grain: mapping.prepared.grain,
-        roles: array::flat_map(
+        roles: array::concat([declared_roles, array::flat_map(
             mapping.prepared.fields,
             fn(field) {
                 let by = match field.reference {
@@ -469,8 +494,9 @@ def local_definition: Fn(Mapping) -> transform::LocalDefinition = fn(mapping) {
                     }
                 )
             }
-        )
+        )])
     };
+    contract::unique(array::map(dataset.roles, fn(role) { role.id }));
     let physical_index: Fn(Int) -> Int = fn(index) {
         let field = mapping.prepared.fields[index];
         if array::length(field.columns) != 1 {

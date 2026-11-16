@@ -36,7 +36,7 @@ HTTP 请求体就是槽位输入，不含 JSONL 的 `method`／`input` 信封。
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8080/ic/transform \
-  -H 'Content-Type: application/json' -d '{"intents":[{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device_id"}]}]}'
+  -H 'Content-Type: application/json' -d '{"intents":[{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device_id"}],"order_by":[{"column":"d_device_id","direction":"Asc"}],"take":10}]}'
 ```
 
 `telora-run` 不提供认证，只绑定宿主私有回环或 Unix socket，并通过可信工具适配器或认证网关向 Agent 暴露查询操作。
@@ -135,15 +135,15 @@ GraphPair 组计数和 Graph 组计数在 SQLite、PG 中均用显式结果别�
 使用维度声明逻辑类型的具体值，在答案中说明最终业务日期；缺少可靠参考时间或时区时，应询问缺失上下文。
 时间值和窗口语义见[时间契约](ontology/docs/TIME.md)。知识发现描述模型，下文给出通用 Intent 语法；模型与 transform 决定组合是否具备合法业务含义。
 
-当前 IC 时间类型为 `DateTimeUtc`（RFC3339 UTC 秒，`YYYY-MM-DDTHH:MM:SSZ`）、`Date`（`YYYY-MM-DD`）和 `EpochMillis`（JSON 整数毫秒）。
+当前 IC 时间类型为 `DateTimeUtc`（RFC3339 UTC 毫秒，`YYYY-MM-DDTHH:MM:SS.sssZ`）、`Date`（`YYYY-MM-DD`）和 `EpochMillis`（JSON 整数毫秒）。
 旧空格分隔 UTC 输入被拒绝，需部署重建制品并通过静态知识发现当前类型。
 
 ### Graph Intent 语法
 
-Graph Intent 有五个必填字段，必要时使用空数组。下面可选顶层 limit 增加最终输出上限：
+Graph Intent 有五个必填字段，必要时使用空数组。下面的无分组计数至多返回一行：
 
 ```json
-{"op":"Graph","limit":1000,"root":"item",
+{"op":"Graph","root":"item",
  "nodes":[{"id":"item","entity":"<dataset ID>"}],
  "edges":[],
  "select":[],"count":"item"}
@@ -173,8 +173,7 @@ select 包含 `{"node":"...","dimension":"..."}`。count 是被计数节点实�
 | `group_by_identity` | 节点实例 ID 字符串数组 |
 | `row_grain` | `"Root"` 或 `"Association"` |
 | `order_by` | `{"node":"...","dimension":"...","direction":"Asc|Desc"}` 数组 |
-| `limit` | 仅顶层 Intent 可选；正有符号 64 位整数，限制最终输出 |
-| `take` | 整数 |
+| `take` | 检查时已知的 1..500 整数，与最终排序共同证明多行结果上界 |
 | `top_per` | `{"owner":"<node>","sample":"<node>","rank":"<dimension>","take":<integer>}` |
 | `top_by_measure` | `{"node":"...","measure":"...","direction":"Asc|Desc","take":<integer>}` |
 
@@ -206,10 +205,10 @@ exists 限定外层实体而不扩增其行；关联一对多实体只需证明�
 两条或更多独立合法图路径需要返回同一实体的一个去重总体时使用 GraphUnion：
 
 ```text
-{"op":"GraphUnion","limit":1000,"branches":[
+{"op":"GraphUnion","branches":[
   {"result_node":"<node ID>","graph":<graph Intent>},
   {"result_node":"<node ID>","graph":<graph Intent>}
-]}
+],"order_by":[{"column":"<output column>","direction":"Asc"}],"take":50}
 ```
 
 每个 Graph 完整且遵循自身声明关系、筛选、授权与粒度规则。
@@ -226,7 +225,7 @@ GraphUnion 至少接受两个原始行分支，可用 filters、exists 和具名
 GraphPair 分别聚合两个总体，显式对齐完整身份，并选择每个输出列来自哪一侧。
 
 ```text
-{"op":"GraphPair","limit":1000,"left":<Graph intent>,"right":<Graph intent>,
+{"op":"GraphPair","left":<Graph intent>,"right":<Graph intent>,
  "align_by":[{"left":{"node":"d"},"right":{"node":"d"}}],
  "select":[{"side":"Right","node":"d","dimension":"device_name"}],
  "rank_by":{"op":"Subtract","minuend":"Right","subtrahend":"Left",
@@ -238,7 +237,7 @@ GraphPair 分别聚合两个总体，显式对齐完整身份，并选择每个�
 输出先按 select 顺序，再输出两侧度量，别名为 left_<node>_<dimension or measure> 和 right_<node>_<dimension or measure>。
 
 排名支持 Subtract（minuend／subtrahend）、Ratio（numerator／denominator）和 GrowthRate（current／baseline）。
-侧别参数显式选择不同 Left／Right，每次排名需 direction Asc|Desc 和 take 1..1000。
+侧别参数显式选择不同 Left／Right，每次排名需 direction Asc|Desc 和 take 1..500。
 数值度量须为同一度量或声明相同非空单位。排除 NULL、Ratio 零分母及 GrowthRate 非正基线。
 运算采用近似双精度，增长率 0.2 表示 20%；并列按完整对齐身份升序、NULLS FIRST 决胜。
 
@@ -248,8 +247,7 @@ GraphPair 分别聚合两个总体，显式对齐完整身份，并选择每个�
 
 旧隐式配对需迁移，形状、别名、配置要求和步骤见[完整 GraphPair 契约](ontology/docs/GRAPH-PAIR.md)。
 
-JSONL 服务响应使用 `telora.service/v1` 信封。成功时 ok.Document 包含 Found 或 NotFound，Found Index 节点包含完整 detail.entries 列表。
-transform 的 ok 包含上述批次响应。拒绝 Intent 表现为 `ok.accepted:false`、带索引诊断和 `queries:null`；
+JSONL 服务响应使用 `telora.service/v1` 信封。transform 的 ok 包含上述批次响应。拒绝 Intent 表现为 `ok.accepted:false`、带索引诊断和 `queries:null`；
 格式错误请求及未捕获服务失败为 `error:true`，带顶层结构化诊断。
 阅读诊断并用相关知识修复 Intent。接受的 Query 含参数化 sql 与 bindings，不是数据库结果。
 将二者一并交给获授权执行层，绝不把值拼入 SQL，并以合适形式向用户展示数据。
