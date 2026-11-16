@@ -23,3 +23,7 @@ codec 和领域 fail! 的输入 subject 使用临时 source=0，显示为 `<inpu
 ## 执行集成
 
 dsh-oks 的 DARI 模型适配器在 worker 内使用 Node 内置 WebAssembly，直接实例化零导入制品，通过 run-service-located 传入 TLI1。支持自包含初始化和服务快照、请求重置与 trap 后恢复。构建和模型验收使用 release 版 Telora；集成不需要 telora-run 可执行文件。
+
+## 模型集成入口
+
+模型通过 `ontology::publication::stage(payload, namespace, aliases, lower)` 在构建期组装公共契约、codec、check_type 与 transform。`lower` 显式选择 SQL 方言；服务槽通过 `publication::dispatch` 分发请求。模块职责见 [模块边界](docs/ARCHITECTURE.md)。

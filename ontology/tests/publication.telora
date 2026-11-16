@@ -1,0 +1,79 @@
+use ontology::semantic as s;
+use ontology::ontology as edsl;
+use ontology::preparation;
+use ontology::publication as p;
+use ontology::query as q;
+use ontology::intent;
+use ontology::typed_query;
+use ontology::sqlite;
+use ontology::postgres;
+use ontology::groups as g;
+use ontology::js_codec;
+use std::test;
+use std::codec;
+use std::json;
+use std::string;
+use std::dict;
+use std::value::{Value};
+
+@s::dataset("reading", "readings", ["id"])
+type Reading = struct {
+    @g::exact("reading_id")
+    id: String
+};
+@js_codec::number_range(0.0, 100.0)
+type Threshold = struct(Float);
+def profile: q::PlanProfile = {
+    allowed_operators: [q::Operator::Source, q::Operator::Column, q::Operator::Project, q::Operator::Order, q::Operator::Limit, q::Operator::Bind, q::Operator::Scalar, q::Operator::Filter],
+    allowed_join_kinds: [], allowed_aggregates: [],
+    allowed_scalars: [q::ScalarFunction::BinaryText, q::ScalarFunction::Eq], allow_distinct: False
+};
+def payload: edsl::PreparedPayload = s::payload("publication-test", [Reading.type], profile);
+def aliases: Array((String, typed_query::TypeRef)) = [("lab::Threshold", typed_query::type_ref(Threshold.type, intent::ResultType::Float))];
+def program: p::Program = p::prepare(payload, "lab", aliases, sqlite::build_query);
+def parse: Fn(String) -> Value = fn(text) { json::parse(text).unwrap!() };
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(fn() { if check() { () } else { fail!("publication assertion failed") } })
+};
+def graph: Value = parse(r#"{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"reading"}],"edges":[],"select":[{"node":"r","dimension":"reading_id"}],"order_by":[{"node":"r","dimension":"reading_id","direction":"Asc"}],"take":5}"#);
+type Batch = struct { intents: Array(Value) };
+def batch: Value = codec::encode({intents: [graph]}.ty!(Batch));
+def field: Fn(Value, String) -> Value = fn(value, name) {
+    match value { Value::Object(fields) => match dict::get(fields, name) { Some(value) => value, None => fail!("missing field", name) }, _ => fail!("expected object") }
+};
+type Request = struct { method: String, input: Value };
+def request: Fn(String, Value) -> Value = fn(method, input) { codec::encode({method, input}.ty!(Request)) };
+
+pub def contract_and_dispatch_share_published_identity: test::Test = verify(fn() {
+    let contract = codec::decode@[p::Contract](program.contract).unwrap!();
+    contract.abi_version == "dari-model/v3" && contract.datasets[0].symbol == "lab::reading" && contract.types[0].name == "lab::Threshold" &&
+    p::dispatch(program, request("contract", parse("null"))) == program.contract &&
+    string::contains(contract.codec_module, "createCodecs")
+});
+pub def namespace_changes_contract_identity: test::Test = verify(fn() {
+    let other = p::prepare(payload, "other", [], sqlite::build_query);
+    codec::decode@[p::Contract](program.contract).unwrap!().contract_id != codec::decode@[p::Contract](other.contract).unwrap!().contract_id
+});
+pub def transform_uses_explicit_dialect: test::Test = verify(fn() {
+    let pg = p::prepare(payload, "lab", aliases, postgres::build_query);
+    field(program.transform(batch), "accepted") == Value::True &&
+    program.transform(batch) == intent::query_request_method_factory(payload, sqlite::build_query)(batch) &&
+    pg.transform(batch) == intent::query_request_method_factory(payload, postgres::build_query)(batch) &&
+    p::dispatch(program, request("transform", batch)) == program.transform(batch)
+});
+pub def preparation_and_author_roots_agree: test::Test = verify(fn() {
+    let mapped = preparation::payload("publication-test", [preparation::mapping("reading", Reading.type)], [], profile);
+    program.transform(batch) == p::prepare(mapped, "lab", aliases, sqlite::build_query).transform(batch)
+});
+type Receipt = struct { contractId: String, inputDigest: String, consumedStepIds: Array(String) };
+pub def proof_covers_intent_and_contract: test::Test = verify(fn() {
+    let contract = codec::decode@[p::Contract](program.contract).unwrap!();
+    let member = contract.datasets[0].members[0].symbol;
+    let input = parse(`{"intent":{"root":"r","nodes":[{"id":"r","dataset":"lab::reading"}],"steps":[{"id":"p","kind":"project","body":{"kind":"record","fields":[{"name":"id","value":{"kind":"member","node":"r","member":"\{member}"}}]}},{"id":"o","kind":"order_by","body":{"terms":[{"direction":"Asc","value":{"kind":"output","name":"id"}}]}},{"id":"t","kind":"take","body":{"count":5}}]}}`);
+    let checked = p::dispatch(program, request("check_type", input));
+    let receipt = codec::decode@[Receipt](field(checked, "receipt")).unwrap!();
+    receipt.contractId == contract.contract_id && receipt.consumedStepIds == ["p", "o", "t"] && field(checked, "container") == codec::encode("table")
+});
+pub def unknown_method_is_rejected: test::Test = test::should_fail_with(fn() {
+    p::dispatch(program, request("unknown", parse("null")))
+}, "unknown DARI model ABI method");
