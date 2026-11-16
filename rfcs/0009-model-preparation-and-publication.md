@@ -33,3 +33,7 @@ IC 以业务类型和字段 Property 表达可解空间。领域声明、模型�
 3. IC 类型检查与 staged 构建
 4. 发布目录、codec、check_type、transform 与错误分发验证
 5. 公共模块不暴露 semantic 私有实现，NS 文件不修改
+
+## 统一发布补充（#81）
+
+统一模型发布调整为一个构建入口、一次准备和一个 Wasm。当前契约见 [模型发布契约](../ontology/MODEL-PUBLICATION.md)。独立的 IC DARI 入口删除；公共服务以 transform 承载通用转换语义，类型化查询协议在检查期完成校验与 lowering，执行期只绑定参数并执行计划。

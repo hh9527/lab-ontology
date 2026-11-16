@@ -1,11 +1,13 @@
 # 本体服务使用说明
 
-本文介绍基于本体的查询服务如何打包、启动和使用。当前模型服务只启用 transform；构建期从同一模型准备查询契约与静态知识，运行期恢复查询状态。
+IC 的统一模型服务使用 `ontology/model`，在同一制品发布知识、类型、codec 与 transform 契约，见 [模型发布契约](ontology/MODEL-PUBLICATION.md)及 [IC 构建与验收](icloud_model/docs/TYPED_MIGRATION.md)。
+
+下文介绍 NS 与 relation_model 的领域 Intent 服务如何打包、启动和使用。它们启用领域 transform；构建期准备查询契约与静态知识，运行期恢复查询状态。
 第 4 节列出本仓库领域，集成应用可替换或省略。构建命令在仓库根目录运行，runner 可从任意能访问产物的目录启动。
 第 1～2 节面向可信宿主，不面向发起查询的 Agent。
 
 本文是当前外部服务及 Intent 契约。模型作者和 QueryAst 边界见[本体文档](ontology/docs/ONTOLOGY.md)和[查询文档](ontology/docs/QUERY.md)。
-[关系示例](relation_model/README.md)和 [IC 领域指南](icloud_model/docs/DOMAIN.md)说明两个模型，均使用下文共享 Intent 语法。
+[关系示例](relation_model/README.md)使用下文的领域 Intent 语法；[IC 领域指南](icloud_model/docs/DOMAIN.md)说明 IC 的业务边界。
 评测结果记录早期实验，不是当前 API 契约。Telora 语言和 CLI 文档属于 Telora 项目，不在本仓库复制维护。
 
 ## 1. 构建运行期制品
@@ -35,7 +37,7 @@ telora-run <artifact>.wasm --serve http://127.0.0.1:8080
 HTTP 请求体就是槽位输入，不含 JSONL 的 `method`／`input` 信封。例如：
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8080/ic/transform \
+curl -sS -X POST http://127.0.0.1:8080/relation/transform \
   -H 'Content-Type: application/json' -d '{"intents":[{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"device"}],"edges":[],"select":[{"node":"d","dimension":"device_id"}],"order_by":[{"column":"d_device_id","direction":"Asc"}],"take":10}]}'
 ```
 
@@ -50,7 +52,7 @@ Agent 环境不得挂载快照、runner、源树、测试或评测材料，也�
 JSONL 请求恰好包含 `method` 和 `input`；method 选择槽位，仅 input 传入该槽位。
 HTTP 则直接把相同 input POST 到对应路径。当前使用 `<domain>/transform`，请求形状见下文 Intent 说明。
 
-当前 IC／relation 不挂载 info／discovery。宿主直接从 Wasm 的 `telora.build.information` 读取
+模型的知识发现通过静态发布完成，relation 不挂载 info／discovery。宿主直接从 Wasm 的 `telora.build.information` 读取
 `ontology.knowledge`，发布 `ontology-knowledge-javascript-v1` 的静态 JS 与模型 JSON 指令。
 同一 ontology 版本共用固定 JS，模型标注只派生 JSON。宿主用 `new Function("data", program)` 物化构图函数，
 传入 JSON.parse 后的 data，得到 v4 图及 vocabulary；词表用于 `va_ask`。
@@ -258,10 +260,9 @@ JSONL 服务响应使用 `telora.service/v1` 信封。transform 的 ok 包含上
 | 构建模块 | 领域 | 范围 |
 | --- | --- | --- |
 | `relation_model` | `relation` | 精简的租户、站点、设备和连通关系示例 |
-| `icloud_model` | `ic` | iMaster Cloud 建模压力夹具 |
+| `icloud_model` | `ontology/model` | IC 统一模型发布；协议见模型发布契约 |
 
-每个模型独立构建快照，暴露 `<domain>/transform` 及对应 HTTP POST 路由。
-两个模块均无需外部构建源，最小构建与请求流程见[关系示例](relation_model/README.md)。
+每个模型独立构建制品。relation_model 暴露 `relation/transform` 及对应 HTTP POST 路由；IC 暴露 `ontology/model`。模型均无需外部构建源，领域 Intent 的最小流程见[关系示例](relation_model/README.md)。
 IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。
 
 ## NeoSight 模型

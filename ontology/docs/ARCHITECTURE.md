@@ -16,8 +16,8 @@ NS 与 relation_model 当前使用 `ontology::registry`，它们的声明由 reg
 
 ## 服务发布
 
-`publication::prepare(payload, namespace, aliases, lower)` 纯计算生成 Program，`publication::stage` 在构建期准备相同的 Program 并附带 codec 元数据。Program 包括公开契约、查询类型证明函数和 transform 函数。发布器统一生成 codec、展示语义、字段映射及契约摘要。
+`publication::prepare(payload, namespace, aliases)` 纯计算生成 Program，包含公开契约和通用 transform 函数。`publication::stage(revision, roots, profile, namespace, aliases)` 在一次构建期准备中生成 Program 和全量知识。发布器统一生成 codec、展示语义、字段映射及契约摘要。
 
-`publication::dispatch(program, request)` 分发 contract/check_type/transform。模型入口绑定服务槽和运输层，发布模块不执行数据库查询。
+`publication::dispatch(program, request)` 分发 contract/transform。模型入口绑定服务槽和运输层，发布模块不执行数据库查询。当前类型化查询协议在 transform 中生成经过校验的参数化 SQLite 计划；执行期只绑定参数和执行计划。
 
-知识发布由模型准备中的 knowledge/world 链生成，与类型查询协议共享模型载荷。
+知识通过同一制品的 ontology.knowledge 元数据发布，与类型化查询协议共享同一次模型准备。详细边界见 [模型发布契约](../MODEL-PUBLICATION.md)。

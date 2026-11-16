@@ -1,13 +1,13 @@
 # DARI 模型输入
 
-IC 的 DARI 服务发布 `dari-model/v3` 契约，来源语义使用 Telora RFC 0322 的结构化输入。DARI 引擎公共端口、意图类型及回执规范见 [dari 模型证明契约](https://github.com/hh9527/dari/blob/main/docs/MODEL-ABI.md)。
+IC 的统一模型服务发布 `dari-model/v3` 契约，来源语义使用 Telora RFC 0322 的结构化输入。DARI 引擎公共端口、意图类型及回执规范见 [dari 模型证明契约](https://github.com/hh9527/dari/blob/main/docs/MODEL-ABI.md)。
 
 ## 服务请求
 
-`ontology/dari` 的 check_type 接收以下业务值：
+`ontology/model` 的 transform 接收以下业务值：
 
 ```json
-{"method":"check_type","input":{"intent":{"root":"node_0","nodes":[],"steps":[]}}}
+{"method":"transform","input":{"intent":{"root":"node_0","nodes":[],"steps":[]}}}
 ```
 
 intent 为有限的结构化 Value。模型直接通过 codec 解码，节点、投影字段、参数和步骤来源沿普通值流传播。传输来源不添加到业务字段中；宿主可为生成字段提供相同的原始表达式 span，并独立传入键来源。
@@ -26,4 +26,4 @@ dsh-oks 的 DARI 模型适配器在 worker 内使用 Node 内置 WebAssembly，�
 
 ## 模型集成入口
 
-模型通过 `ontology::publication::stage(payload, namespace, aliases, lower)` 在构建期组装公共契约、codec、check_type 与 transform。`lower` 显式选择 SQL 方言；服务槽通过 `publication::dispatch` 分发请求。模块职责见 [模块边界](docs/ARCHITECTURE.md)。
+模型通过 `ontology::publication::stage(revision, roots, profile, namespace, aliases)`，在一次构建期准备中发布知识、契约、codec 与转换能力。服务槽通过 `publication::dispatch` 分发 contract/transform；当前查询协议在 transform 内完成校验与 SQLite lowering，执行期只绑定参数并执行。完整契约见 [模型发布契约](MODEL-PUBLICATION.md)。
