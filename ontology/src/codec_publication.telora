@@ -1,0 +1,116 @@
+use crate::typed_query as typed;
+use crate::js_codec as js;
+use crate::codec_program;
+use crate::ontology as edsl;
+use std::value::{Value};
+use std::array;
+use std::dict;
+use std::json;
+use std::codec;
+
+type Pool = struct {
+    indices: Dict(Int),
+    values: Array(Value)
+};
+def empty: Fn() -> Pool = fn() {
+    {indices: {}, values: []}
+};
+def intern: Fn(Pool, Value) -> (Pool, Int) = fn(pool, value) {
+    let key = json::stringify(value);
+    match dict::get(pool.indices, key) {
+        Some(index) => (pool, index),
+        None => do {
+            let index = array::length(pool.values);
+            (
+                {
+                    indices: dict::merge(pool.indices, dict::from_pairs([(key, index)])),
+                    values: array::push(pool.values, value)
+                },
+                index
+            )
+        }
+    }
+};
+type Entry = struct {
+    key: String,
+    codec: Int,
+    presentation: Int,
+    semantic: Int
+};
+type State = struct {
+    codecs: Pool,
+    presentations: Pool,
+    semantics: Pool,
+    types: Array(Entry),
+    keys: Dict(Entry)
+};
+type Descriptors = struct {
+    codecs: Array(Value),
+    presentations: Array(Value),
+    semantics: Array(Value),
+    types: Array(Entry),
+    mappingDefinitions: Array(Value),
+    mappings: Array((String, Int))
+};
+def module_source: Fn(Array(typed::TypeRef), edsl::PreparedPayload) -> String = fn(refs, model) {
+    let state = array::fold(
+        refs,
+        {codecs: empty(), presentations: empty(), semantics: empty(), types: [], keys: {}}.ty!(
+            State
+        ),
+        fn(state, ref) {
+            let presentation = intern(state.presentations, js::presentation(ref.ty));
+            let semantic = intern(state.semantics, js::semantic(ref.ty));
+            array::fold(
+                js::descriptions(ref.ty, ref.storage),
+                state <~ {presentations: presentation.0, semantics: semantic.0},
+                fn(state, source) {
+                    let implementation = intern(state.codecs, source.value);
+                    let key = typed::type_key(ref <~ {storage: source.storage});
+                    let entry = {
+                        key,
+                        codec: implementation.1,
+                        presentation: presentation.1,
+                        semantic: semantic.1
+                    }.ty!(Entry);
+                    match dict::get(state.keys, key) {
+                        Some(previous) => if previous == entry {
+                            state
+                        } else {
+                            fail!("conflicting codec descriptors", key)
+                        },
+                        None => state <~ {
+                            codecs: implementation.0,
+                            types: array::push(state.types, entry),
+                            keys: dict::merge(state.keys, dict::from_pairs([(key, entry)]))
+                        }
+                    }
+                }
+            )
+        }
+    );
+    let mappings = array::fold(
+        array::filter(
+            model.dimensions,
+            fn(d) {
+                d.canonical_values != []
+            }
+        ),
+        (empty(), [].ty!(Array((String, Int)))),
+        fn(state, dimension) {
+            let value = intern(state.0, js::mapping(dimension));
+            let key = `\{model.entities[dimension.entity].id}/\{dimension.id}`;
+            (value.0, array::push(state.1, (key, value.1)))
+        }
+    );
+    let descriptors = {
+        codecs: state.codecs.values,
+        presentations: state.presentations.values,
+        semantics: state.semantics.values,
+        types: state.types,
+        mappingDefinitions: mappings.0.values,
+        mappings: mappings.1
+    }.ty!(Descriptors);
+    `const descriptors = \{json::stringify(codec::encode(descriptors))};\n\{codec_program::program}\n//# sourceURL=ontology-generated-codecs.mjs\n`
+};
+pub use self::{module_source};

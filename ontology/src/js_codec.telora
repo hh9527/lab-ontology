@@ -1,19 +1,16 @@
+# 模型属性形成 codec 描述；单份构造程序在宿主上实例化这些约束。
 use crate::shared_types as shared;
-# 模型属性生成运行时 JS codec；源码由模型构建产生。
 use std::prelude as prelude;
 use std::type_property as property;
 use std::codec as codec;
-use std::json as json;
 use std::type_desc as td;
 use std::array as array;
-use std::pipeline as pipeline;
 use std::value::{Value};
 use crate::intent as intent;
-use crate::knowledge as knowledge;
+use crate::type_catalog as catalog;
 use crate::enum_values as ev;
 use crate::ontology as edsl;
 use crate::quantity as quantity;
-
 @prelude::property(PropertyTarget::Type)
 type NumberRange = struct {
     min: Float,
@@ -29,40 +26,52 @@ def number_range: Fn(Float, Float) -> Fn(Type, Option(NumberRange)) -> NumberRan
         {min, max}
     }
 };
-def ranges: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
-    let range = match property::get_type_prop(ty, NumberRange.type) {
-        Some(range) => do {
-            if storage != intent::ResultType::Float && storage != intent::ResultType::Int {
-                fail!("number_range requires numeric storage", ty)
-            } else {
-                ()
-            };
-            `if (value < \{json::stringify(codec::encode(range.min))} || value > \{json::stringify(codec::encode(range.max))}) throw new TypeError('value outside model range');`
-        },
-        None => "",
-    };
-    let body = knowledge::resolved(ty);
-    let inherited = if td::kind(body) == td::TypeDescKind::Newtype {
-        ranges(td::children(body)[0], storage)
+
+def optional_value: Fn(Type) -> Option(Type) = fn(ty) {
+    catalog::describe(ty).optional
+};
+def leaf: Fn(Type) -> Type = fn(ty) {
+    let description = catalog::describe(ty);
+    if description.kind == td::TypeDescKind::Newtype {
+        leaf(td::children(description.body)[0])
     } else {
-        ""
+        ty
+    }
+};
+def ranges: Fn(Type, intent::ResultType) -> Array(NumberRange) = fn(ty, storage) {
+    let own = match property::get_type_prop(ty, NumberRange.type) {
+        Some(range) => if storage == intent::ResultType::Float || storage == intent::ResultType::Int {
+            [range]
+        } else {
+            fail!("number_range requires numeric storage", ty)
+        },
+        None => []
     };
-    `\{inherited}\{range}`
+    let description = catalog::describe(ty);
+    array::concat(
+        [
+            if description.kind == td::TypeDescKind::Newtype {
+                ranges(td::children(description.body)[0], storage)
+            } else {
+                []
+            },
+            own
+        ]
+    )
 };
 type EnumCase = struct {
     name: String,
     wires: Array(Value)
 };
-def leaf: Fn(Type) -> Type = fn(ty) {
-    let body = knowledge::resolved(ty);
-    if td::kind(body) == td::TypeDescKind::Newtype {
-        leaf(td::children(body)[0])
-    } else {
-        ty
-    }
+type EnumDescription = struct {
+    kind: String,
+    storage: intent::ResultType,
+    cases: Array(EnumCase),
+    tags: Array((String, Int)),
+    order: Array(String)
 };
-def enum_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
-    let variants = td::variants(knowledge::resolved(ty));
+def enum_description: Fn(Type, intent::ResultType) -> Value = fn(ty, storage) {
+    let variants = catalog::describe(ty).variants;
     if !array::all(
         variants,
         fn(v) {
@@ -102,122 +111,73 @@ def enum_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
             {name: v.name, wires: [wire]}.ty!(EnumCase)
         }
     );
-    let table = json::stringify(codec::encode(cases));
-    let order = json::stringify(codec::encode(ev::business_order(ty)));
-    let integer_tags = json::stringify(codec::encode(tags));
-    let shape = if storage == intent::ResultType::Int {
-        "Number.isSafeInteger(value)"
-    } else {
-        "typeof value === 'string'"
-    };
-    `(() => {
-        const cases = \{table};
-        const byName = new Map(cases.map(c => [c.name, c.wires[0]]));
-        const byWire = new Map(cases.map(c => [c.wires[0], c.name]));
-        const byTag = new Map(\{integer_tags}.map(([name,tag]) => [tag,name]));
-        const parse = value => {
-            if (typeof value === 'string' && byName.has(value)) return Object.freeze({tag:value});
-            if (Number.isSafeInteger(value) && byTag.has(value)) return Object.freeze({tag:byTag.get(value)});
-            if (value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && byName.has(value.tag)) return Object.freeze({tag:value.tag});
-            throw new TypeError('expected closed enum variant');
-        };
-        return Object.freeze({variants:Object.freeze(cases.map(c=>c.name)), order:Object.freeze(\{order}), parse,
-            encode: value => byName.get(parse(value).tag),
-            decode: value => { if (!(\{shape}) || !byWire.has(value)) throw new TypeError('unknown closed enum value'); return Object.freeze({tag:byWire.get(value)}); }
-        });
-    })()`
+    codec::encode(
+        {kind: "enum", storage, cases, tags, order: ev::business_order(ty)}.ty!(EnumDescription)
+    )
 };
-def optional_value: Fn(Type) -> Option(Type) = fn(ty) {
-    let body = knowledge::resolved(ty);
-    let variants = if td::kind(body) == td::TypeDescKind::Enum {
-        td::variants(body)
-    } else {
-        []
-    };
-    if array::length(variants) == 2 && array::any(
-        variants,
-        fn(v) {
-            v.name == "None" && v.payload == None
-        }
-    ) {
-        match array::find(
-            variants,
-            fn(v) {
-                v.name == "Some"
+type ScalarDescription = struct {
+    kind: String,
+    primary: String,
+    ranges: Array(NumberRange),
+    operations: Option(Array(quantity::Calculation))
+};
+type OptionalDescription = struct {
+    kind: String,
+    inner: Value
+};
+def describe: Fn(Type, intent::ResultType) -> Value = fn(ty, storage) {
+    match optional_value(ty) {
+        Some(inner) => codec::encode(
+            {kind: "optional", inner: describe(inner, storage)}.ty!(OptionalDescription)
+        ),
+        None => do {
+            let value = leaf(ty);
+            if value != Bool.type && catalog::describe(value).kind == td::TypeDescKind::Enum {
+                enum_description(value, storage)
+            } else {
+                let primary = match shared::semantic(ty) {
+                    Some("TimeZone") => if storage == intent::ResultType::String {
+                        "TimeZone"
+                    } else {
+                        fail!("TimeZone requires String storage")
+                    },
+                    _ => match storage {
+                        intent::ResultType::String => "String",
+                        intent::ResultType::Int => "Int",
+                        intent::ResultType::Float => "Float",
+                        intent::ResultType::Bool => "Bool",
+                        intent::ResultType::DateTimeUtc => "DateTimeUtc",
+                        intent::ResultType::EpochMillis => "EpochMillis",
+                        intent::ResultType::DateTime => "DateTime"
+                    }
+                };
+                codec::encode(
+                    {
+                        kind: "scalar",
+                        primary,
+                        ranges: ranges(ty, storage),
+                        operations: quantity::calculation_policy(ty)
+                    }.ty!(ScalarDescription)
+                )
             }
-        ) {
-            Some(v) => v.payload,
-            None => None
         }
-    } else {
-        None
     }
 };
-def optional_source: Fn(String) -> String = fn(inner) {
-    `(() => { const inner = \{inner}; return Object.freeze({...inner, parse: value => value === null ? null : inner.parse(value), encode: value => value === null ? null : inner.encode(value), decode: value => value === null ? null : inner.decode(value)}); })()`
-};
-def source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
-    match optional_value(ty) {
-        Some(inner) => optional_source(source(inner, storage)),
-        None => required_source(ty, storage)
-    }
-};
-def required_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
-    let value = leaf(ty);
-    if value != Bool.type && td::kind(knowledge::resolved(value)) == td::TypeDescKind::Enum {
-        enum_source(value, storage)
-    } else {
-        scalar_source(ty, storage)
-    }
-};
-def canonical_source: Fn(Type) -> String = fn(ty) {
-    match optional_value(ty) {
-        Some(inner) => optional_source(canonical_source(inner)),
-        None => required_canonical_source(ty)
-    }
-};
-def required_canonical_source: Fn(Type) -> String = fn(ty) {
-    let value = leaf(ty);
-    if value != Bool.type && td::kind(knowledge::resolved(value)) == td::TypeDescKind::Enum {
-        enum_source(value, intent::ResultType::String)
-    } else {
-        scalar_source(String.type, intent::ResultType::String)
-    }
-};
-# 基础类型 codec 由 DARI 宿主提供；自定义类型只增加自己的约束。
-def scalar_source: Fn(Type, intent::ResultType) -> String = fn(ty, storage) {
-    let key = match shared::semantic(ty) {
-        Some("TimeZone") => if storage == intent::ResultType::String {"\"TimeZone\""} else {fail!("TimeZone requires String storage")},
-        _ => json::stringify(codec::encode(storage)),
-    };
-    let range = ranges(ty, storage);
-    let operations = quantity::calculation_policy(ty);
-    let calculation_metadata = match operations {
-        Some(allowed) => `operations: Object.freeze(\{json::stringify(codec::encode(allowed))}),`,
-        None => "",
-    };
-    let metadata = calculation_metadata;
-    if range == "" && metadata == "" {
-        `primary[\{key}]`
-    } else {
-        `(() => { const base = primary[\{key}]; const parse = value => { value = base.parse(value); \{range} return value; }; return Object.freeze({\{metadata}parse, encode: value => base.encode(parse(value)), decode: value => parse(base.decode(value))}); })()`
-    }
-};
-type Source = struct {
+type Description = struct {
     storage: intent::ResultType,
-    code: String
+    value: Value
 };
-def sources: Fn(Type, intent::ResultType) -> Array(Source) = fn(ty, storage) {
-    let base = {storage, code: source(ty, storage)}.ty!(Source);
+def descriptions: Fn(Type, intent::ResultType) -> Array(Description) = fn(ty, storage) {
+    let base = {storage, value: describe(ty, storage)}.ty!(Description);
     let value = leaf(ty);
-    let body = knowledge::resolved(value);
-    if value != Bool.type && td::kind(body) == td::TypeDescKind::Enum && storage != intent::ResultType::Int {
+    let description = catalog::describe(value);
+    if value != Bool.type && description.kind == td::TypeDescKind::Enum && storage != intent::ResultType::Int {
         let tags = ev::integer_tags(value);
-        if tags != [] && array::length(tags) == array::length(td::variants(body)) {
+        if tags != [] && array::length(tags) == array::length(description.variants) {
             [
                 base,
-                {storage: intent::ResultType::Int, code: source(ty, intent::ResultType::Int)}.ty!(
-                    Source
+                {storage: intent::ResultType::Int, value: describe(ty, intent::ResultType::Int)}.ty!(
+                    Description
                 )
             ]
         } else {
@@ -227,7 +187,11 @@ def sources: Fn(Type, intent::ResultType) -> Array(Source) = fn(ty, storage) {
         [base]
     }
 };
-def mapping_source: Fn(edsl::DimensionEntry) -> String = fn(entry) {
+type MappingDescription = struct {
+    cases: Array(EnumCase),
+    fallback: Option(String)
+};
+def mapping: Fn(edsl::DimensionEntry) -> Value = fn(entry) {
     let cases = array::map(
         entry.canonical_values,
         fn(value) {
@@ -246,34 +210,49 @@ def mapping_source: Fn(edsl::DimensionEntry) -> String = fn(entry) {
             }.ty!(EnumCase)
         }
     );
-    let table = json::stringify(codec::encode(cases));
-    let fallback = json::stringify(codec::encode(entry.fallback));
-    `(() => { const cases = \{table}, fallback = \{fallback}; const byWire = new Map(cases.flatMap(c => c.wires.map(w => [w,c.name]))); const sample = cases[0].wires[0]; return Object.freeze({cases:Object.freeze(cases.map(c=>Object.freeze({name:c.name,wires:Object.freeze(c.wires)}))), fallback, map: value => { if (value === null) return null; if (typeof value !== typeof sample || (typeof sample === 'number' && !Number.isSafeInteger(value))) throw new TypeError('invalid field mapping source'); if (byWire.has(value)) return Object.freeze({tag:byWire.get(value)}); if (fallback !== null) return Object.freeze({tag:fallback}); throw new TypeError('unmapped strict field value'); }}); })()`
+    codec::encode({cases, fallback: entry.fallback}.ty!(MappingDescription))
 };
 pub use self::{
     NumberRange,
     number_range,
-    source,
-    canonical_source,
     optional_value,
-    mapping_source,
-    Source,
-    sources
+    describe,
+    Description,
+    descriptions,
+    mapping
 };
-
 # 展现和共享语义分别发布，不属于 parse/encode/decode 的实现。
-type DisplayPresentation = struct {multiplier:Float,suffix:String,precision:Int};
-def presentation_source: Fn(Type) -> String = fn(ty) {
-    let digits=quantity::display_digits(ty);
-    let policy:Option(DisplayPresentation)=match quantity::display_policy(ty) {
-        Some(scale)=>Some({multiplier:scale.multiplier,suffix:scale.suffix,precision:match digits {Some(value)=>value,None=>2}}),
-        None=>match digits {Some(value)=>Some({multiplier:1.0,suffix:"",precision:value}),None=>None},
+type DisplayPresentation = struct {
+    multiplier: Float,
+    suffix: String,
+    precision: Int
+};
+def presentation: Fn(Type) -> Value = fn(ty) {
+    let digits = quantity::display_digits(ty);
+    let policy: Option(DisplayPresentation) = match quantity::display_policy(ty) {
+        Some(scale) => Some(
+            {
+                multiplier: scale.multiplier,
+                suffix: scale.suffix,
+                precision: match digits {
+                    Some(value) => value,
+                    None => 2
+                }
+            }
+        ),
+        None => match digits {
+            Some(value) => Some({multiplier: 1.0, suffix: "", precision: value}),
+            None => None
+        },
     };
-    json::stringify(codec::encode(policy))
+    codec::encode(policy)
 };
-type SemanticIdentity = struct {identity:Option(String),semantic:Option(String)};
-def semantic_source: Fn(Type) -> String = fn(ty) {
-    let identity: SemanticIdentity = {identity:shared::direct(ty),semantic:shared::semantic(ty)};
-    json::stringify(codec::encode(identity))
+type SemanticIdentity = struct {
+    identity: Option(String),
+    semantic: Option(String)
 };
-pub use self::{presentation_source,semantic_source};
+def semantic: Fn(Type) -> Value = fn(ty) {
+    let identity: SemanticIdentity = {identity: shared::direct(ty), semantic: shared::semantic(ty)};
+    codec::encode(identity)
+};
+pub use self::{presentation, semantic};

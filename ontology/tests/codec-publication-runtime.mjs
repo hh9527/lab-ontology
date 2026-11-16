@@ -1,0 +1,53 @@
+// bin/telora -C ontology eval @test/publication:runtime_contract > "$TMPDIR/contract.json"
+// node ontology/tests/codec-publication-runtime.mjs "$TMPDIR/contract.json" /path/to/telora-model.ts
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {createRequire} from 'node:module';
+import {resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
+const [file, adapter] = process.argv.slice(2);
+assert(file && adapter, 'Expected contract JSON and plugin adapter path');
+const require = createRequire(pathToFileURL(resolve(adapter)));
+const {primaryCodecs} = await import(pathToFileURL(require.resolve('@hh9527/dari-core/codecs')));
+const contract = JSON.parse(readFileSync(file));
+const module = await import('data:text/javascript;base64,' + Buffer.from(contract.codec_module).toString('base64'));
+const codecs = module.createCodecs(primaryCodecs);
+const entry = name => contract.types.find(t => t.name === 'lab::' + name);
+const key = (name, storage) => {const t = entry(name); assert(t, name); return t.logical + '@' + (storage ?? t.storage);};
+const get = (name, storage) => codecs[key(name, storage)];
+const range = get('NarrowThreshold');
+assert.equal(range.parse(50), 50);
+for (const value of [-1, 5, 95, 101, '50', null]) assert.throws(() => range.parse(value));
+assert.equal(get('Threshold').parse(5), 5);
+const kind = get('Kind'), integer = get('Kind', 'Int');
+assert.deepEqual(kind.order, ['Onu', 'Olt', 'Unknown']);
+for (const [name, tag] of [['Olt', 9], ['Onu', 1], ['Unknown', 99]]) {
+  assert.deepEqual(kind.parse(name), {tag: name});
+  assert.deepEqual(kind.parse(tag), {tag: name});
+  assert.equal(kind.encode({tag: name}), name);
+  assert.deepEqual(integer.decode(tag), {tag: name});
+  assert.equal(integer.encode(name), tag);
+}
+for (const value of ['other', 999, {tag: 'Olt', extra: true}, null]) assert.throws(() => kind.parse(value));
+assert.throws(() => integer.decode('9'));
+const optional = get('OptionalKind');
+for (const operation of ['parse', 'encode', 'decode']) assert.equal(optional[operation](null), null);
+assert.deepEqual(optional.decode('Olt'), {tag: 'Olt'});
+assert.equal(get('TimeZone').parse('Asia/Shanghai'), 'Asia/Shanghai');
+assert.throws(() => get('TimeZone').parse('Not/AZone'));
+assert(get('Percent').operations.includes('Mean'));
+assert(!get('Percent').operations.includes('Sum'));
+assert.equal(module.presentations[key('Percent')].suffix, '%');
+assert.equal(module.semantics[key('Percent')].identity, 'Percent');
+assert.notEqual(entry('PlainA').logical, entry('PlainB').logical);
+assert.equal(get('PlainA'), get('PlainB'), 'Independent nominal types share an identical codec implementation');
+assert.notEqual(module.semantics[key('PlainA')], module.semantics[key('PlainB')], 'Mutable metadata views remain independent');
+const mapping = module.mappings['reading/kind'];
+assert.equal(mapping, module.mappings['reading/peer_kind'], 'Equal field mapping descriptions share one implementation');
+assert.deepEqual(mapping.map('olt'), {tag: 'Olt'});
+assert.deepEqual(mapping.map('ne.category.olt'), {tag: 'Olt'});
+assert.deepEqual(mapping.map('future-kind'), {tag: 'Unknown'});
+assert.equal(mapping.map(null), null);
+assert.throws(() => mapping.map(9));
+assert(Object.isFrozen(mapping.cases) && Object.isFrozen(mapping.cases[0].wires));
+console.log('Codec publication: independent nominal identities, shared implementations, inherited ranges, enum wire/tag order, nullable codecs, timezone, calculation/display policies and multi-wire Unknown/NULL mappings passed');

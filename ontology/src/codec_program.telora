@@ -1,0 +1,62 @@
+# 模型制品内的通用构造程序；业务约束来自随模型发布的描述表。
+pub def program: String = r#"
+const freeze = Object.freeze;
+function makeCodec(d, primary) {
+  if (d.kind === 'optional') {
+    const inner = makeCodec(d.inner, primary);
+    return freeze({...inner, parse: v => v === null ? null : inner.parse(v), encode: v => v === null ? null : inner.encode(v), decode: v => v === null ? null : inner.decode(v)});
+  }
+  if (d.kind === 'scalar') {
+    const base = primary[d.primary];
+    if (!base) throw new TypeError('missing primary codec ' + d.primary);
+    if (!d.ranges.length && d.operations === null) return base;
+    const parse = value => {
+      value = base.parse(value);
+      for (const r of d.ranges) if (value < r.min || value > r.max) throw new TypeError('value outside model range');
+      return value;
+    };
+    return freeze({...(d.operations === null ? {} : {operations: freeze(d.operations)}), parse, encode: v => base.encode(parse(v)), decode: v => parse(base.decode(v))});
+  }
+  if (d.kind !== 'enum') throw new TypeError('unknown model codec kind');
+  const byName = new Map(d.cases.map(c => [c.name, c.wires[0]]));
+  const byWire = new Map(d.cases.map(c => [c.wires[0], c.name]));
+  const byTag = new Map(d.tags.map(([name, tag]) => [tag, name]));
+  const parse = value => {
+    if (typeof value === 'string' && byName.has(value)) return freeze({tag: value});
+    if (Number.isSafeInteger(value) && byTag.has(value)) return freeze({tag: byTag.get(value)});
+    if (value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && byName.has(value.tag)) return freeze({tag: value.tag});
+    throw new TypeError('expected closed enum variant');
+  };
+  return freeze({variants: freeze(d.cases.map(c => c.name)), order: freeze(d.order), parse,
+    encode: value => byName.get(parse(value).tag),
+    decode: value => {
+      if (!(d.storage === 'Int' ? Number.isSafeInteger(value) : typeof value === 'string') || !byWire.has(value)) throw new TypeError('unknown closed enum value');
+      return freeze({tag: byWire.get(value)});
+    }
+  });
+}
+function makeMapping(d) {
+  const byWire = new Map(d.cases.flatMap(c => c.wires.map(w => [w, c.name])));
+  const sample = d.cases[0].wires[0];
+  return freeze({cases: freeze(d.cases.map(c => freeze({name: c.name, wires: freeze(c.wires)}))), fallback: d.fallback,
+    map: value => {
+      if (value === null) return null;
+      if (typeof value !== typeof sample || (typeof sample === 'number' && !Number.isSafeInteger(value))) throw new TypeError('invalid field mapping source');
+      if (byWire.has(value)) return freeze({tag: byWire.get(value)});
+      if (d.fallback !== null) return freeze({tag: d.fallback});
+      throw new TypeError('unmapped strict field value');
+    }
+  });
+}
+export function createCodecs(primary) {
+  const implementations = descriptors.codecs.map(d => makeCodec(d, primary));
+  return freeze(Object.fromEntries(descriptors.types.map(t => [t.key, implementations[t.codec]])));
+}
+export const presentations = freeze(Object.fromEntries(descriptors.types.map(t => {
+  const value = descriptors.presentations[t.presentation];
+  return [t.key, value === null ? null : {...value}];
+})));
+export const semantics = freeze(Object.fromEntries(descriptors.types.map(t => [t.key, {...descriptors.semantics[t.semantic]}])));
+const mappingImplementations = descriptors.mappingDefinitions.map(makeMapping);
+export const mappings = freeze(Object.fromEntries(descriptors.mappings.map(([key, index]) => [key, mappingImplementations[index]])));
+"#;
