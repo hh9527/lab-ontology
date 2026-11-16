@@ -32,4 +32,4 @@ classification: Option(String),
 
 没有业务顺序的语义分类在远端和本地排序时均被拒绝。raw 排序依据原始类型处理；作者可以显式选择它，不会改变语义投影字段的类型。
 
-验收入口：`ontology/tests/mapped_scopes.telora`、`ontology/tests/mapped-scopes-runtime.mjs`、`dari/semantic-order-test.ts`。IC 的角色和 OLT 样本聚合验收见 `icloud_model/tests/mapped_pon.telora`。
+验收入口：`ontology/tests/mapped_scopes.telora`、`ontology/tests/mapped-scopes-runtime.mjs`、独立 [DARI 仓库](https://github.com/hh9527/dari) 中的语义排序测试。IC 的角色和 OLT 样本聚合验收见 `icloud_model/tests/mapped_pon.telora`。

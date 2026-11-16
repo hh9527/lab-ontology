@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
+import {resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {DatabaseSync} from 'node:sqlite';
 const cases=JSON.parse(readFileSync(process.argv[2]??0,'utf8'));
 const db=new DatabaseSync(':memory:');
@@ -10,8 +12,11 @@ const insert=db.prepare('INSERT INTO samples VALUES(?,?,?,?)');
 for(const [i,[ts,value]]of samples.entries())insert.run(i,new Date(ts).toISOString(),Date.parse(ts),value);
 insert.run(samples.length,'2026-05-03T00:00:00.000Z',null,7);
 const rows=db.prepare('SELECT ts,epoch,value FROM samples').all();
-const {utcBucket,calendarBucket,registerCalendarSqlite}=await import('../../dari/src/calendar.ts');
-registerCalendarSqlite(db);
+// Pass the independent DARI checkout as the second argument.
+const dariRoot=process.argv[3];
+if(!dariRoot)throw Error('Usage: node typed-utc-bucket-runtime.mjs <cases.json> <dari-checkout>');
+const {utcBucket,calendarBucket,registerCalendarFunctions}=await import(pathToFileURL(resolve(dariRoot,'packages/dari-core/src/calendar.ts')).href);
+registerCalendarFunctions({registerFunction:(name,options,fn)=>db.function(name,options,fn)});
 for(const {mode,encoding,unit,result,intent_json}of cases)for(const zone of mode==='region'?['Asia/Shanghai','America/New_York','America/Havana','Australia/Lord_Howe','Asia/Kathmandu']:['UTC']){
  assert.match(result.sql,/GROUP BY/);
  assert.equal(result.receipt.inputDigest,createHash('sha256').update(intent_json).digest('hex'));
