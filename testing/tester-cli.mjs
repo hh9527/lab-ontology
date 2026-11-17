@@ -974,7 +974,7 @@ async function cmdSample(pos, flags) {
     console.warn(notes[notes.length - 1]);
   }
 
-  const created = await rpc(state, 'session/create', { cwd, agentPreset: String(flags.preset ?? 'oks') });
+  const created = await rpc(state, 'session/create', { cwd, agentPreset: String(flags.preset ?? 'data-seer') });
   state.sessionId = created.sessionId;
   if (flags.model) {
     const [provider, model] = String(flags.model).split('/');
