@@ -72,6 +72,7 @@ const HELP = `tester-cli — 试卷测试员命令行
   --timeout 秒     单次等待上限（默认 900）
   --poll 秒        轮询间隔（默认 4）
   --idle 次数      连续空闲多少次判定作答结束（默认 3）
+  --effort 档位    推理档位（off/low/high；省略则用提供方默认）
   --preview 字数   回复预览长度（默认 800，0 表示全给）
   --quiet          只打印计时行
   --json           以 JSON 输出（sessions / state / record）
@@ -978,7 +979,7 @@ async function cmdSample(pos, flags) {
   if (flags.model) {
     const [provider, model] = String(flags.model).split('/');
     if (!provider || !model) throw new Error('--model 用法：provider/model，例如 openai/gpt-6.1-terra');
-    const picked = await rpc(state, 'session/selectModel', { sessionId: created.sessionId, provider, model });
+    const picked = await rpc(state, 'session/selectModel', { sessionId: created.sessionId, provider, model, ...(flags.effort ? { reasoningEffort: String(flags.effort) } : {}) });
     console.log(`✓ 模型切换 ${JSON.stringify(picked.selected ?? picked)}`);
   }
   await saveState(state);
