@@ -95,7 +95,7 @@ def main():
     args = p.parse_args()
     out = args.output.resolve()
     assert not out.exists(), 'use a fresh output directory'
-    for name in ['ontology', 'icloud_model', 'ns_model', 'relation_model']:
+    for name in ['ontology', 'icloud_model', 'relation_model']:
         shutil.copytree(ROOT / name, out / name, ignore=shutil.ignore_patterns('target', '*.wasm'))
     for name in ['telora-config.json', 'telora-lock.json']:
         shutil.copy2(ROOT / name, out / name)

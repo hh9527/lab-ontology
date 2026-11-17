@@ -10,7 +10,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--model', default='ns_model', choices=['ns_model', 'icloud_model'])
+parser.add_argument('--model', default='icloud_model', choices=['icloud_model'])
 parser.add_argument('--reuse', type=Path, help='Reuse a measured baseline and refresh candidate sources')
 args = parser.parse_args()
 base = Path(os.environ.get('TMPDIR') or Path.home() / '.cache/tmp')

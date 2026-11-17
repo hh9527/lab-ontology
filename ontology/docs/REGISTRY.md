@@ -51,7 +51,3 @@ trait Registerable {
 ## IC 模型
 
 IC 使用 semantic 建模入口，模型准备和服务验收见 [IC 类型模型](../../icloud_model/docs/TYPED_MIGRATION.md)。
-
-## NS 模型
-
-NS 使用 semantic 建模入口，以具名身份、Reference、联合角色及外置关系约束业务可解空间。字段 Property 声明分类映射、统计及共享维度能力。模型组织、统一发布及隔离验收见 [NS 类型模型](../../ns_model/README.md)。

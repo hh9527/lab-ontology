@@ -1,6 +1,6 @@
 # 本体服务使用说明
 
-IC 与 NS 的统一模型服务使用 `ontology/model`，在同一制品发布知识、类型、codec 与 transform 契约，见 [模型发布契约](ontology/MODEL-PUBLICATION.md)及 [IC 构建与验收](icloud_model/docs/TYPED_MIGRATION.md)。
+IC 的统一模型服务使用 `ontology/model`，在同一制品发布知识、类型、codec 与 transform 契约，见 [模型发布契约](ontology/MODEL-PUBLICATION.md)及 [IC 构建与验收](icloud_model/docs/TYPED_MIGRATION.md)。
 
 下文介绍 relation_model 的领域 Intent 服务如何打包、启动和使用。该模型启用领域 transform；构建期准备查询契约与静态知识，运行期恢复查询状态。
 第 4 节列出本仓库领域，集成应用可替换或省略。构建命令在仓库根目录运行，runner 可从任意能访问产物的目录启动。
@@ -264,16 +264,3 @@ JSONL 服务响应使用 `telora.service/v1` 信封。transform 的 ok 包含上
 
 每个模型独立构建制品。relation_model 暴露 `relation/transform` 及对应 HTTP POST 路由；IC 暴露 `ontology/model`。模型均无需外部构建源，领域 Intent 的最小流程见[关系示例](relation_model/README.md)。
 IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。
-
-## NeoSight 模型
-
-`ns_model/` 使用 `ontology::semantic` 声明业务类型、字段能力和关系，经统一发布器一次准备知识、类型、codec 与 transform。源时间单位待确认项、迁移边界和构建命令见 [NS 模型](ns_model/README.md)。
-
-### NS 演示数据
-
-```sh
-node scripts/generate-ns-data.mjs --output bin/ns-data --anchor-utc 2026-10-27T00:00:00Z
-node scripts/tests/ns-data.test.mjs
-```
-
-生成数据包含 151 张表、2,118 列、资源关系与 KPI 时间序列，输出 SQLite 和可复查清单。实际模型 SQL 验收与关系基数约束见 [NS 演示数据说明](ns_model/docs/SYNTHETIC_DATA.md)。

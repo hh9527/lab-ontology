@@ -42,7 +42,7 @@ def build_information(path):
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--model', default='ns_model', choices=['ns_model'])
+parser.add_argument('--model', default='icloud_model', choices=['icloud_model'])
 parser.add_argument('--cases', default='prepare_only,roots,types,datasets,full')
 args = parser.parse_args()
 base = Path(os.environ.get('TMPDIR') or Path.home() / '.cache/tmp')

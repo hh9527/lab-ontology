@@ -14,7 +14,7 @@ if not workspace.exists(): subprocess.run(['python3',str(root/'scripts/prepare-m
 compiler=args.telora.resolve()
 information=runpy.run_path(str(root/'scripts/measure-mut-ceiling.py'))['information']
 report={'compilerSha256':hashlib.sha256(compiler.read_bytes()).hexdigest(),'cases':[]}
-for model in ['icloud_model','ns_model']:
+for model in ['icloud_model']:
     expected=None
     for variant in ['baseline','automatic']:
         env=dict(os.environ)

@@ -40,7 +40,7 @@ def information(path):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--telora', type=Path, required=True)
-    p.add_argument('--models', nargs='+', default=['icloud_model', 'ns_model'])
+    p.add_argument('--models', nargs='+', default=['icloud_model'])
     p.add_argument('--variants', nargs='+', default=['baseline', 'literal', 'best', 'no-knowledge', 'types-only'])
     p.add_argument('--repeats', type=int, default=1)
     p.add_argument('--output', type=Path)

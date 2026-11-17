@@ -22,16 +22,6 @@ build: _check_telora
       -o dist/ic-model.wasm
     ls -l dist/ic-model.wasm
 
-# NS 领域模型，产物为 dist/ns-model.wasm。
-build-ns: _check_telora
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p dist
-    "{{telora}}" -C ns_model build @src/lib --staged \
-      --initialization-fuel 400000 --request-fuel 100000 --with-memory-limit 2048 \
-      -o dist/ns-model.wasm
-    ls -l dist/ns-model.wasm
-
 # 清理构建产物。
 clean:
     rm -rf dist
