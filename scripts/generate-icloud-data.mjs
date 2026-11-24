@@ -1,3 +1,4 @@
+import { createAvailability } from './icloud-availability.mjs';
 import { createKpiWaves } from './kpi-waveforms.mjs';
 import { createPonOptics } from './pon-optics.mjs';
 import { alarmFamilies, alarmProfile, alarmEvent } from './icloud-alarm-profiles.mjs';
@@ -45,19 +46,8 @@ const resourceNames = {
 };
 
 const defaultWaves = createKpiWaves(20261031);
-export function onlineRate(index, time, interval) {
-  // One staggered, finite outage per week. A whole-interval outage is a real
-  // zero; absence of an observation is represented by an absent row.
-  const cycle = 7 * 86400000;
-  const offset = ((index * 37 + 11) % 168) * 3600000;
-  const duration = (12 + index % 7 * 8) * 60000;
-  const downtimeUntil = end => {
-    const cycles = Math.floor((end - offset) / cycle);
-    return cycles * duration + Math.min(duration, end - offset - cycles * cycle);
-  };
-  return 100 * (1 - (downtimeUntil(time + interval) - downtimeUntil(time)) / interval);
-}
-export function metricValue(table, column, index, sample, interval, random, samples = 1, startMs = 0, waves = defaultWaves) {
+const defaultAvailability = createAvailability(20261031);
+export function metricValue(table, column, index, sample, interval, random, samples = 1, startMs = 0, waves = defaultWaves, online = null, sampleTime = startMs + sample * interval) {
   const elapsed = sample * interval;
   // A synthetic UTC+08 business clock: peaks around afternoon, quiet nights,
   // lower weekends and occasional resource-specific incidents.
@@ -82,7 +72,7 @@ export function metricValue(table, column, index, sample, interval, random, samp
   }
   if (/onlineRate/i.test(column)) {
     // A rate is the online fraction of this interval, not a missing sample.
-    return onlineRate(index, startMs + elapsed, interval);
+    return (online ?? ((time, span) => defaultAvailability.rate({id: `${table}:${index}`}, time, span)))(sampleTime, interval);
   }
   if (/optics.*power/i.test(column)) return (/tx/i.test(column) ? -4 : -20) + daily * 1.5 - incident * 3;
   if (/rssi/i.test(column)) return -65 + daily * 7 - incident * 8;
@@ -156,6 +146,7 @@ export function generate(options, model = loadModel()) {
     return state / 4294967296;
   }
   const waves = createKpiWaves(seed);
+  const availability = createAvailability(seed);
   const rows = new Map();
   const enums = new Map();
   const enumDefinitions = new Map();
@@ -210,10 +201,18 @@ export function generate(options, model = loadModel()) {
     const count = table === 'X_TENANT_VIEW' ? tenants.count : table === 'I_EnterpriseNetworkLTP' ? resources * 4 : resources;
     rows.set(table, Array.from({ length: count }, (_, index) => Object.fromEntries(dataset.fields.map(field => [field.column, value(dataset, field, index)]))));
   }
+  const identities = new Map();
+  for (const entries of rows.values()) for (const row of entries) if (row.id) {
+    identities.set(row.id, row);
+  }
+  const availabilityIdentity = (row, table, index) => {
+    const owner = identities.get(row.resId ?? row.id) ?? row;
+    return {id: owner.id ?? row.resId ?? `${table}:${index}`, classification: owner.classification ?? ''};
+  };
   const networkClasses = enumDefinitions.get('I_EntNetworkElement.classification');
   rows.get('I_EntNetworkElement').forEach((row,index) => Object.assign(row,
     networkDevicePresentation(row.classification,networkClasses,row.manufacturer,index,row.productName),
-    {commuState: onlineRate(index, anchorMs - 1, 1) === 0 ? '1' : '0'}));
+    {commuState: availability.rate(availabilityIdentity(row, 'I_EntNetworkElement', index), anchorMs - 1, 1) === 0 ? '1' : '0'}));
   const pon = rows.get('I_EntPonElement');
   const oltCount = Math.max(1, Math.floor(resources / 8));
   const splitterCount = Math.max(1, Math.floor(resources / 4));
@@ -393,7 +392,7 @@ export function generate(options, model = loadModel()) {
       const metricTable = {PhysicalServer:'ServerDeviceKPI', HuaweiStorageDevice:'StorageDeviceKPI',
         FCSwitchDevice:'StorageDeviceKPI', I_EntPonElement:'PonDeviceKPI'}[family] ?? 'NetworkDeviceKPI';
       const load = waves(metricTable, metricTable === 'StorageDeviceKPI' ? 'cpuusage' : 'cpuUsage', index).at(occur).load;
-      row.ALARMNAME = alarmEvent({...profile, ports}, load, onlineRate(index, occur, 60000) < 100,
+      row.ALARMNAME = alarmEvent({...profile, ports}, load, availability.rate(availabilityIdentity(owner, family, index), occur, 60000) < 100,
         categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'event'),
         categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'event-variant'));
       const port = ports[Math.floor(categoryRandom(seed, 'T_CURRENT_ALARM', eventIndex, 'port') * ports.length)];
@@ -429,6 +428,8 @@ export function generate(options, model = loadModel()) {
       const sourceFields = catalog.datasets.find(entry => entry.table === table).fields;
       const metricColumns = new Set(sourceFields.filter(field => field.columnType === 'measure').map(field => field.name));
       for (const [index, base] of rows.get(table).entries()) {
+        const resource = availabilityIdentity(base, table, index);
+        const online = (time, span) => availability.rate(resource, time, span);
         const optics = table === 'PonDeviceOnuKPI' ? createPonOptics(seed, base.resId, base.parentId) : null;
         const phase = Math.floor(categoryRandom(seed, table, index, 'sampling-phase') * 101);
         const missing = 2 + Math.floor(categoryRandom(seed, table, index, 'sampling-missing') * 7);
@@ -442,9 +443,10 @@ export function generate(options, model = loadModel()) {
             const jitter = sample === 0 || sample === samples - 1 ? 0
               : Math.floor(((sample * 7919 + phase * 104729) % 1009) / 1009 * Math.min(180000, interval * 0.04));
             row.ts = iso(startMs + sample * interval + jitter);
-            const opticalValues = optics?.(Date.parse(row.ts));
+            const sampleTime = Date.parse(row.ts);
+            const opticalValues = optics?.(sampleTime);
             for (const field of dataset.fields) if (metricColumns.has(field.column)) {
-              let number = opticalValues?.[field.column] ?? metricValue(table, field.column, index, sample, interval, random, samples, startMs, waves);
+              let number = opticalValues?.[field.column] ?? metricValue(table, field.column, index, sample, interval, random, samples, startMs, waves, online, sampleTime);
               if (field.scalar === 'Int') number = Math.round(number);
               if (field.scalar === 'Float') number = Number(number.toFixed(3));
               if (field.scalar === 'Int' || field.scalar === 'Float') row[field.column] = number;
@@ -487,7 +489,7 @@ export function generate(options, model = loadModel()) {
     const manifest = {
       format: 'icloud-synthetic-data/v1', revision: model.revision,
       options: { seed, resources, tenants: tenants.count, days, intervalMinutes, anchor: inputAnchor, storageGapHours, alarmsPerResourcePerDay },
-      generation: { revision: 11, ponOpticsProfile: 'hierarchical-path-loss/v1', alarmProfile: 'asset-derived-conditional-events/v2', capacityUtilizationProfile: 'conserved-capacity-mb/v2', samplingProfile: 'seeded-missing-jitter/v1', topologyProfile: 'multi-port-multi-onu/v1', availabilityProfile: 'interval-downtime/v1', devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v2', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
+      generation: { revision: 12, ponOpticsProfile: 'hierarchical-path-loss/v1', alarmProfile: 'asset-derived-conditional-events/v2', capacityUtilizationProfile: 'conserved-capacity-mb/v2', samplingProfile: 'seeded-missing-jitter/v1', topologyProfile: 'multi-port-multi-onu/v1', availabilityProfile: 'seeded-device-events/v2', devicePresentationProfile: 'canonical-device-class/v1', waveformProfile: 'business-envelope-seeded-jitter/v2', waveformSha256: hash(readFileSync(new URL('./kpi-waveforms.mjs', import.meta.url))), categoryProfile: 'seeded-weighted-categories/v1', tenantDistribution: { tenants: tenants.count, tiers: tenants.tiers }, alarmSeverityWeights: { critical: 1, major: 1.8, minor: 3.2, warning: 4 }, profile: 'daily-business-demo', seriesGaps, alarmDays, metricBusinessUtcOffsetHours: 8 },
       window: { start: iso(startMs), endExclusive: anchor, samplesPerSeries: samples },
       catalogSha256: hash(catalogBytes), modelSha256: hash(JSON.stringify(model)),
       database: { file: 'icloud.sqlite', sha256: hash(readFileSync(databasePath)) },

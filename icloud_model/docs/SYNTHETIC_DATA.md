@@ -77,12 +77,12 @@ StorageDeviceKPI 对每个存储设备和 FC 交换机都有完整序列，故�
 
 本工具参考 `icloud-corpus/pack/tables.py` 的服务器、存储和磁盘档位，以及
 `pack/alarms.py` 的快照时间约束。参考包使用独立表结构和场景规模；本工具仍以本仓准备模型与源目录为结构契约。
-生成规则版本记录在 manifest 的 `generation.revision`，当前为 11，`profile` 为 `daily-business-demo`。
+生成规则版本记录在 manifest 的 `generation.revision`，当前为 12，`profile` 为 `daily-business-demo`。
 这些档位是合成场景，不扩展模型能力，也不声明与参考包逐行一致。
 
 - 服务器 CPU／内存按百分比生成，systemPower／averagePower／peakPower 使用功率数值档位，peakPower 始终大于 averagePower
 - 存储与 FC 的 CPU／内存覆盖高／中／低负载；磁盘 utility 使用百分比，avgreadiosize／avgwriteiosize 使用独立正数档位，保留模型声明单位
-- 有效样本计数 Effcnt 为 1；在线率的日内中断按经过时间计算，改变采样间隔后仍覆盖每日前四小时
+- 有效样本计数 Effcnt 为 1；在线率由按种子、物理设备身份和绝对 UTC 日期生成的停机事件计算；分类可靠性、设备可靠性、发生时刻及修复时长各有差异；设备按种子划分为约 65% 稳定、25% 间歇故障、10% 持续不稳定群体，修复时长平滑限制在 12 小时以内。这些分类差异是合成场景，不代表真实设备类别的可靠性结论。按停机区间并集与实际采样区间的重叠时长计算，改变窗口或采样粒度仍使用同一批事件，通信状态和告警场景共享这些事件
 - 告警到达、确认、清除及末次发生时间保持在锚点之前，未确认／未清除时间仍使用零
 - KPI 建立 `(resId,ts)`，有 parentId 的表另建 `(parentId,ts)`，并执行 ANALYZE
 - 小时指标按 UTC+08 的合成业务时钟表现昼夜和周末差异，叠加资源相位差、高中低档位、缓慢趋势、小幅噪声及少量短时异常；UTC 时间存储不变

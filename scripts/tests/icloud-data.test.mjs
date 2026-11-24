@@ -3,9 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { generate, loadModel, validate, onlineRate } from '../generate-icloud-data.mjs';
+import { generate, loadModel, validate } from '../generate-icloud-data.mjs';
 import { tenantLayout, tenantPresentation } from '../icloud-category-profiles.mjs';
 import { alarmEvent } from '../icloud-alarm-profiles.mjs';
+import { createAvailability } from '../icloud-availability.mjs';
 
 const directory = mkdtempSync(join(process.env.TMPDIR || join(homedir(), '.cache/tmp'), 'icloud-data-test-'));
 const model = loadModel();
@@ -14,7 +15,6 @@ function assertRelationCoverage(manifest) {
   assert.deepEqual(manifest.checks.relations.filter(relation=>relation.upperBoundExceeded), []);
 }
 const options = { seed: 20260926, resources: 12, days: 2, intervalMinutes: 60, anchor: '2026-10-03T12:00:00Z' };
-const hour = 3600000;
 const largeTenants = tenantLayout(150, options.seed, 30);
 assert.equal(new Set(largeTenants.assignments).size, 30);
 assert.deepEqual(largeTenants.tiers.map(tier => largeTenants.assignments.filter(index =>
@@ -25,10 +25,6 @@ for (let i=0; i<100; i++) {
   const name = alarmEvent({MECATEGORY:'EntPonElement', METYPE:'ne.category.pon.spl', ports:[]},1,false,i/100,i/100);
   assert.ok(!/CPU|内存|温度|离线/.test(name), 'Passive splitters only have optical-path scenarios');
 }
-assert.equal(onlineRate(0, 11 * hour, hour), 80, 'A 12-minute outage is 80% online over an hour');
-assert.equal(onlineRate(0, 12 * hour, hour), 100, 'The outage terminates');
-assert.equal(onlineRate(6, ((6 * 37 + 11) % 168) * hour, hour), 0, 'A full-hour outage is an intentional zero');
-assert.equal(onlineRate(0, 0, 14 * 24 * hour), 100 * (1 - 24 / (14 * 24 * 60)), 'Long intervals include every outage');
 let db;
 try {
   const first = generate({ ...options, output: join(directory, 'first') }, model);
@@ -85,6 +81,16 @@ try {
   const {networkDeviceCategory} = await import('../icloud-category-profiles.mjs');
   for (const member of classes) for (const wire of member.wires) assert.equal(networkDeviceCategory(Object.values(wire)[0],classes).id,member.id);
   const devices = db.prepare('SELECT id,name,alias,manufacturer,productName,typeId,classification FROM I_EntNetworkElement').all();
+  const availability = createAvailability(options.seed);
+  for (const row of db.prepare(`SELECT k.resId,k.ts,k.onlineRate,d.classification
+    FROM NetworkDeviceKPI k JOIN I_EntNetworkElement d ON d.id=k.resId`).all()) {
+    const expected = availability.rate({id:row.resId,classification:row.classification},Date.parse(row.ts),options.intervalMinutes*60000);
+    assert.equal(row.onlineRate,Number(expected.toFixed(3)), 'KPI uses actual timestamp and physical device events');
+  }
+  for (const row of db.prepare('SELECT id,classification,commuState FROM I_EntNetworkElement').all()) {
+    assert.equal(row.commuState,availability.rate(row,Date.parse(options.anchor)-1,1)===0?'1':'0', 'Current state shares KPI outage events');
+  }
+
   for (const device of devices) {
     const cls=networkDeviceCategory(device.classification,classes);
     assert.ok(device.name.startsWith(cls.label+'-'));
