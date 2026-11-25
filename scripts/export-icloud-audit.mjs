@@ -21,7 +21,7 @@ try {
   const lock = JSON.parse(readFileSync(join(root, 'telora-lock.json')));
   lock.packages = Object.fromEntries(Object.entries(lock.packages).filter(([name]) => ['ontology', 'icloud_model'].includes(name)));
   writeFileSync(join(temporary, 'telora-lock.json'), JSON.stringify(lock));
-  const result = spawnSync(join(root, 'bin/telora'), ['-C', join(temporary, 'icloud_model'), 'eval', '@src/source_audit:report',
+  const result = spawnSync(process.env.TELORA_BIN || join(root, 'bin/telora'), ['-C', join(temporary, 'icloud_model'), 'eval', '@src/source_audit:report',
     '--initialization-fuel', '400000', '--request-fuel', '100000', '--with-memory-limit', '2048'],
   { encoding: 'utf8', timeout: 180000, maxBuffer: 32 * 1024 * 1024 });
   if (result.error) throw result.error;

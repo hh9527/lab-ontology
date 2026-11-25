@@ -1,3 +1,4 @@
+use crate::query as qb;
 # World 知识发布：缓存具名描述，引用点使用紧凑类型文本。
 use crate::knowledge as k;
 use crate::type_catalog as catalog;
@@ -10,6 +11,7 @@ use crate::samples as samples;
 use crate::knowledge_policy as policy;
 use crate::quantity as quantity;
 use crate::model as m;
+use crate::semantic_model as semantic;
 use std::type_property as property;
 use crate::knowledge_program as knowledge_program;
 use crate::ontology as edsl;
@@ -82,8 +84,16 @@ def raw_type: Fn(Type, Type, Array(Type), Array(td::FieldDesc), Array(td::Varian
             ("inline", codec::encode(False)),
             ("reverse_references", codec::encode(policy::allows_reverse_references(ty))),
             ("name", codec::encode(td::name(ty))),
-            ("unit", codec::encode(property::get_type_prop(ty, quantity::Unit.type))),
-            ("calculations", codec::encode(property::get_type_prop(ty, quantity::Calculations.type))),
+            ("unit", codec::encode(quantity::unit_of(ty))),
+            (
+                "calculations",
+                codec::encode(
+                    match quantity::calculation_policy(ty) {
+                        Some(allowed) => Some({allowed}.ty!(quantity::Calculations)),
+                        None => None
+                    }
+                )
+            ),
             ("kind", codec::encode(td::kind(ty))),
             (
                 "representation",
@@ -185,6 +195,10 @@ def raw_expression: Fn(g::Node) -> Value = fn(node) {
         g::Node::Ipv4(input) => object(
             [("op", Value::String("ipv4")), ("input", raw_expression(input))]
         ),
+        g::Node::NullIf((input, marker)) => object([
+            ("op", Value::String("null_if")), ("input", raw_expression(input)),
+            ("sentinel", codec::encode(marker))
+        ]),
         g::Node::UtcBucket(bucket) => object(
             [
                 ("op", Value::String("utc_bucket")),
@@ -221,7 +235,16 @@ def raw_binding: Fn(g::BindingFacts) -> Value = fn(binding) {
                         binding.members,
                         fn(m) {
                             array::map(
-                                array::concat([[m.value], expression_types(m.node)]),
+                                array::concat(
+                                    [
+                                        [m.value],
+                                        expression_types(m.node),
+                                        match quantity::mean_result_type(m.value) {
+                                            Some(value) => [value],
+                                            None => []
+                                        }
+                                    ]
+                                ),
                                 field_info
                             )
                         }
@@ -238,7 +261,16 @@ def raw_binding: Fn(g::BindingFacts) -> Value = fn(binding) {
                                 local: m.local,
                                 publish: m.id,
                                 input: raw_expression(m.node),
-                                type: field_info(m.value),
+                                type: field_info(
+                                    if m.aggregate == Some(qb::AggregateFunction::Avg) {
+                                        match quantity::mean_result_type(m.value) {
+                                            Some(value) => value,
+                                            None => m.value
+                                        }
+                                    } else {
+                                        m.value
+                                    }
+                                ),
                                 nullable: m.nullable,
                                 aggregate: m.aggregate,
                                 projectable: m.projectable,
@@ -288,6 +320,17 @@ def raw_sample: Fn(samples::BindingFacts) -> Value = fn(b) {
                     [
                         ("name", codec::encode(b.group)),
                         ("type", codec::encode(field_info(b.value))),
+                        (
+                            "mean_type",
+                            codec::encode(
+                                field_info(
+                                    match quantity::mean_result_type(b.value) {
+                                        Some(value) => value,
+                                        None => b.value
+                                    }
+                                )
+                            )
+                        ),
                         ("primary", codec::encode(b.primary)),
                         ("summaries", codec::encode(b.summaries)),
                         ("unit", codec::encode(b.unit))
@@ -300,22 +343,81 @@ def raw_sample: Fn(samples::BindingFacts) -> Value = fn(b) {
         ]
     )
 };
+# Keep author-visible logical types separate from lowered storage columns.
+def logical_field: Fn(Type, edsl::FieldEntry) -> Type = fn(row, field) {
+    match m::field_info(row, field.name) {
+        Some(info) => match catalog::describe(info.ty).optional {
+            Some(inner) => inner,
+            None => info.ty
+        },
+        None => field.ty
+    }
+};
+def subjects_of: Fn(Type) -> Array(policy::Subject) = fn(row) {
+    let declared = match property::get_type_prop(row, policy::Subjects.type) {
+        Some(p) => p.items,
+        None => []
+    };
+    match property::get_type_prop(row, semantic::Binding.type) {
+        Some(binding) => {
+            let subject = {
+                entity: semantic::identity(binding.identity).entity,
+                field: binding.field
+            }.ty!(policy::Subject);
+            if array::any(
+                declared,
+                fn(item) {
+                    item == subject
+                }
+            ) {
+                declared
+            } else {
+                array::push(declared, subject)
+            }
+        },
+        None => declared
+    }
+};
 def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset) {
     let references = dataset.references;
     object(
         [
             ("id", codec::encode(d.dataset.id)),
-            (
-                "subjects",
-                codec::encode(
-                    match property::get_type_prop(dataset.entity_type, policy::Subjects.type) {
-                        Some(p) => p.items,
-                        None => []
-                    }
-                )
-            ),
+            ("subjects", codec::encode(subjects_of(dataset.entity_type))),
             ("source", codec::encode(d.dataset.source)),
             ("grain", codec::encode(d.dataset.grain)),
+            (
+                "group_identity",
+                match dataset.group_identity {
+                    None => codec::encode(None.ty!(Option(String))),
+                    Some(identity) => object(
+                        [
+                            (
+                                "fields",
+                                codec::encode(
+                                    array::map(
+                                        identity.fields,
+                                        fn(index) {
+                                            dataset.fields[index].name
+                                        }
+                                    )
+                                )
+                            ),
+                            (
+                                "attributes",
+                                codec::encode(
+                                    array::map(
+                                        identity.attributes,
+                                        fn(index) {
+                                            dataset.fields[index].name
+                                        }
+                                    )
+                                )
+                            )
+                        ]
+                    )
+                }
+            ),
             ("kind", codec::encode(d.kind)),
             (
                 "scope",
@@ -388,15 +490,42 @@ def raw_dataset: Fn(t::Declaration, edsl::EntityEntry) -> Value = fn(d, dataset)
                                 [
                                     ("name", codec::encode(f.name)),
                                     ("column", codec::encode(f.column)),
-                                    ("type", codec::encode(field_info(f.ty))),
+                                    (
+                                        "type",
+                                        codec::encode(field_info(logical_field(d.dataset.row, f)))
+                                    ),
+                                    ("storage_type", codec::encode(field_info(f.ty))),
                                     ("nullable", codec::encode(f.nullable)),
-                                    ("unit", codec::encode(match m::field_info(d.dataset.row, f.name) {
-                                        Some(field) => match property::get_field_prop(d.dataset.row, field.index, quantity::FieldUnit.type) {
-                                            Some(spec) => Some(spec.unit),
-                                            None => property::get_type_prop(f.ty, quantity::Unit.type),
-                                        },
-                                        None => None,
-                                    })),
+                                    (
+                                        "valid_count",
+                                        codec::encode(
+                                            match m::field_info(d.dataset.row, f.name) {
+                                                Some(_) => samples::valid_count_field(
+                                                    d.dataset.row,
+                                                    f.name
+                                                ),
+                                                None => None
+                                            }
+                                        )
+                                    ),
+                                    (
+                                        "unit",
+                                        codec::encode(
+                                            match m::field_info(d.dataset.row, f.name) {
+                                                Some(field) => match property::get_field_prop(
+                                                    d.dataset.row,
+                                                    field.index,
+                                                    quantity::FieldUnit.type
+                                                ) {
+                                                    Some(spec) => Some(spec.unit),
+                                                    None => quantity::unit_of(
+                                                        logical_field(d.dataset.row, f)
+                                                    ),
+                                                },
+                                                None => None,
+                                            }
+                                        )
+                                    ),
                                     (
                                         "reference_ids",
                                         codec::encode(
@@ -590,6 +719,15 @@ def declaration_types: Fn(Array(t::Declaration)) -> Array(Type) = fn(declaration
                         }
                     ),
                     array::flat_map(
+                        d.samples,
+                        fn(b) {
+                            match quantity::mean_result_type(b.value) {
+                                Some(value) => [value],
+                                None => []
+                            }
+                        }
+                    ),
+                    array::flat_map(
                         d.domains,
                         fn(b) {
                             array::concat(
@@ -613,7 +751,16 @@ def declaration_types: Fn(Array(t::Declaration)) -> Array(Type) = fn(declaration
                                     array::flat_map(
                                         b.members,
                                         fn(m) {
-                                            array::concat([[m.value], expression_types(m.node)])
+                                            array::concat(
+                                                [
+                                                    [m.value],
+                                                    expression_types(m.node),
+                                                    match quantity::mean_result_type(m.value) {
+                                                        Some(value) => [value],
+                                                        None => []
+                                                    }
+                                                ]
+                                            )
                                         }
                                     )
                                 ]

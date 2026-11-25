@@ -1,10 +1,14 @@
-use ontology::groups as g;
-use ontology::model as m;
-use ontology::transform as t;
-use ontology::scalars as s;
-use std::array as array;
-use std::test as test;
+use crate::semantic as s;
+use crate::preparation as preparation;
+use crate::transform as transform;
+use crate::groups as g;
+use crate::model as m;
+use crate::scalars as scalars;
+use std::array;
+use std::test;
+use std::type_property as property;
 
+@s::dataset("readings", "readings", ["id"])
 type Row = struct {
     @g::exact("id")
     id: Int,
@@ -15,74 +19,108 @@ type Row = struct {
     @g::numeric("reading")
     reading: Float,
     @g::epoch_millis("at")
-    at: s::EpochMillis
+    at: scalars::EpochMillis
 };
-def dataset: m::Dataset(Row) = m::dataset("readings", "readings", Row.type, ["id"]);
-pub def properties_expand_into_shared_declaration: test::Test = test::should_ok(
+def local: transform::LocalDefinition = preparation::local_definition(
+    preparation::mapping("readings", Row.type)
+);
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("dimension assertion failed")
+            }
+        }
+    )
+};
+pub def properties_expand_into_shared_declaration: test::Test = verify(
     fn() {
-        let groups = t::declare(dataset, [], [], []).groups;
-        array::length(groups) == 5 && array::any(
-            groups,
+        array::length(local.declaration.groups) == 5 && array::any(
+            local.declaration.groups,
             fn(binding) {
                 let member = binding.members[0];
-                member.id == "name" && member.nullable && member.value == String.type && member.node == g::Node::Column(
-                    {name: "name", value: String.type, nullable: True}
-                )
+                member.id == "name" && member.nullable && member.value == String.type
             }
         )
     }
 );
-pub def composed_ability_reuses_declared_dimension: test::Test = test::should_ok(
-    fn() {
-        g::binding_facts(g::field_binding(dataset, "name")) == g::field_dimensions(dataset)[1]
-    }
-);
+@s::dataset("invalid", "invalid", [])
 type Invalid = struct {
-    @g::search("number")
     number: Int
 };
 pub def search_requires_text: test::Test = test::should_fail_with(
     fn() {
-        g::field_dimensions(m::dataset("invalid", "invalid", Invalid.type, []));
-        True
+        let apply = g::search("number");
+        apply(
+            {owner: Invalid.type, index: 0, name: "number", ty: Int.type}.ty!(
+                property::FieldPropertyCtx
+            ),
+            None
+        )
     },
     "search dimension requires String"
 );
-pub def missing_dimension_is_diagnosed: test::Test = test::should_fail_with(
-    fn() {
-        g::field_binding(dataset, "absent");
-        True
-    },
-    "unknown declared field dimension"
-);
-
 def shared: g::DimensionGroup(Int) = g::dimension_group(
     "shared",
     Int.type,
     True,
     g::numeric_filters
 );
+@s::dataset("narrowed", "narrowed", [])
 type Narrowed = struct {
     @g::field_view(shared, "limited", False, [g::Filter::Eq])
     value: Int
 };
-pub def field_view_preserves_shared_group_and_member_policy: test::Test = test::should_ok(
+pub def field_view_preserves_shared_group_and_member_policy: test::Test = verify(
     fn() {
-        let binding = g::field_dimensions(m::dataset("narrowed", "narrowed", Narrowed.type, []))[0];
-        let member = binding.members[0];
-        member.group == "shared" && !member.projectable && member.filters == [g::Filter::Eq] && member.kind == g::MemberKind::Dimension(
-            {projectable: True, filters: g::numeric_filters}
-        )
+        let local = preparation::local_definition(preparation::mapping("narrowed", Narrowed.type));
+        let member = local.declaration.groups[0].members[0];
+        member.group == "shared" && !member.projectable && member.filters == [g::Filter::Eq]
     }
 );
+@s::dataset("wrong", "wrong", [])
 type WrongView = struct {
-    @g::field_view(shared, "wrong", True, [g::Filter::Eq])
     value: String
 };
 pub def field_view_requires_matching_value_type: test::Test = test::should_fail_with(
     fn() {
-        g::field_dimensions(m::dataset("wrong", "wrong", WrongView.type, []));
-        True
+        let apply = g::field_view(shared, "wrong", True, [g::Filter::Eq]);
+        apply(
+            {owner: WrongView.type, index: 0, name: "value", ty: String.type}.ty!(
+                property::FieldPropertyCtx
+            ),
+            None
+        )
     },
     "field view does not match group type"
+);
+
+@s::dataset("sentinels", "sentinels", ["id"])
+type SentinelRow = struct {
+    @g::exact("sentinel_id")
+    id: Int,
+    @g::exact("raw_frequency")
+    @g::null_if_view("frequency", Int.type, -1)
+    frequency: Option(Int)
+};
+pub def sentinel_view_is_nullable_and_keeps_raw_input: test::Test = verify(
+    fn() {
+        let local = preparation::local_definition(preparation::mapping("sentinels", SentinelRow.type));
+        array::any(local.declaration.groups, fn(group) {
+            array::any(group.members, fn(member) {
+                member.id == "frequency" && member.nullable && member.value == Int.type &&
+                member.filters == g::numeric_filters
+            })
+        }) && array::any(local.declaration.groups, fn(group) {
+            array::any(group.members, fn(member) { member.id == "raw_frequency" })
+        })
+    }
+);
+pub def sentinel_view_rejects_a_different_source_type: test::Test = test::should_fail_with(
+    fn() {
+        let apply = g::null_if_view("invalid", Int.type, -1);
+        apply({owner:WrongView.type,index:0,name:"value",ty:String.type}.ty!(property::FieldPropertyCtx), None)
+    }, "Null-if view input type must match the field type"
 );

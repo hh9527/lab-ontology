@@ -1,6 +1,17 @@
+use ontology::quantity as statistic_quantity;
 use ontology::quantity as presentation;
-use ontology::quantity::{Percent};
+@presentation::calculations(
+    [
+        presentation::Calculation::Compare,
+        presentation::Calculation::Mean,
+        presentation::Calculation::Min,
+        presentation::Calculation::Max,
+        presentation::Calculation::Round
+    ]
+)
+type PortUtilization = struct(Float);
 use ontology::semantic as domain;
+use super::pon_olt as olt;
 # PON 端口 KPI：保持来源 parentId 关联及既有样本粒度假定。
 use super::inventory as i;
 use super::pon_quantities as q;
@@ -12,95 +23,69 @@ use ontology::samples as samples;
 use ontology::relations as r;
 use ontology::ontology as edsl;
 use ontology::query as qb;
-type PortSampleId = struct(String);
-# TODO(#51): 来源 one 与百分比显示冲突；字段尺度暂沿用既有 % 显示，不据此推断来源值已经归一。
-@domain::subject("PonPort", "res_id")
+@domain::entity_by("PonPort")
+type PonPortById = struct(String);
+# 接收／发送利用率保持独立的来源数值类型，不做百分比或归一比例换算。
+@domain::bind(PonPortById.type, "res_id")
+@r::sources("pon_port_kpi_of_device", ["source_EntPonElementAssociationPonDevicePonPortKPI"])
 @domain::dataset("pon_port_kpi", "PonDevicePonPortKPI", ["res_id", "tenant_id", "ts"])
 @domain::metric("ts")
 @domain::relations(relations)
+@edsl::relation_description(
+    "pon_port_kpi_of_olt",
+    "PON 端口所属 OLT",
+    "按端口父设备身份关联 OLT 角色；普通 pon_device 关系只代表 PON 网元，不保证 OLT 分类"
+)
 type PonDevicePonPortKPI = struct {
     @m::column("resId")
-    res_id: PortSampleId,
+    res_id: PonPortById,
     @m::column("tenantId")
     tenant_id: i::TenantId,
     @m::column("parentId")
+    @domain::attribute("parent_id")
     parent_id: domain::Reference(p::PonElementById),
     @m::column("portName")
+    @domain::attribute("port_name")
+    @edsl::field_role(edsl::FieldRole::Appellation)
     port_name: String,
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi_ts",
-            s::DateTimeUtc.type,
-            True,
-            [g::Filter::Eq, g::Filter::Ge, g::Filter::Lt]
-        ),
-        "pon_port_kpi_ts",
-        True,
-        [g::Filter::Eq, g::Filter::Ge, g::Filter::Lt]
-    )
+    @g::view("pon_port_kpi_ts", True, [g::Filter::Eq, g::Filter::Ge, g::Filter::Lt])
     @g::utc_bucket_view("pon_port_kpi_utc_hour", qb::UtcBucketUnit::Hour)
     @g::utc_bucket_view("pon_port_kpi_utc_day", qb::UtcBucketUnit::Day)
     @g::utc_bucket_view("pon_port_kpi_utc_month", qb::UtcBucketUnit::Month)
+    @domain::count("pon_port_kpi_sample_count")
+    @edsl::field_role(edsl::FieldRole::Classification)
     ts: s::DateTimeUtc,
     @m::column("ifInBandRate")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_receive_sample",
-            Percent.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_receive_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("pon_port_receive_sample", True, g::numeric_filters)
     @samples::field(
-        reported_percent_statistics,
+        usage_statistics,
         [
             {statistic: samples::Statistic::Mean, publish: "pon_port_receive_usage"},
             {statistic: samples::Statistic::Max, publish: "pon_port_receive_sample_max"},
             {statistic: samples::Statistic::Min, publish: "pon_port_receive_sample_min"}
         ]
     )
-    @presentation::field_unit("%", "ratio", 0.01)
-    if_in_band_rate: Percent,
+    @samples::valid_count("source_ifInBandRateEffcnt")
+    @domain::count("pon_port_receive_usage_observation_count")
+    if_in_band_rate: PortUtilization,
     @m::column("projectId")
     @g::exact("pon_port_kpi__projectId")
     source_projectId: String,
     @m::column("ifOutBandRate")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__ifOutBandRate",
-            Percent.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__ifOutBandRate",
-        True,
-        g::numeric_filters
-    )
+    @g::view("pon_port_kpi__ifOutBandRate", True, g::numeric_filters)
     @samples::field(
-        reported_percent_statistics,
+        usage_statistics,
         [
             {statistic: samples::Statistic::Mean, publish: "pon_port_transmit_usage"},
             {statistic: samples::Statistic::Max, publish: "pon_port_transmit_usage_max"},
             {statistic: samples::Statistic::Min, publish: "pon_port_transmit_usage_min"}
         ]
     )
-    @presentation::field_unit("%", "ratio", 0.01)
-    source_ifOutBandRate: Percent,
+    @samples::valid_count("source_ifOutBandRateEffcnt")
+    @domain::count("pon_port_transmit_usage_observation_count")
+    source_ifOutBandRate: PortUtilization,
     @m::column("onuHwOpticsTxPower")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__onuHwOpticsTxPower",
-            q::Dbm.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__onuHwOpticsTxPower",
-        True,
-        g::numeric_filters
-    )
+    @g::view("pon_port_kpi__onuHwOpticsTxPower", True, g::numeric_filters)
     @samples::field(
         q::Dbm_statistics,
         [
@@ -109,19 +94,11 @@ type PonDevicePonPortKPI = struct {
             {statistic: samples::Statistic::Min, publish: "pon_port_optics_tx_power_min"}
         ]
     )
+    @samples::valid_count("source_onuHwOpticsTxPowerEffcnt")
+    @domain::count("pon_port_optics_tx_power_observation_count")
     source_onuHwOpticsTxPower: q::Dbm,
     @m::column("hwOpticsTemperature")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__hwOpticsTemperature",
-            q::DegreesCelsius.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__hwOpticsTemperature",
-        True,
-        g::numeric_filters
-    )
+    @g::view("pon_port_kpi__hwOpticsTemperature", True, g::numeric_filters)
     @samples::field(
         q::DegreesCelsius_statistics,
         [
@@ -130,19 +107,11 @@ type PonDevicePonPortKPI = struct {
             {statistic: samples::Statistic::Min, publish: "pon_port_optics_temperature_min"}
         ]
     )
+    @samples::valid_count("source_hwOpticsTemperatureEffcnt")
+    @domain::count("pon_port_optics_temperature_observation_count")
     source_hwOpticsTemperature: q::DegreesCelsius,
     @m::column("ifHCInOctetsSpeed")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__ifHCInOctetsSpeed",
-            q::BitsPerSecond.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__ifHCInOctetsSpeed",
-        True,
-        g::numeric_filters
-    )
+    @g::view("pon_port_kpi__ifHCInOctetsSpeed", True, g::numeric_filters)
     @samples::field(
         q::BitsPerSecond_statistics,
         [
@@ -151,19 +120,10 @@ type PonDevicePonPortKPI = struct {
             {statistic: samples::Statistic::Min, publish: "pon_port_rx_rate_min"}
         ]
     )
+    @domain::count("pon_port_rx_rate_observation_count")
     source_ifHCInOctetsSpeed: q::BitsPerSecond,
     @m::column("ifHCOutOctetsSpeed")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__ifHCOutOctetsSpeed",
-            q::BitsPerSecond.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__ifHCOutOctetsSpeed",
-        True,
-        g::numeric_filters
-    )
+    @g::view("pon_port_kpi__ifHCOutOctetsSpeed", True, g::numeric_filters)
     @samples::field(
         q::BitsPerSecond_statistics,
         [
@@ -172,70 +132,41 @@ type PonDevicePonPortKPI = struct {
             {statistic: samples::Statistic::Min, publish: "pon_port_tx_rate_min"}
         ]
     )
+    @domain::count("pon_port_tx_rate_observation_count")
     source_ifHCOutOctetsSpeed: q::BitsPerSecond,
     @m::column("ifInBandRateEffcnt")
-    @g::field_view(
-        g::dimension_group("pon_port_kpi__ifInBandRateEffcnt", Int.type, True, g::numeric_filters),
-        "pon_port_kpi__ifInBandRateEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_ifInBandRateEffcnt: Int,
+    @g::view("pon_port_kpi__ifInBandRateEffcnt", True, g::numeric_filters)
+    source_ifInBandRateEffcnt: statistic_quantity::EffectiveCount,
     @m::column("ifOutBandRateEffcnt")
-    @g::field_view(
-        g::dimension_group("pon_port_kpi__ifOutBandRateEffcnt", Int.type, True, g::numeric_filters),
-        "pon_port_kpi__ifOutBandRateEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_ifOutBandRateEffcnt: Int,
+    @g::view("pon_port_kpi__ifOutBandRateEffcnt", True, g::numeric_filters)
+    source_ifOutBandRateEffcnt: statistic_quantity::EffectiveCount,
     @m::column("onuHwOpticsTxPowerEffcnt")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__onuHwOpticsTxPowerEffcnt",
-            Int.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__onuHwOpticsTxPowerEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_onuHwOpticsTxPowerEffcnt: Int,
+    @g::view("pon_port_kpi__onuHwOpticsTxPowerEffcnt", True, g::numeric_filters)
+    source_onuHwOpticsTxPowerEffcnt: statistic_quantity::EffectiveCount,
     @m::column("hwOpticsTemperatureEffcnt")
-    @g::field_view(
-        g::dimension_group(
-            "pon_port_kpi__hwOpticsTemperatureEffcnt",
-            Int.type,
-            True,
-            g::numeric_filters
-        ),
-        "pon_port_kpi__hwOpticsTemperatureEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_hwOpticsTemperatureEffcnt: Int,
+    @g::view("pon_port_kpi__hwOpticsTemperatureEffcnt", True, g::numeric_filters)
+    source_hwOpticsTemperatureEffcnt: statistic_quantity::EffectiveCount,
 };
 def device: r::Endpoint = domain::endpoint(PonDevicePonPortKPI.type, "parent_id");
-def reported_percent_statistics: samples::Group(Percent) = samples::group(
-    "pon_port_Percent",
-    Percent.type,
+def usage_statistics: samples::Group(PortUtilization) = samples::group(
+    "pon_port_usage",
+    PortUtilization.type,
     samples::Statistic::Mean,
     [samples::Statistic::Max, samples::Statistic::Min],
-    Some("%")
+    None
 );
 def relations: Array(r::Relation) = [
+    r::relation(
+        "pon_port_kpi_of_olt",
+        device,
+        olt::subject,
+        {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional}
+    ),
     r::relation(
         "pon_port_kpi_of_device",
         device,
         p::subject,
         {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional}
-    ),
-    r::relation(
-        "source_EntPonElementAssociationPonDevicePonPortKPI",
-        p::subject,
-        device,
-        {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Many0}
     ),
 ];
 pub use self::{relations};

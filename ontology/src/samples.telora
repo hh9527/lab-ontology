@@ -9,6 +9,61 @@ use std::array as array;
 use std::prelude as prelude;
 use std::type_property as property;
 
+# A valid-collection counter is associated evidence, never an implicit AVG weight.
+@prelude::property(PropertyTarget::Field)
+type ValidCount = struct {
+    field: String
+};
+def valid_count: Fn(String) -> Fn(property::FieldPropertyCtx, Option(ValidCount)) -> ValidCount = fn(
+    field
+) {
+    fn(ctx, previous) {
+        if field == "" || previous != None || !q::numeric_storage(ctx.ty) {
+            fail!("valid_count requires one named counter on a numeric field", ctx.name)
+        } else {
+            ()
+        };
+        {field}
+    }
+};
+def valid_count_field: Fn(Type, String) -> Option(String) = fn(row, name) {
+    let info = match m::field_info(row, name) {
+        Some(info) => info,
+        None => fail!("sample field does not exist", name)
+    };
+    match property::get_field_prop(row, info.index, ValidCount.type) {
+        None => None,
+        Some(spec) => {
+            let counter = match m::field_info(row, spec.field) {
+                Some(counter) => counter,
+                None => fail!("valid_count field does not exist", name, spec.field)
+            };
+            if spec.field == name || (
+                counter.ty != q::EffectiveCount.type && counter.ty != Option(q::EffectiveCount).type
+            ) {
+                fail!("valid_count must refer to a separate EffectiveCount field", name, spec.field)
+            } else {
+                Some(spec.field)
+            }
+        }
+    }
+};
+type MeanContract = struct {
+    population: String,
+    weighting: String,
+    valid_count: Option(String),
+    merge: String
+};
+def mean_contract: Fn(Type, String) -> MeanContract = fn(row, field) {
+    {
+        population: "NonNullReportedValues",
+        weighting: "EqualPerReportedValue",
+        valid_count: valid_count_field(row, field),
+        merge: "RequerySourceOrCombineSumAndNonNullCount"
+    }
+};
+pub use self::{ValidCount, MeanContract, valid_count, valid_count_field, mean_contract};
+
 # 样本契约附着于实际字段；注册时无需再手写 dataset/field/bind。
 type FieldSample = struct {
     value: Type,
@@ -58,6 +113,7 @@ def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) 
     array::flat_map(
         m::fields_of(dataset.row),
         fn(field) {
+            valid_count_field(dataset.row, field.name);
             match property::get_field_prop(dataset.row, field.index, FieldSamples.type) {
                 None => [],
                 Some(spec) => array::map(
@@ -150,29 +206,41 @@ def prepare_group: Fn(String, Type, Statistic, Array(Statistic), Option(String))
     let members = array::concat([[primary], summaries]);
     match q::calculation_policy(value) {
         None => (),
-        Some(allowed) => do { array::map(members, fn(member) {
-            let operation = match member {
-                Statistic::Mean => Some(q::Calculation::Mean),
-                Statistic::Min => Some(q::Calculation::Min),
-                Statistic::Max => Some(q::Calculation::Max),
-                Statistic::Sum => Some(q::Calculation::Sum),
-                Statistic::Latest => None,
-            };
-            match operation {
-                Some(op) => if !array::any(allowed, fn(item) {item == op}) {fail!("sample statistic exceeds type calculation capabilities", id, member)} else { () },
-                None => (),
-            }
-        }); () },
+        Some(allowed) => do {
+            array::map(
+                members,
+                fn(member) {
+                    let operation = match member {
+                        Statistic::Mean => Some(q::Calculation::Mean),
+                        Statistic::Min => Some(q::Calculation::Min),
+                        Statistic::Max => Some(q::Calculation::Max),
+                        Statistic::Sum => Some(q::Calculation::Sum),
+                        Statistic::Latest => None,
+                    };
+                    match operation {
+                        Some(op) => if !array::any(
+                            allowed,
+                            fn(item) {
+                                item == op
+                            }
+                        ) {
+                            fail!(
+                                "sample statistic exceeds type calculation capabilities",
+                                id,
+                                member
+                            )
+                        } else {
+                            ()
+                        },
+                        None => (),
+                    }
+                }
+            );
+            ()
+        },
     };
     if id == "" || (storage != Int.type && storage != Float.type) || s::time_role(value) != None {
         fail!("sample group requires a name and numeric sample type", id)
-    } else if array::any(
-        members,
-        fn(member) {
-            member == Statistic::Sum
-        }
-    ) && value != q::Count.type && value != q::Bytes.type {
-        fail!("sample Sum requires an explicitly additive quantity type", id)
     } else if unit == Some("") {
         fail!("sample group unit cannot be empty", id)
     } else if array::any(
@@ -232,6 +300,17 @@ def group: for(Value) Fn(
     Array(Statistic),
     Option(String)
 ) -> Group(Value) = fn(id, value, primary, summaries, unit) {
+    let unit = match q::unit_of(Value.type) {
+        Some(inherited) => match unit {
+            Some(declared) => if declared != inherited.symbol {
+                fail!("sample unit conflicts with its nominal type", id)
+            } else {
+                unit
+            },
+            None => Some(inherited.symbol)
+        },
+        None => unit
+    };
     prepare_group(id, value, primary, summaries, unit);
     {id, value, primary, summaries, unit}
 };

@@ -1,64 +1,144 @@
+use ontology::semantic as s;
+use ontology::preparation as prepared;
 use ontology::values as v;
 use ontology::enum_values as ev;
 use ontology::groups as g;
-use ontology::model as m;
-use ontology::transform as t;
-use std::test as test;
-use std::array as array;
+use ontology::ontology as edsl;
+use ontology::query as q;
+use std::test;
+use std::array;
 
 type Status = enum {
     @ev::itag(1)
     Active,
     @ev::itag(2)
-    Inactive,
+    Inactive
 };
-def status: v::Domain(Status, Int) = v::from_enum("Status", Status.type, Int.type, False);
+@s::dataset("device", "devices", [])
 type Row = struct {
-    @v::classification(status, "status")
-    status: Option(Int),
-    @v::field_domain(status, "scope", False, [g::Filter::Eq])
-    scope: Int,
-    other: Int
+    @g::exact("status")
+    status: Option(Status),
+    @g::field_view(
+        g::dimension_group("scope", Status.type, False, [g::Filter::Eq]),
+        "scope",
+        False,
+        [g::Filter::Eq]
+    )
+    scope: Status,
+    @g::exact("other")
+    other: Status
 };
-def dataset: m::Dataset(Row) = m::dataset("device", "devices", Row.type, []);
-def declared: t::Declaration = t::declare(dataset, [], [], []);
-pub def optional_domain_preserves_type_and_encoding: test::Test = test::should_ok(
-    fn() {
-        let binding = v::binding_facts(v::field_binding(dataset, "status"));
-        array::length(declared.domains) == 2 && binding.nullable && binding.definition.value == Status.type && binding.definition.wire == Int.type && binding.definition.values[
-            0
-        ].id == "Active"
+def profile: q::PlanProfile = {
+    allowed_operators: [
+        q::Operator::Source,
+        q::Operator::Column,
+        q::Operator::Project,
+        q::Operator::Filter,
+        q::Operator::Scalar,
+        q::Operator::Bind,
+        q::Operator::Order,
+        q::Operator::Limit
+    ],
+    allowed_scalars: [
+        q::ScalarFunction::Eq,
+        q::ScalarFunction::Ne,
+        q::ScalarFunction::IsNotNull,
+        q::ScalarFunction::And,
+        q::ScalarFunction::Or,
+        q::ScalarFunction::Not,
+        q::ScalarFunction::BinaryText,
+        q::ScalarFunction::If
+    ],
+    allowed_aggregates: [],
+    allowed_join_kinds: [],
+    allow_distinct: False
+};
+def payload: edsl::PreparedPayload = s::payload("field-domains", [Row.type], profile);
+def require: for(A) Fn(Option(A)) -> A = fn(value) {
+    match value {
+        Some(value) => value,
+        None => fail!("missing field-domain test value")
     }
-);
-pub def filter_only_policy_is_preserved: test::Test = test::should_ok(
+};
+def dimension: Fn(String) -> edsl::DimensionEntry = fn(id) {
+    require(
+        array::find(
+            payload.dimensions,
+            fn(d) {
+                d.id == id
+            }
+        )
+    )
+};
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("field-domain assertion failed")
+            }
+        }
+    )
+};
+pub def optional_domain_preserves_type_and_encoding: test::Test = verify(
     fn() {
-        let binding = v::field_binding(dataset, "scope");
-        !binding.projectable && !binding.group_projectable && binding.filters == [g::Filter::Eq] && !binding.nullable
-    }
-);
-pub def explicit_binding_preserves_field_properties: test::Test = test::should_ok(
-    fn() {
-        let explicit = v::bind(
-            dataset,
-            v::dimension_group(status, True, g::equality_filters),
-            g::input(m::field(Row.type, Int.type, "other")),
-            "other",
-            True,
-            g::equality_filters
+        let field = require(
+            array::find(
+                prepared::prepare(Row.type).fields,
+                fn(f) {
+                    f.name == "status"
+                }
+            )
         );
-        array::length(t::with_domains(declared, [explicit]).domains) == 3 && array::length(
-            t::checked_with_domains(declared, [explicit]).domains
-        ) == 3 && array::length(t::checked_declare(dataset, [], [], []).domains) == 2
+        let value = dimension("status");
+        field.value == Status.type && field.nullable && field.storage == Int.type && value.value_type == Some(
+            Status.type
+        ) && array::length(value.canonical_values) == 2 && require(
+            array::find(
+                value.canonical_values,
+                fn(member) {
+                    member.id == "Active"
+                }
+            )
+        ).wires == [edsl::FilterInput::Int(1)]
     }
 );
+pub def filter_only_policy_is_preserved: test::Test = verify(
+    fn() {
+        let value = dimension("scope");
+        !value.projectable && value.filterable && value.authorized && value.ops == [
+            edsl::FilterOp::Eq
+        ]
+    }
+);
+pub def same_enum_fields_keep_independent_capabilities: test::Test = verify(
+    fn() {
+        let other = dimension("other");
+        let scope = dimension("scope");
+        array::length(payload.dimensions) == 3 && other.value_type == scope.value_type && other.projectable && !scope.projectable && other.field != scope.field && other.ops == [
+            edsl::FilterOp::Eq
+        ]
+    }
+);
+type Classification = enum {
+    Known,
+    Unknown
+};
+@s::dataset("wrong", "wrong", [])
+@v::computed(
+    "kind",
+    "status",
+    Classification.type,
+    [v::member(Classification::Known, [1])],
+    Classification::Unknown
+)
 type Wrong = struct {
-    @v::classification(status, "status")
     status: String
 };
 pub def incompatible_source_is_rejected: test::Test = test::should_fail_with(
     fn() {
-        t::declare(m::dataset("wrong", "wrong", Wrong.type, []), [], [], []);
-        True
+        s::payload("wrong-domain", [Wrong.type], profile)
     },
-    "group input field has incompatible type"
+    "computed classification source has incompatible type"
 );

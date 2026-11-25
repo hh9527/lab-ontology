@@ -1,0 +1,337 @@
+use ontology::semantic as s;
+use ontology::scalars as scalars;
+use ontology::groups as g;
+use ontology::relations as r;
+use ontology::values as v;
+use ontology::ontology as edsl;
+use ontology::query as q;
+use ontology::intent;
+use std::json;
+use std::test;
+use ontology::sqlite as sqlite;
+use ontology::postgres as postgres;
+use ontology::typed_query as typed;
+use ontology::typed_query_protocol as protocol;
+use std::codec as codec;
+use std::value::{Value};
+
+@s::entity_by("Device")
+type DeviceId = struct(String);
+@s::entity_by("Tenant")
+type TenantId = struct(String);
+type Kind = enum {
+    Ap,
+    Switch,
+    Unknown
+};
+@s::dataset("devices", "devices", ["id"])
+@s::record_counts(["device_count"])
+@g::groupable(["kind"])
+@v::computed(
+    "kind",
+    "raw",
+    Kind.type,
+    [v::member(Kind::Ap, ["ap"]), v::member(Kind::Switch, ["switch"])],
+    Kind::Unknown
+)
+type Device = struct {
+    @g::exact("device_id")
+    id: DeviceId,
+    @g::exact("name")
+    name: String,
+    @g::exact("raw_kind")
+    raw: String,
+    @g::field_view(g::dimension_group("raw_cpu", Float.type, True, []), "raw_cpu", True, [])
+    cpu: Float,
+    tenant: s::Reference(TenantId)
+};
+@s::dataset("tenants", "tenants", ["id"])
+type Tenant = struct {
+    id: TenantId,
+    @g::exact("tenant_name")
+    name: String
+};
+def profile: q::PlanProfile = {
+    allowed_operators: [
+        q::Operator::Order,
+        q::Operator::Limit,
+        q::Operator::Source,
+        q::Operator::Column,
+        q::Operator::Project,
+        q::Operator::Filter,
+        q::Operator::Scalar,
+        q::Operator::Bind,
+        q::Operator::Aggregate,
+        q::Operator::Group,
+        q::Operator::Join
+    ],
+    allowed_scalars: [
+        q::ScalarFunction::Eq,
+        q::ScalarFunction::BinaryText,
+        q::ScalarFunction::Ne,
+        q::ScalarFunction::If,
+        q::ScalarFunction::IsNotNull,
+        q::ScalarFunction::And,
+        q::ScalarFunction::Or,
+        q::ScalarFunction::Not
+    ],
+    allowed_aggregates: [q::AggregateFunction::Count],
+    allowed_join_kinds: [q::JoinKind::Inner, q::JoinKind::Left],
+    allow_distinct: False
+};
+@s::relations(
+    [
+        r::relation(
+            "tenant",
+            s::endpoint(Device.type, "tenant"),
+            s::endpoint(Tenant.type, "id"),
+            {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional}
+        )
+    ]
+)
+@s::dataset("connections", "connections", [])
+type Connections = struct {
+    value: String
+};
+def payload: edsl::PreparedPayload = s::payload(
+    "grouping",
+    [Device.type, Tenant.type, Connections.type],
+    profile
+);
+def query: Fn(String) -> q::QueryAst = fn(body) {
+    intent::query_intent_ast_factory(payload)(json::parse(body).unwrap!())
+};
+pub def a_name_remains_projectable_without_aggregation: test::Test = test::should_ok(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"name"}],"order_by":[{"node":"d","dimension":"name","direction":"Asc"}],"take":20}"#
+        )
+    }
+);
+pub def a_name_is_not_an_implicit_grouping_category: test::Test = test::should_fail_with(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"name"}],"measures":[{"node":"d","measure":"device_count"}],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    },
+    "dimension is not authorized for grouping"
+);
+pub def a_classification_can_group_counts: test::Test = test::should_ok(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"kind"}],"measures":[{"node":"d","measure":"device_count"}],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    }
+);
+pub def grouping_a_computed_class_does_not_authorize_its_raw_column: test::Test = test::should_fail_with(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"raw_kind"}],"measures":[{"node":"d","measure":"device_count"}],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    },
+    "dimension is not authorized for grouping"
+);
+pub def a_numeric_projection_does_not_implicitly_allow_grouping: test::Test = test::should_fail_with(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"raw_cpu"}],"measures":[{"node":"d","measure":"device_count"}],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    },
+    "dimension is not authorized for grouping"
+);
+pub def identity_grouping_can_display_a_name: test::Test = test::should_ok(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"}],"edges":[],"select":[{"node":"d","dimension":"name"}],"measures":[{"node":"d","measure":"device_count"}],"group_by_identity":["d"],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    }
+);
+pub def a_single_valued_relation_preserves_identity_dependent_attributes: test::Test = test::should_ok(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"devices"},{"id":"t","entity":"tenants"}],"edges":[{"relation":"tenant","from":"d","to":"t"}],"select":[{"node":"d","dimension":"name"},{"node":"t","dimension":"tenant_name"}],"measures":[{"node":"d","measure":"device_count"}],"group_by_identity":["d"],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    }
+);
+pub def grouping_a_tenant_does_not_determine_a_device_name: test::Test = test::should_fail_with(
+    fn() {
+        query(
+            r#"{"op":"Graph","root":"t","nodes":[{"id":"d","entity":"devices"},{"id":"t","entity":"tenants"}],"edges":[{"relation":"tenant","from":"d","to":"t"}],"select":[{"node":"d","dimension":"name"}],"measures":[{"node":"d","measure":"device_count"}],"group_by_identity":["t"],"top_by_measure":{"node":"d","measure":"device_count","direction":"Desc","take":20}}"#
+        )
+    },
+    "dimension is not authorized for grouping"
+);
+@s::dataset("bad", "bad", ["id"])
+@g::groupable(["absent"])
+type Bad = struct {
+    id: DeviceId
+};
+pub def an_unknown_grouping_declaration_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        s::payload("bad", [Bad.type], profile)
+    },
+    "groupable dimension does not exist"
+);
+@s::dataset("hidden", "hidden", ["id"])
+@g::groupable(["hidden_code"])
+type Hidden = struct {
+    id: DeviceId,
+    @g::field_view(
+        g::dimension_group("hidden_code", String.type, False, [g::Filter::Eq]),
+        "hidden_code",
+        False,
+        [g::Filter::Eq]
+    )
+    code: String
+};
+pub def grouping_does_not_expand_projection_capability: test::Test = test::should_fail_with(
+    fn() {
+        s::payload("hidden", [Hidden.type], profile)
+    },
+    "groupable dimension requires projection capability"
+);
+
+# One business entity can have many sampling records.
+@s::bind(DeviceId.type, "id")
+@s::dataset("samples", "samples", ["id", "ts"])
+@s::metric("ts")
+@s::record_counts(["sample_count"])
+type DeviceSamples = struct {
+    id: DeviceId,
+    @s::attribute("name")
+    name: String,
+    ts: scalars::DateTimeUtc,
+    value: Float
+};
+def sample_payload: edsl::PreparedPayload = s::payload("identity", [DeviceSamples.type], profile);
+def sample_query: Fn(String) -> q::QueryAst = fn(select) {
+    intent::query_intent_ast_factory(sample_payload)(json::parse(
+        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"samples"}],"edges":[],"select":[{"node":"s","dimension":"samples__\{select}"}],"measures":[{"node":"s","measure":"sample_count"}],"group_by_identity":["s"],"top_by_measure":{"node":"s","measure":"sample_count","direction":"Desc","take":20}}`
+    ).unwrap!())
+};
+pub def business_identity_projects_its_declared_name: test::Test = test::should_ok(fn() {sample_query("name")});
+pub def business_identity_does_not_determine_sampling_time: test::Test = test::should_fail_with(fn() {sample_query("ts")}, "not authorized for grouping");
+pub def business_identity_does_not_determine_a_sample_value: test::Test = test::should_fail_with(fn() {sample_query("value")}, "not authorized for grouping");
+pub def entity_identity_does_not_replace_record_grain: test::Test = test::should_ok(fn() {
+    let entity = sample_payload.entities[0];
+    match entity.group_identity {
+        Some(identity) => if identity.fields == [0] && identity.attributes == [1] && entity.grain_fields == [0, 2] { () } else { fail!("identity and grain must remain independent") },
+        None => fail!("missing business identity")
+    }
+});
+
+# Coarse identity dependencies cross only stable, single-valued relationships.
+use ontology::model as m;
+use std::array as array;
+@s::entity_by("Region")
+type RegionId = struct(String);
+@s::dataset("regions", "regions", ["id"])
+type Region = struct {
+    id: RegionId,
+    @g::exact("region_name")
+    name: String
+};
+@s::dataset("owners", "owners", ["id"])
+type Owner = struct {
+    id: TenantId,
+    @g::exact("owner_name")
+    name: String,
+    region: s::Reference(RegionId)
+};
+@s::bind(DeviceId.type, "id")
+@s::dataset("linked_samples", "linked_samples", ["id", "ts"])
+@s::metric("ts")
+@s::record_counts(["linked_sample_count"])
+@s::relations(identity_relations)
+type LinkedSample = struct {
+    id: DeviceId,
+    ts: scalars::DateTimeUtc,
+    @s::attribute("owner")
+    owner: Option(s::Reference(TenantId)),
+    changing_owner: Option(s::Reference(TenantId)),
+    @s::attribute("stable_flag")
+    stable_flag: Int,
+    sample_flag: Int
+};
+def owner_endpoint: r::Endpoint = s::endpoint(Owner.type, "id");
+def stable_owner: r::Relation = r::relation("stable_owner", s::endpoint(LinkedSample.type, "owner"), owner_endpoint,
+    {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional});
+def identity_relations: Array(r::Relation) = [
+    stable_owner,
+    r::relation("changing_owner", s::endpoint(LinkedSample.type, "changing_owner"), owner_endpoint,
+        {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional}),
+    r::relation("many_owners", s::endpoint(LinkedSample.type, "owner"), owner_endpoint,
+        {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Many0}),
+    r::relation("reverse_owner", owner_endpoint, s::endpoint(LinkedSample.type, "owner"),
+        {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Many0}),
+    r::guarded(stable_owner <~ {id: "stable_guard"}, m::field(LinkedSample.type, Int.type, "stable_flag"), edsl::FilterOp::Eq, 1),
+    r::guarded(stable_owner <~ {id: "changing_guard"}, m::field(LinkedSample.type, Int.type, "sample_flag"), edsl::FilterOp::Eq, 1),
+    r::relation("owner_region", s::endpoint(Owner.type, "region"), s::endpoint(Region.type, "id"),
+        {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional})
+];
+def linked_payload: edsl::PreparedPayload = s::payload("identity-relations", [LinkedSample.type, Owner.type, Region.type], profile);
+def owner_query: Fn(edsl::PreparedPayload, String, Bool) -> q::QueryAst = fn(payload, relation, reverse) {
+    let from = if reverse {"o"} else {"s"};
+    let to = if reverse {"s"} else {"o"};
+    intent::query_intent_ast_factory(payload)(json::parse(
+        `{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"linked_samples"},{"id":"o","entity":"owners"}],"edges":[{"relation":"\{relation}","from":"\{from}","to":"\{to}"}],"select":[{"node":"o","dimension":"owner_name"}],"measures":[{"node":"s","measure":"linked_sample_count"}],"group_by_identity":["s"],"top_by_measure":{"node":"s","measure":"linked_sample_count","direction":"Desc","take":20}}`
+    ).unwrap!())
+};
+pub def a_stable_optional_reference_determines_the_owner_name: test::Test = test::should_ok(fn() {owner_query(linked_payload, "stable_owner", False)});
+pub def a_reverse_single_valued_reference_determines_the_owner_name: test::Test = test::should_ok(fn() {owner_query(linked_payload, "reverse_owner", True)});
+pub def a_sampling_reference_does_not_determine_the_owner_name: test::Test = test::should_fail_with(fn() {owner_query(linked_payload, "changing_owner", False)}, "not authorized for grouping");
+pub def a_multivalued_relation_does_not_determine_the_owner_name: test::Test = test::should_fail_with(fn() {owner_query(linked_payload, "many_owners", False)}, "not authorized for grouping");
+pub def a_stable_source_guard_preserves_identity_dependencies: test::Test = test::should_ok(fn() {owner_query(linked_payload, "stable_guard", False)});
+pub def a_sampling_source_guard_blocks_identity_dependencies: test::Test = test::should_fail_with(fn() {owner_query(linked_payload, "changing_guard", False)}, "not authorized for grouping");
+pub def a_composite_key_requires_every_source_component: test::Test = test::should_fail_with(fn() {
+    let changed = linked_payload <~ {relations: array::map(linked_payload.relations, fn(relation) {
+        if relation.id != "stable_owner" {relation} else {
+            let source = match array::find(linked_payload.entities, fn(entity) {entity.id == "linked_samples"}) {Some(entity) => entity, None => fail!("missing sample dataset")};
+            let changing = match array::find(source.fields, fn(field) {field.name == "changing_owner"}) {Some(field) => field.index, None => fail!("missing changing reference")};
+            let key = match relation.key { edsl::RelationKey::Eq(pair) => pair, _ => fail!("expected a single reference key") };
+            relation <~ {key: edsl::RelationKey::And([relation.key, edsl::RelationKey::Eq({from: changing, to: key.to})])}
+        }
+    })};
+    owner_query(changed, "stable_owner", False)
+}, "not authorized for grouping");
+pub def stable_single_valued_dependencies_continue_across_hops: test::Test = test::should_ok(fn() {
+    intent::query_intent_ast_factory(linked_payload)(json::parse(
+        r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"linked_samples"},{"id":"o","entity":"owners"},{"id":"r","entity":"regions"}],"edges":[{"relation":"stable_owner","from":"s","to":"o"},{"relation":"owner_region","from":"o","to":"r"}],"select":[{"node":"r","dimension":"region_name"}],"measures":[{"node":"s","measure":"linked_sample_count"}],"group_by_identity":["s"],"top_by_measure":{"node":"s","measure":"linked_sample_count","direction":"Desc","take":20}}"#
+    ).unwrap!())
+});
+
+# Identity grouping forms an object set without requiring a dummy aggregate.
+def names_only: String = r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"samples"}],"edges":[],"select":[{"node":"s","dimension":"samples__name"}],"group_by_identity":["s"],"order_by":[{"node":"s","dimension":"samples__name","direction":"Asc"}],"take":20}"#;
+def names_plan: q::QueryAst = intent::query_intent_ast_factory(sample_payload)(json::parse(names_only).unwrap!());
+pub def identity_grouping_does_not_require_a_measure: test::Test = test::should_ok(fn() {names_plan});
+pub def identity_grouping_does_not_pick_an_arbitrary_sample: test::Test = test::should_fail_with(fn() {
+    intent::query_intent_ast_factory(sample_payload)(json::parse(
+        r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"samples"}],"edges":[],"select":[{"node":"s","dimension":"samples__ts"}],"group_by_identity":["s"],"order_by":[{"node":"s","dimension":"samples__ts","direction":"Asc"}],"take":20}"#
+    ).unwrap!())
+}, "not authorized for grouping");
+def linked_names: String = r#"{"op":"Graph","root":"s","nodes":[{"id":"s","entity":"linked_samples"},{"id":"o","entity":"owners"}],"edges":[{"relation":"stable_owner","from":"s","to":"o"}],"select":[{"node":"o","dimension":"owner_name"}],"group_by_identity":["s"],"order_by":[{"node":"o","dimension":"owner_name","direction":"Asc"}],"take":20}"#;
+def linked_names_plan: q::QueryAst = intent::query_intent_ast_factory(linked_payload)(json::parse(linked_names).unwrap!());
+pub def identity_only_grouping_preserves_optional_dependencies: test::Test = test::should_ok(fn() {linked_names_plan});
+def multiplied_names: String = r#"{"op":"Graph","root":"o","nodes":[{"id":"s","entity":"linked_samples"},{"id":"o","entity":"owners"}],"edges":[{"relation":"stable_owner","from":"s","to":"o"}],"select":[{"node":"o","dimension":"owner_name"}],"group_by_identity":["o"],"order_by":[{"node":"o","dimension":"owner_name","direction":"Asc"}],"take":20}"#;
+def multiplied_names_plan: q::QueryAst = intent::query_intent_ast_factory(linked_payload)(json::parse(multiplied_names).unwrap!());
+pub def identity_grouping_collapses_join_fanout: test::Test = test::should_ok(fn() {multiplied_names_plan});
+
+# Verify the public two-stage protocol, not only the internal Graph request.
+def catalog: Array(typed::Dataset) = [{id:"samples",symbol:"demo::Samples",members:[
+    {id:"samples__name",symbol:"label",kind:"dimension",logical:"String",storage:intent::ResultType::String,nullable:False}.ty!(typed::Member)
+]}.ty!(typed::Dataset)];
+def wire: Value = json::parse(r#"{"root":"a","nodes":[{"id":"a","dataset":"demo::Samples"}],"steps":[
+    {"id":"s0","kind":"group_by_identity","body":{"node":"a"}},
+    {"id":"s1","kind":"project","body":{"kind":"record","fields":[{"name":"label","value":{"kind":"member","node":"a","member":"label"}}]}},
+    {"id":"s2","kind":"order_by","body":{"terms":[{"direction":"Asc","value":{"kind":"output","name":"label"}}]}},
+    {"id":"s3","kind":"take","body":{"count":20}}
+]}"#).unwrap!();
+def protocol_result: Value = protocol::check_type(sample_payload,catalog,[],"grouping-test",Value::Object({intent:wire}));
+pub def identity_only_grouping_passes_the_public_protocol: test::Test = test::should_ok(fn() {protocol_result});
+pub def runtime_cases: Value = Value::Object({
+    names:codec::encode(sqlite::build_query(names_plan)),
+    linked:codec::encode(sqlite::build_query(linked_names_plan)),
+    multiplied:codec::encode(sqlite::build_query(multiplied_names_plan)),
+    postgres:codec::encode(postgres::build_query(names_plan)),
+    protocol:protocol_result
+});

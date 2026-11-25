@@ -6,7 +6,7 @@
 
 `ontology::preparation` 面向集成和验收，提供局部准备结果、能力发现与存储映射。semantic_model、semantic_lowering、semantic_preparation 为私有实现。
 
-NS 与 IC 使用 semantic 建模及统一模型发布入口。relation_model 的独立关系基线使用 `ontology::registry`，其声明由 registry_impl 准备。
+IC 使用 semantic 建模及统一模型发布入口。relation_model 的独立关系基线使用 `ontology::registry`，其声明由 registry_impl 准备。
 
 ## 查询与方言
 

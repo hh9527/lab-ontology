@@ -5,7 +5,12 @@ const queries=JSON.parse(readFileSync(process.argv[2],'utf8'));
 const db=new DatabaseSync(':memory:');
 db.exec(`CREATE TABLE devices(id TEXT,classification TEXT,priority INTEGER);
 INSERT INTO devices VALUES ('a','olt',2),('b','ne.category.olt',1),('c','onu',2),('d','future-kind',1),('e',NULL,1);`);
-const run=i=>db.prepare(queries[i].sql).all(...queries[i].bindings).map(row=>({...row}));
+const run=i=>{
+  const query=queries[i],statement=db.prepare(query.sql);
+  // Nullable membership explicitly defaults to False via parameter slot 0.
+  const parameters=query.sql.includes(':__dari_0')?[{__dari_0:0},...query.bindings]:query.bindings;
+  return statement.all(...parameters).map(row=>({...row}));
+};
 assert.deepEqual(run(0),[
  {a_id:'a',a_kind:'Olt'},{a_id:'b',a_kind:'Olt'},{a_id:'c',a_kind:'Onu'},
  {a_id:'d',a_kind:'Unknown'},{a_id:'e',a_kind:null}
@@ -27,6 +32,8 @@ assert.match(queries[6].sql,/ IN \(/);
 assert.match(queries[5].sql,/ IN \(/);
 const membershipWhere=queries[6].sql.split('WHERE')[1];
 assert(membershipWhere.includes('classification'));
-assert(!membershipWhere.split(') AS __q_result')[0].includes('CASE'),'membership must filter the source, not its CASE projection');
+// unwrap_or may lower to CASE; membership itself must still target raw wires.
+assert.match(membershipWhere,/a\.classification IN \(\?\d+, \?\d+\)/);
+assert(!membershipWhere.includes('a_kind'),'membership must filter the source, not its classification projection');
 db.close();
-console.log('Mapped scopes: multi-wire source filtering, parallel projection, Unknown/NULL separation, and explicit business order passed; PostgreSQL lowering produced both wires');
+console.log('Mapped scopes: multi-wire source filtering, parallel projection, Unknown/NULL separation, and itag ordering passed; PostgreSQL lowering produced both wires');

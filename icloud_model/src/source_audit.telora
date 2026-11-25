@@ -1,6 +1,11 @@
+use ontology::samples as samples;
+use ontology::relations as relations;
+use ontology::query as query;
 # Development audit: export the prepared model, not a second parse of source.
-use crate::typed::{payload};
+use crate::typed::{payload, roots};
 use ontology::ontology as edsl;
+use ontology::quantity as quantity;
+use ontology::preparation as preparation;
 use std::array as array;
 use std::codec as codec;
 use std::value::{Value};
@@ -29,6 +34,7 @@ type Key = enum {
     Or(Array(Key))
 };
 type Field = struct {
+    unit: Option(quantity::Unit),
     nullable: Bool,
     name: String,
     column: String,
@@ -36,8 +42,21 @@ type Field = struct {
     is_key: Bool,
     time: Option(edsl::TimeField),
 };
-type TimeRole = struct { field: String, encoding: edsl::TimeEncoding, semantics: edsl::TimeSemantics, logical_type: String };
+type TimeRole = struct {
+    field: String,
+    encoding: edsl::TimeEncoding,
+    semantics: edsl::TimeSemantics,
+    logical_type: String
+};
+type SamplingStatistic = struct {
+    id: String,
+    field: String,
+    mean: samples::MeanContract
+};
 type Dataset = struct {
+    identity: Option(Array(String)),
+    identity_attributes: Array(String),
+    statistics: Array(SamplingStatistic),
     id: String,
     table: String,
     fields: Array(Field),
@@ -48,6 +67,7 @@ type Dataset = struct {
 };
 type Relation = struct {
     id: String,
+    source_names: Array(String),
     from_dataset: String,
     to_dataset: String,
     from_table: String,
@@ -56,6 +76,8 @@ type Relation = struct {
     key: Key,
 };
 type Dimension = struct {
+    groupable: Bool,
+    projectable: Bool,
     id: String,
     dataset: String,
     column: String,
@@ -119,14 +141,69 @@ pub def report: Value = codec::encode(
                 {
                     id: entity.id,
                     table: entity.table,
-                    grain: array::map(entity.grain_fields, fn(index) { entity.fields[index].name }),
-                    time_roles: array::flat_map(entity.fields, fn(field) {
-                        match field.time {
-                            Some(time) => [{field: field.name, encoding: time.encoding, semantics: time.semantics,
-                                logical_type: match time.encoding { edsl::TimeEncoding::EpochMillis => "EpochMillis", edsl::TimeEncoding::DateText => "Date", edsl::TimeEncoding::LocalText => "DateTime", edsl::TimeEncoding::Rfc3339Text => "DateTimeUtc" }}.ty!(TimeRole)],
-                            None => []
+                    identity: match entity.group_identity {
+                        None => None,
+                        Some(identity) => Some(
+                            array::map(
+                                identity.fields,
+                                fn(index) {
+                                    entity.fields[index].name
+                                }
+                            )
+                        )
+                    },
+                    identity_attributes: match entity.group_identity {
+                        None => [],
+                        Some(identity) => array::map(
+                            identity.attributes,
+                            fn(index) {
+                                entity.fields[index].name
+                            }
+                        )
+                    },
+                    statistics: array::map(
+                        array::filter(
+                            payload.measures,
+                            fn(measure) {
+                                measure.entity == entity.index && measure.aggregate == query::AggregateFunction::Avg
+                            }
+                        ),
+                        fn(measure) {
+                            let field = entity.fields[measure.field].name;
+                            {
+                                id: measure.id,
+                                field,
+                                mean: samples::mean_contract(entity.entity_type, field)
+                            }.ty!(SamplingStatistic)
                         }
-                    }),
+                    ),
+                    grain: array::map(
+                        entity.grain_fields,
+                        fn(index) {
+                            entity.fields[index].name
+                        }
+                    ),
+                    time_roles: array::flat_map(
+                        entity.fields,
+                        fn(field) {
+                            match field.time {
+                                Some(time) => [
+                                    {
+                                        field: field.name,
+                                        encoding: time.encoding,
+                                        semantics: time.semantics,
+                                        logical_type: match time.encoding {
+                                            edsl::TimeEncoding::EpochMillis => "EpochMillis",
+                                            edsl::TimeEncoding::DateText => "Date",
+                                            edsl::TimeEncoding::LocalText => "DateTime",
+                                            edsl::TimeEncoding::Rfc3339Text => "DateTimeUtc"
+                                        }
+                                    }.ty!(TimeRole)
+                                ],
+                                None => []
+                            }
+                        }
+                    ),
                     scope: entity.scope,
                     sample_measures: entity.sample_measures,
                     fields: array::map(
@@ -134,10 +211,21 @@ pub def report: Value = codec::encode(
                         fn(field) {
                             {
                                 name: field.name,
+                                unit: match array::find(
+                                    preparation::prepare(entity.entity_type).fields,
+                                    fn(logical) {
+                                        logical.name == field.name
+                                    }
+                                ) {
+                                    Some(logical) => logical.unit,
+                                    None => None
+                                },
                                 column: field.column,
                                 scalar: scalar_name(field.ty),
                                 nullable: field.nullable,
-                                is_key: array::length(entity.grain_fields) == 1 && entity.grain_fields[0] == field.index,
+                                is_key: array::length(entity.grain_fields) == 1 && entity.grain_fields[
+                                    0
+                                ] == field.index,
                                 time: field.time,
                             }.ty!(Field)
                         }
@@ -150,6 +238,7 @@ pub def report: Value = codec::encode(
             fn(relation) {
                 {
                     id: relation.id,
+                    source_names: relations::source_names(roots, relation.id),
                     from_dataset: payload.entities[relation.from].id,
                     to_dataset: payload.entities[relation.to].id,
                     from_table: payload.entities[relation.from].table,
@@ -167,6 +256,8 @@ pub def report: Value = codec::encode(
                     dataset: payload.entities[dimension.entity].id,
                     column: column(payload.entities[dimension.entity], dimension.field),
                     computed: dimension.computed,
+                    groupable: dimension.groupable,
+                    projectable: dimension.projectable,
                     authorized: dimension.authorized,
                     filterable: dimension.filterable,
                     ops: dimension.ops,

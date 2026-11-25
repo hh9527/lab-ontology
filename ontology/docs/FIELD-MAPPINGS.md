@@ -1,35 +1,87 @@
-# 原始字段与语义投射
+# Sum type 字段与计算分类
 
-字段保留数据库原始类型和原始编码。字段 property 发布平行的语义维度；映射属于该来源字段，同一个 enum 在不同来源可以有不同 wire 编码。
+模型按来源值域选择两种声明：封闭值域直接使用具名 enum 类型；非封闭来源保留原始类型，通过行上的 `values::computed` 发布平行的计算分类字段。计算字段不增加物理列，查询可以分别或同时使用原始字段和计算字段。
+
+## 封闭字段
+
+```telora
+@ev::order_by_itag
+type AlarmSeverity = enum {
+    @ev::itag(1) Critical,
+    @ev::itag(2) Major,
+    @ev::itag(3) Minor,
+    @ev::itag(4) Warning
+};
+
+@domain::dataset("alarm", "alarms", ["id"])
+type Alarm = struct {
+    id: String,
+    @g::exact("alarm_severity")
+    severity: AlarmSeverity
+};
+```
+
+字段类型保留业务身份，variant property 描述来源编码；`itag` 使用整数来源编码，没有源标签时默认使用 PascalCase variant 名称。字符串来源使用 `rename`，同一 variant 的其他来源编码使用 `alias`。同一类型的来源编码只能使用同一种物理存储类型；不同 variant 的 wire 集合必须互斥。字段可用 `Option(AlarmSeverity)` 表达 SQL NULL。
+
+```telora
+type State = enum {
+    @ev::rename("active")
+    @ev::alias("up")
+    Up,
+    @ev::rename("inactive")
+    Down
+};
+```
+
+来源值域是封闭契约：未声明的非空编码在结果解码时失败，不能悄悄解释为其他 variant。公开值使用 variant 身份，查询筛选 lower 到来源 wire；多个 wire 对应同一 variant 时使用 IN，投影负责规范化为 variant。存储表示不授予 enum 原始 Int/String 的算术或文本能力。
+
+## 平行计算分类
 
 ```telora
 type Kind = enum { Olt, Onu, Unknown };
 
-@g::exact("class_raw")
-@v::map_or(
-    Kind.type,
-    "class",
+@domain::dataset("device", "devices", ["id"])
+@v::computed(
+    "kind", "classification_raw", Kind.type,
     [
         v::member(Kind::Olt, ["olt", "ne.category.olt"]),
         v::member(Kind::Onu, ["onu"])
     ],
     Kind::Unknown
 )
-classification: Option(String),
+type Device = struct {
+    id: String,
+    @g::exact("kind_raw")
+    classification_raw: Option(String)
+};
 ```
 
-封闭映射使用 `map`，没有对应成员的非空编码在结果解码时失败。半封闭映射使用 `map_or`，未识别的非空编码投射为 `Unknown`，原始编码仍可从 raw 获取。NULL 投射为 NULL，独立于 Unknown；映射本身不增加可空性。同一来源字段的不同成员不能声明重叠 wire 集合。
+`kind_raw` 保留来源编码；`kind` 是独立发布的具名分类字段，类型为 Kind，并继承来源可空性。未识别的非空值映射为 Unknown，SQL NULL 仍是 NULL。源字段必须存在且物理类型匹配；计算字段名称不能重复。模型作者声明映射，不手写转换函数。
 
-## 筛选与投影
+查询可以使用 `a.kind_raw` 精确保留来源细节，使用 `a.kind` 归一化分类，或同时投影二者。`a.kind == Kind::Olt` 按同一业务类型检查，再下推为来源字段 IN ('olt', 'ne.category.olt')；Unknown 条件匹配非 NULL 且未命中已知成员的来源值。raw 字段只与原始类型比较。
 
-`query_remote!` 中的 `a.class == Kind::Olt` 首先按同一业务类型的相等比较检查。模型再根据该计算字段的映射，将条件下推为 `classification IN ('olt', 'ne.category.olt')`，不需要先计算 CASE。`!=` 使用对应的不相等条件。Unknown 条件匹配非 NULL 且未命中已知成员的编码；NULL 不作为 Unknown。raw 字段只与原始类型的值比较，不能直接与业务 enum 比较。
+## 共享映射
 
-投影语义维度 `a.class` 时，模型生成 CASE，将所有已知 wire 投射为对应 variant。raw 和语义维度可以同时投影。角色范围在同一原始字段上使用 `@s::scope_equal(Kind::Olt)`，成员类型、字段归属与筛选能力在局部初始化时绑定。同一 property 接收原始类型的值时，表达原始字段相等约束。
+同一业务类型在多个来源字段使用相同编码时，先定义 `values::mapping(id, Business.type, Wire.type, members)`，再使用 `@values::computed_domain(domain, publish_id, source_field, fallback)` 绑定。映射定义只保存一份 wire 集合；每个来源的发布名、可空性与能力分别准备。来源编码不同的映射保持独立。
 
-## 独立排序能力
+## Itag 排序
 
-分类映射和可投影能力不授予排序能力。语义维度需要独立声明业务顺序，例如 enum 上的 `@ev::order_by_itag` 和各 variant 的 `@ev::itag`。标签、variant 名称及编码用的 itag 本身不隐含排序授权。
+排序由 enum 类型上的 `@ev::order_by_itag` 授权，每个 variant 必须有一个互异 itag；顺序按整数标签数值确定，作者无需另列语义顺序表。没有该授权的 enum 不能因 variant 名称、来源字符串或编码为整数而自动排序。
 
-没有业务顺序的语义分类在远端和本地排序时均被拒绝。raw 排序依据原始类型处理；作者可以显式选择它，不会改变语义投影字段的类型。
+来源字符串和整数排序标签可以共存，先声明 itag，再用 rename 指定来源字符串：
 
-验收入口：`ontology/tests/mapped_scopes.telora`、`ontology/tests/mapped-scopes-runtime.mjs`、独立 [DARI 仓库](https://github.com/hh9527/dari) 中的语义排序测试。IC 的角色和 OLT 样本聚合验收见 `icloud_model/tests/mapped_pon.telora`。
+```telora
+@ev::order_by_itag
+type Priority = enum {
+    @ev::itag(-3)
+    @ev::rename("zzz")
+    High,
+    @ev::itag(7)
+    @ev::rename("aaa")
+    Low
+};
+```
+
+此时 High 排在 Low 前，与来源字符串的字典序无关。codec 默认接受 PascalCase variant 身份，有完整 itag 时也接受整数标签。原始字段按自己的类型排序；计算分类字段只使用其 enum 授权的 itag 排序。选择哪一个字段由查询决定。
+
+验收入口为 `ontology/tests/sum_type_fields.telora` 和 `ontology/tests/sum-type-fields-runtime.mjs`，后者消费前者导出的 `runtime_fixture`。角色范围和物理链路条件同样保留业务 enum 类型，再由模型转换为来源编码。

@@ -768,7 +768,12 @@ type SourceScope = struct {
     expression: Option(qb::Expr),
     required: qb::PlanProfile
 };
+type GroupIdentity = struct {
+    fields: Array(Int),
+    attributes: Array(Int)
+};
 type EntityEntry = struct {
+    group_identity: Option(GroupIdentity),
     sample_order: Option(qb::LatestOrder),
     source_scope: SourceScope,
     references: Array(ReferenceSpec),
@@ -829,6 +834,7 @@ type MeasureEntry = struct {
 };
 
 type DimensionEntry = struct {
+    groupable: Bool,
     fallback: Option(String),
     utc_bucket: Option(UtcBucketDimensionSpec),
     value_type: Option(Type),
@@ -856,8 +862,15 @@ type PreparedGuard = struct {
     op: FilterOp,
     input: FilterInput
 };
-type PreparedRelationPredicate = struct {target:Bool,predicate:PreparedGuard};
-type PreparedRelationGuard = enum { Predicate(PreparedRelationPredicate), All(Array(PreparedRelationGuard)), Any(Array(PreparedRelationGuard)) };
+type PreparedRelationPredicate = struct {
+    target: Bool,
+    predicate: PreparedGuard
+};
+type PreparedRelationGuard = enum {
+    Predicate(PreparedRelationPredicate),
+    All(Array(PreparedRelationGuard)),
+    Any(Array(PreparedRelationGuard))
+};
 type RelationEntry = struct {
     id: String,
     label: String,
@@ -1213,14 +1226,49 @@ def references_of: Fn(Type) -> Array(ReferenceSpec) = fn(ty) {
     }
 };
 
+def declared_field_roles: Fn(Type, Int, String) -> Array(FieldRole) = fn(owner, index, name) {
+    let roles = match property::get_field_prop(owner, index, FieldRolesDef.type) {
+        Some(note) => note.roles,
+        None => []
+    };
+    if array::any(
+        roles,
+        fn(role) {
+            role == FieldRole::Reference
+        }
+    ) {
+        fail!("Reference role requires a complete identity or named reference", name)
+    } else if array::any(
+        roles,
+        fn(role) {
+            array::length(
+                array::filter(
+                    roles,
+                    fn(other) {
+                        other == role
+                    }
+                )
+            ) != 1
+        }
+    ) {
+        fail!("duplicate field role", name)
+    } else {
+        roles
+    }
+};
 def field_roles_for: Fn(Type, FieldEntry, Array(ReferenceSpec)) -> Array(FieldRole) = fn(
     owner,
     field,
     references
 ) {
-    let declared = match property::get_field_prop(owner, field.index, FieldRolesDef.type) {
-        Some(note) => note.roles,
-        None => [],
+    let declared = match array::find(
+        td::fields(owner),
+        fn(info) {
+            info.name == field.name
+        }
+    ) {
+        Some(info) => declared_field_roles(owner, info.index, info.name),
+        None => []
     };
     let roles = declared;
     if array::any(
@@ -2653,39 +2701,108 @@ def graph_key_condition: Fn(
 def relation_guard_information: Fn(PreparedRelationGuard) -> Value = fn(guard) {
     match guard {
         PreparedRelationGuard::Predicate(value) => {
-            let leaf=codec::encode({field:value.predicate.field,op:value.predicate.op,input:value.predicate.input}.ty!(ScopePredicate));
-            if value.target {Value::Object({"to":leaf})} else {leaf}
+            let leaf = codec::encode(
+                {field: value.predicate.field, op: value.predicate.op, input: value.predicate.input}.ty!(
+                    ScopePredicate
+                )
+            );
+            if value.target {
+                Value::Object({"to": leaf})
+            } else {
+                leaf
+            }
         },
-        PreparedRelationGuard::All(values) => Value::Object({"all":Value::Array(array::map(values,relation_guard_information))}),
-        PreparedRelationGuard::Any(values) => Value::Object({"any":Value::Array(array::map(values,relation_guard_information))})
+        PreparedRelationGuard::All(values) => Value::Object(
+            {"all": Value::Array(array::map(values, relation_guard_information))}
+        ),
+        PreparedRelationGuard::Any(values) => Value::Object(
+            {"any": Value::Array(array::map(values, relation_guard_information))}
+        )
     }
 };
 def guard_information: Fn(Option(PreparedRelationGuard)) -> Option(Value) = fn(guard) {
-    match guard { None => None, Some(value) => Some(relation_guard_information(value)) }
+    match guard {
+        None => None,
+        Some(value) => Some(relation_guard_information(value))
+    }
 };
-def bind_guard_expression: Fn(qb::BuildCtx, Array((EntityEntry,qb::Source)), PreparedRelationGuard) -> (qb::BuildCtx, qb::Expr) = fn(ctx,sources,guard) {
-    let combine = fn(values:Array(PreparedRelationGuard),operation:qb::ScalarFunction) {
-        if values == [] { fail!("relation guard group must not be empty") } else { () };
-        let result=array::fold(values,(ctx,None.ty!(Option(qb::Expr))),fn(state,value) {
-            let bound=bind_guard_expression(state.0,sources,value);
-            (bound.0,Some(match state.1 {None => bound.1,Some(previous) => qb::scalar(operation,[previous,bound.1])}))
-        });
-        (result.0,match result.1 {Some(value) => value,None => fail!("relation guard group must not be empty")})
+def bind_guard_expression: Fn(
+    qb::BuildCtx,
+    Array((EntityEntry, qb::Source)),
+    PreparedRelationGuard
+) -> (qb::BuildCtx, qb::Expr) = fn(ctx, sources, guard) {
+    let combine = fn(values: Array(PreparedRelationGuard), operation: qb::ScalarFunction) {
+        if values == [] {
+            fail!("relation guard group must not be empty")
+        } else {
+            ()
+        };
+        let result = array::fold(
+            values,
+            (ctx, None.ty!(Option(qb::Expr))),
+            fn(state, value) {
+                let bound = bind_guard_expression(state.0, sources, value);
+                (
+                    bound.0,
+                    Some(
+                        match state.1 {
+                            None => bound.1,
+                            Some(previous) => qb::scalar(operation, [previous, bound.1])
+                        }
+                    )
+                )
+            }
+        );
+        (
+            result.0,
+            match result.1 {
+                Some(value) => value,
+                None => fail!("relation guard group must not be empty")
+            }
+        )
     };
     match guard {
         PreparedRelationGuard::Predicate(entry) => {
-            let selected=sources[if entry.target {1} else {0}];
-            let entity=selected.0;let source=selected.1;let value=entry.predicate;
-            let bound=qb::bind(ctx,to_val(value.input));
-            let operation=if value.op == FilterOp::Ne {qb::ScalarFunction::Ne} else {qb::ScalarFunction::Eq};
-            (bound.0,qb::scalar(operation,[prepared_column(source,entity.fields[value.index].column),bound.1]))
+            let selected = sources[
+                if entry.target {
+                    1
+                } else {
+                    0
+                }
+            ];
+            let entity = selected.0;
+            let source = selected.1;
+            let value = entry.predicate;
+            let bound = qb::bind(ctx, to_val(value.input));
+            let operation = if value.op == FilterOp::Ne {
+                qb::ScalarFunction::Ne
+            } else {
+                qb::ScalarFunction::Eq
+            };
+            (
+                bound.0,
+                qb::scalar(
+                    operation,
+                    [prepared_column(source, entity.fields[value.index].column), bound.1]
+                )
+            )
         },
-        PreparedRelationGuard::All(values) => combine(values,qb::ScalarFunction::And),
-        PreparedRelationGuard::Any(values) => combine(values,qb::ScalarFunction::Or)
+        PreparedRelationGuard::All(values) => combine(values, qb::ScalarFunction::And),
+        PreparedRelationGuard::Any(values) => combine(values, qb::ScalarFunction::Or)
     }
 };
-def bind_indexed_guard: Fn(qb::BuildCtx,Array((EntityEntry,qb::Source)),Option(PreparedRelationGuard)) -> (qb::BuildCtx,Option(qb::Expr)) = fn(ctx,sources,guard) {
-    match guard {None => (ctx,None), Some(value) => {let result=bind_guard_expression(ctx,sources,value);(result.0,Some(result.1))}}
+def bind_indexed_guard: Fn(
+    qb::BuildCtx,
+    Array((EntityEntry, qb::Source)),
+    Option(PreparedRelationGuard)
+) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, sources, guard) {
+    match guard {
+        None => (ctx, None),
+        Some(value) => {
+            let result = bind_guard_expression(ctx, sources, value);
+            (result.0, Some(result.1))
+        }
+    }
 };
 def bind_relation_guard: Fn(
     qb::BuildCtx,
@@ -2694,7 +2811,11 @@ def bind_relation_guard: Fn(
     qb::Source,
     qb::Source
 ) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, relation, source, target) {
-    bind_indexed_guard(ctx, [(payload.entities[relation.from],source),(payload.entities[relation.to],target)], relation.guard)
+    bind_indexed_guard(
+        ctx,
+        [(payload.entities[relation.from], source), (payload.entities[relation.to], target)],
+        relation.guard
+    )
 };
 def bind_link_guard: Fn(
     qb::BuildCtx,
@@ -2702,7 +2823,7 @@ def bind_link_guard: Fn(
     BusinessLinkEntry,
     qb::Source
 ) -> (qb::BuildCtx, Option(qb::Expr)) = fn(ctx, payload, link, source) {
-    bind_indexed_guard(ctx, [(payload.entities[link.hub],source)], link.guard)
+    bind_indexed_guard(ctx, [(payload.entities[link.hub], source)], link.guard)
 };
 def graph_guarded_join: Fn(
     qb::BuildCtx,
@@ -2866,7 +2987,13 @@ def graph_constraints: Fn(
                         to.source,
                         relation.key
                     );
-                    let guard = bind_relation_guard(state.0, payload, relation, from.source, to.source);
+                    let guard = bind_relation_guard(
+                        state.0,
+                        payload,
+                        relation,
+                        from.source,
+                        to.source
+                    );
                     let expr = match guard.1 {
                         None => key,
                         Some(value) => qb::scalar(qb::ScalarFunction::And, [key, value]),
@@ -4047,6 +4174,226 @@ def graph_unsafe_edges: Fn(
     proved
 };
 
+# A coarse business identity determines only its declared keys/attributes.
+# A reached single row determines every column, including further relation keys.
+def graph_group_field: Fn(EntityEntry, Int) -> Bool = fn(entity, index) {
+    match entity.group_identity {
+        None => False,
+        Some(identity) => array::any(
+            array::concat([identity.fields, identity.attributes]),
+            fn(field) {
+                field == index
+            }
+        )
+    }
+};
+def graph_key_determined: Fn(RelationKey, Bool, Fn(Int) -> Bool) -> Bool = fn(key, forward, known) {
+    match key {
+        RelationKey::Eq(pair) => known(
+            if forward {
+                pair.from
+            } else {
+                pair.to
+            }
+        ),
+        RelationKey::And(parts) => parts != [] && array::all(
+            parts,
+            fn(part) {
+                graph_key_determined(part, forward, known)
+            }
+        ),
+        RelationKey::Or(parts) => parts != [] && array::all(
+            parts,
+            fn(part) {
+                graph_key_determined(part, forward, known)
+            }
+        )
+    }
+};
+def graph_guard_determined: Fn(PreparedRelationGuard, Bool, Fn(Int) -> Bool) -> Bool = fn(
+    guard,
+    forward,
+    known
+) {
+    match guard {
+        PreparedRelationGuard::Predicate(value) => value.target == forward || known(
+            value.predicate.index
+        ),
+        PreparedRelationGuard::All(parts) => array::all(
+            parts,
+            fn(part) {
+                graph_guard_determined(part, forward, known)
+            }
+        ),
+        PreparedRelationGuard::Any(parts) => array::all(
+            parts,
+            fn(part) {
+                graph_guard_determined(part, forward, known)
+            }
+        )
+    }
+};
+def graph_identity_determined: Fn(PreparedPayload, GraphRequest) -> Array(String) = fn(
+    payload,
+    request
+) {
+    let records = array::filter(
+        request.group_by_identity,
+        fn(id) {
+            graph_group_is_record(
+                payload.entities[entity_by_id(payload, graph_node(request, id).entity)]
+            )
+        }
+    );
+    # Monotone closure: at most one new complete row per graph node.
+    array::fold(
+        request.nodes,
+        records,
+        fn(known, node) {
+            array::fold(
+                request.edges,
+                known,
+                fn(known, edge) {
+                    if array::any(
+                        payload.business_links,
+                        fn(link) {
+                            link.id == edge.relation
+                        }
+                    ) {
+                        known
+                    } else {
+                        let relation = request_relation(payload, edge.relation);
+                        array::fold(
+                            [True, False],
+                            known,
+                            fn(known, forward) {
+                                let source_id = if forward {
+                                    edge.from
+                                } else {
+                                    edge.to
+                                };
+                                let target_id = if forward {
+                                    edge.to
+                                } else {
+                                    edge.from
+                                };
+                                let complete = array::any(
+                                    known,
+                                    fn(id) {
+                                        id == source_id
+                                    }
+                                );
+                                let grouped = array::any(
+                                    request.group_by_identity,
+                                    fn(id) {
+                                        id == source_id
+                                    }
+                                );
+                                if (!complete && !grouped) || array::any(
+                                    known,
+                                    fn(id) {
+                                        id == target_id
+                                    }
+                                ) || !relation_preserves_grain(relation, forward) {
+                                    known
+                                } else {
+                                    let entity = payload.entities[
+                                        entity_by_id(payload, graph_node(request, source_id).entity)
+                                    ];
+                                    let field_known: Fn(Int) -> Bool = fn(index) {
+                                        complete || graph_group_field(entity, index)
+                                    };
+                                    let stable_guard = match relation.guard {
+                                        None => True,
+                                        Some(guard) => graph_guard_determined(
+                                            guard,
+                                            forward,
+                                            field_known
+                                        )
+                                    };
+                                    if stable_guard && graph_key_determined(
+                                        relation.key,
+                                        forward,
+                                        field_known
+                                    ) {
+                                        array::push(known, target_id)
+                                    } else {
+                                        known
+                                    }
+                                }
+                            }
+                        )
+                    }
+                }
+            )
+        }
+    )
+};
+def graph_group_determines: Fn(PreparedPayload, GraphRequest, Array(String), GraphSelect) -> Bool = fn(
+    payload,
+    request,
+    determined,
+    item
+) {
+    let entity = payload.entities[entity_by_id(payload, graph_node(request, item.node).entity)];
+    array::any(
+        determined,
+        fn(id) {
+            id == item.node
+        }
+    ) || (
+        array::any(
+            request.group_by_identity,
+            fn(id) {
+                id == item.node
+            }
+        ) && match array::find(
+            payload.dimensions,
+            fn(d) {
+                d.entity == entity.index && d.id == item.dimension
+            }
+        ) {
+            None => False,
+            Some(dimension) => graph_identity_attribute(entity, dimension)
+        }
+    )
+};
+def validate_graph_grouping: Fn(PreparedPayload, GraphRequest) -> () = fn(payload, request) {
+    if request.count != None || request.measures != [] || request.group_by_identity != [] {
+        let determined = graph_identity_determined(payload, request);
+        array::map(
+            request.select,
+            fn(item) {
+                let entity = entity_by_id(payload, graph_node(request, item.node).entity);
+                match array::find(
+                    payload.dimensions,
+                    fn(d) {
+                        d.entity == entity && d.id == item.dimension
+                    }
+                ) {
+                    None => (),
+                    Some(dimension) => if !dimension.groupable && !graph_group_determines(
+                        payload,
+                        request,
+                        determined,
+                        item
+                    ) {
+                        fail!(
+                            `dimension is not authorized for grouping: \{item.node}.\{item.dimension}; group the owning node with group_by_identity only when its identity determines this attribute; a reference on another node is not interchangeable with the target identity`,
+                            item.node,
+                            item.dimension
+                        )
+                    } else {
+                        ()
+                    }
+                }
+            }
+        );
+        ()
+    } else {
+        ()
+    }
+};
 def graph_count_subject_grain: Fn(
     PreparedPayload,
     GraphRequest,
@@ -4076,7 +4423,9 @@ def graph_multiplying_projection: Fn(GraphRequest, GraphEdge) -> Bool = fn(reque
 };
 
 def graph_raw_row_fanout: Fn(PreparedPayload, GraphRequest) -> Bool = fn(payload, request) {
-    request.count == None && request.count_value == None && array::length(request.measures) == 0 && request.top_per == None && request.top_by_measure == None && !graph_count_subject_grain(
+    request.count == None && request.count_value == None && request.group_by_identity == [] && array::length(
+        request.measures
+    ) == 0 && request.top_per == None && request.top_by_measure == None && !graph_count_subject_grain(
         payload,
         request,
         request.root
@@ -4299,6 +4648,44 @@ def graph_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity
     }
 };
 
+# Business identity groups samples without changing their record grain.
+def graph_group_identity_columns: Fn(EntityEntry, String) -> Array(String) = fn(entity, node_id) {
+    match entity.group_identity {
+        None => graph_identity_columns(entity, node_id),
+        Some(identity) => array::map(
+            identity.fields,
+            fn(index) {
+                entity.fields[index].column
+            }
+        )
+    }
+};
+def graph_group_is_record: Fn(EntityEntry) -> Bool = fn(entity) {
+    match entity.group_identity {
+        None => True,
+        Some(identity) => array::length(identity.fields) == array::length(entity.grain_fields) && array::all(
+            identity.fields,
+            fn(index) {
+                array::any(
+                    entity.grain_fields,
+                    fn(field) {
+                        field == index
+                    }
+                )
+            }
+        )
+    }
+};
+def graph_identity_attribute: Fn(EntityEntry, DimensionEntry) -> Bool = fn(entity, dimension) {
+    match entity.group_identity {
+        None => False,
+        Some(_) => !dimension.computed && dimension.utc_bucket == None && graph_group_field(
+            entity,
+            dimension.field
+        )
+    }
+};
+
 def graph_count_identity_column: Fn(EntityEntry, String) -> String = fn(entity, subject_id) {
     graph_identity_columns(entity, subject_id)[0]
 };
@@ -4324,7 +4711,7 @@ def graph_pair_identity: Fn(PreparedPayload, GraphRequest, qb::Plan) -> Array(qb
                 None => fail!("graph pair identity source is missing", id),
             };
             array::map(
-                graph_identity_columns(entity, id),
+                graph_group_identity_columns(entity, id),
                 fn(column) {
                     prepared_column(source, column)
                 }
@@ -4708,7 +5095,7 @@ def graph_top_per: Fn(
                 rank.canonical_values != [] && rank.canonical_order == []
             ) {
                 fail!(
-                    "graph top-per rank has no declared business ordering; choose an ordered dimension or declare canonical_order",
+                    "graph top-per rank has no declared business ordering; choose an ordered dimension or declare order_by_itag with distinct integer tags on its enum",
                     spec.rank
                 )
             } else {
@@ -4799,7 +5186,7 @@ def graph_top_by_measure: Fn(
                 [
                     keys,
                     array::map(
-                        graph_identity_columns(entity, id),
+                        graph_group_identity_columns(entity, id),
                         fn(column) {
                             prepared_column(instance.source, column)
                         }
@@ -4822,11 +5209,16 @@ def graph_top_by_measure: Fn(
         }
     );
     let dimension_group = unsplit_group && graph_count_subject_grain(payload, request, spec.node).0;
-    # Root dimensions are functionally determined by a complete root identity.
-    let identity_group = request.group_by_identity == [request.root] && array::all(
+    # A complete root identity also determines attributes across single-valued relations.
+    let determined = graph_identity_determined(payload, request);
+    let identity_group = request.group_by_identity == [request.root] && graph_count_subject_grain(
+        payload,
+        request,
+        spec.node
+    ).0 && array::all(
         request.select,
         fn(item) {
-            item.node == request.root
+            graph_group_determines(payload, request, determined, item)
         }
     );
     let contextual_group = graph_contextual_measure_grain(payload, request, spec.node);
@@ -4852,7 +5244,7 @@ def graph_top_by_measure: Fn(
     } else {
         let notice: Option(Int) = if !unsplit_group && array::length(visible_grouping) > 0 {
             warn!(
-                "graph aggregate top ranks identity groups, not the projected dimension groups; hidden identity keys may split the visible groups. Remove group_by_identity to rank dimension values when the measure source is grain-safe"
+                "graph aggregate top ranks identity groups; projected labels may repeat because hidden identity keys distinguish entities"
             )
         } else {
             None
@@ -5108,6 +5500,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
         order_by: request.order_by,
         take: request.take,
     };
+    validate_graph_grouping(payload, request);
     if array::length(request.nodes) == 0 || (
         array::length(request.select) == 0 && array::length(request.measures) == 0 && request.count == None && request.count_value == None
     ) {
@@ -5138,10 +5531,6 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
         }
     ) {
         fail!("graph node instance ids must be nonempty and unique")
-    } else if request.count == None && array::length(request.measures) == 0 && array::length(
-        request.group_by_identity
-    ) > 0 {
-        fail!("graph identity grouping requires an aggregate projection")
     } else if request.distinct && (
         request.count != None || array::length(request.measures) > 0 || request.top_per != None || request.top_by_measure != None || request.include_empty
     ) {
@@ -5172,7 +5561,11 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
         fail!(
             "graph association rows require raw projections without global root take, aggregates or partitioned Top-N"
         )
-    } else if request.take != None && !graph_count_subject_grain(payload, request, request.root).0 {
+    } else if request.take != None && request.group_by_identity == [] && !graph_count_subject_grain(
+        payload,
+        request,
+        request.root
+    ).0 {
         let unsafe_edge = graph_count_subject_grain(payload, request, request.root).1;
         let projected = match unsafe_edge {
             Some(edge) => graph_multiplying_projection(request, edge),
@@ -5754,7 +6147,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                                 dimension.canonical_values != [] && dimension.canonical_order == []
                             ) {
                                 fail!(
-                                    "graph order dimension has no declared business ordering; use a plain ordered dimension or extend the Model with an explicit value order",
+                                    "graph order dimension has no declared business ordering; use a plain ordered dimension or declare order_by_itag with distinct integer tags on its enum",
                                     item.node,
                                     item.dimension
                                 )
@@ -5829,12 +6222,26 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
             let raw_order = match request.take {
                 None => ordered.1,
                 Some(_) => array::fold(
-                    built.1,
+                    array::filter(
+                        built.1,
+                        fn(instance) {
+                            request.group_by_identity == [] || array::any(
+                                request.group_by_identity,
+                                fn(id) {
+                                    id == instance.id
+                                }
+                            )
+                        }
+                    ),
                     ordered.1,
                     fn(acc, instance) {
                         let entity = payload.entities[instance.entity];
                         array::fold(
-                            graph_identity_columns(entity, instance.id),
+                            if request.group_by_identity == [] {
+                                graph_identity_columns(entity, instance.id)
+                            } else {
+                                graph_group_identity_columns(entity, instance.id)
+                            },
                             acc,
                             fn(keys, column) {
                                 let expr = prepared_column(instance.source, column);
@@ -6043,7 +6450,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                     }
                 },
             };
-            let visible_grouping = if request.count != None || array::length(request.measures) > 0 {
+            let visible_grouping = if request.count != None || array::length(request.measures) > 0 || request.group_by_identity != [] {
                 array::map(
                     row_projection,
                     fn(item) {
@@ -6063,7 +6470,7 @@ def lower_graph: Fn(qb::BuildCtx, PreparedPayload, GraphRequest) -> (qb::BuildCt
                     let instance = graph_instance(built.1, id);
                     let entity = payload.entities[instance.entity];
                     array::fold(
-                        graph_identity_columns(entity, id),
+                        graph_group_identity_columns(entity, id),
                         grouped,
                         fn(acc, column) {
                             let expr = prepared_column(instance.source, column);
@@ -6391,6 +6798,7 @@ pub use self::{
     FieldRole,
     references_of,
     field_roles_for,
+    declared_field_roles,
     ReferenceSpec,
     RelationPair,
     RelationKey,
@@ -6423,6 +6831,7 @@ pub use self::{
     FieldEntry,
     CanonicalValueSpec,
     CanonicalAlias,
+    GroupIdentity,
     EntityEntry,
     MeasureEntry,
     PreparedMeasurePredicate,

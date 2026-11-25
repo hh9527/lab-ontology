@@ -1,137 +1,101 @@
 # 本体模型与查询转换
 
-本文是 `ontology` 包当前的模型作者契约。宿主服务协议和 JSON Intent 语法见
-[使用说明](../../USAGE.md)，知识查询见[知识契约](KNOWLEDGE.md)。声明签名以
-[`ontology.telora`](../src/ontology.telora) 为准，本文不另行维护装饰器参数清单。
+模型作者通过 `ontology::semantic` 的 Property 声明业务身份、数据集、字段及关系。`ontology::publication::stage` 从同一份准备结果发布查询契约、知识、类型和 codec。统一模型边界见[模型发布契约](../MODEL-PUBLICATION.md)，知识结构见[知识契约](KNOWLEDGE.md)。
 
-知识发布包含事实和已声明的约束。面向 Agent 的用法与工具示例由消费方负责；版本化契约见[知识契约](KNOWLEDGE.md)。
+## 类型与物理映射
 
-原始字段、平行语义投射、多 wire 筛选、半封闭分类与独立排序能力见[字段映射](FIELD-MAPPINGS.md)。
-
-## 联合定位角色
-
-`@semantic::role(name, Identity.type, {part: "field"})` 把同一行已有的标量字段映射到一个完整业务身份。外置 Relation 通过 `semantic::endpoint(Row.type, name)` 使用该角色。声明必须覆盖身份的全部成员，源字段必须存在、存储表示相容且互不重复；任一源字段可空时整个角色可空。角色名不能与同一行的自动身份或 Reference 角色重名。
-
-联合角色只授予显式连接的定位方式，不声明数据集唯一性，不增加物理列，也不授予原始字段额外计算能力。例如设备内端口名可定位光模块，光模块仍可没有唯一 grain。嵌套存储结构使用字段级 `semantic::columns`；跨现有字段的定位使用类型级 `semantic::role`。
-
-## 查询模型准备
-
-IC 使用 `ontology::semantic`，从业务身份、Reference 字段与外置关系准备模型，具体入口见 [IC 类型模型](../../icloud_model/docs/TYPED_MIGRATION.md)。relation 使用 registry 的类型化 Dataset、Entity 角色、Group 绑定及显式记录计数声明。
-`transform::prepare/build` 默认信任模型，准备查询所需的 `PreparedPayload`；
-发布前用独立 `transform::self_check` 完整检查同一组声明。运行期始终校验输入。
-`world::stage` 在封闭构建期从同一准备结果产出查询状态与静态知识；服务仅挂载 transform。
-类型化声明签名见 [`world`](../src/world.telora)；注解式 `edsl::build_transform_root` 仍作为库接口保留。
-完整的小型声明见 [`relation_model`](../../relation_model/src/typed_relations.telora)，服务挂载见[入口](../../relation_model/src/lib.telora)。
-
-Group 输入是封闭的类型化表达式，支持字段、毫秒换秒、速率和完整身份投影。
-维度和聚合度量共用这些表达式；Graph 投影与相关 EXISTS 聚合均检查能力和粒度。
-DimensionGroup 提供文本搜索、数值比较和相等策略，绑定可以收紧能力；筛选专用成员允许声明的过滤，但不允许投影、值计数或样本排名。
-可空身份缺失任一分量时所有分量投影为 NULL，速率只在正时长上计算，Sum／Max／Avg 保留空集 NULL 语义。
-逻辑 Row 字段默认使用同名物理列。异名映射在字段上声明 `@model::column("physicalName")`，初始化从字段类型和 property 派生查询所需的映射。
+字段类型表达业务语义，`Option(T)` 表达可空性。逻辑字段默认使用同名物理列，异名使用 `@model::column("physicalName")`。标量、newtype、封闭 enum 与 Reference 的存储表示由类型准备过程确定。
 
 ```telora
+use ontology::semantic as s;
 use ontology::model as m;
-
-type Row = struct {
-    id: Int,
-    @m::column("tenantId")
-    tenant_id: String,
-    @m::column("operState")
-    oper_status: String,
-};
-```
-
-直接字段的查询维度在字段上声明。`transform::declare` 从 Row property 展开这些维度，transform 和知识发布共用展开后的声明。
-
-```telora
 use ontology::groups as g;
 
-type FrameRow = struct {
-    @g::exact("frame_id")
-    id: String,
-    @g::search("frame_name")
+@s::entity_by("Item")
+type ItemById = struct(String);
+
+@s::subject("Item", "id")
+@s::dataset("items", "items", ["id"])
+type Item = struct {
+    @g::exact("item_id")
+    id: ItemById,
+    @m::column("displayName")
+    @g::search("item_name")
     name: String,
-    @g::numeric("frame_temperature")
-    temperature: Option(Float),
+    parent: Option(s::Reference(ItemById))
 };
 ```
 
-- `@g::search(id)` 发布 String 字段的文本搜索维度
-- `@g::exact(id)` 发布字段的等值维度，保留 newtype 身份
-- `@g::numeric(id)` 发布数值比较维度
-- `@g::epoch_millis(id)` 发布 EpochMillis 时间比较维度
+`entity_by` 表达完整身份；单独指代使用 newtype，联合指代使用具名 struct。Reference 保留目标身份，阻止其来源 String／Int 的普通算术和文本操作。外置 Relation 决定可连接的端点；Reference 本身不自动产生 JOIN。
 
-维度保留字段可空性；同一字段可以声明多个维度。复用 Row 的 Dataset 继承相同的字段声明，维度发布名在各自 Dataset 内寻址。字段业务角色与查询能力分别声明，称谓或分类本身不授予查询操作。
-枚举分类字段通过值域声明业务成员与源编码的对应关系：
+字段知识中的 `type` 是逻辑值类型，`storage_type` 是物理标量类型，`nullable` 单独表达可空性。联合字段映射到多个物理列时，各物理分量保留自己的存储信息；完整身份由 Role 的 parts 表达。知识发现与查询目录共同保留名义类型，物理存储相同不意味着可互换。
 
-```telora
-@v::classification(FrameOperState_domain, "frame_oper_state")
-oper_state: Option(Int),
-```
+## 字段角色与查询授权
 
-`@v::classification(domain, id)` 发布可投影、支持等值筛选的业务维度。需要限制能力时使用 `@v::field_domain(domain, id, projectable, filters)`。源字段必须与值域的源类型一致，或为该类型的 Option；业务枚举、编码映射与排序由值域定义。
+称谓、指代、分类、指标描述字段的业务用途。称谓通过 `@edsl::field_role(edsl::FieldRole::Appellation)` 显式声明；完整身份和 Reference 的 Role 映射派生指代，enum 值域绑定派生分类，上报样本声明派生指标。角色可以重叠，详细规则见[字段角色](FIELD-ROLES.md)。
 
-组合能力通过 `g::field_binding(dataset, id)` 或 `v::field_binding(dataset, id)` 引用字段已声明的维度。计算表达式、关系和聚合组合使用显式声明；模型自检统一检查属性派生与显式声明间的重复和冲突。显式 `with_domains` 绑定与字段值域声明共同组成 Dataset 的业务维度。
+角色不授予查询能力。查询操作在字段上分别声明：
 
-程序式构造可使用 `transform::column` 与 `transform::map_columns`。同一字段的显式映射与 property 必须一致。
-映射保留字段类型、可空性、角色和粒度；模型自检拒绝错配、非法标识符和物理列名冲突，冲突判断不区分 ASCII 大小写。Group 表达式和角色关系共同使用该映射。
-这些表达式直接生成 QueryAst，不接受任意函数或 SQL 字符串映射；API 与范围见 [RFC 0002](../../rfcs/0002-typed-model-composition.md)。
+- `@g::search(id)`：文本搜索与投影
+- `@g::exact(id)`：等值筛选与投影，保留名义类型
+- `@g::numeric(id)`：数值比较与投影
+- `@g::epoch_millis(id)`：EpochMillis 比较与投影
+- `@g::view(id, projectable, filters)`：从字段推导逻辑类型、可空性，显式指定直接视图能力
 
-```telora
-use ontology::ontology as edsl;
-use ontology::intent as intent;
-use ontology::sqlite as sqlite;
-use std::value::{ Value };
+共享视图模板用 `g::dimension_group` 定义上限，`g::field_view` 绑定到具体字段；绑定可以收紧投影和筛选能力。自定义表达式在已发布维度之上组合，不能扩大类型或模板授权。模型自检拒绝重复名称、非法列映射及能力冲突。
 
-# `payload` 是领域模型的 PreparedPayload。
-def lower: Fn(Value) -> Value =
-    intent::query_request_method_factory(payload, sqlite::build_query);
-```
+字段上的 `@groups::null_if_view(id, Int.type, -1)` 可以发布将来源缺失标记转换为 NULL 的可空数值视图；原始字段另行发布，保留编码筛选。该 property 也支持 String，标记类型必须与字段一致，值通过参数绑定进入 SQL。
 
-SQL 后端在构造转换函数时指定，请求本身不能选择后端。入口服务仅将槽位输入传给对应方法，宿主的 JSONL 信封负责选择槽位。
-SQLite、PostgreSQL 和 UQL 均提供 `build_query(QueryAst)` 渲染器。
-[UQL 文档](UQL.md)说明接入方式及执行假设；[方言契约](DIALECT-CONTRACT.md)记录宣布完整跨方言支持前尚需完成的执行等价性验证。
+## 封闭值域与平行分类
 
-## 模型声明
+来源值域封闭时，字段直接使用具名 enum；来源编码由 variant 的 `rename`、`alias`、`itag` Property 声明。非封闭来源保留原始字段，通过 `values::computed` 发布平行计算分类；未知非空来源映射为显式 Unknown，SQL NULL 保持 NULL。
 
-属性业务角色和具名唯一引用集合见[字段角色](FIELD-ROLES.md)。这些声明丰富发现信息，与查询权限、键、粒度和聚合规则相互独立。
+可复用的映射用 `values::mapping` 定义一次，使用 `@values::computed_domain(domain, id, source, fallback)` 分别绑定来源字段与发布名。各字段的物理来源、可空性及查询权限仍独立。排序由 enum 的 `order_by_itag` 及互异整数标签授权。筛选、投影、分组、codec 与排序共用映射事实，见[字段映射](FIELD-MAPPINGS.md)。
 
-数量类型可以用 `@quantity::unit(symbol, quantity, scale)` 声明单位，知识发布在类型节点的 `unit` 中保留这三个字段。
-`scale` 是相对该量纲基准单位的倍率：比例以 1、数据容量以 byte、功率以 W 为基准。
-共享类型 `Percent`（0..100）、`Fraction`（0..1）、`Megabytes`（十进制 MB）和 `Watts` 已声明单位。
-这些元数据不触发隐式换算；单位未知的来源字段应保留独立类型，不能根据数值分布猜测单位。
+## 记录粒度与实体身份
 
-- `@entity_id` 和 `@entity_source` 指定数据集及其可信物理来源。`@dataset` 可声明种类和完整身份粒度；未显式声明粒度的模型也可使用 `@key()`。
-- `@dimension`、`@measure` 及相关注解发布可查询能力。物理字段不会自动成为可见或可筛选维度；声明的操作符和输入种类约束 Intent 值。
-- 具名值类型拥有规范成员及其源编码。维度通过 `@dimension_type` 绑定这些类型。标签和别名辅助发现，查询 Intent 仍使用稳定 ID。类型级 `@half_open()` 增加显式 Unknown 分支，保留未识别字符串；带标签输入、结果列和分组规则见[半开放枚举](HALF-OPEN.md)。
-- 具名关系声明包括端点类型、连接键和 `RelationCardinality {from,to}`。各端点指定另一侧一条记录可匹配本侧多少条记录：`One`（1..1）、`Optional`（0..1）、`Many0`（0..N）、`Many1`（1..N）。对 Device → Site，`{from: Many0, to: One}` 表示每台设备恰好属于一个站点，而每个站点可有零至多台设备。
-  基数是可信的模型契约，独立于 Eq/And/Or 键。正向遍历读取 `to`，反向读取 `from`。`One` 和 `Optional` 保持粒度，对 Or 键也如此；两种 Many 均可能扩增行数。准备阶段校验字段、标量与时间类型及保护条件，但不根据身份键重新证明基数，也不检查运行时数据。
-  下界描述必需的参与关系，不改写连接或取消筛选。内连接仍只选择匹配记录，现有 `include_empty` 模式决定左连接行为。
-  身份分组、实体计数和集合结果对齐仍需要实体身份；业务连接的端点身份比较仍需完整参与者键。业务连接可将端点角色标为有向或无向，物理 A/Z 存储位置本身不表示业务方向。
-- `@knowledge_doc`、`@term`、描述、标签、本地化文本及引用丰富知识图，但不授予查询权限，也不创建遍历边。只有已声明关系或业务连接授权图遍历。
-- 时间角色声明逻辑类型和物理编码。调用方提供具体时间边界，详见[时间契约](TIME.md)。
-- 逻辑标量类型定义值与操作的语义，独立于物理存储和维度能力子集。初始 IPv4 契约见[逻辑类型](LOGICAL-TYPES.md)。
+`dataset(id, table, grain)` 声明一条记录的完整粒度。`@semantic::bind(Identity.type, field)` 声明这条记录描述的业务身份；存在绑定时，知识主体从该身份及字段派生。额外业务主体使用 `@semantic::subject(entity, field)`，这项知识归属不证明记录唯一性。
 
-`build_transform_root` 校验并准备 transform 契约；需要完整知识准备时可显式使用 `build_root`，当前类型化模型通过 `world::stage` 导出静态知识。
-维度可见性由模型声明，调用方认证由宿主负责。模型注解决定哪些业务含义合法；Intent 和渲染器都不能增加未声明语义。
+例如采样记录的 grain 可以是 `["res_id", "tenant_id", "ts"]`，而业务身份只绑定 `res_id`。多个采样时刻可以描述同一对象。没有唯一性依据的来源可以没有 grain；对象计数和记录级身份操作仍要求相应证明。
 
-## 转换边界
+`group_by_identity` 使用已绑定的业务身份，没有绑定时使用完整记录 grain。它可以形成带聚合指标的身份组，也可以只投影身份及其决定的属性，得到对象集合；不同身份的同名标签分别保留。
 
-公共服务通过 `{"intents":[...]}` 接收一至五个独立的 `Graph`、`GraphPair` 或 `GraphUnion` Intent，各项拥有独立诊断作用域。
-仅当所有项均可转换时接受整批；任一项失败时，`queries` 为 null，且每项都有带索引的状态。多个 Intent 是独立计划，不是 SQL 并集。
-`GraphUnion` 则是单个 Intent，遵循更严格的形状规则并产生一个去重结果集。
+当身份比记录 grain 更粗时，身份属性通过 `@semantic::attribute(...)` 声明。单次采样值、时间戳等不自动成为身份属性。记录计数、采样排序和关系保持记录粒度的证明使用 grain，不用业务身份替代。
 
-内部的 `query_intent_ast_factory(payload)` 返回将单个 Intent 转为已校验 `QueryAst` 的函数。
-输入类型、维度能力和度量单位直接来自查询准备结构，请求解析不构造知识发现详情。
-`query_intent_lower_factory(payload, to_query)` 在其上增加后端渲染器；
-`query_request_method_factory(payload, to_query)` 是示例和 IC 入口使用的批量服务边界。
-这些工厂不同：直接工厂不解析服务请求对象，方法工厂负责解析。
+已从关联目标节点取得类型化身份时，后续查询可直接复用该身份参数。源节点的引用属于源节点属性；相同存储编码不意味着其分组权限与目标身份相同。特别是可选关联未匹配时，多个不同源引用可能落到同一个空目标。
 
-图节点指定数据集实例，边通过已声明关系连接实例。`exists` 限定外层总体而不扩增其行数。
-只有能证明模型支持对应粒度和能力时，才允许投影、聚合、分组、排序和时间窗口。
-失败返回结构化诊断，不能据此随意选择连接或悄悄改变请求总体。转换成功只证明所提交 Intent 在模型下合法，不证明 Agent 正确理解了用户自然语言问题。
+## 分组能力
 
-Intent 解析与转换实现见 [`intent.telora`](../src/intent.telora)，模型支持的图校验见
-[`ontology.telora`](../src/ontology.telora)。外部 Intent 形状示例统一维护在[使用说明](../../USAGE.md)，避免产生第二份 JSON 协议。
+`@groups::groupable([dimension_id, ...])` 独立授权按分类值分组，成员必须已声明且可投影。名称、编码、数值或 enum 的投影许可本身不授予分组。时间桶 Property 同时授权桶键分组，原始时刻不自动获得此能力。
 
-领域类型的统一注册入口与 IC 自检方法见[类型驱动的领域注册](REGISTRY.md)。
+身份组可以投影由该身份决定的属性。依赖可沿单值 Relation 传递：遍历方向至多返回一行，并且来源连接键和 guard 均由当前身份决定时，对端属性也可投影；多值关系或随采样变化的键不传递这种依赖。可选关系保留对端可空性。
+
+## 外置关系与联合定位
+
+`semantic::endpoint(Row.type, role)` 引用身份或 Reference 端点。`relations::relation(id, from, to, {from, to})` 声明连接键与两侧基数；字段及完整身份必须匹配。正向读取 to，反向读取 from；One 与 Optional 至多匹配一行，Many0 与 Many1 可能扩增行数。
+
+Optional 关联保留根行，并使对端字段可空；原始字段是否可空与关系是否可选分别表达。基数是模型的业务契约，准备阶段检查结构，不通过运行时采样重定义它。
+
+`@semantic::role(name, Identity.type, {part: "field"})` 将同一行已有字段组合为完整身份，所有分量必须覆盖、存储相容且互不重复。它提供定位方式，不声称这些分量唯一确定数据集的行。嵌套存储结构使用字段级 `semantic::columns`。
+
+`semantic::role_endpoint(endpoint, classification_id, Enum::Member)` 限定端点的业务分类。分类需授权等值筛选且成员有有限来源 wire；多 wire 取析取，多个端点条件及附加 guard 取合取。限定端点不改变 Dataset、身份类型或记录粒度。
+
+同一关联只发布一条可遍历 Relation；正反向使用同一条边。`@relations::sources(relation_id, [source_name, ...])` 记录来源名称，不创建查询别名或额外路径。角色、guard、连接键或基数不同的关系分别保留。来源追溯不增加合法查询空间。
+
+## 数量与统计契约
+
+`ontology::quantity` 提供单位、显示尺度及计算能力。业务 newtype 继承这些约束而保留独立身份；具体字段统计只能在类型能力内选择聚合。允许 Sum 的类型由 `calculations` 授权，不依赖某几个内置类型的名称白名单。原始数值类型遵循其数值能力，业务 newtype 可以显式收紧。
+
+Percent 与 Ratio 分别保留百分数和归一比例的存储尺度，显示规则与计算解耦。整数数量通过 `mean_result` 指定浮点业务均值类型，极值保持原类型。单位由类型继承；字段单位与统计模板中的显式单位必须一致，不能通过重复声明偷偷换算。共享类型见[量纲类型](QUANTITIES.md)。
+
+`@samples::field(group, names)` 声明上报值的聚合模板及发布名。模板的单位默认从类型继承。`@samples::valid_count(field)` 关联 EffectiveCount 字段，提供采集覆盖信息，不隐式改变 AVG 权重。
+
+均值的总体为非空上报值，每个上报值等权；合并均值须重新查询完整来源，或组合各组 sum 与 non-null count。记录计数、非空观测计数、有效采集次数分别表达，不相互替代。空集 Sum／Avg／Min／Max 保留 NULL 语义；空身份集合保持空集合。
+
+## 发布、校验与执行
+
+模型根在封闭构建期准备一次。`publication::stage` 同时产出静态知识、公共符号、codec 和 transform 闭包，统一模型服务通过 `ontology/model` 接收 `{method, input}`。contract 返回类型与符号，transform 校验完整类型化意图并返回参数化计划、结果类型、上界及消费凭据。运行期绑定参数，不重新规划，也不执行数据库查询。
+
+模型决定可解空间及 SQL 方言语义，执行适配器负责数据库连接。SQLite、PostgreSQL 的 QueryAst 渲染与后端能力见[查询文档](QUERY.md)和[方言契约](DIALECT-CONTRACT.md)。独立的 Graph Intent 库协议见[使用说明](../../USAGE.md)，不作为统一模型服务的请求形状。
+
+查询成功证明方案符合模型声明，不证明自然语言意图已经理解正确。时间、样本、分类、关联和结果上界都在相应检查边界验证。模型作者不通过显示标签、知识描述或运行结果增加未声明的查询能力。

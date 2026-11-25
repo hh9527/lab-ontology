@@ -165,18 +165,47 @@ def dataset: Fn(String, String, Array(String)) -> Fn(Type, Option(TableInfo)) ->
         {source, id: Some(id), grain}
     }
 };
-type RoleMapping = struct { name: String, identity: Type, fields: Dict(String) };
+type RoleMapping = struct {
+    name: String,
+    identity: Type,
+    fields: Dict(String)
+};
 @prelude::property(PropertyTarget::Type)
-type RoleMappings = struct { items: Array(RoleMapping) };
-def role: Fn(String, Type, Dict(String)) -> Fn(Type, Option(RoleMappings)) -> RoleMappings = fn(name, by, fields) {
+type RoleMappings = struct {
+    items: Array(RoleMapping)
+};
+def role: Fn(String, Type, Dict(String)) -> Fn(Type, Option(RoleMappings)) -> RoleMappings = fn(
+    name,
+    by,
+    fields
+) {
     contract::publish_name(name);
     let parts = identity(by).parts;
-    if array::length(dict::pairs(fields)) != array::length(parts) || !array::all(parts, fn(part) { dict::get(fields, part.path) != None }) {
+    if array::length(dict::pairs(fields)) != array::length(parts) || !array::all(
+        parts,
+        fn(part) {
+            dict::get(fields, part.path) != None
+        }
+    ) {
         fail!("role mapping must cover the complete identity", name)
-    } else { () };
+    } else {
+        ()
+    };
     fn(ctx, previous) {
-        let items = match previous { Some(previous) => previous.items, None => [] };
-        if array::any(items, fn(item) { item.name == name }) { fail!("duplicate role mapping", name) } else { () };
+        let items = match previous {
+            Some(previous) => previous.items,
+            None => []
+        };
+        if array::any(
+            items,
+            fn(item) {
+                item.name == name
+            }
+        ) {
+            fail!("duplicate role mapping", name)
+        } else {
+            ()
+        };
         {items: array::concat([items, [{name, identity: by, fields}.ty!(RoleMapping)]])}
     }
 };
@@ -365,13 +394,39 @@ def columns: Fn(Dict(String)) -> Fn(property::FieldPropertyCtx, Option(Columns))
     }
 };
 def allowed_statistics: Fn(Type) -> Array(Statistic) = fn(ty) {
-    match property::get_type_prop(ty, NumericInfo.type) {
-        Some(info) => info.statistics,
-        None => if ty == Float.type || ty == Int.type || ty == quantity::Count.type || ty == quantity::Bytes.type {
-            [Statistic::Mean, Statistic::Min, Statistic::Max, Statistic::Sum]
-        } else {
-            []
-        }
+    if !quantity::numeric_storage(ty) {
+        []
+    } else {
+        let explicit = property::get_type_prop(ty, NumericInfo.type);
+        let offered = match explicit {
+            Some(info) => info.statistics,
+            None => [Statistic::Mean, Statistic::Min, Statistic::Max, Statistic::Sum]
+        };
+        array::filter(
+            offered,
+            fn(statistic) {
+                let operation = match statistic {
+                    Statistic::Mean => quantity::Calculation::Mean,
+                    Statistic::Min => quantity::Calculation::Min,
+                    Statistic::Max => quantity::Calculation::Max,
+                    Statistic::Sum => quantity::Calculation::Sum
+                };
+                let allowed = match quantity::calculation_policy(ty) {
+                    None => True,
+                    Some(policy) => array::any(
+                        policy,
+                        fn(item) {
+                            item == operation
+                        }
+                    )
+                };
+                if !allowed && explicit != None {
+                    fail!("semantic statistic exceeds type calculation capabilities", ty, statistic)
+                } else {
+                    allowed
+                }
+            }
+        )
     }
 };
 
@@ -568,8 +623,9 @@ def compute: Fn(Type) -> Prepared = fn(row) {
     let fields = array::map(
         td::fields(row),
         fn(f) {
+            edsl::declared_field_roles(row, f.index, f.name);
             let value = value_type(f.ty);
-            let storage = groups::representation(value.0);
+            let storage = values::storage_type(value.0);
             let reference = property::get_type_prop(value.0, ReferenceInfo.type);
             let identity_info = property::get_type_prop(value.0, IdentityInfo.type);
             let sample_fields = property::get_field_prop(row, f.index, samples::FieldSamples.type);
@@ -719,17 +775,10 @@ def compute: Fn(Type) -> Prepared = fn(row) {
                 },
                 scope: match property::get_field_prop(row, f.index, SourceScope.type) {
                     Some(spec) => {
-                        let resolved = if value.0 == spec.value {
+                        let resolved = if value.0 == spec.value && !values::is_enum(value.0) {
                             spec
                         } else {
-                            let domains = match property::get_field_prop(
-                                row,
-                                f.index,
-                                values::FieldDomains.type
-                            ) {
-                                Some(domains) => domains.dimensions,
-                                None => []
-                            };
+                            let domains = values::scope_domains_of(row, f.index);
                             let matching = array::filter(
                                 domains,
                                 fn(binding) {
@@ -780,8 +829,21 @@ def compute: Fn(Type) -> Prepared = fn(row) {
                     None => None
                 },
                 unit: match property::get_field_prop(row, f.index, quantity::FieldUnit.type) {
-                    Some(spec) => Some(spec.unit),
-                    None => property::get_type_prop(value.0, quantity::Unit.type),
+                    Some(spec) => {
+                        match quantity::unit_of(value.0) {
+                            Some(inherited) => if inherited.quantity != spec.unit.quantity || inherited.scale != spec.unit.scale {
+                                fail!(
+                                    "field unit conflicts with its nominal type; use an explicit conversion or a distinct source type",
+                                    f.name
+                                )
+                            } else {
+                                ()
+                            },
+                            None => ()
+                        };
+                        Some(spec.unit)
+                    },
+                    None => quantity::unit_of(value.0),
                 }
             }.ty!(Field)
         }
@@ -923,7 +985,11 @@ def compute: Fn(Type) -> Prepared = fn(row) {
         Some(b) => {
             let key = field(result, b.field);
             identity(b.identity);
-            if key.nullable || key.value != b.identity {
+            let by = match key.reference {
+                Some(reference) => reference.identity,
+                None => key.value
+            };
+            if key.nullable || by != b.identity {
                 fail!("row identity binding has incompatible type", b.field)
             } else {
                 ()
@@ -1141,6 +1207,7 @@ pub use self::{
     table,
     dataset,
     TableInfo,
+    Binding,
     bind,
     grain,
     Temporal,

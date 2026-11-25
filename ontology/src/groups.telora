@@ -9,6 +9,8 @@ use std::array as array;
 use std::prelude as prelude;
 use std::type_property as property;
 use std::type_desc as td;
+use std::codec as codec;
+use std::value::{Value};
 
 type Column = struct {
     index: Int,
@@ -33,6 +35,7 @@ type Node = enum {
     Column(Column),
     Seconds(Node),
     Ipv4(Node),
+    NullIf((Node, qb::Val)),
     UtcBucket(BucketInput),
     Rate(RateInputs),
     Identity(IdentityInput),
@@ -266,6 +269,47 @@ type DimensionPolicy = struct {
     projectable: Bool,
     filters: Array(Filter)
 };
+@prelude::property(PropertyTarget::Type)
+type GroupableDimensions = struct {
+    ids: Array(String)
+};
+def groupable: Fn(Array(String)) -> Fn(Type, Option(GroupableDimensions)) -> GroupableDimensions = fn(
+    ids
+) {
+    array::map(ids, property_contract::publish_name);
+    fn(ctx, previous) {
+        let before = match previous {
+            Some(spec) => spec.ids,
+            None => []
+        };
+        let all = array::concat([before, ids]);
+        if array::any(
+            all,
+            fn(id) {
+                array::length(
+                    array::filter(
+                        all,
+                        fn(other) {
+                            other == id
+                        }
+                    )
+                ) != 1
+            }
+        ) {
+            fail!("groupable dimension must be declared once", ctx)
+        } else {
+            ()
+        };
+        {ids: all}
+    }
+};
+def groupable_dimensions: Fn(Type) -> Array(String) = fn(row) {
+    match property::get_type_prop(row, GroupableDimensions.type) {
+        Some(spec) => spec.ids,
+        None => []
+    }
+};
+pub use self::{groupable, groupable_dimensions};
 type MemberKind = enum {
     Dimension(DimensionPolicy),
     Transfer(TransferMember),
@@ -513,15 +557,28 @@ def validate_numeric: Fn(String, Type, Array(Statistic)) -> () = fn(id, value, m
     match quantity::calculation_policy(value) {
         None => (),
         Some(allowed) => do {
-            array::map(members, fn(member) {
-                let op = match member {
-                    Statistic::Mean => quantity::Calculation::Mean,
-                    Statistic::Min => quantity::Calculation::Min,
-                    Statistic::Max => quantity::Calculation::Max,
-                    Statistic::Sum => quantity::Calculation::Sum,
-                };
-                if !array::any(allowed, fn(item) {item == op}) {fail!("numeric statistic exceeds type calculation capabilities", id, member)} else { () }
-            }); ()
+            array::map(
+                members,
+                fn(member) {
+                    let op = match member {
+                        Statistic::Mean => quantity::Calculation::Mean,
+                        Statistic::Min => quantity::Calculation::Min,
+                        Statistic::Max => quantity::Calculation::Max,
+                        Statistic::Sum => quantity::Calculation::Sum,
+                    };
+                    if !array::any(
+                        allowed,
+                        fn(item) {
+                            item == op
+                        }
+                    ) {
+                        fail!("numeric statistic exceeds type calculation capabilities", id, member)
+                    } else {
+                        ()
+                    }
+                }
+            );
+            ()
         },
     };
     if id == "" || array::length(members) == 0 || (storage != Int.type && storage != Float.type) || scalars::time_role(
@@ -542,13 +599,6 @@ def validate_numeric: Fn(String, Type, Array(Statistic)) -> () = fn(id, value, m
         }
     ) {
         fail!("numeric group statistics must be distinct", id)
-    } else if array::any(
-        members,
-        fn(member) {
-            member == Statistic::Sum
-        }
-    ) && value != quantity::Count.type && value != quantity::Bytes.type {
-        fail!("numeric Sum requires an explicitly additive quantity type", id)
     } else {
         ()
     }
@@ -712,6 +762,13 @@ def lower: Fn(qb::BuildCtx, qb::Source, Node) -> (qb::BuildCtx, qb::Expr) = fn(c
         Node::Ipv4(input) => {
             let lowered = lower(ctx, source, input);
             edsl::canonical_ipv4_view(lowered.0, lowered.1)
+        },
+        Node::NullIf((input, sentinel)) => {
+            let lowered = lower(ctx, source, input);
+            let code = qb::bind(lowered.0, sentinel);
+            let missing = qb::bind(code.0, qb::Val::None);
+            let matches = qb::scalar(qb::ScalarFunction::Eq, [lowered.1, code.1]);
+            (missing.0, qb::scalar_if(matches, missing.1, lowered.1))
         },
         Node::UtcBucket(bucket) => {
             let lowered = lower(ctx, source, bucket.input);
@@ -1139,11 +1196,46 @@ def field_view: for(V) Fn(
     }
 };
 
-pub use self::{field_view};
+# A direct view derives nominal type and nullability from the field.
+def view: Fn(
+    String,
+    Bool,
+    Array(Filter)
+) -> Fn(property::FieldPropertyCtx, Option(FieldDimensions)) -> FieldDimensions = fn(
+    id,
+    projectable,
+    filters
+) {
+    property_contract::publish_name(id);
+    fn(ctx, previous) {
+        let before = match previous {
+            Some(spec) => spec.dimensions,
+            None => []
+        };
+        {
+            dimensions: array::push(
+                before,
+                prepare_field_dimension(
+                    ctx,
+                    {
+                        id,
+                        group: id,
+                        projectable,
+                        group_projectable: projectable,
+                        group_filters: filters,
+                        filters
+                    }.ty!(FieldDimensionSpec)
+                )
+            )
+        }
+    }
+};
+pub use self::{field_view, view};
 
 # 派生视图也在源字段上声明；局部准备时才绑定实际字段索引。
 type FieldExpressionKind = enum {
     Ipv4,
+    NullIf(qb::Val),
     UtcBucket((qb::UtcBucketUnit, qb::UtcBucketEncoding))
 };
 type FieldExpression = struct {
@@ -1187,6 +1279,52 @@ def ipv4_view: Fn(
         }
     }
 };
+def null_if_view: for(T) Fn(
+    String,
+    TypeOf(T),
+    T
+) -> Fn(property::FieldPropertyCtx, Option(FieldExpressions)) -> FieldExpressions = fn(
+    id,
+    value,
+    sentinel
+) {
+    property_contract::publish_name(id);
+    if value != Int.type && value != String.type {
+        fail!("Null-if view requires an integer or text input type", id)
+    } else {
+        ()
+    };
+    let marker: qb::Val = match codec::encode(sentinel) {
+        Value::Int(number) => qb::Val::Int(number),
+        Value::String(text) => qb::Val::String(text),
+        _ => fail!("Null-if view requires an integer or text sentinel", id)
+    };
+    fn(ctx, previous) {
+        if ctx.ty != value && ctx.ty != Option(T).type {
+            fail!("Null-if view input type must match the field type", ctx.name)
+        } else {
+            ()
+        };
+        let before = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        {
+            items: array::push(
+                before,
+                {
+                    id,
+                    input: value,
+                    value,
+                    input_nullable: ctx.ty != value,
+                    kind: FieldExpressionKind::NullIf(marker),
+                    filters: if value == Int.type { numeric_filters } else { text_search_filters }
+                }.ty!(FieldExpression)
+            )
+        }
+    }
+};
+
 def utc_bucket_view: Fn(
     String,
     qb::UtcBucketUnit
@@ -1250,6 +1388,7 @@ def field_expressions_for: Fn(model::PreparedDataset) -> Array(BindingFacts) = f
                         );
                         let node = match view.kind {
                             FieldExpressionKind::Ipv4 => Node::Ipv4(input),
+                            FieldExpressionKind::NullIf(sentinel) => Node::NullIf((input, sentinel)),
                             FieldExpressionKind::UtcBucket(bucket) => Node::UtcBucket(
                                 {input, unit: bucket.0, encoding: bucket.1}
                             )
@@ -1289,7 +1428,7 @@ def field_expressions_for: Fn(model::PreparedDataset) -> Array(BindingFacts) = f
         }
     )
 };
-pub use self::{ipv4_view, utc_bucket_view, FieldExpressions, field_expressions_for};
+pub use self::{ipv4_view, null_if_view, utc_bucket_view, FieldExpressions, field_expressions_for};
 
 type FieldStatistic = struct {
     group: NumericGroupFacts,

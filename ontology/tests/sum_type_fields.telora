@@ -1,0 +1,310 @@
+use ontology::semantic as s;
+use ontology::preparation as prepared;
+use ontology::groups as g;
+use ontology::values as v;
+use ontology::enum_values as ev;
+use ontology::ontology as edsl;
+use ontology::query as q;
+use ontology::intent;
+use ontology::sqlite;
+use ontology::publication;
+use ontology::typed_query;
+use std::array;
+use std::test;
+use std::json;
+use std::codec;
+use std::value::{Value};
+
+@ev::order_by_itag
+type Severity = enum {
+    @ev::itag(30)
+    Critical,
+    @ev::itag(10)
+    Minor
+};
+type Status = enum {
+    On,
+    Off
+};
+@ev::order_by_itag
+type Priority = enum {
+    @ev::itag(-3)
+    @ev::rename("zzz")
+    High,
+    @ev::itag(7)
+    @ev::rename("aaa")
+    Low
+};
+type Kind = enum {
+    Olt,
+    Onu,
+    Unknown
+};
+@s::dataset("records", "records", ["id"])
+@v::computed(
+    "kind",
+    "raw_kind",
+    Kind.type,
+    [v::member(Kind::Olt, ["olt", "ne.category.olt"]), v::member(Kind::Onu, ["onu"])],
+    Kind::Unknown
+)
+type Row = struct {
+    @g::exact("id")
+    id: String,
+    @g::exact("severity")
+    severity: Option(Severity),
+    @g::exact("status")
+    status: Status,
+    @g::exact("priority")
+    priority: Priority,
+    @g::exact("kind_raw")
+    raw_kind: Option(String)
+};
+def profile: q::PlanProfile = {
+    allowed_operators: [
+        q::Operator::Source,
+        q::Operator::Column,
+        q::Operator::Project,
+        q::Operator::Order,
+        q::Operator::Limit,
+        q::Operator::Bind,
+        q::Operator::Scalar,
+        q::Operator::Filter,
+        q::Operator::Group,
+        q::Operator::Aggregate
+    ],
+    allowed_join_kinds: [],
+    allowed_aggregates: [q::AggregateFunction::Count],
+    allowed_scalars: [
+        q::ScalarFunction::BinaryText,
+        q::ScalarFunction::Eq,
+        q::ScalarFunction::Ne,
+        q::ScalarFunction::IsNotNull,
+        q::ScalarFunction::And,
+        q::ScalarFunction::Or,
+        q::ScalarFunction::Not,
+        q::ScalarFunction::If
+    ],
+    allow_distinct: True
+};
+def payload: edsl::PreparedPayload = s::payload("sum-type-fields", [Row.type], profile);
+def program: publication::Program = publication::prepare(payload, "lab", []);
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("sum type assertion failed")
+            }
+        }
+    )
+};
+def require: for(A) Fn(Option(A)) -> A = fn(value) {
+    match value {
+        Some(value) => value,
+        None => fail!("missing test value")
+    }
+};
+def dimension: Fn(String) -> edsl::DimensionEntry = fn(id) {
+    require(
+        array::find(
+            payload.dimensions,
+            fn(d) {
+                d.id == id
+            }
+        )
+    )
+};
+pub def closed_fields_keep_nominal_type_and_physical_storage: test::Test = verify(
+    fn() {
+        let row = prepared::prepare(Row.type);
+        let severity = require(
+            array::find(
+                row.fields,
+                fn(f) {
+                    f.name == "severity"
+                }
+            )
+        );
+        let status = require(
+            array::find(
+                row.fields,
+                fn(f) {
+                    f.name == "status"
+                }
+            )
+        );
+        let priority = require(
+            array::find(
+                row.fields,
+                fn(f) {
+                    f.name == "priority"
+                }
+            )
+        );
+        severity.value == Severity.type && severity.storage == Int.type && severity.nullable && status.value == Status.type && status.storage == String.type && priority.value == Priority.type && priority.storage == String.type && array::length(
+            payload.entities[0].fields
+        ) == 5
+    }
+);
+pub def computed_classification_is_parallel_and_does_not_change_source: test::Test = verify(
+    fn() {
+        let raw = dimension("kind_raw");
+        let mapped = dimension("kind");
+        raw.value_type == None && !raw.computed && mapped.value_type == Some(Kind.type) && mapped.computed && mapped.field == raw.field && mapped.fallback == Some(
+            "Unknown"
+        ) && array::length(payload.dimensions) == 6
+    }
+);
+pub def ordering_comes_from_itags_independent_of_text_wire_values: test::Test = verify(
+    fn() {
+        dimension("severity").canonical_order == ["Minor", "Critical"] && dimension("priority").canonical_order == [
+            "High",
+            "Low"
+        ] && dimension("status").canonical_order == []
+    }
+);
+pub def published_computed_field_keeps_enum_and_source_nullability: test::Test = verify(
+    fn() {
+        let contract = codec::decode@[publication::Contract](program.contract).unwrap!();
+        let kind = require(
+            array::find(
+                contract.datasets[0].members,
+                fn(m) {
+                    m.id == "kind"
+                }
+            )
+        );
+        kind.nullable && kind.logical != "String"
+    }
+);
+type Mixed = enum {
+    @ev::itag(1)
+    A,
+    @ev::rename("b")
+    B
+};
+pub def mixed_physical_wire_types_are_rejected: test::Test = test::should_fail_with(
+    fn() {
+        ev::storage_type(Mixed.type)
+    },
+    "enum source tags must use one physical storage type"
+);
+type Duplicate = enum {
+    @ev::itag(1)
+    A,
+    @ev::itag(1)
+    B
+};
+@s::dataset("bad", "bad", [])
+type Bad = struct {
+    value: Duplicate
+};
+pub def duplicate_source_wires_are_rejected: test::Test = test::should_fail(
+    fn() {
+        s::payload("bad", [Bad.type], profile)
+    }
+);
+@ev::order_by_itag
+type MissingOrder = enum {
+    A,
+    B
+};
+pub def ordered_enum_requires_complete_itags: test::Test = test::should_fail_with(
+    fn() {
+        ev::itag_order(MissingOrder.type)
+    },
+    "order_by_itag requires one integer tag per variant"
+);
+@s::dataset("wrong", "wrong", [])
+@v::computed("kind", "missing", Kind.type, [v::member(Kind::Onu, ["onu"])], Kind::Unknown)
+type MissingSource = struct {
+    id: String
+};
+pub def computed_source_must_exist: test::Test = test::should_fail_with(
+    fn() {
+        s::payload("wrong", [MissingSource.type], profile)
+    },
+    "computed classification source does not exist"
+);
+def graph: Fn(String) -> Value = fn(body) {
+    json::parse(
+        `{"op":"Graph","root":"r","nodes":[{"id":"r","entity":"records"}],"edges":[],\{body},"take":20}`
+    ).unwrap!()
+};
+def query: Fn(String) -> q::Query = fn(body) {
+    sqlite::build_query(intent::query_intent_ast_factory(payload)(graph(body)))
+};
+pub def unordered_enum_sort_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        query(
+            r#""select":[{"node":"r","dimension":"status"}],"order_by":[{"column":"r_status","direction":"Asc"}]"#
+        )
+    },
+    "has no declared business ordering"
+);
+pub def runtime_contract: Value = program.contract;
+pub def runtime_cases: Value = codec::encode(
+    [
+        query(
+            r#""select":[{"node":"r","dimension":"id"},{"node":"r","dimension":"severity"},{"node":"r","dimension":"status"},{"node":"r","dimension":"priority"},{"node":"r","dimension":"kind_raw"},{"node":"r","dimension":"kind"}],"order_by":[{"column":"r_id","direction":"Asc"}]"#
+        ),
+        query(
+            r#""select":[{"node":"r","dimension":"id"},{"node":"r","dimension":"severity"}],"filters":[{"node":"r","dimension":"severity","op":"Eq","value":"Critical"}],"order_by":[{"column":"r_id","direction":"Asc"}]"#
+        ),
+        query(
+            r#""select":[{"node":"r","dimension":"id"},{"node":"r","dimension":"kind_raw"},{"node":"r","dimension":"kind"}],"filters":[{"node":"r","dimension":"kind","op":"Eq","value":"Olt"}],"order_by":[{"column":"r_id","direction":"Asc"}]"#
+        ),
+        query(
+            r#""select":[{"node":"r","dimension":"id"},{"node":"r","dimension":"kind"}],"filters":[{"node":"r","dimension":"kind","op":"Eq","value":"Unknown"}],"order_by":[{"column":"r_id","direction":"Asc"}]"#
+        ),
+        query(
+            r#""select":[{"node":"r","dimension":"id"},{"node":"r","dimension":"severity"}],"order_by":[{"column":"r_severity","direction":"Asc"},{"column":"r_id","direction":"Asc"}]"#
+        ),
+        query(
+            r#""select":[{"node":"r","dimension":"id"},{"node":"r","dimension":"priority"}],"order_by":[{"column":"r_priority","direction":"Asc"},{"column":"r_id","direction":"Asc"}]"#
+        )
+    ]
+);
+type RuntimeFixture = struct {
+    contract: Value,
+    cases: Value
+};
+pub def runtime_fixture: Value = codec::encode(
+    {contract: runtime_contract, cases: runtime_cases}.ty!(RuntimeFixture)
+);
+@ev::order_by_itag
+type AliasedCode = enum {
+    @ev::itag(1)
+    @ev::alias(11)
+    Normal,
+    @ev::itag(2)
+    Fault
+};
+pub def integer_source_aliases_do_not_create_multiple_itags: test::Test = verify(
+    fn() {
+        array::length(ev::integer_tags(AliasedCode.type)) == 2 && ev::itag_order(AliasedCode.type) == [
+            "Normal",
+            "Fault"
+        ] && require(
+            array::find(
+                ev::members(AliasedCode.type),
+                fn(member) {
+                    member.id == "Normal"
+                }
+            )
+        ).wires == [edsl::FilterInput::Int(1), edsl::FilterInput::Int(11)]
+    }
+);
+@s::dataset("wrong_type", "wrong_type", [])
+@v::computed("kind", "source", Kind.type, [v::member(Kind::Onu, ["onu"])], Kind::Unknown)
+type WrongSourceType = struct {
+    source: Int
+};
+pub def computed_source_type_must_match: test::Test = test::should_fail_with(
+    fn() {
+        s::payload("wrong-type", [WrongSourceType.type], profile)
+    },
+    "computed classification source has incompatible type"
+);

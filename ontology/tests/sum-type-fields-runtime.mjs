@@ -1,0 +1,43 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
+const {contract,cases}=JSON.parse(readFileSync(process.argv[2],'utf8'));
+const module=await import('data:text/javascript;base64,'+Buffer.from(contract.codec_module).toString('base64'));
+const scalar=type=>Object.fromEntries(['parse','encode','decode'].map(op=>[op,value=>{assert.equal(typeof value,type);return value}]));
+const codecs=module.createCodecs({String:scalar('string'),Int:scalar('number'),Float:scalar('number'),Bool:scalar('boolean')});
+const byName=name=>contract.types.find(t=>t.name.endsWith('::'+name));
+const get=(name,storage='String')=>{const type=byName(name);assert(type,name);return codecs[type.logical+'@'+storage]};
+assert.deepEqual(get('Severity').parse(30),{tag:'Critical'});
+assert.equal(get('Severity','Int').encode('Minor'),10);
+assert.deepEqual(get('Priority').order,['High','Low']);
+assert.equal(get('Priority','Int').encode('High'),-3);
+assert.throws(()=>get('Status').decode('other'));
+assert.throws(()=>get('Severity','Int').decode(999));
+assert.throws(()=>get('Severity').parse({tag:'Other'}));
+const mapping=module.mappings['records/kind'];
+assert.deepEqual(mapping.map('future-kind'),{tag:'Unknown'});
+assert.equal(mapping.map(null),null);
+assert.deepEqual(mapping.map('ne.category.olt'),{tag:'Olt'});
+const db=new DatabaseSync(':memory:');
+try{
+ db.exec(`CREATE TABLE records(id TEXT,severity INTEGER,status TEXT,priority TEXT,raw_kind TEXT);
+ INSERT INTO records VALUES ('a',30,'On','aaa','olt'),('b',10,'Off','zzz','ne.category.olt'),
+ ('c',NULL,'On','aaa','future-kind'),('d',30,'On','zzz',NULL),('e',10,'invalid','zzz','onu');`);
+ const run=i=>db.prepare(cases[i].sql).all(...cases[i].bindings).map(row=>({...row}));
+ const all=run(0);
+ assert.equal(all[0].r_severity,'Critical');assert.equal(all[0].r_kind_raw,'olt');assert.equal(all[0].r_kind,'Olt');
+ assert.equal(all[2].r_severity,null);assert.equal(all[2].r_kind,'Unknown');assert.equal(all[2].r_kind_raw,'future-kind');
+ assert.equal(all[3].r_kind,null);
+ assert.throws(()=>get('Status').decode(all[4].r_status),'Closed fields reject unknown physical values');
+ assert.deepEqual(run(1).map(r=>r.r_id),['a','d']);
+ assert.deepEqual(run(2).map(r=>[r.r_id,r.r_kind_raw,r.r_kind]),[['a','olt','Olt'],['b','ne.category.olt','Olt']]);
+ assert.deepEqual(run(3),[{r_id:'c',r_kind:'Unknown'}]);
+ assert.deepEqual(run(4).map(r=>r.r_id),['c','b','e','a','d']);
+ assert.deepEqual(run(5).map(r=>r.r_id),['b','d','e','a','c']);
+ assert.match(cases[2].sql,/ IN \(/);
+ assert(!cases[2].sql.split('WHERE')[1].split('ORDER BY')[0].includes('CASE'),'Classification equality filters the source wire directly');
+ const members=contract.datasets[0].members;
+ assert.equal(members.find(m=>m.id==='kind').nullable,true);
+ assert.equal(members.find(m=>m.id==='status').nullable,false);
+ console.log('Sum type fields: physical storage, closed codecs, parallel raw/classification, IN filtering, Unknown/NULL and itag ordering passed');
+}finally{db.close()}

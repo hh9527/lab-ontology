@@ -9,57 +9,75 @@ use crate::groups as groups;
 use std::pipeline as pipeline;
 use std::json as json;
 use std::codec as codec;
+use std::value::{Value};
 
 @prelude::property(PropertyTarget::Variant)
 type Tags = struct {
     values: Array(edsl::FilterInput),
-    id: String
+    id: String,
+    itag: Option(Int)
 };
 @prelude::property(PropertyTarget::Type)
 type OrderByITag = struct {};
-def tags: Fn(Array(edsl::FilterInput)) -> Fn(property::VariantPropertyCtx, Option(Tags)) -> Tags = fn(
-    values
-) {
-    fn(ctx, previous) {
-        let before = match previous {
-            Some(p) => p.values,
-            None => []
-        };
-        {values: array::concat([before, values]), id: ctx.name}
-    }
-};
 def itag: Fn(Int) -> Fn(property::VariantPropertyCtx, Option(Tags)) -> Tags = fn(value) {
-    tags([edsl::FilterInput::Int(value)])
+    fn(ctx, previous) {
+        if previous != None {
+            fail!("itag must be declared once, before source aliases", ctx.name)
+        } else {
+            ()
+        };
+        {values: [edsl::FilterInput::Int(value)], id: ctx.name, itag: Some(value)}
+    }
 };
 # 字符串源表示使用重命名；多个源表示通过 alias 补充。
 def rename: Fn(String) -> Fn(property::VariantPropertyCtx, Option(Tags)) -> Tags = fn(value) {
     fn(ctx, previous) {
         match previous {
-            Some(_) => fail!("rename must be declared once, before aliases", ctx.name),
-            None => {values: [edsl::FilterInput::Text(value)], id: ctx.name},
+            Some(before) => if before.itag != None && array::all(
+                before.values,
+                fn(v) {
+                    match v {
+                        edsl::FilterInput::Int(_) => True,
+                        _ => False
+                    }
+                }
+            ) {
+                {values: [edsl::FilterInput::Text(value)], id: ctx.name, itag: before.itag}
+            } else {
+                fail!("rename must be declared once, before aliases", ctx.name)
+            },
+            None => {values: [edsl::FilterInput::Text(value)], id: ctx.name, itag: None},
         }
     }
 };
-def alias: Fn(String) -> Fn(property::VariantPropertyCtx, Option(Tags)) -> Tags = fn(value) {
+def alias: for(Wire: codec::Encode) Fn(
+    Wire
+) -> Fn(property::VariantPropertyCtx, Option(Tags)) -> Tags = fn(value) {
+    let input = match codec::encode(value) {
+        Value::String(text) => edsl::FilterInput::Text(text),
+        Value::Int(number) => edsl::FilterInput::Int(number),
+        _ => fail!("enum alias requires Int or String")
+    };
     fn(ctx, previous) {
         match previous {
-            Some(p) => {
+            Some(before) => {
                 if !array::all(
-                    p.values,
-                    fn(v) {
-                        match v {
-                            edsl::FilterInput::Text(_) => True,
+                    before.values,
+                    fn(source) {
+                        match (source, input) {
+                            (edsl::FilterInput::Text(_), edsl::FilterInput::Text(_)) => True,
+                            (edsl::FilterInput::Int(_), edsl::FilterInput::Int(_)) => True,
                             _ => False
                         }
                     }
                 ) {
-                    fail!("string alias requires rename", ctx.name)
+                    fail!("enum alias must match primary source storage", ctx.name)
                 } else {
                     ()
                 };
-                p <~ {values: array::push(p.values, edsl::FilterInput::Text(value))}
+                before <~ {values: array::push(before.values, input)}
             },
-            None => fail!("string alias requires rename", ctx.name),
+            None => fail!("enum alias requires a primary source tag", ctx.name)
         }
     }
 };
@@ -116,7 +134,11 @@ def prepare_members: Fn(Type) -> Array(edsl::CanonicalValueSpec) = fn(ty) {
             };
             let tag = match property::get_variant_prop(ty, variant.index, Tags.type) {
                 Some(tag) => tag,
-                None => fail!("domain variant requires source tags", ty, variant.name),
+                None => {
+                    values: [edsl::FilterInput::Text(variant.name)],
+                    id: variant.name,
+                    itag: None
+                }.ty!(Tags),
             };
             let label = match property::get_variant_prop(ty, variant.index, Description.type) {
                 Some(info) => info.label,
@@ -126,18 +148,48 @@ def prepare_members: Fn(Type) -> Array(edsl::CanonicalValueSpec) = fn(ty) {
         }
     )
 };
+def storage_type: Fn(Type) -> Type = fn(ty) {
+    let values = array::flat_map(
+        members(ty),
+        fn(member) {
+            member.wires
+        }
+    );
+    if array::length(values) == 0 {
+        fail!("closed enum requires at least one variant", ty)
+    } else if array::all(
+        values,
+        fn(value) {
+            match value {
+                edsl::FilterInput::Int(_) => True,
+                _ => False
+            }
+        }
+    ) {
+        Int.type
+    } else if array::all(
+        values,
+        fn(value) {
+            match value {
+                edsl::FilterInput::Text(_) => True,
+                _ => False
+            }
+        }
+    ) {
+        String.type
+    } else {
+        fail!("enum source tags must use one physical storage type", ty)
+    }
+};
+pub use self::{storage_type};
 def integer_tags: Fn(Type) -> Array((String, Int)) = fn(ty) {
     let items = array::flat_map(
         td::variants(groups::representation(ty)),
         fn(v) {
             match property::get_variant_prop(ty, v.index, Tags.type) {
-                Some(tag) => if array::length(tag.values) == 1 {
-                    match tag.values[0] {
-                        edsl::FilterInput::Int(n) => [(v.name, n)],
-                        _ => []
-                    }
-                } else {
-                    []
+                Some(tag) => match tag.itag {
+                    Some(value) => [(v.name, value)],
+                    None => []
                 },
                 None => [],
             }
@@ -151,7 +203,7 @@ def integer_tags: Fn(Type) -> Array((String, Int)) = fn(ty) {
         ) |> pipeline::collect()
     )
 };
-def business_order: Fn(Type) -> Array(String) = fn(ty) {
+def itag_order: Fn(Type) -> Array(String) = fn(ty) {
     if property::get_type_prop(ty, OrderByITag.type) == None {
         []
     } else {
@@ -192,7 +244,7 @@ def business_order: Fn(Type) -> Array(String) = fn(ty) {
         )
     }
 };
-pub use self::{integer_tags, business_order};
+pub use self::{integer_tags, itag_order};
 pub use self::{
     Tags,
     OrderByITag,

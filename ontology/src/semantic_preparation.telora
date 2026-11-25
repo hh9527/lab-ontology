@@ -43,11 +43,93 @@ def endpoint: Fn(Type, String) -> relation::Endpoint = fn(row, field) {
             role.id == field
         }
     ) {
-        Some(binding) => {dataset, role: field, binding},
+        Some(binding) => {dataset, role: field, binding, guard: None},
         None => fail!(
             "relation endpoint requires an identity or Reference field",
             dataset.id,
             field
+        )
+    }
+};
+# A named role reuses the published nominal classification and all its source aliases.
+def role_endpoint: for(Member: codec::Encode) Fn(
+    relation::Endpoint,
+    String,
+    Member
+) -> relation::Endpoint = fn(endpoint, dimension, member) {
+    let prepared: edsl::PreparedPayload = local(endpoint.dataset.row).payload;
+    let entry: edsl::DimensionEntry = match array::find(
+        prepared.dimensions,
+        fn(entry) {
+            entry.id == dimension
+        }
+    ) {
+        Some(entry) => entry,
+        None => fail!("role endpoint requires a declared classification", dimension)
+    };
+    if entry.value_type != Some(Member.type) {
+        fail!("role endpoint member has a different business type", dimension)
+    } else if !entry.authorized || !entry.filterable || !array::any(
+        entry.ops,
+        fn(op) {
+            op == edsl::FilterOp::Eq
+        }
+    ) {
+        fail!("role endpoint classification requires equality capability", dimension)
+    } else {
+        ()
+    };
+    let name = match codec::encode(member) {
+        Value::String(name) => name,
+        _ => fail!("role endpoint requires a unit enum member", dimension)
+    };
+    let declared = match array::find(
+        entry.canonical_values,
+        fn(value) {
+            value.id == name
+        }
+    ) {
+        Some(value) => value,
+        None => fail!("role endpoint requires a declared member", dimension, name)
+    };
+    if declared.wires == [] {
+        fail!("role endpoint requires explicit source values, not a fallback", dimension, name)
+    } else {
+        ()
+    };
+    let field: edsl::FieldEntry = prepared.entities[0].fields[entry.field];
+    let predicates: Array(relation::Guard) = array::map(
+        declared.wires,
+        fn(input) {
+            relation::Guard::Predicate(
+                {
+                    target: False,
+                    row: endpoint.dataset.row,
+                    dataset: endpoint.dataset.id,
+                    source: endpoint.dataset.source,
+                    column: {
+                        index: field.index,
+                        name: field.name,
+                        value: field.ty,
+                        nullable: field.nullable
+                    }.ty!(groups::Column),
+                    op: edsl::FilterOp::Eq,
+                    input
+                }.ty!(relation::GuardPredicate)
+            )
+        }
+    );
+    let predicate: relation::Guard = if array::length(predicates) == 1 {
+        predicates[0]
+    } else {
+        relation::Guard::Any(predicates)
+    };
+    endpoint <~ {
+        guard: Some(
+            match endpoint.guard {
+                None => predicate,
+                Some(previous) => relation::Guard::All([previous, predicate])
+            }
         )
     }
 };
@@ -59,7 +141,11 @@ def guarded_on: for(Scalar: codec::Encode) Fn(
     Scalar,
     Bool
 ) -> relation::Relation = fn(edge, name, op, value, target) {
-    let endpoint=if target {edge.to} else {edge.from};
+    let endpoint = if target {
+        edge.to
+    } else {
+        edge.from
+    };
     let row = endpoint.dataset.row;
     let prepared = local(row);
     let field = match array::find(
@@ -86,22 +172,74 @@ def guarded_on: for(Scalar: codec::Encode) Fn(
         Value::False => edsl::FilterInput::Bool(False),
         _ => fail!("relation guard requires a scalar literal", name)
     };
-    relation::with_guard(edge, relation::Guard::Predicate({target, row, dataset: endpoint.dataset.id, source: endpoint.dataset.source, column: {index: field.index, name, value: Scalar.type, nullable: field.nullable}, op, input}.ty!(relation::GuardPredicate)))
+    relation::with_guard(
+        edge,
+        relation::Guard::Predicate(
+            {
+                target,
+                row,
+                dataset: endpoint.dataset.id,
+                source: endpoint.dataset.source,
+                column: {index: field.index, name, value: Scalar.type, nullable: field.nullable},
+                op,
+                input
+            }.ty!(relation::GuardPredicate)
+        )
+    )
 };
-def guarded: for(Scalar:codec::Encode) Fn(relation::Relation,String,edsl::FilterOp,Scalar) -> relation::Relation = fn(edge,name,op,value) {guarded_on(edge,name,op,value,False)};
-def guarded_to: for(Scalar:codec::Encode) Fn(relation::Relation,String,edsl::FilterOp,Scalar) -> relation::Relation = fn(edge,name,op,value) {guarded_on(edge,name,op,value,True)};
+def guarded: for(Scalar: codec::Encode) Fn(
+    relation::Relation,
+    String,
+    edsl::FilterOp,
+    Scalar
+) -> relation::Relation = fn(edge, name, op, value) {
+    guarded_on(edge, name, op, value, False)
+};
+def guarded_to: for(Scalar: codec::Encode) Fn(
+    relation::Relation,
+    String,
+    edsl::FilterOp,
+    Scalar
+) -> relation::Relation = fn(edge, name, op, value) {
+    guarded_on(edge, name, op, value, True)
+};
 # 同一字段的有限候选值取析取，与已有关系条件取合取。
-def guarded_in_on: for(Scalar: codec::Encode) Fn(relation::Relation, String, Array(Scalar),Bool) -> relation::Relation = fn(edge, name, values,target) {
-    if values == [] { fail!("relation membership guard requires at least one value", name) } else { () };
-    let predicates = array::map(values, fn(value) {
-        match guarded_on(edge <~ {guard: None}, name, edsl::FilterOp::Eq, value,target).guard {
-            Some(predicate) => predicate, None => fail!("missing prepared relation guard")
+def guarded_in_on: for(Scalar: codec::Encode) Fn(
+    relation::Relation,
+    String,
+    Array(Scalar),
+    Bool
+) -> relation::Relation = fn(edge, name, values, target) {
+    if values == [] {
+        fail!("relation membership guard requires at least one value", name)
+    } else {
+        ()
+    };
+    let predicates = array::map(
+        values,
+        fn(value) {
+            match guarded_on(edge <~ {guard: None}, name, edsl::FilterOp::Eq, value, target).guard {
+                Some(predicate) => predicate,
+                None => fail!("missing prepared relation guard")
+            }
         }
-    });
+    );
     relation::with_guard(edge, relation::Guard::Any(predicates))
 };
-def guarded_in: for(Scalar:codec::Encode) Fn(relation::Relation,String,Array(Scalar)) -> relation::Relation = fn(edge,name,values) {guarded_in_on(edge,name,values,False)};
-def guarded_in_to: for(Scalar:codec::Encode) Fn(relation::Relation,String,Array(Scalar)) -> relation::Relation = fn(edge,name,values) {guarded_in_on(edge,name,values,True)};
+def guarded_in: for(Scalar: codec::Encode) Fn(
+    relation::Relation,
+    String,
+    Array(Scalar)
+) -> relation::Relation = fn(edge, name, values) {
+    guarded_in_on(edge, name, values, False)
+};
+def guarded_in_to: for(Scalar: codec::Encode) Fn(
+    relation::Relation,
+    String,
+    Array(Scalar)
+) -> relation::Relation = fn(edge, name, values) {
+    guarded_in_on(edge, name, values, True)
+};
 @prelude::property(PropertyTarget::Type)
 type Connections = struct {
     relations: Array(relation::Relation),
@@ -150,16 +288,41 @@ def define: Fn(String, Array(Type), query::PlanProfile) -> world::World = fn(
             connections(property::get_type_prop(row, Connections.type))
         }
     );
+    let relations = array::flat_map(
+        edges,
+        fn(edge) {
+            edge.relations
+        }
+    );
+    relation::validate_sources(
+        roots,
+        array::concat(
+            [
+                array::map(
+                    relations,
+                    fn(edge) {
+                        edge.id
+                    }
+                ),
+                array::flat_map(
+                    edges,
+                    fn(edge) {
+                        array::map(
+                            edge.alternatives,
+                            fn(item) {
+                                item.id
+                            }
+                        )
+                    }
+                )
+            ]
+        )
+    );
     world::from_definitions_with_entities(
         revision,
         array::map(roots, local),
         [],
-        array::flat_map(
-            edges,
-            fn(edge) {
-                edge.relations
-            }
-        ),
+        relations,
         array::flat_map(
             edges,
             fn(edge) {
@@ -190,4 +353,17 @@ def stage: for(B) Fn(String, Array(Type), query::PlanProfile, Fn(edsl::PreparedP
 ) {
     world::stage(define(revision, roots, profile), program)
 };
-pub use self::{endpoint, guarded, guarded_in, guarded_to, guarded_in_to, relations, alternatives, links, payload, stage, define};
+pub use self::{
+    endpoint,
+    role_endpoint,
+    guarded,
+    guarded_in,
+    guarded_to,
+    guarded_in_to,
+    relations,
+    alternatives,
+    links,
+    payload,
+    stage,
+    define
+};

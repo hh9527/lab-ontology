@@ -1,8 +1,12 @@
 # 将独立 Entity 角色绑定为具名 Dataset 关系；只服务 transform。
 use crate::model as model;
+use crate::values as values;
+use crate::enum_values as ev;
 use crate::ontology as edsl;
 use crate::query as qb;
 use std::array as array;
+use std::prelude as prelude;
+use std::type_property as property;
 use std::codec as codec;
 use std::value::{Value};
 use crate::groups as g;
@@ -10,10 +14,113 @@ use std::type_desc as td;
 use crate::registry_impl as registry;
 use std::type_memorizer as memo;
 
+# Source names are provenance, not additional traversable edges or aliases.
+type SourceMapping = struct {
+    relation: String,
+    names: Array(String)
+};
+@prelude::property(PropertyTarget::Type)
+type SourceMappings = struct {
+    items: Array(SourceMapping)
+};
+def sources: Fn(String, Array(String)) -> Fn(Type, Option(SourceMappings)) -> SourceMappings = fn(
+    relation,
+    names
+) {
+    if relation == "" || names == [] || array::any(
+        names,
+        fn(name) {
+            name == "" || name == relation || array::length(
+                array::filter(
+                    names,
+                    fn(other) {
+                        other == name
+                    }
+                )
+            ) != 1
+        }
+    ) {
+        fail!("relation sources require unique, nonempty provenance names", relation)
+    } else {
+        ()
+    };
+    fn(row, previous) {
+        let items = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        if array::any(
+            items,
+            fn(item) {
+                item.relation == relation
+            }
+        ) {
+            fail!("relation sources must be declared once", relation)
+        } else {
+            ()
+        };
+        {items: array::push(items, {relation, names}.ty!(SourceMapping))}
+    }
+};
+def source_names: Fn(Array(Type), String) -> Array(String) = fn(rows, id) {
+    array::flat_map(
+        rows,
+        fn(row) {
+            match property::get_type_prop(row, SourceMappings.type) {
+                None => [],
+                Some(spec) => array::flat_map(
+                    spec.items,
+                    fn(item) {
+                        if item.relation == id {
+                            item.names
+                        } else {
+                            []
+                        }
+                    }
+                )
+            }
+        }
+    )
+};
+def validate_sources: Fn(Array(Type), Array(String)) -> () = fn(rows, ids) {
+    array::map(
+        rows,
+        fn(row) {
+            match property::get_type_prop(row, SourceMappings.type) {
+                None => (),
+                Some(spec) => do {
+                    array::map(
+                        spec.items,
+                        fn(item) {
+                            if !array::any(
+                                ids,
+                                fn(id) {
+                                    id == item.relation
+                                }
+                            ) {
+                                fail!(
+                                    "relation sources reference an unknown relation",
+                                    item.relation
+                                )
+                            } else {
+                                ()
+                            }
+                        }
+                    );
+                    ()
+                }
+            }
+        }
+    );
+    ()
+};
+pub use self::{sources, source_names, validate_sources};
+
 type Endpoint = struct {
     dataset: model::PreparedDataset,
     role: String,
-    binding: model::PreparedRole
+    binding: model::PreparedRole,
+    guard: Option(Guard)
 };
 type GuardPredicate = struct {
     target: Bool,
@@ -24,7 +131,11 @@ type GuardPredicate = struct {
     op: edsl::FilterOp,
     input: edsl::FilterInput
 };
-type Guard = enum { Predicate(GuardPredicate), All(Array(Guard)), Any(Array(Guard)) };
+type Guard = enum {
+    Predicate(GuardPredicate),
+    All(Array(Guard)),
+    Any(Array(Guard))
+};
 type Relation = struct {
     key: edsl::RelationKey,
     guard: Option(Guard),
@@ -49,8 +160,30 @@ def endpoint: Fn(Type, String) -> Endpoint = fn(row, name) {
             role.id == name
         }
     ) {
-        Some(binding) => {dataset, role: name, binding},
+        Some(binding) => {dataset, role: name, binding, guard: None},
         None => fail!("relation endpoint role does not exist", dataset.id, name)
+    }
+};
+# Endpoint constraints are relative to that endpoint, independent of edge direction.
+def endpoint_guard: Fn(Guard, Bool) -> Guard = fn(predicate, target) {
+    match predicate {
+        Guard::Predicate(value) => Guard::Predicate(value <~ {target}),
+        Guard::All(items) => Guard::All(
+            array::map(
+                items,
+                fn(item) {
+                    endpoint_guard(item, target)
+                }
+            )
+        ),
+        Guard::Any(items) => Guard::Any(
+            array::map(
+                items,
+                fn(item) {
+                    endpoint_guard(item, target)
+                }
+            )
+        )
     }
 };
 def relation: Fn(String, Endpoint, Endpoint, edsl::RelationCardinality) -> Relation = fn(
@@ -81,12 +214,27 @@ def relation: Fn(String, Endpoint, Endpoint, edsl::RelationCardinality) -> Relat
         } else {
             edsl::RelationKey::And(parts)
         };
-        {guard: None, id, from, to, cardinality, key}
+        let edge = {guard: None, id, from, to, cardinality, key}.ty!(Relation);
+        let edge = match from.guard {
+            None => edge,
+            Some(predicate) => with_guard(edge, endpoint_guard(predicate, False))
+        };
+        match to.guard {
+            None => edge,
+            Some(predicate) => with_guard(edge, endpoint_guard(predicate, True))
+        }
     }
 };
 # 多次附加条件取合取，不能覆盖已有的业务约束。
 def with_guard: Fn(Relation, Guard) -> Relation = fn(edge, predicate) {
-    edge <~ {guard: Some(match edge.guard {None => predicate, Some(previous) => Guard::All([previous, predicate])})}
+    edge <~ {
+        guard: Some(
+            match edge.guard {
+                None => predicate,
+                Some(previous) => Guard::All([previous, predicate])
+            }
+        )
+    }
 };
 def guarded: for(Row, Scalar: codec::Encode) Fn(
     Relation,
@@ -99,7 +247,54 @@ def guarded: for(Row, Scalar: codec::Encode) Fn(
     } else if op != edsl::FilterOp::Eq && op != edsl::FilterOp::Ne {
         fail!("relation guard supports only Eq or Ne", relation.id)
     } else {
-        with_guard(relation, Guard::Predicate({target: False, row: Row.type, dataset: relation.from.dataset.id, source: relation.from.dataset.source, column: {index: field.index, name: field.name, value: Scalar.type, nullable: field.nullable}, op, input: scalar_input(value)}.ty!(GuardPredicate)))
+        let inputs = if values::is_enum(Scalar.type) {
+            let name = match codec::encode(value) {
+                Value::String(name) => name,
+                _ => fail!("enum guard requires a unit variant")
+            };
+            match array::find(
+                ev::members(Scalar.type),
+                fn(member) {
+                    member.id == name
+                }
+            ) {
+                Some(member) => member.wires,
+                None => fail!("enum guard member is not declared", name)
+            }
+        } else {
+            [scalar_input(value)]
+        };
+        let predicates = array::map(
+            inputs,
+            fn(input) {
+                Guard::Predicate(
+                    {
+                        target: False,
+                        row: Row.type,
+                        dataset: relation.from.dataset.id,
+                        source: relation.from.dataset.source,
+                        column: {
+                            index: field.index,
+                            name: field.name,
+                            value: values::storage_type(Scalar.type),
+                            nullable: field.nullable
+                        },
+                        op,
+                        input
+                    }.ty!(GuardPredicate)
+                )
+            }
+        );
+        with_guard(
+            relation,
+            if array::length(predicates) == 1 {
+                predicates[0]
+            } else if op == edsl::FilterOp::Eq {
+                Guard::Any(predicates)
+            } else {
+                Guard::All(predicates)
+            }
+        )
     }
 };
 def link: Fn(String, Relation, Relation, edsl::LinkDirection) -> Link = fn(id, a, z, direction) {
@@ -139,13 +334,26 @@ def owner: Fn(Owners, Endpoint) -> edsl::EntityEntry = fn(owners, endpoint) {
 };
 def lower_guard: Fn(Guard) -> edsl::PreparedRelationGuard = fn(value) {
     match value {
-        Guard::Predicate(value) => edsl::PreparedRelationGuard::Predicate({target:value.target,predicate:{field: value.column.name, index: value.column.index, op: value.op, input: value.input}}),
-        Guard::All(values) => edsl::PreparedRelationGuard::All(array::map(values,lower_guard)),
-        Guard::Any(values) => edsl::PreparedRelationGuard::Any(array::map(values,lower_guard))
+        Guard::Predicate(value) => edsl::PreparedRelationGuard::Predicate(
+            {
+                target: value.target,
+                predicate: {
+                    field: value.column.name,
+                    index: value.column.index,
+                    op: value.op,
+                    input: value.input
+                }
+            }
+        ),
+        Guard::All(values) => edsl::PreparedRelationGuard::All(array::map(values, lower_guard)),
+        Guard::Any(values) => edsl::PreparedRelationGuard::Any(array::map(values, lower_guard))
     }
 };
 def guard: Fn(Option(Guard)) -> Option(edsl::PreparedRelationGuard) = fn(value) {
-    match value {None => None, Some(value) => Some(lower_guard(value))}
+    match value {
+        None => None,
+        Some(value) => Some(lower_guard(value))
+    }
 };
 def lower: Fn(Owners, Relation) -> edsl::RelationEntry = fn(owners, declared) {
     let from = owner(owners, declared.from);

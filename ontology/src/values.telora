@@ -255,20 +255,31 @@ def domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(
             );
             let body = g::representation(business);
             let label = if td::kind(body) == td::TypeDescKind::Enum {
-                match array::find(td::variants(body), fn(variant) {variant.name == name}) {
-                    Some(variant) => match property::get_variant_prop(business, variant.index, ev::Description.type) {
+                match array::find(
+                    td::variants(body),
+                    fn(variant) {
+                        variant.name == name
+                    }
+                ) {
+                    Some(variant) => match property::get_variant_prop(
+                        business,
+                        variant.index,
+                        ev::Description.type
+                    ) {
                         Some(description) => description.label,
                         None => name
                     },
                     None => name
                 }
-            } else {name};
+            } else {
+                name
+            };
             {id: name, label, wires}.ty!(edsl::CanonicalValueSpec)
         }
     );
     {
         definition: prepare_definition(
-            {id, value: business, wire, values, half_open, order: ev::business_order(business)}
+            {id, value: business, wire, values, half_open, order: ev::itag_order(business)}
         )
     }
 };
@@ -286,21 +297,6 @@ def mapping: for(Business: codec::Encode, Wire: codec::Encode) Fn(
     domain(id, business, wire, members, False)
 };
 pub use self::{mapping};
-def ordered: for(Business: codec::Encode, Wire) Fn(
-    Domain(Business, Wire),
-    Array(Business)
-) -> Domain(Business, Wire) = fn(domain, order) {
-    let ids = array::map(
-        order,
-        fn(value) {
-            match codec::encode(value) {
-                Value::String(id) => id,
-                _ => fail!("business order requires text ids", domain.definition.id)
-            }
-        }
-    );
-    {definition: prepare_order(domain.definition <~ {order: ids})}
-};
 def validate_filters: Fn(Array(g::Filter)) -> () = fn(filters) {
     if !array::all(
         filters,
@@ -454,7 +450,6 @@ pub use self::{
     BindingFacts,
     member,
     domain,
-    ordered,
     dimension_group,
     bind,
     binding_facts
@@ -469,58 +464,7 @@ def from_enum: for(Business, Wire) Fn(
     Bool
 ) -> Domain(Business, Wire) = fn(id, business, wire, half_open) {
     let values = ev::members(business);
-    let order = if property::get_type_prop(business, ev::OrderByITag.type) != None {
-        if wire != Int.type {
-            fail!("order_by_itag requires integer storage", id)
-        } else {
-            ()
-        };
-        let tagged = array::map(
-            values,
-            fn(value) {
-                if array::length(value.wires) != 1 {
-                    fail!("ordered variant requires exactly one integer tag", id, value.id)
-                } else {
-                    ()
-                };
-                match value.wires[0] {
-                    edsl::FilterInput::Int(tag) => (tag, value.id),
-                    _ => fail!("ordered variant requires exactly one integer tag", id, value.id),
-                }
-            }
-        );
-        let sorted = array::fold(
-            tagged,
-            [].ty!(Array((Int, String))),
-            fn(items, item) {
-                array::concat(
-                    [
-                        array::filter(
-                            items,
-                            fn(p) {
-                                p.0 < item.0
-                            }
-                        ),
-                        [item],
-                        array::filter(
-                            items,
-                            fn(p) {
-                                p.0 >= item.0
-                            }
-                        )
-                    ]
-                )
-            }
-        );
-        array::map(
-            sorted,
-            fn(item) {
-                item.1
-            }
-        )
-    } else {
-        []
-    };
+    let order = ev::itag_order(business);
     {definition: prepare_definition({id, value: business, wire, values, half_open, order})}
 };
 pub use self::{from_enum};
@@ -603,40 +547,257 @@ def classification: for(Business, Wire) Fn(
 ) -> Fn(property::FieldPropertyCtx, Option(FieldDomains)) -> FieldDomains = fn(domain, id) {
     field_domain(domain, id, True, g::equality_filters)
 };
-def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) {
-    array::flat_map(
-        m::fields_of(dataset.row),
-        fn(field) {
-            match property::get_field_prop(dataset.row, field.index, FieldDomains.type) {
-                None => [],
-                Some(declared) => array::map(
-                    declared.dimensions,
-                    fn(spec) {
-                        let nullable = field.ty != spec.definition.wire;
-                        let column: g::Column = {
-                            index: field.index,
-                            name: field.name,
-                            value: spec.definition.wire,
-                            nullable
-                        };
+# The enum field is the closed contract; source tags belong to its type.
+def base_type: Fn(Type) -> Type = fn(ty) {
+    let body = g::representation(ty);
+    if td::kind(body) == td::TypeDescKind::Enum {
+        let variants = td::variants(body);
+        if array::length(variants) == 2 && array::any(
+            variants,
+            fn(v) {
+                v.name == "None" && v.payload == None
+            }
+        ) {
+            match array::find(
+                variants,
+                fn(v) {
+                    v.name == "Some"
+                }
+            ) {
+                Some(v) => match v.payload {
+                    Some(value) => value,
+                    None => ty
+                },
+                None => ty
+            }
+        } else {
+            ty
+        }
+    } else {
+        ty
+    }
+};
+def is_enum: Fn(Type) -> Bool = fn(ty) {
+    let value = base_type(ty);
+    value != Bool.type && td::kind(g::representation(value)) == td::TypeDescKind::Enum
+};
+def storage_type: Fn(Type) -> Type = fn(ty) {
+    let value = base_type(ty);
+    if is_enum(value) {
+        ev::storage_type(value)
+    } else {
+        g::representation(value)
+    }
+};
+def domains_of: Fn(Type, Int) -> Array(FieldDomain) = fn(row, index) {
+    let field = m::fields_of(row)[index];
+    let value = base_type(field.ty);
+    if is_enum(value) {
+        if property::get_field_prop(row, index, FieldDomains.type) != None {
+            fail!(
+                "enum fields declare their source tags on the enum, not a parallel field mapping",
+                field.name
+            )
+        } else {
+            ()
+        };
+        let views = match property::get_field_prop(row, index, g::FieldDimensions.type) {
+            Some(spec) => spec.dimensions,
+            None => [
+                {
+                    id: field.name,
+                    nullable: field.ty != value,
+                    group: "closed",
+                    value,
+                    projectable: True,
+                    group_projectable: True,
+                    group_filters: [],
+                    filters: []
+                }.ty!(g::FieldDimension)
+            ]
+        };
+        array::map(
+            views,
+            fn(view) {
+                validate_filters(view.filters);
+                {
+                    definition: prepare_definition(
                         {
-                            row: dataset.row,
-                            dataset: dataset.id,
-                            source: dataset.source,
-                            column,
-                            nullable,
-                            definition: spec.definition,
-                            group_projectable: spec.projectable,
-                            group_filters: spec.filters,
-                            id: spec.id,
-                            projectable: spec.projectable,
-                            filters: spec.filters
-                        }.ty!(BindingFacts)
+                            id: view.id,
+                            value,
+                            wire: ev::storage_type(value),
+                            values: ev::members(value),
+                            half_open: False,
+                            order: ev::itag_order(value)
+                        }
+                    ),
+                    id: view.id,
+                    projectable: view.projectable,
+                    filters: view.filters
+                }.ty!(FieldDomain)
+            }
+        )
+    } else {
+        match property::get_field_prop(row, index, FieldDomains.type) {
+            Some(spec) => spec.dimensions,
+            None => []
+        }
+    }
+};
+# Computed classifications are row-level declarations parallel to physical fields.
+type ComputedField = struct {
+    source: String,
+    field: FieldDomain
+};
+@prelude::property(PropertyTarget::Type)
+type ComputedFields = struct {
+    items: Array(ComputedField)
+};
+def computed_domain: for(Business: codec::Encode, Wire: codec::Encode) Fn(
+    Domain(Business, Wire),
+    String,
+    String,
+    Business
+) -> Fn(Type, Option(ComputedFields)) -> ComputedFields = fn(declared, id, source, fallback) {
+    contract::publish_name(id);
+    let name = match codec::encode(fallback) {
+        Value::String(value) => value,
+        _ => fail!("computed classification fallback requires an enum variant", id)
+    };
+    let definition = declared.definition <~ {fallback: Some(name)};
+    fn(row, previous) {
+        let before = match previous {
+            Some(spec) => spec.items,
+            None => []
+        };
+        if array::any(
+            before,
+            fn(item) {
+                item.field.id == id
+            }
+        ) {
+            fail!("duplicate computed classification", id)
+        } else {
+            ()
+        };
+        {
+            items: array::push(
+                before,
+                {
+                    source,
+                    field: {definition, id, projectable: True, filters: g::equality_filters}.ty!(
+                        FieldDomain
+                    )
+                }.ty!(ComputedField)
+            )
+        }
+    }
+};
+def computed: for(Business: codec::Encode, Wire: codec::Encode) Fn(
+    String,
+    String,
+    TypeOf(Business),
+    Array(Member(Business, Wire)),
+    Business
+) -> Fn(Type, Option(ComputedFields)) -> ComputedFields = fn(
+    id,
+    source,
+    business,
+    members,
+    fallback
+) {
+    computed_domain(mapping(id, business, Wire.type, members), id, source, fallback)
+};
+# Scopes may name the computed classification of the same physical source.
+def scope_domains_of: Fn(Type, Int) -> Array(FieldDomain) = fn(row, index) {
+    let field = m::fields_of(row)[index];
+    let computed = match property::get_type_prop(row, ComputedFields.type) {
+        None => [],
+        Some(spec) => array::map(
+            array::filter(
+                spec.items,
+                fn(item) {
+                    item.source == field.name
+                }
+            ),
+            fn(item) {
+                item.field
+            }
+        )
+    };
+    array::concat([domains_of(row, index), computed])
+};
+pub use self::{scope_domains_of};
+def source_binding: Fn(m::PreparedDataset, Int, FieldDomain) -> BindingFacts = fn(
+    dataset,
+    index,
+    spec
+) {
+    let field = m::fields_of(dataset.row)[index];
+    let nullable = field.ty != base_type(field.ty);
+    {
+        row: dataset.row,
+        dataset: dataset.id,
+        source: dataset.source,
+        column: {index, name: field.name, value: spec.definition.wire, nullable}.ty!(g::Column),
+        nullable,
+        definition: spec.definition,
+        group_projectable: spec.projectable,
+        group_filters: spec.filters,
+        id: spec.id,
+        projectable: spec.projectable,
+        filters: spec.filters
+    }
+};
+def field_bindings: Fn(m::PreparedDataset) -> Array(BindingFacts) = fn(dataset) {
+    array::concat(
+        [
+            array::flat_map(
+                m::fields_of(dataset.row),
+                fn(field) {
+                    array::map(
+                        domains_of(dataset.row, field.index),
+                        fn(spec) {
+                            source_binding(dataset, field.index, spec)
+                        }
+                    )
+                }
+            ),
+            match property::get_type_prop(dataset.row, ComputedFields.type) {
+                None => [],
+                Some(spec) => array::map(
+                    spec.items,
+                    fn(item) {
+                        let field = match m::field_info(dataset.row, item.source) {
+                            Some(field) => field,
+                            None => fail!(
+                                "computed classification source does not exist",
+                                item.source
+                            )
+                        };
+                        if base_type(field.ty) != item.field.definition.wire {
+                            fail!(
+                                "computed classification source has incompatible type",
+                                item.source
+                            )
+                        } else {
+                            ()
+                        };
+                        source_binding(dataset, field.index, item.field)
                     }
                 )
             }
-        }
+        ]
     )
+};
+pub use self::{
+    base_type,
+    is_enum,
+    storage_type,
+    domains_of,
+    computed,
+    computed_domain,
+    ComputedFields
 };
 pub use self::{FieldDomains, FieldDomain, field_domain, classification, field_bindings};
 

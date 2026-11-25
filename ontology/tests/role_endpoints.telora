@@ -1,0 +1,177 @@
+use ontology::semantic as s;
+use ontology::relations as r;
+use ontology::values as v;
+use ontology::groups as g;
+use ontology::enum_values as ev;
+use ontology::ontology as edsl;
+use std::test;
+use std::array;
+
+@s::entity_by("Device")
+type DeviceId = struct(String);
+type Kind = enum {
+    Ap,
+    Switch,
+    Unknown
+};
+type WrongKind = enum {
+    Ap
+};
+type State = enum {
+    @ev::itag(1)
+    Enabled,
+    @ev::itag(2)
+    Disabled
+};
+@s::dataset("devices", "devices", ["id"])
+@v::computed(
+    "kind",
+    "raw",
+    Kind.type,
+    [v::member(Kind::Ap, ["ap", "access.point"]), v::member(Kind::Switch, ["switch"])],
+    Kind::Unknown
+)
+type Device = struct {
+    id: DeviceId,
+    raw: Option(String),
+    @g::exact("state")
+    state: State,
+    @g::field_view(
+        g::dimension_group("display_state", State.type, True, []),
+        "display_state",
+        True,
+        []
+    )
+    display_state: State
+};
+def subject: r::Endpoint = s::endpoint(Device.type, "id");
+def ap: r::Endpoint = s::role_endpoint(subject, "kind", Kind::Ap);
+def cardinality: edsl::RelationCardinality = {
+    from: edsl::Cardinality::Optional,
+    to: edsl::Cardinality::Optional
+};
+def predicates: Fn(Option(r::Guard)) -> Array(r::GuardPredicate) = fn(guard) {
+    match guard {
+        None => [],
+        Some(guard) => match guard {
+            r::Guard::Predicate(value) => [value],
+            r::Guard::All(items) => array::flat_map(
+                items,
+                fn(item) {
+                    predicates(Some(item))
+                }
+            ),
+            r::Guard::Any(items) => array::flat_map(
+                items,
+                fn(item) {
+                    predicates(Some(item))
+                }
+            )
+        }
+    }
+};
+def verify: Fn(Fn() -> Bool) -> test::Test = fn(check) {
+    test::should_ok(
+        fn() {
+            if check() {
+                ()
+            } else {
+                fail!("role endpoint assertion failed")
+            }
+        }
+    )
+};
+pub def role_resolves_all_aliases_from_the_classification: test::Test = verify(
+    fn() {
+        let values = predicates(ap.guard);
+        array::length(values) == 2 && array::all(
+            values,
+            fn(value) {
+                value.column.name == "raw" && value.column.nullable
+            }
+        ) && values[0].input == edsl::FilterInput::Text("ap") && values[1].input == edsl::FilterInput::Text(
+            "access.point"
+        )
+    }
+);
+pub def source_and_target_roles_are_rebased_for_each_relation: test::Test = verify(
+    fn() {
+        let forward = predicates(r::relation("forward", ap, subject, cardinality).guard);
+        let reverse = predicates(r::relation("reverse", subject, ap, cardinality).guard);
+        array::length(forward) == 2 && array::all(
+            forward,
+            fn(value) {
+                !value.target
+            }
+        ) && array::length(reverse) == 2 && array::all(
+            reverse,
+            fn(value) {
+                value.target
+            }
+        ) && array::all(
+            predicates(ap.guard),
+            fn(value) {
+                !value.target
+            }
+        )
+    }
+);
+pub def constraints_on_both_sides_are_preserved: test::Test = verify(
+    fn() {
+        let values = predicates(r::relation("both", ap, ap, cardinality).guard);
+        array::length(values) == 4 && array::length(
+            array::filter(
+                values,
+                fn(value) {
+                    value.target
+                }
+            )
+        ) == 2
+    }
+);
+pub def role_constraints_compose_with_closed_enum_and_relation_guards: test::Test = verify(
+    fn() {
+        let enabled = s::role_endpoint(ap, "state", State::Enabled);
+        let edge = s::guarded(
+            r::relation("enabled", enabled, subject, cardinality),
+            "display_state",
+            edsl::FilterOp::Eq,
+            2
+        );
+        let values = predicates(edge.guard);
+        array::length(values) == 4 && array::any(
+            values,
+            fn(value) {
+                value.input == edsl::FilterInput::Int(1)
+            }
+        ) && array::any(
+            values,
+            fn(value) {
+                value.input == edsl::FilterInput::Int(2)
+            }
+        )
+    }
+);
+pub def unknown_classification_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        s::role_endpoint(subject, "absent", Kind::Ap)
+    },
+    "role endpoint requires a declared classification"
+);
+pub def member_requires_the_same_nominal_business_type: test::Test = test::should_fail_with(
+    fn() {
+        s::role_endpoint(subject, "kind", WrongKind::Ap)
+    },
+    "role endpoint member has a different business type"
+);
+pub def display_only_classification_does_not_grant_a_role_filter: test::Test = test::should_fail_with(
+    fn() {
+        s::role_endpoint(subject, "display_state", State::Enabled)
+    },
+    "role endpoint classification requires equality capability"
+);
+pub def fallback_is_not_a_finite_membership_role: test::Test = test::should_fail(
+    fn() {
+        s::role_endpoint(subject, "kind", Kind::Unknown)
+    }
+);

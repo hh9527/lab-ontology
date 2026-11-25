@@ -1,9 +1,11 @@
+use crate::query as qb;
 use std::seq as seq;
 # 从同一次 Prepared 导出有限事实；不捕获 handler，不生成反向导航。
 use crate::transform as t;
 use crate::groups as g;
 use crate::values as v;
 use crate::samples as samples;
+use crate::relations as relations;
 use crate::ontology as edsl;
 use std::array as array;
 use std::dict as dict;
@@ -110,9 +112,9 @@ def compute_type_id: Fn(Type) -> String = fn(ty) {
 # 具名类型保留身份；只有内置标量／容器使用内联表达式。
 # Option 的公开反射形状是匿名 None/Some 枚举，具名枚举的 kind 为 Ref。
 def inline_type: Fn(Type) -> Bool = fn(ty) {
-    policy::constructor_name(ty) != None || ty == Int.type || ty == Float.type || ty == Bool.type || ty == String.type || td::kind(ty) == td::TypeDescKind::Array || td::kind(
+    policy::constructor_name(ty) != None || ty == Int.type || ty == Float.type || ty == Bool.type || ty == String.type || td::kind(
         ty
-    ) == td::TypeDescKind::Dict || (
+    ) == td::TypeDescKind::Array || td::kind(ty) == td::TypeDescKind::Dict || (
         td::kind(ty) == td::TypeDescKind::Enum && td::name(ty) == None && array::length(
             td::children(ty)
         ) == 1 && array::map(
@@ -136,11 +138,11 @@ def type_ref: Fn(Type) -> String = fn(ty) {
         let constructor = match policy::constructor_name(ty) {
             Some(name) => name,
             None => if td::kind(ty) == td::TypeDescKind::Array {
-            "Array"
-        } else if td::kind(ty) == td::TypeDescKind::Dict {
-            "Dict"
-        } else {
-            "Option"
+                "Array"
+            } else if td::kind(ty) == td::TypeDescKind::Dict {
+                "Dict"
+            } else {
+                "Option"
             }
         };
         `\{constructor}(\{string::join(array::map(td::children(ty), type_ref), ", ")})`
@@ -206,6 +208,7 @@ def expression_types: Fn(g::Node) -> Array(Type) = fn(node) {
         g::Node::Column(c) => [c.value],
         g::Node::Seconds(input) => expression_types(input),
         g::Node::Ipv4(input) => expression_types(input),
+        g::Node::NullIf((input, _)) => expression_types(input),
         g::Node::UtcBucket(b) => expression_types(b.input),
         g::Node::Rate(inputs) => array::concat(
             [expression_types(inputs.amount), expression_types(inputs.duration)]
@@ -236,7 +239,42 @@ def field_business_roles: Fn(
     edsl::FieldEntry,
     Array(edsl::ReferenceSpec)
 ) -> Array(edsl::FieldRole) = fn(d, dataset, field, references) {
-    let roles = edsl::field_roles_for(d.dataset.row, field, references);
+    let declared = edsl::field_roles_for(d.dataset.row, field, references);
+    let roles = if array::any(
+        d.dataset.roles,
+        fn(role) {
+            array::any(
+                role.parts,
+                fn(part) {
+                    part.source == field.name
+                }
+            )
+        }
+    ) && !array::any(
+        declared,
+        fn(role) {
+            role == edsl::FieldRole::Reference
+        }
+    ) {
+        array::push(declared, edsl::FieldRole::Reference)
+    } else {
+        declared
+    };
+    let roles = if array::any(
+        d.domains,
+        fn(domain) {
+            domain.column.name == field.name
+        }
+    ) && !array::any(
+        roles,
+        fn(role) {
+            role == edsl::FieldRole::Classification
+        }
+    ) {
+        array::push(roles, edsl::FieldRole::Classification)
+    } else {
+        roles
+    };
     if array::any(
         d.samples,
         fn(sample) {
@@ -314,6 +352,7 @@ def local_capabilities: Fn(edsl::PreparedPayload) -> LocalCapabilities = fn(payl
                     ("id", codec::encode(d.id)),
                     ("authorized", codec::encode(d.authorized)),
                     ("projectable", codec::encode(d.projectable)),
+                    ("groupable", codec::encode(d.groupable)),
                     ("filterable", codec::encode(d.filterable)),
                     ("ops", codec::encode(d.ops)),
                     ("input_kinds", codec::encode(d.input_kinds)),
@@ -337,6 +376,39 @@ def local_capabilities: Fn(edsl::PreparedPayload) -> LocalCapabilities = fn(payl
                     ("id", codec::encode(m.id)),
                     ("anchor_field", codec::encode(payload.entities[m.entity].fields[m.field].name)),
                     ("aggregate", codec::encode(m.aggregate)),
+                    (
+                        "observation_count",
+                        codec::encode(
+                            if m.aggregate == qb::AggregateFunction::Avg {
+                                match array::find(
+                                    payload.measures,
+                                    fn(counter) {
+                                        counter.entity == m.entity && counter.field == m.field && counter.aggregate == qb::AggregateFunction::Count && counter.predicate == None
+                                    }
+                                ) {
+                                    Some(counter) => Some(counter.id),
+                                    None => None
+                                }
+                            } else {
+                                None
+                            }
+                        )
+                    ),
+                    (
+                        "statistics",
+                        codec::encode(
+                            if m.aggregate == qb::AggregateFunction::Avg {
+                                Some(
+                                    samples::mean_contract(
+                                        payload.entities[m.entity].entity_type,
+                                        payload.entities[m.entity].fields[m.field].name
+                                    )
+                                )
+                            } else {
+                                None
+                            }
+                        )
+                    ),
                     (
                         "predicate",
                         codec::encode(
@@ -426,6 +498,20 @@ def raw_relation_sources: Fn(t::Prepared) -> Value = fn(prepared) {
                             object(
                                 [
                                     ("id", codec::encode(r.id)),
+                                    (
+                                        "source_names",
+                                        codec::encode(
+                                            relations::source_names(
+                                                array::map(
+                                                    prepared.declarations,
+                                                    fn(d) {
+                                                        d.dataset.row
+                                                    }
+                                                ),
+                                                r.id
+                                            )
+                                        )
+                                    ),
                                     ("from", raw_endpoint(r.from.dataset.id, r.from.role)),
                                     ("to", raw_endpoint(r.to.dataset.id, r.to.role))
                                 ]
@@ -443,6 +529,20 @@ def raw_relation_sources: Fn(t::Prepared) -> Value = fn(prepared) {
                             object(
                                 [
                                     ("id", codec::encode(a.id)),
+                                    (
+                                        "source_names",
+                                        codec::encode(
+                                            relations::source_names(
+                                                array::map(
+                                                    prepared.declarations,
+                                                    fn(d) {
+                                                        d.dataset.row
+                                                    }
+                                                ),
+                                                a.id
+                                            )
+                                        )
+                                    ),
                                     (
                                         "choices",
                                         Value::Array(

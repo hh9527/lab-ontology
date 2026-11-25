@@ -1,0 +1,157 @@
+use crate::semantic as s;
+use crate::preparation as preparation;
+use crate::groups as g;
+use crate::values as v;
+use crate::quantity as q;
+use crate::samples as samples;
+use crate::scalars as scalars;
+use crate::relations as relations;
+use crate::ontology as edsl;
+use crate::query as query;
+use crate::world as world;
+use std::test;
+use std::codec;
+use std::value::{Value};
+
+@s::entity_by("Item")
+type ItemId = struct(String);
+type Kind = enum {
+    A,
+    B,
+    Unknown
+};
+def mapping: v::Domain(Kind, String) = v::mapping(
+    "kind",
+    Kind.type,
+    String.type,
+    [v::member(Kind::A, ["a", "alias_a"]), v::member(Kind::B, ["b"])]
+);
+type Utilization = struct(q::Percent);
+type EventCount = struct(q::EffectiveCount);
+def statistics: samples::Group(Utilization) = samples::group(
+    "utilization",
+    Utilization.type,
+    samples::Statistic::Mean,
+    [],
+    None
+);
+@s::bind(ItemId.type, "id")
+@s::dataset("items", "items", ["id"])
+@s::metric("ts")
+@g::groupable(["kind"])
+@v::computed_domain(mapping, "kind", "raw", Kind::Unknown)
+type Item = struct {
+    @g::exact("id")
+    id: ItemId,
+    @edsl::field_role(edsl::FieldRole::Appellation)
+    @g::exact("name")
+    name: String,
+    @g::exact("raw")
+    raw: Option(String),
+    @g::view("value", True, [g::Filter::Eq])
+    @samples::field(statistics, [{statistic: samples::Statistic::Mean, publish: "mean"}])
+    value: Option(Utilization),
+    ts: scalars::DateTimeUtc,
+    @g::exact("peer")
+    peer: Option(s::Reference(ItemId))
+};
+def profile: query::PlanProfile = {
+    allowed_operators: [
+        query::Operator::Source,
+        query::Operator::Column,
+        query::Operator::Project,
+        query::Operator::Aggregate,
+        query::Operator::Group,
+        query::Operator::Scalar,
+        query::Operator::Bind,
+        query::Operator::Filter
+    ],
+    allowed_scalars: [
+        query::ScalarFunction::Eq,
+        query::ScalarFunction::Ne,
+        query::ScalarFunction::If,
+        query::ScalarFunction::IsNotNull,
+        query::ScalarFunction::And,
+        query::ScalarFunction::Or,
+        query::ScalarFunction::Not,
+        query::ScalarFunction::Lower,
+        query::ScalarFunction::Instr,
+        query::ScalarFunction::BinaryText,
+        query::ScalarFunction::Ge,
+        query::ScalarFunction::Gt,
+        query::ScalarFunction::Le,
+        query::ScalarFunction::Lt,
+        query::ScalarFunction::Length,
+        query::ScalarFunction::Substr,
+        query::ScalarFunction::RegexMatch
+    ],
+    allowed_aggregates: [query::AggregateFunction::Avg],
+    allowed_join_kinds: [],
+    allow_distinct: False
+};
+def fixture: world::World = world::from_definitions_with_entities(
+    "model-contract",
+    [preparation::local_definition(preparation::mapping("items", Item.type))],
+    [],
+    [],
+    [],
+    [],
+    profile
+);
+pub def publication: Value = world::publication(fixture, world::prepare(fixture));
+pub def a_typed_field_view_uses_the_field_nominal_type: test::Test = test::should_ok(
+    fn() {
+        preparation::prepare(Item.type)
+    }
+);
+pub def nominal_effective_counters_can_be_summed: test::Test = test::should_ok(
+    fn() {
+        samples::group("events", EventCount.type, samples::Statistic::Sum, [], None);
+        g::numeric_group("events", EventCount.type, [g::Statistic::Sum])
+    }
+);
+pub def explicitly_nonadditive_samples_cannot_be_summed: test::Test = test::should_fail_with(
+    fn() {
+        samples::group("ratio", Utilization.type, samples::Statistic::Sum, [], None)
+    },
+    "exceeds type calculation capabilities"
+);
+pub def a_unit_is_inherited_from_the_business_type: test::Test = test::should_ok(
+    fn() {
+        if statistics.unit == Some("%") {
+            ()
+        } else {
+            fail!("missing inherited unit")
+        }
+    }
+);
+pub def a_conflicting_sample_unit_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        samples::group("bad", Utilization.type, samples::Statistic::Mean, [], Some("byte"))
+    },
+    "sample unit conflicts"
+);
+
+@relations::sources("peer", ["source_peer"])
+type SourceNotes = struct {
+    value: String
+};
+pub def source_names_are_provenance_without_new_edges: test::Test = test::should_ok(
+    fn() {
+        relations::validate_sources([SourceNotes.type], ["peer"]);
+        if relations::source_names([SourceNotes.type], "peer") == ["source_peer"] && relations::source_names(
+            [SourceNotes.type],
+            "other"
+        ) == [] {
+            ()
+        } else {
+            fail!("incorrect source provenance")
+        }
+    }
+);
+pub def provenance_requires_a_real_canonical_relation: test::Test = test::should_fail_with(
+    fn() {
+        relations::validate_sources([SourceNotes.type], ["other"])
+    },
+    "unknown relation"
+);

@@ -1,7 +1,8 @@
+use ontology::quantity as statistic_quantity;
 use super::metric_values as metric;
 use ontology::quantity as presentation;
 use ontology::semantic as domain;
-# 网络设备样本：保留来源尺度、最新整行选择和明确的计数样本加总。
+# 网络设备样本：保留来源尺度、最新整行选择和端口存量的样本均值、峰值。
 use super::inventory as i;
 use ontology::model as m;
 use ontology::groups as g;
@@ -15,11 +16,32 @@ use ontology::query as qb;
 use ontology::quantity::{Percent};
 # 来源在线率暂按百分比；不确认生产尺度或与其他在线率总体互换。
 # 来源定义为设备端口在线比例，百分比尺度。
-@domain::subject("Device", "res_id")
+@presentation::unit("ms", "time", 0.001)
+@presentation::calculations([presentation::Calculation::Compare, presentation::Calculation::Mean,
+    presentation::Calculation::Min, presentation::Calculation::Max, presentation::Calculation::Round])
+type MeanPingResponseTime = struct(Float);
+@presentation::unit("ms", "time", 0.001)
+@presentation::calculations([presentation::Calculation::Compare, presentation::Calculation::Mean,
+    presentation::Calculation::Min, presentation::Calculation::Max, presentation::Calculation::Round])
+@presentation::mean_result(MeanPingResponseTime.type)
+type PingResponseTime = struct(Int);
+def ping_statistics: samples::Group(PingResponseTime) = samples::group(
+    "device_ping_response", PingResponseTime.type, samples::Statistic::Mean,
+    [samples::Statistic::Min, samples::Statistic::Max], None
+);
+@domain::bind(i::DeviceById.type, "res_id")
+@g::groupable(["device_kpi__classification"])
+@r::sources("device_kpi_of_device", ["source_EntNetworkElement_NetworkDeviceKPI"])
 @domain::dataset("device_kpi", "NetworkDeviceKPI", ["res_id", "tenant_id", "ts"])
 @domain::record_counts(["device_kpi_sample_count"])
 @domain::metric("ts")
 @domain::relations(relations)
+@v::computed_domain(
+    i::device_class_domain,
+    "device_kpi__classification",
+    "source_classification",
+    i::DeviceClass::Unknown
+)
 type NetworkDeviceKPI = struct {
     @m::column("resId")
     @g::exact("device_kpi_res_id")
@@ -27,28 +49,14 @@ type NetworkDeviceKPI = struct {
     @m::column("tenantId")
     @g::exact("device_kpi_tenant_id")
     tenant_id: i::TenantId,
-    @g::field_view(
-        g::dimension_group(
-            "device_kpi_ts_raw",
-            s::DateTimeUtc.type,
-            True,
-            [g::Filter::Eq, g::Filter::Ge, g::Filter::Lt]
-        ),
-        "device_kpi_ts_raw",
-        True,
-        [g::Filter::Eq, g::Filter::Ge, g::Filter::Lt]
-    )
+    @g::view("device_kpi_ts_raw", True, [g::Filter::Eq, g::Filter::Ge, g::Filter::Lt])
     @g::utc_bucket_view("device_kpi_utc_hour", qb::UtcBucketUnit::Hour)
     @g::utc_bucket_view("device_kpi_utc_day", qb::UtcBucketUnit::Day)
     @g::utc_bucket_view("device_kpi_utc_month", qb::UtcBucketUnit::Month)
+    @edsl::field_role(edsl::FieldRole::Classification)
     ts: s::DateTimeUtc,
     @m::column("cpuUsage")
-    @g::field_view(
-        g::dimension_group("device_cpu_sample", metric::CpuUtilization.type, True, g::numeric_filters),
-        "device_cpu_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("device_cpu_sample", True, g::numeric_filters)
     @samples::field(
         metric::cpu_statistics,
         [
@@ -58,15 +66,11 @@ type NetworkDeviceKPI = struct {
             {statistic: samples::Statistic::Min, publish: "device_cpu_sample_min"}
         ]
     )
-    @presentation::field_unit("%", "ratio", 0.01)
+    @samples::valid_count("source_cpuUsageEffcnt")
+    @domain::count("cpu_usage_observation_count")
     cpu_usage: metric::CpuUtilization,
     @m::column("memUsage")
-    @g::field_view(
-        g::dimension_group("device_memory_sample", metric::MemoryUtilization.type, True, g::numeric_filters),
-        "device_memory_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("device_memory_sample", True, g::numeric_filters)
     @samples::field(
         metric::memory_statistics,
         [
@@ -76,62 +80,56 @@ type NetworkDeviceKPI = struct {
             {statistic: samples::Statistic::Min, publish: "device_memory_sample_min"}
         ]
     )
-    @presentation::field_unit("%", "ratio", 0.01)
+    @samples::valid_count("source_memUsageEffcnt")
+    @domain::count("memory_usage_observation_count")
     mem_usage: metric::MemoryUtilization,
+    @m::column("nePingRespTime")
+    @g::view("device_ping_response_sample", True, g::numeric_filters)
+    @samples::field(ping_statistics, [
+        {statistic: samples::Statistic::Mean, publish: "device_ping_response_avg"},
+        {statistic: samples::Statistic::Min, publish: "device_ping_response_min"},
+        {statistic: samples::Statistic::Max, publish: "device_ping_response_max"}
+    ])
+    @domain::count("device_ping_response_observation_count")
+    ping_response_time: Option(PingResponseTime),
     @m::column("portCount")
-    @g::field_view(
-        g::dimension_group("port_count_sample", q::Count.type, True, g::numeric_filters),
-        "port_count_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("port_count_sample", True, g::numeric_filters)
     @samples::field(
         port_count_statistics,
         [
-            {statistic: samples::Statistic::Sum, publish: "port_count"},
             {statistic: samples::Statistic::Max, publish: "port_count_peak"},
             {statistic: samples::Statistic::Mean, publish: "port_count_sample_avg"}
         ]
     )
+    @samples::valid_count("source_portCountEffcnt")
+    @domain::count("port_count_sample_avg_observation_count")
     port_count: q::Count,
     @m::column("portUsedCount")
-    @g::field_view(
-        g::dimension_group("used_port_sample", q::Count.type, True, g::numeric_filters),
-        "used_port_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("used_port_sample", True, g::numeric_filters)
     @samples::field(
         port_used_count_statistics,
         [
-            {statistic: samples::Statistic::Sum, publish: "used_port_count"},
             {statistic: samples::Statistic::Mean, publish: "used_port_sample_avg"},
             {statistic: samples::Statistic::Max, publish: "used_port_sample_max"}
         ]
     )
+    @samples::valid_count("source_portUsedCountEffcnt")
+    @domain::count("used_port_sample_avg_observation_count")
     port_used_count: q::Count,
     @m::column("operStatusCount")
-    @g::field_view(
-        g::dimension_group("running_port_sample", q::Count.type, True, g::numeric_filters),
-        "running_port_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("running_port_sample", True, g::numeric_filters)
     @samples::field(
         oper_status_count_statistics,
         [
-            {statistic: samples::Statistic::Sum, publish: "running_port_count"},
             {statistic: samples::Statistic::Mean, publish: "running_port_sample_avg"}
         ]
     )
+    @samples::valid_count("source_operStatusCountEffcnt")
+    @domain::count("running_port_sample_avg_observation_count")
     oper_status_count: q::Count,
     @m::column("adminStatusCount")
-    @g::field_view(
-        g::dimension_group("admin_port_sample", q::Count.type, True, g::numeric_filters),
-        "admin_port_sample",
-        True,
-        g::numeric_filters
-    )
+    @g::view("admin_port_sample", True, g::numeric_filters)
+    @samples::valid_count("source_adminStatusCountEffcnt")
     admin_status_count: q::Count,
     @m::column("parentId")
     @g::exact("device_kpi__parentId")
@@ -145,36 +143,9 @@ type NetworkDeviceKPI = struct {
     @m::column("classification")
     @edsl::field_role(edsl::FieldRole::Classification)
     @g::exact("device_kpi__classification_raw")
-    @v::map_or(
-        i::DeviceClass.type,
-        "device_kpi__classification",
-        [
-            v::member(i::DeviceClass::Wac, ["ne.category.ac", "AC", "WAC"]),
-            v::member(i::DeviceClass::Lsw, ["ne.category.switch", "LSW"]),
-            v::member(i::DeviceClass::Router, ["ne.category.router", "AR"]),
-            v::member(i::DeviceClass::Firewall, ["ne.category.firewall", "FW"]),
-            v::member(i::DeviceClass::Ap, ["ne.category.fatap", "AP"]),
-            v::member(i::DeviceClass::Tianguan, ["TianGuan"]),
-            v::member(i::DeviceClass::Printer, ["ne.category.printer", "printer"]),
-            v::member(i::DeviceClass::Ups, ["ne.category.ups", "ups"]),
-            v::member(i::DeviceClass::Lb, ["ne.category.lb", "lb"]),
-            v::member(i::DeviceClass::Others, ["ne.category.unknown"])
-        ],
-        i::DeviceClass::Unknown
-    )
     source_classification: String,
     @m::column("onlineRate")
-    @g::field_view(
-        g::dimension_group(
-            "device_kpi__onlineRate",
-            metric::OnlineProportion.type,
-            True,
-            g::numeric_filters
-        ),
-        "device_kpi__onlineRate",
-        True,
-        g::numeric_filters
-    )
+    @g::view("device_kpi__onlineRate", True, g::numeric_filters)
     @samples::field(
         metric::online_statistics,
         [
@@ -183,137 +154,68 @@ type NetworkDeviceKPI = struct {
             {statistic: samples::Statistic::Max, publish: "device_online_rate_max"}
         ]
     )
-    @presentation::field_unit("%", "ratio", 0.01)
+    @samples::valid_count("source_onlineRateEffcnt")
+    @domain::count("device_online_rate_avg_observation_count")
     source_onlineRate: metric::OnlineProportion,
     @m::column("ifUtilizationRate")
-    @g::field_view(
-        g::dimension_group("device_kpi__ifUtilizationRate", Percent.type, True, g::numeric_filters),
-        "device_kpi__ifUtilizationRate",
-        True,
-        g::numeric_filters
-    )
+    @g::view("device_kpi__ifUtilizationRate", True, g::numeric_filters)
     @samples::field(
-        source_ifUtilizationRate_statistics,
+        metric::DevicePortUtilization_statistics,
         [
             {statistic: samples::Statistic::Mean, publish: "device_port_usage_avg"},
             {statistic: samples::Statistic::Max, publish: "device_port_usage_max"},
             {statistic: samples::Statistic::Min, publish: "device_port_usage_min"}
         ]
     )
-    @presentation::field_unit("%", "ratio", 0.01)
-    source_ifUtilizationRate: Percent,
+    @samples::valid_count("source_ifUtilizationRateEffcnt")
+    @domain::count("device_port_usage_avg_observation_count")
+    source_ifUtilizationRate: metric::DevicePortUtilization,
     @m::column("cpuUsageEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__cpuUsageEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__cpuUsageEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_cpuUsageEffcnt: Int,
+    @g::view("device_kpi__cpuUsageEffcnt", True, g::numeric_filters)
+    source_cpuUsageEffcnt: statistic_quantity::EffectiveCount,
     @m::column("memUsageEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__memUsageEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__memUsageEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_memUsageEffcnt: Int,
+    @g::view("device_kpi__memUsageEffcnt", True, g::numeric_filters)
+    source_memUsageEffcnt: statistic_quantity::EffectiveCount,
     @m::column("onlineRateEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__onlineRateEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__onlineRateEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_onlineRateEffcnt: Int,
+    @g::view("device_kpi__onlineRateEffcnt", True, g::numeric_filters)
+    source_onlineRateEffcnt: statistic_quantity::EffectiveCount,
     @m::column("ifUtilizationRateEffcnt")
-    @g::field_view(
-        g::dimension_group(
-            "device_kpi__ifUtilizationRateEffcnt",
-            Int.type,
-            True,
-            g::numeric_filters
-        ),
-        "device_kpi__ifUtilizationRateEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_ifUtilizationRateEffcnt: Int,
+    @g::view("device_kpi__ifUtilizationRateEffcnt", True, g::numeric_filters)
+    source_ifUtilizationRateEffcnt: statistic_quantity::EffectiveCount,
     @m::column("portCountEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__portCountEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__portCountEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_portCountEffcnt: Int,
+    @g::view("device_kpi__portCountEffcnt", True, g::numeric_filters)
+    source_portCountEffcnt: statistic_quantity::EffectiveCount,
     @m::column("portUsedCountEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__portUsedCountEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__portUsedCountEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_portUsedCountEffcnt: Int,
+    @g::view("device_kpi__portUsedCountEffcnt", True, g::numeric_filters)
+    source_portUsedCountEffcnt: statistic_quantity::EffectiveCount,
     @m::column("operStatusCountEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__operStatusCountEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__operStatusCountEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_operStatusCountEffcnt: Int,
+    @g::view("device_kpi__operStatusCountEffcnt", True, g::numeric_filters)
+    source_operStatusCountEffcnt: statistic_quantity::EffectiveCount,
     @m::column("adminStatusCountEffcnt")
-    @g::field_view(
-        g::dimension_group("device_kpi__adminStatusCountEffcnt", Int.type, True, g::numeric_filters),
-        "device_kpi__adminStatusCountEffcnt",
-        True,
-        g::numeric_filters
-    )
-    source_adminStatusCountEffcnt: Int,
+    @g::view("device_kpi__adminStatusCountEffcnt", True, g::numeric_filters)
+    source_adminStatusCountEffcnt: statistic_quantity::EffectiveCount,
 };
 def device: r::Endpoint = domain::endpoint(NetworkDeviceKPI.type, "res_id");
-def cpu_usage_statistics: samples::Group(Percent) = samples::group(
-    "device_cpu_usage",
-    Percent.type,
-    samples::Statistic::Mean,
-    [samples::Statistic::Latest, samples::Statistic::Max, samples::Statistic::Min],
-    Some("%")
-);
 def port_count_statistics: samples::Group(q::Count) = samples::group(
     "device_port_count",
     q::Count.type,
-    samples::Statistic::Sum,
-    [samples::Statistic::Max, samples::Statistic::Mean],
+    samples::Statistic::Mean,
+    [samples::Statistic::Max],
     None
 );
 def port_used_count_statistics: samples::Group(q::Count) = samples::group(
     "device_port_used_count",
     q::Count.type,
-    samples::Statistic::Sum,
-    [samples::Statistic::Mean, samples::Statistic::Max],
+    samples::Statistic::Mean,
+    [samples::Statistic::Max],
     None
 );
 def oper_status_count_statistics: samples::Group(q::Count) = samples::group(
     "device_oper_status_count",
     q::Count.type,
-    samples::Statistic::Sum,
-    [samples::Statistic::Mean],
+    samples::Statistic::Mean,
+    [],
     None
-);
-def source_onlineRate_statistics: samples::Group(Percent) = samples::group(
-    "device_source_onlineRate",
-    Percent.type,
-    samples::Statistic::Mean,
-    [samples::Statistic::Min, samples::Statistic::Max],
-    Some("%")
-);
-def source_ifUtilizationRate_statistics: samples::Group(Percent) = samples::group(
-    "device_source_ifUtilizationRate",
-    Percent.type,
-    samples::Statistic::Mean,
-    [samples::Statistic::Max, samples::Statistic::Min],
-    Some("%")
 );
 def relations: Array(r::Relation) = [
     r::relation(
@@ -321,12 +223,6 @@ def relations: Array(r::Relation) = [
         device,
         i::device_subject,
         {from: edsl::Cardinality::Many0, to: edsl::Cardinality::Optional}
-    ),
-    r::relation(
-        "source_EntNetworkElement_NetworkDeviceKPI",
-        i::device_subject,
-        device,
-        {from: edsl::Cardinality::Optional, to: edsl::Cardinality::Many0}
     ),
 ];
 pub use self::{relations};

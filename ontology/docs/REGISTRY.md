@@ -1,4 +1,6 @@
-# 类型驱动的领域注册
+# 显式角色模型的类型注册
+
+`ontology::registry` 为显式 Dataset／Entity 角色组合提供注册接口，relation_model 使用此接口。IC 的模型作者入口为 `ontology::semantic`，见[本体模型](ONTOLOGY.md)。两者共享准备、查询与知识发布结构。
 
 领域定义由具名类型和 property 构成。Dataset 与 Entity 是显式注册根；字段、值域、样本及关系作为所属定义的内容登记。共享业务 Type 从引用自动收集。
 

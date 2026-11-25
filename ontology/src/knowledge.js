@@ -55,7 +55,7 @@ function typerefs(state, id) {
   const info = state.fieldTypes.get(id);
   return info.references;
 }
-const column = (s, c) => ({ ...c, type: typeref(s, c.type) });
+const column = (s, c) => ({ ...c, type: typeref(s, c.type), ...(c.storage_type ? {storage_type: typeref(s, c.storage_type)} : {}) });
 function expression(s, e) {
   if (e.op === 'column') return { ...e, input: column(s, e.input) };
   if (e.op === 'identity') return { ...e, column: column(s, e.column), parts: e.parts.map(c => column(s, c)) };
@@ -101,13 +101,13 @@ function domain(s, dataset, b) {
   merge(s, member(dataset, 'dimensions', b.id), { binding: key, group, type: typeref(s, b.definition.type) }, [key, group, ...typerefs(s, b.definition.type)]);
 }
 function sample(s, dataset, b) {
-  const definition = { ...b.definition, type: typeref(s, b.definition.type) };
+  const definition = { ...b.definition, type: typeref(s, b.definition.type), mean_type: typeref(s, b.definition.mean_type) };
   const group = address('measure_groups', sha256(json(definition))), key = member(dataset, 'bindings', json(['sample', b.names]));
   const field = member(dataset, 'fields', b.field);
   merge(s, group, definition, typerefs(s, b.definition.type));
   merge(s, key, { group, field, nullable: b.nullable, names: b.names }, [group, field]);
   for (const n of b.names) merge(s, member(dataset, 'measures', n.publish),
-    { binding: key, group, statistic: n.statistic, type: typeref(s, b.definition.type) }, [key, group, ...typerefs(s, b.definition.type)]);
+    { binding: key, group, statistic: n.statistic, type: typeref(s, n.statistic === 'Mean' ? b.definition.mean_type : b.definition.type) }, [key, group, ...typerefs(s, n.statistic === 'Mean' ? b.definition.mean_type : b.definition.type)]);
 }
 function entity(s, r) {
   const key = address('entities', r.entity);
@@ -117,7 +117,7 @@ function entity(s, r) {
 function dataset(s, d) {
   const subjects = (d.subjects ?? []).map(subject => ({ entity: address('entities', subject.entity), field: member(d.id, 'fields', subject.field) }));
   for (const subject of subjects) if (!s.facts.has(subject.entity)) merge(s, subject.entity, {identities: []});
-  merge(s, address('datasets', d.id), { source: d.source, grain: d.grain, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [], ...(subjects.length ? {subjects} : {}) }, subjects.map(subject => subject.entity));
+  merge(s, address('datasets', d.id), { source: d.source, grain: d.grain, group_identity: d.group_identity ?? null, kind: d.kind, scope: d.scope, clock: d.clock, references: d.references ?? [], ...(subjects.length ? {subjects} : {}) }, subjects.map(subject => subject.entity));
   for (const r of d.roles) {
     merge(s, member(d.id, 'roles', r.id), { entity: address('entities', r.entity), identity: typeref(s, r.identity), optional: r.optional,
       parts: r.parts.map(p => ({ ...p, type: typeref(s, p.type), raw: p.raw === null ? null : typeref(s, p.raw) })) },
@@ -125,7 +125,8 @@ function dataset(s, d) {
   }
   for (const f of d.fields) {
     const { name, ...value } = f;
-    merge(s, member(d.id, 'fields', name), column(s, value), typerefs(s, f.type));
+    const validCount = f.valid_count ? member(d.id, 'fields', f.valid_count) : null;
+    merge(s, member(d.id, 'fields', name), column(s, {...value, valid_count: validCount}), [...typerefs(s, f.type), ...(validCount ? [validCount] : [])]);
     if (f.time !== null) merge(s, member(d.id, 'time_roles', name), { field: member(d.id, 'fields', name), encoding: f.time.encoding,
       semantics: f.time.semantics, authoritative: d.clock === name }, [member(d.id, 'fields', name)]);
   }
@@ -147,7 +148,11 @@ function capabilities(s, c) {
   }
   for (const m of c.measures) {
     const { id, dataset, ...value } = m, field = member(dataset, 'fields', m.anchor_field);
-    merge(s, member(dataset, 'measures', id), { ...value, anchor_field: field }, [field,
+    const validCount = m.statistics?.valid_count ? member(dataset, 'fields', m.statistics.valid_count) : null;
+    const observationCount = m.observation_count ? member(dataset, 'measures', m.observation_count) : null;
+    const statistics = m.statistics ? {...m.statistics, valid_count: validCount} : null;
+    merge(s, member(dataset, 'measures', id), { ...value, statistics, observation_count: observationCount, anchor_field: field }, [field,
+      ...(validCount ? [validCount] : []), ...(observationCount ? [observationCount] : []),
       ...(m.computed === null ? [] : [member(dataset, 'measures', m.computed.left), member(dataset, 'measures', m.computed.right)])]);
   }
   for (const r of c.relations) merge(s, address('relations', r.id), { from_dataset: address('datasets', r.from_dataset), to_dataset: address('datasets', r.to_dataset),
@@ -161,11 +166,11 @@ const endpoint = p => member(p.dataset, 'roles', p.role);
 function relations(s, r) {
   for (const v of r.relations) {
     const from = endpoint(v.from), to = endpoint(v.to);
-    merge(s, address('relations', v.id), { from_role: from, to_role: to }, [from, to]);
+    merge(s, address('relations', v.id), { from_role: from, to_role: to, source_names: v.source_names ?? [] }, [from, to]);
   }
   for (const a of r.alternatives) {
     const choices = a.choices.map(c => ({ from: endpoint(c.from), to: endpoint(c.to) }));
-    merge(s, address('relations', a.id), { alternatives: choices }, choices.flatMap(c => [c.from, c.to]));
+    merge(s, address('relations', a.id), { alternatives: choices, source_names: a.source_names ?? [] }, choices.flatMap(c => [c.from, c.to]));
   }
 }
 // Knowledge nodes and relation descriptors share transport, not graph identity.

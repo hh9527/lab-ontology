@@ -1,4 +1,4 @@
-# 本体服务使用说明
+# 领域 Intent 库与示例服务
 
 IC 的统一模型服务使用 `ontology/model`，在同一制品发布知识、类型、codec 与 transform 契约，见 [模型发布契约](ontology/MODEL-PUBLICATION.md)及 [IC 构建与验收](icloud_model/docs/TYPED_MIGRATION.md)。
 
@@ -6,14 +6,14 @@ IC 的统一模型服务使用 `ontology/model`，在同一制品发布知识、
 第 4 节列出本仓库领域，集成应用可替换或省略。构建命令在仓库根目录运行，runner 可从任意能访问产物的目录启动。
 第 1～2 节面向可信宿主，不面向发起查询的 Agent。
 
-本文是当前外部服务及 Intent 契约。模型作者和 QueryAst 边界见[本体文档](ontology/docs/ONTOLOGY.md)和[查询文档](ontology/docs/QUERY.md)。
+本文描述 relation_model 示例服务与独立 Intent 库的契约；IC 的统一模型服务使用前述发布契约。模型作者和 QueryAst 边界见[本体文档](ontology/docs/ONTOLOGY.md)和[查询文档](ontology/docs/QUERY.md)。
 [关系示例](relation_model/README.md)使用下文的领域 Intent 语法；[IC 领域指南](icloud_model/docs/DOMAIN.md)说明 IC 的业务边界。
 评测结果记录早期实验，不是当前 API 契约。Telora 语言和 CLI 文档属于 Telora 项目，不在本仓库复制维护。
 
 ## 1. 构建运行期制品
 
 ```sh
-bin/telora -C <module> build <module> --staged -o <artifact>.wasm
+telora -C <module> build @src/lib --staged -o <artifact>.wasm
 ```
 
 `<module>` 是拥有 `MainService` 的 Telora 工作区成员，不是请求中的领域名。
@@ -45,7 +45,6 @@ curl -sS -X POST http://127.0.0.1:8080/relation/transform \
 Agent 环境不得挂载快照、runner、源树、测试或评测材料，也不得拥有能读取宿主部署目录的 shell 或文件工具。
 网关凭据及 runner 命令不进入 Agent 上下文。仅在提示词中省略产物路径不构成隔离；能无限制访问宿主文件系统的本地工具进程也不构成隔离。
 限流、请求大小限制、访问日志和 SQL 执行授权由宿主负责。`transform` 只生成 Query，不执行。
-当前 CLI 选项是 `--serve`，`--bind` 属于旧版 Telora 文档。
 
 ## 3. 宿主请求协议与知识事实
 
@@ -55,14 +54,12 @@ HTTP 则直接把相同 input POST 到对应路径。当前使用 `<domain>/tran
 模型的知识发现通过静态发布完成，relation 不挂载 info／discovery。宿主直接从 Wasm 的 `telora.build.information` 读取
 `ontology.knowledge`，发布 `ontology-knowledge-javascript-v1` 的静态 JS 与模型 JSON 指令。
 同一 ontology 版本共用固定 JS，模型标注只派生 JSON。宿主用 `new Function("data", program)` 物化构图函数，
-传入 JSON.parse 后的 data，得到 v4 图及 vocabulary；词表用于 `va_ask`。
+传入 JSON.parse 后的 data，得到 v5 图及 vocabulary；词表供消费方词汇发现使用。
 Entity 描述业务身份，Dataset 描述物理行及粒度，Role 显式连接二者；DimensionGroup／MeasureGroup 可复用并通过绑定发布成员。
 插件校验引用闭合，并派生导航和反向链接。Int／Float／Bool／String 及 Option／Array／Dict 内联表达，不生成类型节点；具名业务类型保留节点。
 可选展示 sidecar 仅补充名称和文档。模型事实、引用、协议及独立库接口见[知识契约](ontology/docs/KNOWLEDGE.md)。
 
-对 dsh-oks，知识是 `{meta,origin,data}` 资源，data 为规范键字典。
-`oks_data` 自动解包 `.data`；用法由 `oks://help/knowledge`、`oks://help/query` 提供。
-消费方从静态知识发现稳定业务 ID，再构造 Intent，不通过运行期遍历重建知识图。
+消费方直接从静态知识发现稳定业务 ID，再构造此库的 Intent；工具协议和 Agent 工作流由消费方定义。
 
 Dimension 标识业务投影与筛选，Measure 标识声明聚合，文档提供允许的查询能力。
 
@@ -264,3 +261,7 @@ JSONL 服务响应使用 `telora.service/v1` 信封。transform 的 ok 包含上
 
 每个模型独立构建制品。relation_model 暴露 `relation/transform` 及对应 HTTP POST 路由；IC 暴露 `ontology/model`。模型均无需外部构建源，领域 Intent 的最小流程见[关系示例](relation_model/README.md)。
 IC 夹具不是完整生产领域模型，不得猜测补全缺失知识点或合法转换路径。
+
+## 测评与配套数据
+
+考题、考官方法、数据生成与场景覆盖检查由 [dataseer-ic-exam](https://github.com/hh9527/dataseer-ic-exam) 维护，集成项目固定其 submodule 提交。本仓发布 `icloud_model/data/generation-contract.json` 与 `source_catalog.json` 作为显式输入；模型源码和建模契约验收仍在本仓。使用方式见 [测评数据契约](icloud_model/docs/SYNTHETIC_DATA.md)。

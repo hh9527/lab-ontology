@@ -56,5 +56,5 @@ mkdir -p "$publication_tmp"
 bin/telora -C ontology eval @test/publication:runtime_contract \
   --request-fuel 100000 > "$publication_tmp/codec-contract.json"
 node ontology/tests/codec-publication-runtime.mjs "$publication_tmp/codec-contract.json" \
-  /path/to/dsh-oks/packages/dsh-oks/src/telora-model.ts
+  /path/to/dari/packages/dari-model/src/telora-model.ts
 ```

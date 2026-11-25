@@ -406,6 +406,7 @@ def entity_entry: Fn(Declaration, Int) -> edsl::EntityEntry = fn(declared, index
         table: dataset.source,
         alias: source.alias,
         source,
+        group_identity: None,
         grain_fields: declared.grain_fields,
         fields,
         sample_measures,
@@ -431,6 +432,7 @@ def physical_node: Fn(g::Node, Array(edsl::FieldEntry)) -> g::Node = fn(node, fi
         g::Node::Column(value) => g::Node::Column(column(value)),
         g::Node::Seconds(input) => g::Node::Seconds(physical_node(input, fields)),
         g::Node::Ipv4(input) => g::Node::Ipv4(physical_node(input, fields)),
+        g::Node::NullIf((input, marker)) => g::Node::NullIf((physical_node(input, fields), marker)),
         g::Node::UtcBucket(bucket) => g::Node::UtcBucket(
             bucket <~ {input: physical_node(bucket.input, fields)}
         ),
@@ -451,6 +453,7 @@ def anchor_column: Fn(g::Node) -> Int = fn(node) {
         g::Node::Column(column) => column.index,
         g::Node::Seconds(input) => anchor_column(input),
         g::Node::Ipv4(input) => anchor_column(input),
+        g::Node::NullIf((input, _)) => anchor_column(input),
         g::Node::UtcBucket(bucket) => anchor_column(bucket.input),
         g::Node::Rate(inputs) => anchor_column(inputs.amount),
         g::Node::Identity(input) => input.column.index,
@@ -505,6 +508,15 @@ def dimension_entry: Fn(edsl::EntityEntry, g::Member) -> edsl::DimensionEntry = 
         utc_bucket: match member.node {
             g::Node::UtcBucket(bucket) => Some({id: member.id, unit: bucket.unit}),
             _ => None
+        },
+        groupable: match member.node {
+            g::Node::UtcBucket(_) => member.projectable,
+            _ => array::any(
+                g::groupable_dimensions(entity.entity_type),
+                fn(id) {
+                    id == member.id
+                }
+            )
         },
         value_type: None,
         ty: if let Some(role) = scalars::time_role(member.value) {
@@ -568,6 +580,7 @@ def domain_entry: Fn(edsl::EntityEntry, v::BindingFacts) -> edsl::DimensionEntry
     let base = dimension_entry(entity, member);
     base <~ {
         value_type: Some(binding.definition.value),
+        computed: !v::is_enum(m::field_type(entity.entity_type, binding.column.name)),
         ty: binding.definition.id,
         half_open: binding.definition.half_open,
         fallback: binding.definition.fallback,
@@ -671,9 +684,33 @@ def lower_prepared: Fn(Array(Declaration), Array(edsl::EntityEntry)) -> Prepared
             )
         }
     );
-    {
-        ()
-    };
+    array::map(
+        entities,
+        fn(entity) {
+            array::map(
+                g::groupable_dimensions(entity.entity_type),
+                fn(id) {
+                    match array::find(
+                        dimensions,
+                        fn(d) {
+                            d.entity == entity.index && d.id == id
+                        }
+                    ) {
+                        None => fail!("groupable dimension does not exist", entity.id, id),
+                        Some(d) => if !d.authorized || !d.projectable {
+                            fail!(
+                                "groupable dimension requires projection capability",
+                                entity.id,
+                                id
+                            )
+                        } else {
+                            ()
+                        }
+                    }
+                }
+            )
+        }
+    );
     let measures = array::flat_map(
         array::enumerate(declarations),
         fn(pair) {
