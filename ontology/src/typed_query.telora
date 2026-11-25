@@ -1009,6 +1009,51 @@ def check_type: Fn(edsl::PreparedPayload, Array(Dataset), Value) -> Value = fn(
             }.ty!(Column)
         }
     );
+    # The Graph lowerer groups on the projected canonical expressions, plus
+    # explicit identity keys. Only prove bounds for the former here. Closed
+    # enum dimensions require valid source wires under the model contract.
+    let finite_group_bound: Option(Int) = match ast.plan {
+        qb::QueryPlan::Rows(plan) => if plan.grouping == [] || request.identity != [] || plan.partition != None {
+            None
+        } else {
+            let keys = array::filter(request.projections, fn(p) { p.kind == "dimension" });
+            if array::length(keys) != array::length(plan.grouping) {
+                None
+            } else {
+                array::fold(keys, Some(1), fn(bound, key) {
+                    let source = match array::find(request.nodes, fn(n) { n.id == key.node }) {
+                        Some(value) => value,
+                        None => fail!("Missing checked grouping source")
+                    };
+                    let owner = match array::find(payload.entities, fn(e) { e.id == source.entity }) {
+                        Some(value) => value,
+                        None => fail!("Missing checked grouping owner")
+                    };
+                    let dimension = match array::find(payload.dimensions, fn(d) {
+                        d.entity == owner.index && d.id == key.id
+                    }) {
+                        Some(value) => value,
+                        None => fail!("Missing checked grouping dimension")
+                    };
+                    let column = match array::find(public_columns, fn(c) { c.name == key.name }) {
+                        Some(value) => value,
+                        None => fail!("Missing checked grouping column")
+                    };
+                    if dimension.half_open || dimension.canonical_values == [] || dimension.value_type == None {
+                        None
+                    } else {
+                        let size = array::length(dimension.canonical_values) + if column.nullable { 1 } else { 0 };
+                        match bound {
+                            # Keep multiplication within the public row budget.
+                            Some(n) => if n <= 500 / size { Some(n * size) } else { None },
+                            None => None
+                        }
+                    }
+                })
+            }
+        },
+        _ => None
+    };
     let projection = string::join(
         array::map(
             request.projections,
@@ -1024,13 +1069,17 @@ def check_type: Fn(edsl::PreparedPayload, Array(Dataset), Value) -> Value = fn(
             bindings: query.bindings,
             columns: public_columns,
             max_rows: if request.take != None {
-                Some(qb::result_bound(ast))
+                let limit = qb::result_bound(ast);
+                match finite_group_bound {
+                    Some(n) => Some(if n < limit { n } else { limit }),
+                    None => Some(limit)
+                }
             } else {
                 match ast.plan {
                     qb::QueryPlan::Rows(plan) => if qb::scalar_plan(plan) {
                         Some(1)
                     } else {
-                        None
+                        finite_group_bound
                     },
                     _ => None
                 }
