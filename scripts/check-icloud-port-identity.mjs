@@ -42,8 +42,8 @@ try {
   assert.throws(() => compile('ts:a.pon_port_kpi_ts,n:a.pon_port_kpi_sample_count'), /not authorized for grouping/);
   assert.throws(() => compile('raw:a.pon_port_receive_sample,n:a.pon_port_kpi_sample_count'), /not authorized for grouping/);
   assert.throws(() => compile('name:a.pon_port_kpi__port_name,n:a.pon_port_kpi_sample_count', false), /not authorized for grouping/);
-  db.exec(`CREATE TABLE I_EntPonElement(id TEXT,name TEXT,classification TEXT);
-    INSERT INTO I_EntPonElement VALUES ('olt1','OLT A','ne.category.olt'),('olt2','OLT B','ne.category.olt'),('nonolt','ONU','ne.category.pon.onu');
+  db.exec(`CREATE TABLE EntPonElement(id TEXT,name TEXT,classification TEXT);
+    INSERT INTO EntPonElement VALUES ('olt1','OLT A','ne.category.olt'),('olt2','OLT B','ne.category.olt'),('nonolt','ONU','ne.category.pon.onu');
     INSERT INTO PonDevicePonPortKPI VALUES
     ('p3','t1','missing','GPON0/0/1','2026-11-01T00:00:00.000Z',40),
     ('p4','t1','nonolt','GPON0/0/1','2026-11-01T00:00:00.000Z',50);`);

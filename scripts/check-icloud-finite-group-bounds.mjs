@@ -29,8 +29,8 @@ try {
     '|> order_by(desc(rows.n)) |> take(50)').max_rows, 4);
   assert.throws(() => plan('current_alarm', 'label: a.alarm_name, n: a.alarm_count'), /proven result bound/);
 
-  db.exec(`CREATE TABLE I_EntPonElement(id TEXT, commuState TEXT);
-    INSERT INTO I_EntPonElement VALUES ('a','0'),('b','2'),('c','1');`);
+  db.exec(`CREATE TABLE EntPonElement(id TEXT, commuState TEXT);
+    INSERT INTO EntPonElement VALUES ('a','0'),('b','2'),('c','1');`);
   const bound = plan('pon_device', 'label: a.pon_commu_state, n: a.pon_device_count');
   assert.equal(bound.max_rows, 2);
   const rows = db.prepare(bound.sql).all(...bound.bindings).map(row => ({...row}));

@@ -15,12 +15,12 @@ const db = new DatabaseSync(':memory:');
 try {
   db.exec(`CREATE TABLE PhysicalServer(id TEXT,name TEXT,healthStatus INTEGER,connectStatus INTEGER);
     INSERT INTO PhysicalServer VALUES ('s1','Same',0,1),('s2','Same',0,3),('s3','Other',4,1);
-    CREATE TABLE I_EntNetworkElement(id TEXT,name TEXT,classification TEXT);
-    INSERT INTO I_EntNetworkElement VALUES ('ap1','AP 1','ne.category.fatap'),('ap2','AP 2','AP'),('sw','Switch','ne.category.switch');
+    CREATE TABLE EntNetworkElement(id TEXT,name TEXT,classification TEXT);
+    INSERT INTO EntNetworkElement VALUES ('ap1','AP 1','ne.category.fatap'),('ap2','AP 2','AP'),('sw','Switch','ne.category.switch');
     CREATE TABLE NetworkApRadioSsidKPI(resId TEXT,parentId TEXT,connectedTerminals INTEGER);
     INSERT INTO NetworkApRadioSsidKPI VALUES ('ssid1','ap1',10),('ssid2','ap2',20),('ssid3','sw',30);
-    CREATE TABLE I_EntPonElement(id TEXT,name TEXT,classification TEXT,parentOltResId TEXT);
-    INSERT INTO I_EntPonElement VALUES ('olt','OLT','ne.category.olt',''),('onu1','ONU 1','ne.category.pon.onu','olt'),
+    CREATE TABLE EntPonElement(id TEXT,name TEXT,classification TEXT,parentOltResId TEXT);
+    INSERT INTO EntPonElement VALUES ('olt','OLT','ne.category.olt',''),('onu1','ONU 1','ne.category.pon.onu','olt'),
       ('onu2','ONU 2','ne.category.pon.onu','olt'),('spl','Splitter','ne.category.pon.spl','olt');
     CREATE TABLE PonDeviceOnuKPI(resId TEXT,onuHwOpticsRxPower REAL);
     INSERT INTO PonDeviceOnuKPI VALUES ('onu1',-22),('onu1',-24),('onu2',-18);

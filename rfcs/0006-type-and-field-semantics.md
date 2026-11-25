@@ -88,7 +88,7 @@ type DeviceByTenantAndCode = struct {
 最小实验使用以下写法；完整可编译示例见 `ontology/tests/semantic_model.telora`。
 
 ```telora
-@s::table("I_EntNetworkElement")
+@s::table("EntNetworkElement")
 @s::bind(DeviceById.type, "id")
 @s::grain(["id"])
 type Devices = struct {

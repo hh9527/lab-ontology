@@ -38,7 +38,7 @@ try {
     const dimension = model.dimensions.find(dimension => dimension.dataset === role && dimension.column === 'name');
     const rows = await query({ op: 'Graph', root: 'p', nodes: [{ id: 'p', entity: role }], edges: [], select: [{ node: 'p', dimension: dimension.id }] });
     assert.ok(rows.length > 0);
-    const expected = db.prepare('SELECT name FROM I_EntPonElement WHERE classification=?').all(role === 'pon_onu_role' ? 'ne.category.pon.onu' : 'ne.category.olt').map(row => row.name).sort();
+    const expected = db.prepare('SELECT name FROM EntPonElement WHERE classification=?').all(role === 'pon_onu_role' ? 'ne.category.pon.onu' : 'ne.category.olt').map(row => row.name).sort();
     assert.deepEqual(rows.map(row => Object.values(row)[0]).sort(), expected);
   }
   const start = manifest.window.start;

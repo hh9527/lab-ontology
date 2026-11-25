@@ -27,7 +27,7 @@ async function request(method, input) {
   return response.ok;
 }
 try {
-  for (const table of ['I_EntNetworkElement', 'I_EntPonElement']) {
+  for (const table of ['EntNetworkElement', 'EntPonElement']) {
     db.exec(`CREATE TABLE ${table}(id TEXT, name TEXT)`);
     const insert = db.prepare(`INSERT INTO ${table} VALUES (?, ?)`);
     for (const id of ['a', 'b', 'c', 'd']) insert.run(id, 'same-name');

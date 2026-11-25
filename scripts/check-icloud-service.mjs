@@ -61,7 +61,7 @@ try {
     for (const query of empty) assert.deepEqual(execute(query), []);
     for (const [id, tenantId, name, commuState, ipAddress] of [
       ['d1', 't1', 'Alpha', '0', '10.0.0.1'], ['d2', 't2', 'Beta', '1', '::1'], ['d3', 't1', 'Gamma', 'offline', '10.0.0.128'],
-    ]) insert('I_EntNetworkElement', { id, tenantId, name, commuState, ipAddress, alias: name, classification: 'AR', createTime: 1790812800000 });
+    ]) insert('EntNetworkElement', { id, tenantId, name, commuState, ipAddress, alias: name, classification: 'AR', createTime: 1790812800000 });
     for (const [resId, tenantId, day, cpuUsage, memUsage] of [
       ['d1', 't1', '01', 10, 1], ['d1', 't1', '02', 50, 2], ['d1', 't1', '03', null, 3],
       ['d2', 't2', '01', 20, 4], ['d2', 't2', '02', 80, 5], ['d2', 't2', '03', 90, null],
