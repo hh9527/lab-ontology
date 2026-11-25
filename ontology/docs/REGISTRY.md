@@ -10,7 +10,7 @@
 use ontology::registry as registry;
 use ontology::groups as g;
 
-@registry::dataset("frame", "I_EnterpriseFrame", [])
+@registry::dataset("frame", "EnterpriseFrame", [])
 type IEnterpriseFrame = struct {
     @g::search("frame_name")
     name: String,

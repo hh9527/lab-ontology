@@ -4,6 +4,8 @@
 
 `data/source_catalog.json` 保存来源表、字段、关系条件及文件散列。`data/source_exceptions.json` 记录已审查的补充字段、身份依据、枚举恢复和无效来源关系。数据库结构是输入现状。
 
+七张 IC 资源表使用与逻辑实体同名的物理表名。导入来源 YAML 时，`scripts/icloud-source-catalog.py` 将这七张表的 `I_` 前缀去掉，目录中的 `table` 与 `properties["dte.twin.tableName"]` 使用同一名称。每条记录的 `file` 和 `sha256` 对应原始 YAML。
+
 `src/typed/` 是业务模型的声明来源，维护存储映射、业务类型、可用算子、统计总体和关系。来源字段类型不自动授予业务运算能力；模型作者根据证据显式增强 Property。
 
 ## 更新步骤

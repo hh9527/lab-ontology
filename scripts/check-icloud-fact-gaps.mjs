@@ -44,8 +44,8 @@ try{
  db.exec(`CREATE TABLE SYS_StorageDisk(id TEXT);INSERT INTO SYS_StorageDisk VALUES ('disk-a');
  CREATE TABLE StorageHardDriveKPI(resId TEXT,ts TEXT,utility REAL);INSERT INTO StorageHardDriveKPI VALUES ('disk-a','2026-11-01T00:00:00.000Z',20),('disk-a','2026-11-01T01:00:00.000Z',40);`);
  assert.deepEqual(evaluate(`let r=from(ic::source_SYS_StorageDisk).as!(d) |> connect(ic::relations::source_SYS_StorageDisk_StorageHardDriveKPI).as!(k);let g=r |> group_by_identity(d);let o=g |> project({id:d.storage_disk_id,usage:k.storage_disk_usage});o |> order_by(asc(o.id)) |> take(10)`).rows,[{id:'disk-a',usage:30}]);
- db.exec(`CREATE TABLE I_EnterpriseOpticalModule(id TEXT,tenantId TEXT);
- INSERT INTO I_EnterpriseOpticalModule VALUES ('module-a','t'),('module-b',NULL);
+ db.exec(`CREATE TABLE EnterpriseOpticalModule(id TEXT,tenantId TEXT);
+ INSERT INTO EnterpriseOpticalModule VALUES ('module-a','t'),('module-b',NULL);
  CREATE TABLE X_TENANT_VIEW(TENANT_ID TEXT,TENANT_NAME TEXT);INSERT INTO X_TENANT_VIEW VALUES ('t','Tenant');`);
  assert.deepEqual(evaluate(`let r=from(ic::source_EnterpriseOpticalModule).as!(m) |> connect(ic::relations::source_EnterpriseOpticalModule_X_TENANT_VIEW).as!(t);let o=r |> project({id:m.network_optical_module_id,tenant:t.tenant_name});o |> order_by(asc(o.id)) |> take(10)`).rows,[{id:'module-a',tenant:'Tenant'},{id:'module-b',tenant:null}]);
  console.log('Passed: Ping/AP memory null-aware statistics, fractional business mean, window filtering, seven link statistics, frequency thresholds/sentinel/NULL disk KPI identity join and optional optical-module tenant');

@@ -91,7 +91,7 @@ try {
   const requests = host.stats.requests;
   await host.close(); closed = true;
   // 模型通道关闭后，同一计划仍可绑定不同值并执行。
-  database.exec('CREATE TABLE I_EntNetworkElement (id TEXT, classification TEXT); INSERT INTO I_EntNetworkElement VALUES (\'d1\',\'LSW\'), (\'d2\',\'future-device\'); CREATE TABLE T_CURRENT_ALARM(CSN INTEGER, SEVERITY INTEGER); INSERT INTO T_CURRENT_ALARM VALUES (1,4),(2,2),(3,1),(4,3)');
+  database.exec('CREATE TABLE EntNetworkElement (id TEXT, classification TEXT); INSERT INTO EntNetworkElement VALUES (\'d1\',\'LSW\'), (\'d2\',\'future-device\'); CREATE TABLE T_CURRENT_ALARM(CSN INTEGER, SEVERITY INTEGER); INSERT INTO T_CURRENT_ALARM VALUES (1,4),(2,2),(3,1),(4,3)');
   const run = (plan, parameters) => {
     const query = host.bind(plan, parameters);
     return database.prepare(query.sql).all(...query.bindings).map(row => ({ ...row }));

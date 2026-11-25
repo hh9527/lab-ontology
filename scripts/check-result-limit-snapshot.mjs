@@ -7,9 +7,9 @@ const artifact = process.argv[2];
 if (!artifact) throw new Error('Usage: node scripts/check-result-limit-snapshot.mjs <icloud-snapshot.wasm>');
 const database = new DatabaseSync(':memory:');
 try {
-  database.exec('CREATE TABLE I_EntNetworkElement(id TEXT, tenantId TEXT, name TEXT)');
+  database.exec('CREATE TABLE EntNetworkElement(id TEXT, tenantId TEXT, name TEXT)');
   for (let i = 0; i < 130; i++) {
-    database.prepare('INSERT INTO I_EntNetworkElement VALUES (?, ?, ?)').run(`device-${i}`, 'tenant', `name-${i}`);
+    database.prepare('INSERT INTO EntNetworkElement VALUES (?, ?, ?)').run(`device-${i}`, 'tenant', `name-${i}`);
   }
   const graph = { op: 'Graph', root: 'd', nodes: [{ id: 'd', entity: 'device' }], edges: [],
     select: [{ node: 'd', dimension: 'device_name' }] };

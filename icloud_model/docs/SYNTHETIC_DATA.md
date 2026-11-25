@@ -9,6 +9,8 @@ IC 测评数据生成、场景画像、考题和逐题覆盖检查由 [dataseer-
 
 消费方将同一模型版本的两个 JSON 显式传给生成器；源目录摘要不匹配时拒绝生成。模型源码、契约导出与 SQL 能力验收由本仓维护。
 
+与本版契约配套的生成器须按目录中的 `table` 查找资源行和枚举，并使用相同表名执行校验 SQL。设备、PON 设备和端口等七张资源表使用无前缀名称，例如 `EntNetworkElement`、`EntPonElement` 和 `EnterpriseNetworkLTP`。
+
 ```sh
 node "$EXAM_REPO/data/ic/generate.mjs" \
   --contract "$PWD/icloud_model/data/generation-contract.json" \

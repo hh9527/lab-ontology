@@ -59,7 +59,7 @@ try {
       return executor.prepare(q.sql).all(...q.bindings).map(r=>({...r}));
     };
     const expected = db.prepare(`SELECT p.parentOltResId id,avg(k.cpuUsage) cpu FROM PonDeviceOnuKPI k
-      JOIN I_EntPonElement p ON k.resId=p.id WHERE p.classification='ne.category.pon.onu' GROUP BY p.parentOltResId ORDER BY id`).all();
+      JOIN EntPonElement p ON k.resId=p.id WHERE p.classification='ne.category.pon.onu' GROUP BY p.parentOltResId ORDER BY id`).all();
     const actual = (await run(onu)).sort((a,b)=>a.o_pon_olt_id.localeCompare(b.o_pon_olt_id));
     assert.equal(actual.length,expected.length);
     for(let i=0;i<actual.length;i++){
@@ -70,7 +70,7 @@ try {
       edges:[...onu.edges,{relation:'pon_onu_parent_olt',from:'sibling',to:'o'}]};
     const rejected=await run(unsafe,false);
     assert.match(JSON.stringify(rejected.diagnostics),/multiplied|grain-safe/);
-    const portCount=db.prepare('SELECT count(*) n FROM I_EnterpriseNetworkLTP').get().n;
+    const portCount=db.prepare('SELECT count(*) n FROM EnterpriseNetworkLTP').get().n;
     const portQuery = {op:'Graph',root:'k',nodes:[{id:'k',entity:'interface_kpi'},{id:'p',entity:'port'},{id:'d',entity:'device'}],
       edges:[{relation:'interface_kpi_of_port',from:'k',to:'p'},{relation:'port_belongs_to_device',from:'p',to:'d'}],
       select:[{node:'k',dimension:'interface_kpi_res_id'},{node:'p',dimension:'port_name'},{node:'d',dimension:'device_id'}],
@@ -96,13 +96,13 @@ try {
     // A half-open enum preserves raw unknown values and their explicit kind.
     const unknownDb = new DatabaseSync(':memory:');
     try {
-      unknownDb.exec('CREATE TABLE I_EntNetworkElement(id TEXT, classification TEXT)');
-      const insert=unknownDb.prepare('INSERT INTO I_EntNetworkElement VALUES (?,?)');
-      for (const row of db.prepare('SELECT id,classification FROM I_EntNetworkElement').all()) insert.run(row.id,row.classification);
-      unknownDb.exec("UPDATE I_EntNetworkElement SET classification='unlisted-source-code' WHERE rowid=1");
+      unknownDb.exec('CREATE TABLE EntNetworkElement(id TEXT, classification TEXT)');
+      const insert=unknownDb.prepare('INSERT INTO EntNetworkElement VALUES (?,?)');
+      for (const row of db.prepare('SELECT id,classification FROM EntNetworkElement').all()) insert.run(row.id,row.classification);
+      unknownDb.exec("UPDATE EntNetworkElement SET classification='unlisted-source-code' WHERE rowid=1");
       const groups = await run({op:'Graph',root:'d',nodes:[{id:'d',entity:'device'}],edges:[],
         select:[{node:'d',dimension:'device_class'}],measures:[{node:'d',measure:'device_count'}]},true,unknownDb);
-      assert.equal(groups.reduce((sum,r)=>sum+r.d_device_count,0),db.prepare('SELECT count(*) n FROM I_EntNetworkElement').get().n);
+      assert.equal(groups.reduce((sum,r)=>sum+r.d_device_count,0),db.prepare('SELECT count(*) n FROM EntNetworkElement').get().n);
       assert(groups.some(r=>r.d_device_class==='unlisted-source-code'&&r.d_device_class__kind==='Unknown'));
     }finally{unknownDb.close();}
     console.log(JSON.stringify({enumFields,onuGroups:actual.length,ports:ports.length,totalPorts:portCount,topPorts:topPorts.length,tenantGroups:tenantCpu.length,powerMeasures:3,unsafeFanoutRejected:true,unknownEnumTotalsPreserved:true,unitMetadata:true,chineseEnumNames:true}));

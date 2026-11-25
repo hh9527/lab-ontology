@@ -22,9 +22,9 @@ if(!casesFile){
 }
 const cases=JSON.parse(readFileSync(casesFile,'utf8'));
 const db=new DatabaseSync(':memory:');
-db.exec(`CREATE TABLE I_EntPonElement(id TEXT,name TEXT,classification TEXT,parentOltResId TEXT);
+db.exec(`CREATE TABLE EntPonElement(id TEXT,name TEXT,classification TEXT,parentOltResId TEXT);
 CREATE TABLE PonDeviceOnuKPI(resId TEXT,tenantId TEXT,ts TEXT,onuHwOpticsRxPower REAL);
-INSERT INTO I_EntPonElement VALUES
+INSERT INTO EntPonElement VALUES
  ('olt-a','OLT A','ne.category.olt',''),('olt-b','OLT B','ne.category.olt',''),
  ('onu-a','ONU A','ne.category.pon.onu','olt-a'),('onu-b','ONU B','ne.category.pon.onu','olt-a'),
  ('onu-c','ONU C','ne.category.pon.onu','olt-b'),('spl','Splitter','ne.category.pon.spl','olt-a');

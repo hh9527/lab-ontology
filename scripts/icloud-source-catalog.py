@@ -14,6 +14,17 @@ from pathlib import Path
 import yaml
 
 
+UNPREFIXED_TABLES = {
+    "EntCollaborationElement",
+    "EntNetworkElement",
+    "EntPonElement",
+    "EnterpriseFrame",
+    "EnterpriseNetworkLTP",
+    "EnterpriseOpticalModule",
+    "EnterpriseSlot",
+}
+
+
 def field_metadata(field):
     properties = field.get("properties") or {}
     selected = {key: field.get(key) for key in (
@@ -43,11 +54,14 @@ def catalog(directory):
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
         if path.name.endswith(".logical.yaml"):
+            name = data["name"]
             properties = data.get("properties") or {}
+            if name in UNPREFIXED_TABLES and properties.get("dte.twin.tableName") == f"I_{name}":
+                properties["dte.twin.tableName"] = name
             datasets.append({
                 **provenance,
-                "name": data["name"],
-                "table": properties.get("dte.twin.tableName", data["name"]),
+                "name": name,
+                "table": properties.get("dte.twin.tableName", name),
                 "label": data.get("businessName"),
                 "label_zh": data.get("businessName_cn"),
                 "description": data.get("description"),
