@@ -142,6 +142,13 @@ type Ordering = struct {
 type Group = struct {
     node: String
 };
+type Pivot = struct {
+    index: String,
+    columns: String,
+    values: String,
+    max_rows: Int,
+    max_columns: Int
+};
 type Take = struct {
     count: Int
 };
@@ -161,6 +168,7 @@ type State = struct {
     projected: Bool,
     ordered: Bool,
     take: Option(Int),
+    pivot: Option(Pivot),
     container: String,
     projections: Array(Projection),
     order_by: Array(Order),
@@ -969,6 +977,7 @@ def check_type: Fn(
         identity: [],
         edges: [],
         projected: False,
+        pivot: None,
         ordered: False,
         take: None,
         container: "table",
@@ -983,7 +992,9 @@ def check_type: Fn(
         request.steps,
         initial,
         fn(state, step) {
-            if state.take != None {
+            if state.pivot != None {
+                fail!("pivot is terminal in a model query", step.kind)
+            } else if state.take != None {
                 fail!("take is terminal in a model query", step.kind)
             } else {
                 ()
@@ -1295,6 +1306,20 @@ def check_type: Fn(
                     );
                     state <~ {ordered: True, order_by: terms}
                 }
+            } else if step.kind == "pivot" {
+                let pivot = codec::decode@[Pivot](step.body).unwrap!();
+                if request.pair != None || state.identity != [] || state.ordered || !state.projected {
+                    fail!("pivot requires an unordered aggregate projection over one remote root")
+                } else if pivot.max_rows < 1 || pivot.max_rows > 500 || pivot.max_columns < 1 || pivot.max_columns > 500 {
+                    fail!("pivot budgets must be within 1..500")
+                } else if pivot.index == pivot.columns || array::length(state.projections) != 3
+                    || !array::any(state.projections, fn(p) { p.name == pivot.index && p.kind == "dimension" })
+                    || !array::any(state.projections, fn(p) { p.name == pivot.columns && p.kind == "dimension" })
+                    || !array::any(state.projections, fn(p) { p.name == pivot.values && p.kind == "measure" }) {
+                    fail!("pivot requires exactly two projected dimensions and one aggregate measure")
+                } else {
+                    state <~ {pivot: Some(pivot)}
+                }
             } else if step.kind == "take" || step.kind == "take_opt" {
                 if !state.projected {
                     fail!("selection requires a projection")
@@ -1365,7 +1390,8 @@ def check_type: Fn(
         Value::Object(fields) => Value::Object(
             dict::merge(
                 fields,
-                {container: codec::encode(state.container), receipt: codec::encode(receipt)}
+                {container: codec::encode(state.container), receipt: codec::encode(receipt),
+                 pivot: codec::encode(state.pivot)}
             )
         ),
         _ => fail!("model lowering must return a result template"),
