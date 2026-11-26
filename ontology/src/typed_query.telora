@@ -79,7 +79,8 @@ type RowPredicate = struct {
     dimension: String,
     op: edsl::FilterOp,
     parameter: Int,
-    input_type: intent::ResultType
+    input_type: intent::ResultType,
+    subnet: Option(String)
 };
 type NullPredicate = struct {
     kind: String,
@@ -148,6 +149,7 @@ type Column = struct {
 };
 type Template = struct {
     sql: String,
+    total_sql: Option(String),
     bindings: Array(qb::Val),
     columns: Array(Column),
     max_rows: Option(Int),
@@ -334,6 +336,7 @@ def collect: Fn(edsl::PreparedPayload, String) -> Collected = fn(payload, namesp
 
 type PublishedType = struct {
     name: String,
+    preferred: Bool,
     logical: String,
     storage: intent::ResultType
 };
@@ -390,16 +393,6 @@ def type_symbols: Fn(String, Array(TypeRef)) -> Array(PublishedType) = fn(namesp
             }
         ) |> pipeline::collect()
     );
-    let canonical = array::map(
-        named,
-        fn(item) {
-            {
-                name: string::join([namespace, item.0], "::"),
-                logical: item.1.logical,
-                storage: item.1.storage
-            }.ty!(PublishedType)
-        }
-    );
     # 每个类型只反射一次名字；别名判重使用计数表，不在每轮重新反射整个目录。
     let short_counts = array::fold(
         named,
@@ -412,6 +405,17 @@ def type_symbols: Fn(String, Array(TypeRef)) -> Array(PublishedType) = fn(namesp
             dict::merge(counts, dict::from_pairs([(item.2, previous + 1)]))
         }
     );
+    let canonical = array::map(
+        named,
+        fn(item) {
+            {
+                name: string::join([namespace, item.0], "::"),
+                preferred: item.0 == item.2 || dict::get(short_counts, item.2) != Some(1),
+                logical: item.1.logical,
+                storage: item.1.storage
+            }.ty!(PublishedType)
+        }
+    );
     let short = array::flat_map(
         named,
         fn(item) {
@@ -420,6 +424,7 @@ def type_symbols: Fn(String, Array(TypeRef)) -> Array(PublishedType) = fn(namesp
                 [
                     {
                         name: string::join([namespace, name], "::"),
+                        preferred: True,
                         logical: item.1.logical,
                         storage: item.1.storage
                     }.ty!(PublishedType)
@@ -705,7 +710,13 @@ def row_predicate: Fn(
             )
         };
         let output = edsl::dimension_output_with_context(ctx, scoped, dimension);
-        if array::any(
+        if predicate.op == edsl::FilterOp::InSubnet || predicate.op == edsl::FilterOp::NotInSubnet {
+            let subnet = match predicate.subnet {
+                Some(value) => value,
+                None => fail!("subnet filter requires a CIDR string")
+            };
+            edsl::subnet_condition(output.0, dimension, output.1, predicate.op, edsl::FilterInput::Ipv4Subnet(subnet))
+        } else if array::any(
             [
                 edsl::FilterOp::Contains,
                 edsl::FilterOp::NotContains,
@@ -970,20 +981,17 @@ def check_type: Fn(edsl::PreparedPayload, Array(Dataset), Value) -> Value = fn(
             }
         }
     );
-    let query = sqlite::build_query_not_none(
-        ast,
-        array::map(
-            array::filter(
-                request.projections,
-                fn(p) {
-                    p.not_none
-                }
-            ),
-            fn(p) {
-                `\{p.node}_\{p.id}`
-            }
-        )
+    let nonnull_columns = array::map(
+        array::filter(request.projections, fn(p) { p.not_none }),
+        fn(p) { `\{p.node}_\{p.id}` }
     );
+    let query = sqlite::build_query_not_none(ast, nonnull_columns);
+    let total_sql = if ast.selection != None {
+        let population = sqlite::build_query_not_none(ast <~ {selection: None}, nonnull_columns);
+        Some(`SELECT COUNT(*) AS total FROM (\{population.sql}) AS __dari_population`)
+    } else {
+        None
+    };
     let columns = intent::result_columns(payload, graph, ast);
     let public_columns = array::map(
         request.projections,
@@ -1066,6 +1074,7 @@ def check_type: Fn(edsl::PreparedPayload, Array(Dataset), Value) -> Value = fn(
     codec::encode(
         {
             sql: `SELECT \{projection} FROM (\{query.sql}) AS __dari_result`,
+            total_sql,
             bindings: query.bindings,
             columns: public_columns,
             max_rows: if request.take != None {
