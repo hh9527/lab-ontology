@@ -157,7 +157,7 @@ pub def filtered_distinct_aggregate_preserves_local_scope: test::Test = test::sh
         } else { () }
     }
 );
-pub def documented_string_functions_and_ascii_case_folding: test::Test = test::should_ok(
+pub def documented_string_functions_and_direct_lower: test::Test = test::should_ok(
     fn() {
         if scalar(qb::ScalarFunction::Instr, [id, needle.1]) != "instr(`select`.`id`, ?)" {
             fail!("instr must render positional placeholders", scalar(qb::ScalarFunction::Instr, [id, needle.1]))
@@ -171,11 +171,9 @@ pub def documented_string_functions_and_ascii_case_folding: test::Test = test::s
         if scalar(qb::ScalarFunction::RegexMatch, [id, needle.1]) != "(regexp_count(`select`.`id`, ?) > 0)" {
             fail!("regex match lost its regexp_count form", scalar(qb::ScalarFunction::RegexMatch, [id, needle.1]))
         } else { () };
-        if !string::contains(scalar(qb::ScalarFunction::Lower, [needle.1]), "replace(?, 'A', 'a')") {
-            fail!("ascii case folding lost its REPLACE chain", scalar(qb::ScalarFunction::Lower, [needle.1]))
-        } else { () };
-        if string::contains(scalar(qb::ScalarFunction::Lower, [needle.1]), "translate(") {
-            fail!("ascii case folding must not use translate", scalar(qb::ScalarFunction::Lower, [needle.1]))
+        # OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
+        if scalar(qb::ScalarFunction::Lower, [needle.1]) != "lower(?)" {
+            fail!("lower must render the engine function directly", scalar(qb::ScalarFunction::Lower, [needle.1]))
         } else { () }
     }
 );
@@ -669,13 +667,15 @@ pub def selection_wrap_orders_and_limits_literal: test::Test = test::should_ok(
         } else { () }
     }
 );
-pub def having_requires_group_by: test::Test = test::should_fail_with(
+pub def ungrouped_having_renders_natively: test::Test = test::should_ok(
     fn() {
-        render(qb::QueryPlan::Rows({...grouped, projection: [count], grouping: [], ordering: []}))
-    },
-    "UQL HAVING requires GROUP BY"
+        let query = render(qb::QueryPlan::Rows({...grouped, projection: [count], grouping: [], ordering: []}));
+        if !string::contains(query.sql, "HAVING count(DISTINCT CASE") {
+            fail!("ungrouped HAVING must render natively", query.sql)
+        } else { () }
+    }
 );
-pub def ranked_keys_use_derived_exists_instead_of_grouped_expression_subquery: test::Test = test::should_ok(
+pub def ranked_keys_use_direct_scalar_subquery: test::Test = test::should_ok(
     fn() {
         let query = render(
             qb::QueryPlan::Rows(
@@ -691,10 +691,57 @@ pub def ranked_keys_use_derived_exists_instead_of_grouped_expression_subquery: t
                 }
             )
         );
-        string::contains(query.sql, "EXISTS (SELECT 1 FROM (SELECT `select_2`.`category` AS") && string::contains(
+        if !string::contains(query.sql, "`select`.`category` = (SELECT `select_2`.`category` FROM") {
+            fail!("ranked key lost its direct scalar subquery form", query.sql)
+        } else { () };
+        if !string::contains(
             query.sql,
-            "GROUP BY `select_2`.`category` ORDER BY"
-        ) && !string::contains(query.sql, "GROUP BY 1")
+            "GROUP BY `select_2`.`category` ORDER BY sum(`select_2`.`amount`) DESC NULLS LAST LIMIT 1)"
+        ) {
+            fail!("ranked key lost its grouped ordering with LIMIT 1", query.sql)
+        } else { () };
+        if string::contains(query.sql, "EXISTS (SELECT 1 FROM (SELECT") {
+            fail!("ranked key must not use the historical EXISTS wrapper", query.sql)
+        } else { () }
+    }
+);
+# The §6.1 count shape: the aggregate argument is a constant binding allocated
+# BEFORE the predicate's binding, but the CASE text places the predicate first,
+# so the expansion must follow text order, not allocation order.
+def agg_order_arg: (qb::BuildCtx, qb::Expr) = qb::bind(qb::build_context(), qb::Val::Int(1));
+def agg_order_filter: (qb::BuildCtx, qb::Expr) = qb::bind(agg_order_arg.0, qb::Val::String("active"));
+def agg_order_predicate: qb::Expr = qb::scalar(
+    qb::ScalarFunction::Eq,
+    [qb::column(source.1, "kind"), agg_order_filter.1]
+);
+def agg_order_plan: qb::Plan = {...plan,
+    projection: [
+        qb::aggregate_filtered(qb::AggregateFunction::Count, agg_order_arg.1, False, Some(agg_order_predicate), "c")
+    ],
+    ordering: []};
+pub def filtered_aggregate_binds_in_text_order: test::Test = test::should_ok(
+    fn() {
+        let query = uql::build_query(qb::finish(agg_order_filter.0, qb::QueryPlan::Rows(agg_order_plan)));
+        if !string::contains(query.sql, "count(CASE WHEN `select`.`kind` = ? THEN ? ELSE NULL END)") {
+            fail!("filtered aggregate lost its scoped CASE form", query.sql)
+        } else { () };
+        if query.bindings != [qb::Val::String("active"), qb::Val::Int(1)] {
+            fail!("the filter must bind before the aggregate argument (text order)", query.bindings)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def joined_groups_align_null_safe: test::Test = test::should_ok(
+    fn() {
+        let query = render(qb::QueryPlan::JoinedGroups(joined));
+        if !string::contains(query.sql, "AS `__q_left`") || !string::contains(query.sql, "AS `__q_right`") {
+            fail!("joined groups lost their fixed semantic aliases", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "`__q_left`.`category` <=> `__q_right`.`category`") {
+            fail!("joined identity keys lost their NULL-safe alignment", query.sql)
+        } else { () }
     }
 );
 def epoch_cases: Array(Case) = array::flat_map(

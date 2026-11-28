@@ -115,74 +115,7 @@ def utc_days_ago_sql: Fn(Array(qb::Expr), RenderCtx) -> Emitted = fn(args, ctx) 
         ctx: time_second.ctx}
 };
 
-# LOWER may fold non-ASCII characters differently across UQL sources. The AST
-# contract folds only A-Z; REPLACE preserves that contract on every backend.
-def ascii_lower: Fn(String) -> String = fn(value) {
-    array::fold(
-        array::enumerate(
-            [
-                "A",
-                "B",
-                "C",
-                "D",
-                "E",
-                "F",
-                "G",
-                "H",
-                "I",
-                "J",
-                "K",
-                "L",
-                "M",
-                "N",
-                "O",
-                "P",
-                "Q",
-                "R",
-                "S",
-                "T",
-                "U",
-                "V",
-                "W",
-                "X",
-                "Y",
-                "Z"
-            ]
-        ),
-        value,
-        fn(sql, pair) {
-            let lower = [
-                "a",
-                "b",
-                "c",
-                "d",
-                "e",
-                "f",
-                "g",
-                "h",
-                "i",
-                "j",
-                "k",
-                "l",
-                "m",
-                "n",
-                "o",
-                "p",
-                "q",
-                "r",
-                "s",
-                "t",
-                "u",
-                "v",
-                "w",
-                "x",
-                "y",
-                "z"
-            ];
-            `replace(\{sql}, '\{pair.1}', '\{lower[pair.0]}')`
-        }
-    )
-};
+# OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
 
 # The AST ordering contract (ascending puts NULL first, descending last) is
 # expressed with the engine's native NULLS FIRST/LAST spelling.
@@ -204,7 +137,7 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
         qb::ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
         qb::ScalarFunction::Div => `(\{parts[0]} / \{parts[1]})`,
         # OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
-        qb::ScalarFunction::Lower => ascii_lower(parts[0]),
+        qb::ScalarFunction::Lower => `lower(\{parts[0]})`,
         qb::ScalarFunction::Length => `char_length(\{parts[0]})`,
         # Both temporal functions restate subexpressions, so they render through
         # the occurrence-aware emitters in emit_expr, never through this
@@ -408,8 +341,8 @@ def render_join: Fn(qb::Join, RenderCtx) -> Emitted = fn(join, ctx) {
 };
 
 def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
-    let arg = emit_expr(call.arg, ctx);
     if call.function == qb::AggregateFunction::Latest {
+        let arg = emit_expr(call.arg, ctx);
         let time = match call.latest {
             Some(order) => order.time,
             None => fail!("Latest ordering is required")
@@ -419,6 +352,11 @@ def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
             ctx: arg.ctx
         }
     } else {
+        # The spec has no aggregate-level FILTER clause; the local predicate folds
+        # into a CASE without ELSE, and the closed aggregate set ignores its NULLs,
+        # which is exactly the FILTER semantics. The CASE text places the
+        # predicate before the aggregate argument, so the predicate renders first
+        # and every positional `?` is pushed in text order.
         let distinct = if call.distinct {
             "DISTINCT "
         } else {
@@ -426,10 +364,11 @@ def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
         };
         let filtered: Emitted = match call.filter {
             Some(expr) => {
-                let value = emit_expr(expr, arg.ctx);
-                {sql: `CASE WHEN \{value.sql} THEN \{arg.sql} ELSE NULL END`, ctx: value.ctx}
+                let value = emit_expr(expr, ctx);
+                let arg = emit_expr(call.arg, value.ctx);
+                {sql: `CASE WHEN \{value.sql} THEN \{arg.sql} ELSE NULL END`, ctx: arg.ctx}
             },
-            None => arg,
+            None => emit_expr(call.arg, ctx),
         };
         {sql: `\{qb::aggregate_name(call.function)}(\{distinct}\{filtered.sql})`, ctx: filtered.ctx}
     }
@@ -628,11 +567,6 @@ def render_exists: Fn(qb::Exists, RenderCtx) -> Emitted = fn(ex, ctx) {
                 {sql: `\{prefix} (\{body.sql})`, ctx: body.ctx}
             },
             None => {
-                let checked = if array::length(ex.having) > 0 && array::length(ex.grouping) == 0 {
-                    fail!("UQL HAVING requires GROUP BY", ex)
-                } else {
-                    True
-                };
                 let source = render_source(ex.source, ctx);
                 let initial_path: Arguments = {sql: [], ctx: source.ctx};
                 let path = array::fold(
@@ -739,6 +673,10 @@ def render_scalar_comparison: Fn(qb::ScalarAggregateComparison, RenderCtx) -> Em
     }
 };
 
+# Direct grouped-key scalar subquery: rendering keeps key, source, joins,
+# filter and ordering aligned with the SQL text occurrence order. The key is
+# restated in both the SELECT list and GROUP BY; every restatement renders its
+# own positional `?`, so a bind-bearing key expands once per occurrence.
 def render_ranked_comparison: Fn(qb::RankedKeyComparison, RenderCtx) -> Emitted = fn(cmp, ctx) {
     let sq = cmp.inner;
     let key = render_exprs(sq.keys, ctx);
@@ -756,7 +694,8 @@ def render_ranked_comparison: Fn(qb::RankedKeyComparison, RenderCtx) -> Emitted 
         Some(expr) => emit_expr(expr, joins.ctx),
         None => {sql: "", ctx: joins.ctx},
     };
-    let ordering = aggregate(sq.order, filtered.ctx);
+    let grouped = render_exprs(sq.keys, filtered.ctx);
+    let ordering = aggregate(sq.order, grouped.ctx);
     let direction = ordered_sql(ordering.sql, sq.direction);
     let join_sql = if array::length(sq.joins) > 0 {
         ` \{string::join(joins.sql, " ")}`
@@ -768,14 +707,9 @@ def render_ranked_comparison: Fn(qb::RankedKeyComparison, RenderCtx) -> Emitted 
     } else {
         ""
     };
-    # UQL expression subqueries cannot project grouped keys. A derived table
-    # inside EXISTS preserves WHERE comparison semantics, including NULLs.
-    let key_alias = internal_alias(ordering.ctx);
-    let row_alias = internal_alias(key_alias.1);
-    let inner = `SELECT \{key.sql} AS \{quoted(key_alias.0)} FROM \{source.sql}\{join_sql}\{filter_sql} GROUP BY \{key.sql} ORDER BY \{direction} LIMIT 1`;
     {
-        sql: `EXISTS (SELECT 1 FROM (\{inner}) AS \{quoted(row_alias.0)} WHERE \{column_sql(cmp.outer)} \{comparison_op(cmp.op)} \{quoted(row_alias.0)}.\{quoted(key_alias.0)})`,
-        ctx: row_alias.1
+        sql: `\{column_sql(cmp.outer)} \{comparison_op(cmp.op)} (SELECT \{key.sql} FROM \{source.sql}\{join_sql}\{filter_sql} GROUP BY \{grouped.sql} ORDER BY \{direction} LIMIT 1)`,
+        ctx: ordering.ctx
     }
 };
 
@@ -1224,11 +1158,6 @@ def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = f
     } else {
         qb::validate_structure(raw)
     };
-    let checked = if array::length(plan.having) > 0 && array::length(plan.grouping) == 0 {
-        fail!("UQL HAVING requires GROUP BY", plan)
-    } else {
-        True
-    };
     if override == None && array::length(qb::latest_calls(plan)) > 0 {
         let stage = qb::latest_stage(plan);
         let input = emit_rows(stage.input, False, ctx);
@@ -1361,17 +1290,22 @@ def emit_set: Fn(qb::SetPlan, RenderCtx) -> Emitted = fn(set, ctx) {
     {sql: string::join(rendered.0, ` \{op} `), ctx: rendered.1}
 };
 
+def count_over: Fn(Emitted) -> Emitted = fn(inner) {
+    {sql: `SELECT count(1) FROM (\{inner.sql}) AS \`__q_count\``, ctx: inner.ctx}
+};
+
+# Aligned pair queries: `__q_left`/`__q_right` are the fixed semantic
+# aliases, identity keys align through the spec's NULL-safe `<=>`, and the
+# ranked shape appends `comparison_value` as the first ordering key.
 def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(joined, count, ctx) {
     let left = emit_rows(joined.left, False, ctx);
     let right = emit_rows(joined.right, False, left.ctx);
-    let left_alias = internal_alias(right.ctx);
-    let right_alias = internal_alias(left_alias.1);
     let outputs = array::map(
         joined.outputs,
         fn(item) {
             let alias = match item.side {
-                qb::PairSide::Left => left_alias.0,
-                qb::PairSide::Right => right_alias.0
+                qb::PairSide::Left => "__q_left",
+                qb::PairSide::Right => "__q_right"
             };
             `\{quoted(alias)}.\{quoted(item.column)} AS \{quoted(item.alias)}`
         }
@@ -1379,30 +1313,28 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
     let keys = array::map(
         joined.keys,
         fn(name) {
-            let l = `\{quoted(left_alias.0)}.\{quoted(name)}`;
-            let r = `\{quoted(right_alias.0)}.\{quoted(name)}`;
-            `(\{l} = \{r} OR (\{l} IS NULL AND \{r} IS NULL))`
+            `\`__q_left\`.\{quoted(name)} <=> \`__q_right\`.\{quoted(name)}`
         }
     );
     let selected = if count {
-        "count(1) AS count"
+        "count(1)"
     } else {
         string::join(outputs, ", ")
     };
-    let ranking = match joined.rank {
-        None => ("", {sql: "", ctx: right_alias.1}.ty!(Emitted)),
-        Some(rank) => {
-            let l = `\{quoted(left_alias.0)}.\{quoted(rank.left_measure)}`;
-            let r = `\{quoted(right_alias.0)}.\{quoted(rank.right_measure)}`;
+    let ranking: (String, String, RenderCtx) = match joined.rank {
+        None => ("", "", right.ctx),
+        Some(rank) => do {
+            let left_measure = `\`__q_left\`.\{quoted(rank.left_measure)}`;
+            let right_measure = `\`__q_right\`.\{quoted(rank.right_measure)}`;
             let a = if rank.first == qb::PairSide::Left {
-                l
+                left_measure
             } else {
-                r
+                right_measure
             };
             let b = if rank.first == qb::PairSide::Left {
-                r
+                right_measure
             } else {
-                l
+                left_measure
             };
             let first = `CAST(\{a} AS DOUBLE)`;
             let second = `CAST(\{b} AS DOUBLE)`;
@@ -1416,30 +1348,23 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
                 qb::PairRankOp::Ratio => ` AND \{b} <> 0`,
                 qb::PairRankOp::GrowthRate => ` AND \{b} > 0`,
             };
-            let direction = match rank.direction {
-                qb::Ordering::Asc => "ASC",
-                qb::Ordering::Desc => "DESC"
-            };
             let ties = array::map(
                 joined.keys,
                 fn(name) {
-                    ordered_sql(`\{quoted(left_alias.0)}.\{quoted(name)}`, qb::Ordering::Asc)
+                    ordered_sql(`\`__q_left\`.\{quoted(name)}`, qb::Ordering::Asc)
                 }
             );
-            let local = emit_expr(rank.take, right_alias.1);
-            let limit = {sql: ` LIMIT \{local.sql}`, ctx: local.ctx}.ty!(Emitted);
+            let take = emit_expr(rank.take, right.ctx);
             (
                 `, \{expression} AS \`comparison_value\``,
-                {
-                    sql: ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY \`comparison_value\` \{direction}, \{string::join(ties, ", ")}\{limit.sql}`,
-                    ctx: limit.ctx
-                }.ty!(Emitted)
+                ` WHERE \{left_measure} IS NOT NULL AND \{right_measure} IS NOT NULL\{guard} ORDER BY \{ordered_sql(`\`comparison_value\``, rank.direction)}, \{string::join(ties, ", ")} LIMIT \{take.sql}`,
+                take.ctx
             )
         },
     };
     {
-        sql: `SELECT \{selected}\{ranking.0} FROM (\{left.sql}) AS \{quoted(left_alias.0)} INNER JOIN (\{right.sql}) AS \{quoted(right_alias.0)} ON \{string::join(keys, " AND ")}\{ranking.1.sql}`,
-        ctx: ranking.1.ctx
+        sql: `SELECT \{selected}\{ranking.0} FROM (\{left.sql}) AS \`__q_left\` INNER JOIN (\{right.sql}) AS \`__q_right\` ON \{string::join(keys, " AND ")}\{ranking.1}`,
+        ctx: ranking.2
     }
 };
 
@@ -1498,23 +1423,9 @@ pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
     let rendered = match plan {
         qb::QueryPlan::Rows(rows) => emit_rows_from(rows, False, ctx, None),
         qb::QueryPlan::DistinctRows(rows) => emit_rows_from(rows, True, ctx, None),
-        qb::QueryPlan::GroupCount(rows) => {
-            let inner = emit_rows(rows, False, ctx);
-            let alias = internal_alias(inner.ctx);
-            {
-                sql: `SELECT count(1) AS count FROM (\{inner.sql}) AS \{quoted(alias.0)}`,
-                ctx: alias.1
-            }
-        },
+        qb::QueryPlan::GroupCount(rows) => count_over(emit_rows(rows, False, ctx)),
         qb::QueryPlan::SetRows(set) => emit_set(set, ctx),
-        qb::QueryPlan::SetCount(set) => {
-            let inner = emit_set(set, ctx);
-            let alias = internal_alias(inner.ctx);
-            {
-                sql: `SELECT count(1) AS count FROM (\{inner.sql}) AS \{quoted(alias.0)}`,
-                ctx: alias.1
-            }
-        },
+        qb::QueryPlan::SetCount(set) => count_over(emit_set(set, ctx)),
         qb::QueryPlan::JoinedGroups(joined) => emit_joined_groups(joined, False, ctx),
         qb::QueryPlan::JoinedGroupCount(joined) => emit_joined_groups(joined, True, ctx),
     };
