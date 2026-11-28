@@ -17,6 +17,9 @@ def needle: (qb::BuildCtx, qb::Expr) = qb::bind(peer.0, qb::Val::String("active"
 def take: (qb::BuildCtx, qb::Expr) = qb::bind(needle.0, qb::Val::Int(2));
 def threshold: (qb::BuildCtx, qb::Expr) = qb::bind(take.0, qb::Val::Int(0));
 def cap: (qb::BuildCtx, qb::Expr) = qb::bind(threshold.0, qb::Val::Int(1));
+def ago_time: (qb::BuildCtx, qb::Expr) = qb::bind(cap.0, qb::Val::String("2026-03-05 07:25:00"));
+def ago_days: (qb::BuildCtx, qb::Expr) = qb::bind(ago_time.0, qb::Val::Int(2));
+def null_time: (qb::BuildCtx, qb::Expr) = qb::bind(ago_days.0, qb::Val::None);
 def id: qb::Expr = qb::column(source.1, "id");
 def category: qb::Expr = qb::column(source.1, "category");
 def amount: qb::Expr = qb::column(source.1, "amount");
@@ -65,10 +68,16 @@ def grouped: qb::Plan = {
     ordering: [qb::order_by(qb::OrderKey::AggregateRef({alias: "double_hits"}), qb::Ordering::Desc)],
 };
 def render: Fn(qb::QueryPlan) -> qb::Query = fn(p) {
-    uql::build_query(qb::finish(cap.0, p))
+    uql::build_query(qb::finish(null_time.0, p))
 };
 def scalar: Fn(qb::ScalarFunction, Array(qb::Expr)) -> String = fn(f, args) {
-    uql::render_expr_with_context(qb::scalar(f, args), cap.0).sql
+    uql::render_expr_with_context(qb::scalar(f, args), null_time.0).sql
+};
+def scalar_query: Fn(qb::ScalarFunction, Array(qb::Expr)) -> qb::Query = fn(f, args) {
+    uql::render_expr_with_context(qb::scalar(f, args), null_time.0)
+};
+def placeholder_count: Fn(String) -> Int = fn(sql) {
+    array::length(string::split(sql, "?")) - 1
 };
 
 pub def identifiers_aliases_and_binding_handles: test::Test = test::should_ok(
@@ -91,44 +100,84 @@ pub def identifiers_aliases_and_binding_handles: test::Test = test::should_ok(
                 }
             )
         );
-        query.bindings == cap.0.bindings && string::contains(query.sql, "`events` AS `select`") && string::contains(
+        if query.bindings != [qb::Val::String("active"), qb::Val::Int(2), qb::Val::Int(0)] {
+            fail!("the occurrence expansion lost the render order", query.bindings)
+        } else { () };
+        if !string::contains(query.sql, "`events` AS `select`") {
+            fail!("source rendering lost its table and alias", query.sql)
+        } else { () };
+        if !string::contains(
             query.sql,
             "LEFT JOIN `events` AS `select_2` ON `select`.`id` = `select_2`.`id`"
-        ) && string::contains(query.sql, "`select`.`kind` = $1") && string::contains(
-            query.sql,
-            "LIMIT $2 OFFSET $3"
-        )
+        ) {
+            fail!("join rendering lost its ON alignment", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "`select`.`kind` = ?") {
+            fail!("the placeholder must be positional", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "LIMIT ? OFFSET ?") {
+            fail!("pagination must render positional placeholders", query.sql)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
     }
 );
-pub def repeated_binding_remains_one_handle: test::Test = test::should_ok(
+pub def repeated_binding_expands_per_occurrence: test::Test = test::should_ok(
     fn() {
-        scalar(qb::ScalarFunction::Eq, [needle.1, needle.1]) == "$1 = $1"
+        let rendered = uql::render_expr_with_context(
+            qb::scalar(qb::ScalarFunction::Eq, [needle.1, needle.1]),
+            cap.0
+        );
+        if rendered.sql != "? = ?" {
+            fail!("a repeated handle must render one placeholder per occurrence", rendered.sql)
+        } else { () };
+        if rendered.bindings != [qb::Val::String("active"), qb::Val::String("active")] {
+            fail!("a repeated handle must repeat its value per occurrence", rendered.bindings)
+        } else { () }
     }
 );
 pub def filtered_distinct_aggregate_preserves_local_scope: test::Test = test::should_ok(
     fn() {
         let query = render(qb::QueryPlan::Rows(grouped));
-        string::contains(
+        if !string::contains(
             query.sql,
-            "count(DISTINCT CASE WHEN `select`.`kind` = $1 THEN `select`.`amount` ELSE NULL END)"
-        ) && !string::contains(query.sql, "FILTER (") && !string::contains(query.sql, " WHERE ") && string::contains(
-            query.sql,
-            "HAVING count(DISTINCT CASE"
-        ) && string::contains(query.sql, "END) >= $3")
+            "count(DISTINCT CASE WHEN `select`.`kind` = ? THEN `select`.`amount` ELSE NULL END)"
+        ) {
+            fail!("the filtered aggregate lost its scoped CASE form", query.sql)
+        } else { () };
+        if string::contains(query.sql, "FILTER (") {
+            fail!("the filtered aggregate must not render a FILTER clause", query.sql)
+        } else { () };
+        if string::contains(query.sql, " WHERE ") {
+            fail!("the local predicate leaked into the global WHERE", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "HAVING count(DISTINCT CASE") {
+            fail!("the HAVING threshold lost its aggregate form", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "END) >= ?") {
+            fail!("the HAVING threshold must use a positional placeholder", query.sql)
+        } else { () }
     }
 );
-pub def documented_string_functions_and_ascii_case_folding: test::Test = test::should_ok(
+pub def documented_string_functions_and_direct_lower: test::Test = test::should_ok(
     fn() {
-        scalar(qb::ScalarFunction::Instr, [id, needle.1]) == "instr(`select`.`id`, $1)" && scalar(
-            qb::ScalarFunction::Substr,
-            [id, take.1]
-        ) == "substr(`select`.`id`, $2)" && scalar(qb::ScalarFunction::Length, [id]) == "char_length(`select`.`id`)" && scalar(
-            qb::ScalarFunction::RegexMatch,
-            [id, needle.1]
-        ) == "(regexp_count(`select`.`id`, $1) > 0)" && string::contains(
-            scalar(qb::ScalarFunction::Lower, [needle.1]),
-            "replace($1, 'A', 'a')"
-        ) && !string::contains(scalar(qb::ScalarFunction::Lower, [needle.1]), "translate(")
+        if scalar(qb::ScalarFunction::Instr, [id, needle.1]) != "instr(`select`.`id`, ?)" {
+            fail!("instr must render positional placeholders", scalar(qb::ScalarFunction::Instr, [id, needle.1]))
+        } else { () };
+        if scalar(qb::ScalarFunction::Substr, [id, take.1]) != "substr(`select`.`id`, ?)" {
+            fail!("substr must render positional placeholders", scalar(qb::ScalarFunction::Substr, [id, take.1]))
+        } else { () };
+        if scalar(qb::ScalarFunction::Length, [id]) != "char_length(`select`.`id`)" {
+            fail!("length lost its char_length form", scalar(qb::ScalarFunction::Length, [id]))
+        } else { () };
+        if scalar(qb::ScalarFunction::RegexMatch, [id, needle.1]) != "(regexp_count(`select`.`id`, ?) > 0)" {
+            fail!("regex match lost its regexp_count form", scalar(qb::ScalarFunction::RegexMatch, [id, needle.1]))
+        } else { () };
+        # OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
+        if scalar(qb::ScalarFunction::Lower, [needle.1]) != "lower(?)" {
+            fail!("lower must render the engine function directly", scalar(qb::ScalarFunction::Lower, [needle.1]))
+        } else { () }
     }
 );
 pub def binary_collation_is_not_silently_changed: test::Test = test::should_fail_with(
@@ -137,7 +186,7 @@ pub def binary_collation_is_not_silently_changed: test::Test = test::should_fail
     },
     "UQL spec does not define binary text collation"
 );
-pub def explicit_null_order_is_portable: test::Test = test::should_ok(
+pub def explicit_null_order_is_native: test::Test = test::should_ok(
     fn() {
         let asc = render(qb::QueryPlan::Rows(plan));
         let desc = render(
@@ -145,13 +194,12 @@ pub def explicit_null_order_is_portable: test::Test = test::should_ok(
                 {...plan, ordering: [qb::order_by(qb::OrderKey::Expr(id), qb::Ordering::Desc)]}
             )
         );
-        string::contains(
-            asc.sql,
-            "ORDER BY CASE WHEN `select`.`id` IS NULL THEN 0 ELSE 1 END ASC, `select`.`id` ASC"
-        ) && string::contains(
-            desc.sql,
-            "ORDER BY CASE WHEN `select`.`id` IS NULL THEN 1 ELSE 0 END ASC, `select`.`id` DESC"
-        )
+        if !string::contains(asc.sql, "ORDER BY `select`.`id` ASC NULLS FIRST") {
+            fail!("ascending order lost its native NULLS FIRST form", asc.sql)
+        } else { () };
+        if !string::contains(desc.sql, "ORDER BY `select`.`id` DESC NULLS LAST") {
+            fail!("descending order lost its native NULLS LAST form", desc.sql)
+        } else { () }
     }
 );
 pub def utc_buckets_use_documented_functions: test::Test = test::should_ok(
@@ -174,18 +222,151 @@ pub def utc_buckets_use_documented_functions: test::Test = test::should_ok(
             ),
             [id]
         );
-        datetime == "date_trunc('HOUR', CAST(`select`.`id` AS TIMESTAMP))" && date == "CAST(date_trunc('MONTH', CAST(`select`.`id` AS TIMESTAMP)) AS DATE)" && string::contains(
-            epoch,
-            "timestampdiff('SECOND'"
-        ) && string::contains(epoch, "mod(mod(`select`.`id`, 86400000) + 86400000, 86400000)") && string::contains(
-            epoch,
-            "ELSE NULL END"
-        ) && string::contains(
-            scalar(qb::ScalarFunction::UtcDaysAgo, [needle.1, take.1]),
-            "timestampadd('DAY', (0 - CAST($2 AS INTEGER))"
-        )
+        if datetime != "time_floor(CAST(`select`.`id` AS TIMESTAMP), 'PT1H')" {
+            fail!("unexpected datetime hour bucket rendering (OQ-7)", datetime)
+        } else { () };
+        if date != "date_trunc('month', CAST(`select`.`id` AS TIMESTAMP))" {
+            fail!("unexpected date bucket rendering (OQ-2)", date)
+        } else { () };
+        if !string::contains(epoch, "timestampdiff('SECOND'") {
+            fail!("epoch bucket lost its timestampdiff form", epoch)
+        } else { () };
+        if !string::contains(epoch, "mod(mod(`select`.`id`, 86400000) + 86400000, 86400000)") {
+            fail!("epoch bucket lost its canonical day-offset arithmetic", epoch)
+        } else { () };
+        if !string::contains(epoch, "TIMESTAMP '1970-01-01 00:00:00'") {
+            fail!("epoch month bucket lost its typed epoch anchor (m12)", epoch)
+        } else { () };
+        if !string::contains(epoch, "ELSE NULL END") {
+            fail!("epoch bucket lost its NULL branch", epoch)
+        } else { () };
+        let days_ago = scalar_query(qb::ScalarFunction::UtcDaysAgo, [needle.1, take.1]);
+        if days_ago.sql != "concat(timestamp_format(timestampadd('DAY', (0 - CAST(? AS INTEGER)), CAST(? AS TIMESTAMP)), '%Y-%m-%d'), 'T', timestamp_format(timestampadd('DAY', (0 - CAST(? AS INTEGER)), CAST(? AS TIMESTAMP)), '%H:%i:%s'), 'Z')" {
+            fail!("utc_days_ago lost its concat combination (OQ-1)", days_ago.sql)
+        } else { () };
+        if days_ago.bindings != [qb::Val::Int(2), qb::Val::String("active"), qb::Val::Int(2), qb::Val::String("active")] {
+            fail!("utc_days_ago must expand the restated subexpression per occurrence", days_ago.bindings)
+        } else { () }
     }
 );
+pub def unsupported_bucket_vocabulary_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket(
+                    {unit: qb::UtcBucketUnit::Year, encoding: qb::UtcBucketEncoding::DateTimeUtc}
+                ),
+                [id]
+            ),
+            cap.0
+        )
+    },
+    "UQL buckets support hour, day and month units only"
+);
+pub def quarter_bucket_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket(
+                    {unit: qb::UtcBucketUnit::Quarter, encoding: qb::UtcBucketEncoding::DateTimeUtc}
+                ),
+                [id]
+            ),
+            cap.0
+        )
+    },
+    "UQL buckets support hour, day and month units only"
+);
+pub def week_bucket_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket(
+                    {unit: qb::UtcBucketUnit::Week, encoding: qb::UtcBucketEncoding::DateTimeUtc}
+                ),
+                [id]
+            ),
+            cap.0
+        )
+    },
+    "UQL buckets support hour, day and month units only"
+);
+pub def date_hour_bucket_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket(
+                    {unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::Date}
+                ),
+                [id]
+            ),
+            cap.0
+        )
+    },
+    "invalid scalar call arity"
+);
+pub def zoned_time_bucket_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(
+                qb::ScalarFunction::ZonedTimeBucket(qb::UtcBucketUnit::Day),
+                [id, needle.1]
+            ),
+            cap.0
+        )
+    },
+    "UQL does not define region timezone buckets"
+);
+pub def epoch_millis_to_utc_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(qb::ScalarFunction::EpochMillisToUtc, [needle.1]),
+            cap.0
+        )
+    },
+    "UQL does not define epoch millis to timestamp conversion"
+);
+pub def symbolic_parameter_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        uql::render_expr_with_context(
+            qb::scalar(qb::ScalarFunction::IsNotNull, [qb::Expr::Parameter(0)]),
+            cap.0
+        )
+    },
+    "symbolic query parameters require binding before this dialect"
+);
+pub def epoch_boundaries_expand_per_occurrence: test::Test = test::should_ok(fn() {
+    type EpochEntry = struct {value: qb::Val, unit: qb::UtcBucketUnit};
+    let boundaries: Array(EpochEntry) = array::flat_map(
+        [
+            qb::Val::Int(-1), qb::Val::Int(-3600001), qb::Val::Int(-86400001),
+            qb::Val::Int(-62135596800000), qb::Val::Int(-62135596800001),
+            qb::Val::Int(253402300799999), qb::Val::Int(253402300800000), qb::Val::None,
+        ],
+        fn(value) {
+            array::map(
+                [qb::UtcBucketUnit::Hour, qb::UtcBucketUnit::Day, qb::UtcBucketUnit::Month],
+                fn(unit) {
+                    {value, unit}.ty!(EpochEntry)
+                }
+            )
+        }
+    );
+    array::fold(boundaries, True, fn(healthy, entry) {
+        let bound = qb::bind(qb::build_context(), entry.value);
+        let rendered = uql::render_expr_with_context(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket({unit: entry.unit, encoding: qb::UtcBucketEncoding::EpochMillis}),
+                [bound.1]
+            ),
+            bound.0
+        );
+        if rendered.bindings != [entry.value, entry.value, entry.value, entry.value] {
+            fail!("epoch bucket must expand the guarded value per occurrence", entry, rendered.bindings)
+        } else { () };
+        healthy
+    });
+});
 pub def unregistered_binding_is_rejected: test::Test = test::should_fail_with(
     fn() {
         uql::render_expr_with_context(qb::Expr::AllocatedBind({index: 5}), cap.0)
@@ -296,6 +477,40 @@ def partitioned: qb::Plan = {
         )
     )
 };
+# The partition key is deliberately not projected: it must surface through the
+# hidden `__q_pk_<i>` materialization so the outer ordering stays stable.
+def partitioned_hidden_key: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(id, "id")],
+    ordering: [],
+    partition: Some(
+        qb::partitioned_top_n_bound(
+            [category],
+            [qb::order_by(qb::OrderKey::Expr(amount), qb::Ordering::Desc)],
+            take.1
+        )
+    )
+};
+def days_ago: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(qb::scalar(qb::ScalarFunction::UtcDaysAgo, [ago_time.1, ago_days.1]), "ago")]
+};
+def days_ago_null: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(qb::scalar(qb::ScalarFunction::UtcDaysAgo, [null_time.1, ago_days.1]), "ago")]
+};
+def bucket_hour: qb::Plan = {
+    ...plan,
+    projection: [
+        qb::named_expr_item(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::DateTimeUtc}),
+                [ago_time.1]
+            ),
+            "bucket"
+        )
+    ]
+};
 def joined: qb::JoinedGroups = {
     left: {...grouped, ordering: []},
     right: {...grouped, ordering: []},
@@ -396,6 +611,7 @@ def cases: Array(Case) = [
     },
     {name: "latest", query: render(qb::QueryPlan::Rows(latest))},
     {name: "partitioned", query: render(qb::QueryPlan::Rows(partitioned))},
+    {name: "partitioned_hidden_key", query: render(qb::QueryPlan::Rows(partitioned_hidden_key))},
     {name: "joined", query: render(qb::QueryPlan::JoinedGroups(joined))},
     {name: "joined_count", query: render(qb::QueryPlan::JoinedGroupCount(joined))},
     {
@@ -453,30 +669,302 @@ def cases: Array(Case) = [
             )
         )
     },
+    {name: "days_ago", query: render(qb::QueryPlan::Rows(days_ago))},
+    {name: "days_ago_null", query: render(qb::QueryPlan::Rows(days_ago_null))},
+    {name: "bucket_hour", query: render(qb::QueryPlan::Rows(bucket_hour))},
 ];
-pub def all_plan_shapes_preserve_context: test::Test = test::should_ok(
+# The expected arrays are the occurrence-order expansions: grouped re-expands
+# its computed measure in HAVING and ORDER BY, joined groups render the grouped
+# plan twice, and the capped case keeps the business LIMIT before the take.
+type Expectation = struct {
+    name: String,
+    bindings: Array(qb::Val)
+};
+def grouped_bindings: Array(qb::Val) = [
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::Int(0),
+    qb::Val::String("active"),
+    qb::Val::String("active")
+];
+# The aligned sides strip the grouped plan's ordering, so each side expands the
+# projection and HAVING re-expansions only.
+def aligned_bindings: Array(qb::Val) = [
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::Int(0)
+];
+def joined_bindings: Array(qb::Val) = array::concat([aligned_bindings, aligned_bindings]);
+def expectations: Array(Expectation) = [
+    {name: "rows", bindings: []},
+    {name: "desc", bindings: []},
+    {name: "distinct", bindings: []},
+    {name: "union", bindings: []},
+    {name: "set_count", bindings: []},
+    {name: "scalar", bindings: []},
+    {name: "ranked", bindings: []},
+    {name: "latest", bindings: []},
+    {name: "lower", bindings: []},
+    {name: "scoped", bindings: [qb::Val::String("active")]},
+    {name: "exists", bindings: [qb::Val::String("active")]},
+    {name: "not_exists", bindings: [qb::Val::String("active")]},
+    {name: "grouped", bindings: grouped_bindings},
+    {name: "group_count", bindings: grouped_bindings},
+    {name: "partitioned", bindings: [qb::Val::Int(2)]},
+    {name: "partitioned_hidden_key", bindings: [qb::Val::Int(2)]},
+    {name: "joined", bindings: joined_bindings},
+    {name: "joined_count", bindings: joined_bindings},
+    {name: "joined_ratio", bindings: array::push(joined_bindings, qb::Val::Int(2))},
+    {name: "capped", bindings: [qb::Val::Int(2)]},
+    {
+        name: "days_ago",
+        bindings: [
+            qb::Val::Int(2),
+            qb::Val::String("2026-03-05 07:25:00"),
+            qb::Val::Int(2),
+            qb::Val::String("2026-03-05 07:25:00")
+        ]
+    },
+    {name: "days_ago_null", bindings: [qb::Val::Int(2), qb::Val::None, qb::Val::Int(2), qb::Val::None]},
+    {name: "bucket_hour", bindings: [qb::Val::String("2026-03-05 07:25:00")]},
+];
+def expected_for: Fn(String) -> Array(qb::Val) = fn(name) {
+    match array::find(expectations, fn(item) { item.name == name }) {
+        Some(item) => item.bindings,
+        None => fail!("missing expansion expectation", name),
+    }
+};
+pub def all_plan_shapes_expand_occurrence_bindings: test::Test = test::should_ok(
     fn() {
-        array::all(
-            cases,
-            fn(item) {
-                item.query.bindings == cap.0.bindings && !string::contains(
-                    item.query.sql,
-                    "NULLS FIRST"
-                ) && !string::contains(item.query.sql, "FILTER (") && !string::contains(
-                    item.query.sql,
-                    "DOUBLE PRECISION"
-                )
-            }
-        )
+        let mismatched = array::filter(cases, fn(item) {
+            item.query.bindings != expected_for(item.name)
+        });
+        if array::length(mismatched) > 0 {
+            fail!("a plan shape broke the occurrence-order expansion", mismatched)
+        } else { () };
+        let broken = array::filter(cases, fn(item) {
+            placeholder_count(item.query.sql) != array::length(item.query.bindings)
+        });
+        if array::length(broken) > 0 {
+            fail!("a plan shape rendered a placeholder count that differs from its bindings", broken)
+        } else { () };
+        let filtered = array::filter(cases, fn(item) { string::contains(item.query.sql, "FILTER (") });
+        if array::length(filtered) > 0 {
+            fail!("a plan shape rendered a FILTER clause", filtered)
+        } else { () };
+        let widened = array::filter(cases, fn(item) { string::contains(item.query.sql, "DOUBLE PRECISION") });
+        if array::length(widened) > 0 {
+            fail!("a plan shape rendered non-portable DOUBLE PRECISION", widened)
+        } else { () }
     }
 );
-pub def having_requires_group_by: test::Test = test::should_fail_with(
+pub def selection_wrap_orders_and_limits_literal: test::Test = test::should_ok(
     fn() {
-        render(qb::QueryPlan::Rows({...grouped, projection: [count], grouping: [], ordering: []}))
-    },
-    "UQL HAVING requires GROUP BY"
+        let query = match array::find(cases, fn(item) { item.name == "capped" }) {
+            Some(item) => item.query,
+            None => fail!("missing capped case"),
+        };
+        if !string::contains(query.sql, "AS `__q_result`") {
+            fail!("the final selection lost its semantic alias", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "LIMIT 1") {
+            fail!("the final selection must append a literal LIMIT", query.sql)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
 );
-pub def ranked_keys_use_derived_exists_instead_of_grouped_expression_subquery: test::Test = test::should_ok(
+pub def selection_order_key_with_binding_counts_placeholder: test::Test = test::should_ok(
+    fn() {
+        let query = uql::build_query(
+            {
+                ...qb::finish(needle.0, qb::QueryPlan::Rows(plan)),
+                selection: Some(
+                    {
+                        order_by: [
+                            {
+                                key: needle.1,
+                                direction: qb::Ordering::Asc
+                            }
+                        ],
+                        take: 2
+                    }
+                )
+            }
+        );
+        if !string::contains(query.sql, "ORDER BY ? ASC NULLS FIRST") {
+            fail!("a bound selection key must render its own positional placeholder", query.sql)
+        } else { () };
+        if query.bindings != [qb::Val::String("active")] {
+            fail!("the bound selection key must push its occurrence binding", query.bindings)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def ranked_bind_key_expands_per_restatement: test::Test = test::should_ok(
+    fn() {
+        let ranked_bound_inner: qb::RankedKeySubquery = qb::ranked_key_subquery_spec(
+            peer.1,
+            [],
+            None,
+            [needle.1],
+            {
+                function: qb::AggregateFunction::Sum,
+                arg: qb::column(peer.1, "amount"),
+                distinct: False,
+                filter: None,
+                alias: "total",
+                latest: None
+            },
+            qb::Ordering::Desc
+        );
+        let query = render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    ranked_key_comparisons: [
+                        qb::ranked_key_comparison(
+                            qb::source_column_ref(source.1, "category"),
+                            qb::ScalarFunction::Eq,
+                            ranked_bound_inner
+                        )
+                    ]
+                }
+            )
+        );
+        if !string::contains(query.sql, "= (SELECT ? FROM") {
+            fail!("the bound ranked key lost its scalar subquery form", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "GROUP BY ? ORDER BY sum(`select_2`.`amount`) DESC NULLS LAST LIMIT 1)") {
+            fail!("the bound ranked key must restate itself in GROUP BY", query.sql)
+        } else { () };
+        if query.bindings != [qb::Val::String("active"), qb::Val::String("active")] {
+            fail!("the key must repeat its binding once per restatement", query.bindings)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def structural_names_use_the_shared_vocabulary: test::Test = test::should_ok(
+    fn() {
+        let named: Array(Case) = array::filter(cases, fn(item) {
+            item.name == "latest" || item.name == "joined" || item.name == "group_count"
+                || item.name == "capped" || item.name == "partitioned" || item.name == "partitioned_hidden_key"
+        });
+        if array::length(named) != 6 {
+            fail!("structural name cases went missing", array::map(named, fn(item) { item.name }))
+        } else { () };
+        let latest_sql = match array::find(named, fn(item) { item.name == "latest" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing latest"),
+        };
+        if !string::contains(latest_sql, "AS `__latest_stage`") {
+            fail!("latest staging lost its semantic alias", latest_sql)
+        } else { () };
+        if !string::contains(latest_sql, "`__latest_row` = 1") {
+            fail!("latest reduction lost its staged row marker", latest_sql)
+        } else { () };
+        if !string::contains(latest_sql, "DESC NULLS LAST") {
+            fail!("latest window lost its explicit NULLS ordering", latest_sql)
+        } else { () };
+        let joined_sql = match array::find(named, fn(item) { item.name == "joined" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing joined"),
+        };
+        if !string::contains(joined_sql, "`__q_left`.`category` <=> `__q_right`.`category`") {
+            fail!("joined identity keys lost their NULL-safe alignment", joined_sql)
+        } else { () };
+        let count_sql = match array::find(named, fn(item) { item.name == "group_count" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing group_count"),
+        };
+        if !string::contains(count_sql, "AS `__q_count`") {
+            fail!("group counting lost its semantic derived alias", count_sql)
+        } else { () };
+        let capped_sql = match array::find(named, fn(item) { item.name == "capped" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing capped"),
+        };
+        if !string::contains(capped_sql, "AS `__q_result`") {
+            fail!("the final selection lost its semantic alias", capped_sql)
+        } else { () };
+        if !string::contains(capped_sql, "LIMIT 1") {
+            fail!("the final selection must append a literal LIMIT", capped_sql)
+        } else { () };
+        let partitioned_sql = match array::find(named, fn(item) { item.name == "partitioned" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing partitioned"),
+        };
+        if !string::contains(partitioned_sql, "AS `__q_partitioned`") {
+            fail!("partitioned Top-N lost its semantic outer alias", partitioned_sql)
+        } else { () };
+        if !string::contains(partitioned_sql, "`__q_rn` <= ?") {
+            fail!("partitioned Top-N lost its row-number cut", partitioned_sql)
+        } else { () };
+        if !string::contains(partitioned_sql, "AS `__q_ok_0`") {
+            fail!("partitioned Top-N lost its hidden ordering key name", partitioned_sql)
+        } else { () };
+        let hidden_key_sql = match array::find(named, fn(item) { item.name == "partitioned_hidden_key" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing partitioned_hidden_key"),
+        };
+        if !string::contains(hidden_key_sql, "AS `__q_pk_0`") {
+            fail!("an unprojected partition key must materialize as __q_pk_<i>", hidden_key_sql)
+        } else { () }
+    }
+);
+pub def offset_without_limit_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        render(qb::QueryPlan::Rows({...plan, offset: Some(threshold.1)}))
+    },
+    "UQL OFFSET requires a LIMIT or a final output cap"
+);
+pub def offset_with_selection_uses_single_layer: test::Test = test::should_ok(
+    fn() {
+        let query = uql::build_query(
+            {
+                ...qb::finish(cap.0, qb::QueryPlan::Rows({...plan, offset: Some(threshold.1)})),
+                selection: Some(
+                    {
+                        order_by: [
+                            {
+                                key: qb::Expr::Column({source: "__q_result", column: "id"}),
+                                direction: qb::Ordering::Asc
+                            }
+                        ],
+                        take: 2
+                    }
+                )
+            }
+        );
+        if !string::contains(query.sql, "LIMIT 2 OFFSET ?") {
+            fail!("a bare OFFSET with a selection must upgrade to the single-layer shape", query.sql)
+        } else { () };
+        if string::contains(query.sql, "AS `__q_result`") {
+            fail!("the single-layer OFFSET shape must not wrap again", query.sql)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def ungrouped_having_renders_natively: test::Test = test::should_ok(
+    fn() {
+        let query = render(qb::QueryPlan::Rows({...grouped, projection: [count], grouping: [], ordering: []}));
+        if !string::contains(query.sql, "HAVING count(DISTINCT CASE") {
+            fail!("ungrouped HAVING must render natively", query.sql)
+        } else { () }
+    }
+);
+pub def ranked_keys_use_direct_scalar_subquery: test::Test = test::should_ok(
     fn() {
         let query = render(
             qb::QueryPlan::Rows(
@@ -492,10 +980,57 @@ pub def ranked_keys_use_derived_exists_instead_of_grouped_expression_subquery: t
                 }
             )
         );
-        string::contains(query.sql, "EXISTS (SELECT 1 FROM (SELECT `select_2`.`category` AS") && string::contains(
+        if !string::contains(query.sql, "`select`.`category` = (SELECT `select_2`.`category` FROM") {
+            fail!("ranked key lost its direct scalar subquery form", query.sql)
+        } else { () };
+        if !string::contains(
             query.sql,
-            "GROUP BY `select_2`.`category` ORDER BY"
-        ) && !string::contains(query.sql, "GROUP BY 1")
+            "GROUP BY `select_2`.`category` ORDER BY sum(`select_2`.`amount`) DESC NULLS LAST LIMIT 1)"
+        ) {
+            fail!("ranked key lost its grouped ordering with LIMIT 1", query.sql)
+        } else { () };
+        if string::contains(query.sql, "EXISTS (SELECT 1 FROM (SELECT") {
+            fail!("ranked key must not use the historical EXISTS wrapper", query.sql)
+        } else { () }
+    }
+);
+# The §6.1 count shape: the aggregate argument is a constant binding allocated
+# BEFORE the predicate's binding, but the CASE text places the predicate first,
+# so the expansion must follow text order, not allocation order.
+def agg_order_arg: (qb::BuildCtx, qb::Expr) = qb::bind(qb::build_context(), qb::Val::Int(1));
+def agg_order_filter: (qb::BuildCtx, qb::Expr) = qb::bind(agg_order_arg.0, qb::Val::String("active"));
+def agg_order_predicate: qb::Expr = qb::scalar(
+    qb::ScalarFunction::Eq,
+    [qb::column(source.1, "kind"), agg_order_filter.1]
+);
+def agg_order_plan: qb::Plan = {...plan,
+    projection: [
+        qb::aggregate_filtered(qb::AggregateFunction::Count, agg_order_arg.1, False, Some(agg_order_predicate), "c")
+    ],
+    ordering: []};
+pub def filtered_aggregate_binds_in_text_order: test::Test = test::should_ok(
+    fn() {
+        let query = uql::build_query(qb::finish(agg_order_filter.0, qb::QueryPlan::Rows(agg_order_plan)));
+        if !string::contains(query.sql, "count(CASE WHEN `select`.`kind` = ? THEN ? ELSE NULL END)") {
+            fail!("filtered aggregate lost its scoped CASE form", query.sql)
+        } else { () };
+        if query.bindings != [qb::Val::String("active"), qb::Val::Int(1)] {
+            fail!("the filter must bind before the aggregate argument (text order)", query.bindings)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def joined_groups_align_null_safe: test::Test = test::should_ok(
+    fn() {
+        let query = render(qb::QueryPlan::JoinedGroups(joined));
+        if !string::contains(query.sql, "AS `__q_left`") || !string::contains(query.sql, "AS `__q_right`") {
+            fail!("joined groups lost their fixed semantic aliases", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "`__q_left`.`category` <=> `__q_right`.`category`") {
+            fail!("joined identity keys lost their NULL-safe alignment", query.sql)
+        } else { () }
     }
 );
 def epoch_cases: Array(Case) = array::flat_map(
@@ -511,7 +1046,7 @@ def epoch_cases: Array(Case) = array::flat_map(
     ],
     fn(value) {
         array::map(
-            [qb::UtcBucketUnit::Hour, qb::UtcBucketUnit::Day],
+            [qb::UtcBucketUnit::Hour, qb::UtcBucketUnit::Day, qb::UtcBucketUnit::Month],
             fn(unit) {
                 let bound = qb::bind(qb::build_context(), value);
                 let rendered = uql::render_expr_with_context(
@@ -525,7 +1060,8 @@ def epoch_cases: Array(Case) = array::flat_map(
                 );
                 let name = match unit {
                     qb::UtcBucketUnit::Hour => "epoch_hour",
-                    _ => "epoch_day"
+                    qb::UtcBucketUnit::Day => "epoch_day",
+                    _ => "epoch_month"
                 };
                 {name, query: {...rendered, sql: `SELECT \{rendered.sql}`}}.ty!(Case)
             }

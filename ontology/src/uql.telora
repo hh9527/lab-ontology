@@ -4,19 +4,22 @@ use std::array as array;
 use std::string as string;
 use crate::query as qb;
 
+# The render context carries the immutable builder bindings plus the
+# occurrence-order expansion that becomes the positional bindings array: every
+# rendered `?` appends its handle's value, so the array length always equals
+# the `?` count, repeated references repeat their value, and handles that
+# never appear in the SQL never enter the array.
 type RenderCtx = struct {
     builder_bindings: Array(qb::Val),
+    occurrences: Array(qb::Val),
     reserved_aliases: Array(String),
     next_alias: Int,
 };
 
-type Emitted = struct {
-    sql: String,
-    ctx: RenderCtx
-};
+type Emitted = struct { sql: String, ctx: RenderCtx };
 
 def context: Fn(Array(String), Array(qb::Val)) -> RenderCtx = fn(reserved, bindings) {
-    {builder_bindings: bindings, reserved_aliases: reserved, next_alias: 0}
+    {builder_bindings: bindings, occurrences: [], reserved_aliases: reserved, next_alias: 0}
 };
 
 pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
@@ -34,114 +37,92 @@ pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
     }
 };
 
-# UQL temporal functions have no timezone argument. Executors must use UTC.
-def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
-    let unit = match spec.unit {
-        qb::UtcBucketUnit::Year => "YEAR",
-        qb::UtcBucketUnit::Quarter => "QUARTER",
-        qb::UtcBucketUnit::Week => "WEEK",
-        qb::UtcBucketUnit::Hour => "HOUR",
-        qb::UtcBucketUnit::Day => "DAY",
-        qb::UtcBucketUnit::Month => "MONTH",
-    };
+# UQL temporal functions carry no timezone argument; executors interpret them
+# as UTC. The bucket matrix: DateTimeUtc keeps the datetime logical type
+# (`time_floor` for hours, `CAST(date_trunc … AS TIMESTAMP)` for day/month),
+# Date uses date_trunc's DATE result directly, and EpochMillis buckets sit
+# inside the calendar-range guard CASE. The epoch form restates the value
+# inside the guard and the offset arithmetic; every restatement renders its
+# own positional `?` so the occurrence expansion stays exact.
+def utc_bucket_sql: Fn(qb::UtcBucketSpec, qb::Expr, RenderCtx) -> Emitted = fn(spec, value, ctx) {
     match spec.encoding {
-        qb::UtcBucketEncoding::DateTimeUtc => `date_trunc('\{unit}', CAST(\{value} AS TIMESTAMP))`,
-        qb::UtcBucketEncoding::Date => `CAST(date_trunc('\{unit}', CAST(\{value} AS TIMESTAMP)) AS DATE)`,
-        qb::UtcBucketEncoding::EpochMillis => do {
-            let bucket = match spec.unit {
-                qb::UtcBucketUnit::Hour => `CAST((\{value} - mod(mod(\{value}, 3600000) + 3600000, 3600000)) AS BIGINT)`,
-                qb::UtcBucketUnit::Day => `CAST((\{value} - mod(mod(\{value}, 86400000) + 86400000, 86400000)) AS BIGINT)`,
-                qb::UtcBucketUnit::Month => do {
-                    let origin = "CAST('1970-01-01 00:00:00' AS TIMESTAMP)";
-                    # TIMESTAMPADD accepts INT counts. Whole days cover the full
-                    # supported calendar range without overflowing a 32-bit INT;
-                    # intra-day time cannot change the containing UTC month.
-                    let days = `CAST((\{value} - mod(mod(\{value}, 86400000) + 86400000, 86400000)) / 86400000 AS INTEGER)`;
-                    let timestamp = `timestampadd('DAY', \{days}, \{origin})`;
-                    `CAST(timestampdiff('SECOND', \{origin}, date_trunc('MONTH', \{timestamp})) AS BIGINT) * 1000`
-                },
-                _ => fail!("this bucket unit requires DateTimeUtc"),
+        qb::UtcBucketEncoding::DateTimeUtc => do {
+            let rendered = emit_expr(value, ctx);
+            let sql = match spec.unit {
+                qb::UtcBucketUnit::Year => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Quarter => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Week => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Hour => `time_floor(CAST(\{rendered.sql} AS TIMESTAMP), 'PT1H')`,
+                qb::UtcBucketUnit::Day => `CAST(date_trunc('day', CAST(\{rendered.sql} AS TIMESTAMP)) AS TIMESTAMP)`,
+                qb::UtcBucketUnit::Month => `CAST(date_trunc('month', CAST(\{rendered.sql} AS TIMESTAMP)) AS TIMESTAMP)`,
             };
-            `CASE WHEN \{value} >= -62135596800000 AND \{value} < 253402300800000 THEN \{bucket} ELSE NULL END`
+            {sql, ctx: rendered.ctx}
+        },
+        qb::UtcBucketEncoding::Date => do {
+            let rendered = emit_expr(value, ctx);
+            let sql = match spec.unit {
+                qb::UtcBucketUnit::Year => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Quarter => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Week => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Hour => fail!("UQL date buckets support day and month units only", spec),
+                qb::UtcBucketUnit::Day => `date_trunc('day', CAST(\{rendered.sql} AS TIMESTAMP))`,
+                qb::UtcBucketUnit::Month => `date_trunc('month', CAST(\{rendered.sql} AS TIMESTAMP))`,
+            };
+            {sql, ctx: rendered.ctx}
+        },
+        qb::UtcBucketEncoding::EpochMillis => do {
+            let lower = emit_expr(value, ctx);
+            let upper = emit_expr(value, lower.ctx);
+            let offset = emit_expr(value, upper.ctx);
+            let inner = emit_expr(value, offset.ctx);
+            let bucket = match spec.unit {
+                qb::UtcBucketUnit::Year => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Quarter => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Week => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Hour =>
+                    `CAST((\{offset.sql} - mod(mod(\{inner.sql}, 3600000) + 3600000, 3600000)) AS BIGINT)`,
+                qb::UtcBucketUnit::Day =>
+                    `CAST((\{offset.sql} - mod(mod(\{inner.sql}, 86400000) + 86400000, 86400000)) AS BIGINT)`,
+                qb::UtcBucketUnit::Month => do {
+                    # Whole-day timestampadd plus a month-truncated timestampdiff keeps
+                    # 32-bit INT counts and fractional months out of the arithmetic; the
+                    # epoch anchor is the typed literal and the truncation result is CAST
+                    # back to TIMESTAMP before the difference is taken.
+                    let origin = "TIMESTAMP '1970-01-01 00:00:00'";
+                    let days = `CAST((\{offset.sql} - mod(mod(\{inner.sql}, 86400000) + 86400000, 86400000)) / 86400000 AS INTEGER)`;
+                    `CAST(timestampdiff('SECOND', \{origin}, CAST(date_trunc('month', timestampadd('DAY', \{days}, \{origin})) AS TIMESTAMP)) AS BIGINT) * 1000`
+                },
+            };
+            {sql: `CASE WHEN \{lower.sql} >= -62135596800000 AND \{upper.sql} < 253402300800000 THEN \{bucket} ELSE NULL END`,
+                ctx: inner.ctx}
         },
     }
 };
 
-# LOWER may fold non-ASCII characters differently across UQL sources. The AST
-# contract folds only A-Z; REPLACE preserves that contract on every backend.
-def ascii_lower: Fn(String) -> String = fn(value) {
-    array::fold(
-        array::enumerate(
-            [
-                "A",
-                "B",
-                "C",
-                "D",
-                "E",
-                "F",
-                "G",
-                "H",
-                "I",
-                "J",
-                "K",
-                "L",
-                "M",
-                "N",
-                "O",
-                "P",
-                "Q",
-                "R",
-                "S",
-                "T",
-                "U",
-                "V",
-                "W",
-                "X",
-                "Y",
-                "Z"
-            ]
-        ),
-        value,
-        fn(sql, pair) {
-            let lower = [
-                "a",
-                "b",
-                "c",
-                "d",
-                "e",
-                "f",
-                "g",
-                "h",
-                "i",
-                "j",
-                "k",
-                "l",
-                "m",
-                "n",
-                "o",
-                "p",
-                "q",
-                "r",
-                "s",
-                "t",
-                "u",
-                "v",
-                "w",
-                "x",
-                "y",
-                "z"
-            ];
-            `replace(\{sql}, '\{pair.1}', '\{lower[pair.0]}')`
-        }
-    )
+# timestamp_format format strings carry no T/Z literals, so the shifted
+# timestamp is restated twice and the date/time halves are joined by concat;
+# concat propagates NULL from any argument, keeping NULL timestamps NULL.
+# Text order inside one timestampadd is days-then-timestamp, so the arguments
+# render in that order and every restatement renders its own positional `?`.
+def utc_days_ago_sql: Fn(Array(qb::Expr), RenderCtx) -> Emitted = fn(args, ctx) {
+    let days_first = emit_expr(args[1], ctx);
+    let time_first = emit_expr(args[0], days_first.ctx);
+    let days_second = emit_expr(args[1], time_first.ctx);
+    let time_second = emit_expr(args[0], days_second.ctx);
+    let first = `timestampadd('DAY', (0 - CAST(\{days_first.sql} AS INTEGER)), CAST(\{time_first.sql} AS TIMESTAMP))`;
+    let second = `timestampadd('DAY', (0 - CAST(\{days_second.sql} AS INTEGER)), CAST(\{time_second.sql} AS TIMESTAMP))`;
+    {sql: `concat(timestamp_format(\{first}, '%Y-%m-%d'), 'T', timestamp_format(\{second}, '%H:%i:%s'), 'Z')`,
+        ctx: time_second.ctx}
 };
 
-# Explicit null keys avoid relying on a backend's default null placement or
-# PostgreSQL's NULLS FIRST/LAST extension, absent from the UQL ORDER BY spec.
+# OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
+
+# The AST ordering contract (ascending puts NULL first, descending last) is
+# expressed with the engine's native NULLS FIRST/LAST spelling.
 def ordered_sql: Fn(String, qb::Ordering) -> String = fn(value, direction) {
     match direction {
-        qb::Ordering::Asc => `CASE WHEN \{value} IS NULL THEN 0 ELSE 1 END ASC, \{value} ASC`,
-        qb::Ordering::Desc => `CASE WHEN \{value} IS NULL THEN 1 ELSE 0 END ASC, \{value} DESC`,
+        qb::Ordering::Asc => `\{value} ASC NULLS FIRST`,
+        qb::Ordering::Desc => `\{value} DESC NULLS LAST`,
     }
 };
 
@@ -155,15 +136,16 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
         qb::ScalarFunction::Add => `(\{parts[0]} + \{parts[1]})`,
         qb::ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
         qb::ScalarFunction::Div => `(\{parts[0]} / \{parts[1]})`,
-        qb::ScalarFunction::Lower => ascii_lower(parts[0]),
+        # OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
+        qb::ScalarFunction::Lower => `lower(\{parts[0]})`,
         qb::ScalarFunction::Length => `char_length(\{parts[0]})`,
-        qb::ScalarFunction::UtcDaysAgo => `timestamp_format(timestampadd('DAY', (0 - CAST(\{parts[1]} AS INTEGER)), CAST(\{parts[0]} AS TIMESTAMP)), 'yyyy-MM-dd''T''HH:mm:ss''Z''')`,
-        qb::ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, parts[0]),
-        qb::ScalarFunction::ZonedTimeBucket(_) => fail!("region timezone buckets require PostgreSQL or the SQLite timezone adapter"),
-        qb::ScalarFunction::EpochMillisToUtc => do {
-            let v=parts[0];let rem=`mod(mod(\{v}, 86400000) + 86400000, 86400000)`;
-            `timestampadd('MILLISECOND', CAST(\{rem} AS INTEGER), timestampadd('DAY', CAST((\{v} - \{rem}) / 86400000 AS INTEGER), CAST('1970-01-01 00:00:00' AS TIMESTAMP)))`
-        },
+        # Both temporal functions restate subexpressions, so they render through
+        # the occurrence-aware emitters in emit_expr, never through this
+        # string-combining path.
+        qb::ScalarFunction::UtcDaysAgo => fail!("UtcDaysAgo requires occurrence-order rendering"),
+        qb::ScalarFunction::UtcTimeBucket(_) => fail!("UtcTimeBucket requires occurrence-order rendering"),
+        qb::ScalarFunction::ZonedTimeBucket(_) => fail!("UQL does not define region timezone buckets"),
+        qb::ScalarFunction::EpochMillisToUtc => fail!("UQL does not define epoch millis to timestamp conversion"),
         qb::ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         qb::ScalarFunction::Ne => `\{parts[0]} <> \{parts[1]}`,
         qb::ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,
@@ -182,7 +164,9 @@ type Arguments = struct {
     ctx: RenderCtx
 };
 
-# The build context owns placeholder assignments; rendering only resolves handles.
+# The build context owns placeholder assignment; rendering only resolves
+# handles, emitting a bare `?` and appending the handle's value to the
+# occurrence expansion.
 pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
     match expr {
         qb::Expr::Parameter(_) => fail!(
@@ -198,29 +182,35 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
         qb::Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(
             ctx.builder_bindings
         ) {
-            {sql: `$\{binding.index}`, ctx}
+            {
+                sql: "?",
+                ctx: {...ctx, occurrences: array::push(ctx.occurrences, ctx.builder_bindings[binding.index - 1])}
+            }
         } else {
             fail!("binding handle is not registered in builder context", binding)
         },
-        qb::Expr::Scalar(call) => {
-            let initial: Arguments = {sql: [], ctx};
-            let args = array::fold(
-                call.args,
-                initial,
-                fn(state, arg) {
-                    let rendered = emit_expr(arg, state.ctx);
-                    {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
-                }
-            );
-            {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+        qb::Expr::Scalar(call) => match call.function {
+            qb::ScalarFunction::UtcDaysAgo => utc_days_ago_sql(call.args, ctx),
+            qb::ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, call.args[0], ctx),
+            _ => do {
+                let initial: Arguments = {sql: [], ctx};
+                let args = array::fold(
+                    call.args,
+                    initial,
+                    fn(state, arg) {
+                        let rendered = emit_expr(arg, state.ctx);
+                        {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+                    }
+                );
+                {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+            },
         },
     }
 };
 
 pub def render_expr_with_context: Fn(qb::Expr, qb::BuildCtx) -> qb::Query = fn(expr, builder) {
-    let initial = context([], builder.bindings);
-    let emitted = emit_expr(expr, initial);
-    {sql: emitted.sql, bindings: builder.bindings}
+    let emitted = emit_expr(expr, context([], builder.bindings));
+    {sql: emitted.sql, bindings: emitted.ctx.occurrences}
 };
 
 def quoted: Fn(String) -> String = fn(identifier) {
@@ -351,8 +341,8 @@ def render_join: Fn(qb::Join, RenderCtx) -> Emitted = fn(join, ctx) {
 };
 
 def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
-    let arg = emit_expr(call.arg, ctx);
     if call.function == qb::AggregateFunction::Latest {
+        let arg = emit_expr(call.arg, ctx);
         let time = match call.latest {
             Some(order) => order.time,
             None => fail!("Latest ordering is required")
@@ -362,6 +352,11 @@ def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
             ctx: arg.ctx
         }
     } else {
+        # The spec has no aggregate-level FILTER clause; the local predicate folds
+        # into a CASE without ELSE, and the closed aggregate set ignores its NULLs,
+        # which is exactly the FILTER semantics. The CASE text places the
+        # predicate before the aggregate argument, so the predicate renders first
+        # and every positional `?` is pushed in text order.
         let distinct = if call.distinct {
             "DISTINCT "
         } else {
@@ -369,10 +364,11 @@ def aggregate: Fn(qb::AggregateCall, RenderCtx) -> Emitted = fn(call, ctx) {
         };
         let filtered: Emitted = match call.filter {
             Some(expr) => {
-                let value = emit_expr(expr, arg.ctx);
-                {sql: `CASE WHEN \{value.sql} THEN \{arg.sql} ELSE NULL END`, ctx: value.ctx}
+                let value = emit_expr(expr, ctx);
+                let arg = emit_expr(call.arg, value.ctx);
+                {sql: `CASE WHEN \{value.sql} THEN \{arg.sql} ELSE NULL END`, ctx: arg.ctx}
             },
-            None => arg,
+            None => emit_expr(call.arg, ctx),
         };
         {sql: `\{qb::aggregate_name(call.function)}(\{distinct}\{filtered.sql})`, ctx: filtered.ctx}
     }
@@ -571,11 +567,6 @@ def render_exists: Fn(qb::Exists, RenderCtx) -> Emitted = fn(ex, ctx) {
                 {sql: `\{prefix} (\{body.sql})`, ctx: body.ctx}
             },
             None => {
-                let checked = if array::length(ex.having) > 0 && array::length(ex.grouping) == 0 {
-                    fail!("UQL HAVING requires GROUP BY", ex)
-                } else {
-                    True
-                };
                 let source = render_source(ex.source, ctx);
                 let initial_path: Arguments = {sql: [], ctx: source.ctx};
                 let path = array::fold(
@@ -682,6 +673,10 @@ def render_scalar_comparison: Fn(qb::ScalarAggregateComparison, RenderCtx) -> Em
     }
 };
 
+# Direct grouped-key scalar subquery: rendering keeps key, source, joins,
+# filter and ordering aligned with the SQL text occurrence order. The key is
+# restated in both the SELECT list and GROUP BY; every restatement renders its
+# own positional `?`, so a bind-bearing key expands once per occurrence.
 def render_ranked_comparison: Fn(qb::RankedKeyComparison, RenderCtx) -> Emitted = fn(cmp, ctx) {
     let sq = cmp.inner;
     let key = render_exprs(sq.keys, ctx);
@@ -699,7 +694,8 @@ def render_ranked_comparison: Fn(qb::RankedKeyComparison, RenderCtx) -> Emitted 
         Some(expr) => emit_expr(expr, joins.ctx),
         None => {sql: "", ctx: joins.ctx},
     };
-    let ordering = aggregate(sq.order, filtered.ctx);
+    let grouped = render_exprs(sq.keys, filtered.ctx);
+    let ordering = aggregate(sq.order, grouped.ctx);
     let direction = ordered_sql(ordering.sql, sq.direction);
     let join_sql = if array::length(sq.joins) > 0 {
         ` \{string::join(joins.sql, " ")}`
@@ -711,14 +707,9 @@ def render_ranked_comparison: Fn(qb::RankedKeyComparison, RenderCtx) -> Emitted 
     } else {
         ""
     };
-    # UQL expression subqueries cannot project grouped keys. A derived table
-    # inside EXISTS preserves WHERE comparison semantics, including NULLs.
-    let key_alias = internal_alias(ordering.ctx);
-    let row_alias = internal_alias(key_alias.1);
-    let inner = `SELECT \{key.sql} AS \{quoted(key_alias.0)} FROM \{source.sql}\{join_sql}\{filter_sql} GROUP BY \{key.sql} ORDER BY \{direction} LIMIT 1`;
     {
-        sql: `EXISTS (SELECT 1 FROM (\{inner}) AS \{quoted(row_alias.0)} WHERE \{column_sql(cmp.outer)} \{comparison_op(cmp.op)} \{quoted(row_alias.0)}.\{quoted(key_alias.0)})`,
-        ctx: row_alias.1
+        sql: `\{column_sql(cmp.outer)} \{comparison_op(cmp.op)} (SELECT \{key.sql} FROM \{source.sql}\{join_sql}\{filter_sql} GROUP BY \{grouped.sql} ORDER BY \{direction} LIMIT 1)`,
+        ctx: ordering.ctx
     }
 };
 
@@ -880,13 +871,11 @@ def plan_aliases: Fn(qb::Plan) -> Array(String) = fn(plan) {
 
 type PartitionItem = struct {
     sql: String,
-    value: String,
     alias: String,
     ctx: RenderCtx
 };
 type ExprBinding = struct {
     expr: qb::Expr,
-    sql: String,
     alias: String
 };
 type PartitionItems = struct {
@@ -903,7 +892,6 @@ def partition_item: Fn(qb::SelectItem, qb::Plan, RenderCtx) -> PartitionItem = f
             let allocated = internal_alias(emitted.ctx);
             {
                 sql: `\{emitted.sql} AS \{quoted(allocated.0)}`,
-                value: emitted.sql,
                 alias: allocated.0,
                 ctx: allocated.1
             }
@@ -912,7 +900,6 @@ def partition_item: Fn(qb::SelectItem, qb::Plan, RenderCtx) -> PartitionItem = f
             let emitted = emit_expr(named.expr, ctx);
             {
                 sql: `\{emitted.sql} AS \{quoted(named.alias)}`,
-                value: emitted.sql,
                 alias: named.alias,
                 ctx: emitted.ctx
             }
@@ -921,7 +908,6 @@ def partition_item: Fn(qb::SelectItem, qb::Plan, RenderCtx) -> PartitionItem = f
             let emitted = aggregate(call, ctx);
             {
                 sql: `\{emitted.sql} AS \{quoted(call.alias)}`,
-                value: emitted.sql,
                 alias: call.alias,
                 ctx: emitted.ctx
             }
@@ -930,7 +916,6 @@ def partition_item: Fn(qb::SelectItem, qb::Plan, RenderCtx) -> PartitionItem = f
             let emitted = measure(plan, ca.alias, ctx);
             {
                 sql: `\{emitted.sql} AS \{quoted(ca.alias)}`,
-                value: emitted.sql,
                 alias: ca.alias,
                 ctx: emitted.ctx
             }
@@ -954,7 +939,10 @@ type PartitionKeys = struct {
     ctx: RenderCtx
 };
 
-def partition_key: Fn(qb::Expr, PartitionKeys) -> PartitionKeys = fn(expr, state) {
+# Unprojected partition keys materialize as hidden `__q_pk_<i>` columns and
+# unprojected partition ordering keys as `__q_ok_<j>`, so the outer ORDER BY
+# stays deterministic (§7.6). Projected keys keep their projection alias.
+def partition_key: Fn(qb::Expr, Int, PartitionKeys) -> PartitionKeys = fn(expr, index, state) {
     match find_expression(expr, state.expressions) {
         Some(found) => {
             hidden: state.hidden,
@@ -964,21 +952,35 @@ def partition_key: Fn(qb::Expr, PartitionKeys) -> PartitionKeys = fn(expr, state
         },
         None => {
             let emitted = emit_expr(expr, state.ctx);
-            let allocated = internal_alias(emitted.ctx);
-            let binding: ExprBinding = {expr, sql: emitted.sql, alias: allocated.0};
             {
-                hidden: array::push(state.hidden, `\{emitted.sql} AS \{quoted(allocated.0)}`),
-                outer: array::push(state.outer, allocated.0),
-                expressions: array::push(state.expressions, binding),
-                ctx: allocated.1
+                hidden: array::push(state.hidden, `\{emitted.sql} AS \`__q_pk_\{index}\``),
+                outer: array::push(state.outer, `__q_pk_\{index}`),
+                expressions: state.expressions,
+                ctx: emitted.ctx
             }
         },
     }
 };
 
-def partition_order_key: Fn(qb::OrderBy, PartitionKeys) -> PartitionKeys = fn(item, state) {
+def partition_order_key: Fn(qb::OrderBy, Int, PartitionKeys) -> PartitionKeys = fn(item, index, state) {
     match item.key {
-        qb::OrderKey::Expr(expr) => partition_key(expr, state),
+        qb::OrderKey::Expr(expr) => match find_expression(expr, state.expressions) {
+            Some(found) => {
+                hidden: state.hidden,
+                outer: array::push(state.outer, found.alias),
+                expressions: state.expressions,
+                ctx: state.ctx
+            },
+            None => {
+                let emitted = emit_expr(expr, state.ctx);
+                {
+                    hidden: array::push(state.hidden, `\{emitted.sql} AS \`__q_ok_\{index}\``),
+                    outer: array::push(state.outer, `__q_ok_\{index}`),
+                    expressions: state.expressions,
+                    ctx: emitted.ctx
+                }
+            },
+        },
         qb::OrderKey::AggregateRef(ref) => {
             {
                 hidden: state.hidden,
@@ -994,21 +996,26 @@ def partition_order_key: Fn(qb::OrderBy, PartitionKeys) -> PartitionKeys = fn(it
     }
 };
 
+# Partitioned Top-N (§7.6): the inner query numbers rows over the partition,
+# the outer query keeps `__q_rn <= take` and orders deterministically by the
+# hidden keys. Window PARTITION BY/ORDER BY and GROUP BY restate their
+# expressions (never aliases), so every restatement binds its own positional
+# `?` (§4.2).
 def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = fn(plan, pt, ctx) {
-    let initial: PartitionItems = {sql: [], aliases: [], expressions: [], ctx};
+    let selected_initial: PartitionItems = {sql: [], aliases: [], expressions: [], ctx};
     let selected = array::fold(
         plan.projection,
-        initial,
+        selected_initial,
         fn(state, item) {
             let emitted = partition_item(item, plan, state.ctx);
             let expressions = match item {
                 qb::SelectItem::Expr(expr) => array::push(
                     state.expressions,
-                    {expr, sql: emitted.value, alias: emitted.alias}
+                    {expr, alias: emitted.alias}
                 ),
                 qb::SelectItem::NamedExpr(named) => array::push(
                     state.expressions,
-                    {expr: named.expr, sql: emitted.value, alias: emitted.alias}
+                    {expr: named.expr, alias: emitted.alias}
                 ),
                 _ => state.expressions,
             };
@@ -1027,10 +1034,10 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
         ctx: selected.ctx
     };
     let partition = array::fold(
-        pt.partition_by,
+        array::enumerate(pt.partition_by),
         key_initial,
-        fn(state, expr) {
-            partition_key(expr, state)
+        fn(state, pair) {
+            partition_key(pair.1, pair.0, state)
         }
     );
     let order_initial: PartitionKeys = {
@@ -1040,41 +1047,26 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
         ctx: partition.ctx
     };
     let ordered = array::fold(
-        pt.order_by,
+        array::enumerate(pt.order_by),
         order_initial,
-        fn(state, item) {
-            partition_order_key(item, state)
+        fn(state, pair) {
+            partition_order_key(pair.1, pair.0, state)
         }
     );
-    let window_partition = array::map(
-        pt.partition_by,
-        fn(expr) {
-            match find_expression(expr, ordered.expressions) {
-                Some(found) => found.sql,
-                None => fail!("partition key was not rendered", expr),
-            }
-        }
-    );
-    let window_initial: Arguments = {sql: [], ctx: ordered.ctx};
+    let window_partition = render_exprs(pt.partition_by, ordered.ctx);
+    let window_initial: Arguments = {sql: [], ctx: window_partition.ctx};
     let window_order = array::fold(
         pt.order_by,
         window_initial,
         fn(state, item) {
-            let rendered = match item.key {
-                qb::OrderKey::Expr(expr) => match find_expression(expr, ordered.expressions) {
-                    Some(found) => {sql: found.sql, ctx: state.ctx},
-                    None => fail!("partition ordering key was not rendered", expr),
-                },
-                _ => order_key(item.key, plan, state.ctx),
-            };
+            let rendered = order_key(item.key, plan, state.ctx);
             {
                 sql: array::push(state.sql, ordered_sql(rendered.sql, item.direction)),
                 ctx: rendered.ctx
             }
         }
     );
-    let row_alias = internal_alias(window_order.ctx);
-    let source = render_from(plan, row_alias.1);
+    let source = render_from(plan, window_order.ctx);
     let join_initial: Arguments = {sql: [], ctx: source.ctx};
     let joins = array::fold(
         plan.joins,
@@ -1085,16 +1077,8 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
         }
     );
     let where_clause = render_where(plan, joins.ctx);
-    let grouping_sql = array::map(
-        plan.grouping,
-        fn(expr) {
-            match find_expression(expr, ordered.expressions) {
-                Some(found) => found.sql,
-                None => fail!("partition grouping key was not rendered", expr),
-            }
-        }
-    );
-    let having_initial: Arguments = {sql: [], ctx: where_clause.ctx};
+    let grouping = render_exprs(plan.grouping, where_clause.ctx);
+    let having_initial: Arguments = {sql: [], ctx: grouping.ctx};
     let having = array::fold(
         plan.having,
         having_initial,
@@ -1103,10 +1087,9 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
             {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
         }
     );
-    let inner_alias = internal_alias(having.ctx);
-    let take = emit_expr(pt.take, inner_alias.1);
+    let take = emit_expr(pt.take, having.ctx);
     let hidden = array::concat([partition.hidden, ordered.hidden]);
-    let row_number = `row_number() OVER (PARTITION BY \{string::join(window_partition, ", ")} ORDER BY \{string::join(window_order.sql, ", ")}) AS \{quoted(row_alias.0)}`;
+    let row_number = `row_number() OVER (PARTITION BY \{window_partition.sql} ORDER BY \{string::join(window_order.sql, ", ")}) AS \`__q_rn\``;
     let inner_items = array::concat([selected.sql, hidden, [row_number]]);
     let join_sql = if array::length(plan.joins) > 0 {
         ` \{string::join(joins.sql, " ")}`
@@ -1114,7 +1097,7 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
         ""
     };
     let group_sql = if array::length(plan.grouping) > 0 {
-        ` GROUP BY \{string::join(grouping_sql, ", ")}`
+        ` GROUP BY \{grouping.sql}`
     } else {
         ""
     };
@@ -1127,50 +1110,46 @@ def emit_partitioned: Fn(qb::Plan, qb::PartitionedTopN, RenderCtx) -> Emitted = 
     let outer_columns = array::map(
         selected.aliases,
         fn(name) {
-            `\{quoted(inner_alias.0)}.\{quoted(name)}`
+            `\`__q_partitioned\`.\{quoted(name)}`
         }
     );
     let partition_order = array::map(
         partition.outer,
         fn(name) {
-            ordered_sql(`\{quoted(inner_alias.0)}.\{quoted(name)}`, qb::Ordering::Asc)
+            ordered_sql(`\`__q_partitioned\`.\{quoted(name)}`, qb::Ordering::Asc)
         }
     );
     let ranked_order = array::map(
         array::enumerate(pt.order_by),
         fn(pair) {
-            ordered_sql(
-                `\{quoted(inner_alias.0)}.\{quoted(ordered.outer[pair.0])}`,
-                pair.1.direction
-            )
+            ordered_sql(`\`__q_partitioned\`.\{quoted(ordered.outer[pair.0])}`, pair.1.direction)
         }
     );
     let outer_order = string::join(array::concat([partition_order, ranked_order]), ", ");
     {
-        sql: `SELECT \{string::join(outer_columns, ", ")} FROM (\{inner_sql}) AS \{quoted(inner_alias.0)} WHERE \{quoted(inner_alias.0)}.\{quoted(row_alias.0)} <= \{take.sql} ORDER BY \{outer_order}`,
+        sql: `SELECT \{string::join(outer_columns, ", ")} FROM (\{inner_sql}) AS \`__q_partitioned\` WHERE \`__q_partitioned\`.\`__q_rn\` <= \{take.sql} ORDER BY \{outer_order}`,
         ctx: take.ctx
     }
 };
 
 def emit_rows: Fn(qb::Plan, Bool, RenderCtx) -> Emitted = fn(raw, distinct, ctx) {
-    emit_rows_from(raw, distinct, ctx, None)
+    emit_rows_from(raw, distinct, ctx, None, None)
 };
 
-def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = fn(
+# The optional selection take upgrades a bare OFFSET to the single-layer
+# `LIMIT <take> OFFSET ?` shape: the delivered rows are an ordered prefix of
+# the complete business query and the final LIMIT position stays a literal.
+def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String), Option(Int)) -> Emitted = fn(
     raw,
     distinct,
     ctx,
-    override
+    override,
+    selection_take
 ) {
     let plan = if distinct {
         qb::validate_distinct_plan(raw)
     } else {
         qb::validate_structure(raw)
-    };
-    let checked = if array::length(plan.having) > 0 && array::length(plan.grouping) == 0 {
-        fail!("UQL HAVING requires GROUP BY", plan)
-    } else {
-        True
     };
     if override == None && array::length(qb::latest_calls(plan)) > 0 {
         let stage = qb::latest_stage(plan);
@@ -1194,7 +1173,7 @@ def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = f
             }
         );
         let source = `(SELECT \`__latest_input\`.*, row_number() OVER (\{partition}ORDER BY \{string::join(orders, ", ")}) AS \`__latest_row\` FROM (\{input.sql}) AS \`__latest_input\`) AS \`__latest_stage\``;
-        emit_rows_from(stage.output, distinct, input.ctx, Some(source))
+        emit_rows_from(stage.output, distinct, input.ctx, Some(source), selection_take)
     } else {
         match plan.partition {
             Some(pt) => emit_partitioned(plan, pt, ctx),
@@ -1241,20 +1220,6 @@ def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = f
                         {sql: array::push(state.sql, value.sql), ctx: value.ctx}
                     }
                 );
-                let limit: Emitted = match plan.limit {
-                    Some(value) => {
-                        let allocated = emit_expr(value, ordering.ctx);
-                        {sql: ` LIMIT \{allocated.sql}`, ctx: allocated.ctx}
-                    },
-                    None => {sql: "", ctx: ordering.ctx},
-                };
-                let offset: Emitted = match plan.offset {
-                    Some(value) => {
-                        let allocated = emit_expr(value, limit.ctx);
-                        {sql: ` OFFSET \{allocated.sql}`, ctx: allocated.ctx}
-                    },
-                    None => {sql: "", ctx: limit.ctx},
-                };
                 let prefix = if distinct {
                     "SELECT DISTINCT"
                 } else {
@@ -1281,9 +1246,37 @@ def emit_rows_from: Fn(qb::Plan, Bool, RenderCtx, Option(String)) -> Emitted = f
                 } else {
                     ""
                 };
-                {
-                    sql: `\{prefix} \{string::join(selected.sql, ", ")} FROM \{source.sql}\{join_sql}\{where_sql}\{group_sql}\{having_sql}\{order_sql}\{limit.sql}\{offset.sql}`,
-                    ctx: offset.ctx
+                let body = `\{prefix} \{string::join(selected.sql, ", ")} FROM \{source.sql}\{join_sql}\{where_sql}\{group_sql}\{having_sql}\{order_sql}`;
+                # A bare OFFSET is not a spec-listed form: it is fail-closed
+                # unless the selection take supplies the single-layer
+                # `LIMIT <take> OFFSET ?` shape.
+                match (plan.limit, plan.offset) {
+                    (None, None) => {sql: body, ctx: ordering.ctx},
+                    (Some(local), None) => {
+                        let limited = emit_expr(local, ordering.ctx);
+                        {sql: `\{body} LIMIT \{limited.sql}`, ctx: limited.ctx}
+                    },
+                    (Some(local), Some(shift)) => {
+                        let limited = emit_expr(local, ordering.ctx);
+                        let skipped = emit_expr(shift, limited.ctx);
+                        {
+                            sql: `\{body} LIMIT \{limited.sql} OFFSET \{skipped.sql}`,
+                            ctx: skipped.ctx
+                        }
+                    },
+                    (None, Some(shift)) => match selection_take {
+                        None => fail!(
+                            "UQL OFFSET requires a LIMIT or a final output cap",
+                            plan
+                        ),
+                        Some(value) => {
+                            let skipped = emit_expr(shift, ordering.ctx);
+                            {
+                                sql: `\{body} LIMIT \{value} OFFSET \{skipped.sql}`,
+                                ctx: skipped.ctx
+                            }
+                        },
+                    },
                 }
             },
         }
@@ -1304,17 +1297,22 @@ def emit_set: Fn(qb::SetPlan, RenderCtx) -> Emitted = fn(set, ctx) {
     {sql: string::join(rendered.0, ` \{op} `), ctx: rendered.1}
 };
 
+def count_over: Fn(Emitted) -> Emitted = fn(inner) {
+    {sql: `SELECT count(1) FROM (\{inner.sql}) AS \`__q_count\``, ctx: inner.ctx}
+};
+
+# Aligned pair queries: `__q_left`/`__q_right` are the fixed semantic
+# aliases, identity keys align through the spec's NULL-safe `<=>`, and the
+# ranked shape appends `comparison_value` as the first ordering key.
 def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(joined, count, ctx) {
     let left = emit_rows(joined.left, False, ctx);
     let right = emit_rows(joined.right, False, left.ctx);
-    let left_alias = internal_alias(right.ctx);
-    let right_alias = internal_alias(left_alias.1);
     let outputs = array::map(
         joined.outputs,
         fn(item) {
             let alias = match item.side {
-                qb::PairSide::Left => left_alias.0,
-                qb::PairSide::Right => right_alias.0
+                qb::PairSide::Left => "__q_left",
+                qb::PairSide::Right => "__q_right"
             };
             `\{quoted(alias)}.\{quoted(item.column)} AS \{quoted(item.alias)}`
         }
@@ -1322,30 +1320,28 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
     let keys = array::map(
         joined.keys,
         fn(name) {
-            let l = `\{quoted(left_alias.0)}.\{quoted(name)}`;
-            let r = `\{quoted(right_alias.0)}.\{quoted(name)}`;
-            `(\{l} = \{r} OR (\{l} IS NULL AND \{r} IS NULL))`
+            `\`__q_left\`.\{quoted(name)} <=> \`__q_right\`.\{quoted(name)}`
         }
     );
     let selected = if count {
-        "count(1) AS count"
+        "count(1)"
     } else {
         string::join(outputs, ", ")
     };
-    let ranking = match joined.rank {
-        None => ("", {sql: "", ctx: right_alias.1}.ty!(Emitted)),
-        Some(rank) => {
-            let l = `\{quoted(left_alias.0)}.\{quoted(rank.left_measure)}`;
-            let r = `\{quoted(right_alias.0)}.\{quoted(rank.right_measure)}`;
+    let ranking: (String, String, RenderCtx) = match joined.rank {
+        None => ("", "", right.ctx),
+        Some(rank) => do {
+            let left_measure = `\`__q_left\`.\{quoted(rank.left_measure)}`;
+            let right_measure = `\`__q_right\`.\{quoted(rank.right_measure)}`;
             let a = if rank.first == qb::PairSide::Left {
-                l
+                left_measure
             } else {
-                r
+                right_measure
             };
             let b = if rank.first == qb::PairSide::Left {
-                r
+                right_measure
             } else {
-                l
+                left_measure
             };
             let first = `CAST(\{a} AS DOUBLE)`;
             let second = `CAST(\{b} AS DOUBLE)`;
@@ -1359,34 +1355,60 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
                 qb::PairRankOp::Ratio => ` AND \{b} <> 0`,
                 qb::PairRankOp::GrowthRate => ` AND \{b} > 0`,
             };
-            let direction = match rank.direction {
-                qb::Ordering::Asc => "ASC",
-                qb::Ordering::Desc => "DESC"
-            };
             let ties = array::map(
                 joined.keys,
                 fn(name) {
-                    ordered_sql(`\{quoted(left_alias.0)}.\{quoted(name)}`, qb::Ordering::Asc)
+                    ordered_sql(`\`__q_left\`.\{quoted(name)}`, qb::Ordering::Asc)
                 }
             );
-            let local = emit_expr(rank.take, right_alias.1);
-            let limit = {sql: ` LIMIT \{local.sql}`, ctx: local.ctx}.ty!(Emitted);
+            let take = emit_expr(rank.take, right.ctx);
             (
                 `, \{expression} AS \`comparison_value\``,
-                {
-                    sql: ` WHERE \{l} IS NOT NULL AND \{r} IS NOT NULL\{guard} ORDER BY \`comparison_value\` \{direction}, \{string::join(ties, ", ")}\{limit.sql}`,
-                    ctx: limit.ctx
-                }.ty!(Emitted)
+                ` WHERE \{left_measure} IS NOT NULL AND \{right_measure} IS NOT NULL\{guard} ORDER BY \{ordered_sql(`\`comparison_value\``, rank.direction)}, \{string::join(ties, ", ")} LIMIT \{take.sql}`,
+                take.ctx
             )
         },
     };
     {
-        sql: `SELECT \{selected}\{ranking.0} FROM (\{left.sql}) AS \{quoted(left_alias.0)} INNER JOIN (\{right.sql}) AS \{quoted(right_alias.0)} ON \{string::join(keys, " AND ")}\{ranking.1.sql}`,
-        ctx: ranking.1.ctx
+        sql: `SELECT \{selected}\{ranking.0} FROM (\{left.sql}) AS \`__q_left\` INNER JOIN (\{right.sql}) AS \`__q_right\` ON \{string::join(keys, " AND ")}\{ranking.1}`,
+        ctx: ranking.2
     }
 };
 
 # Materialize the same validated AST boundary as the PostgreSQL renderer.
+# The final selection wraps the rendered query: the take bound at intent time
+# is a literal (it never occupies a placeholder), and the ordering keys render
+# through the same occurrence expansion so a bound key pushes its own `?`.
+def render_selection: Fn(Emitted, qb::ResultSelection, Option(Array(String))) -> Emitted = fn(
+    query,
+    selection,
+    columns
+) {
+    let take = qb::public_take(selection.take);
+    let projected = match columns {
+        Some(names) => string::join(array::map(names, quoted), ", "),
+        None => "*",
+    };
+    let order_initial: Arguments = {sql: [], ctx: query.ctx};
+    let ordering = array::fold(
+        selection.order_by,
+        order_initial,
+        fn(state, item) {
+            let key = emit_expr(item.key, state.ctx);
+            {sql: array::push(state.sql, ordered_sql(key.sql, item.direction)), ctx: key.ctx}
+        }
+    );
+    let order_sql = if array::length(ordering.sql) > 0 {
+        ` ORDER BY \{string::join(ordering.sql, ", ")}`
+    } else {
+        ""
+    };
+    {
+        sql: `SELECT \{projected} FROM (\{query.sql}) AS \`__q_result\`\{order_sql} LIMIT \{take}`,
+        ctx: ordering.ctx
+    }
+};
+
 pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
     let raw = ast.plan;
     let builder = ast.ctx;
@@ -1405,34 +1427,34 @@ pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
         ),
     };
     let ctx = context(reserved, builder.bindings);
+    # Rows plans whose only pagination is a bare OFFSET upgrade it to the
+    # single-layer `LIMIT <take> OFFSET ?` shape inside emit_rows_from, so
+    # the selection must not wrap them a second time. In that single-layer
+    # shape the selection's own order_by is dropped and the plan ordering
+    # stands: the shared intent layer never combines a plan offset with a
+    # final selection, so this is a defensive path, not a reachable contract.
+    let selection_take: Option(Int) = match ast.selection {
+        Some(selection) => Some(qb::public_take(selection.take)),
+        None => None,
+    };
+    let single_layer = match (plan, selection_take) {
+        (qb::QueryPlan::Rows(rows), Some(_)) => rows.limit == None && rows.offset != None,
+        (qb::QueryPlan::DistinctRows(rows), Some(_)) => rows.limit == None && rows.offset != None,
+        _ => False,
+    };
     let rendered = match plan {
-        qb::QueryPlan::Rows(rows) => emit_rows_from(rows, False, ctx, None),
-        qb::QueryPlan::DistinctRows(rows) => emit_rows_from(rows, True, ctx, None),
-        qb::QueryPlan::GroupCount(rows) => {
-            let inner = emit_rows(rows, False, ctx);
-            let alias = internal_alias(inner.ctx);
-            {
-                sql: `SELECT count(1) AS count FROM (\{inner.sql}) AS \{quoted(alias.0)}`,
-                ctx: alias.1
-            }
-        },
+        qb::QueryPlan::Rows(rows) => emit_rows_from(rows, False, ctx, None, selection_take),
+        qb::QueryPlan::DistinctRows(rows) => emit_rows_from(rows, True, ctx, None, selection_take),
+        qb::QueryPlan::GroupCount(rows) => count_over(emit_rows(rows, False, ctx)),
         qb::QueryPlan::SetRows(set) => emit_set(set, ctx),
-        qb::QueryPlan::SetCount(set) => {
-            let inner = emit_set(set, ctx);
-            let alias = internal_alias(inner.ctx);
-            {
-                sql: `SELECT count(1) AS count FROM (\{inner.sql}) AS \{quoted(alias.0)}`,
-                ctx: alias.1
-            }
-        },
+        qb::QueryPlan::SetCount(set) => count_over(emit_set(set, ctx)),
         qb::QueryPlan::JoinedGroups(joined) => emit_joined_groups(joined, False, ctx),
         qb::QueryPlan::JoinedGroupCount(joined) => emit_joined_groups(joined, True, ctx),
     };
-    qb::select_result(
-        {sql: rendered.sql, bindings: builder.bindings},
-        ast,
-        fn(expr) {
-            render_expr_with_context(expr, ast.ctx).sql
-        }
-    )
+    let selected: Emitted = match (ast.selection, single_layer) {
+        (Some(selection), False) => render_selection(rendered, selection, ast.output_columns),
+        (_, True) => rendered,
+        (None, False) => rendered,
+    };
+    {sql: selected.sql, bindings: selected.ctx.occurrences}
 };

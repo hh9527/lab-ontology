@@ -1,8 +1,6 @@
 use crate::ontology as edsl;
 use crate::intent as intent;
 use crate::query as qb;
-use crate::sqlite as sqlite;
-use crate::postgres as postgres;
 use crate::uql as uql;
 use std::array as array;
 use std::codec as codec;
@@ -32,7 +30,8 @@ def profile: qb::PlanProfile = {
         qb::Operator::Bind,
         qb::Operator::Scalar,
         qb::Operator::Filter,
-        qb::Operator::Limit
+        qb::Operator::Limit,
+        qb::Operator::Order
     ],
     allowed_join_kinds: [],
     allowed_aggregates: [],
@@ -54,49 +53,74 @@ def parse: Fn(String) -> Value = fn(text) {
     }
 };
 def input: Value = parse(
-    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"server"}],"edges":[],"select":[{"node":"d","dimension":"ip"}],"filters":[{"node":"d","dimension":"id","op":"Eq","value":42}],"limit":7}"#
+    r#"{"op":"Graph","root":"d","nodes":[{"id":"d","entity":"server"}],"edges":[],"select":[{"node":"d","dimension":"ip"}],"filters":[{"node":"d","dimension":"id","op":"Eq","value":42}],"order_by":[{"node":"d","dimension":"ip","direction":"Desc"}],"take":7}"#
 );
 def ast: qb::QueryAst = intent::query_intent_ast_factory(payload)(input);
 def lower: Fn(Value) -> Value = intent::query_request_method_factory(payload, uql::build_query);
 
-pub def model_lowering_uses_the_same_ast_and_bindings_in_three_backends: test::Test = test::should_ok(
+pub def model_lowering_renders_positional_uql_with_occurrence_bindings: test::Test = test::should_ok(
     fn() {
         let rendered = intent::query_intent_lower_factory(payload, uql::build_query)(input);
-        rendered == uql::build_query(ast) && rendered.bindings == sqlite::build_query(ast).bindings && rendered.bindings == postgres::build_query(
-            ast
-        ).bindings && rendered.bindings == [qb::Val::Int(42), qb::Val::Int(7)] && string::contains(
-            rendered.sql,
-            "`PhysicalServer` AS `s`"
-        ) && string::contains(rendered.sql, "`s`.`IP_ADDRESS`") && string::contains(
-            rendered.sql,
-            "`s`.`ID` = $1"
-        ) && string::contains(rendered.sql, "LIMIT $2")
+        if rendered != uql::build_query(ast) {
+            fail!("intent lowering must match the direct UQL rendering", rendered)
+        } else { () };
+        if rendered.bindings != [qb::Val::Int(42)] {
+            fail!("the filter value is the only occurrence binding", rendered.bindings)
+        } else { () };
+        if array::length(string::split(rendered.sql, "?")) - 1 != array::length(rendered.bindings) {
+            fail!("the placeholder count must equal the bindings length", rendered.sql)
+        } else { () };
+        if !string::contains(rendered.sql, "`PhysicalServer` AS `s`") {
+            fail!("the physical table must be aliased", rendered.sql)
+        } else { () };
+        if !string::contains(rendered.sql, "`s`.`IP_ADDRESS`") {
+            fail!("the projected column must stay quoted", rendered.sql)
+        } else { () };
+        if !string::contains(rendered.sql, "`s`.`ID` = ?") {
+            fail!("the filter must use a positional placeholder", rendered.sql)
+        } else { () };
+        if !string::contains(rendered.sql, "AS `__q_result`") {
+            fail!("the final selection must wrap the business query", rendered.sql)
+        } else { () };
+        if !string::contains(rendered.sql, "LIMIT 7") {
+            fail!("the final take renders as a literal limit", rendered.sql)
+        } else { () }
     }
 );
 
-pub def batch_service_preserves_columns_and_limit_slot: test::Test = test::should_ok(
+pub def batch_service_preserves_columns_and_result_bound: test::Test = test::should_ok(
     fn() {
         match lower(Value::Object({intents: Value::Array([input])})) {
-            Value::Object(response) => dict::get(response, "accepted") == Some(Value::True) && dict::get(
+            Value::Object(response) => if dict::get(response, "accepted") == Some(Value::True) && dict::get(
                 response,
                 "diagnostics"
-            ) == Some(Value::Array([])) && (
+            ) == Some(Value::Array([])) {
                 match dict::get(response, "queries") {
-                    Some(Value::Array(queries)) => array::length(queries) == 1 && (
+                    Some(Value::Array(queries)) => if array::length(queries) == 1 {
                         match queries[0] {
-                            Value::Object(query) => dict::get(query, "columns") == Some(
+                            Value::Object(query) => if dict::get(query, "columns") != Some(
                                 codec::encode(intent::result_columns(payload, input, ast))
-                            ) && dict::get(query, "limit_slot") == Some(Value::Int(1)) && dict::get(
+                            ) {
+                                fail!("the result columns must be preserved", query)
+                            } else { () };if dict::get(query, "max_rows") != Some(Value::Int(7)) {
+                                fail!("the final selection bounds the delivered rows", query)
+                            } else { () };if dict::get(
                                 query,
                                 "bindings"
-                            ) == Some(codec::encode(ast.ctx.bindings)),
-                            _ => False,
+                            ) != Some(codec::encode(uql::build_query(ast).bindings)) {
+                                fail!("the bindings must be the occurrence expansion", query)
+                            } else { () },
+                            _ => fail!("the batch response query must be an object", queries[0]),
                         }
-                    ),
-                    _ => False,
+                    } else {
+                        fail!("the batch must accept the single intent", queries)
+                    },
+                    _ => fail!("the batch response must carry queries", response),
                 }
-            ),
-            _ => False,
+            } else {
+                fail!("the batch must accept the valid intent", response)
+            },
+            _ => fail!("the batch response must be an object", response),
         }
     }
 );
