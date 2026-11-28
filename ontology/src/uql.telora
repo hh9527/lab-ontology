@@ -4,19 +4,22 @@ use std::array as array;
 use std::string as string;
 use crate::query as qb;
 
+# The render context carries the immutable builder bindings plus the
+# occurrence-order expansion that becomes the positional bindings array: every
+# rendered `?` appends its handle's value, so the array length always equals
+# the `?` count, repeated references repeat their value, and handles that
+# never appear in the SQL never enter the array.
 type RenderCtx = struct {
     builder_bindings: Array(qb::Val),
+    occurrences: Array(qb::Val),
     reserved_aliases: Array(String),
     next_alias: Int,
 };
 
-type Emitted = struct {
-    sql: String,
-    ctx: RenderCtx
-};
+type Emitted = struct { sql: String, ctx: RenderCtx };
 
 def context: Fn(Array(String), Array(qb::Val)) -> RenderCtx = fn(reserved, bindings) {
-    {builder_bindings: bindings, reserved_aliases: reserved, next_alias: 0}
+    {builder_bindings: bindings, occurrences: [], reserved_aliases: reserved, next_alias: 0}
 };
 
 pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
@@ -136,12 +139,12 @@ def ascii_lower: Fn(String) -> String = fn(value) {
     )
 };
 
-# Explicit null keys avoid relying on a backend's default null placement or
-# PostgreSQL's NULLS FIRST/LAST extension, absent from the UQL ORDER BY spec.
+# The AST ordering contract (ascending puts NULL first, descending last) is
+# expressed with the engine's native NULLS FIRST/LAST spelling.
 def ordered_sql: Fn(String, qb::Ordering) -> String = fn(value, direction) {
     match direction {
-        qb::Ordering::Asc => `CASE WHEN \{value} IS NULL THEN 0 ELSE 1 END ASC, \{value} ASC`,
-        qb::Ordering::Desc => `CASE WHEN \{value} IS NULL THEN 1 ELSE 0 END ASC, \{value} DESC`,
+        qb::Ordering::Asc => `\{value} ASC NULLS FIRST`,
+        qb::Ordering::Desc => `\{value} DESC NULLS LAST`,
     }
 };
 
@@ -182,7 +185,9 @@ type Arguments = struct {
     ctx: RenderCtx
 };
 
-# The build context owns placeholder assignments; rendering only resolves handles.
+# The build context owns placeholder assignment; rendering only resolves
+# handles, emitting a bare `?` and appending the handle's value to the
+# occurrence expansion.
 pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
     match expr {
         qb::Expr::Parameter(_) => fail!(
@@ -198,7 +203,10 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
         qb::Expr::AllocatedBind(binding) => if binding.index > 0 && binding.index <= array::length(
             ctx.builder_bindings
         ) {
-            {sql: `$\{binding.index}`, ctx}
+            {
+                sql: "?",
+                ctx: {...ctx, occurrences: array::push(ctx.occurrences, ctx.builder_bindings[binding.index - 1])}
+            }
         } else {
             fail!("binding handle is not registered in builder context", binding)
         },
@@ -218,9 +226,8 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
 };
 
 pub def render_expr_with_context: Fn(qb::Expr, qb::BuildCtx) -> qb::Query = fn(expr, builder) {
-    let initial = context([], builder.bindings);
-    let emitted = emit_expr(expr, initial);
-    {sql: emitted.sql, bindings: builder.bindings}
+    let emitted = emit_expr(expr, context([], builder.bindings));
+    {sql: emitted.sql, bindings: emitted.ctx.occurrences}
 };
 
 def quoted: Fn(String) -> String = fn(identifier) {
@@ -1387,6 +1394,39 @@ def emit_joined_groups: Fn(qb::JoinedGroups, Bool, RenderCtx) -> Emitted = fn(jo
 };
 
 # Materialize the same validated AST boundary as the PostgreSQL renderer.
+# The final selection wraps the rendered query: the take bound at intent time
+# is a literal (it never occupies a placeholder), and the ordering keys render
+# through the same occurrence expansion so a bound key pushes its own `?`.
+def render_selection: Fn(Emitted, qb::ResultSelection, Option(Array(String))) -> Emitted = fn(
+    query,
+    selection,
+    columns
+) {
+    let take = qb::public_take(selection.take);
+    let projected = match columns {
+        Some(names) => string::join(array::map(names, quoted), ", "),
+        None => "*",
+    };
+    let order_initial: Arguments = {sql: [], ctx: query.ctx};
+    let ordering = array::fold(
+        selection.order_by,
+        order_initial,
+        fn(state, item) {
+            let key = emit_expr(item.key, state.ctx);
+            {sql: array::push(state.sql, ordered_sql(key.sql, item.direction)), ctx: key.ctx}
+        }
+    );
+    let order_sql = if array::length(ordering.sql) > 0 {
+        ` ORDER BY \{string::join(ordering.sql, ", ")}`
+    } else {
+        ""
+    };
+    {
+        sql: `SELECT \{projected} FROM (\{query.sql}) AS \`__q_result\`\{order_sql} LIMIT \{take}`,
+        ctx: ordering.ctx
+    }
+};
+
 pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
     let raw = ast.plan;
     let builder = ast.ctx;
@@ -1428,11 +1468,9 @@ pub def build_query: Fn(qb::QueryAst) -> qb::Query = fn(ast) {
         qb::QueryPlan::JoinedGroups(joined) => emit_joined_groups(joined, False, ctx),
         qb::QueryPlan::JoinedGroupCount(joined) => emit_joined_groups(joined, True, ctx),
     };
-    qb::select_result(
-        {sql: rendered.sql, bindings: builder.bindings},
-        ast,
-        fn(expr) {
-            render_expr_with_context(expr, ast.ctx).sql
-        }
-    )
+    let selected: Emitted = match ast.selection {
+        Some(selection) => render_selection(rendered, selection, ast.output_columns),
+        None => rendered,
+    };
+    {sql: selected.sql, bindings: selected.ctx.occurrences}
 };
