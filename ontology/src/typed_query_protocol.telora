@@ -8,6 +8,7 @@ use std::array as array;
 use std::dict as dict;
 use std::codec as codec;
 use std::json as json;
+use std::string as string;
 use std::hash as hash;
 use std::value::{Value};
 
@@ -31,7 +32,8 @@ type Intent = struct {
     root: String,
     pair: Option(PairRoots),
     nodes: Array(Node),
-    steps: Array(Step)
+    steps: Array(Step),
+    branches: Option(Array(Value))
 };
 type Member = struct {
     kind: String,
@@ -796,7 +798,7 @@ def prepare_time_projections: Fn(
     (prepared.payload, prepared.catalog, request <~ {steps: prepared.steps})
 };
 
-def check_type: Fn(
+def check_leaf: Fn(
     edsl::PreparedPayload,
     Array(typed::Dataset),
     Array(typed::Relation),
@@ -1403,6 +1405,125 @@ def check_type: Fn(
             )
         ),
         _ => fail!("model lowering must return a result template"),
+    }
+};
+
+type UnionColumn = struct {
+    name: String,
+    type: intent::ResultType,
+    logical: String,
+    nullable: Bool
+};
+type UnionTemplate = struct {
+    container: String, receipt: Receipt, columns: Array(UnionColumn), max_rows: Int,
+    union_branches: Array(UnionLeaf), sql: String, total_sql: String
+};
+type UnionLeaf = struct {
+    container: String,
+    receipt: Receipt,
+    pivot: Option(Pivot),
+    max_rows: Option(Int),
+    total_sql: Option(String),
+    sql: String,
+    bindings: Value,
+    columns: Array(UnionColumn)
+};
+
+def check_type: Fn(edsl::PreparedPayload, Array(typed::Dataset), Array(typed::Relation), String, Value) -> Value = fn(payload, catalog, relations, contract_id, input) {
+    let envelope = codec::decode@[Envelope](input).unwrap!();
+    let request = codec::decode@[Intent](envelope.intent).unwrap!();
+    match request.branches {
+        None => check_leaf(payload, catalog, relations, contract_id, input),
+        Some(branches) => {
+            if array::length(branches) < 2 || array::length(request.steps) != 2 ||
+                request.steps[0].kind != "order_by" || request.steps[1].kind != "take" {
+                fail!("remote union_all requires branches followed by global order_by and top or take", envelope.intent)
+            } else { () };
+            let checked = array::map(branches, fn(branch) {
+                let plan = codec::decode@[Intent](branch).unwrap!();
+                if plan.steps == [] || plan.branches != None || plan.pair != None || array::any(plan.steps, fn(step) {
+                    step.kind == "order_by" || step.kind == "take" || step.kind == "take_opt" || step.kind == "pivot"
+                }) {
+                    fail!("remote union_all requires unbounded projected branches", branch)
+                } else { () };
+                let projection = plan.steps[array::length(plan.steps) - 1];
+                if projection.kind != "project" { fail!("union_all branch requires project", branch) } else { () };
+                let record = codec::decode@[Record](projection.body).unwrap!();
+                let fields = array::filter(record.fields, fn(field) { wire_kind(field.value) != "parameter" });
+                let steps = array::map(plan.steps, fn(step) {
+                    if step.id == projection.id {
+                        step <~ {body: codec::encode(record <~ {fields})}
+                    } else { step }
+                });
+                let narrowed = codec::encode(plan <~ {steps});
+                let leaf = codec::decode@[UnionLeaf](check_leaf(payload, catalog, relations, contract_id, codec::encode({intent: narrowed}.ty!(Envelope)))).unwrap!();
+                let columns = array::map(record.fields, fn(field) {
+                    if !qb::is_sql_identifier(field.name) || array::length(array::filter(record.fields, fn(f) { f.name == field.name })) != 1 {
+                        fail!("union_all output names must be unique identifiers", field.value)
+                    } else { () };
+                    if wire_kind(field.value) == "parameter" {
+                        let p = codec::decode@[Parameter](field.value).unwrap!();
+                        if p.index < 0 || p.logical != None || p.nullable {
+                            fail!("union_all branch constant requires a nonnullable scalar", field.value)
+                        } else { () };
+                        let logical = match p.input_type {
+                            intent::ResultType::String => "String",
+                            intent::ResultType::Bool => "Bool",
+                            intent::ResultType::Int => "Int",
+                            intent::ResultType::Float => "Float",
+                            _ => fail!("unsupported union_all branch constant type", field.value),
+                        };
+                        {name: field.name, type: p.input_type, logical, nullable: False}.ty!(UnionColumn)
+                    } else {
+                        match array::find(leaf.columns, fn(c) { c.name == field.name }) {
+                            Some(c) => c,
+                            None => fail!("missing checked union_all column", field.value),
+                        }
+                    }
+                });
+                let select = string::join(array::map(record.fields, fn(field) {
+                    if wire_kind(field.value) == "parameter" {
+                        let p = codec::decode@[Parameter](field.value).unwrap!();
+                        `:__dari_\{p.index} AS \{field.name}`
+                    } else { field.name }
+                }), ", ");
+                leaf <~ {columns, sql: `SELECT \{select} FROM (\{leaf.sql}) AS union_branch`}
+            });
+            let columns = array::map(array::enumerate(checked[0].columns), fn(entry) {
+                let column = entry.1;
+                column <~ {nullable: array::any(checked, fn(leaf: UnionLeaf) {
+                    array::length(leaf.columns) > entry.0 && leaf.columns[entry.0].nullable
+                })}
+            });
+            array::map(array::enumerate(checked), fn(entry) {
+                if array::length(entry.1.columns) != array::length(columns) ||
+                    !array::all(array::enumerate(entry.1.columns), fn(col) {
+                        let actual = col.1;
+                        let expected = columns[col.0];
+                        codec::encode(actual <~ {nullable: False}) == codec::encode(expected <~ {nullable: False})
+                    }) {
+                    fail!("union_all branches must project the same ordered business Schema", branches[entry.0])
+                } else { () }
+            });
+            let order = codec::decode@[Ordering](request.steps[0].body).unwrap!();
+            if order.terms == [] { fail!("union_all requires a global ordering", request.steps[0].body) } else { () };
+            let order_sql = string::join(array::map(order.terms, fn(term) {
+                let key = codec::decode@[Output](term.value).unwrap!();
+                if key.kind != "output" || !array::any(columns, fn(c) {
+                    c.name == key.name && (c.logical == "String" || c.logical == "Int" || c.logical == "Float")
+                }) {
+                    fail!("union_all ordering requires a projected scalar with declared ordering", term.value)
+                } else { () };
+                let direction = match term.direction { qb::Ordering::Asc => "ASC", qb::Ordering::Desc => "DESC" };
+                `\{key.name} \{direction}`
+            }), ", ");
+            let take = qb::public_take(codec::decode@[Take](request.steps[1].body).unwrap!().count);
+            let receipt = {contractId: contract_id, inputDigest: hash::sha256(json::stringify(envelope.intent)),
+                consumedStepIds: array::map(request.steps, fn(step) { step.id })}.ty!(Receipt);
+            codec::encode({container: "table", receipt, columns, max_rows: take, union_branches: checked,
+                sql: `SELECT * FROM (__dari_union_branches__) AS union_rows ORDER BY \{order_sql} LIMIT \{take}`,
+                total_sql: "SELECT COUNT(*) AS total FROM (__dari_union_branches__) AS union_rows"}.ty!(UnionTemplate))
+        }
     }
 };
 pub use self::{check_type};

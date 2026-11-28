@@ -20,7 +20,7 @@ pub def aliases_and_bindings_materialize_in_both_dialects: test::Test = test::sh
                     qb::source_column_ref(second.1, "team_id")
                 )
             ],
-            projection: [qb::expr_item(qb::source_column(second.1, "name"))],
+            projection: [qb::named_expr_item(qb::source_column(second.1, "name"), "name")],
             filter: Some(
                 qb::scalar(qb::ScalarFunction::Eq, [qb::source_column(second.1, "id"), bound.1])
             ),
@@ -38,22 +38,46 @@ pub def aliases_and_bindings_materialize_in_both_dialects: test::Test = test::sh
         };
         let ast = qb::QueryPlan::Rows(plan);
         let finished = qb::finish(bound.0, ast);
-        let sqlite = sqlite::build_query(finished);
+        let sqlite_query = sqlite::build_query(finished);
         let postgres = pg::build_query(finished);
+        let set: qb::SetPlan = {kind: qb::SetOpKind::UnionAll, operands: [plan, plan]};
+        let union = qb::finish(bound.0, qb::QueryPlan::SetRows(set));
+        let union = union <~ {
+            selection: Some({
+                order_by: [{key: qb::Expr::Column({source: "__q_result", column: "name"}), direction: qb::Ordering::Asc}],
+                take: 2
+            }.ty!(qb::ResultSelection))
+        };
+        let sqlite_union = sqlite::build_query(union);
+        let postgres_union = pg::build_query(union);
+        let count = qb::finish(bound.0, qb::QueryPlan::SetCount(set));
+        let sqlite_count = sqlite::build_query(count);
+        let postgres_count = pg::build_query(count);
+        if !string::contains(sqlite_count.sql, " UNION ALL ") ||
+            !string::contains(postgres_count.sql, " UNION ALL ") ||
+            !string::contains(sqlite_union.sql, " UNION ALL ") ||
+            !string::contains(postgres_union.sql, " UNION ALL ") ||
+            !string::contains(sqlite_union.sql, "LIMIT 2") ||
+            !string::contains(postgres_union.sql, "LIMIT 2") ||
+            sqlite_union.bindings != sqlite_query.bindings || postgres_union.bindings != postgres.bindings {
+            fail!("UNION ALL must preserve both branches and shared bindings");
+        } else {
+            ()
+        };
         if first.1.alias == "t" && second.1.alias == "t_2" && string::contains(
-            sqlite.sql,
+            sqlite_query.sql,
             "members AS t_2 ON t.id = t_2.team_id"
-        ) && string::contains(sqlite.sql, "t_2.id = ?1") && string::contains(
+        ) && string::contains(sqlite_query.sql, "t_2.id = ?1") && string::contains(
             postgres.sql,
             "\"members\" AS \"t_2\" ON \"t\".\"id\" = \"t_2\".\"team_id\""
-        ) && string::contains(postgres.sql, "\"t_2\".\"id\" = $1") && sqlite.bindings == [
+        ) && string::contains(postgres.sql, "\"t_2\".\"id\" = $1") && sqlite_query.bindings == [
             qb::Val::Int(7)
-        ] && postgres.bindings == sqlite.bindings {
+        ] && postgres.bindings == sqlite_query.bindings {
             True
         } else {
             fail!(
                 "constructed AST must preserve aliases and bindings in both dialects",
-                sqlite,
+                sqlite_query,
                 postgres
             )
         }
