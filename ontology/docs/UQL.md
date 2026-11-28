@@ -52,6 +52,6 @@ TELORA=../telora/target/release/telora
 python3 scripts/check-uql.py --telora "$TELORA"
 ```
 
-`uql` 覆盖渲染契约、拒绝场景与出现顺序展开断言。`uql_intent` 覆盖模型转换、后端绑定语义、结果列、上限槽位和带索引的批量失败，包括不支持的二进制排序规则。
+`uql` 覆盖渲染契约、拒绝场景与出现顺序展开断言。`uql_intent` 覆盖模型转换、后端绑定语义、结果列、结果上界（`max_rows`）和带索引的批量失败，包括不支持的二进制排序规则。
 Python 检查在内存 SQLite 中执行 47 条生成查询，覆盖可移植 SQL 子集及纪元时／日／月边界。
 它不验证真实 UQL 引擎；日历／格式化函数和引擎专有正则行为仍需引擎集成检查。
