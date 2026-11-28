@@ -17,6 +17,9 @@ def needle: (qb::BuildCtx, qb::Expr) = qb::bind(peer.0, qb::Val::String("active"
 def take: (qb::BuildCtx, qb::Expr) = qb::bind(needle.0, qb::Val::Int(2));
 def threshold: (qb::BuildCtx, qb::Expr) = qb::bind(take.0, qb::Val::Int(0));
 def cap: (qb::BuildCtx, qb::Expr) = qb::bind(threshold.0, qb::Val::Int(1));
+def ago_time: (qb::BuildCtx, qb::Expr) = qb::bind(cap.0, qb::Val::String("2026-03-05 07:25:00"));
+def ago_days: (qb::BuildCtx, qb::Expr) = qb::bind(ago_time.0, qb::Val::Int(2));
+def null_time: (qb::BuildCtx, qb::Expr) = qb::bind(ago_days.0, qb::Val::None);
 def id: qb::Expr = qb::column(source.1, "id");
 def category: qb::Expr = qb::column(source.1, "category");
 def amount: qb::Expr = qb::column(source.1, "amount");
@@ -65,13 +68,13 @@ def grouped: qb::Plan = {
     ordering: [qb::order_by(qb::OrderKey::AggregateRef({alias: "double_hits"}), qb::Ordering::Desc)],
 };
 def render: Fn(qb::QueryPlan) -> qb::Query = fn(p) {
-    uql::build_query(qb::finish(cap.0, p))
+    uql::build_query(qb::finish(null_time.0, p))
 };
 def scalar: Fn(qb::ScalarFunction, Array(qb::Expr)) -> String = fn(f, args) {
-    uql::render_expr_with_context(qb::scalar(f, args), cap.0).sql
+    uql::render_expr_with_context(qb::scalar(f, args), null_time.0).sql
 };
 def scalar_query: Fn(qb::ScalarFunction, Array(qb::Expr)) -> qb::Query = fn(f, args) {
-    uql::render_expr_with_context(qb::scalar(f, args), cap.0)
+    uql::render_expr_with_context(qb::scalar(f, args), null_time.0)
 };
 def placeholder_count: Fn(String) -> Int = fn(sql) {
     array::length(string::split(sql, "?")) - 1
@@ -474,6 +477,40 @@ def partitioned: qb::Plan = {
         )
     )
 };
+# The partition key is deliberately not projected: it must surface through the
+# hidden `__q_pk_<i>` materialization so the outer ordering stays stable.
+def partitioned_hidden_key: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(id, "id")],
+    ordering: [],
+    partition: Some(
+        qb::partitioned_top_n_bound(
+            [category],
+            [qb::order_by(qb::OrderKey::Expr(amount), qb::Ordering::Desc)],
+            take.1
+        )
+    )
+};
+def days_ago: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(qb::scalar(qb::ScalarFunction::UtcDaysAgo, [ago_time.1, ago_days.1]), "ago")]
+};
+def days_ago_null: qb::Plan = {
+    ...plan,
+    projection: [qb::named_expr_item(qb::scalar(qb::ScalarFunction::UtcDaysAgo, [null_time.1, ago_days.1]), "ago")]
+};
+def bucket_hour: qb::Plan = {
+    ...plan,
+    projection: [
+        qb::named_expr_item(
+            qb::scalar(
+                qb::ScalarFunction::UtcTimeBucket({unit: qb::UtcBucketUnit::Hour, encoding: qb::UtcBucketEncoding::DateTimeUtc}),
+                [ago_time.1]
+            ),
+            "bucket"
+        )
+    ]
+};
 def joined: qb::JoinedGroups = {
     left: {...grouped, ordering: []},
     right: {...grouped, ordering: []},
@@ -574,6 +611,7 @@ def cases: Array(Case) = [
     },
     {name: "latest", query: render(qb::QueryPlan::Rows(latest))},
     {name: "partitioned", query: render(qb::QueryPlan::Rows(partitioned))},
+    {name: "partitioned_hidden_key", query: render(qb::QueryPlan::Rows(partitioned_hidden_key))},
     {name: "joined", query: render(qb::QueryPlan::JoinedGroups(joined))},
     {name: "joined_count", query: render(qb::QueryPlan::JoinedGroupCount(joined))},
     {
@@ -631,9 +669,83 @@ def cases: Array(Case) = [
             )
         )
     },
+    {name: "days_ago", query: render(qb::QueryPlan::Rows(days_ago))},
+    {name: "days_ago_null", query: render(qb::QueryPlan::Rows(days_ago_null))},
+    {name: "bucket_hour", query: render(qb::QueryPlan::Rows(bucket_hour))},
 ];
+# The expected arrays are the occurrence-order expansions: grouped re-expands
+# its computed measure in HAVING and ORDER BY, joined groups render the grouped
+# plan twice, and the capped case keeps the business LIMIT before the take.
+type Expectation = struct {
+    name: String,
+    bindings: Array(qb::Val)
+};
+def grouped_bindings: Array(qb::Val) = [
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::Int(0),
+    qb::Val::String("active"),
+    qb::Val::String("active")
+];
+# The aligned sides strip the grouped plan's ordering, so each side expands the
+# projection and HAVING re-expansions only.
+def aligned_bindings: Array(qb::Val) = [
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::String("active"),
+    qb::Val::Int(0)
+];
+def joined_bindings: Array(qb::Val) = array::concat([aligned_bindings, aligned_bindings]);
+def expectations: Array(Expectation) = [
+    {name: "rows", bindings: []},
+    {name: "desc", bindings: []},
+    {name: "distinct", bindings: []},
+    {name: "union", bindings: []},
+    {name: "set_count", bindings: []},
+    {name: "scalar", bindings: []},
+    {name: "ranked", bindings: []},
+    {name: "latest", bindings: []},
+    {name: "lower", bindings: []},
+    {name: "scoped", bindings: [qb::Val::String("active")]},
+    {name: "exists", bindings: [qb::Val::String("active")]},
+    {name: "not_exists", bindings: [qb::Val::String("active")]},
+    {name: "grouped", bindings: grouped_bindings},
+    {name: "group_count", bindings: grouped_bindings},
+    {name: "partitioned", bindings: [qb::Val::Int(2)]},
+    {name: "partitioned_hidden_key", bindings: [qb::Val::Int(2)]},
+    {name: "joined", bindings: joined_bindings},
+    {name: "joined_count", bindings: joined_bindings},
+    {name: "joined_ratio", bindings: array::push(joined_bindings, qb::Val::Int(2))},
+    {name: "capped", bindings: [qb::Val::Int(2)]},
+    {
+        name: "days_ago",
+        bindings: [
+            qb::Val::Int(2),
+            qb::Val::String("2026-03-05 07:25:00"),
+            qb::Val::Int(2),
+            qb::Val::String("2026-03-05 07:25:00")
+        ]
+    },
+    {name: "days_ago_null", bindings: [qb::Val::Int(2), qb::Val::None, qb::Val::Int(2), qb::Val::None]},
+    {name: "bucket_hour", bindings: [qb::Val::String("2026-03-05 07:25:00")]},
+];
+def expected_for: Fn(String) -> Array(qb::Val) = fn(name) {
+    match array::find(expectations, fn(item) { item.name == name }) {
+        Some(item) => item.bindings,
+        None => fail!("missing expansion expectation", name),
+    }
+};
 pub def all_plan_shapes_expand_occurrence_bindings: test::Test = test::should_ok(
     fn() {
+        let mismatched = array::filter(cases, fn(item) {
+            item.query.bindings != expected_for(item.name)
+        });
+        if array::length(mismatched) > 0 {
+            fail!("a plan shape broke the occurrence-order expansion", mismatched)
+        } else { () };
         let broken = array::filter(cases, fn(item) {
             placeholder_count(item.query.sql) != array::length(item.query.bindings)
         });
@@ -661,6 +773,154 @@ pub def selection_wrap_orders_and_limits_literal: test::Test = test::should_ok(
         } else { () };
         if !string::contains(query.sql, "LIMIT 1") {
             fail!("the final selection must append a literal LIMIT", query.sql)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def ranked_bind_key_expands_per_restatement: test::Test = test::should_ok(
+    fn() {
+        let ranked_bound_inner: qb::RankedKeySubquery = qb::ranked_key_subquery_spec(
+            peer.1,
+            [],
+            None,
+            [needle.1],
+            {
+                function: qb::AggregateFunction::Sum,
+                arg: qb::column(peer.1, "amount"),
+                distinct: False,
+                filter: None,
+                alias: "total",
+                latest: None
+            },
+            qb::Ordering::Desc
+        );
+        let query = render(
+            qb::QueryPlan::Rows(
+                {
+                    ...plan,
+                    ranked_key_comparisons: [
+                        qb::ranked_key_comparison(
+                            qb::source_column_ref(source.1, "category"),
+                            qb::ScalarFunction::Eq,
+                            ranked_bound_inner
+                        )
+                    ]
+                }
+            )
+        );
+        if !string::contains(query.sql, "= (SELECT ? FROM") {
+            fail!("the bound ranked key lost its scalar subquery form", query.sql)
+        } else { () };
+        if !string::contains(query.sql, "GROUP BY ? ORDER BY sum(`select_2`.`amount`) DESC NULLS LAST LIMIT 1)") {
+            fail!("the bound ranked key must restate itself in GROUP BY", query.sql)
+        } else { () };
+        if query.bindings != [qb::Val::String("active"), qb::Val::String("active")] {
+            fail!("the key must repeat its binding once per restatement", query.bindings)
+        } else { () };
+        if placeholder_count(query.sql) != array::length(query.bindings) {
+            fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
+        } else { () }
+    }
+);
+pub def structural_names_use_the_shared_vocabulary: test::Test = test::should_ok(
+    fn() {
+        let named: Array(Case) = array::filter(cases, fn(item) {
+            item.name == "latest" || item.name == "joined" || item.name == "group_count"
+                || item.name == "capped" || item.name == "partitioned" || item.name == "partitioned_hidden_key"
+        });
+        if array::length(named) != 6 {
+            fail!("structural name cases went missing", array::map(named, fn(item) { item.name }))
+        } else { () };
+        let latest_sql = match array::find(named, fn(item) { item.name == "latest" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing latest"),
+        };
+        if !string::contains(latest_sql, "AS `__latest_stage`") {
+            fail!("latest staging lost its semantic alias", latest_sql)
+        } else { () };
+        if !string::contains(latest_sql, "`__latest_row` = 1") {
+            fail!("latest reduction lost its staged row marker", latest_sql)
+        } else { () };
+        if !string::contains(latest_sql, "DESC NULLS LAST") {
+            fail!("latest window lost its explicit NULLS ordering", latest_sql)
+        } else { () };
+        let joined_sql = match array::find(named, fn(item) { item.name == "joined" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing joined"),
+        };
+        if !string::contains(joined_sql, "`__q_left`.`category` <=> `__q_right`.`category`") {
+            fail!("joined identity keys lost their NULL-safe alignment", joined_sql)
+        } else { () };
+        let count_sql = match array::find(named, fn(item) { item.name == "group_count" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing group_count"),
+        };
+        if !string::contains(count_sql, "AS `__q_count`") {
+            fail!("group counting lost its semantic derived alias", count_sql)
+        } else { () };
+        let capped_sql = match array::find(named, fn(item) { item.name == "capped" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing capped"),
+        };
+        if !string::contains(capped_sql, "AS `__q_result`") {
+            fail!("the final selection lost its semantic alias", capped_sql)
+        } else { () };
+        if !string::contains(capped_sql, "LIMIT 1") {
+            fail!("the final selection must append a literal LIMIT", capped_sql)
+        } else { () };
+        let partitioned_sql = match array::find(named, fn(item) { item.name == "partitioned" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing partitioned"),
+        };
+        if !string::contains(partitioned_sql, "AS `__q_partitioned`") {
+            fail!("partitioned Top-N lost its semantic outer alias", partitioned_sql)
+        } else { () };
+        if !string::contains(partitioned_sql, "`__q_rn` <= ?") {
+            fail!("partitioned Top-N lost its row-number cut", partitioned_sql)
+        } else { () };
+        if !string::contains(partitioned_sql, "AS `__q_ok_0`") {
+            fail!("partitioned Top-N lost its hidden ordering key name", partitioned_sql)
+        } else { () };
+        let hidden_key_sql = match array::find(named, fn(item) { item.name == "partitioned_hidden_key" }) {
+            Some(item) => item.query.sql,
+            None => fail!("missing partitioned_hidden_key"),
+        };
+        if !string::contains(hidden_key_sql, "AS `__q_pk_0`") {
+            fail!("an unprojected partition key must materialize as __q_pk_<i>", hidden_key_sql)
+        } else { () }
+    }
+);
+pub def offset_without_limit_is_rejected: test::Test = test::should_fail_with(
+    fn() {
+        render(qb::QueryPlan::Rows({...plan, offset: Some(threshold.1)}))
+    },
+    "UQL OFFSET requires a LIMIT or a final output cap"
+);
+pub def offset_with_selection_uses_single_layer: test::Test = test::should_ok(
+    fn() {
+        let query = uql::build_query(
+            {
+                ...qb::finish(cap.0, qb::QueryPlan::Rows({...plan, offset: Some(threshold.1)})),
+                selection: Some(
+                    {
+                        order_by: [
+                            {
+                                key: qb::Expr::Column({source: "__q_result", column: "id"}),
+                                direction: qb::Ordering::Asc
+                            }
+                        ],
+                        take: 2
+                    }
+                )
+            }
+        );
+        if !string::contains(query.sql, "LIMIT 2 OFFSET ?") {
+            fail!("a bare OFFSET with a selection must upgrade to the single-layer shape", query.sql)
+        } else { () };
+        if string::contains(query.sql, "AS `__q_result`") {
+            fail!("the single-layer OFFSET shape must not wrap again", query.sql)
         } else { () };
         if placeholder_count(query.sql) != array::length(query.bindings) {
             fail!("placeholder count must equal the bindings length", query.sql, query.bindings)
