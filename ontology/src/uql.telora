@@ -37,37 +37,82 @@ pub def internal_alias: Fn(RenderCtx) -> (String, RenderCtx) = fn(ctx) {
     }
 };
 
-# UQL temporal functions have no timezone argument. Executors must use UTC.
-def utc_bucket_sql: Fn(qb::UtcBucketSpec, String) -> String = fn(spec, value) {
-    let unit = match spec.unit {
-        qb::UtcBucketUnit::Year => "YEAR",
-        qb::UtcBucketUnit::Quarter => "QUARTER",
-        qb::UtcBucketUnit::Week => "WEEK",
-        qb::UtcBucketUnit::Hour => "HOUR",
-        qb::UtcBucketUnit::Day => "DAY",
-        qb::UtcBucketUnit::Month => "MONTH",
-    };
+# UQL temporal functions carry no timezone argument; executors interpret them
+# as UTC. The bucket matrix: DateTimeUtc keeps the datetime logical type
+# (`time_floor` for hours, `CAST(date_trunc … AS TIMESTAMP)` for day/month),
+# Date uses date_trunc's DATE result directly, and EpochMillis buckets sit
+# inside the calendar-range guard CASE. The epoch form restates the value
+# inside the guard and the offset arithmetic; every restatement renders its
+# own positional `?` so the occurrence expansion stays exact.
+def utc_bucket_sql: Fn(qb::UtcBucketSpec, qb::Expr, RenderCtx) -> Emitted = fn(spec, value, ctx) {
     match spec.encoding {
-        qb::UtcBucketEncoding::DateTimeUtc => `date_trunc('\{unit}', CAST(\{value} AS TIMESTAMP))`,
-        qb::UtcBucketEncoding::Date => `CAST(date_trunc('\{unit}', CAST(\{value} AS TIMESTAMP)) AS DATE)`,
-        qb::UtcBucketEncoding::EpochMillis => do {
-            let bucket = match spec.unit {
-                qb::UtcBucketUnit::Hour => `CAST((\{value} - mod(mod(\{value}, 3600000) + 3600000, 3600000)) AS BIGINT)`,
-                qb::UtcBucketUnit::Day => `CAST((\{value} - mod(mod(\{value}, 86400000) + 86400000, 86400000)) AS BIGINT)`,
-                qb::UtcBucketUnit::Month => do {
-                    let origin = "CAST('1970-01-01 00:00:00' AS TIMESTAMP)";
-                    # TIMESTAMPADD accepts INT counts. Whole days cover the full
-                    # supported calendar range without overflowing a 32-bit INT;
-                    # intra-day time cannot change the containing UTC month.
-                    let days = `CAST((\{value} - mod(mod(\{value}, 86400000) + 86400000, 86400000)) / 86400000 AS INTEGER)`;
-                    let timestamp = `timestampadd('DAY', \{days}, \{origin})`;
-                    `CAST(timestampdiff('SECOND', \{origin}, date_trunc('MONTH', \{timestamp})) AS BIGINT) * 1000`
-                },
-                _ => fail!("this bucket unit requires DateTimeUtc"),
+        qb::UtcBucketEncoding::DateTimeUtc => do {
+            let rendered = emit_expr(value, ctx);
+            let sql = match spec.unit {
+                qb::UtcBucketUnit::Year => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Quarter => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Week => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Hour => `time_floor(CAST(\{rendered.sql} AS TIMESTAMP), 'PT1H')`,
+                qb::UtcBucketUnit::Day => `CAST(date_trunc('day', CAST(\{rendered.sql} AS TIMESTAMP)) AS TIMESTAMP)`,
+                qb::UtcBucketUnit::Month => `CAST(date_trunc('month', CAST(\{rendered.sql} AS TIMESTAMP)) AS TIMESTAMP)`,
             };
-            `CASE WHEN \{value} >= -62135596800000 AND \{value} < 253402300800000 THEN \{bucket} ELSE NULL END`
+            {sql, ctx: rendered.ctx}
+        },
+        qb::UtcBucketEncoding::Date => do {
+            let rendered = emit_expr(value, ctx);
+            let sql = match spec.unit {
+                qb::UtcBucketUnit::Year => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Quarter => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Week => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Hour => fail!("UQL date buckets support day and month units only", spec),
+                qb::UtcBucketUnit::Day => `date_trunc('day', CAST(\{rendered.sql} AS TIMESTAMP))`,
+                qb::UtcBucketUnit::Month => `date_trunc('month', CAST(\{rendered.sql} AS TIMESTAMP))`,
+            };
+            {sql, ctx: rendered.ctx}
+        },
+        qb::UtcBucketEncoding::EpochMillis => do {
+            let lower = emit_expr(value, ctx);
+            let upper = emit_expr(value, lower.ctx);
+            let offset = emit_expr(value, upper.ctx);
+            let inner = emit_expr(value, offset.ctx);
+            let bucket = match spec.unit {
+                qb::UtcBucketUnit::Year => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Quarter => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Week => fail!("UQL buckets support hour, day and month units only", spec),
+                qb::UtcBucketUnit::Hour =>
+                    `CAST((\{offset.sql} - mod(mod(\{inner.sql}, 3600000) + 3600000, 3600000)) AS BIGINT)`,
+                qb::UtcBucketUnit::Day =>
+                    `CAST((\{offset.sql} - mod(mod(\{inner.sql}, 86400000) + 86400000, 86400000)) AS BIGINT)`,
+                qb::UtcBucketUnit::Month => do {
+                    # Whole-day timestampadd plus a month-truncated timestampdiff keeps
+                    # 32-bit INT counts and fractional months out of the arithmetic; the
+                    # epoch anchor is the typed literal and the truncation result is CAST
+                    # back to TIMESTAMP before the difference is taken.
+                    let origin = "TIMESTAMP '1970-01-01 00:00:00'";
+                    let days = `CAST((\{offset.sql} - mod(mod(\{inner.sql}, 86400000) + 86400000, 86400000)) / 86400000 AS INTEGER)`;
+                    `CAST(timestampdiff('SECOND', \{origin}, CAST(date_trunc('month', timestampadd('DAY', \{days}, \{origin})) AS TIMESTAMP)) AS BIGINT) * 1000`
+                },
+            };
+            {sql: `CASE WHEN \{lower.sql} >= -62135596800000 AND \{upper.sql} < 253402300800000 THEN \{bucket} ELSE NULL END`,
+                ctx: inner.ctx}
         },
     }
+};
+
+# timestamp_format format strings carry no T/Z literals, so the shifted
+# timestamp is restated twice and the date/time halves are joined by concat;
+# concat propagates NULL from any argument, keeping NULL timestamps NULL.
+# Text order inside one timestampadd is days-then-timestamp, so the arguments
+# render in that order and every restatement renders its own positional `?`.
+def utc_days_ago_sql: Fn(Array(qb::Expr), RenderCtx) -> Emitted = fn(args, ctx) {
+    let days_first = emit_expr(args[1], ctx);
+    let time_first = emit_expr(args[0], days_first.ctx);
+    let days_second = emit_expr(args[1], time_first.ctx);
+    let time_second = emit_expr(args[0], days_second.ctx);
+    let first = `timestampadd('DAY', (0 - CAST(\{days_first.sql} AS INTEGER)), CAST(\{time_first.sql} AS TIMESTAMP))`;
+    let second = `timestampadd('DAY', (0 - CAST(\{days_second.sql} AS INTEGER)), CAST(\{time_second.sql} AS TIMESTAMP))`;
+    {sql: `concat(timestamp_format(\{first}, '%Y-%m-%d'), 'T', timestamp_format(\{second}, '%H:%i:%s'), 'Z')`,
+        ctx: time_second.ctx}
 };
 
 # LOWER may fold non-ASCII characters differently across UQL sources. The AST
@@ -158,15 +203,16 @@ def scalar_sql: Fn(qb::ScalarFunction, Array(String)) -> String = fn(function, p
         qb::ScalarFunction::Add => `(\{parts[0]} + \{parts[1]})`,
         qb::ScalarFunction::Sub => `(\{parts[0]} - \{parts[1]})`,
         qb::ScalarFunction::Div => `(\{parts[0]} / \{parts[1]})`,
+        # OQ-5: the engine's lower() folds A-Z only, matching the AST contract.
         qb::ScalarFunction::Lower => ascii_lower(parts[0]),
         qb::ScalarFunction::Length => `char_length(\{parts[0]})`,
-        qb::ScalarFunction::UtcDaysAgo => `timestamp_format(timestampadd('DAY', (0 - CAST(\{parts[1]} AS INTEGER)), CAST(\{parts[0]} AS TIMESTAMP)), 'yyyy-MM-dd''T''HH:mm:ss''Z''')`,
-        qb::ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, parts[0]),
-        qb::ScalarFunction::ZonedTimeBucket(_) => fail!("region timezone buckets require PostgreSQL or the SQLite timezone adapter"),
-        qb::ScalarFunction::EpochMillisToUtc => do {
-            let v=parts[0];let rem=`mod(mod(\{v}, 86400000) + 86400000, 86400000)`;
-            `timestampadd('MILLISECOND', CAST(\{rem} AS INTEGER), timestampadd('DAY', CAST((\{v} - \{rem}) / 86400000 AS INTEGER), CAST('1970-01-01 00:00:00' AS TIMESTAMP)))`
-        },
+        # Both temporal functions restate subexpressions, so they render through
+        # the occurrence-aware emitters in emit_expr, never through this
+        # string-combining path.
+        qb::ScalarFunction::UtcDaysAgo => fail!("UtcDaysAgo requires occurrence-order rendering"),
+        qb::ScalarFunction::UtcTimeBucket(_) => fail!("UtcTimeBucket requires occurrence-order rendering"),
+        qb::ScalarFunction::ZonedTimeBucket(_) => fail!("UQL does not define region timezone buckets"),
+        qb::ScalarFunction::EpochMillisToUtc => fail!("UQL does not define epoch millis to timestamp conversion"),
         qb::ScalarFunction::Eq => `\{parts[0]} = \{parts[1]}`,
         qb::ScalarFunction::Ne => `\{parts[0]} <> \{parts[1]}`,
         qb::ScalarFunction::Lt => `\{parts[0]} < \{parts[1]}`,
@@ -210,17 +256,21 @@ pub def emit_expr: Fn(qb::Expr, RenderCtx) -> Emitted = fn(expr, ctx) {
         } else {
             fail!("binding handle is not registered in builder context", binding)
         },
-        qb::Expr::Scalar(call) => {
-            let initial: Arguments = {sql: [], ctx};
-            let args = array::fold(
-                call.args,
-                initial,
-                fn(state, arg) {
-                    let rendered = emit_expr(arg, state.ctx);
-                    {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
-                }
-            );
-            {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+        qb::Expr::Scalar(call) => match call.function {
+            qb::ScalarFunction::UtcDaysAgo => utc_days_ago_sql(call.args, ctx),
+            qb::ScalarFunction::UtcTimeBucket(spec) => utc_bucket_sql(spec, call.args[0], ctx),
+            _ => do {
+                let initial: Arguments = {sql: [], ctx};
+                let args = array::fold(
+                    call.args,
+                    initial,
+                    fn(state, arg) {
+                        let rendered = emit_expr(arg, state.ctx);
+                        {sql: array::push(state.sql, rendered.sql), ctx: rendered.ctx}
+                    }
+                );
+                {sql: scalar_sql(call.function, args.sql), ctx: args.ctx}
+            },
         },
     }
 };
