@@ -64,8 +64,10 @@ JoinedGroupCount 拒绝排名。模型转换校验数值类型、单位和配置
 ## 生成边界
 
 SQLite、PostgreSQL 和 UQL 提供 `build_query(QueryAst) -> Query`，其中 `Query` 包含
-`sql: String` 与 `bindings: Array(Val)`。同一绑定句柄在 SQLite 中变为 `?n`，在 PostgreSQL 和 UQL 中变为 `$n`。
-`bindings[n-1]` 提供句柄 `n` 的值；重复引用复用该句柄。渲染器负责标识符引用及自身语法、函数，不反向解析 SQL，也不将数据值转义后拼入模板。
+`sql: String` 与 `bindings: Array(Val)`。SQLite 和 PostgreSQL 中同一绑定句柄变为 `$n`，
+`bindings[n-1]` 提供句柄 `n` 的值，重复引用复用该句柄。
+UQL 渲染为纯位置 `?`，`bindings` 为出现顺序展开数组，重复引用重复追加值，未出现在 SQL 中的句柄不进入数组。
+渲染器负责标识符引用及自身语法、函数，不反向解析 SQL，也不将数据值转义后拼入模板。
 
 ```telora
 use ontology::sqlite as sqlite;

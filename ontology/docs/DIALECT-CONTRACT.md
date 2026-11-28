@@ -34,7 +34,7 @@ SQLite 与 PostgreSQL 消费相同的结构校验 AST。不能用 PG 强制转�
 ## 共同契约
 
 - 查询形状（`Rows`、`DistinctRows`、`SetRows`、`SetCount`、`GroupCount`、`JoinedGroups`、`JoinedGroupCount`）及已校验 `Plan` 的含义不随方言改变。方言不能悄悄近似 AST 节点、重解释身份键、改变绑定顺序或使用依赖会话的日期时间语义。
-- `BuildCtx` 在构造 AST 时为每个动态标量分配稳定索引。同一句柄在 SQLite 中为 `?n`，在 PostgreSQL 和 UQL 中为 `$n`；重复引用复用索引。即使 SQL 表达式顺序与分配顺序不同，`Query.bindings[n-1]` 仍是句柄 `n` 的标量。
+- `BuildCtx` 在构造 AST 时为每个动态标量分配稳定索引。SQLite 和 PostgreSQL 中同一句柄为 `$n`，重复引用复用索引，`Query.bindings[n-1]` 是句柄 `n` 的标量。UQL 渲染为纯位置 `?`，`Query.bindings` 为出现顺序展开数组：每个 `?` 按其在 SQL 文本中的位置追加其句柄的值，重复引用重复追加值，未出现在 SQL 中的句柄不进入数组。
 - 源、列和别名按标识符检查，不能接受任意 SQL。PostgreSQL 必须保留声明的大小写，包括大小写混合的物理列名；未加引号的 PG 标识符会折叠为小写。须针对真实表测试。
 - 新共享 AST 操作只有在所有支持的方言均能以等价结果和失败模式执行后，才向本体转换开放。
 
