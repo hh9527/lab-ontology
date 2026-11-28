@@ -13,7 +13,8 @@ use std::hash as hash;
 use std::value::{Value};
 
 type Envelope = struct {
-    intent: Value
+    intent: Value,
+    dialect: Option(typed::Dialect)
 };
 type Node = struct {
     id: String,
@@ -1062,7 +1063,7 @@ def check_leaf: Fn(
                 } else {
                     ()
                 };
-                if expression_kind(step.body) == "call" || expression_kind(step.body) == "mapped_comparison" {
+                if expression_kind(step.body) == "call" || expression_kind(step.body) == "mapped_comparison" || expression_kind(step.body) == "subnet" {
                     state <~ {
                         row_predicates: array::push(
                             state.row_predicates,
@@ -1379,8 +1380,9 @@ def check_leaf: Fn(
         take,
         identity: state.identity
     }.ty!(LoweredRequest);
+    let dialect = match envelope.dialect { Some(value) => value, None => typed::Dialect::Sqlite };
     let lowered = match request.pair {
-        None => typed::check_type(payload, catalog, codec::encode(lowered_request)),
+        None => typed::check_type(payload, catalog, codec::encode(lowered_request), dialect),
         Some(roots) => pair::check_type(
             payload,
             catalog,
@@ -1388,7 +1390,8 @@ def check_leaf: Fn(
                 {request: lowered_request, left: roots.left, right: roots.right, rank: state.rank}.ty!(
                     PairRequest
                 )
-            )
+            ),
+            dialect
         ),
     };
     let receipt = {
@@ -1432,6 +1435,7 @@ type UnionLeaf = struct {
 def check_type: Fn(edsl::PreparedPayload, Array(typed::Dataset), Array(typed::Relation), String, Value) -> Value = fn(payload, catalog, relations, contract_id, input) {
     let envelope = codec::decode@[Envelope](input).unwrap!();
     let request = codec::decode@[Intent](envelope.intent).unwrap!();
+    let postgres = envelope.dialect == Some(typed::Dialect::Postgres);
     match request.branches {
         None => check_leaf(payload, catalog, relations, contract_id, input),
         Some(branches) => {
@@ -1456,7 +1460,7 @@ def check_type: Fn(edsl::PreparedPayload, Array(typed::Dataset), Array(typed::Re
                     } else { step }
                 });
                 let narrowed = codec::encode(plan <~ {steps});
-                let leaf = codec::decode@[UnionLeaf](check_leaf(payload, catalog, relations, contract_id, codec::encode({intent: narrowed}.ty!(Envelope)))).unwrap!();
+                let leaf = codec::decode@[UnionLeaf](check_leaf(payload, catalog, relations, contract_id, codec::encode({intent: narrowed, dialect: envelope.dialect}.ty!(Envelope)))).unwrap!();
                 let columns = array::map(record.fields, fn(field) {
                     if !qb::is_sql_identifier(field.name) || array::length(array::filter(record.fields, fn(f) { f.name == field.name })) != 1 {
                         fail!("union_all output names must be unique identifiers", field.value)
@@ -1484,8 +1488,18 @@ def check_type: Fn(edsl::PreparedPayload, Array(typed::Dataset), Array(typed::Re
                 let select = string::join(array::map(record.fields, fn(field) {
                     if wire_kind(field.value) == "parameter" {
                         let p = codec::decode@[Parameter](field.value).unwrap!();
-                        `:__dari_\{p.index} AS \{field.name}`
-                    } else { field.name }
+                        let parameter = `:__dari_\{p.index}`;
+                        let sql = if postgres {
+                            let storage = match p.input_type {
+                                intent::ResultType::Int => "bigint",
+                                intent::ResultType::Float => "double precision",
+                                intent::ResultType::Bool => "boolean",
+                                _ => "text",
+                            };
+                            `CAST(\{parameter} AS \{storage})`
+                        } else { parameter };
+                        `\{sql} AS "\{field.name}"`
+                    } else { `"\{field.name}"` }
                 }), ", ");
                 leaf <~ {columns, sql: `SELECT \{select} FROM (\{leaf.sql}) AS union_branch`}
             });
@@ -1515,7 +1529,10 @@ def check_type: Fn(edsl::PreparedPayload, Array(typed::Dataset), Array(typed::Re
                     fail!("union_all ordering requires a projected scalar with declared ordering", term.value)
                 } else { () };
                 let direction = match term.direction { qb::Ordering::Asc => "ASC", qb::Ordering::Desc => "DESC" };
-                `\{key.name} \{direction}`
+                let nulls = if postgres {
+                    match term.direction { qb::Ordering::Asc => " NULLS FIRST", qb::Ordering::Desc => " NULLS LAST" }
+                } else { "" };
+                `"\{key.name}" \{direction}\{nulls}`
             }), ", ");
             let take = qb::public_take(codec::decode@[Take](request.steps[1].body).unwrap!().count);
             let receipt = {contractId: contract_id, inputDigest: hash::sha256(json::stringify(envelope.intent)),

@@ -2,7 +2,6 @@ use crate::typed_query as typed;
 use crate::ontology as edsl;
 use crate::intent as intent;
 use crate::query as qb;
-use crate::sqlite as sqlite;
 use std::array as array;
 use std::codec as codec;
 use std::dict as dict;
@@ -26,7 +25,7 @@ type Comparison = struct {kind:String,node:String,dimension:String,op:edsl::Filt
 type Null = struct {kind:String,node:String,dimension:String,present:Bool};
 type Boolean = struct {kind:String,left:Value,right:Value};
 type Column = struct {name:String,type:intent::ResultType,logical:String,nullable:Bool};
-type Template = struct {sql:String,bindings:Array(qb::Val),columns:Array(Column),max_rows:Int};
+type Template = struct {sql:String,total_sql:Option(String),bindings:Array(qb::Val),columns:Array(Column),max_rows:Int};
 
 def filter_nodes: Fn(Value) -> Array(String) = fn(value) {
     match value {
@@ -39,7 +38,7 @@ def filter_nodes: Fn(Value) -> Array(String) = fn(value) {
     }
 };
 
-def check_type: Fn(edsl::PreparedPayload,Array(typed::Dataset),Value) -> Value = fn(payload,catalog,input) {
+def check_type: Fn(edsl::PreparedPayload,Array(typed::Dataset),Value,typed::Dialect) -> Value = fn(payload,catalog,input,dialect) {
     let spec=codec::decode@[Input](input).unwrap!();
     let request=spec.request;
     let take=match request.take {Some(n)=>qb::public_take(n),None=>fail!("pair ranking requires a terminal take")};
@@ -123,8 +122,24 @@ def check_type: Fn(edsl::PreparedPayload,Array(typed::Dataset),Value) -> Value =
         {name:p.name,type:member.storage,logical:member.logical,nullable:if p.not_none {False} else {column.nullable}}.ty!(Column)
     });
     if spec.rank != None && array::any(request.projections,fn(p){p.not_none}) {fail!("not_none with pair ranking requires projection in a following query!")} else { () };
-    let query=sqlite::build_query_not_none(ast,array::map(array::filter(request.projections,fn(p){p.not_none}),fn(p){column_name(p.node,p.id)}));
-    let projection=string::join(array::map(request.projections,fn(p){`\{column_name(p.node,p.id)} AS \{p.name}`}),", ");
-    codec::encode({sql:`SELECT \{projection} FROM (\{query.sql}) AS __dari_pair`,bindings:query.bindings,columns:public_columns,max_rows:qb::result_bound(ast)}.ty!(Template))
+    let required = array::map(array::filter(request.projections, fn(p) { p.not_none }), fn(p) { column_name(p.node, p.id) });
+    let query = typed::build_query(dialect, ast, required);
+    let total_sql = if ast.selection != None {
+        let population = typed::build_query(dialect, ast <~ {selection: None}, required);
+        Some(`SELECT COUNT(*) AS total FROM (\{population.sql}) AS __dari_population`)
+    } else {
+        match ast.plan {
+            qb::QueryPlan::JoinedGroups(joined) => {
+                let population = typed::build_query(dialect, ast <~ {
+                    plan: qb::QueryPlan::JoinedGroupCount(joined),
+                    output_columns: None
+                }, []);
+                Some(`SELECT count AS total FROM (\{population.sql}) AS __dari_population`)
+            },
+            _ => None,
+        }
+    };
+    let projection=string::join(array::map(request.projections,fn(p){`"\{column_name(p.node,p.id)}" AS "\{p.name}"`}),", ");
+    codec::encode({sql:`SELECT \{projection} FROM (\{query.sql}) AS __dari_pair`,total_sql,bindings:query.bindings,columns:public_columns,max_rows:qb::result_bound(ast)}.ty!(Template))
 };
 pub use self::{Rank,check_type};
